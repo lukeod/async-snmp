@@ -1,0 +1,44 @@
+[package]
+name = "async-snmp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.10"
+bytes = "1.11.0"
+
+[dependencies.async-snmp]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_ber_decoder"
+path = "fuzz_targets/fuzz_ber_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_oid_parser"
+path = "fuzz_targets/fuzz_oid_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_message_parser"
+path = "fuzz_targets/fuzz_message_parser.rs"
+test = false
+doc = false
+bench = false

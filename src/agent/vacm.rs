@@ -1,0 +1,633 @@
+//! View-based Access Control Model (RFC 3415).
+//!
+//! VACM controls access through three tables:
+//! 1. Security-to-Group: Maps (securityModel, securityName) → groupName
+//! 2. Access: Maps (groupName, contextPrefix, securityModel, securityLevel) → views
+//! 3. View Tree Family: Defines views as OID subtree collections
+
+use std::collections::HashMap;
+
+use bytes::Bytes;
+
+use crate::message::SecurityLevel;
+use crate::oid::Oid;
+
+/// Security model identifiers (RFC 3411).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecurityModel {
+    /// Wildcard for VACM matching (matches any model).
+    Any = 0,
+    /// SNMPv1.
+    V1 = 1,
+    /// SNMPv2c.
+    V2c = 2,
+    /// SNMPv3 User-based Security Model.
+    Usm = 3,
+}
+
+/// Access type for VACM checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessType {
+    /// Read access (GET, GETNEXT, GETBULK).
+    Read,
+    /// Write access (SET).
+    Write,
+}
+
+/// Context matching mode for access entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextMatch {
+    /// Exact context name match.
+    #[default]
+    Exact,
+    /// Context name prefix match.
+    Prefix,
+}
+
+/// A view is a collection of OID subtrees.
+#[derive(Debug, Clone, Default)]
+pub struct View {
+    subtrees: Vec<ViewSubtree>,
+}
+
+impl View {
+    /// Create a new empty view.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an included subtree to the view.
+    pub fn include(mut self, oid: Oid) -> Self {
+        self.subtrees.push(ViewSubtree {
+            oid,
+            mask: Vec::new(),
+            included: true,
+        });
+        self
+    }
+
+    /// Add an included subtree with a mask to the view.
+    pub fn include_masked(mut self, oid: Oid, mask: Vec<u8>) -> Self {
+        self.subtrees.push(ViewSubtree {
+            oid,
+            mask,
+            included: true,
+        });
+        self
+    }
+
+    /// Add an excluded subtree to the view.
+    pub fn exclude(mut self, oid: Oid) -> Self {
+        self.subtrees.push(ViewSubtree {
+            oid,
+            mask: Vec::new(),
+            included: false,
+        });
+        self
+    }
+
+    /// Add an excluded subtree with a mask to the view.
+    pub fn exclude_masked(mut self, oid: Oid, mask: Vec<u8>) -> Self {
+        self.subtrees.push(ViewSubtree {
+            oid,
+            mask,
+            included: false,
+        });
+        self
+    }
+
+    /// Check if an OID is in this view.
+    ///
+    /// Per RFC 3415 Section 5, an OID is in the view if:
+    /// - At least one included subtree matches, AND
+    /// - No excluded subtree matches
+    pub fn contains(&self, oid: &Oid) -> bool {
+        let mut dominated_by_include = false;
+        let mut dominated_by_exclude = false;
+
+        for subtree in &self.subtrees {
+            if subtree.matches(oid) {
+                if subtree.included {
+                    dominated_by_include = true;
+                } else {
+                    dominated_by_exclude = true;
+                }
+            }
+        }
+
+        // Included and not excluded
+        dominated_by_include && !dominated_by_exclude
+    }
+}
+
+/// A subtree in a view with optional mask.
+#[derive(Debug, Clone)]
+pub struct ViewSubtree {
+    /// Base OID of subtree.
+    pub oid: Oid,
+    /// Bit mask for wildcard matching (empty = exact match).
+    ///
+    /// Each bit position corresponds to an arc in the OID:
+    /// - Bit 8 of byte 0 = arc 0
+    /// - Bit 7 of byte 0 = arc 1
+    /// - etc.
+    ///
+    /// A bit value of 1 means the arc must match exactly.
+    /// A bit value of 0 means any value is accepted (wildcard).
+    pub mask: Vec<u8>,
+    /// Include (true) or exclude (false) this subtree.
+    pub included: bool,
+}
+
+impl ViewSubtree {
+    /// Check if an OID matches this subtree (with mask).
+    pub fn matches(&self, oid: &Oid) -> bool {
+        let subtree_arcs = self.oid.arcs();
+        let oid_arcs = oid.arcs();
+
+        // OID must be at least as long as subtree
+        if oid_arcs.len() < subtree_arcs.len() {
+            return false;
+        }
+
+        // Check each arc against mask
+        for (i, &subtree_arc) in subtree_arcs.iter().enumerate() {
+            let mask_bit = if i / 8 < self.mask.len() {
+                (self.mask[i / 8] >> (7 - (i % 8))) & 1
+            } else {
+                1 // Default: exact match required
+            };
+
+            if mask_bit == 1 && oid_arcs[i] != subtree_arc {
+                return false;
+            }
+            // mask_bit == 0: wildcard, any value matches
+        }
+
+        true
+    }
+}
+
+/// Access table entry.
+#[derive(Debug, Clone)]
+pub struct VacmAccessEntry {
+    /// Group name this entry applies to.
+    pub group_name: Bytes,
+    /// Context prefix for matching.
+    pub context_prefix: Bytes,
+    /// Security model (or Any for wildcard).
+    pub security_model: SecurityModel,
+    /// Minimum security level required.
+    pub security_level: SecurityLevel,
+    /// Context matching mode.
+    pub context_match: ContextMatch,
+    /// View name for read access.
+    pub read_view: Bytes,
+    /// View name for write access.
+    pub write_view: Bytes,
+    /// View name for notify access (traps/informs).
+    pub notify_view: Bytes,
+}
+
+/// Builder for access entries.
+pub struct AccessEntryBuilder {
+    group_name: Bytes,
+    context_prefix: Bytes,
+    security_model: SecurityModel,
+    security_level: SecurityLevel,
+    context_match: ContextMatch,
+    read_view: Bytes,
+    write_view: Bytes,
+    notify_view: Bytes,
+}
+
+impl AccessEntryBuilder {
+    /// Create a new access entry builder for a group.
+    pub fn new(group_name: impl Into<Bytes>) -> Self {
+        Self {
+            group_name: group_name.into(),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::new(),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        }
+    }
+
+    /// Set the context prefix for matching.
+    pub fn context_prefix(mut self, prefix: impl Into<Bytes>) -> Self {
+        self.context_prefix = prefix.into();
+        self
+    }
+
+    /// Set the security model.
+    pub fn security_model(mut self, model: SecurityModel) -> Self {
+        self.security_model = model;
+        self
+    }
+
+    /// Set the minimum security level required.
+    pub fn security_level(mut self, level: SecurityLevel) -> Self {
+        self.security_level = level;
+        self
+    }
+
+    /// Set the context matching mode.
+    pub fn context_match(mut self, mode: ContextMatch) -> Self {
+        self.context_match = mode;
+        self
+    }
+
+    /// Set the read view name.
+    pub fn read_view(mut self, view: impl Into<Bytes>) -> Self {
+        self.read_view = view.into();
+        self
+    }
+
+    /// Set the write view name.
+    pub fn write_view(mut self, view: impl Into<Bytes>) -> Self {
+        self.write_view = view.into();
+        self
+    }
+
+    /// Set the notify view name.
+    pub fn notify_view(mut self, view: impl Into<Bytes>) -> Self {
+        self.notify_view = view.into();
+        self
+    }
+
+    /// Build the access entry.
+    pub fn build(self) -> VacmAccessEntry {
+        VacmAccessEntry {
+            group_name: self.group_name,
+            context_prefix: self.context_prefix,
+            security_model: self.security_model,
+            security_level: self.security_level,
+            context_match: self.context_match,
+            read_view: self.read_view,
+            write_view: self.write_view,
+            notify_view: self.notify_view,
+        }
+    }
+}
+
+/// VACM configuration.
+#[derive(Debug, Clone, Default)]
+pub struct VacmConfig {
+    /// (securityModel, securityName) → groupName
+    security_to_group: HashMap<(SecurityModel, Bytes), Bytes>,
+    /// Access table entries.
+    access_entries: Vec<VacmAccessEntry>,
+    /// viewName → View
+    views: HashMap<Bytes, View>,
+}
+
+impl VacmConfig {
+    /// Create a new empty VACM configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Map a security name to a group for a specific security model.
+    pub fn add_group(
+        &mut self,
+        security_name: impl Into<Bytes>,
+        security_model: SecurityModel,
+        group_name: impl Into<Bytes>,
+    ) {
+        self.security_to_group
+            .insert((security_model, security_name.into()), group_name.into());
+    }
+
+    /// Add an access entry.
+    pub fn add_access(&mut self, entry: VacmAccessEntry) {
+        self.access_entries.push(entry);
+    }
+
+    /// Add a view.
+    pub fn add_view(&mut self, name: impl Into<Bytes>, view: View) {
+        self.views.insert(name.into(), view);
+    }
+
+    /// Resolve group name for a request.
+    pub fn get_group(&self, model: SecurityModel, name: &[u8]) -> Option<&Bytes> {
+        let name_bytes = Bytes::copy_from_slice(name);
+        // Try exact match first
+        self.security_to_group
+            .get(&(model, name_bytes.clone()))
+            // Fall back to Any security model
+            .or_else(|| {
+                self.security_to_group
+                    .get(&(SecurityModel::Any, name_bytes))
+            })
+    }
+
+    /// Get access entry for context.
+    ///
+    /// Returns the best matching entry per RFC 3415 Section 4:
+    /// - Prefer specific security model over Any
+    /// - Prefer longer context prefix
+    pub fn get_access(
+        &self,
+        group: &[u8],
+        context: &[u8],
+        model: SecurityModel,
+        level: SecurityLevel,
+    ) -> Option<&VacmAccessEntry> {
+        // Find best matching entry
+        self.access_entries
+            .iter()
+            .filter(|e| {
+                e.group_name.as_ref() == group
+                    && self.context_matches(&e.context_prefix, context, e.context_match)
+                    && (e.security_model == model || e.security_model == SecurityModel::Any)
+                    && level >= e.security_level
+            })
+            .max_by_key(|e| {
+                // Prefer specific matches
+                let model_score = if e.security_model == model { 2 } else { 1 };
+                let context_score = e.context_prefix.len();
+                (model_score, context_score)
+            })
+    }
+
+    /// Check if context matches the prefix.
+    fn context_matches(&self, prefix: &[u8], context: &[u8], mode: ContextMatch) -> bool {
+        match mode {
+            ContextMatch::Exact => prefix == context,
+            ContextMatch::Prefix => context.starts_with(prefix),
+        }
+    }
+
+    /// Check if OID access is permitted.
+    pub fn check_access(&self, view_name: Option<&Bytes>, oid: &Oid) -> bool {
+        let Some(view_name) = view_name else {
+            return false;
+        };
+
+        if view_name.is_empty() {
+            return false;
+        }
+
+        let Some(view) = self.views.get(view_name) else {
+            return false;
+        };
+
+        view.contains(oid)
+    }
+}
+
+/// Builder for VACM configuration.
+pub struct VacmBuilder {
+    config: VacmConfig,
+}
+
+impl VacmBuilder {
+    /// Create a new VACM builder.
+    pub fn new() -> Self {
+        Self {
+            config: VacmConfig::new(),
+        }
+    }
+
+    /// Map a security name to a group.
+    pub fn group(
+        mut self,
+        security_name: impl Into<Bytes>,
+        security_model: SecurityModel,
+        group_name: impl Into<Bytes>,
+    ) -> Self {
+        self.config
+            .add_group(security_name, security_model, group_name);
+        self
+    }
+
+    /// Add an access entry using a builder function.
+    pub fn access<F>(mut self, group_name: impl Into<Bytes>, configure: F) -> Self
+    where
+        F: FnOnce(AccessEntryBuilder) -> AccessEntryBuilder,
+    {
+        let builder = AccessEntryBuilder::new(group_name);
+        let entry = configure(builder).build();
+        self.config.add_access(entry);
+        self
+    }
+
+    /// Add a view using a builder function.
+    pub fn view<F>(mut self, name: impl Into<Bytes>, configure: F) -> Self
+    where
+        F: FnOnce(View) -> View,
+    {
+        let view = configure(View::new());
+        self.config.add_view(name, view);
+        self
+    }
+
+    /// Build the VACM configuration.
+    pub fn build(self) -> VacmConfig {
+        self.config
+    }
+}
+
+impl Default for VacmBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oid;
+
+    #[test]
+    fn test_view_contains_simple() {
+        let view = View::new().include(oid!(1, 3, 6, 1, 2, 1)); // system MIB
+
+        // OID within the subtree
+        assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
+        assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 2, 1, 1)));
+
+        // OID exactly at subtree
+        assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1)));
+
+        // OID outside the subtree
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 4, 1)));
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 2)));
+    }
+
+    #[test]
+    fn test_view_exclude() {
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1)) // system MIB
+            .exclude(oid!(1, 3, 6, 1, 2, 1, 1, 7)); // sysServices
+
+        // Included OIDs
+        assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
+        assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)));
+
+        // Excluded OID
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 7)));
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 7, 0)));
+    }
+
+    #[test]
+    fn test_view_subtree_mask() {
+        // Create a view that matches ifDescr.* (any interface index)
+        // The subtree OID is ifDescr (1.3.6.1.2.1.2.2.1.2) with 10 arcs (indices 0-9)
+        // We want arcs 0-9 to match exactly, and arc 10+ to be wildcard
+        // Mask: 0xFF = 11111111 (arcs 0-7 must match)
+        //       0xC0 = 11000000 (arcs 8-9 must match, 10-15 wildcard)
+        let subtree = ViewSubtree {
+            oid: oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2), // ifDescr
+            mask: vec![0xFF, 0xC0],                  // 11111111 11000000 - arcs 0-9 must match
+            included: true,
+        };
+
+        // Should match with any interface index in position 10
+        assert!(subtree.matches(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1)));
+        assert!(subtree.matches(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 999)));
+
+        // Should not match if arc 9 differs (the "2" in ifDescr)
+        assert!(!subtree.matches(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 1)));
+    }
+
+    #[test]
+    fn test_vacm_group_lookup() {
+        let mut config = VacmConfig::new();
+        config.add_group("public", SecurityModel::V2c, "readonly_group");
+        config.add_group("admin", SecurityModel::Usm, "admin_group");
+
+        assert_eq!(
+            config.get_group(SecurityModel::V2c, b"public"),
+            Some(&Bytes::from_static(b"readonly_group"))
+        );
+        assert_eq!(
+            config.get_group(SecurityModel::Usm, b"admin"),
+            Some(&Bytes::from_static(b"admin_group"))
+        );
+        assert_eq!(config.get_group(SecurityModel::V1, b"public"), None);
+    }
+
+    #[test]
+    fn test_vacm_group_any_model() {
+        let mut config = VacmConfig::new();
+        config.add_group("universal", SecurityModel::Any, "universal_group");
+
+        // Should match any security model
+        assert_eq!(
+            config.get_group(SecurityModel::V1, b"universal"),
+            Some(&Bytes::from_static(b"universal_group"))
+        );
+        assert_eq!(
+            config.get_group(SecurityModel::V2c, b"universal"),
+            Some(&Bytes::from_static(b"universal_group"))
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_lookup() {
+        let mut config = VacmConfig::new();
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"readonly_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"full_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        let access = config.get_access(
+            b"readonly_group",
+            b"",
+            SecurityModel::V2c,
+            SecurityLevel::NoAuthNoPriv,
+        );
+        assert!(access.is_some());
+        assert_eq!(access.unwrap().read_view, Bytes::from_static(b"full_view"));
+    }
+
+    #[test]
+    fn test_vacm_access_security_level() {
+        let mut config = VacmConfig::new();
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"admin_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Usm,
+            security_level: SecurityLevel::AuthPriv, // Require encryption
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"full_view"),
+            write_view: Bytes::from_static(b"full_view"),
+            notify_view: Bytes::new(),
+        });
+
+        // Should not match with lower security level
+        let access = config.get_access(
+            b"admin_group",
+            b"",
+            SecurityModel::Usm,
+            SecurityLevel::AuthNoPriv,
+        );
+        assert!(access.is_none());
+
+        // Should match with required level
+        let access = config.get_access(
+            b"admin_group",
+            b"",
+            SecurityModel::Usm,
+            SecurityLevel::AuthPriv,
+        );
+        assert!(access.is_some());
+    }
+
+    #[test]
+    fn test_vacm_check_access() {
+        let mut config = VacmConfig::new();
+        config.add_view("full_view", View::new().include(oid!(1, 3, 6, 1)));
+
+        assert!(config.check_access(
+            Some(&Bytes::from_static(b"full_view")),
+            &oid!(1, 3, 6, 1, 2, 1, 1, 0),
+        ));
+
+        // Empty view name = no access
+        assert!(!config.check_access(Some(&Bytes::new()), &oid!(1, 3, 6, 1, 2, 1, 1, 0),));
+
+        // None = no access
+        assert!(!config.check_access(None, &oid!(1, 3, 6, 1, 2, 1, 1, 0),));
+
+        // Unknown view = no access
+        assert!(!config.check_access(
+            Some(&Bytes::from_static(b"unknown_view")),
+            &oid!(1, 3, 6, 1, 2, 1, 1, 0),
+        ));
+    }
+
+    #[test]
+    fn test_vacm_builder() {
+        let config = VacmBuilder::new()
+            .group("public", SecurityModel::V2c, "readonly_group")
+            .group("admin", SecurityModel::Usm, "admin_group")
+            .access("readonly_group", |a| {
+                a.context_prefix("")
+                    .security_model(SecurityModel::Any)
+                    .security_level(SecurityLevel::NoAuthNoPriv)
+                    .read_view("full_view")
+            })
+            .access("admin_group", |a| {
+                a.security_model(SecurityModel::Usm)
+                    .security_level(SecurityLevel::AuthPriv)
+                    .read_view("full_view")
+                    .write_view("full_view")
+            })
+            .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
+            .build();
+
+        assert!(config.get_group(SecurityModel::V2c, b"public").is_some());
+        assert!(config.get_group(SecurityModel::Usm, b"admin").is_some());
+    }
+}
