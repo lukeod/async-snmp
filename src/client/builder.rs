@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::client::walk::{OidOrdering, WalkMode};
-use crate::client::{Auth, CommunityVersion, ClientConfig, V3SecurityConfig};
+use crate::client::{Auth, ClientConfig, CommunityVersion, V3SecurityConfig};
 use crate::error::Error;
 use crate::transport::{TcpTransport, Transport, UdpTransport};
 use crate::v3::EngineCache;
@@ -199,7 +199,10 @@ impl ClientBuilder {
         }
 
         // Validate walk mode for v1
-        if let Auth::Community { version: CommunityVersion::V1, .. } = &self.auth
+        if let Auth::Community {
+            version: CommunityVersion::V1,
+            ..
+        } = &self.auth
             && self.walk_mode == WalkMode::GetBulk
         {
             return Err(Error::Config("GETBULK not supported in SNMPv1".into()));
@@ -248,13 +251,16 @@ impl ClientBuilder {
                 }
             }
             Auth::Usm(usm) => {
-                let mut security = V3SecurityConfig::new(Bytes::copy_from_slice(usm.username.as_bytes()));
+                let mut security =
+                    V3SecurityConfig::new(Bytes::copy_from_slice(usm.username.as_bytes()));
 
-                if let (Some(auth_proto), Some(auth_pass)) = (usm.auth_protocol, &usm.auth_password) {
+                if let (Some(auth_proto), Some(auth_pass)) = (usm.auth_protocol, &usm.auth_password)
+                {
                     security = security.auth(auth_proto, auth_pass.as_bytes().to_vec());
                 }
 
-                if let (Some(priv_proto), Some(priv_pass)) = (usm.priv_protocol, &usm.priv_password) {
+                if let (Some(priv_proto), Some(priv_pass)) = (usm.priv_protocol, &usm.priv_password)
+                {
                     security = security.privacy(priv_proto, priv_pass.as_bytes().to_vec());
                 }
 
@@ -410,7 +416,9 @@ mod tests {
         };
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         let err = builder.validate().unwrap_err();
-        assert!(matches!(err, Error::Config(msg) if msg.contains("privacy requires authentication")));
+        assert!(
+            matches!(err, Error::Config(msg) if msg.contains("privacy requires authentication"))
+        );
     }
 
     #[test]
@@ -426,7 +434,9 @@ mod tests {
         };
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         let err = builder.validate().unwrap_err();
-        assert!(matches!(err, Error::Config(msg) if msg.contains("auth protocol requires password")));
+        assert!(
+            matches!(err, Error::Config(msg) if msg.contains("auth protocol requires password"))
+        );
     }
 
     #[test]
@@ -442,7 +452,9 @@ mod tests {
         };
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         let err = builder.validate().unwrap_err();
-        assert!(matches!(err, Error::Config(msg) if msg.contains("priv protocol requires password")));
+        assert!(
+            matches!(err, Error::Config(msg) if msg.contains("priv protocol requires password"))
+        );
     }
 
     #[test]

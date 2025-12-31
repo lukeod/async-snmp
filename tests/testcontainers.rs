@@ -594,15 +594,17 @@ async fn create_v3_client() -> Client {
     let info = get_v3_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    Client::builder(&target,
+    Client::builder(
+        &target,
         Auth::usm(users::PRIVAES128_USER)
             .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 authPriv AES")
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 authPriv AES")
 }
 
 #[tokio::test]
@@ -678,32 +680,36 @@ async fn test_v3_shared_engine_cache() {
     let cache = Arc::new(EngineCache::new());
 
     // First client - will perform discovery
-    let client1 = Client::builder(&target,
+    let client1 = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES128_USER)
             .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
-        .engine_cache(cache.clone())
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect client 1");
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD),
+    )
+    .engine_cache(cache.clone())
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect client 1");
 
     let result1 = client1.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
     assert!(result1.is_ok(), "Client 1 GET failed: {:?}", result1);
     println!("Client 1 (with discovery): {:?}", result1.unwrap().value);
 
     // Second client - should use cached engine state
-    let client2 = Client::builder(&target,
+    let client2 = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES128_USER)
             .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
-        .engine_cache(cache.clone())
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect client 2");
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD),
+    )
+    .engine_cache(cache.clone())
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect client 2");
 
     let result2 = client2.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await;
     assert!(result2.is_ok(), "Client 2 GET failed: {:?}", result2);
@@ -727,14 +733,16 @@ async fn test_v3_wrong_auth_password() {
     let target = format!("{}:{}", info.host, info.port);
 
     // Use wrong auth password - should fail
-    let result = Client::builder(&target,
+    let result = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES128_USER)
             .auth(AuthProtocol::Sha1, "wrongpassword123")
-            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(3))
-        .retries(0) // Don't retry on auth failure
-        .connect()
-        .await;
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(3))
+    .retries(0) // Don't retry on auth failure
+    .connect()
+    .await;
 
     match result {
         Ok(client) => {
@@ -778,14 +786,16 @@ async fn test_v3_wrong_priv_password() {
     let target = format!("{}:{}", info.host, info.port);
 
     // Use correct auth but wrong priv password - should fail
-    let result = Client::builder(&target,
+    let result = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES128_USER)
             .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes128, "wrongprivpass99"))
-        .timeout(Duration::from_secs(3))
-        .retries(0)
-        .connect()
-        .await;
+            .privacy(PrivProtocol::Aes128, "wrongprivpass99"),
+    )
+    .timeout(Duration::from_secs(3))
+    .retries(0)
+    .connect()
+    .await;
 
     match result {
         Ok(client) => {
@@ -826,14 +836,16 @@ async fn test_v3_unknown_user() {
     let target = format!("{}:{}", info.host, info.port);
 
     // Use non-existent username
-    let result = Client::builder(&target,
+    let result = Client::builder(
+        &target,
         Auth::usm("nonexistentuser")
             .auth(AuthProtocol::Sha1, "somepassword123")
-            .privacy(PrivProtocol::Aes128, "somepassword123"))
-        .timeout(Duration::from_secs(3))
-        .retries(0)
-        .connect()
-        .await;
+            .privacy(PrivProtocol::Aes128, "somepassword123"),
+    )
+    .timeout(Duration::from_secs(3))
+    .retries(0)
+    .connect()
+    .await;
 
     match result {
         Ok(client) => {
@@ -865,14 +877,16 @@ async fn test_v3_wrong_auth_protocol() {
     let target = format!("{}:{}", info.host, info.port);
 
     // privaes128_user is configured with SHA-1, try with MD5
-    let result = Client::builder(&target,
+    let result = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES128_USER)
             .auth(AuthProtocol::Md5, AUTH_PASSWORD) // Wrong protocol
-            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(3))
-        .retries(0)
-        .connect()
-        .await;
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(3))
+    .retries(0)
+    .connect()
+    .await;
 
     match result {
         Ok(client) => {
@@ -901,12 +915,15 @@ async fn create_set_client() -> Client {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    Client::builder(&target, Auth::v2c(std::str::from_utf8(COMMUNITY_RW).unwrap()))
-        .timeout(Duration::from_secs(5))
-        .retries(2)
-        .connect()
-        .await
-        .expect("Failed to connect to SNMP agent for SET tests")
+    Client::builder(
+        &target,
+        Auth::v2c(std::str::from_utf8(COMMUNITY_RW).unwrap()),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(2)
+    .connect()
+    .await
+    .expect("Failed to connect to SNMP agent for SET tests")
 }
 
 #[tokio::test]
@@ -1134,7 +1151,7 @@ async fn test_getbulk_mixed_non_repeaters_and_repeaters() {
         println!("  {}: {:?}", vb.oid, vb.value);
     }
     // Should return 1 non-repeater + up to 3 repetitions = up to 4 varbinds
-    assert!(results.len() >= 1, "Expected at least 1 varbind");
+    assert!(!results.is_empty(), "Expected at least 1 varbind");
     assert!(
         results.len() <= 4,
         "Expected at most 4 varbinds, got {}",
@@ -1238,14 +1255,15 @@ async fn test_v3_auth_sha224() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::builder(&target,
-        Auth::usm(users::AUTHSHA224_USER)
-            .auth(AuthProtocol::Sha224, AUTH_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 SHA-224");
+    let client = Client::builder(
+        &target,
+        Auth::usm(users::AUTHSHA224_USER).auth(AuthProtocol::Sha224, AUTH_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 SHA-224");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1265,14 +1283,15 @@ async fn test_v3_auth_sha256() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::builder(&target,
-        Auth::usm(users::AUTHSHA256_USER)
-            .auth(AuthProtocol::Sha256, AUTH_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 SHA-256");
+    let client = Client::builder(
+        &target,
+        Auth::usm(users::AUTHSHA256_USER).auth(AuthProtocol::Sha256, AUTH_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 SHA-256");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1292,14 +1311,15 @@ async fn test_v3_auth_sha384() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::builder(&target,
-        Auth::usm(users::AUTHSHA384_USER)
-            .auth(AuthProtocol::Sha384, AUTH_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 SHA-384");
+    let client = Client::builder(
+        &target,
+        Auth::usm(users::AUTHSHA384_USER).auth(AuthProtocol::Sha384, AUTH_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 SHA-384");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1319,14 +1339,15 @@ async fn test_v3_auth_sha512() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::builder(&target,
-        Auth::usm(users::AUTHSHA512_USER)
-            .auth(AuthProtocol::Sha512, AUTH_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 SHA-512");
+    let client = Client::builder(
+        &target,
+        Auth::usm(users::AUTHSHA512_USER).auth(AuthProtocol::Sha512, AUTH_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 SHA-512");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1346,14 +1367,15 @@ async fn test_v3_auth_md5() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::builder(&target,
-        Auth::usm(users::AUTHMD5_USER)
-            .auth(AuthProtocol::Md5, AUTH_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 MD5");
+    let client = Client::builder(
+        &target,
+        Auth::usm(users::AUTHMD5_USER).auth(AuthProtocol::Md5, AUTH_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 MD5");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1378,15 +1400,17 @@ async fn test_v3_priv_aes192() {
     let target = format!("{}:{}", info.host, info.port);
 
     // AES-192 user uses SHA-256 auth per container config
-    let client = Client::builder(&target,
+    let client = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES192_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes192, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 AES-192");
+            .privacy(PrivProtocol::Aes192, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 AES-192");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1407,15 +1431,17 @@ async fn test_v3_priv_aes256() {
     let target = format!("{}:{}", info.host, info.port);
 
     // AES-256 user uses SHA-256 auth per container config
-    let client = Client::builder(&target,
+    let client = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES256_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes256, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 AES-256");
+            .privacy(PrivProtocol::Aes256, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 AES-256");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1436,15 +1462,17 @@ async fn test_v3_priv_des() {
     let target = format!("{}:{}", info.host, info.port);
 
     // DES user uses SHA-1 auth per container config
-    let client = Client::builder(&target,
+    let client = Client::builder(
+        &target,
         Auth::usm(users::PRIVDES_USER)
             .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Des, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 DES");
+            .privacy(PrivProtocol::Des, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 DES");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
@@ -1464,15 +1492,17 @@ async fn test_v3_priv_aes192_walk() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::builder(&target,
+    let client = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES192_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes192, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 AES-192");
+            .privacy(PrivProtocol::Aes192, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 AES-192");
 
     let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1));
     let mut pinned = Box::pin(walk);
@@ -1494,15 +1524,17 @@ async fn test_v3_priv_aes256_walk() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::builder(&target,
+    let client = Client::builder(
+        &target,
         Auth::usm(users::PRIVAES256_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes256, PRIV_PASSWORD))
-        .timeout(Duration::from_secs(5))
-        .retries(1)
-        .connect()
-        .await
-        .expect("Failed to connect V3 AES-256");
+            .privacy(PrivProtocol::Aes256, PRIV_PASSWORD),
+    )
+    .timeout(Duration::from_secs(5))
+    .retries(1)
+    .connect()
+    .await
+    .expect("Failed to connect V3 AES-256");
 
     let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1));
     let mut pinned = Box::pin(walk);

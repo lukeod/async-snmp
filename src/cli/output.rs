@@ -398,8 +398,7 @@ impl OutputContext {
     }
 
     fn write_json<W: Write>(&self, w: &mut W, result: &OperationResult) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(result)
-            .map_err(io::Error::other)?;
+        let json = serde_json::to_string_pretty(result).map_err(io::Error::other)?;
         writeln!(w, "{}", json)
     }
 

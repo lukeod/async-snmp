@@ -5,7 +5,6 @@
 //!
 //! Run with: `cargo test --test client_mock`
 
-#[allow(dead_code)]
 mod common;
 
 use async_snmp::{
@@ -1776,7 +1775,7 @@ async fn test_v1_opaque_value() {
         .unwrap();
 
     assert!(
-        matches!(result.value, Value::Opaque(ref data) if data.as_ref() == &[0xDE, 0xAD, 0xBE, 0xEF])
+        matches!(result.value, Value::Opaque(ref data) if data.as_ref() == [0xDE, 0xAD, 0xBE, 0xEF])
     );
 }
 

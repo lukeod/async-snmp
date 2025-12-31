@@ -141,7 +141,9 @@ async fn run_get(
     args: &Args,
     oids: &[Oid],
 ) -> async_snmp::Result<Vec<async_snmp::VarBind>> {
-    let auth = args.v3.auth(&args.common)
+    let auth = args
+        .v3
+        .auth(&args.common)
         .map_err(|e| async_snmp::Error::Config(e.to_string()))?;
 
     let client = Client::builder(target.to_string(), auth)

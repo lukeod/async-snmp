@@ -913,7 +913,7 @@ mod tests {
                 ResponseBuilder::new(i)
                     .varbind(
                         Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, i as u32, 0]),
-                        Value::Integer(i as i32),
+                        Value::Integer(i),
                     )
                     .build_v2c(b"public"),
             );

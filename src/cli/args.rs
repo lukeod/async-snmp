@@ -6,9 +6,9 @@ use clap::{Parser, ValueEnum};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::Version;
 use crate::client::Auth;
 use crate::v3::{AuthProtocol, PrivProtocol};
-use crate::Version;
 
 /// SNMP version for CLI argument parsing.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -143,12 +143,16 @@ impl V3Args {
         if let Some(ref username) = self.username {
             let mut builder = Auth::usm(username);
             if let Some(proto) = self.auth_protocol {
-                let pass = self.auth_password.as_ref()
+                let pass = self
+                    .auth_password
+                    .as_ref()
                     .ok_or("auth password required")?;
                 builder = builder.auth(proto, pass);
             }
             if let Some(proto) = self.priv_protocol {
-                let pass = self.priv_password.as_ref()
+                let pass = self
+                    .priv_password
+                    .as_ref()
                     .ok_or("priv password required")?;
                 builder = builder.privacy(proto, pass);
             }

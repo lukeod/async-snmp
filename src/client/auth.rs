@@ -69,20 +69,35 @@ pub struct UsmAuth {
     /// SNMPv3 username
     pub username: String,
     /// Authentication protocol (None for noAuthNoPriv)
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub auth_protocol: Option<AuthProtocol>,
     /// Authentication password
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub auth_password: Option<String>,
     /// Privacy protocol (None for noPriv)
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub priv_protocol: Option<PrivProtocol>,
     /// Privacy password
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub priv_password: Option<String>,
     /// SNMPv3 context name for VACM context selection.
     /// Most deployments use empty string (default).
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub context_name: Option<String>,
 }
 

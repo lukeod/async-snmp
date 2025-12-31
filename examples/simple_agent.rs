@@ -119,12 +119,12 @@ impl MibHandler for SystemHandler {
         value: &'a Value,
     ) -> BoxFuture<'a, SetResult> {
         Box::pin(async move {
-            if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-                if let Value::Integer(v) = value {
-                    self.counter.store(*v, Ordering::Relaxed);
-                    println!("Counter set to: {}", v);
-                    return SetResult::Ok;
-                }
+            if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)
+                && let Value::Integer(v) = value
+            {
+                self.counter.store(*v, Ordering::Relaxed);
+                println!("Counter set to: {}", v);
+                return SetResult::Ok;
             }
             SetResult::CommitFailed
         })
