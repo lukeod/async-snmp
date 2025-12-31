@@ -24,4 +24,3 @@ target
 /docs
 /fuzz/target
 /tests/vendor/
-CLAUDE.md
