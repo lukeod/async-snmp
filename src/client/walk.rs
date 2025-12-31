@@ -13,6 +13,7 @@ use crate::oid::Oid;
 use crate::transport::Transport;
 use crate::value::Value;
 use crate::varbind::VarBind;
+use crate::version::Version;
 
 use super::Client;
 
@@ -370,6 +371,88 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
     }
 }
 
+// ============================================================================
+// Unified WalkStream - auto-selects GETNEXT or GETBULK based on WalkMode
+// ============================================================================
+
+/// Unified walk stream that auto-selects between GETNEXT and GETBULK.
+///
+/// Created by [`Client::walk()`] when using `WalkMode::Auto` or explicit mode selection.
+/// This type wraps either a [`Walk`] or [`BulkWalk`] internally based on:
+/// - `WalkMode::Auto`: Uses GETNEXT for V1, GETBULK for V2c/V3
+/// - `WalkMode::GetNext`: Always uses GETNEXT
+/// - `WalkMode::GetBulk`: Always uses GETBULK (fails on V1)
+pub enum WalkStream<T: Transport> {
+    /// GETNEXT-based walk (used for V1 or when explicitly requested)
+    GetNext(Walk<T>),
+    /// GETBULK-based walk (used for V2c/V3 or when explicitly requested)
+    GetBulk(BulkWalk<T>),
+}
+
+impl<T: Transport> WalkStream<T> {
+    /// Create a new walk stream with auto-selection based on version and walk mode.
+    pub(crate) fn new(
+        client: Client<T>,
+        oid: Oid,
+        version: Version,
+        walk_mode: WalkMode,
+        ordering: OidOrdering,
+        max_results: Option<usize>,
+        max_repetitions: i32,
+    ) -> Result<Self> {
+        let use_bulk = match walk_mode {
+            WalkMode::Auto => version != Version::V1,
+            WalkMode::GetNext => false,
+            WalkMode::GetBulk => {
+                if version == Version::V1 {
+                    return Err(Error::GetBulkNotSupportedInV1);
+                }
+                true
+            }
+        };
+
+        Ok(if use_bulk {
+            WalkStream::GetBulk(BulkWalk::new(
+                client,
+                oid,
+                max_repetitions,
+                ordering,
+                max_results,
+            ))
+        } else {
+            WalkStream::GetNext(Walk::new(client, oid, ordering, max_results))
+        })
+    }
+}
+
+impl<T: Transport + 'static> WalkStream<T> {
+    /// Get the next varbind, or None when complete.
+    pub async fn next(&mut self) -> Option<Result<VarBind>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+
+    /// Collect all remaining varbinds.
+    pub async fn collect(mut self) -> Result<Vec<VarBind>> {
+        let mut results = Vec::new();
+        while let Some(result) = self.next().await {
+            results.push(result?);
+        }
+        Ok(results)
+    }
+}
+
+impl<T: Transport + 'static> Stream for WalkStream<T> {
+    type Item = Result<VarBind>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // SAFETY: We're just projecting the pin to the inner enum variant
+        match self.get_mut() {
+            WalkStream::GetNext(walk) => Pin::new(walk).poll_next(cx),
+            WalkStream::GetBulk(bulk_walk) => Pin::new(bulk_walk).poll_next(cx),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,7 +539,7 @@ mod tests {
         );
 
         let client = mock_client(mock);
-        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+        let walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
 
         let mut pinned = Box::pin(walk);
         let results = collect_walk(pinned.as_mut(), 10).await;
@@ -480,7 +563,7 @@ mod tests {
         );
 
         let client = mock_client(mock);
-        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1])); // system subtree
+        let walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1])); // system subtree
 
         let mut pinned = Box::pin(walk);
         let results = collect_walk(pinned.as_mut(), 10).await;
@@ -529,7 +612,7 @@ mod tests {
         );
 
         let client = mock_client(mock);
-        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+        let walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
 
         let mut pinned = Box::pin(walk);
         let results = collect_walk(pinned.as_mut(), 10).await;
@@ -565,7 +648,7 @@ mod tests {
         mock.queue_timeout();
 
         let client = mock_client(mock);
-        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+        let walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
 
         let mut pinned = Box::pin(walk);
         let results = collect_walk(pinned.as_mut(), 10).await;
@@ -687,7 +770,7 @@ mod tests {
         );
 
         let client = mock_client(mock);
-        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+        let walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
 
         let mut pinned = Box::pin(walk);
         let results = collect_walk(pinned.as_mut(), 10).await;
@@ -730,7 +813,7 @@ mod tests {
         );
 
         let client = mock_client(mock);
-        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+        let walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
 
         let mut pinned = Box::pin(walk);
         let results = collect_walk(pinned.as_mut(), 10).await;
@@ -1014,7 +1097,7 @@ mod tests {
         );
 
         let client = mock_client(mock);
-        let mut walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+        let mut walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
 
         // Use inherent next() method
         let first = walk.next().await;
@@ -1059,7 +1142,7 @@ mod tests {
         );
 
         let client = mock_client(mock);
-        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+        let walk = client.walk_getnext(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
 
         // Use inherent collect() method
         let results = walk.collect().await.unwrap();

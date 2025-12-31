@@ -484,6 +484,13 @@ pub enum Error {
     #[error("walk cycle detected: OID {oid} returned twice")]
     DuplicateOid { oid: crate::oid::Oid },
 
+    /// GETBULK not supported in SNMPv1.
+    ///
+    /// Returned when `WalkMode::GetBulk` is explicitly requested with an SNMPv1 client.
+    /// GETBULK is only available in SNMPv2c and SNMPv3.
+    #[error("GETBULK is not supported in SNMPv1")]
+    GetBulkNotSupportedInV1,
+
     /// Configuration error.
     ///
     /// Returned when client configuration is invalid (e.g., privacy

@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use tracing::{Span, instrument};
 
 pub use v3::{V3DerivedKeys, V3SecurityConfig};
-pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode};
+pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 
 /// SNMP client.
 ///
@@ -645,7 +645,57 @@ impl<T: Transport> Client<T> {
         Ok(response.varbinds)
     }
 
+    /// Walk an OID subtree.
+    ///
+    /// Auto-selects the optimal walk method based on SNMP version and `WalkMode`:
+    /// - `WalkMode::Auto` (default): Uses GETNEXT for V1, GETBULK for V2c/V3
+    /// - `WalkMode::GetNext`: Always uses GETNEXT
+    /// - `WalkMode::GetBulk`: Always uses GETBULK (fails on V1)
+    ///
+    /// Returns an async stream that yields each variable binding in the subtree.
+    /// The walk terminates when an OID outside the subtree is encountered or
+    /// when `EndOfMibView` is returned.
+    ///
+    /// Uses the client's configured `oid_ordering`, `max_walk_results`, and
+    /// `max_repetitions` (for GETBULK) settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use async_snmp::{Auth, Client, oid};
+    /// # async fn example() -> async_snmp::Result<()> {
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
+    /// // Auto-selects GETBULK for V2c/V3, GETNEXT for V1
+    /// let results = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?.collect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
+    pub fn walk(&self, oid: Oid) -> Result<WalkStream<T>>
+    where
+        T: 'static,
+    {
+        let ordering = self.inner.config.oid_ordering;
+        let max_results = self.inner.config.max_walk_results;
+        let walk_mode = self.inner.config.walk_mode;
+        let max_repetitions = self.inner.config.max_repetitions as i32;
+        let version = self.inner.config.version;
+
+        WalkStream::new(
+            self.clone(),
+            oid,
+            version,
+            walk_mode,
+            ordering,
+            max_results,
+            max_repetitions,
+        )
+    }
+
     /// Walk an OID subtree using GETNEXT.
+    ///
+    /// This method always uses GETNEXT regardless of the client's `WalkMode` configuration.
+    /// For auto-selection based on version and mode, use [`walk()`](Self::walk) instead.
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
     /// The walk terminates when an OID outside the subtree is encountered or
@@ -659,13 +709,13 @@ impl<T: Transport> Client<T> {
     /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
     /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
-    /// let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1));
-    /// // Use tokio_stream::StreamExt or futures::StreamExt for iteration
+    /// // Force GETNEXT even for V2c/V3 clients
+    /// let results = client.walk_getnext(oid!(1, 3, 6, 1, 2, 1, 1)).collect().await?;
     /// # Ok(())
     /// # }
     /// ```
     #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
-    pub fn walk(&self, oid: Oid) -> Walk<T>
+    pub fn walk_getnext(&self, oid: Oid) -> Walk<T>
     where
         T: 'static,
     {

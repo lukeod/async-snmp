@@ -81,7 +81,7 @@ pub mod cli;
 pub use agent::{Agent, AgentBuilder, VacmBuilder, VacmConfig, View};
 pub use client::{
     Auth, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion, OidOrdering, UsmAuth,
-    UsmBuilder, V3SecurityConfig, Walk, WalkMode,
+    UsmBuilder, V3SecurityConfig, Walk, WalkMode, WalkStream,
 };
 pub use error::{
     AuthErrorKind, CryptoErrorKind, DecodeErrorKind, EncodeErrorKind, Error, ErrorStatus,
