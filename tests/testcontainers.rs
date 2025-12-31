@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use async_snmp::{Auth, Client, SharedUdpTransport, Value, oid};
+use async_snmp::{Auth, Client, SharedUdpTransport, Transport, Value, oid};
 use common::{AUTH_PASSWORD, COMMUNITY_RW, PRIV_PASSWORD, parse_image, snmpd_image, users};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -562,6 +562,251 @@ async fn test_shared_transport_walk() {
         "Expected at least 5 system OIDs, got {}",
         results.len()
     );
+}
+
+/// Test that SharedUdpTransport uses a single socket for all handles.
+///
+/// This verifies the FD efficiency benefit: N clients share 1 socket instead of N sockets.
+/// We verify this by checking that all handles report the same local address.
+#[tokio::test]
+async fn test_shared_transport_fd_efficiency() {
+    require_container_runtime!();
+
+    let info = get_v2c_container().await;
+    let target: SocketAddr = format!("127.0.0.1:{}", info.port).parse().unwrap();
+
+    let shared = SharedUdpTransport::builder()
+        .bind("0.0.0.0:0")
+        .build()
+        .await
+        .expect("Failed to bind shared transport");
+
+    let local_addr = shared.local_addr();
+    println!("Shared transport bound to: {}", local_addr);
+
+    // Create 50 handles - all should share the same socket
+    let handles: Vec<_> = (0..50).map(|_| shared.handle(target)).collect();
+
+    // Verify all handles report the same local address (same underlying socket)
+    for (i, handle) in handles.iter().enumerate() {
+        assert_eq!(
+            handle.local_addr(),
+            local_addr,
+            "Handle {} has different local_addr - socket not shared!",
+            i
+        );
+    }
+
+    // Create clients and verify they work
+    let clients: Vec<_> = handles
+        .into_iter()
+        .map(|h| {
+            Client::builder(target.to_string(), Auth::v2c("public"))
+                .timeout(Duration::from_secs(5))
+                .build(h)
+                .expect("Failed to build client")
+        })
+        .collect();
+
+    // Spot check a few clients still work
+    for (i, client) in clients.iter().take(3).enumerate() {
+        let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
+        assert!(result.is_ok(), "Client {} GET failed: {:?}", i, result);
+    }
+
+    println!(
+        "FD efficiency verified: {} clients sharing 1 socket at {}",
+        clients.len(),
+        local_addr
+    );
+}
+
+/// Test concurrent request correctness with SharedUdpTransport.
+///
+/// Fires many concurrent requests through a shared transport and verifies
+/// that request-ID correlation correctly routes responses to the right callers.
+/// Even if throughput is limited by the single-threaded net-snmp agent,
+/// this validates the correctness of the correlation mechanism.
+#[tokio::test]
+async fn test_shared_transport_concurrent_correctness() {
+    require_container_runtime!();
+
+    let info = get_v2c_container().await;
+    let target: SocketAddr = format!("127.0.0.1:{}", info.port).parse().unwrap();
+
+    let shared = SharedUdpTransport::builder()
+        .bind("0.0.0.0:0")
+        .build()
+        .await
+        .expect("Failed to bind shared transport");
+
+    // Create 20 clients sharing the transport
+    let clients: Vec<_> = (0..20)
+        .map(|_| {
+            Client::builder(target.to_string(), Auth::v2c("public"))
+                .timeout(Duration::from_secs(10))
+                .build(shared.handle(target))
+                .expect("Failed to build client")
+        })
+        .collect();
+
+    // Fire concurrent GET requests - each should get a valid response
+    let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0); // sysDescr
+    let futures: Vec<_> = clients.iter().map(|c| c.get(&oid)).collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    let mut success_count = 0;
+    for (i, result) in results.iter().enumerate() {
+        match result {
+            Ok(vb) => {
+                assert!(
+                    matches!(vb.value, Value::OctetString(_)),
+                    "Client {} got unexpected value type: {:?}",
+                    i,
+                    vb.value
+                );
+                success_count += 1;
+            }
+            Err(e) => {
+                panic!("Client {} failed: {}", i, e);
+            }
+        }
+    }
+
+    println!(
+        "Concurrent correctness: {}/{} requests succeeded",
+        success_count,
+        clients.len()
+    );
+    assert_eq!(success_count, clients.len());
+}
+
+/// Test that SharedUdpTransport handles high concurrency with different OIDs.
+///
+/// Each client requests a different OID to ensure responses are correctly
+/// correlated even when the response content differs.
+#[tokio::test]
+async fn test_shared_transport_concurrent_different_oids() {
+    require_container_runtime!();
+
+    let info = get_v2c_container().await;
+    let target: SocketAddr = format!("127.0.0.1:{}", info.port).parse().unwrap();
+
+    let shared = SharedUdpTransport::builder()
+        .bind("0.0.0.0:0")
+        .build()
+        .await
+        .expect("Failed to bind shared transport");
+
+    // Different system OIDs to request
+    let oids = [
+        oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), // sysDescr
+        oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), // sysUpTime
+        oid!(1, 3, 6, 1, 2, 1, 1, 4, 0), // sysContact
+        oid!(1, 3, 6, 1, 2, 1, 1, 5, 0), // sysName
+        oid!(1, 3, 6, 1, 2, 1, 1, 6, 0), // sysLocation
+    ];
+
+    // Create clients and pair with OIDs (cycling through)
+    let clients: Vec<_> = (0..15)
+        .map(|_| {
+            Client::builder(target.to_string(), Auth::v2c("public"))
+                .timeout(Duration::from_secs(10))
+                .build(shared.handle(target))
+                .expect("Failed to build client")
+        })
+        .collect();
+
+    // Each client requests a different OID (cycling)
+    let futures: Vec<_> = clients
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let oid = oids[i % oids.len()].clone();
+            async move { (i, oid.clone(), c.get(&oid).await) }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    for (i, expected_oid, result) in results {
+        match result {
+            Ok(vb) => {
+                assert_eq!(
+                    vb.oid, expected_oid,
+                    "Client {} got wrong OID: expected {}, got {}",
+                    i, expected_oid, vb.oid
+                );
+            }
+            Err(e) => {
+                panic!("Client {} failed requesting {}: {}", i, expected_oid, e);
+            }
+        }
+    }
+
+    println!(
+        "Concurrent different-OID test: {} requests with correct correlation",
+        clients.len()
+    );
+}
+
+/// Test that dropping a client doesn't affect other clients on the same shared transport.
+#[tokio::test]
+async fn test_shared_transport_client_drop_isolation() {
+    require_container_runtime!();
+
+    let info = get_v2c_container().await;
+    let target: SocketAddr = format!("127.0.0.1:{}", info.port).parse().unwrap();
+
+    let shared = SharedUdpTransport::builder()
+        .bind("0.0.0.0:0")
+        .build()
+        .await
+        .expect("Failed to bind shared transport");
+
+    let client1 = Client::builder(target.to_string(), Auth::v2c("public"))
+        .timeout(Duration::from_secs(5))
+        .build(shared.handle(target))
+        .expect("Failed to build client1");
+
+    let client2 = Client::builder(target.to_string(), Auth::v2c("public"))
+        .timeout(Duration::from_secs(5))
+        .build(shared.handle(target))
+        .expect("Failed to build client2");
+
+    // Verify both work
+    let result1 = client1.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
+    assert!(result1.is_ok(), "Client1 initial GET failed");
+
+    let result2 = client2.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await;
+    assert!(result2.is_ok(), "Client2 initial GET failed");
+
+    // Drop client1
+    drop(client1);
+
+    // client2 should still work
+    let result2_after = client2.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await;
+    assert!(
+        result2_after.is_ok(),
+        "Client2 GET after client1 drop failed: {:?}",
+        result2_after
+    );
+
+    // Create a new client3 on the same transport
+    let client3 = Client::builder(target.to_string(), Auth::v2c("public"))
+        .timeout(Duration::from_secs(5))
+        .build(shared.handle(target))
+        .expect("Failed to build client3");
+
+    let result3 = client3.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
+    assert!(
+        result3.is_ok(),
+        "Client3 GET after client1 drop failed: {:?}",
+        result3
+    );
+
+    println!("Client drop isolation verified: transport survives client drops");
 }
 
 // ============================================================================
