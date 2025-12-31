@@ -91,26 +91,28 @@ impl EncodeBuf {
 
     /// Encode an INTEGER.
     pub fn push_integer(&mut self, value: i32) {
-        let bytes = encode_integer(value);
-        self.push_bytes(&bytes);
-        self.push_length(bytes.len());
+        let (arr, len) = encode_integer_stack(value);
+        // Valid bytes are at the end of the array
+        self.push_bytes(&arr[4 - len..]);
+        self.push_length(len);
         self.push_tag(tag::universal::INTEGER);
     }
 
     /// Encode a 64-bit integer (for Counter64).
     pub fn push_integer64(&mut self, value: u64) {
-        let bytes = encode_integer64(value);
-        self.push_bytes(&bytes);
-        self.push_length(bytes.len());
+        let (arr, len) = encode_integer64_stack(value);
+        // Valid bytes are at the end of the array
+        self.push_bytes(&arr[9 - len..]);
+        self.push_length(len);
         self.push_tag(tag::application::COUNTER64);
     }
 
     /// Encode an unsigned 32-bit integer with a specific tag.
     pub fn push_unsigned32(&mut self, tag: u8, value: u32) {
-        // Unsigned integers need special handling to avoid sign extension
-        let bytes = encode_unsigned32(value);
-        self.push_bytes(&bytes);
-        self.push_length(bytes.len());
+        let (arr, len) = encode_unsigned32_stack(value);
+        // Valid bytes are at the end of the array
+        self.push_bytes(&arr[5 - len..]);
+        self.push_length(len);
         self.push_tag(tag);
     }
 
@@ -129,7 +131,7 @@ impl EncodeBuf {
 
     /// Encode an OBJECT IDENTIFIER.
     pub fn push_oid(&mut self, oid: &crate::oid::Oid) {
-        let ber = oid.to_ber();
+        let ber = oid.to_ber_smallvec();
         self.push_bytes(&ber);
         self.push_length(ber.len());
         self.push_tag(tag::universal::OBJECT_IDENTIFIER);
@@ -164,7 +166,11 @@ impl Default for EncodeBuf {
 }
 
 /// Encode a signed 32-bit integer in minimal BER form.
-fn encode_integer(value: i32) -> Vec<u8> {
+///
+/// Returns a stack-allocated array and the number of valid bytes.
+/// The valid bytes are at the END of the array (for reverse-buffer compatibility).
+#[inline]
+fn encode_integer_stack(value: i32) -> ([u8; 4], usize) {
     let bytes = value.to_be_bytes();
 
     // Find first significant byte
@@ -181,13 +187,17 @@ fn encode_integer(value: i32) -> Vec<u8> {
         }
     }
 
-    bytes[start..].to_vec()
+    (bytes, 4 - start)
 }
 
 /// Encode an unsigned 32-bit integer.
-fn encode_unsigned32(value: u32) -> Vec<u8> {
+///
+/// Returns a stack-allocated array and the number of valid bytes.
+/// The valid bytes are at the END of the array (for reverse-buffer compatibility).
+#[inline]
+fn encode_unsigned32_stack(value: u32) -> ([u8; 5], usize) {
     if value == 0 {
-        return vec![0];
+        return ([0, 0, 0, 0, 0], 1);
     }
 
     let bytes = value.to_be_bytes();
@@ -200,18 +210,24 @@ fn encode_unsigned32(value: u32) -> Vec<u8> {
 
     if bytes[start] & 0x80 != 0 {
         // Need to add a leading 0x00 to indicate positive
-        let mut result = vec![0];
-        result.extend_from_slice(&bytes[start..]);
-        result
+        let mut result = [0u8; 5];
+        result[1..].copy_from_slice(&bytes);
+        (result, 5 - start)
     } else {
-        bytes[start..].to_vec()
+        let mut result = [0u8; 5];
+        result[1..].copy_from_slice(&bytes);
+        (result, 4 - start)
     }
 }
 
 /// Encode an unsigned 64-bit integer.
-fn encode_integer64(value: u64) -> Vec<u8> {
+///
+/// Returns a stack-allocated array and the number of valid bytes.
+/// The valid bytes are at the END of the array (for reverse-buffer compatibility).
+#[inline]
+fn encode_integer64_stack(value: u64) -> ([u8; 9], usize) {
     if value == 0 {
-        return vec![0];
+        return ([0; 9], 1);
     }
 
     let bytes = value.to_be_bytes();
@@ -223,17 +239,32 @@ fn encode_integer64(value: u64) -> Vec<u8> {
     }
 
     if bytes[start] & 0x80 != 0 {
-        let mut result = vec![0];
-        result.extend_from_slice(&bytes[start..]);
-        result
+        // Need to add a leading 0x00 to indicate positive
+        let mut result = [0u8; 9];
+        result[1..].copy_from_slice(&bytes);
+        (result, 9 - start)
     } else {
-        bytes[start..].to_vec()
+        let mut result = [0u8; 9];
+        result[1..].copy_from_slice(&bytes);
+        (result, 8 - start)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper to extract the valid bytes from stack-based integer encoding
+    fn encode_integer(value: i32) -> Vec<u8> {
+        let (arr, len) = encode_integer_stack(value);
+        arr[4 - len..].to_vec()
+    }
+
+    /// Helper to extract the valid bytes from stack-based unsigned32 encoding
+    fn encode_unsigned32(value: u32) -> Vec<u8> {
+        let (arr, len) = encode_unsigned32_stack(value);
+        arr[5 - len..].to_vec()
+    }
 
     #[test]
     fn test_encode_integer() {

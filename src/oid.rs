@@ -198,6 +198,41 @@ impl Oid {
         self.validate_length()
     }
 
+    /// Encode to BER format, returning bytes in a stack-allocated buffer.
+    ///
+    /// Uses SmallVec to avoid heap allocation for OIDs with up to ~20 arcs.
+    /// This is the optimized version used internally by encoding routines.
+    ///
+    /// OID encoding (X.690 Section 8.19):
+    /// - First two arcs encoded as (arc1 * 40) + arc2 using base-128
+    /// - Remaining arcs encoded as base-128 variable length
+    pub fn to_ber_smallvec(&self) -> SmallVec<[u8; 64]> {
+        let mut bytes = SmallVec::new();
+
+        if self.arcs.is_empty() {
+            return bytes;
+        }
+
+        // First two arcs combined into first subidentifier
+        // Uses base-128 encoding because arc2 can be > 127 when arc1=2
+        if self.arcs.len() >= 2 {
+            let first_subid = self.arcs[0] * 40 + self.arcs[1];
+            encode_subidentifier_smallvec(&mut bytes, first_subid);
+        } else if self.arcs.len() == 1 {
+            let first_subid = self.arcs[0] * 40;
+            encode_subidentifier_smallvec(&mut bytes, first_subid);
+        }
+
+        // Remaining arcs (only if there are more than 2)
+        if self.arcs.len() > 2 {
+            for &arc in &self.arcs[2..] {
+                encode_subidentifier_smallvec(&mut bytes, arc);
+            }
+        }
+
+        bytes
+    }
+
     /// Encode to BER format.
     ///
     /// OID encoding (X.690 Section 8.19):
@@ -215,30 +250,7 @@ impl Oid {
     /// This method does not validate arc constraints. Use [`to_ber_checked()`](Self::to_ber_checked)
     /// for validation, or call [`validate()`](Self::validate) first.
     pub fn to_ber(&self) -> Vec<u8> {
-        if self.arcs.is_empty() {
-            return vec![];
-        }
-
-        let mut bytes = Vec::new();
-
-        // First two arcs combined into first subidentifier
-        // Uses base-128 encoding because arc2 can be > 127 when arc1=2
-        if self.arcs.len() >= 2 {
-            let first_subid = self.arcs[0] * 40 + self.arcs[1];
-            encode_subidentifier(&mut bytes, first_subid);
-        } else if self.arcs.len() == 1 {
-            let first_subid = self.arcs[0] * 40;
-            encode_subidentifier(&mut bytes, first_subid);
-        }
-
-        // Remaining arcs (only if there are more than 2)
-        if self.arcs.len() > 2 {
-            for &arc in &self.arcs[2..] {
-                encode_subidentifier(&mut bytes, arc);
-            }
-        }
-
-        bytes
+        self.to_ber_smallvec().to_vec()
     }
 
     /// Encode to BER format with validation.
@@ -285,8 +297,9 @@ impl Oid {
     }
 }
 
-/// Encode a subidentifier in base-128 variable length.
-fn encode_subidentifier(bytes: &mut Vec<u8>, value: u32) {
+/// Encode a subidentifier in base-128 variable length into a SmallVec.
+#[inline]
+fn encode_subidentifier_smallvec(bytes: &mut SmallVec<[u8; 64]>, value: u32) {
     if value == 0 {
         bytes.push(0);
         return;
