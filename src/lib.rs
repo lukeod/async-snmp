@@ -1,3 +1,7 @@
+// Allow large error types - the Error enum includes OIDs inline for debugging convenience.
+// Boxing them would add complexity and allocations for a marginal size reduction.
+#![allow(clippy::result_large_err)]
+
 //! # async-snmp
 //!
 //! Modern, async-first SNMP client library for Rust.
@@ -8,19 +12,18 @@
 //! - Async-first API built on Tokio
 //! - Zero-copy BER encoding/decoding
 //! - Type-safe OID and value handling
-//! - Compile-time safe builders (no runtime panics)
+//! - Config-driven client construction
 //!
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use async_snmp::{Client, oid};
+//! use async_snmp::{Auth, Client, oid};
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), async_snmp::Error> {
 //!     // SNMPv2c client
-//!     let client = Client::v2c("192.168.1.1:161")
-//!         .community(b"public")
+//!     let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
 //!         .timeout(Duration::from_secs(5))
 //!         .connect()
 //!         .await?;
@@ -35,13 +38,14 @@
 //! ## SNMPv3 Example
 //!
 //! ```rust,no_run
-//! use async_snmp::{Client, oid, v3::{AuthProtocol, PrivProtocol}};
+//! use async_snmp::{Auth, Client, oid, v3::{AuthProtocol, PrivProtocol}};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), async_snmp::Error> {
-//!     let client = Client::v3("192.168.1.1:161", "admin")
-//!         .auth(AuthProtocol::Sha256, "authpass123")
-//!         .privacy(PrivProtocol::Aes128, "privpass123")
+//!     let client = Client::builder("192.168.1.1:161",
+//!         Auth::usm("admin")
+//!             .auth(AuthProtocol::Sha256, "authpass123")
+//!             .privacy(PrivProtocol::Aes128, "privpass123"))
 //!         .connect()
 //!         .await?;
 //!
@@ -76,8 +80,8 @@ pub mod cli;
 // Re-exports for convenience
 pub use agent::{Agent, AgentBuilder, VacmBuilder, VacmConfig, View};
 pub use client::{
-    BulkWalk, Client, ClientConfig, V1ClientBuilder, V2cClientBuilder, V3AuthClientBuilder,
-    V3AuthPrivClientBuilder, V3ClientBuilder, V3SecurityConfig, Walk,
+    Auth, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion, OidOrdering,
+    UsmAuth, UsmBuilder, V3SecurityConfig, Walk, WalkMode,
 };
 pub use error::{
     AuthErrorKind, CryptoErrorKind, DecodeErrorKind, EncodeErrorKind, Error, ErrorStatus,

@@ -47,8 +47,8 @@ impl EncodeBuf {
     pub fn push_length(&mut self, len: usize) {
         let (bytes, count) = encode_length(len);
         // The encode_length returns bytes in reverse order for prepending
-        for i in 0..count {
-            self.buf.push(bytes[i]);
+        for byte in bytes.iter().take(count) {
+            self.buf.push(*byte);
         }
     }
 

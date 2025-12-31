@@ -384,13 +384,13 @@ impl OutputContext {
             }
         }
 
-        if self.show_timing {
-            if let Some(ms) = result.timing_ms {
-                if let Some(retries) = result.retries {
-                    writeln!(w, "\nTiming: {:.1}ms ({} retries)", ms, retries)?;
-                } else {
-                    writeln!(w, "\nTiming: {:.1}ms", ms)?;
-                }
+        if self.show_timing
+            && let Some(ms) = result.timing_ms
+        {
+            if let Some(retries) = result.retries {
+                writeln!(w, "\nTiming: {:.1}ms ({} retries)", ms, retries)?;
+            } else {
+                writeln!(w, "\nTiming: {:.1}ms", ms)?;
             }
         }
 
@@ -399,7 +399,7 @@ impl OutputContext {
 
     fn write_json<W: Write>(&self, w: &mut W, result: &OperationResult) -> io::Result<()> {
         let json = serde_json::to_string_pretty(result)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         writeln!(w, "{}", json)
     }
 

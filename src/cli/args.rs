@@ -6,8 +6,9 @@ use clap::{Parser, ValueEnum};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::Version;
+use crate::client::Auth;
 use crate::v3::{AuthProtocol, PrivProtocol};
+use crate::Version;
 
 /// SNMP version for CLI argument parsing.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -134,6 +135,33 @@ impl V3Args {
         self.username.is_some()
     }
 
+    /// Build an Auth configuration from the V3 args and common args.
+    ///
+    /// If a username is provided, builds a USM auth configuration.
+    /// Otherwise, builds a community auth based on the version and community from common args.
+    pub fn auth(&self, common: &CommonArgs) -> Result<Auth, String> {
+        if let Some(ref username) = self.username {
+            let mut builder = Auth::usm(username);
+            if let Some(proto) = self.auth_protocol {
+                let pass = self.auth_password.as_ref()
+                    .ok_or("auth password required")?;
+                builder = builder.auth(proto, pass);
+            }
+            if let Some(proto) = self.priv_protocol {
+                let pass = self.priv_password.as_ref()
+                    .ok_or("priv password required")?;
+                builder = builder.privacy(proto, pass);
+            }
+            Ok(builder.into())
+        } else {
+            let community = &common.community;
+            Ok(match common.snmp_version {
+                SnmpVersion::V1 => Auth::v1(community),
+                _ => Auth::v2c(community),
+            })
+        }
+    }
+
     /// Validate V3 arguments and return an error message if invalid.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(ref _username) = self.username {
@@ -155,15 +183,15 @@ impl V3Args {
             }
 
             // Check auth/priv compatibility
-            if let (Some(auth), Some(priv_proto)) = (self.auth_protocol, self.priv_protocol) {
-                if !auth.is_compatible_with(priv_proto) {
-                    return Err(format!(
-                        "{} authentication does not produce enough key material for {} privacy; use {} or stronger",
-                        auth,
-                        priv_proto,
-                        priv_proto.min_auth_protocol()
-                    ));
-                }
+            if let (Some(auth), Some(priv_proto)) = (self.auth_protocol, self.priv_protocol)
+                && !auth.is_compatible_with(priv_proto)
+            {
+                return Err(format!(
+                    "{} authentication does not produce enough key material for {} privacy; use {} or stronger",
+                    auth,
+                    priv_proto,
+                    priv_proto.min_auth_protocol()
+                ));
             }
         }
         Ok(())
@@ -355,7 +383,7 @@ fn parse_hex_string(s: &str) -> Result<Vec<u8>, String> {
     // Remove common separators: spaces, colons, dashes
     let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
 
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         return Err("hex string must have even number of digits".into());
     }
 

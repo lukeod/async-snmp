@@ -1,9 +1,44 @@
 //! SNMP client implementation.
 
-mod builder;
+mod auth;
+mod new_builder;
 mod v3;
 mod walk;
 
+pub use auth::{Auth, CommunityVersion, UsmAuth, UsmBuilder};
+pub use new_builder::ClientBuilder;
+
+// New unified entry point
+impl Client<UdpTransport> {
+    /// Create a new SNMP client builder.
+    ///
+    /// This is the single entry point for client construction, supporting all
+    /// SNMP versions (v1, v2c, v3) through the [`Auth`] enum.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::{Auth, Client};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> async_snmp::Result<()> {
+    /// // Simple v2c client with default settings
+    /// let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+    ///     .connect().await?;
+    ///
+    /// // v3 client with authentication
+    /// let client = Client::builder("192.168.1.1:161",
+    ///     Auth::usm("admin").auth(async_snmp::v3::AuthProtocol::Sha256, "password"))
+    ///     .timeout(Duration::from_secs(10))
+    ///     .retries(5)
+    ///     .connect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn builder(target: impl Into<String>, auth: impl Into<Auth>) -> ClientBuilder {
+        ClientBuilder::new(target, auth)
+    }
+}
 use crate::error::{DecodeErrorKind, Error, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
@@ -22,12 +57,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{Span, instrument};
 
-pub use builder::{
-    V1ClientBuilder, V2cClientBuilder, V3AuthClientBuilder, V3AuthPrivClientBuilder,
-    V3ClientBuilder,
-};
 pub use v3::{V3DerivedKeys, V3SecurityConfig};
-pub use walk::{BulkWalk, Walk};
+pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode};
 
 /// SNMP client.
 ///
@@ -66,6 +97,14 @@ pub struct ClientConfig {
     pub max_oids_per_request: usize,
     /// SNMPv3 security configuration
     pub v3_security: Option<V3SecurityConfig>,
+    /// Walk operation mode (Auto, GetNext, or GetBulk)
+    pub walk_mode: WalkMode,
+    /// OID ordering behavior during walk operations
+    pub oid_ordering: OidOrdering,
+    /// Maximum results from a single walk operation (None = unlimited)
+    pub max_walk_results: Option<usize>,
+    /// Max-repetitions for GETBULK operations (default: 25)
+    pub max_repetitions: u32,
 }
 
 impl Default for ClientConfig {
@@ -77,6 +116,10 @@ impl Default for ClientConfig {
             retries: 3,
             max_oids_per_request: 10,
             v3_security: None,
+            walk_mode: WalkMode::Auto,
+            oid_ordering: OidOrdering::Strict,
+            max_walk_results: None,
+            max_repetitions: 25,
         }
     }
 }
@@ -326,7 +369,7 @@ impl<T: Transport> Client<T> {
     #[instrument(skip(self), err, fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
     pub async fn get(&self, oid: &Oid) -> Result<VarBind> {
         let request_id = self.next_request_id();
-        let pdu = Pdu::get_request(request_id, &[oid.clone()]);
+        let pdu = Pdu::get_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
 
         response
@@ -345,9 +388,9 @@ impl<T: Transport> Client<T> {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use async_snmp::{Client, oid};
+    /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::v2c("127.0.0.1:161").community(b"public").connect().await?;
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// let results = client.get_many(&[
     ///     oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),  // sysDescr
     ///     oid!(1, 3, 6, 1, 2, 1, 1, 3, 0),  // sysUpTime
@@ -373,7 +416,7 @@ impl<T: Transport> Client<T> {
         }
 
         // Batched path: split into chunks
-        let num_batches = (oids.len() + max_per_request - 1) / max_per_request;
+        let num_batches = oids.len().div_ceil(max_per_request);
         tracing::debug!(
             snmp.oid_count = oids.len(),
             snmp.max_per_request = max_per_request,
@@ -403,7 +446,7 @@ impl<T: Transport> Client<T> {
     #[instrument(skip(self), err, fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
     pub async fn get_next(&self, oid: &Oid) -> Result<VarBind> {
         let request_id = self.next_request_id();
-        let pdu = Pdu::get_next_request(request_id, &[oid.clone()]);
+        let pdu = Pdu::get_next_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
 
         response
@@ -422,9 +465,9 @@ impl<T: Transport> Client<T> {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use async_snmp::{Client, oid};
+    /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::v2c("127.0.0.1:161").community(b"public").connect().await?;
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// let results = client.get_next_many(&[
     ///     oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2),  // ifDescr
     ///     oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 3),  // ifType
@@ -449,7 +492,7 @@ impl<T: Transport> Client<T> {
         }
 
         // Batched path: split into chunks
-        let num_batches = (oids.len() + max_per_request - 1) / max_per_request;
+        let num_batches = oids.len().div_ceil(max_per_request);
         tracing::debug!(
             snmp.oid_count = oids.len(),
             snmp.max_per_request = max_per_request,
@@ -499,9 +542,9 @@ impl<T: Transport> Client<T> {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use async_snmp::{Client, oid, Value};
+    /// # use async_snmp::{Auth, Client, oid, Value};
     /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::v2c("127.0.0.1:161").community(b"private").connect().await?;
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("private")).connect().await?;
     /// let results = client.set_many(&[
     ///     (oid!(1, 3, 6, 1, 2, 1, 1, 5, 0), Value::from("new-hostname")),
     ///     (oid!(1, 3, 6, 1, 2, 1, 1, 6, 0), Value::from("new-location")),
@@ -530,7 +573,7 @@ impl<T: Transport> Client<T> {
         }
 
         // Batched path: split into chunks
-        let num_batches = (varbinds.len() + max_per_request - 1) / max_per_request;
+        let num_batches = varbinds.len().div_ceil(max_per_request);
         tracing::debug!(
             snmp.oid_count = varbinds.len(),
             snmp.max_per_request = max_per_request,
@@ -573,9 +616,9 @@ impl<T: Transport> Client<T> {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use async_snmp::{Client, oid};
+    /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::v2c("127.0.0.1:161").community(b"public").connect().await?;
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// // Get next 10 entries starting from ifDescr
     /// let results = client.get_bulk(&[oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2)], 0, 10).await?;
     /// for vb in results {
@@ -608,12 +651,14 @@ impl<T: Transport> Client<T> {
     /// The walk terminates when an OID outside the subtree is encountered or
     /// when `EndOfMibView` is returned.
     ///
+    /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use async_snmp::{Client, oid};
+    /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::v2c("127.0.0.1:161").community(b"public").connect().await?;
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1));
     /// // Use tokio_stream::StreamExt or futures::StreamExt for iteration
     /// # Ok(())
@@ -624,7 +669,9 @@ impl<T: Transport> Client<T> {
     where
         T: 'static,
     {
-        Walk::new(self.clone(), oid)
+        let ordering = self.inner.config.oid_ordering;
+        let max_results = self.inner.config.max_walk_results;
+        Walk::new(self.clone(), oid, ordering, max_results)
     }
 
     /// Walk an OID subtree using GETBULK (more efficient than GETNEXT).
@@ -632,17 +679,20 @@ impl<T: Transport> Client<T> {
     /// Returns an async stream that yields each variable binding in the subtree.
     /// Uses GETBULK internally for better performance when walking large tables.
     ///
+    /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
+    /// If `max_repetitions` is not specified, uses the client's configured `max_repetitions`.
+    ///
     /// # Arguments
     ///
     /// * `oid` - The base OID of the subtree to walk
-    /// * `max_repetitions` - How many OIDs to fetch per request (default: 10)
+    /// * `max_repetitions` - How many OIDs to fetch per request
     ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use async_snmp::{Client, oid};
+    /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::v2c("127.0.0.1:161").community(b"public").connect().await?;
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// // Walk the interfaces table efficiently
     /// let walk = client.bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2, 2), 25);
     /// // Process with futures StreamExt
@@ -654,6 +704,36 @@ impl<T: Transport> Client<T> {
     where
         T: 'static,
     {
-        BulkWalk::new(self.clone(), oid, max_repetitions)
+        let ordering = self.inner.config.oid_ordering;
+        let max_results = self.inner.config.max_walk_results;
+        BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
+    }
+
+    /// Walk an OID subtree using the client's configured `max_repetitions`.
+    ///
+    /// This is a convenience method that uses the client's `max_repetitions` setting
+    /// (default: 25) instead of requiring it as a parameter.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use async_snmp::{Auth, Client, oid};
+    /// # async fn example() -> async_snmp::Result<()> {
+    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
+    /// // Walk using configured max_repetitions
+    /// let walk = client.bulk_walk_default(oid!(1, 3, 6, 1, 2, 1, 2, 2));
+    /// // Process with futures StreamExt
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
+    pub fn bulk_walk_default(&self, oid: Oid) -> BulkWalk<T>
+    where
+        T: 'static,
+    {
+        let ordering = self.inner.config.oid_ordering;
+        let max_results = self.inner.config.max_walk_results;
+        let max_repetitions = self.inner.config.max_repetitions as i32;
+        BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
     }
 }

@@ -179,7 +179,7 @@ impl Transport for MockTransport {
                 }),
                 Some(MockResponse::IoError(msg)) => Err(Error::Io {
                     target: Some(target),
-                    source: std::io::Error::new(std::io::ErrorKind::Other, msg),
+                    source: std::io::Error::other(msg),
                 }),
                 None => Err(Error::Timeout {
                     target: Some(target),

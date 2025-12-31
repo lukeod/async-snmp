@@ -9,7 +9,7 @@
 mod common;
 
 use async_snmp::{
-    Client, ClientConfig, Error, ErrorStatus, Value, Version, oid,
+    Client, ClientConfig, Error, ErrorStatus, OidOrdering, Value, Version, WalkMode, oid,
     transport::{MockTransport, ResponseBuilder},
 };
 use bytes::Bytes;
@@ -27,6 +27,10 @@ fn create_mock_client(mock: MockTransport) -> Client<MockTransport> {
         retries: 0,
         max_oids_per_request: 10,
         v3_security: None,
+        walk_mode: WalkMode::Auto,
+        oid_ordering: OidOrdering::Strict,
+        max_walk_results: None,
+        max_repetitions: 25,
     };
     Client::new(mock, config)
 }
@@ -39,6 +43,10 @@ fn create_mock_client_v1(mock: MockTransport) -> Client<MockTransport> {
         retries: 0,
         max_oids_per_request: 10,
         v3_security: None,
+        walk_mode: WalkMode::Auto,
+        oid_ordering: OidOrdering::Strict,
+        max_walk_results: None,
+        max_repetitions: 25,
     };
     Client::new(mock, config)
 }
@@ -342,6 +350,10 @@ async fn test_get_many_batching() {
         retries: 0,
         max_oids_per_request: 2,
         v3_security: None,
+        walk_mode: WalkMode::Auto,
+        oid_ordering: OidOrdering::Strict,
+        max_walk_results: None,
+        max_repetitions: 25,
     };
     let client = Client::new(mock.clone(), config);
 
@@ -625,6 +637,10 @@ async fn test_retry_on_timeout_success_on_retry() {
         retries: 1,
         max_oids_per_request: 10,
         v3_security: None,
+        walk_mode: WalkMode::Auto,
+        oid_ordering: OidOrdering::Strict,
+        max_walk_results: None,
+        max_repetitions: 25,
     };
     let client = Client::new(mock.clone(), config);
 
@@ -652,6 +668,10 @@ async fn test_retry_exhaustion() {
         retries: 2,
         max_oids_per_request: 10,
         v3_security: None,
+        walk_mode: WalkMode::Auto,
+        oid_ordering: OidOrdering::Strict,
+        max_walk_results: None,
+        max_repetitions: 25,
     };
     let client = Client::new(mock.clone(), config);
 
@@ -1708,6 +1728,10 @@ async fn test_v1_retry_on_timeout() {
         retries: 1,
         max_oids_per_request: 10,
         v3_security: None,
+        walk_mode: WalkMode::Auto,
+        oid_ordering: OidOrdering::Strict,
+        max_walk_results: None,
+        max_repetitions: 25,
     };
     let client = Client::new(mock.clone(), config);
 

@@ -173,8 +173,8 @@ where
 
     while count < expansion_size {
         // Fill buffer with password bytes
-        for i in 0..64 {
-            buf[i] = password[password_index];
+        for byte in &mut buf {
+            *byte = password[password_index];
             password_index = (password_index + 1) % password_len;
         }
         hasher.update(buf);

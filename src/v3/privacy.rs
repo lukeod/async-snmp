@@ -13,7 +13,7 @@
 //! ## AES-CFB-128
 //! - Salt (privParameters): 64-bit counter = 8 bytes
 //! - IV: engineBoots (4 bytes) || engineTime (4 bytes) || salt (8 bytes) = 16 bytes
-//!       (concatenation, NOT XOR)
+//!   (concatenation, NOT XOR)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

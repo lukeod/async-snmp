@@ -1,5 +1,8 @@
 //! Walk stream implementations.
 
+#![allow(clippy::type_complexity)]
+
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -13,6 +16,90 @@ use crate::varbind::VarBind;
 
 use super::Client;
 
+/// Walk operation mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum WalkMode {
+    /// Auto-select based on version (default).
+    /// V1 uses GETNEXT, V2c/V3 uses GETBULK.
+    #[default]
+    Auto,
+    /// Always use GETNEXT (slower but more compatible).
+    GetNext,
+    /// Always use GETBULK (faster, errors on v1).
+    GetBulk,
+}
+
+/// OID ordering behavior during walk operations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OidOrdering {
+    /// Require strictly increasing OIDs (default).
+    /// Walk terminates with error on first violation.
+    /// Most efficient: O(1) memory, O(1) per-item check.
+    #[default]
+    Strict,
+
+    /// Allow non-increasing OIDs, with cycle detection.
+    /// Some buggy agents return OIDs out of order.
+    /// Walk tracks all seen OIDs in a HashSet to detect cycles.
+    /// Terminates with error if same OID returned twice.
+    /// Memory: O(n) where n = number of walk results.
+    AllowNonIncreasing,
+}
+
+/// Internal OID tracking for walk operations.
+///
+/// This enum implements two strategies for detecting walk termination
+/// conditions due to agent misbehavior:
+/// - `Strict`: O(1) memory, compares against previous OID
+/// - `Relaxed`: O(n) memory, tracks all seen OIDs in a HashSet
+enum OidTracker {
+    /// O(1) memory: stores only the previous OID for comparison.
+    /// Used by default Strict mode.
+    Strict { last: Option<Oid> },
+
+    /// O(n) memory: HashSet of all seen OIDs for cycle detection.
+    /// Only allocated when AllowNonIncreasing is configured.
+    Relaxed { seen: HashSet<Oid> },
+}
+
+impl OidTracker {
+    fn new(ordering: OidOrdering) -> Self {
+        match ordering {
+            OidOrdering::Strict => OidTracker::Strict { last: None },
+            OidOrdering::AllowNonIncreasing => OidTracker::Relaxed {
+                seen: HashSet::new(),
+            },
+        }
+    }
+
+    /// Check if OID is valid according to ordering rules.
+    /// Returns Ok(()) if valid, Err if violation detected.
+    fn check(&mut self, oid: &Oid) -> Result<()> {
+        match self {
+            OidTracker::Strict { last } => {
+                if let Some(prev) = last
+                    && oid <= prev
+                {
+                    return Err(Error::NonIncreasingOid {
+                        previous: prev.clone(),
+                        current: oid.clone(),
+                    });
+                }
+                *last = Some(oid.clone());
+                Ok(())
+            }
+            OidTracker::Relaxed { seen } => {
+                if !seen.insert(oid.clone()) {
+                    return Err(Error::DuplicateOid { oid: oid.clone() });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Async stream for walking an OID subtree using GETNEXT.
 ///
 /// Created by [`Client::walk()`].
@@ -20,23 +107,49 @@ pub struct Walk<T: Transport> {
     client: Client<T>,
     base_oid: Oid,
     current_oid: Oid,
-    /// Last OID that was successfully returned to the caller.
-    /// Used to detect non-increasing OIDs (agent misbehavior).
-    last_returned_oid: Option<Oid>,
+    /// OID tracker for ordering validation.
+    oid_tracker: OidTracker,
+    /// Maximum number of results to return (None = unlimited).
+    max_results: Option<usize>,
+    /// Count of results returned so far.
+    count: usize,
     done: bool,
     pending: Option<Pin<Box<dyn std::future::Future<Output = Result<VarBind>> + Send>>>,
 }
 
 impl<T: Transport> Walk<T> {
-    pub(crate) fn new(client: Client<T>, oid: Oid) -> Self {
+    pub(crate) fn new(
+        client: Client<T>,
+        oid: Oid,
+        ordering: OidOrdering,
+        max_results: Option<usize>,
+    ) -> Self {
         Self {
             client,
             base_oid: oid.clone(),
             current_oid: oid,
-            last_returned_oid: None,
+            oid_tracker: OidTracker::new(ordering),
+            max_results,
+            count: 0,
             done: false,
             pending: None,
         }
+    }
+}
+
+impl<T: Transport + 'static> Walk<T> {
+    /// Get the next varbind, or None when complete.
+    pub async fn next(&mut self) -> Option<Result<VarBind>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+
+    /// Collect all remaining varbinds.
+    pub async fn collect(mut self) -> Result<Vec<VarBind>> {
+        let mut results = Vec::new();
+        while let Some(result) = self.next().await {
+            results.push(result?);
+        }
+        Ok(results)
     }
 }
 
@@ -45,6 +158,14 @@ impl<T: Transport + 'static> Stream for Walk<T> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.done {
+            return Poll::Ready(None);
+        }
+
+        // Check max_results limit
+        if let Some(max) = self.max_results
+            && self.count >= max
+        {
+            self.done = true;
             return Poll::Ready(None);
         }
 
@@ -79,21 +200,15 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                             return Poll::Ready(None);
                         }
 
-                        // Check for non-increasing OID (agent misbehavior).
-                        // This prevents infinite loops on non-conformant devices.
-                        if let Some(last_oid) = self.last_returned_oid.take()
-                            && vb.oid <= last_oid
-                        {
+                        // Check OID ordering using the tracker
+                        if let Err(e) = self.oid_tracker.check(&vb.oid) {
                             self.done = true;
-                            return Poll::Ready(Some(Err(Error::NonIncreasingOid {
-                                previous: last_oid,
-                                current: vb.oid,
-                            })));
+                            return Poll::Ready(Some(Err(e)));
                         }
 
                         // Update current OID for next iteration
                         self.current_oid = vb.oid.clone();
-                        self.last_returned_oid = Some(vb.oid.clone());
+                        self.count += 1;
 
                         Poll::Ready(Some(Ok(vb)))
                     }
@@ -115,9 +230,12 @@ pub struct BulkWalk<T: Transport> {
     base_oid: Oid,
     current_oid: Oid,
     max_repetitions: i32,
-    /// Last OID that was successfully returned to the caller.
-    /// Used to detect non-increasing OIDs (agent misbehavior).
-    last_returned_oid: Option<Oid>,
+    /// OID tracker for ordering validation.
+    oid_tracker: OidTracker,
+    /// Maximum number of results to return (None = unlimited).
+    max_results: Option<usize>,
+    /// Count of results returned so far.
+    count: usize,
     done: bool,
     /// Buffered results from the last GETBULK response
     buffer: Vec<VarBind>,
@@ -127,18 +245,42 @@ pub struct BulkWalk<T: Transport> {
 }
 
 impl<T: Transport> BulkWalk<T> {
-    pub(crate) fn new(client: Client<T>, oid: Oid, max_repetitions: i32) -> Self {
+    pub(crate) fn new(
+        client: Client<T>,
+        oid: Oid,
+        max_repetitions: i32,
+        ordering: OidOrdering,
+        max_results: Option<usize>,
+    ) -> Self {
         Self {
             client,
             base_oid: oid.clone(),
             current_oid: oid,
             max_repetitions,
-            last_returned_oid: None,
+            oid_tracker: OidTracker::new(ordering),
+            max_results,
+            count: 0,
             done: false,
             buffer: Vec::new(),
             buffer_idx: 0,
             pending: None,
         }
+    }
+}
+
+impl<T: Transport + 'static> BulkWalk<T> {
+    /// Get the next varbind, or None when complete.
+    pub async fn next(&mut self) -> Option<Result<VarBind>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+
+    /// Collect all remaining varbinds.
+    pub async fn collect(mut self) -> Result<Vec<VarBind>> {
+        let mut results = Vec::new();
+        while let Some(result) = self.next().await {
+            results.push(result?);
+        }
+        Ok(results)
     }
 }
 
@@ -148,6 +290,14 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             if self.done {
+                return Poll::Ready(None);
+            }
+
+            // Check max_results limit
+            if let Some(max) = self.max_results
+                && self.count >= max
+            {
+                self.done = true;
                 return Poll::Ready(None);
             }
 
@@ -168,21 +318,15 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                     return Poll::Ready(None);
                 }
 
-                // Check for non-increasing OID (agent misbehavior).
-                // This prevents infinite loops on non-conformant devices.
-                if let Some(last_oid) = self.last_returned_oid.take()
-                    && vb.oid <= last_oid
-                {
+                // Check OID ordering using the tracker
+                if let Err(e) = self.oid_tracker.check(&vb.oid) {
                     self.done = true;
-                    return Poll::Ready(Some(Err(Error::NonIncreasingOid {
-                        previous: last_oid,
-                        current: vb.oid,
-                    })));
+                    return Poll::Ready(Some(Err(e)));
                 }
 
                 // Update current OID for next request
                 self.current_oid = vb.oid.clone();
-                self.last_returned_oid = Some(vb.oid.clone());
+                self.count += 1;
 
                 return Poll::Ready(Some(Ok(vb)));
             }
@@ -245,6 +389,10 @@ mod tests {
             retries: 0,
             max_oids_per_request: 10,
             v3_security: None,
+            walk_mode: WalkMode::Auto,
+            oid_ordering: OidOrdering::Strict,
+            max_walk_results: None,
+            max_repetitions: 25,
         };
         Client::new(mock, config)
     }
@@ -638,5 +786,312 @@ mod tests {
             if previous == &Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 3, 0])
                && current == &Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 2, 0])
         ));
+    }
+
+    // Tests for AllowNonIncreasing OID ordering mode
+
+    #[tokio::test]
+    async fn test_walk_allow_non_increasing_accepts_out_of_order() {
+        let mut mock = MockTransport::new("127.0.0.1:161".parse().unwrap());
+
+        // Three OIDs out of order, but no duplicates
+        mock.queue_response(
+            ResponseBuilder::new(1)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 5, 0]),
+                    Value::OctetString("five".into()),
+                )
+                .build_v2c(b"public"),
+        );
+        mock.queue_response(
+            ResponseBuilder::new(2)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 3, 0]), // out of order
+                    Value::OctetString("three".into()),
+                )
+                .build_v2c(b"public"),
+        );
+        mock.queue_response(
+            ResponseBuilder::new(3)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 7, 0]),
+                    Value::OctetString("seven".into()),
+                )
+                .build_v2c(b"public"),
+        );
+        // Fourth response leaves subtree
+        mock.queue_response(
+            ResponseBuilder::new(4)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 1, 0]),
+                    Value::Integer(1),
+                )
+                .build_v2c(b"public"),
+        );
+
+        let client = mock_client(mock);
+        let walk = Walk::new(
+            client,
+            Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]),
+            OidOrdering::AllowNonIncreasing,
+            None,
+        );
+
+        let mut pinned = Box::pin(walk);
+        let results = collect_walk(pinned.as_mut(), 10).await;
+
+        // Should get all three results successfully
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn test_walk_allow_non_increasing_detects_cycle() {
+        use crate::error::Error;
+
+        let mut mock = MockTransport::new("127.0.0.1:161".parse().unwrap());
+
+        // First OID
+        mock.queue_response(
+            ResponseBuilder::new(1)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
+                    Value::OctetString("first".into()),
+                )
+                .build_v2c(b"public"),
+        );
+        // Second OID
+        mock.queue_response(
+            ResponseBuilder::new(2)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 2, 0]),
+                    Value::OctetString("second".into()),
+                )
+                .build_v2c(b"public"),
+        );
+        // Same as first - cycle!
+        mock.queue_response(
+            ResponseBuilder::new(3)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
+                    Value::OctetString("first-again".into()),
+                )
+                .build_v2c(b"public"),
+        );
+
+        let client = mock_client(mock);
+        let walk = Walk::new(
+            client,
+            Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]),
+            OidOrdering::AllowNonIncreasing,
+            None,
+        );
+
+        let mut pinned = Box::pin(walk);
+        let results = collect_walk(pinned.as_mut(), 10).await;
+
+        // Should get first two OK, then DuplicateOid error
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(matches!(
+            &results[2],
+            Err(Error::DuplicateOid { oid })
+            if oid == &Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0])
+        ));
+    }
+
+    // Tests for max_results limit
+
+    #[tokio::test]
+    async fn test_walk_respects_max_results() {
+        let mut mock = MockTransport::new("127.0.0.1:161".parse().unwrap());
+
+        // Queue many responses
+        for i in 1..=10 {
+            mock.queue_response(
+                ResponseBuilder::new(i)
+                    .varbind(
+                        Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, i as u32, 0]),
+                        Value::Integer(i as i32),
+                    )
+                    .build_v2c(b"public"),
+            );
+        }
+
+        let client = mock_client(mock);
+        let walk = Walk::new(
+            client,
+            Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]),
+            OidOrdering::Strict,
+            Some(3), // Limit to 3 results
+        );
+
+        let mut pinned = Box::pin(walk);
+        let results = collect_walk(pinned.as_mut(), 20).await;
+
+        // Should stop after 3 results
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn test_bulk_walk_respects_max_results() {
+        let mut mock = MockTransport::new("127.0.0.1:161".parse().unwrap());
+
+        // GETBULK returns many varbinds at once
+        mock.queue_response(
+            ResponseBuilder::new(1)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
+                    Value::Integer(1),
+                )
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 2, 0]),
+                    Value::Integer(2),
+                )
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 3, 0]),
+                    Value::Integer(3),
+                )
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 4, 0]),
+                    Value::Integer(4),
+                )
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 5, 0]),
+                    Value::Integer(5),
+                )
+                .build_v2c(b"public"),
+        );
+
+        let client = mock_client(mock);
+        let walk = BulkWalk::new(
+            client,
+            Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]),
+            10,
+            OidOrdering::Strict,
+            Some(3), // Limit to 3 results
+        );
+
+        let mut pinned = Box::pin(walk);
+        let results = collect_bulk_walk(pinned.as_mut(), 20).await;
+
+        // Should stop after 3 results even though buffer has more
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_ok()));
+    }
+
+    // Tests for inherent next() and collect() methods
+
+    #[tokio::test]
+    async fn test_walk_inherent_next() {
+        let mut mock = MockTransport::new("127.0.0.1:161".parse().unwrap());
+
+        mock.queue_response(
+            ResponseBuilder::new(1)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
+                    Value::OctetString("test".into()),
+                )
+                .build_v2c(b"public"),
+        );
+        mock.queue_response(
+            ResponseBuilder::new(2)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 2, 0]),
+                    Value::Integer(42),
+                )
+                .build_v2c(b"public"),
+        );
+        mock.queue_response(
+            ResponseBuilder::new(3)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 1, 0]), // leaves subtree
+                    Value::Integer(1),
+                )
+                .build_v2c(b"public"),
+        );
+
+        let client = mock_client(mock);
+        let mut walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+
+        // Use inherent next() method
+        let first = walk.next().await;
+        assert!(first.is_some());
+        assert!(first.unwrap().is_ok());
+
+        let second = walk.next().await;
+        assert!(second.is_some());
+        assert!(second.unwrap().is_ok());
+
+        let third = walk.next().await;
+        assert!(third.is_none()); // Walk ended
+    }
+
+    #[tokio::test]
+    async fn test_walk_inherent_collect() {
+        let mut mock = MockTransport::new("127.0.0.1:161".parse().unwrap());
+
+        mock.queue_response(
+            ResponseBuilder::new(1)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
+                    Value::OctetString("test".into()),
+                )
+                .build_v2c(b"public"),
+        );
+        mock.queue_response(
+            ResponseBuilder::new(2)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 2, 0]),
+                    Value::Integer(42),
+                )
+                .build_v2c(b"public"),
+        );
+        mock.queue_response(
+            ResponseBuilder::new(3)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 1, 0]), // leaves subtree
+                    Value::Integer(1),
+                )
+                .build_v2c(b"public"),
+        );
+
+        let client = mock_client(mock);
+        let walk = client.walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]));
+
+        // Use inherent collect() method
+        let results = walk.collect().await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_walk_inherent_collect() {
+        let mut mock = MockTransport::new("127.0.0.1:161".parse().unwrap());
+
+        mock.queue_response(
+            ResponseBuilder::new(1)
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
+                    Value::OctetString("desc".into()),
+                )
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 2, 0]),
+                    Value::ObjectIdentifier(Oid::from_slice(&[1, 3, 6, 1, 4, 1, 99])),
+                )
+                .varbind(
+                    Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 1, 0]), // outside system
+                    Value::Integer(1),
+                )
+                .build_v2c(b"public"),
+        );
+
+        let client = mock_client(mock);
+        let walk = client.bulk_walk(Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1]), 10);
+
+        // Use inherent collect() method
+        let results = walk.collect().await.unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

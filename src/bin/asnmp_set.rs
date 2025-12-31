@@ -50,7 +50,7 @@ struct SetVarbind {
 }
 
 fn parse_varbinds(args: &[String]) -> Result<Vec<SetVarbind>, String> {
-    if args.len() % 3 != 0 {
+    if !args.len().is_multiple_of(3) {
         return Err("arguments must be OID TYPE VALUE triplets".into());
     }
 
@@ -145,7 +145,7 @@ async fn main() -> ExitCode {
 
     // Build and run the SET request
     let start = Instant::now();
-    let result = run_set(target, version, &args, varbinds).await;
+    let result = run_set(target, &args, varbinds).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -185,108 +185,25 @@ async fn main() -> ExitCode {
 
 async fn run_set(
     target: std::net::SocketAddr,
-    version: SnmpVersion,
     args: &Args,
     varbinds: Vec<SetVarbind>,
 ) -> async_snmp::Result<Vec<VarBind>> {
-    let timeout = args.common.timeout_duration();
-    let retries = args.common.retries;
+    let auth = args.v3.auth(&args.common)
+        .map_err(|e| async_snmp::Error::Config(e.to_string()))?;
+
+    let client = Client::builder(target.to_string(), auth)
+        .timeout(args.common.timeout_duration())
+        .retries(args.common.retries)
+        .connect()
+        .await?;
 
     // Convert to (Oid, Value) pairs
     let pairs: Vec<(Oid, Value)> = varbinds.into_iter().map(|vb| (vb.oid, vb.value)).collect();
 
-    match version {
-        SnmpVersion::V1 => {
-            let client = Client::v1(target.to_string())
-                .community(args.common.community.as_bytes())
-                .timeout(timeout)
-                .retries(retries)
-                .connect()
-                .await?;
-
-            if pairs.len() == 1 {
-                let (oid, value) = pairs.into_iter().next().unwrap();
-                client.set(&oid, value).await.map(|vb| vec![vb])
-            } else {
-                client.set_many(&pairs).await
-            }
-        }
-        SnmpVersion::V2c => {
-            let client = Client::v2c(target.to_string())
-                .community(args.common.community.as_bytes())
-                .timeout(timeout)
-                .retries(retries)
-                .connect()
-                .await?;
-
-            if pairs.len() == 1 {
-                let (oid, value) = pairs.into_iter().next().unwrap();
-                client.set(&oid, value).await.map(|vb| vec![vb])
-            } else {
-                client.set_many(&pairs).await
-            }
-        }
-        SnmpVersion::V3 => {
-            let username = args.v3.username.clone().expect("username required for v3");
-
-            match (&args.v3.auth_protocol, &args.v3.priv_protocol) {
-                (Some(auth), Some(priv_proto)) => {
-                    // authPriv
-                    let auth_pass = args.v3.auth_password.clone().expect("auth password");
-                    let priv_pass = args.v3.priv_password.clone().expect("priv password");
-
-                    let client = Client::v3(target.to_string(), username)
-                        .auth(*auth, auth_pass)
-                        .privacy(*priv_proto, priv_pass)
-                        .timeout(timeout)
-                        .retries(retries)
-                        .connect()
-                        .await?;
-
-                    if pairs.len() == 1 {
-                        let (oid, value) = pairs.into_iter().next().unwrap();
-                        client.set(&oid, value).await.map(|vb| vec![vb])
-                    } else {
-                        client.set_many(&pairs).await
-                    }
-                }
-                (Some(auth), None) => {
-                    // authNoPriv
-                    let auth_pass = args.v3.auth_password.clone().expect("auth password");
-
-                    let client = Client::v3(target.to_string(), username)
-                        .auth(*auth, auth_pass)
-                        .timeout(timeout)
-                        .retries(retries)
-                        .connect()
-                        .await?;
-
-                    if pairs.len() == 1 {
-                        let (oid, value) = pairs.into_iter().next().unwrap();
-                        client.set(&oid, value).await.map(|vb| vec![vb])
-                    } else {
-                        client.set_many(&pairs).await
-                    }
-                }
-                (None, None) => {
-                    // noAuthNoPriv
-                    let client = Client::v3(target.to_string(), username)
-                        .timeout(timeout)
-                        .retries(retries)
-                        .connect()
-                        .await?;
-
-                    if pairs.len() == 1 {
-                        let (oid, value) = pairs.into_iter().next().unwrap();
-                        client.set(&oid, value).await.map(|vb| vec![vb])
-                    } else {
-                        client.set_many(&pairs).await
-                    }
-                }
-                (None, Some(_)) => {
-                    unreachable!("privacy without authentication should be caught by validation");
-                }
-            }
-        }
+    if pairs.len() == 1 {
+        let (oid, value) = pairs.into_iter().next().unwrap();
+        client.set(&oid, value).await.map(|vb| vec![vb])
+    } else {
+        client.set_many(&pairs).await
     }
 }

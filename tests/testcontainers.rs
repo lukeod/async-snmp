@@ -4,13 +4,18 @@
 //! SNMP protocol support including V2c SET, V3 SHA-2 auth, and AES-192/256 privacy.
 //!
 //! Requirements:
-//!   - Docker or Podman running (auto-detected)
+//!   - Docker running
 //!   - Custom container image built locally:
 //!     `docker build -t async-snmp-test:latest tests/containers/snmpd/`
 //!
+//! Container lifecycle:
+//!   - A single container is shared across all tests in a run
+//!   - Container is automatically cleaned up when tests complete (via atexit)
+//!   - Stale containers from crashed runs are cleaned up at startup
+//!
 //! Environment variables:
 //!   - SNMPD_IMAGE: Override the snmpd image (default: async-snmp-test:latest)
-//!   - DOCKER_HOST: Override container runtime socket
+//!   - DOCKER_HOST: Override Docker socket location
 
 mod common;
 
@@ -18,12 +23,12 @@ use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use async_snmp::{Client, SharedUdpTransport, Value, oid};
+use async_snmp::{Auth, Client, SharedUdpTransport, Value, oid};
 use common::{
     AUTH_PASSWORD, COMMUNITY_RW, PRIV_PASSWORD, collect_stream, parse_image, snmpd_image, users,
 };
 use testcontainers::{
-    ContainerAsync, GenericImage,
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
@@ -33,22 +38,19 @@ use tokio::sync::OnceCell;
 // Container Runtime Detection
 // ============================================================================
 
-/// Configure Podman socket if needed and check runtime availability.
+/// Check if Docker is available.
 ///
-/// testcontainers-rs natively handles:
+/// testcontainers-rs natively handles Docker socket detection via:
 /// - `DOCKER_HOST` environment variable
 /// - `/var/run/docker.sock` (standard Docker)
 /// - `~/.docker/run/docker.sock`, `~/.docker/desktop/docker.sock` (rootless Docker)
-///
-/// This function adds Podman socket auto-detection, which testcontainers-rs
-/// does not provide (users are expected to set DOCKER_HOST manually).
-fn configure_container_runtime() -> Option<()> {
-    static RUNTIME_CHECK: OnceLock<Option<()>> = OnceLock::new();
+fn is_docker_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
 
-    *RUNTIME_CHECK.get_or_init(|| {
-        // If DOCKER_HOST is set or standard Docker socket exists, testcontainers handles it
+    *AVAILABLE.get_or_init(|| {
+        // If DOCKER_HOST is set, assume Docker is available
         if std::env::var("DOCKER_HOST").is_ok() {
-            return Some(());
+            return true;
         }
 
         // Check paths that testcontainers-rs will find natively
@@ -65,49 +67,18 @@ fn configure_container_runtime() -> Option<()> {
                 .unwrap_or_default(),
         ];
 
-        for path in &docker_paths {
-            if !path.is_empty() && std::path::Path::new(path).exists() {
-                return Some(());
-            }
-        }
-
-        // Podman auto-detection (not provided by testcontainers-rs)
-        if let Some(runtime_dir) = dirs::runtime_dir() {
-            let podman_socket = runtime_dir.join("podman/podman.sock");
-            if podman_socket.exists() {
-                // SAFETY: Test code, single-threaded initialization via OnceLock
-                unsafe {
-                    std::env::set_var("DOCKER_HOST", format!("unix://{}", podman_socket.display()));
-                }
-                return Some(());
-            }
-        }
-
-        // Root Podman socket
-        if std::path::Path::new("/run/podman/podman.sock").exists() {
-            // SAFETY: Test code, single-threaded initialization via OnceLock
-            unsafe {
-                std::env::set_var("DOCKER_HOST", "unix:///run/podman/podman.sock");
-            }
-            return Some(());
-        }
-
-        None
+        docker_paths
+            .iter()
+            .any(|path| !path.is_empty() && std::path::Path::new(path).exists())
     })
 }
 
-/// Macro to skip test if no container runtime is available
+/// Macro to skip test if Docker is not available
 macro_rules! require_container_runtime {
     () => {
-        if configure_container_runtime().is_none() {
-            eprintln!("Skipping test: no container runtime (Docker/Podman) available");
+        if !is_docker_available() {
+            eprintln!("Skipping test: Docker not available");
             return;
-        }
-        // Disable Ryuk for Podman compatibility (Ryuk requires Docker API features
-        // that Podman doesn't fully support)
-        // SAFETY: Called early in test, before any threads spawned
-        unsafe {
-            std::env::set_var("TESTCONTAINERS_RYUK_DISABLED", "true");
         }
     };
 }
@@ -123,10 +94,46 @@ struct ContainerInfo {
     port: u16,
 }
 
-/// Shared container - reused across all tests
+/// Container name used for the test container.
+const CONTAINER_NAME: &str = "async-snmp-test";
+
+/// Shared container - reused across all tests within a single test run.
+///
+/// At startup, any existing container with this name is stopped and removed,
+/// ensuring a clean state. The container is then shared across all tests
+/// in this run for speed.
+///
 /// Our custom container (async-snmp-test) has all users pre-configured,
 /// so a single container supports v2c, v3, and all security levels.
 static SNMPD_CONTAINER: OnceCell<ContainerInfo> = OnceCell::const_new();
+
+/// Stop and remove the test container.
+fn cleanup_container() {
+    let _ = std::process::Command::new("docker")
+        .args(["stop", CONTAINER_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("docker")
+        .args(["rm", CONTAINER_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Register cleanup to run when the process exits.
+fn register_cleanup() {
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        extern "C" fn cleanup_on_exit() {
+            cleanup_container();
+        }
+        // SAFETY: cleanup_on_exit is a valid C function that doesn't panic
+        unsafe {
+            libc::atexit(cleanup_on_exit);
+        }
+    });
+}
 
 /// Check if a container image exists locally.
 /// Returns Ok(()) if the image exists, Err with a helpful message otherwise.
@@ -150,6 +157,11 @@ fn check_image_exists(image: &str) -> Result<(), String> {
 async fn get_snmpd_container() -> &'static ContainerInfo {
     SNMPD_CONTAINER
         .get_or_init(|| async {
+            // Clean up any stale container from previous (possibly crashed) runs
+            cleanup_container();
+            // Register cleanup to run when this process exits
+            register_cleanup();
+
             let image_str = snmpd_image();
             let (name, tag) = parse_image(&image_str);
 
@@ -162,6 +174,7 @@ async fn get_snmpd_container() -> &'static ContainerInfo {
             let container = GenericImage::new(name, tag)
                 .with_exposed_port(161.udp())
                 .with_wait_for(WaitFor::seconds(2))
+                .with_container_name(CONTAINER_NAME)
                 .start()
                 .await
                 .expect("Failed to start snmpd container");
@@ -195,8 +208,7 @@ async fn create_v2c_client() -> Client {
     let info = get_v2c_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    Client::v2c(&target)
-        .community(b"public")
+    Client::builder(&target, Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
         .retries(2)
         .connect()
@@ -415,8 +427,7 @@ async fn test_get_many_batching() {
     let target = format!("{}:{}", info.host, info.port);
 
     // Create client with small max_oids_per_request to force batching
-    let client = Client::v2c(&target)
-        .community(b"public")
+    let client = Client::builder(&target, Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .max_oids_per_request(2) // Force batching at 2 OIDs
@@ -483,11 +494,11 @@ async fn test_shared_transport_single_client() {
         .await
         .expect("Failed to bind shared transport");
 
-    let client = Client::v2c(target.to_string())
-        .community(b"public")
+    let client = Client::builder(target.to_string(), Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
         .retries(1)
-        .build(shared.handle(target));
+        .build(shared.handle(target))
+        .expect("Failed to build client");
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
     match result {
@@ -512,15 +523,15 @@ async fn test_shared_transport_multiple_clients() {
         .await
         .expect("Failed to bind shared transport");
 
-    let client1 = Client::v2c(target.to_string())
-        .community(b"public")
+    let client1 = Client::builder(target.to_string(), Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
-        .build(shared.handle(target));
+        .build(shared.handle(target))
+        .expect("Failed to build client1");
 
-    let client2 = Client::v2c(target.to_string())
-        .community(b"public")
+    let client2 = Client::builder(target.to_string(), Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
-        .build(shared.handle(target));
+        .build(shared.handle(target))
+        .expect("Failed to build client2");
 
     // Run concurrent requests
     let oid1 = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0); // sysDescr
@@ -551,10 +562,10 @@ async fn test_shared_transport_walk() {
         .await
         .expect("Failed to bind shared transport");
 
-    let client = Client::v2c(target.to_string())
-        .community(b"public")
+    let client = Client::builder(target.to_string(), Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
-        .build(shared.handle(target));
+        .build(shared.handle(target))
+        .expect("Failed to build client");
 
     let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1));
     let mut pinned = Box::pin(walk);
@@ -583,9 +594,10 @@ async fn create_v3_client() -> Client {
     let info = get_v3_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    Client::v3(&target, users::PRIVAES128_USER)
-        .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes128, PRIV_PASSWORD)
+    Client::builder(&target,
+        Auth::usm(users::PRIVAES128_USER)
+            .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -666,9 +678,10 @@ async fn test_v3_shared_engine_cache() {
     let cache = Arc::new(EngineCache::new());
 
     // First client - will perform discovery
-    let client1 = Client::v3(&target, users::PRIVAES128_USER)
-        .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes128, PRIV_PASSWORD)
+    let client1 = Client::builder(&target,
+        Auth::usm(users::PRIVAES128_USER)
+            .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
         .engine_cache(cache.clone())
         .timeout(Duration::from_secs(5))
         .retries(1)
@@ -681,9 +694,10 @@ async fn test_v3_shared_engine_cache() {
     println!("Client 1 (with discovery): {:?}", result1.unwrap().value);
 
     // Second client - should use cached engine state
-    let client2 = Client::v3(&target, users::PRIVAES128_USER)
-        .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes128, PRIV_PASSWORD)
+    let client2 = Client::builder(&target,
+        Auth::usm(users::PRIVAES128_USER)
+            .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
         .engine_cache(cache.clone())
         .timeout(Duration::from_secs(5))
         .retries(1)
@@ -713,9 +727,10 @@ async fn test_v3_wrong_auth_password() {
     let target = format!("{}:{}", info.host, info.port);
 
     // Use wrong auth password - should fail
-    let result = Client::v3(&target, users::PRIVAES128_USER)
-        .auth(AuthProtocol::Sha1, "wrongpassword123")
-        .privacy(PrivProtocol::Aes128, PRIV_PASSWORD)
+    let result = Client::builder(&target,
+        Auth::usm(users::PRIVAES128_USER)
+            .auth(AuthProtocol::Sha1, "wrongpassword123")
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
         .timeout(Duration::from_secs(3))
         .retries(0) // Don't retry on auth failure
         .connect()
@@ -763,9 +778,10 @@ async fn test_v3_wrong_priv_password() {
     let target = format!("{}:{}", info.host, info.port);
 
     // Use correct auth but wrong priv password - should fail
-    let result = Client::v3(&target, users::PRIVAES128_USER)
-        .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes128, "wrongprivpass99")
+    let result = Client::builder(&target,
+        Auth::usm(users::PRIVAES128_USER)
+            .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes128, "wrongprivpass99"))
         .timeout(Duration::from_secs(3))
         .retries(0)
         .connect()
@@ -810,9 +826,10 @@ async fn test_v3_unknown_user() {
     let target = format!("{}:{}", info.host, info.port);
 
     // Use non-existent username
-    let result = Client::v3(&target, "nonexistentuser")
-        .auth(AuthProtocol::Sha1, "somepassword123")
-        .privacy(PrivProtocol::Aes128, "somepassword123")
+    let result = Client::builder(&target,
+        Auth::usm("nonexistentuser")
+            .auth(AuthProtocol::Sha1, "somepassword123")
+            .privacy(PrivProtocol::Aes128, "somepassword123"))
         .timeout(Duration::from_secs(3))
         .retries(0)
         .connect()
@@ -848,9 +865,10 @@ async fn test_v3_wrong_auth_protocol() {
     let target = format!("{}:{}", info.host, info.port);
 
     // privaes128_user is configured with SHA-1, try with MD5
-    let result = Client::v3(&target, users::PRIVAES128_USER)
-        .auth(AuthProtocol::Md5, AUTH_PASSWORD) // Wrong protocol
-        .privacy(PrivProtocol::Aes128, PRIV_PASSWORD)
+    let result = Client::builder(&target,
+        Auth::usm(users::PRIVAES128_USER)
+            .auth(AuthProtocol::Md5, AUTH_PASSWORD) // Wrong protocol
+            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD))
         .timeout(Duration::from_secs(3))
         .retries(0)
         .connect()
@@ -883,8 +901,7 @@ async fn create_set_client() -> Client {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    Client::v2c(&target)
-        .community(COMMUNITY_RW)
+    Client::builder(&target, Auth::v2c(std::str::from_utf8(COMMUNITY_RW).unwrap()))
         .timeout(Duration::from_secs(5))
         .retries(2)
         .connect()
@@ -1165,7 +1182,7 @@ async fn test_v3_noauthnopriv_get() {
     let target = format!("{}:{}", info.host, info.port);
 
     // noAuthNoPriv user - no authentication or privacy
-    let client = Client::v3(&target, users::NOAUTH_USER)
+    let client = Client::builder(&target, Auth::usm(users::NOAUTH_USER))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1190,7 +1207,7 @@ async fn test_v3_noauthnopriv_walk() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::NOAUTH_USER)
+    let client = Client::builder(&target, Auth::usm(users::NOAUTH_USER))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1221,8 +1238,9 @@ async fn test_v3_auth_sha224() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::AUTHSHA224_USER)
-        .auth(AuthProtocol::Sha224, AUTH_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::AUTHSHA224_USER)
+            .auth(AuthProtocol::Sha224, AUTH_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1247,8 +1265,9 @@ async fn test_v3_auth_sha256() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::AUTHSHA256_USER)
-        .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::AUTHSHA256_USER)
+            .auth(AuthProtocol::Sha256, AUTH_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1273,8 +1292,9 @@ async fn test_v3_auth_sha384() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::AUTHSHA384_USER)
-        .auth(AuthProtocol::Sha384, AUTH_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::AUTHSHA384_USER)
+            .auth(AuthProtocol::Sha384, AUTH_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1299,8 +1319,9 @@ async fn test_v3_auth_sha512() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::AUTHSHA512_USER)
-        .auth(AuthProtocol::Sha512, AUTH_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::AUTHSHA512_USER)
+            .auth(AuthProtocol::Sha512, AUTH_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1325,8 +1346,9 @@ async fn test_v3_auth_md5() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::AUTHMD5_USER)
-        .auth(AuthProtocol::Md5, AUTH_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::AUTHMD5_USER)
+            .auth(AuthProtocol::Md5, AUTH_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1356,9 +1378,10 @@ async fn test_v3_priv_aes192() {
     let target = format!("{}:{}", info.host, info.port);
 
     // AES-192 user uses SHA-256 auth per container config
-    let client = Client::v3(&target, users::PRIVAES192_USER)
-        .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes192, PRIV_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::PRIVAES192_USER)
+            .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes192, PRIV_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1384,9 +1407,10 @@ async fn test_v3_priv_aes256() {
     let target = format!("{}:{}", info.host, info.port);
 
     // AES-256 user uses SHA-256 auth per container config
-    let client = Client::v3(&target, users::PRIVAES256_USER)
-        .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes256, PRIV_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::PRIVAES256_USER)
+            .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes256, PRIV_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1412,9 +1436,10 @@ async fn test_v3_priv_des() {
     let target = format!("{}:{}", info.host, info.port);
 
     // DES user uses SHA-1 auth per container config
-    let client = Client::v3(&target, users::PRIVDES_USER)
-        .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Des, PRIV_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::PRIVDES_USER)
+            .auth(AuthProtocol::Sha1, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Des, PRIV_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1439,9 +1464,10 @@ async fn test_v3_priv_aes192_walk() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::PRIVAES192_USER)
-        .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes192, PRIV_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::PRIVAES192_USER)
+            .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes192, PRIV_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()
@@ -1468,9 +1494,10 @@ async fn test_v3_priv_aes256_walk() {
     let info = get_snmpd_container().await;
     let target = format!("{}:{}", info.host, info.port);
 
-    let client = Client::v3(&target, users::PRIVAES256_USER)
-        .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-        .privacy(PrivProtocol::Aes256, PRIV_PASSWORD)
+    let client = Client::builder(&target,
+        Auth::usm(users::PRIVAES256_USER)
+            .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
+            .privacy(PrivProtocol::Aes256, PRIV_PASSWORD))
         .timeout(Duration::from_secs(5))
         .retries(1)
         .connect()

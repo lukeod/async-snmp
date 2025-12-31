@@ -41,7 +41,9 @@ sha2 = "0.10.9"
 testcontainers = "0.26"
 proptest = "1.9"
 dirs = "6.0"
+libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
 
 # Enable testing features for integration tests
 async-snmp = { path = ".", features = ["testing"] }
@@ -49,7 +51,8 @@ async-snmp = { path = ".", features = ["testing"] }
 [features]
 default = []
 testing = []  # Expose MockTransport for downstream testing
-cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
+serde = ["dep:serde"]  # Serialize/Deserialize for Auth, WalkMode, etc.
+cli = ["dep:clap", "serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
 tls = []      # Future: SNMP over TLS (RFC 6353)
 dtls = []     # Future: SNMP over DTLS (RFC 6353)
 

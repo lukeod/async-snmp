@@ -111,7 +111,7 @@ async fn main() -> ExitCode {
 
     // Build and run the walk
     let start = Instant::now();
-    let result = run_walk(target, version, &args, oid, use_getnext).await;
+    let result = run_walk(target, &args, oid, use_getnext).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -152,109 +152,26 @@ async fn main() -> ExitCode {
 
 async fn run_walk(
     target: std::net::SocketAddr,
-    version: SnmpVersion,
     args: &Args,
     oid: Oid,
     use_getnext: bool,
 ) -> async_snmp::Result<Vec<VarBind>> {
-    let timeout = args.common.timeout_duration();
-    let retries = args.common.retries;
-    let max_repetitions = args.walk.max_repetitions as i32;
+    let auth = args.v3.auth(&args.common)
+        .map_err(|e| async_snmp::Error::Config(e.to_string()))?;
 
-    match version {
-        SnmpVersion::V1 => {
-            let client = Client::v1(target.to_string())
-                .community(args.common.community.as_bytes())
-                .timeout(timeout)
-                .retries(retries)
-                .connect()
-                .await?;
+    let client = Client::builder(target.to_string(), auth)
+        .timeout(args.common.timeout_duration())
+        .retries(args.common.retries)
+        .connect()
+        .await?;
 
-            // V1 only supports GETNEXT
-            let walk = client.walk(oid);
-            collect_walk(walk).await
-        }
-        SnmpVersion::V2c => {
-            let client = Client::v2c(target.to_string())
-                .community(args.common.community.as_bytes())
-                .timeout(timeout)
-                .retries(retries)
-                .connect()
-                .await?;
-
-            if use_getnext {
-                let walk = client.walk(oid);
-                collect_walk(walk).await
-            } else {
-                let walk = client.bulk_walk(oid, max_repetitions);
-                collect_walk(walk).await
-            }
-        }
-        SnmpVersion::V3 => {
-            let username = args.v3.username.clone().expect("username required for v3");
-
-            match (&args.v3.auth_protocol, &args.v3.priv_protocol) {
-                (Some(auth), Some(priv_proto)) => {
-                    // authPriv
-                    let auth_pass = args.v3.auth_password.clone().expect("auth password");
-                    let priv_pass = args.v3.priv_password.clone().expect("priv password");
-
-                    let client = Client::v3(target.to_string(), username)
-                        .auth(*auth, auth_pass)
-                        .privacy(*priv_proto, priv_pass)
-                        .timeout(timeout)
-                        .retries(retries)
-                        .connect()
-                        .await?;
-
-                    if use_getnext {
-                        let walk = client.walk(oid);
-                        collect_walk(walk).await
-                    } else {
-                        let walk = client.bulk_walk(oid, max_repetitions);
-                        collect_walk(walk).await
-                    }
-                }
-                (Some(auth), None) => {
-                    // authNoPriv
-                    let auth_pass = args.v3.auth_password.clone().expect("auth password");
-
-                    let client = Client::v3(target.to_string(), username)
-                        .auth(*auth, auth_pass)
-                        .timeout(timeout)
-                        .retries(retries)
-                        .connect()
-                        .await?;
-
-                    if use_getnext {
-                        let walk = client.walk(oid);
-                        collect_walk(walk).await
-                    } else {
-                        let walk = client.bulk_walk(oid, max_repetitions);
-                        collect_walk(walk).await
-                    }
-                }
-                (None, None) => {
-                    // noAuthNoPriv
-                    let client = Client::v3(target.to_string(), username)
-                        .timeout(timeout)
-                        .retries(retries)
-                        .connect()
-                        .await?;
-
-                    if use_getnext {
-                        let walk = client.walk(oid);
-                        collect_walk(walk).await
-                    } else {
-                        let walk = client.bulk_walk(oid, max_repetitions);
-                        collect_walk(walk).await
-                    }
-                }
-                (None, Some(_)) => {
-                    unreachable!("privacy without authentication should be caught by validation");
-                }
-            }
-        }
+    if use_getnext {
+        let walk = client.walk(oid);
+        collect_walk(walk).await
+    } else {
+        let max_repetitions = args.walk.max_repetitions as i32;
+        let walk = client.bulk_walk(oid, max_repetitions);
+        collect_walk(walk).await
     }
 }
 

@@ -469,11 +469,27 @@ pub enum Error {
     /// Returned when a walk operation receives an OID that is not
     /// lexicographically greater than the previous OID, which would
     /// cause an infinite loop. This indicates a non-conformant SNMP agent.
+    ///
+    /// Only occurs with `OidOrdering::Strict` (the default).
     #[error("walk detected non-increasing OID: {previous} >= {current}")]
     NonIncreasingOid {
         previous: crate::oid::Oid,
         current: crate::oid::Oid,
     },
+
+    /// Walk detected a cycle (same OID returned twice).
+    ///
+    /// Only occurs with `OidOrdering::AllowNonIncreasing`, which uses
+    /// a HashSet to track all seen OIDs and detect cycles.
+    #[error("walk cycle detected: OID {oid} returned twice")]
+    DuplicateOid { oid: crate::oid::Oid },
+
+    /// Configuration error.
+    ///
+    /// Returned when client configuration is invalid (e.g., privacy
+    /// without authentication, missing passwords).
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
 impl Error {

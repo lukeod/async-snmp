@@ -359,6 +359,14 @@ impl fmt::Display for Oid {
     }
 }
 
+impl std::str::FromStr for Oid {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s)
+    }
+}
+
 impl From<&[u32]> for Oid {
     fn from(arcs: &[u32]) -> Self {
         Self::from_slice(arcs)
@@ -636,5 +644,35 @@ mod tests {
         let arcs: Vec<u32> = (0..(MAX_OID_LEN + 1) as u32).collect();
         let oid = Oid::new(arcs);
         assert!(oid.validate_all().is_err());
+    }
+
+    #[test]
+    fn test_oid_fromstr() {
+        // Test basic parsing via FromStr trait
+        let oid: Oid = "1.3.6.1.2.1.1.1.0".parse().unwrap();
+        assert_eq!(oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+
+        // Test empty OID
+        let empty: Oid = "".parse().unwrap();
+        assert!(empty.is_empty());
+
+        // Test single arc
+        let single: Oid = "1".parse().unwrap();
+        assert_eq!(single.arcs(), &[1]);
+
+        // Test roundtrip Display -> FromStr
+        let original = oid!(1, 3, 6, 1, 4, 1, 9, 9, 42);
+        let displayed = original.to_string();
+        let parsed: Oid = displayed.parse().unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_oid_fromstr_invalid() {
+        // Invalid arc value
+        assert!("1.3.abc.1".parse::<Oid>().is_err());
+
+        // Negative number (parsed as invalid)
+        assert!("1.3.-6.1".parse::<Oid>().is_err());
     }
 }
