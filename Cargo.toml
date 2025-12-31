@@ -6,8 +6,14 @@ rust-version = "1.88"
 description = "Modern async-first SNMP client library for Rust"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/async-snmp/async-snmp"
+documentation = "https://docs.rs/async-snmp"
+readme = "README.md"
 keywords = ["snmp", "network", "async", "monitoring"]
 categories = ["network-programming", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 bytes = "1.11.0"
