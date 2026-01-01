@@ -57,13 +57,63 @@ pub enum Value {
     /// fall back to Counter32 (with potential overflow for high-bandwidth counters).
     Counter64(u64),
 
-    /// noSuchObject exception - OID exists but no value
+    /// noSuchObject exception - the requested OID exists in the MIB but has no value.
+    ///
+    /// This exception indicates that the agent recognizes the OID (it's a valid
+    /// MIB object), but there is no instance available. This commonly occurs when
+    /// requesting a table column OID without an index.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    ///
+    /// let response = Value::NoSuchObject;
+    /// assert!(response.is_exception());
+    ///
+    /// // When handling responses, check for exceptions:
+    /// match response {
+    ///     Value::NoSuchObject => println!("OID exists but has no value"),
+    ///     _ => {}
+    /// }
+    /// ```
     NoSuchObject,
 
-    /// noSuchInstance exception - Instance doesn't exist
+    /// noSuchInstance exception - the specific instance does not exist.
+    ///
+    /// This exception indicates that while the MIB object exists, the specific
+    /// instance (index) requested does not. This commonly occurs when querying
+    /// a table row that doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    ///
+    /// let response = Value::NoSuchInstance;
+    /// assert!(response.is_exception());
+    /// ```
     NoSuchInstance,
 
-    /// endOfMibView exception - End of MIB reached during walk
+    /// endOfMibView exception - end of the MIB has been reached.
+    ///
+    /// This exception is returned during GETNEXT/GETBULK operations when
+    /// there are no more OIDs lexicographically greater than the requested OID.
+    /// This is the normal termination condition for SNMP walks.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    ///
+    /// let response = Value::EndOfMibView;
+    /// assert!(response.is_exception());
+    ///
+    /// // Commonly used to detect end of walk
+    /// if matches!(response, Value::EndOfMibView) {
+    ///     println!("Walk complete - reached end of MIB");
+    /// }
+    /// ```
     EndOfMibView,
 
     /// Unknown/unrecognized value type (for forward compatibility)
@@ -72,6 +122,24 @@ pub enum Value {
 
 impl Value {
     /// Try to get as i32.
+    ///
+    /// Returns `Some(i32)` for [`Value::Integer`], `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    ///
+    /// let v = Value::Integer(42);
+    /// assert_eq!(v.as_i32(), Some(42));
+    ///
+    /// let v = Value::Integer(-100);
+    /// assert_eq!(v.as_i32(), Some(-100));
+    ///
+    /// // Counter32 is not an Integer
+    /// let v = Value::Counter32(42);
+    /// assert_eq!(v.as_i32(), None);
+    /// ```
     pub fn as_i32(&self) -> Option<i32> {
         match self {
             Value::Integer(v) => Some(*v),
@@ -80,6 +148,29 @@ impl Value {
     }
 
     /// Try to get as u32.
+    ///
+    /// Returns `Some(u32)` for [`Value::Counter32`], [`Value::Gauge32`],
+    /// [`Value::TimeTicks`], or non-negative [`Value::Integer`]. Returns `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    ///
+    /// // Works for Counter32, Gauge32, TimeTicks
+    /// assert_eq!(Value::Counter32(100).as_u32(), Some(100));
+    /// assert_eq!(Value::Gauge32(200).as_u32(), Some(200));
+    /// assert_eq!(Value::TimeTicks(300).as_u32(), Some(300));
+    ///
+    /// // Works for non-negative integers
+    /// assert_eq!(Value::Integer(50).as_u32(), Some(50));
+    ///
+    /// // Returns None for negative integers
+    /// assert_eq!(Value::Integer(-1).as_u32(), None);
+    ///
+    /// // Counter64 returns None (use as_u64 instead)
+    /// assert_eq!(Value::Counter64(100).as_u32(), None);
+    /// ```
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(*v),
@@ -89,6 +180,29 @@ impl Value {
     }
 
     /// Try to get as u64.
+    ///
+    /// Returns `Some(u64)` for [`Value::Counter64`], or any 32-bit unsigned type
+    /// ([`Value::Counter32`], [`Value::Gauge32`], [`Value::TimeTicks`]), or
+    /// non-negative [`Value::Integer`]. Returns `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    ///
+    /// // Counter64 is the primary use case
+    /// assert_eq!(Value::Counter64(10_000_000_000).as_u64(), Some(10_000_000_000));
+    ///
+    /// // Also works for 32-bit unsigned types
+    /// assert_eq!(Value::Counter32(100).as_u64(), Some(100));
+    /// assert_eq!(Value::Gauge32(200).as_u64(), Some(200));
+    ///
+    /// // Non-negative integers work
+    /// assert_eq!(Value::Integer(50).as_u64(), Some(50));
+    ///
+    /// // Negative integers return None
+    /// assert_eq!(Value::Integer(-1).as_u64(), None);
+    /// ```
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Value::Counter64(v) => Some(*v),
@@ -99,6 +213,26 @@ impl Value {
     }
 
     /// Try to get as bytes.
+    ///
+    /// Returns `Some(&[u8])` for [`Value::OctetString`] or [`Value::Opaque`].
+    /// Returns `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    /// use bytes::Bytes;
+    ///
+    /// let v = Value::OctetString(Bytes::from_static(b"hello"));
+    /// assert_eq!(v.as_bytes(), Some(b"hello".as_slice()));
+    ///
+    /// // Works for Opaque too
+    /// let v = Value::Opaque(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]));
+    /// assert_eq!(v.as_bytes(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    ///
+    /// // Other types return None
+    /// assert_eq!(Value::Integer(42).as_bytes(), None);
+    /// ```
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::OctetString(v) | Value::Opaque(v) => Some(v),
@@ -107,11 +241,48 @@ impl Value {
     }
 
     /// Try to get as string (UTF-8).
+    ///
+    /// Returns `Some(&str)` if the value is an [`Value::OctetString`] or [`Value::Opaque`]
+    /// containing valid UTF-8. Returns `None` for other types or invalid UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    /// use bytes::Bytes;
+    ///
+    /// let v = Value::OctetString(Bytes::from_static(b"Linux router1 5.4.0"));
+    /// assert_eq!(v.as_str(), Some("Linux router1 5.4.0"));
+    ///
+    /// // Invalid UTF-8 returns None
+    /// let v = Value::OctetString(Bytes::from_static(&[0xFF, 0xFE]));
+    /// assert_eq!(v.as_str(), None);
+    ///
+    /// // Binary data with valid UTF-8 bytes still works, but use as_bytes() for clarity
+    /// let binary = Value::OctetString(Bytes::from_static(&[0x80, 0x81, 0x82]));
+    /// assert_eq!(binary.as_str(), None); // Invalid UTF-8 sequence
+    /// assert!(binary.as_bytes().is_some());
+    /// ```
     pub fn as_str(&self) -> Option<&str> {
         self.as_bytes().and_then(|b| std::str::from_utf8(b).ok())
     }
 
     /// Try to get as OID.
+    ///
+    /// Returns `Some(&Oid)` for [`Value::ObjectIdentifier`], `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::{Value, oid};
+    ///
+    /// let v = Value::ObjectIdentifier(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0));
+    /// let oid = v.as_oid().unwrap();
+    /// assert_eq!(oid.to_string(), "1.3.6.1.2.1.1.2.0");
+    ///
+    /// // Other types return None
+    /// assert_eq!(Value::Integer(42).as_oid(), None);
+    /// ```
     pub fn as_oid(&self) -> Option<&Oid> {
         match self {
             Value::ObjectIdentifier(oid) => Some(oid),
@@ -120,6 +291,21 @@ impl Value {
     }
 
     /// Try to get as IP address.
+    ///
+    /// Returns `Some(Ipv4Addr)` for [`Value::IpAddress`], `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Value;
+    /// use std::net::Ipv4Addr;
+    ///
+    /// let v = Value::IpAddress([192, 168, 1, 1]);
+    /// assert_eq!(v.as_ip(), Some(Ipv4Addr::new(192, 168, 1, 1)));
+    ///
+    /// // Other types return None
+    /// assert_eq!(Value::Integer(42).as_ip(), None);
+    /// ```
     pub fn as_ip(&self) -> Option<std::net::Ipv4Addr> {
         match self {
             Value::IpAddress(bytes) => Some(std::net::Ipv4Addr::from(*bytes)),
@@ -332,7 +518,47 @@ impl std::fmt::Display for Value {
     }
 }
 
-// Convenience conversions
+/// Convenience conversions for creating [`Value`] from common Rust types.
+///
+/// # Examples
+///
+/// ```
+/// use async_snmp::Value;
+/// use bytes::Bytes;
+///
+/// // From integers
+/// let v: Value = 42i32.into();
+/// assert_eq!(v.as_i32(), Some(42));
+///
+/// // From strings (creates OctetString)
+/// let v: Value = "hello".into();
+/// assert_eq!(v.as_str(), Some("hello"));
+///
+/// // From String
+/// let v: Value = String::from("world").into();
+/// assert_eq!(v.as_str(), Some("world"));
+///
+/// // From byte slices
+/// let v: Value = (&[1u8, 2, 3][..]).into();
+/// assert_eq!(v.as_bytes(), Some(&[1, 2, 3][..]));
+///
+/// // From Bytes
+/// let v: Value = Bytes::from_static(b"data").into();
+/// assert_eq!(v.as_bytes(), Some(b"data".as_slice()));
+///
+/// // From u64 (creates Counter64)
+/// let v: Value = 10_000_000_000u64.into();
+/// assert_eq!(v.as_u64(), Some(10_000_000_000));
+///
+/// // From Ipv4Addr
+/// use std::net::Ipv4Addr;
+/// let v: Value = Ipv4Addr::new(10, 0, 0, 1).into();
+/// assert_eq!(v.as_ip(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+///
+/// // From [u8; 4] (creates IpAddress)
+/// let v: Value = [192u8, 168, 1, 1].into();
+/// assert!(matches!(v, Value::IpAddress([192, 168, 1, 1])));
+/// ```
 impl From<i32> for Value {
     fn from(v: i32) -> Self {
         Value::Integer(v)

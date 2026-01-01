@@ -34,6 +34,26 @@ impl Oid {
     }
 
     /// Create an OID from arc values.
+    ///
+    /// Accepts any iterator of `u32` values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::oid::Oid;
+    ///
+    /// // From a Vec
+    /// let oid = Oid::new(vec![1, 3, 6, 1, 2, 1]);
+    /// assert_eq!(oid.arcs(), &[1, 3, 6, 1, 2, 1]);
+    ///
+    /// // From an array
+    /// let oid = Oid::new([1, 3, 6, 1]);
+    /// assert_eq!(oid.len(), 4);
+    ///
+    /// // From a range
+    /// let oid = Oid::new(0..5);
+    /// assert_eq!(oid.arcs(), &[0, 1, 2, 3, 4]);
+    /// ```
     pub fn new(arcs: impl IntoIterator<Item = u32>) -> Self {
         Self {
             arcs: arcs.into_iter().collect(),
@@ -41,6 +61,20 @@ impl Oid {
     }
 
     /// Create an OID from a slice of arcs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::oid::Oid;
+    ///
+    /// let arcs = [1, 3, 6, 1, 2, 1, 1, 1, 0];
+    /// let oid = Oid::from_slice(&arcs);
+    /// assert_eq!(oid.to_string(), "1.3.6.1.2.1.1.1.0");
+    ///
+    /// // Empty slice creates an empty OID
+    /// let empty = Oid::from_slice(&[]);
+    /// assert!(empty.is_empty());
+    /// ```
     pub fn from_slice(arcs: &[u32]) -> Self {
         Self {
             arcs: SmallVec::from_slice(arcs),
@@ -109,11 +143,55 @@ impl Oid {
     }
 
     /// Check if this OID starts with another OID.
+    ///
+    /// Returns `true` if `self` begins with the same arcs as `other`.
+    /// An OID always starts with itself, and any OID starts with an empty OID.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::oid::Oid;
+    ///
+    /// let sys_descr = Oid::parse("1.3.6.1.2.1.1.1.0").unwrap();
+    /// let system = Oid::parse("1.3.6.1.2.1.1").unwrap();
+    /// let interfaces = Oid::parse("1.3.6.1.2.1.2").unwrap();
+    ///
+    /// // sysDescr is under the system subtree
+    /// assert!(sys_descr.starts_with(&system));
+    ///
+    /// // sysDescr is not under the interfaces subtree
+    /// assert!(!sys_descr.starts_with(&interfaces));
+    ///
+    /// // Every OID starts with itself
+    /// assert!(sys_descr.starts_with(&sys_descr));
+    ///
+    /// // Every OID starts with the empty OID
+    /// assert!(sys_descr.starts_with(&Oid::empty()));
+    /// ```
     pub fn starts_with(&self, other: &Oid) -> bool {
         self.arcs.len() >= other.arcs.len() && self.arcs[..other.arcs.len()] == other.arcs[..]
     }
 
     /// Get the parent OID (all arcs except the last).
+    ///
+    /// Returns `None` if the OID is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::oid::Oid;
+    ///
+    /// let sys_descr = Oid::parse("1.3.6.1.2.1.1.1.0").unwrap();
+    /// let parent = sys_descr.parent().unwrap();
+    /// assert_eq!(parent.to_string(), "1.3.6.1.2.1.1.1");
+    ///
+    /// // Can chain parent() calls
+    /// let grandparent = parent.parent().unwrap();
+    /// assert_eq!(grandparent.to_string(), "1.3.6.1.2.1.1");
+    ///
+    /// // Empty OID has no parent
+    /// assert!(Oid::empty().parent().is_none());
+    /// ```
     pub fn parent(&self) -> Option<Oid> {
         if self.arcs.is_empty() {
             None
@@ -125,6 +203,22 @@ impl Oid {
     }
 
     /// Create a child OID by appending an arc.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::oid::Oid;
+    ///
+    /// let system = Oid::parse("1.3.6.1.2.1.1").unwrap();
+    ///
+    /// // sysDescr is system.1
+    /// let sys_descr = system.child(1);
+    /// assert_eq!(sys_descr.to_string(), "1.3.6.1.2.1.1.1");
+    ///
+    /// // sysDescr.0 is the scalar instance
+    /// let sys_descr_instance = sys_descr.child(0);
+    /// assert_eq!(sys_descr_instance.to_string(), "1.3.6.1.2.1.1.1.0");
+    /// ```
     pub fn child(&self, arc: u32) -> Oid {
         let mut arcs = self.arcs.clone();
         arcs.push(arc);
@@ -136,6 +230,28 @@ impl Oid {
     /// - arc1 must be 0, 1, or 2
     /// - arc2 must be <= 39 when arc1 is 0 or 1
     /// - arc2 can be any value when arc1 is 2
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::oid::Oid;
+    ///
+    /// // Standard SNMP OIDs are valid
+    /// let oid = Oid::parse("1.3.6.1.2.1.1.1.0").unwrap();
+    /// assert!(oid.validate().is_ok());
+    ///
+    /// // arc1 must be 0, 1, or 2
+    /// let invalid = Oid::from_slice(&[3, 0]);
+    /// assert!(invalid.validate().is_err());
+    ///
+    /// // arc2 must be <= 39 when arc1 is 0 or 1
+    /// let invalid = Oid::from_slice(&[0, 40]);
+    /// assert!(invalid.validate().is_err());
+    ///
+    /// // arc2 can be any value when arc1 is 2
+    /// let valid = Oid::from_slice(&[2, 999]);
+    /// assert!(valid.validate().is_ok());
+    /// ```
     pub fn validate(&self) -> Result<()> {
         if self.arcs.is_empty() {
             return Ok(());
@@ -406,12 +522,24 @@ impl Ord for Oid {
 
 /// Macro to create an OID at compile time.
 ///
+/// This is the preferred way to create OID constants since it's concise
+/// and avoids parsing overhead.
+///
 /// # Examples
 ///
 /// ```
 /// use async_snmp::oid;
 ///
+/// // Create an OID for sysDescr.0
 /// let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+/// assert_eq!(sys_descr.to_string(), "1.3.6.1.2.1.1.1.0");
+///
+/// // Trailing commas are allowed
+/// let sys_name = oid!(1, 3, 6, 1, 2, 1, 1, 5, 0,);
+///
+/// // Can use in const contexts (via from_slice)
+/// let interfaces = oid!(1, 3, 6, 1, 2, 1, 2);
+/// assert!(sys_descr.starts_with(&oid!(1, 3, 6, 1, 2, 1, 1)));
 /// ```
 #[macro_export]
 macro_rules! oid {
