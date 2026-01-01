@@ -128,6 +128,52 @@
 //! }
 //! ```
 //!
+//! ## High-Throughput SNMPv3 Polling
+//!
+//! SNMPv3 has two expensive per-connection operations:
+//! - **Password derivation**: ~850μs to derive keys from passwords (SHA-256)
+//! - **Engine discovery**: Round-trip to learn the agent's engine ID and time
+//!
+//! For polling many targets with shared credentials, cache both:
+//!
+//! ```rust,no_run
+//! use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol};
+//! use async_snmp::{SharedUdpTransport, oid};
+//! use std::sync::Arc;
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! // 1. Derive master keys once (expensive: ~850μs)
+//! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
+//!     .with_privacy(PrivProtocol::Aes128, b"privpassword");
+//!
+//! // 2. Share engine discovery results across clients
+//! let engine_cache = Arc::new(EngineCache::new());
+//!
+//! // 3. Use shared transport for socket efficiency
+//! let transport = SharedUdpTransport::bind("0.0.0.0:0").await?;
+//!
+//! // Poll multiple targets - only ~1μs key localization per engine
+//! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
+//!     let handle = transport.handle(target.parse().unwrap());
+//!     let auth = Auth::usm("snmpuser").with_master_keys(master_keys.clone());
+//!
+//!     let client = Client::builder(target, auth)
+//!         .engine_cache(engine_cache.clone())
+//!         .build(handle)?;
+//!
+//!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
+//!     println!("{}: {:?}", target, result.value);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! | Optimization | Without | With | Savings |
+//! |--------------|---------|------|---------|
+//! | `MasterKeys` | 850μs/engine | 1μs/engine | ~99.9% |
+//! | `EngineCache` | 1 RTT/engine | 0 RTT (cached) | 1 RTT |
+//! | `SharedUdpTransport` | 1 socket/target | 1 socket total | FD limits |
+//!
 //! ## Graceful Shutdown
 //!
 //! Use `tokio::select!` or cancellation tokens for clean shutdown.
