@@ -156,7 +156,7 @@ impl AgentBuilder {
     /// Create a new builder with default settings.
     ///
     /// Defaults:
-    /// - Bind address: `0.0.0.0:161`
+    /// - Bind address: `0.0.0.0:161` (UDP)
     /// - Max message size: 1472 bytes (Ethernet MTU - IP/UDP headers)
     /// - No communities or USM users (all requests rejected)
     /// - No handlers registered
@@ -172,10 +172,10 @@ impl AgentBuilder {
         }
     }
 
-    /// Set the bind address.
+    /// Set the UDP bind address.
     ///
-    /// Default is `0.0.0.0:161` (standard SNMP port). Note that binding to
-    /// port 161 typically requires root/administrator privileges.
+    /// Default is `0.0.0.0:161` (standard SNMP agent port). Note that binding
+    /// to UDP port 161 typically requires root/administrator privileges.
     ///
     /// # IPv4 Examples
     ///

@@ -83,31 +83,36 @@ struct ClientInner<T: Transport> {
 }
 
 /// Client configuration.
+///
+/// Most users should use [`ClientBuilder`] rather than constructing this directly.
 #[derive(Clone)]
 pub struct ClientConfig {
-    /// SNMP version
+    /// SNMP version (default: V2c)
     pub version: Version,
-    /// Community string (v1/v2c)
+    /// Community string for v1/v2c (default: "public")
     pub community: Bytes,
-    /// Request timeout
+    /// Request timeout (default: 5 seconds)
     pub timeout: Duration,
-    /// Number of retries
+    /// Number of retries (default: 3)
     pub retries: u32,
-    /// Maximum OIDs per request
+    /// Maximum OIDs per request (default: 10)
     pub max_oids_per_request: usize,
-    /// SNMPv3 security configuration
+    /// SNMPv3 security configuration (default: None)
     pub v3_security: Option<V3SecurityConfig>,
-    /// Walk operation mode (Auto, GetNext, or GetBulk)
+    /// Walk operation mode (default: Auto)
     pub walk_mode: WalkMode,
-    /// OID ordering behavior during walk operations
+    /// OID ordering behavior during walk operations (default: Strict)
     pub oid_ordering: OidOrdering,
-    /// Maximum results from a single walk operation (None = unlimited)
+    /// Maximum results from a single walk operation (default: None/unlimited)
     pub max_walk_results: Option<usize>,
     /// Max-repetitions for GETBULK operations (default: 25)
     pub max_repetitions: u32,
 }
 
 impl Default for ClientConfig {
+    /// Returns configuration for SNMPv2c with community "public".
+    ///
+    /// See field documentation for all default values.
     fn default() -> Self {
         Self {
             version: Version::V2c,
@@ -605,13 +610,19 @@ impl<T: Transport> Client<T> {
 
     /// GETBULK request (SNMPv2c/v3 only).
     ///
-    /// Retrieves multiple variable bindings in a single request.
+    /// Efficiently retrieves multiple variable bindings in a single request.
+    /// GETBULK splits the requested OIDs into two groups:
+    ///
+    /// - **Non-repeaters** (first N OIDs): Each gets a single GETNEXT, returning
+    ///   one value per OID. Use for scalar values like `sysUpTime.0`.
+    /// - **Repeaters** (remaining OIDs): Each gets up to `max_repetitions` GETNEXTs,
+    ///   returning multiple values per OID. Use for walking table columns.
     ///
     /// # Arguments
     ///
     /// * `oids` - OIDs to retrieve
-    /// * `non_repeaters` - Number of OIDs to treat as non-repeating
-    /// * `max_repetitions` - Maximum iterations for repeating OIDs
+    /// * `non_repeaters` - How many OIDs (from the start) are non-repeating
+    /// * `max_repetitions` - Maximum rows to return for each repeating OID
     ///
     /// # Example
     ///
@@ -619,11 +630,13 @@ impl<T: Transport> Client<T> {
     /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
     /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
-    /// // Get next 10 entries starting from ifDescr
-    /// let results = client.get_bulk(&[oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2)], 0, 10).await?;
-    /// for vb in results {
-    ///     println!("{}: {:?}", vb.oid, vb.value);
-    /// }
+    /// // Get sysUpTime (non-repeater) plus 10 interface descriptions (repeater)
+    /// let results = client.get_bulk(
+    ///     &[oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2)],
+    ///     1,  // first OID is non-repeating
+    ///     10, // get up to 10 values for the second OID
+    /// ).await?;
+    /// // Results: [sysUpTime value, ifDescr.1, ifDescr.2, ..., ifDescr.10]
     /// # Ok(())
     /// # }
     /// ```
@@ -727,10 +740,10 @@ impl<T: Transport> Client<T> {
     /// Walk an OID subtree using GETBULK (more efficient than GETNEXT).
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
-    /// Uses GETBULK internally for better performance when walking large tables.
+    /// Uses GETBULK internally with `non_repeaters=0`, fetching `max_repetitions`
+    /// values per request for efficient table traversal.
     ///
     /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
-    /// If `max_repetitions` is not specified, uses the client's configured `max_repetitions`.
     ///
     /// # Arguments
     ///

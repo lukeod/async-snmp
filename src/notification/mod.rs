@@ -139,7 +139,11 @@ pub struct NotificationReceiverBuilder {
 }
 
 impl NotificationReceiverBuilder {
-    /// Create a new builder.
+    /// Create a new builder with default settings.
+    ///
+    /// Defaults:
+    /// - Bind address: `0.0.0.0:162` (UDP, standard SNMP trap port)
+    /// - No USM users (v3 notifications rejected until users are added)
     pub fn new() -> Self {
         Self {
             bind_addr: "0.0.0.0:162".to_string(),
@@ -147,9 +151,9 @@ impl NotificationReceiverBuilder {
         }
     }
 
-    /// Set the bind address.
+    /// Set the UDP bind address.
     ///
-    /// Default is "0.0.0.0:162" (standard trap port).
+    /// Default is `0.0.0.0:162` (UDP, standard SNMP trap port).
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
         self

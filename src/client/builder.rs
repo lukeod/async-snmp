@@ -117,17 +117,23 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the number of retries (default: 3).
+    /// Set the number of retries for UDP transports (default: 3).
     ///
-    /// The client will retry failed requests up to this many times before
-    /// returning an error. Set to 0 to disable retries.
+    /// On timeout, the client immediately resends the request up to this many
+    /// times before returning an error. Retries are disabled for TCP (which
+    /// handles reliability at the transport layer).
+    ///
+    /// **Note:** There is no exponential backoff between retries. Each attempt
+    /// uses the full timeout, so worst-case latency is `timeout × (retries + 1)`.
+    /// For overwhelmed agents, consider reducing retries or increasing timeout
+    /// rather than adding more retries.
     ///
     /// # Example
     ///
     /// ```rust
     /// use async_snmp::{Auth, ClientBuilder};
     ///
-    /// // Increase retries for unreliable networks
+    /// // More retries for lossy networks (but beware of total latency)
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .retries(5);
     ///
@@ -166,19 +172,28 @@ impl ClientBuilder {
 
     /// Set max-repetitions for GETBULK operations (default: 25).
     ///
-    /// Controls how many rows are requested per GETBULK PDU during walk
-    /// operations. Higher values reduce round-trips but increase response size.
+    /// Controls how many values are requested per GETBULK PDU during walks.
+    /// This is a performance tuning parameter with trade-offs:
+    ///
+    /// - **Higher values**: Fewer network round-trips, faster walks on reliable
+    ///   networks. But larger responses risk UDP fragmentation or may exceed
+    ///   agent response buffer limits (causing truncation).
+    /// - **Lower values**: More round-trips (higher latency), but smaller
+    ///   responses that fit within MTU limits.
+    ///
+    /// The default of 25 is conservative. For local/reliable networks with
+    /// capable agents, values of 50-100 can significantly speed up large walks.
     ///
     /// # Example
     ///
     /// ```rust
     /// use async_snmp::{Auth, ClientBuilder};
     ///
-    /// // Reduce max-repetitions for devices with limited buffer sizes
+    /// // Lower value for agents with small response buffers or lossy networks
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_repetitions(10);
     ///
-    /// // Increase for faster walks over reliable networks
+    /// // Higher value for fast local network walks
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_repetitions(50);
     /// ```

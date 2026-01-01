@@ -402,13 +402,20 @@ impl SharedUdpTransportBuilder {
         self
     }
 
-    /// Configure warning on source address mismatch.
+    /// Configure warning on source address mismatch (default: true).
+    ///
+    /// When enabled, logs a warning if a response arrives from a different
+    /// IP address than the request target. This is common with load balancers,
+    /// NAT, or multi-homed devices.
     pub fn warn_on_source_mismatch(mut self, warn: bool) -> Self {
         self.config.warn_on_source_mismatch = warn;
         self
     }
 
-    /// Set maximum message size.
+    /// Set maximum receive buffer size (default: 65535).
+    ///
+    /// This is the maximum size of incoming UDP datagrams. Messages larger
+    /// than this will be truncated.
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.config.max_message_size = size;
         self

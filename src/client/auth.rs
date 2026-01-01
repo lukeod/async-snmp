@@ -53,6 +53,7 @@ pub enum Auth {
 }
 
 impl Default for Auth {
+    /// Returns `Auth::v2c("public")`.
     fn default() -> Self {
         Auth::v2c("public")
     }
