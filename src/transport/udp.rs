@@ -1,4 +1,56 @@
-//! UDP transport implementation.
+//! UDP transport implementation for SNMP clients.
+//!
+//! This module provides [`UdpTransport`], a simple UDP-based transport for SNMP
+//! communication. Each transport instance owns a "connected" UDP socket bound
+//! to a specific target.
+//!
+//! # Connection Behavior
+//!
+//! Despite the term "connected", UDP sockets created by [`UdpTransport::connect()`]
+//! do not establish a stateful connection like TCP. Instead, the kernel:
+//!
+//! 1. Associates the socket with the target address for `send()` calls
+//! 2. Filters incoming packets to only accept those from the target
+//! 3. Enables better error reporting (e.g., ICMP port unreachable)
+//!
+//! This is more efficient than unconnected UDP for single-target communication.
+//!
+//! # When to Use
+//!
+//! - **1-100 targets**: `UdpTransport` is simpler and sufficient
+//! - **100+ targets**: Consider [`SharedUdpTransport`](super::SharedUdpTransport)
+//!   to reduce socket overhead
+//! - **Reliable delivery needed**: Use [`TcpTransport`](super::TcpTransport) instead
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use async_snmp::{Auth, Client};
+//! use std::time::Duration;
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! // The standard way to create a UDP client
+//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     .timeout(Duration::from_secs(5))
+//!     .retries(3)
+//!     .connect()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For direct transport construction:
+//!
+//! ```rust,no_run
+//! use async_snmp::transport::UdpTransport;
+//! use async_snmp::{Client, ClientConfig};
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! let transport = UdpTransport::connect("192.168.1.1:161".parse().unwrap()).await?;
+//! let client = Client::new(transport, ClientConfig::default());
+//! # Ok(())
+//! # }
+//! ```
 
 use super::{Transport, extract_request_id};
 use crate::error::{Error, Result};
@@ -14,13 +66,39 @@ use tokio::time::timeout;
 /// UDP transport for a single target.
 ///
 /// Each `UdpTransport` owns a connected UDP socket to a specific target.
-/// For high-throughput scenarios with many targets, use `SharedUdpTransport` instead.
+/// For high-throughput scenarios with many targets, consider using
+/// [`SharedUdpTransport`](super::SharedUdpTransport) instead.
 ///
-/// ## Concurrent Request Handling
+/// # Cloning
+///
+/// `UdpTransport` uses `Arc` internally, so cloning is cheap. Multiple clients
+/// can share the same transport, though this is typically only useful for
+/// different SNMP configurations to the same target.
+///
+/// # Concurrent Request Handling
 ///
 /// When multiple concurrent requests are made through the same `UdpTransport`,
 /// responses are properly correlated using request IDs. If a caller receives a
 /// response for a different request, it buffers the response for the correct caller.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use async_snmp::transport::UdpTransport;
+/// use async_snmp::{Client, ClientConfig};
+/// use std::time::Duration;
+///
+/// # async fn example() -> async_snmp::Result<()> {
+/// // Connect with a timeout
+/// let transport = UdpTransport::connect_timeout(
+///     "192.168.1.1:161".parse().unwrap(),
+///     Duration::from_secs(5)
+/// ).await?;
+///
+/// let client = Client::new(transport, ClientConfig::default());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct UdpTransport {
     inner: Arc<UdpTransportInner>,

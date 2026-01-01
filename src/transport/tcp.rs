@@ -1,10 +1,77 @@
-//! TCP transport implementation.
+//! TCP transport implementation for SNMP clients.
 //!
-//! TCP transport uses BER self-describing length for message framing.
-//! Each SNMP message is a BER-encoded SEQUENCE, so the receiver reads:
+//! This module provides [`TcpTransport`], a TCP-based transport for SNMP
+//! communication. TCP transport is useful when UDP is unreliable (firewalls,
+//! lossy networks) or when larger message sizes are needed.
+//!
+//! # Message Framing
+//!
+//! Unlike UDP where each datagram is a complete message, TCP is a byte stream.
+//! SNMP over TCP uses BER's self-describing length for framing:
+//!
+//! ```text
+//! +------+--------+------------+
+//! | 0x30 | Length |  Content   |
+//! +------+--------+------------+
+//!   Tag   1-5 bytes  N bytes
+//! ```
+//!
+//! The receiver reads:
 //! 1. Tag byte (0x30 for SEQUENCE)
 //! 2. Length field (1-5 bytes, definite form only)
 //! 3. Content bytes (length determined by step 2)
+//!
+//! This is the native BER encoding - no additional framing is needed.
+//!
+//! # When to Prefer TCP Over UDP
+//!
+//! | Use Case | Recommendation |
+//! |----------|----------------|
+//! | Standard polling | UDP (lower overhead, retries handle loss) |
+//! | Firewalled networks | TCP (stateful connection may pass firewall) |
+//! | Large responses (>64KB) | TCP (no UDP datagram size limit) |
+//! | Unreliable networks | TCP (built-in retransmission) |
+//! | Simple deployment | UDP (no connection state to manage) |
+//!
+//! # No Automatic Retries
+//!
+//! Since TCP guarantees delivery or connection failure, the client disables
+//! automatic retries when using TCP transport. A timeout means the connection
+//! is likely broken, and retry would require reconnection.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use async_snmp::{Auth, Client};
+//! use std::time::Duration;
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! // Create a TCP client via the builder
+//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     .timeout(Duration::from_secs(10))
+//!     .connect_tcp()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For direct transport construction:
+//!
+//! ```rust,no_run
+//! use async_snmp::transport::TcpTransport;
+//! use async_snmp::{Client, ClientConfig};
+//! use std::time::Duration;
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! let transport = TcpTransport::connect_timeout(
+//!     "192.168.1.1:161".parse().unwrap(),
+//!     Duration::from_secs(5)
+//! ).await?;
+//!
+//! let client = Client::new(transport, ClientConfig::default());
+//! # Ok(())
+//! # }
+//! ```
 
 use super::Transport;
 use crate::error::{DecodeErrorKind, Error, Result};
@@ -17,23 +84,50 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 
-/// Maximum SNMP message size for TCP (per net-snmp SNMP_MAX_PACKET_LEN).
+/// Maximum SNMP message size for TCP (per RFC 3430).
 const MAX_TCP_MESSAGE_SIZE: usize = 0x7fffffff;
 
 /// TCP transport for a single target.
 ///
 /// Each `TcpTransport` owns a TCP connection to a specific target.
 /// Unlike UDP, TCP is stream-oriented so messages are framed using
-/// BER's self-describing length.
+/// BER's self-describing length encoding.
+///
+/// # Connection Lifecycle
+///
+/// The connection is established during construction and remains open
+/// for the lifetime of the transport. If the connection fails, subsequent
+/// operations return errors and a new transport must be created.
+///
+/// # No Retries
 ///
 /// Since TCP guarantees delivery or failure, the client does not retry
-/// on timeout when using TCP transport (`is_stream() = true`).
+/// on timeout when using TCP transport ([`is_stream()`](Transport::is_stream)
+/// returns `true`). A timeout indicates the connection is likely broken.
 ///
-/// ## Concurrent Request Handling
+/// # Serialized Operations
 ///
 /// Request-response pairs are serialized to ensure correct correlation.
 /// The stream lock is held from `send()` until `recv()` completes,
 /// preventing interleaving of concurrent requests.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use async_snmp::transport::TcpTransport;
+/// use async_snmp::{Client, ClientConfig};
+/// use std::time::Duration;
+///
+/// # async fn example() -> async_snmp::Result<()> {
+/// let transport = TcpTransport::connect_timeout(
+///     "192.168.1.1:161".parse().unwrap(),
+///     Duration::from_secs(5)
+/// ).await?;
+///
+/// let client = Client::new(transport, ClientConfig::default());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct TcpTransport {
     inner: Arc<TcpTransportInner>,

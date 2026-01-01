@@ -1,6 +1,23 @@
-//! Transport layer abstraction.
+//! Transport layer abstraction for SNMP communication.
 //!
-//! Provides the `Transport` trait and implementations for UDP, shared UDP, and TCP.
+//! This module provides the [`Transport`] trait and three implementations:
+//!
+//! - [`UdpTransport`] - One connected UDP socket per target (simple, default)
+//! - [`SharedUdpTransport`] - Single UDP socket for many targets (high-throughput)
+//! - [`TcpTransport`] - TCP stream with BER framing (reliable, larger messages)
+//!
+//! # Choosing a Transport
+//!
+//! | Scenario | Recommended Transport |
+//! |----------|----------------------|
+//! | Normal use (1-100 targets) | [`UdpTransport`] via [`Client::builder().connect()`](crate::Client::builder) |
+//! | High-throughput (100-10,000+ targets) | [`SharedUdpTransport`] with handles |
+//! | Firewall/NAT traversal | [`TcpTransport`] via [`Client::builder().connect_tcp()`](crate::ClientBuilder::connect_tcp) |
+//! | Large SNMP messages (>64KB) | [`TcpTransport`] |
+//!
+//! Most users should use [`Client::builder()`](crate::Client::builder) which creates
+//! the appropriate transport automatically. Direct transport construction is only
+//! needed for advanced use cases like shared transports.
 
 mod shared;
 mod tcp;
