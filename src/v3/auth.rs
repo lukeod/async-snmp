@@ -30,7 +30,7 @@
 //! let key2 = master.localize(b"\x80\x00\x1f\x88\x81...");
 //! ```
 
-use digest::{Digest, KeyInit, Mac, OutputSizeUser};
+use digest::{Digest, KeyInit, Mac, OutputSizeUser, core_api::BlockSizeUser};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::AuthProtocol;
@@ -355,81 +355,24 @@ where
 /// Compute HMAC with the appropriate algorithm.
 fn compute_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> Vec<u8> {
     match protocol {
-        AuthProtocol::Md5 => compute_hmac_md5(key, data, 12),
-        AuthProtocol::Sha1 => compute_hmac_sha1(key, data, 12),
-        AuthProtocol::Sha224 => compute_hmac_sha224(key, data, 16),
-        AuthProtocol::Sha256 => compute_hmac_sha256(key, data, 24),
-        AuthProtocol::Sha384 => compute_hmac_sha384(key, data, 32),
-        AuthProtocol::Sha512 => compute_hmac_sha512(key, data, 48),
+        AuthProtocol::Md5 => compute_hmac_impl::<md5::Md5>(key, data, 12),
+        AuthProtocol::Sha1 => compute_hmac_impl::<sha1::Sha1>(key, data, 12),
+        AuthProtocol::Sha224 => compute_hmac_impl::<sha2::Sha224>(key, data, 16),
+        AuthProtocol::Sha256 => compute_hmac_impl::<sha2::Sha256>(key, data, 24),
+        AuthProtocol::Sha384 => compute_hmac_impl::<sha2::Sha384>(key, data, 32),
+        AuthProtocol::Sha512 => compute_hmac_impl::<sha2::Sha512>(key, data, 48),
     }
 }
 
-/// Compute HMAC-MD5 and truncate.
-fn compute_hmac_md5(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8> {
-    use hmac::Hmac;
-    type HmacMd5 = Hmac<md5::Md5>;
-
-    let mut mac = <HmacMd5 as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
-    Mac::update(&mut mac, data);
-    let result = mac.finalize().into_bytes();
-    result[..truncate_len].to_vec()
-}
-
-/// Compute HMAC-SHA1 and truncate.
-fn compute_hmac_sha1(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8> {
-    use hmac::Hmac;
-    type HmacSha1 = Hmac<sha1::Sha1>;
+/// Generic HMAC computation with truncation.
+fn compute_hmac_impl<D>(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8>
+where
+    D: Digest + BlockSizeUser + Clone,
+{
+    use hmac::SimpleHmac;
 
     let mut mac =
-        <HmacSha1 as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
-    Mac::update(&mut mac, data);
-    let result = mac.finalize().into_bytes();
-    result[..truncate_len].to_vec()
-}
-
-/// Compute HMAC-SHA224 and truncate.
-fn compute_hmac_sha224(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8> {
-    use hmac::Hmac;
-    type HmacSha224 = Hmac<sha2::Sha224>;
-
-    let mut mac =
-        <HmacSha224 as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
-    Mac::update(&mut mac, data);
-    let result = mac.finalize().into_bytes();
-    result[..truncate_len].to_vec()
-}
-
-/// Compute HMAC-SHA256 and truncate.
-fn compute_hmac_sha256(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8> {
-    use hmac::Hmac;
-    type HmacSha256 = Hmac<sha2::Sha256>;
-
-    let mut mac =
-        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
-    Mac::update(&mut mac, data);
-    let result = mac.finalize().into_bytes();
-    result[..truncate_len].to_vec()
-}
-
-/// Compute HMAC-SHA384 and truncate.
-fn compute_hmac_sha384(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8> {
-    use hmac::Hmac;
-    type HmacSha384 = Hmac<sha2::Sha384>;
-
-    let mut mac =
-        <HmacSha384 as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
-    Mac::update(&mut mac, data);
-    let result = mac.finalize().into_bytes();
-    result[..truncate_len].to_vec()
-}
-
-/// Compute HMAC-SHA512 and truncate.
-fn compute_hmac_sha512(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8> {
-    use hmac::Hmac;
-    type HmacSha512 = Hmac<sha2::Sha512>;
-
-    let mut mac =
-        <HmacSha512 as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
+        <SimpleHmac<D> as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
     Mac::update(&mut mac, data);
     let result = mac.finalize().into_bytes();
     result[..truncate_len].to_vec()
