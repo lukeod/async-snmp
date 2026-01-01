@@ -1,6 +1,6 @@
 # async-snmp
 
-[![CI](https://github.com/async-snmp/async-snmp/actions/workflows/ci.yml/badge.svg)](https://github.com/async-snmp/async-snmp/actions/workflows/ci.yml)
+[![CI](https://github.com/lukeod/async-snmp/actions/workflows/ci.yml/badge.svg)](https://github.com/lukeod/async-snmp/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/async-snmp.svg)](https://crates.io/crates/async-snmp)
 [![Documentation](https://docs.rs/async-snmp/badge.svg)](https://docs.rs/async-snmp)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://blog.rust-lang.org/)
