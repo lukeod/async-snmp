@@ -1,6 +1,154 @@
 //! Error types for async-snmp.
 //!
+//! This module provides comprehensive error handling for SNMP operations, including:
+//!
+//! - [`Error`] - The main error type for all library operations
+//! - [`ErrorStatus`] - SNMP protocol errors returned by agents (RFC 3416)
+//! - Helper types for authentication, encryption, and encoding errors
+//!
 //! All errors are `#[non_exhaustive]` to allow adding new variants without breaking changes.
+//!
+//! # Error Handling Patterns
+//!
+//! ## Basic Error Matching
+//!
+//! Most applications should match on specific error variants to provide appropriate responses:
+//!
+//! ```no_run
+//! use async_snmp::{Auth, Client, Error, ErrorStatus, oid};
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     .connect()
+//!     .await?;
+//!
+//! match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
+//!     Ok(varbind) => {
+//!         println!("Value: {:?}", varbind.value);
+//!     }
+//!     Err(Error::Timeout { elapsed, retries, .. }) => {
+//!         println!("Request timed out after {:?} ({} retries)", elapsed, retries);
+//!     }
+//!     Err(Error::Snmp { status, index, .. }) => {
+//!         println!("SNMP error: {} at index {}", status, index);
+//!     }
+//!     Err(e) => {
+//!         println!("Other error: {}", e);
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## SNMP Protocol Errors
+//!
+//! [`ErrorStatus`] represents errors returned by SNMP agents. Common cases include:
+//!
+//! ```no_run
+//! use async_snmp::{Auth, Client, Error, ErrorStatus, Value, oid};
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! let client = Client::builder("192.168.1.1:161", Auth::v2c("private"))
+//!     .connect()
+//!     .await?;
+//!
+//! let result = client.set(&oid!(1, 3, 6, 1, 2, 1, 1, 4, 0), Value::from("admin@example.com")).await;
+//!
+//! if let Err(Error::Snmp { status, oid, .. }) = result {
+//!     match status {
+//!         ErrorStatus::NoSuchName => {
+//!             println!("OID does not exist");
+//!         }
+//!         ErrorStatus::NotWritable => {
+//!             println!("Object is read-only");
+//!         }
+//!         ErrorStatus::AuthorizationError => {
+//!             println!("Access denied - check community string");
+//!         }
+//!         ErrorStatus::WrongType | ErrorStatus::WrongValue => {
+//!             println!("Invalid value for this OID");
+//!         }
+//!         _ => {
+//!             println!("SNMP error: {}", status);
+//!         }
+//!     }
+//!     if let Some(oid) = oid {
+//!         println!("Problematic OID: {}", oid);
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Timeout Handling
+//!
+//! Timeouts include retry information to help diagnose connectivity issues:
+//!
+//! ```no_run
+//! use async_snmp::{Auth, Client, Error, oid};
+//! use std::time::Duration;
+//!
+//! # async fn example() {
+//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     .timeout(Duration::from_secs(2))
+//!     .retries(3)
+//!     .connect()
+//!     .await
+//!     .expect("failed to create client");
+//!
+//! match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
+//!     Err(Error::Timeout { target, elapsed, request_id, retries }) => {
+//!         if let Some(addr) = target {
+//!             println!("No response from {} after {:?}", addr, elapsed);
+//!         }
+//!         println!("Request ID {} failed after {} retries", request_id, retries);
+//!         // Consider: is the host reachable? Is SNMP enabled? Is the port correct?
+//!     }
+//!     _ => {}
+//! }
+//! # }
+//! ```
+//!
+//! ## SNMPv3 Errors
+//!
+//! SNMPv3 operations can fail with authentication or encryption errors:
+//!
+//! ```no_run
+//! use async_snmp::{Auth, AuthProtocol, Client, Error, AuthErrorKind, oid};
+//!
+//! # async fn example() {
+//! let client = Client::builder(
+//!     "192.168.1.1:161",
+//!     Auth::usm("admin").auth(AuthProtocol::Sha256, "wrongpassword"),
+//! )
+//! .connect()
+//! .await
+//! .expect("failed to create client");
+//!
+//! match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
+//!     Err(Error::AuthenticationFailed { kind, .. }) => {
+//!         match kind {
+//!             AuthErrorKind::HmacMismatch => {
+//!                 println!("Wrong password or credentials");
+//!             }
+//!             AuthErrorKind::NoUser => {
+//!                 println!("User not configured on agent");
+//!             }
+//!             _ => {
+//!                 println!("Auth failed: {}", kind);
+//!             }
+//!         }
+//!     }
+//!     Err(Error::NotInTimeWindow { .. }) => {
+//!         println!("Clock skew between client and agent");
+//!     }
+//!     Err(Error::UnknownEngineId { .. }) => {
+//!         println!("Engine discovery failed");
+//!     }
+//!     _ => {}
+//! }
+//! # }
+//! ```
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -260,30 +408,86 @@ impl std::fmt::Display for OidErrorKind {
     }
 }
 
-/// SNMP error status codes (RFC 3416).
+/// SNMP protocol error status codes (RFC 3416).
+///
+/// These codes are returned by SNMP agents to indicate the result of an operation.
+/// The error status is included in the [`Error::Snmp`] variant along with an error
+/// index indicating which varbind caused the error.
+///
+/// # Error Categories
+///
+/// ## SNMPv1 Errors (0-5)
+///
+/// - `NoError` - Operation succeeded
+/// - `TooBig` - Response too large for transport
+/// - `NoSuchName` - OID not found (v1 only; v2c+ uses exceptions)
+/// - `BadValue` - Invalid value in SET
+/// - `ReadOnly` - Attempted write to read-only object
+/// - `GenErr` - Unspecified error
+///
+/// ## SNMPv2c/v3 Errors (6-18)
+///
+/// These provide more specific error information for SET operations:
+///
+/// - `NoAccess` - Object not accessible (access control)
+/// - `WrongType` - Value has wrong ASN.1 type
+/// - `WrongLength` - Value has wrong length
+/// - `WrongValue` - Value out of range or invalid
+/// - `NotWritable` - Object does not support SET
+/// - `AuthorizationError` - Access denied by VACM
+///
+/// # Example
+///
+/// ```
+/// use async_snmp::ErrorStatus;
+///
+/// let status = ErrorStatus::from_i32(2);
+/// assert_eq!(status, ErrorStatus::NoSuchName);
+/// assert_eq!(status.as_i32(), 2);
+/// println!("Error: {}", status); // prints "noSuchName"
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorStatus {
+    /// Operation completed successfully (status = 0).
     NoError,
+    /// Response message would be too large for transport (status = 1).
     TooBig,
+    /// Requested OID not found (status = 2). SNMPv1 only; v2c+ uses exception values.
     NoSuchName,
+    /// Invalid value provided in SET request (status = 3).
     BadValue,
+    /// Attempted to SET a read-only object (status = 4).
     ReadOnly,
+    /// Unspecified error occurred (status = 5).
     GenErr,
+    /// Object exists but access is denied (status = 6).
     NoAccess,
+    /// SET value has wrong ASN.1 type (status = 7).
     WrongType,
+    /// SET value has incorrect length (status = 8).
     WrongLength,
+    /// SET value uses wrong encoding (status = 9).
     WrongEncoding,
+    /// SET value is out of range or otherwise invalid (status = 10).
     WrongValue,
+    /// Object does not support row creation (status = 11).
     NoCreation,
+    /// Value is inconsistent with other managed objects (status = 12).
     InconsistentValue,
+    /// Resource required for SET is unavailable (status = 13).
     ResourceUnavailable,
+    /// SET commit phase failed (status = 14).
     CommitFailed,
+    /// SET undo phase failed (status = 15).
     UndoFailed,
+    /// Access denied by VACM (status = 16).
     AuthorizationError,
+    /// Object does not support modification (status = 17).
     NotWritable,
+    /// Named object cannot be created (status = 18).
     InconsistentName,
-    /// Unknown/future error status code.
+    /// Unknown or future error status code.
     Unknown(i32),
 }
 
@@ -368,11 +572,56 @@ impl std::fmt::Display for ErrorStatus {
     }
 }
 
-/// Library error type.
+/// The main error type for all async-snmp operations.
+///
+/// This enum covers all possible error conditions including network issues,
+/// protocol errors, encoding/decoding failures, and SNMPv3 security errors.
+///
+/// # Common Patterns
+///
+/// ## Checking Error Type
+///
+/// Use pattern matching to handle specific error conditions:
+///
+/// ```
+/// use async_snmp::{Error, ErrorStatus};
+///
+/// fn is_retriable(error: &Error) -> bool {
+///     matches!(error,
+///         Error::Timeout { .. } |
+///         Error::Io { .. } |
+///         Error::NotInTimeWindow { .. }
+///     )
+/// }
+///
+/// fn is_access_error(error: &Error) -> bool {
+///     matches!(error,
+///         Error::Snmp { status: ErrorStatus::NoAccess | ErrorStatus::AuthorizationError, .. } |
+///         Error::AuthenticationFailed { .. } |
+///         Error::InvalidCommunity { .. }
+///     )
+/// }
+/// ```
+///
+/// ## Extracting Target Address
+///
+/// Many errors include the target address for diagnostics:
+///
+/// ```
+/// use async_snmp::Error;
+///
+/// fn log_error(error: &Error) {
+///     if let Some(addr) = error.target() {
+///         println!("Error from {}: {}", addr, error);
+///     } else {
+///         println!("Error: {}", error);
+///     }
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// I/O error during communication.
+    /// I/O error during network communication.
     #[error("I/O error{}: {source}", target.map(|t| format!(" communicating with {}", t)).unwrap_or_default())]
     Io {
         target: Option<SocketAddr>,
@@ -539,6 +788,28 @@ impl Error {
     }
 
     /// Get the target address if this error has one.
+    ///
+    /// Returns `Some(addr)` for network-related errors that have a known target,
+    /// `None` for errors like OID parsing or encoding that aren't target-specific.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use async_snmp::Error;
+    /// use std::time::Duration;
+    ///
+    /// let error = Error::Timeout {
+    ///     target: Some("192.168.1.1:161".parse().unwrap()),
+    ///     elapsed: Duration::from_secs(5),
+    ///     request_id: 42,
+    ///     retries: 3,
+    /// };
+    ///
+    /// assert_eq!(
+    ///     error.target().map(|a| a.to_string()),
+    ///     Some("192.168.1.1:161".to_string())
+    /// );
+    /// ```
     pub fn target(&self) -> Option<SocketAddr> {
         match self {
             Self::Io { target, .. } => *target,
