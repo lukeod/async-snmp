@@ -14,8 +14,9 @@
 //!
 //! Run with: cargo run --example tcp_client
 //!
-//! Most SNMP agents don't support TCP by default. net-snmp supports it with:
-//!   snmpd -Lf /dev/null tcp:11161
+//! Uses the async-snmp test container (supports TCP on same port):
+//!   docker build -t async-snmp-test:latest tests/containers/snmpd/
+//!   docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
 
 use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, TcpTransport, Transport, oid};
 use std::net::SocketAddr;
@@ -123,8 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\n--- SNMPv3 over TCP ---\n");
 
-    let auth = Auth::usm("snmpuser")
-        .auth(AuthProtocol::Sha256, "authpass123")
+    // Uses container user: privaes128_user (SHA + AES-128)
+    let auth = Auth::usm("privaes128_user")
+        .auth(AuthProtocol::Sha1, "authpass123")
         .privacy(PrivProtocol::Aes128, "privpass123");
 
     match Client::builder(target, auth)

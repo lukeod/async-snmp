@@ -1,17 +1,15 @@
 //! SNMPv3 Client Example
 //!
 //! This example demonstrates SNMPv3 operations with authentication and privacy:
-//! - authPriv security level (SHA-256 authentication + AES-128 encryption)
+//! - authPriv security level (SHA-1 authentication + AES-128 encryption)
 //! - Various security levels (noAuthNoPriv, authNoPriv, authPriv)
 //! - Master key caching for high-throughput scenarios
 //!
 //! Run with: cargo run --example snmpv3_client
 //!
-//! Configure net-snmp with a v3 user:
-//!   net-snmp-create-v3-user -ro -a SHA-256 -A authpass123 \
-//!       -x AES -X privpass123 snmpuser
-//!
-//! Or use the testcontainers snmpd image which has pre-configured users.
+//! Uses the async-snmp test container which has pre-configured users:
+//!   docker build -t async-snmp-test:latest tests/containers/snmpd/
+//!   docker run -d -p 11161:161/udp async-snmp-test:latest
 
 use async_snmp::{Auth, AuthProtocol, Client, MasterKeys, PrivProtocol, oid};
 use std::time::Duration;
@@ -29,13 +27,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = "127.0.0.1:11161";
 
     // =========================================================================
-    // Example 1: authPriv (SHA-256 + AES-128) - Most secure
+    // Example 1: authPriv (SHA-1 + AES-128) - Most secure
     // =========================================================================
-    println!("--- SNMPv3 authPriv (SHA-256 + AES-128) ---\n");
+    println!("--- SNMPv3 authPriv (SHA-1 + AES-128) ---\n");
 
     // Build authentication using the fluent builder API
-    let auth = Auth::usm("snmpuser")
-        .auth(AuthProtocol::Sha256, "authpass123")
+    // Uses container user: privaes128_user (SHA + AES-128)
+    let auth = Auth::usm("privaes128_user")
+        .auth(AuthProtocol::Sha1, "authpass123")
         .privacy(PrivProtocol::Aes128, "privpass123");
 
     let client = Client::builder(target, auth)
@@ -55,7 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("--- SNMPv3 authNoPriv (SHA-256 only) ---\n");
 
-    let auth_only = Auth::usm("authonlyuser").auth(AuthProtocol::Sha256, "authpass123");
+    // Uses container user: authsha256_user (SHA-256 auth, no privacy)
+    let auth_only = Auth::usm("authsha256_user").auth(AuthProtocol::Sha256, "authpass123");
     // Note: no .privacy() call
 
     let client_auth = Client::builder(target, auth_only)
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match client_auth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
         Ok(result) => println!("sysName: {:?}\n", result.value),
-        Err(e) => println!("Error (expected if user not configured): {}\n", e),
+        Err(e) => println!("Error: {}\n", e),
     }
 
     // =========================================================================
@@ -75,8 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("--- SNMPv3 noAuthNoPriv ---\n");
 
+    // Uses container user: noauth_user (no auth, no privacy)
     // Just specify username, no auth or privacy
-    let no_auth = Auth::usm("rouser");
+    let no_auth = Auth::usm("noauth_user");
 
     let client_noauth = Client::builder(target, no_auth)
         .timeout(Duration::from_secs(10))
@@ -87,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match client_noauth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
         Ok(result) => println!("sysUpTime: {:?}\n", result.value),
-        Err(e) => println!("Error (expected if user not configured): {}\n", e),
+        Err(e) => println!("Error: {}\n", e),
     }
 
     // =========================================================================
@@ -99,17 +100,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This avoids the expensive key derivation (~850us) on every connection.
     // Only the cheap localization (~1us) is done per engine.
 
+    // Uses container user: privaes192_user (SHA-256 + AES-192)
     let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")
-        .with_privacy(PrivProtocol::Aes128, b"privpass123");
+        .with_privacy(PrivProtocol::Aes192, b"privpass123");
 
     println!("Master keys derived once (expensive operation)");
 
     // Create multiple clients using the cached master keys
-    let targets = ["192.168.1.1:161", "192.168.1.2:161", "192.168.1.3:161"];
+    // Note: These TEST-NET-1 addresses are for demonstration - they won't be reachable
+    let targets = ["192.0.2.1:161", "192.0.2.2:161", "192.0.2.3:161"];
 
     for target_addr in &targets {
         // Clone master keys (cheap - just Arc increment)
-        let auth = Auth::usm("snmpuser").with_master_keys(master_keys.clone());
+        let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
 
         // Each client reuses the master keys; only localization is performed
         match Client::builder(*target_addr, auth)
