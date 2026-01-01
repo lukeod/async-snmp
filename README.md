@@ -31,11 +31,9 @@ Modern, async-first SNMP client library for Rust.
 
 ### SNMPv3 Security
 
-| Authentication | Privacy |
-|----------------|---------|
-| MD5, SHA-1 | DES |
-| SHA-224, SHA-256 | AES-128 |
-| SHA-384, SHA-512 | AES-192, AES-256 |
+**Authentication:** MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512
+
+**Privacy:** DES, AES-128, AES-192, AES-256
 
 ## Installation
 
