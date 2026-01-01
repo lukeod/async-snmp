@@ -38,11 +38,6 @@ impl EncodeBuf {
         self.buf.extend(bytes.iter().rev());
     }
 
-    /// Push bytes without reversing (for content that's already in correct order).
-    pub fn push_bytes_raw(&mut self, bytes: &[u8]) {
-        self.buf.extend(bytes.iter().rev());
-    }
-
     /// Push a BER length encoding.
     pub fn push_length(&mut self, len: usize) {
         let (bytes, count) = encode_length(len);

@@ -103,7 +103,7 @@ impl OidTracker {
 
 /// Async stream for walking an OID subtree using GETNEXT.
 ///
-/// Created by [`Client::walk()`].
+/// Created by [`Client::walk_getnext()`].
 pub struct Walk<T: Transport> {
     client: Client<T>,
     base_oid: Oid,

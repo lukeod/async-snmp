@@ -11,14 +11,23 @@ use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PduType {
+    /// GET request - retrieve specific OID values.
     GetRequest = 0xA0,
+    /// GET-NEXT request - retrieve the next OID in the MIB tree.
     GetNextRequest = 0xA1,
+    /// Response to a request from an agent.
     Response = 0xA2,
+    /// SET request - modify OID values.
     SetRequest = 0xA3,
+    /// SNMPv1 trap - unsolicited notification from an agent.
     TrapV1 = 0xA4,
+    /// GET-BULK request - efficient bulk retrieval of table data.
     GetBulkRequest = 0xA5,
+    /// INFORM request - acknowledged notification.
     InformRequest = 0xA6,
+    /// SNMPv2c/v3 trap - unsolicited notification from an agent.
     TrapV2 = 0xA7,
+    /// Report - used in SNMPv3 for engine discovery and error reporting.
     Report = 0xA8,
 }
 

@@ -6,7 +6,7 @@ use crate::varbind::VarBind;
 
 /// Result of a SET operation phase.
 ///
-/// This enum is used by the three-phase SET protocol:
+/// This enum is used by the two-phase SET protocol:
 /// - `test_set`: Returns Ok if the SET would succeed
 /// - `commit_set`: Returns Ok if the change was applied
 /// - `undo_set`: Does not return SetResult (best-effort rollback)

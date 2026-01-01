@@ -6,7 +6,7 @@
 //! # Master Key Caching
 //!
 //! For high-throughput polling of many engines with shared credentials, use
-//! [`MasterKeys`](crate::MasterKeys) to cache the expensive password-to-key
+//! [`MasterKeys`] to cache the expensive password-to-key
 //! derivation:
 //!
 //! ```rust

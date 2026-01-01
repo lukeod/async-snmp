@@ -28,7 +28,7 @@ impl Client<UdpTransport> {
     ///
     /// // v3 client with authentication
     /// let client = Client::builder("192.168.1.1:161",
-    ///     Auth::usm("admin").auth(async_snmp::v3::AuthProtocol::Sha256, "password"))
+    ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"))
     ///     .timeout(Duration::from_secs(10))
     ///     .retries(5)
     ///     .connect().await?;

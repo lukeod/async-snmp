@@ -8,7 +8,7 @@ use std::fmt;
 
 /// Maximum number of arcs (subidentifiers) allowed in an OID.
 ///
-/// Net-snmp limits OIDs to 128 subidentifiers (`MAX_OID_LEN` in `types.h`).
+/// SNMP implementations commonly limit OIDs to 128 subidentifiers.
 /// This provides protection against DoS attacks from maliciously long OIDs.
 ///
 /// This limit is enforced optionally via [`Oid::validate_length()`]. The standard
@@ -164,7 +164,7 @@ impl Oid {
 
     /// Validate that the OID doesn't exceed the maximum arc count.
     ///
-    /// Net-snmp limits OIDs to 128 subidentifiers (`MAX_OID_LEN`). This check
+    /// SNMP implementations commonly limit OIDs to 128 subidentifiers. This check
     /// provides protection against DoS attacks from maliciously long OIDs.
     ///
     /// # Examples

@@ -49,7 +49,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// struct MyHandler;
 ///
 /// impl MibHandler for MyHandler {
-///     fn get<'a>(&'a self, ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+///     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
 ///         Box::pin(async move {
 ///             if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
 ///                 return GetResult::Value(Value::Integer(42));
@@ -58,7 +58,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///         })
 ///     }
 ///
-///     fn get_next<'a>(&'a self, ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+///     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
 ///         Box::pin(async move {
 ///             let my_oid = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
 ///             if oid < &my_oid {

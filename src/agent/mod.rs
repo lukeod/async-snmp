@@ -21,7 +21,7 @@
 //! struct SystemMibHandler;
 //!
 //! impl MibHandler for SystemMibHandler {
-//!     fn get<'a>(&'a self, ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+//!     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
 //!         Box::pin(async move {
 //!             // sysDescr.0
 //!             if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 1, 0) {
@@ -35,7 +35,7 @@
 //!         })
 //!     }
 //!
-//!     fn get_next<'a>(&'a self, ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+//!     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
 //!         Box::pin(async move {
 //!             // Return the lexicographically next OID after the given one
 //!             let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);

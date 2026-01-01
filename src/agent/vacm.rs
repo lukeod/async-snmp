@@ -119,8 +119,8 @@ pub struct ViewSubtree {
     /// Bit mask for wildcard matching (empty = exact match).
     ///
     /// Each bit position corresponds to an arc in the OID:
-    /// - Bit 8 of byte 0 = arc 0
-    /// - Bit 7 of byte 0 = arc 1
+    /// - Bit 7 (MSB) of byte 0 = arc 0
+    /// - Bit 6 of byte 0 = arc 1
     /// - etc.
     ///
     /// A bit value of 1 means the arc must match exactly.

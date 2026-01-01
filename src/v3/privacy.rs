@@ -3,6 +3,8 @@
 //! This module implements:
 //! - DES-CBC privacy (RFC 3414 Section 8)
 //! - AES-128-CFB privacy (RFC 3826)
+//! - AES-192-CFB privacy (RFC 3826)
+//! - AES-256-CFB privacy (RFC 3826)
 //!
 //! # Salt/IV Construction
 //!
@@ -100,6 +102,11 @@ impl PrivKey {
     /// | DES, AES-128     | Any (MD5+)             |
     /// | AES-192          | SHA-224+               |
     /// | AES-256          | SHA-256+               |
+    ///
+    /// # Panics
+    ///
+    /// Panics during encryption if the privacy protocol requires a longer key
+    /// than the authentication protocol provides.
     pub fn from_password(
         auth_protocol: AuthProtocol,
         priv_protocol: PrivProtocol,
@@ -121,6 +128,11 @@ impl PrivKey {
     ///
     /// The authentication protocol used for the master key must produce sufficient
     /// key material for the privacy protocol. See [`AuthProtocol::is_compatible_with`].
+    ///
+    /// # Panics
+    ///
+    /// Panics during encryption if the privacy protocol requires a longer key
+    /// than the authentication protocol provides.
     pub fn from_master_key(
         master: &super::MasterKey,
         priv_protocol: PrivProtocol,

@@ -16,6 +16,16 @@ pub enum Version {
 
 impl Version {
     /// Get the BER-encoded version number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Version;
+    ///
+    /// assert_eq!(Version::V1.as_i32(), 0);
+    /// assert_eq!(Version::V2c.as_i32(), 1);
+    /// assert_eq!(Version::V3.as_i32(), 3);
+    /// ```
     pub const fn as_i32(self) -> i32 {
         match self {
             Version::V1 => 0,
@@ -25,6 +35,17 @@ impl Version {
     }
 
     /// Create from BER-encoded version number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::Version;
+    ///
+    /// assert_eq!(Version::from_i32(0), Some(Version::V1));
+    /// assert_eq!(Version::from_i32(1), Some(Version::V2c));
+    /// assert_eq!(Version::from_i32(3), Some(Version::V3));
+    /// assert_eq!(Version::from_i32(2), None); // Invalid version
+    /// ```
     pub const fn from_i32(value: i32) -> Option<Self> {
         match value {
             0 => Some(Version::V1),
