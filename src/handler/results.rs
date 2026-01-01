@@ -1,17 +1,57 @@
 //! Result types for MIB handler operations.
+//!
+//! This module provides the result types returned by [`MibHandler`](super::MibHandler)
+//! methods:
+//!
+//! - [`GetResult`] - Result of a GET operation
+//! - [`GetNextResult`] - Result of a GETNEXT operation
+//! - [`SetResult`] - Result of SET test/commit phases
+//! - [`Response`] - Internal response type (typically not used directly)
 
 use crate::error::ErrorStatus;
 use crate::value::Value;
 use crate::varbind::VarBind;
 
-/// Result of a SET operation phase.
+/// Result of a SET operation phase (RFC 3416).
 ///
 /// This enum is used by the two-phase SET protocol:
-/// - `test_set`: Returns Ok if the SET would succeed
-/// - `commit_set`: Returns Ok if the change was applied
-/// - `undo_set`: Does not return SetResult (best-effort rollback)
+/// - [`MibHandler::test_set`](super::MibHandler::test_set): Returns `Ok` if the SET would succeed
+/// - [`MibHandler::commit_set`](super::MibHandler::commit_set): Returns `Ok` if the change was applied
+/// - [`MibHandler::undo_set`](super::MibHandler::undo_set): Does not return `SetResult` (best-effort)
 ///
-/// The variants map to RFC 3416 error status codes.
+/// # Choosing the Right Error
+///
+/// | Situation | Variant |
+/// |-----------|---------|
+/// | SET succeeded | [`Ok`](SetResult::Ok) |
+/// | User lacks permission | [`NoAccess`](SetResult::NoAccess) |
+/// | Object is read-only by design | [`NotWritable`](SetResult::NotWritable) |
+/// | Wrong ASN.1 type (e.g., String for Integer) | [`WrongType`](SetResult::WrongType) |
+/// | Value too long/short | [`WrongLength`](SetResult::WrongLength) |
+/// | Value encoding error | [`WrongEncoding`](SetResult::WrongEncoding) |
+/// | Semantic validation failed | [`WrongValue`](SetResult::WrongValue) |
+/// | Cannot create table row | [`NoCreation`](SetResult::NoCreation) |
+/// | Values conflict within request | [`InconsistentValue`](SetResult::InconsistentValue) |
+/// | Out of memory, lock contention | [`ResourceUnavailable`](SetResult::ResourceUnavailable) |
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::handler::SetResult;
+/// use async_snmp::Value;
+///
+/// fn validate_admin_status(value: &Value) -> SetResult {
+///     match value {
+///         Value::Integer(v) if *v == 1 || *v == 2 => SetResult::Ok, // up(1) or down(2)
+///         Value::Integer(_) => SetResult::WrongValue, // Invalid admin status
+///         _ => SetResult::WrongType, // Must be Integer
+///     }
+/// }
+///
+/// assert_eq!(validate_admin_status(&Value::Integer(1)), SetResult::Ok);
+/// assert_eq!(validate_admin_status(&Value::Integer(99)), SetResult::WrongValue);
+/// assert_eq!(validate_admin_status(&Value::OctetString("up".into())), SetResult::WrongType);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetResult {
     /// Operation succeeded.
@@ -28,12 +68,22 @@ pub enum SetResult {
     /// is making the request. Maps to RFC 3416 error status code 17 (notWritable).
     NotWritable,
     /// Value has wrong ASN.1 type for this OID.
+    ///
+    /// Use when the provided value type doesn't match the expected type
+    /// (e.g., OctetString provided for an Integer object).
     WrongType,
     /// Value has wrong length for this OID.
+    ///
+    /// Use when the value length violates constraints (e.g., DisplayString
+    /// longer than 255 characters).
     WrongLength,
     /// Value encoding is incorrect.
     WrongEncoding,
     /// Value is not valid for this OID (semantic check failed).
+    ///
+    /// Use when the value type is correct but the value itself is invalid
+    /// (e.g., negative value for an unsigned counter, or value outside
+    /// an enumeration's valid range).
     WrongValue,
     /// Cannot create new row (table doesn't support row creation).
     NoCreation,
@@ -108,7 +158,7 @@ impl Response {
     }
 }
 
-/// Result of a GET operation on a specific OID.
+/// Result of a GET operation on a specific OID (RFC 3416).
 ///
 /// This enum distinguishes between the RFC 3416-mandated exception types:
 /// - `Value`: The OID exists and has the given value
@@ -116,44 +166,67 @@ impl Response {
 /// - `NoSuchInstance`: The object type exists but this specific instance doesn't
 ///   (e.g., table row doesn't exist)
 ///
-/// For SNMPv1, both exception types result in a `noSuchName` error response.
-/// For SNMPv2c/v3, they result in the appropriate exception value in the response.
+/// # Version Differences
 ///
-/// # Example
+/// - **SNMPv1**: Both exception types result in a `noSuchName` error response
+/// - **SNMPv2c/v3**: Returns the appropriate exception value in the response varbind
+///
+/// # Choosing NoSuchObject vs NoSuchInstance
+///
+/// | Situation | Variant |
+/// |-----------|---------|
+/// | OID prefix not recognized | [`NoSuchObject`](GetResult::NoSuchObject) |
+/// | Scalar object not implemented | [`NoSuchObject`](GetResult::NoSuchObject) |
+/// | Table column not implemented | [`NoSuchObject`](GetResult::NoSuchObject) |
+/// | Table row doesn't exist | [`NoSuchInstance`](GetResult::NoSuchInstance) |
+/// | Scalar has no value (optional) | [`NoSuchInstance`](GetResult::NoSuchInstance) |
+///
+/// # Example: Scalar Objects
 ///
 /// ```rust
-/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
-/// use async_snmp::{Oid, Value, VarBind, oid};
+/// use async_snmp::handler::GetResult;
+/// use async_snmp::{Value, oid};
 ///
-/// struct IfTableHandler {
-///     // Simulates interface table with indices 1 and 2
-///     interfaces: Vec<u32>,
+/// fn get_scalar(oid: &async_snmp::Oid) -> GetResult {
+///     if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 1, 0) {  // sysDescr.0
+///         GetResult::Value(Value::OctetString("My SNMP Agent".into()))
+///     } else if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 2, 0) {  // sysObjectID.0
+///         GetResult::Value(Value::ObjectIdentifier(oid!(1, 3, 6, 1, 4, 1, 99999)))
+///     } else {
+///         GetResult::NoSuchObject
+///     }
+/// }
+/// ```
+///
+/// # Example: Table Objects
+///
+/// ```rust
+/// use async_snmp::handler::GetResult;
+/// use async_snmp::{Value, Oid, oid};
+///
+/// struct IfTable {
+///     entries: Vec<(u32, String)>,  // (index, description)
 /// }
 ///
-/// impl MibHandler for IfTableHandler {
-///     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
-///         Box::pin(async move {
-///             let if_descr_prefix = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2);
+/// impl IfTable {
+///     fn get(&self, oid: &Oid) -> GetResult {
+///         let if_descr_prefix = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2);
 ///
-///             if oid.starts_with(&if_descr_prefix) {
-///                 // Extract index from OID
-///                 if let Some(&index) = oid.arcs().get(if_descr_prefix.len()) {
-///                     if self.interfaces.contains(&index) {
-///                         return GetResult::Value(Value::OctetString(
-///                             format!("eth{}", index - 1).into()
-///                         ));
-///                     }
-///                     // Index exists in MIB but not in our table
-///                     return GetResult::NoSuchInstance;
-///                 }
-///             }
-///             // OID is not in our MIB at all
-///             GetResult::NoSuchObject
-///         })
-///     }
+///         if !oid.starts_with(&if_descr_prefix) {
+///             return GetResult::NoSuchObject;  // Not our column
+///         }
 ///
-///     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
-///         Box::pin(async move { GetNextResult::EndOfMibView }) // Simplified
+///         // Extract index from OID (position after prefix)
+///         let arcs = oid.arcs();
+///         if arcs.len() != if_descr_prefix.len() + 1 {
+///             return GetResult::NoSuchInstance;  // Wrong index format
+///         }
+///
+///         let index = arcs[if_descr_prefix.len()];
+///         match self.entries.iter().find(|(i, _)| *i == index) {
+///             Some((_, desc)) => GetResult::Value(Value::OctetString(desc.clone().into())),
+///             None => GetResult::NoSuchInstance,  // Row doesn't exist
+///         }
 ///     }
 /// }
 /// ```
@@ -164,11 +237,13 @@ pub enum GetResult {
     /// The object type is not implemented by this agent.
     ///
     /// Use this when the OID prefix (object type) is not recognized.
+    /// This typically means the handler doesn't implement this part of the MIB.
     NoSuchObject,
     /// The object type exists but this specific instance doesn't.
     ///
     /// Use this when the OID prefix is valid but the instance identifier
-    /// (e.g., table index) doesn't exist.
+    /// (e.g., table index) doesn't exist. This is common for table objects
+    /// where the row has been deleted or never existed.
     NoSuchInstance,
 }
 
@@ -197,19 +272,71 @@ impl From<Option<Value>> for GetResult {
     }
 }
 
-/// Result of a GETNEXT operation.
+/// Result of a GETNEXT operation (RFC 3416).
 ///
-/// This enum provides symmetry with [`GetResult`] for the GETNEXT operation:
-/// - `Value`: Returns the next OID/value pair in the MIB tree
-/// - `EndOfMibView`: No more OIDs after the given one in this handler's subtree
+/// GETNEXT retrieves the lexicographically next OID after the requested one.
+/// This is the foundation of SNMP walking (iterating through MIB subtrees)
+/// and is also used internally by GETBULK.
 ///
-/// For SNMPv1, `EndOfMibView` results in a `noSuchName` error response.
-/// For SNMPv2c/v3, it results in the `endOfMibView` exception value.
+/// # Version Differences
+///
+/// - **SNMPv1**: `EndOfMibView` results in a `noSuchName` error response
+/// - **SNMPv2c/v3**: Returns the `endOfMibView` exception value in the response
+///
+/// # Lexicographic Ordering
+///
+/// OIDs are compared arc-by-arc as unsigned integers:
+/// - `1.3.6.1.2` < `1.3.6.1.2.1` (shorter is less than longer with same prefix)
+/// - `1.3.6.1.2.1` < `1.3.6.1.3` (compare at first differing arc)
+/// - `1.3.6.1.10` > `1.3.6.1.9` (numeric comparison, not lexicographic string)
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::handler::GetNextResult;
+/// use async_snmp::{Value, VarBind, Oid, oid};
+///
+/// struct SimpleTable {
+///     oids: Vec<(Oid, Value)>,  // Must be sorted!
+/// }
+///
+/// impl SimpleTable {
+///     fn get_next(&self, after: &Oid) -> GetNextResult {
+///         // Find first OID that is strictly greater than 'after'
+///         for (oid, value) in &self.oids {
+///             if oid > after {
+///                 return GetNextResult::Value(VarBind::new(oid.clone(), value.clone()));
+///             }
+///         }
+///         GetNextResult::EndOfMibView
+///     }
+/// }
+///
+/// let table = SimpleTable {
+///     oids: vec![
+///         (oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::OctetString("sysDescr".into())),
+///         (oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::TimeTicks(12345)),
+///     ],
+/// };
+///
+/// // Before first OID - returns first
+/// let result = table.get_next(&oid!(1, 3, 6, 1, 2, 1, 1, 0));
+/// assert!(result.is_value());
+///
+/// // After last OID - returns EndOfMibView
+/// let result = table.get_next(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0));
+/// assert!(result.is_end_of_mib_view());
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum GetNextResult {
     /// The next OID/value pair in the MIB tree.
+    ///
+    /// The returned OID must be strictly greater than the input OID.
     Value(VarBind),
     /// No more OIDs after the given one (end of MIB view).
+    ///
+    /// Return this when the requested OID is at or past the last OID
+    /// in your handler's subtree.
     EndOfMibView,
 }
 

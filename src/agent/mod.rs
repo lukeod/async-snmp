@@ -70,7 +70,7 @@ mod response;
 mod set_handler;
 pub mod vacm;
 
-pub use vacm::{SecurityModel, VacmBuilder, VacmConfig, View};
+pub use vacm::{SecurityModel, VacmBuilder, VacmConfig, View, ViewSubtree};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -109,6 +109,39 @@ pub(crate) struct RegisteredHandler {
 }
 
 /// Builder for [`Agent`].
+///
+/// Use this builder to configure and construct an SNMP agent. The builder
+/// pattern allows you to chain configuration methods before calling
+/// [`build()`](AgentBuilder::build) to create the agent.
+///
+/// # Minimal Example
+///
+/// ```rust,no_run
+/// use async_snmp::agent::Agent;
+/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
+/// use async_snmp::{Oid, Value, VarBind, oid};
+/// use std::sync::Arc;
+///
+/// struct MyHandler;
+/// impl MibHandler for MyHandler {
+///     fn get<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, GetResult> {
+///         Box::pin(async { GetResult::NoSuchObject })
+///     }
+///     fn get_next<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+///         Box::pin(async { GetNextResult::EndOfMibView })
+///     }
+/// }
+///
+/// # async fn example() -> Result<(), async_snmp::Error> {
+/// let agent = Agent::builder()
+///     .bind("0.0.0.0:1161")  // Use non-privileged port
+///     .community(b"public")
+///     .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MyHandler))
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct AgentBuilder {
     bind_addr: String,
     communities: Vec<Vec<u8>>,
@@ -121,6 +154,12 @@ pub struct AgentBuilder {
 
 impl AgentBuilder {
     /// Create a new builder with default settings.
+    ///
+    /// Defaults:
+    /// - Bind address: `0.0.0.0:161`
+    /// - Max message size: 1472 bytes (Ethernet MTU - IP/UDP headers)
+    /// - No communities or USM users (all requests rejected)
+    /// - No handlers registered
     pub fn new() -> Self {
         Self {
             bind_addr: "0.0.0.0:161".to_string(),
@@ -135,7 +174,41 @@ impl AgentBuilder {
 
     /// Set the bind address.
     ///
-    /// Default is "0.0.0.0:161".
+    /// Default is `0.0.0.0:161` (standard SNMP port). Note that binding to
+    /// port 161 typically requires root/administrator privileges.
+    ///
+    /// # IPv4 Examples
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    ///
+    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// // Bind to all IPv4 interfaces on standard port (requires privileges)
+    /// let agent = Agent::builder().bind("0.0.0.0:161").community(b"public").build().await?;
+    ///
+    /// // Bind to localhost only on non-privileged port
+    /// let agent = Agent::builder().bind("127.0.0.1:1161").community(b"public").build().await?;
+    ///
+    /// // Bind to specific interface
+    /// let agent = Agent::builder().bind("192.168.1.100:161").community(b"public").build().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # IPv6 Examples
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    ///
+    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// // Bind to all IPv6 interfaces (IPv6_V6ONLY is set, no IPv4 traffic)
+    /// let agent = Agent::builder().bind("[::]:161").community(b"public").build().await?;
+    ///
+    /// // Bind to IPv6 localhost
+    /// let agent = Agent::builder().bind("[::1]:1161").community(b"public").build().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -144,13 +217,45 @@ impl AgentBuilder {
     /// Add an accepted community string for v1/v2c requests.
     ///
     /// Multiple communities can be added. If none are added,
-    /// all community strings are rejected.
+    /// all v1/v2c requests are rejected.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    ///
+    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// let agent = Agent::builder()
+    ///     .bind("0.0.0.0:1161")
+    ///     .community(b"public")   // Read-only access
+    ///     .community(b"private")  // Read-write access (with VACM)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn community(mut self, community: &[u8]) -> Self {
         self.communities.push(community.to_vec());
         self
     }
 
     /// Add multiple community strings.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    ///
+    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// let communities = ["public", "private", "monitor"];
+    /// let agent = Agent::builder()
+    ///     .bind("0.0.0.0:1161")
+    ///     .communities(communities)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn communities<I, C>(mut self, communities: I) -> Self
     where
         I: IntoIterator<Item = C>,
@@ -162,7 +267,40 @@ impl AgentBuilder {
         self
     }
 
-    /// Add a USM user for v3 authentication.
+    /// Add a USM user for SNMPv3 authentication.
+    ///
+    /// Configure authentication and privacy settings using the closure.
+    /// Multiple users can be added with different security levels.
+    ///
+    /// # Security Levels
+    ///
+    /// - **noAuthNoPriv**: No authentication or encryption (not recommended)
+    /// - **authNoPriv**: Authentication only (HMAC verification)
+    /// - **authPriv**: Authentication and encryption (most secure)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    /// use async_snmp::{AuthProtocol, PrivProtocol};
+    ///
+    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// let agent = Agent::builder()
+    ///     .bind("0.0.0.0:1161")
+    ///     // Read-only user with authentication only
+    ///     .usm_user("monitor", |u| {
+    ///         u.auth(AuthProtocol::Sha256, b"monitorpass123")
+    ///     })
+    ///     // Admin user with full encryption
+    ///     .usm_user("admin", |u| {
+    ///         u.auth(AuthProtocol::Sha256, b"adminauth123")
+    ///          .privacy(PrivProtocol::Aes128, b"adminpriv123")
+    ///     })
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
     where
         F: FnOnce(UsmUserConfig) -> UsmUserConfig,
@@ -173,9 +311,26 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the engine ID for v3.
+    /// Set the engine ID for SNMPv3.
     ///
-    /// If not set, a default engine ID will be generated.
+    /// If not set, a default engine ID will be generated based on the
+    /// RFC 3411 format using enterprise number and timestamp.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    ///
+    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// let agent = Agent::builder()
+    ///     .bind("0.0.0.0:1161")
+    ///     .engine_id(b"\x80\x00\x00\x00\x01MyEngine".to_vec())
+    ///     .community(b"public")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
         self.engine_id = Some(engine_id.into());
         self
@@ -197,6 +352,42 @@ impl AgentBuilder {
     ///
     /// Handlers are matched by longest prefix. When a request comes in,
     /// the handler with the longest matching prefix is used.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    /// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
+    /// use async_snmp::{Oid, Value, VarBind, oid};
+    /// use std::sync::Arc;
+    ///
+    /// struct SystemHandler;
+    /// impl MibHandler for SystemHandler {
+    ///     fn get<'a>(&'a self, _: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+    ///         Box::pin(async move {
+    ///             if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 1, 0) {
+    ///                 GetResult::Value(Value::OctetString("My Agent".into()))
+    ///             } else {
+    ///                 GetResult::NoSuchObject
+    ///             }
+    ///         })
+    ///     }
+    ///     fn get_next<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+    ///         Box::pin(async { GetNextResult::EndOfMibView })
+    ///     }
+    /// }
+    ///
+    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// let agent = Agent::builder()
+    ///     .bind("0.0.0.0:1161")
+    ///     .community(b"public")
+    ///     // Register handler for system MIB subtree
+    ///     .handler(oid!(1, 3, 6, 1, 2, 1, 1), Arc::new(SystemHandler))
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn handler(mut self, prefix: Oid, handler: Arc<dyn MibHandler>) -> Self {
         self.handlers.push(RegisteredHandler { prefix, handler });
         self

@@ -1,9 +1,166 @@
 //! View-based Access Control Model (RFC 3415).
 //!
+//! VACM controls access to MIB objects based on who is making the request
+//! and what they are trying to access. It implements fine-grained access control
+//! through a three-table architecture.
+//!
+//! # Overview
+//!
+//! VACM (View-based Access Control Model) is the standard access control mechanism
+//! for SNMPv3, though it can also be used with SNMPv1/v2c. It answers the question:
+//! "Can this user perform this operation on this OID?"
+//!
+//! # Architecture
+//!
 //! VACM controls access through three tables:
-//! 1. Security-to-Group: Maps (securityModel, securityName) → groupName
-//! 2. Access: Maps (groupName, contextPrefix, securityModel, securityLevel) → views
-//! 3. View Tree Family: Defines views as OID subtree collections
+//!
+//! 1. **Security-to-Group Table**: Maps (securityModel, securityName) to groupName.
+//!    This groups users/communities with similar access rights.
+//!
+//! 2. **Access Table**: Maps (groupName, contextPrefix, securityModel, securityLevel)
+//!    to view names for read, write, and notify operations.
+//!
+//! 3. **View Tree Family Table**: Defines views as collections of OID subtrees,
+//!    with optional inclusion/exclusion and wildcard masks.
+//!
+//! # Basic Example
+//!
+//! Configure read-only access for "public" community:
+//!
+//! ```rust
+//! use async_snmp::agent::{Agent, SecurityModel, VacmBuilder};
+//! use async_snmp::oid;
+//!
+//! # fn example() {
+//! let vacm = VacmBuilder::new()
+//!     // Map "public" community to "readonly_group"
+//!     .group("public", SecurityModel::V2c, "readonly_group")
+//!     // Grant read access to full_view
+//!     .access("readonly_group", |a| a.read_view("full_view"))
+//!     // Define what OIDs are in full_view
+//!     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
+//!     .build();
+//! # }
+//! ```
+//!
+//! # Read/Write Access Example
+//!
+//! Configure different access levels for different users:
+//!
+//! ```rust
+//! use async_snmp::agent::{Agent, SecurityModel, VacmBuilder};
+//! use async_snmp::message::SecurityLevel;
+//! use async_snmp::oid;
+//!
+//! # fn example() {
+//! let vacm = VacmBuilder::new()
+//!     // Read-only community
+//!     .group("public", SecurityModel::V2c, "readers")
+//!     // Read-write community
+//!     .group("private", SecurityModel::V2c, "writers")
+//!     // SNMPv3 admin user
+//!     .group("admin", SecurityModel::Usm, "admins")
+//!
+//!     // Readers can only read
+//!     .access("readers", |a| a
+//!         .read_view("system_view"))
+//!
+//!     // Writers can read everything and write to ifAdminStatus
+//!     .access("writers", |a| a
+//!         .read_view("full_view")
+//!         .write_view("if_admin_view"))
+//!
+//!     // Admins require encryption and can read/write everything
+//!     .access("admins", |a| a
+//!         .security_model(SecurityModel::Usm)
+//!         .security_level(SecurityLevel::AuthPriv)
+//!         .read_view("full_view")
+//!         .write_view("full_view"))
+//!
+//!     // Define views
+//!     .view("system_view", |v| v
+//!         .include(oid!(1, 3, 6, 1, 2, 1, 1)))  // system MIB only
+//!     .view("full_view", |v| v
+//!         .include(oid!(1, 3, 6, 1)))           // everything
+//!     .view("if_admin_view", |v| v
+//!         .include(oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 7)))  // ifAdminStatus
+//!     .build();
+//! # }
+//! ```
+//!
+//! # View Exclusions
+//!
+//! Views can exclude specific subtrees from a broader include:
+//!
+//! ```rust
+//! use async_snmp::agent::View;
+//! use async_snmp::oid;
+//!
+//! // Include all of system MIB except sysServices
+//! let view = View::new()
+//!     .include(oid!(1, 3, 6, 1, 2, 1, 1))        // system MIB
+//!     .exclude(oid!(1, 3, 6, 1, 2, 1, 1, 7));    // except sysServices
+//!
+//! assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)));   // sysDescr.0 - allowed
+//! assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 7, 0)));  // sysServices.0 - blocked
+//! ```
+//!
+//! # Wildcard Masks
+//!
+//! Masks allow matching OIDs with wildcards at specific positions:
+//!
+//! ```rust
+//! use async_snmp::agent::ViewSubtree;
+//! use async_snmp::oid;
+//!
+//! // Match ifDescr for any interface index (ifDescr.*)
+//! // OID: 1.3.6.1.2.1.2.2.1.2 (10 arcs, indices 0-9)
+//! // Mask: 0xFF 0xC0 = 11111111 11000000 (arcs 0-9 must match, 10+ wildcard)
+//! let subtree = ViewSubtree {
+//!     oid: oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2),  // ifDescr
+//!     mask: vec![0xFF, 0xC0],
+//!     included: true,
+//! };
+//!
+//! // Matches any interface index
+//! assert!(subtree.matches(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1)));    // ifDescr.1
+//! assert!(subtree.matches(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 100)));  // ifDescr.100
+//!
+//! // Does not match different columns
+//! assert!(!subtree.matches(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 1)));   // ifType.1
+//! ```
+//!
+//! # Integration with Agent
+//!
+//! Use [`AgentBuilder::vacm()`](super::AgentBuilder::vacm) to configure VACM:
+//!
+//! ```rust,no_run
+//! use async_snmp::agent::{Agent, SecurityModel};
+//! use async_snmp::oid;
+//!
+//! # async fn example() -> Result<(), async_snmp::Error> {
+//! let agent = Agent::builder()
+//!     .bind("0.0.0.0:161")
+//!     .community(b"public")
+//!     .community(b"private")
+//!     .vacm(|v| v
+//!         .group("public", SecurityModel::V2c, "readonly")
+//!         .group("private", SecurityModel::V2c, "readwrite")
+//!         .access("readonly", |a| a.read_view("all"))
+//!         .access("readwrite", |a| a.read_view("all").write_view("all"))
+//!         .view("all", |v| v.include(oid!(1, 3, 6, 1))))
+//!     .build()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Access Denied Behavior
+//!
+//! When VACM denies access:
+//! - **SNMPv1**: Returns `noSuchName` error
+//! - **SNMPv2c/v3 GET**: Returns `noAccess` error or `NoSuchObject` per RFC 3416
+//! - **SNMPv2c/v3 SET**: Returns `noAccess` error
 
 use std::collections::HashMap;
 
@@ -13,9 +170,27 @@ use crate::message::SecurityLevel;
 use crate::oid::Oid;
 
 /// Security model identifiers (RFC 3411).
+///
+/// Used to specify which SNMP version/security mechanism a mapping applies to.
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::agent::{SecurityModel, VacmBuilder};
+///
+/// let vacm = VacmBuilder::new()
+///     // Map communities to groups by security model
+///     .group("public", SecurityModel::V2c, "readonly")
+///     .group("admin", SecurityModel::Usm, "admin_group")
+///     // Any model can match as a fallback
+///     .group("universal", SecurityModel::Any, "universal_group")
+///     .build();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SecurityModel {
     /// Wildcard for VACM matching (matches any model).
+    ///
+    /// Use this when the same mapping should apply regardless of SNMP version.
     Any = 0,
     /// SNMPv1.
     V1 = 1,
@@ -35,7 +210,26 @@ pub(crate) enum ContextMatch {
     Prefix,
 }
 
-/// A view is a collection of OID subtrees.
+/// A view is a collection of OID subtrees defining accessible objects.
+///
+/// Views are used by VACM to determine which OIDs a user can access.
+/// Each view consists of included and/or excluded subtrees.
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::agent::View;
+/// use async_snmp::oid;
+///
+/// // Create a view that includes the system MIB but excludes sysContact
+/// let view = View::new()
+///     .include(oid!(1, 3, 6, 1, 2, 1, 1))        // system MIB
+///     .exclude(oid!(1, 3, 6, 1, 2, 1, 1, 4));    // sysContact
+///
+/// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)));   // sysDescr.0
+/// assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 4, 0)));  // sysContact.0
+/// assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 2)));        // interfaces MIB
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct View {
     subtrees: Vec<ViewSubtree>,
@@ -43,11 +237,31 @@ pub struct View {
 
 impl View {
     /// Create a new empty view.
+    ///
+    /// An empty view contains no OIDs. Add subtrees with [`include()`](View::include)
+    /// or [`exclude()`](View::exclude).
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add an included subtree to the view.
+    ///
+    /// All OIDs starting with `oid` will be included in the view,
+    /// unless excluded by a later [`exclude()`](View::exclude) call.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::View;
+    /// use async_snmp::oid;
+    ///
+    /// let view = View::new()
+    ///     .include(oid!(1, 3, 6, 1, 2, 1))  // MIB-2
+    ///     .include(oid!(1, 3, 6, 1, 4, 1)); // enterprises
+    ///
+    /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
+    /// assert!(view.contains(&oid!(1, 3, 6, 1, 4, 1, 99999, 1)));
+    /// ```
     pub fn include(mut self, oid: Oid) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -57,7 +271,27 @@ impl View {
         self
     }
 
-    /// Add an included subtree with a mask to the view.
+    /// Add an included subtree with a wildcard mask.
+    ///
+    /// The mask allows wildcards at specific OID arc positions.
+    /// See [`ViewSubtree::mask`] for mask format details.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::View;
+    /// use async_snmp::oid;
+    ///
+    /// // Include ifDescr for any interface (mask makes arc 10 a wildcard)
+    /// let view = View::new()
+    ///     .include_masked(
+    ///         oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2),  // ifDescr
+    ///         vec![0xFF, 0xC0]  // First 10 arcs must match
+    ///     );
+    ///
+    /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1)));   // ifDescr.1
+    /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 100))); // ifDescr.100
+    /// ```
     pub fn include_masked(mut self, oid: Oid, mask: Vec<u8>) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -68,6 +302,23 @@ impl View {
     }
 
     /// Add an excluded subtree to the view.
+    ///
+    /// OIDs starting with `oid` will be excluded, even if they match
+    /// an included subtree. Exclusions take precedence.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::View;
+    /// use async_snmp::oid;
+    ///
+    /// let view = View::new()
+    ///     .include(oid!(1, 3, 6, 1, 2, 1, 1))     // system MIB
+    ///     .exclude(oid!(1, 3, 6, 1, 2, 1, 1, 6)); // except sysLocation
+    ///
+    /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)));  // sysDescr
+    /// assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 6, 0))); // sysLocation
+    /// ```
     pub fn exclude(mut self, oid: Oid) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -77,7 +328,9 @@ impl View {
         self
     }
 
-    /// Add an excluded subtree with a mask to the view.
+    /// Add an excluded subtree with a wildcard mask.
+    ///
+    /// See [`include_masked()`](View::include_masked) for mask usage.
     pub fn exclude_masked(mut self, oid: Oid, mask: Vec<u8>) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -92,6 +345,21 @@ impl View {
     /// Per RFC 3415 Section 5, an OID is in the view if:
     /// - At least one included subtree matches, AND
     /// - No excluded subtree matches
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::View;
+    /// use async_snmp::oid;
+    ///
+    /// let view = View::new()
+    ///     .include(oid!(1, 3, 6, 1, 2, 1))
+    ///     .exclude(oid!(1, 3, 6, 1, 2, 1, 25));  // host resources
+    ///
+    /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
+    /// assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 25, 1, 0)));
+    /// assert!(!view.contains(&oid!(1, 3, 6, 1, 4, 1)));  // not included
+    /// ```
     pub fn contains(&self, oid: &Oid) -> bool {
         let mut dominated_by_include = false;
         let mut dominated_by_exclude = false;
@@ -181,6 +449,30 @@ pub struct VacmAccessEntry {
 }
 
 /// Builder for access entries.
+///
+/// Configure what views a group can access for different operations.
+/// Typically used via [`VacmBuilder::access()`].
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::agent::{SecurityModel, VacmBuilder};
+/// use async_snmp::message::SecurityLevel;
+/// use async_snmp::oid;
+///
+/// let vacm = VacmBuilder::new()
+///     .group("admin", SecurityModel::Usm, "admin_group")
+///     .access("admin_group", |a| a
+///         .security_model(SecurityModel::Usm)
+///         .security_level(SecurityLevel::AuthPriv)
+///         .read_view("full_view")
+///         .write_view("config_view")
+///         .notify_view("trap_view"))
+///     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
+///     .view("config_view", |v| v.include(oid!(1, 3, 6, 1, 4, 1)))
+///     .view("trap_view", |v| v.include(oid!(1, 3, 6, 1)))
+///     .build();
+/// ```
 pub struct AccessEntryBuilder {
     group_name: Bytes,
     context_prefix: Bytes,
@@ -208,18 +500,43 @@ impl AccessEntryBuilder {
     }
 
     /// Set the context prefix for matching.
+    ///
+    /// Context is an SNMPv3 concept that allows partitioning MIB views.
+    /// Most deployments use an empty context (the default).
     pub fn context_prefix(mut self, prefix: impl Into<Bytes>) -> Self {
         self.context_prefix = prefix.into();
         self
     }
 
-    /// Set the security model.
+    /// Set the security model this entry applies to.
+    ///
+    /// Default is [`SecurityModel::Any`] which matches all models.
     pub fn security_model(mut self, model: SecurityModel) -> Self {
         self.security_model = model;
         self
     }
 
     /// Set the minimum security level required.
+    ///
+    /// Requests with lower security levels will be denied access.
+    /// Default is [`SecurityLevel::NoAuthNoPriv`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::{SecurityModel, VacmBuilder};
+    /// use async_snmp::message::SecurityLevel;
+    /// use async_snmp::oid;
+    ///
+    /// let vacm = VacmBuilder::new()
+    ///     .group("admin", SecurityModel::Usm, "secure_group")
+    ///     .access("secure_group", |a| a
+    ///         // Require authentication and encryption
+    ///         .security_level(SecurityLevel::AuthPriv)
+    ///         .read_view("full_view"))
+    ///     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
+    ///     .build();
+    /// ```
     pub fn security_level(mut self, level: SecurityLevel) -> Self {
         self.security_level = level;
         self
@@ -236,18 +553,27 @@ impl AccessEntryBuilder {
     }
 
     /// Set the read view name.
+    ///
+    /// The view must be defined with [`VacmBuilder::view()`].
+    /// If not set, read operations are denied.
     pub fn read_view(mut self, view: impl Into<Bytes>) -> Self {
         self.read_view = view.into();
         self
     }
 
     /// Set the write view name.
+    ///
+    /// The view must be defined with [`VacmBuilder::view()`].
+    /// If not set, write (SET) operations are denied.
     pub fn write_view(mut self, view: impl Into<Bytes>) -> Self {
         self.write_view = view.into();
         self
     }
 
     /// Set the notify view name.
+    ///
+    /// Used for trap/inform generation (not access control).
+    /// The view must be defined with [`VacmBuilder::view()`].
     pub fn notify_view(mut self, view: impl Into<Bytes>) -> Self {
         self.notify_view = view.into();
         self
@@ -375,6 +701,44 @@ impl VacmConfig {
 }
 
 /// Builder for VACM configuration.
+///
+/// Use this to configure access control for your SNMP agent. The typical
+/// workflow is:
+///
+/// 1. Map security names (communities/usernames) to groups with [`group()`](VacmBuilder::group)
+/// 2. Define access rules for groups with [`access()`](VacmBuilder::access)
+/// 3. Define views (OID collections) with [`view()`](VacmBuilder::view)
+/// 4. Build with [`build()`](VacmBuilder::build)
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::agent::{SecurityModel, VacmBuilder};
+/// use async_snmp::message::SecurityLevel;
+/// use async_snmp::oid;
+///
+/// let vacm = VacmBuilder::new()
+///     // Step 1: Map security names to groups
+///     .group("public", SecurityModel::V2c, "readers")
+///     .group("admin", SecurityModel::Usm, "admins")
+///
+///     // Step 2: Define access for each group
+///     .access("readers", |a| a
+///         .read_view("system_view"))
+///     .access("admins", |a| a
+///         .security_level(SecurityLevel::AuthPriv)
+///         .read_view("full_view")
+///         .write_view("full_view"))
+///
+///     // Step 3: Define views
+///     .view("system_view", |v| v
+///         .include(oid!(1, 3, 6, 1, 2, 1, 1)))
+///     .view("full_view", |v| v
+///         .include(oid!(1, 3, 6, 1)))
+///
+///     // Step 4: Build
+///     .build();
+/// ```
 pub struct VacmBuilder {
     config: VacmConfig,
 }
@@ -388,6 +752,26 @@ impl VacmBuilder {
     }
 
     /// Map a security name to a group.
+    ///
+    /// The security name is:
+    /// - For SNMPv1/v2c: the community string
+    /// - For SNMPv3: the USM username
+    ///
+    /// Multiple security names can map to the same group.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::{SecurityModel, VacmBuilder};
+    ///
+    /// let vacm = VacmBuilder::new()
+    ///     // Multiple communities in same group
+    ///     .group("public", SecurityModel::V2c, "readonly")
+    ///     .group("monitor", SecurityModel::V2c, "readonly")
+    ///     // Different users in different groups
+    ///     .group("admin", SecurityModel::Usm, "admin_group")
+    ///     .build();
+    /// ```
     pub fn group(
         mut self,
         security_name: impl Into<Bytes>,
@@ -400,6 +784,28 @@ impl VacmBuilder {
     }
 
     /// Add an access entry using a builder function.
+    ///
+    /// Access entries define what views a group can use for read, write,
+    /// and notify operations. Use the closure to configure the entry.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::{SecurityModel, VacmBuilder};
+    /// use async_snmp::message::SecurityLevel;
+    /// use async_snmp::oid;
+    ///
+    /// let vacm = VacmBuilder::new()
+    ///     .group("public", SecurityModel::V2c, "readers")
+    ///     .access("readers", |a| a
+    ///         .security_model(SecurityModel::V2c)
+    ///         .security_level(SecurityLevel::NoAuthNoPriv)
+    ///         .read_view("system_view")
+    ///         // No write_view = read-only
+    ///     )
+    ///     .view("system_view", |v| v.include(oid!(1, 3, 6, 1, 2, 1, 1)))
+    ///     .build();
+    /// ```
     pub fn access<F>(mut self, group_name: impl Into<Bytes>, configure: F) -> Self
     where
         F: FnOnce(AccessEntryBuilder) -> AccessEntryBuilder,
@@ -411,6 +817,24 @@ impl VacmBuilder {
     }
 
     /// Add a view using a builder function.
+    ///
+    /// Views define collections of OID subtrees. Use the closure to add
+    /// included and excluded subtrees.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::agent::VacmBuilder;
+    /// use async_snmp::oid;
+    ///
+    /// let vacm = VacmBuilder::new()
+    ///     .view("system_only", |v| v
+    ///         .include(oid!(1, 3, 6, 1, 2, 1, 1)))  // system MIB
+    ///     .view("all_except_private", |v| v
+    ///         .include(oid!(1, 3, 6, 1))
+    ///         .exclude(oid!(1, 3, 6, 1, 4, 1, 99999)))  // exclude our enterprise
+    ///     .build();
+    /// ```
     pub fn view<F>(mut self, name: impl Into<Bytes>, configure: F) -> Self
     where
         F: FnOnce(View) -> View,
