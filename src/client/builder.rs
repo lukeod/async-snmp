@@ -306,11 +306,17 @@ impl ClientBuilder {
             if usm.priv_protocol.is_some() && usm.auth_protocol.is_none() {
                 return Err(Error::Config("privacy requires authentication".into()));
             }
-            // Protocol requires password
-            if usm.auth_protocol.is_some() && usm.auth_password.is_none() {
+            // Protocol requires password (unless using master keys)
+            if usm.auth_protocol.is_some()
+                && usm.auth_password.is_none()
+                && usm.master_keys.is_none()
+            {
                 return Err(Error::Config("auth protocol requires password".into()));
             }
-            if usm.priv_protocol.is_some() && usm.priv_password.is_none() {
+            if usm.priv_protocol.is_some()
+                && usm.priv_password.is_none()
+                && usm.master_keys.is_none()
+            {
                 return Err(Error::Config("priv protocol requires password".into()));
             }
         }
@@ -518,7 +524,7 @@ impl ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v3::{AuthProtocol, PrivProtocol};
+    use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol};
 
     #[test]
     fn test_builder_defaults() {
@@ -656,6 +662,41 @@ mod tests {
             "192.168.1.1:161",
             Auth::usm("admin").auth(AuthProtocol::Sha256, "pass"),
         );
+        assert!(builder.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_master_keys_bypass_auth_password() {
+        // When master keys are set, auth password is not required
+        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass");
+        let usm = crate::client::UsmAuth {
+            username: "user".to_string(),
+            auth_protocol: Some(AuthProtocol::Sha256),
+            auth_password: None, // No password
+            priv_protocol: None,
+            priv_password: None,
+            context_name: None,
+            master_keys: Some(master_keys),
+        };
+        let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
+        assert!(builder.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_master_keys_bypass_priv_password() {
+        // When master keys are set, priv password is not required
+        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass")
+            .with_privacy(PrivProtocol::Aes128, b"privpass");
+        let usm = crate::client::UsmAuth {
+            username: "user".to_string(),
+            auth_protocol: Some(AuthProtocol::Sha256),
+            auth_password: None, // No password
+            priv_protocol: Some(PrivProtocol::Aes128),
+            priv_password: None, // No password
+            context_name: None,
+            master_keys: Some(master_keys),
+        };
+        let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         assert!(builder.validate().is_ok());
     }
 }
