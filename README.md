@@ -104,7 +104,7 @@ async fn main() -> Result<(), async_snmp::Error> {
         .await?;
 
     // Walk the system subtree
-    let mut walk = client.walk(&oid!(1, 3, 6, 1, 2, 1, 1));
+    let mut walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;
     while let Some(result) = walk.next().await {
         let vb = result?;
         println!("{}: {:?}", vb.oid, vb.value);
@@ -143,8 +143,8 @@ async fn main() -> Result<(), async_snmp::Error> {
 
     for (client, result) in clients.iter().zip(results) {
         match result {
-            Ok(vb) => println!("{}: {:?}", client.target(), vb.value),
-            Err(e) => eprintln!("{}: {}", client.target(), e),
+            Ok(vb) => println!("{}: {:?}", client.peer_addr(), vb.value),
+            Err(e) => eprintln!("{}: {}", client.peer_addr(), e),
         }
     }
 
@@ -160,7 +160,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 
 | Feature | Description |
 |---------|-------------|
-| `testing` | Expose `MockTransport` for downstream testing |
+| `testing` | Expose `transport::MockTransport` for downstream testing |
 | `serde` | Serialize/Deserialize support for configuration types |
 | `cli` | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 
