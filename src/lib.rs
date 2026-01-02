@@ -118,10 +118,20 @@
 //! # }
 //! ```
 //!
-//! ## Concurrent Operations
+//! ## Scalable Polling (Shared Transport)
 //!
-//! Use standard async patterns to poll multiple devices concurrently.
-//! Share a [`UdpTransport`] for polling many targets.
+//! For monitoring systems polling many targets, share a single [`UdpTransport`]
+//! across all clients:
+//!
+//! - **1 file descriptor** for all targets (vs 1 per target)
+//! - **Firewall session reuse** between polls to the same target
+//! - **Lower memory** from shared socket buffers
+//! - **No per-poll socket creation** overhead
+//!
+//! **Scaling guidance:**
+//! - **Most use cases**: Single shared [`UdpTransport`] recommended
+//! - **~100,000s+ targets**: Multiple [`UdpTransport`] instances, sharded by target
+//! - **Scrape isolation**: Per-client via [`.connect()`](ClientBuilder::connect) (FD + syscall overhead)
 //!
 //! ```rust,no_run
 //! use async_snmp::{Auth, Client, oid};
@@ -129,7 +139,7 @@
 //! use futures::future::join_all;
 //!
 //! async fn poll_many_devices(targets: Vec<String>) -> Vec<(String, Result<String, String>)> {
-//!     // Create a shared transport for efficient socket usage
+//!     // Single socket shared across all clients
 //!     let transport = UdpTransport::bind("0.0.0.0:0")
 //!         .await
 //!         .expect("failed to bind");
@@ -426,9 +436,3 @@ pub type UdpClient = Client<UdpHandle>;
 
 /// Type alias for a client using a TCP connection.
 pub type TcpClient = Client<TcpTransport>;
-
-/// Testing utilities exposed via the `testing` feature.
-#[cfg(feature = "testing")]
-pub mod testing {
-    pub use crate::format::hex::{Bytes as HexBytes, DecodeError, decode, encode};
-}

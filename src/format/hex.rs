@@ -30,7 +30,6 @@ pub fn encode(bytes: &[u8]) -> String {
 /// assert!(decode("xyz").is_err());
 /// assert!(decode("abc").is_err()); // odd length
 /// ```
-#[cfg(any(test, feature = "testing"))]
 pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
     if !s.len().is_multiple_of(2) {
         return Err(DecodeError::OddLength);
@@ -42,7 +41,6 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 }
 
 /// Error type for hex decoding.
-#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     /// Input has odd length (must be pairs of hex digits)
