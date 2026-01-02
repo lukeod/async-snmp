@@ -199,10 +199,12 @@ impl NotificationReceiverBuilder {
             ),
         })?;
 
-        let socket = bind_udp_socket(bind_addr).await.map_err(|e| Error::Io {
-            target: Some(bind_addr),
-            source: e,
-        })?;
+        let socket = bind_udp_socket(bind_addr, None)
+            .await
+            .map_err(|e| Error::Io {
+                target: Some(bind_addr),
+                source: e,
+            })?;
 
         let local_addr = socket.local_addr().map_err(|e| Error::Io {
             target: Some(bind_addr),
@@ -441,10 +443,12 @@ impl NotificationReceiver {
             ),
         })?;
 
-        let socket = bind_udp_socket(bind_addr).await.map_err(|e| Error::Io {
-            target: Some(bind_addr),
-            source: e,
-        })?;
+        let socket = bind_udp_socket(bind_addr, None)
+            .await
+            .map_err(|e| Error::Io {
+                target: Some(bind_addr),
+                source: e,
+            })?;
 
         let local_addr = socket.local_addr().map_err(|e| Error::Io {
             target: Some(bind_addr),

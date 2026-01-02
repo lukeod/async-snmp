@@ -81,6 +81,8 @@ use std::time::Instant;
 use bytes::Bytes;
 use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::ber::Decoder;
@@ -149,7 +151,10 @@ pub struct AgentBuilder {
     handlers: Vec<RegisteredHandler>,
     engine_id: Option<Vec<u8>>,
     max_message_size: usize,
+    max_concurrent_requests: Option<usize>,
+    recv_buffer_size: Option<usize>,
     vacm: Option<VacmConfig>,
+    cancel: Option<CancellationToken>,
 }
 
 impl AgentBuilder {
@@ -158,6 +163,8 @@ impl AgentBuilder {
     /// Defaults:
     /// - Bind address: `0.0.0.0:161` (UDP)
     /// - Max message size: 1472 bytes (Ethernet MTU - IP/UDP headers)
+    /// - Max concurrent requests: 1000
+    /// - Receive buffer size: 4MB (requested from kernel)
     /// - No communities or USM users (all requests rejected)
     /// - No handlers registered
     pub fn new() -> Self {
@@ -168,7 +175,10 @@ impl AgentBuilder {
             handlers: Vec::new(),
             engine_id: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_concurrent_requests: Some(1000),
+            recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
             vacm: None,
+            cancel: None,
         }
     }
 
@@ -348,6 +358,29 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the maximum number of concurrent requests the agent will process.
+    ///
+    /// Default is 1000. Requests beyond this limit will queue until a slot
+    /// becomes available. Set to `None` for unbounded concurrency.
+    ///
+    /// This controls memory usage under high load while still allowing
+    /// parallel request processing.
+    pub fn max_concurrent_requests(mut self, limit: Option<usize>) -> Self {
+        self.max_concurrent_requests = limit;
+        self
+    }
+
+    /// Set the UDP socket receive buffer size.
+    ///
+    /// Default is 4MB. The kernel may cap this at `net.core.rmem_max`.
+    /// A larger buffer prevents packet loss during request bursts.
+    ///
+    /// Set to `None` to use the kernel default.
+    pub fn recv_buffer_size(mut self, size: Option<usize>) -> Self {
+        self.recv_buffer_size = size;
+        self
+    }
+
     /// Register a MIB handler for an OID subtree.
     ///
     /// Handlers are matched by longest prefix. When a request comes in,
@@ -437,6 +470,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a cancellation token for graceful shutdown.
+    ///
+    /// If not set, the agent creates its own token accessible via `Agent::cancel()`.
+    pub fn cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
     /// Build the agent.
     pub async fn build(mut self) -> Result<Agent> {
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| Error::Io {
@@ -447,10 +488,12 @@ impl AgentBuilder {
             ),
         })?;
 
-        let socket = bind_udp_socket(bind_addr).await.map_err(|e| Error::Io {
-            target: Some(bind_addr),
-            source: e,
-        })?;
+        let socket = bind_udp_socket(bind_addr, self.recv_buffer_size)
+            .await
+            .map_err(|e| Error::Io {
+                target: Some(bind_addr),
+                source: e,
+            })?;
 
         let local_addr = socket.local_addr().map_err(|e| Error::Io {
             target: Some(bind_addr),
@@ -474,9 +517,16 @@ impl AgentBuilder {
         self.handlers
             .sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
 
+        let cancel = self.cancel.unwrap_or_default();
+
+        // Create concurrency limiter if configured
+        let concurrency_limit = self
+            .max_concurrent_requests
+            .map(|n| Arc::new(Semaphore::new(n)));
+
         Ok(Agent {
             inner: Arc::new(AgentInner {
-                socket,
+                socket: Arc::new(socket),
                 local_addr,
                 communities: self.communities,
                 usm_users: self.usm_users,
@@ -487,10 +537,12 @@ impl AgentBuilder {
                 engine_start: Instant::now(),
                 salt_counter: SaltCounter::new(),
                 max_message_size: self.max_message_size,
+                concurrency_limit,
                 vacm: self.vacm,
                 snmp_invalid_msgs: AtomicU32::new(0),
                 snmp_unknown_security_models: AtomicU32::new(0),
                 snmp_silent_drops: AtomicU32::new(0),
+                cancel,
             }),
         })
     }
@@ -504,7 +556,7 @@ impl Default for AgentBuilder {
 
 /// Inner state shared across agent clones.
 pub(crate) struct AgentInner {
-    pub(crate) socket: UdpSocket,
+    pub(crate) socket: Arc<UdpSocket>,
     pub(crate) local_addr: SocketAddr,
     pub(crate) communities: Vec<Vec<u8>>,
     pub(crate) usm_users: HashMap<Bytes, UsmUserConfig>,
@@ -515,6 +567,7 @@ pub(crate) struct AgentInner {
     pub(crate) engine_start: Instant,
     pub(crate) salt_counter: SaltCounter,
     pub(crate) max_message_size: usize,
+    pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
     pub(crate) vacm: Option<VacmConfig>,
     // RFC 3412 statistics counters
     /// snmpInvalidMsgs (1.3.6.1.6.3.11.2.1.2) - messages with invalid msgFlags
@@ -526,6 +579,8 @@ pub(crate) struct AgentInner {
     /// snmpSilentDrops (1.3.6.1.6.3.11.2.1.3) - confirmed-class PDUs silently
     /// dropped because even an empty response would exceed max message size
     pub(crate) snmp_silent_drops: AtomicU32,
+    /// Cancellation token for graceful shutdown.
+    pub(crate) cancel: CancellationToken,
 }
 
 /// SNMP Agent.
@@ -568,6 +623,13 @@ impl Agent {
         &self.inner.engine_id
     }
 
+    /// Get the cancellation token for this agent.
+    ///
+    /// Call `token.cancel()` to initiate graceful shutdown.
+    pub fn cancel(&self) -> CancellationToken {
+        self.inner.cancel.clone()
+    }
+
     /// Get the snmpInvalidMsgs counter value.
     ///
     /// This counter tracks messages with invalid msgFlags, such as
@@ -602,42 +664,63 @@ impl Agent {
         self.inner.snmp_silent_drops.load(Ordering::Relaxed)
     }
 
-    /// Run the agent, processing requests indefinitely.
+    /// Run the agent, processing requests concurrently.
     ///
-    /// This method runs until an error occurs or the task is cancelled.
+    /// Requests are processed in parallel up to the configured
+    /// `max_concurrent_requests` limit (default: 1000). This method runs
+    /// until the cancellation token is triggered.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn run(&self) -> Result<()> {
         let mut buf = vec![0u8; 65535];
 
         loop {
-            let (len, source) =
-                self.inner
-                    .socket
-                    .recv_from(&mut buf)
-                    .await
-                    .map_err(|e| Error::Io {
+            let (len, source) = tokio::select! {
+                result = self.inner.socket.recv_from(&mut buf) => {
+                    result.map_err(|e| Error::Io {
                         target: Some(self.inner.local_addr),
                         source: e,
-                    })?;
+                    })?
+                }
+                _ = self.inner.cancel.cancelled() => {
+                    tracing::info!("agent shutdown requested");
+                    return Ok(());
+                }
+            };
 
             let data = Bytes::copy_from_slice(&buf[..len]);
 
-            // Update engine time before processing
-            self.update_engine_time();
+            // Clone agent for the spawned task
+            let agent = self.clone();
 
-            match self.handle_request(data, source).await {
-                Ok(Some(response_bytes)) => {
-                    if let Err(e) = self.inner.socket.send_to(&response_bytes, source).await {
-                        tracing::warn!(snmp.source = %source, error = %e, "failed to send response");
+            // Acquire concurrency permit if configured
+            let permit = if let Some(ref sem) = self.inner.concurrency_limit {
+                Some(sem.clone().acquire_owned().await.expect("semaphore closed"))
+            } else {
+                None
+            };
+
+            // Spawn task to handle request concurrently
+            tokio::spawn(async move {
+                // Update engine time
+                agent.update_engine_time();
+
+                match agent.handle_request(data, source).await {
+                    Ok(Some(response_bytes)) => {
+                        if let Err(e) = agent.inner.socket.send_to(&response_bytes, source).await {
+                            tracing::warn!(snmp.source = %source, error = %e, "failed to send response");
+                        }
+                    }
+                    Ok(None) => {
+                        // No response needed (e.g., invalid message)
+                    }
+                    Err(e) => {
+                        tracing::warn!(snmp.source = %source, error = %e, "error handling request");
                     }
                 }
-                Ok(None) => {
-                    // No response needed (e.g., invalid message)
-                }
-                Err(e) => {
-                    tracing::warn!(snmp.source = %source, error = %e, "error handling request");
-                }
-            }
+
+                // Permit dropped here, releasing the slot
+                drop(permit);
+            });
         }
     }
 
