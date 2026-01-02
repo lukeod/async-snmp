@@ -161,6 +161,24 @@ impl Pdu {
         let error_index = pdu_decoder.read_integer()?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
 
+        // Validate error_index bounds per RFC 3416 Section 3.
+        // error_index is 1-based: 0 means no error, 1..=len points to specific varbind.
+        if error_index < 0 {
+            return Err(Error::decode(
+                pdu_decoder.offset(),
+                DecodeErrorKind::NegativeErrorIndex { value: error_index },
+            ));
+        }
+        if error_index > 0 && (error_index as usize) > varbinds.len() {
+            return Err(Error::decode(
+                pdu_decoder.offset(),
+                DecodeErrorKind::ErrorIndexOutOfBounds {
+                    index: error_index,
+                    varbind_count: varbinds.len(),
+                },
+            ));
+        }
+
         Ok(Pdu {
             pdu_type,
             request_id,
@@ -516,6 +534,24 @@ impl GetBulkPdu {
         let max_repetitions = pdu.read_integer()?;
         let varbinds = decode_varbind_list(&mut pdu)?;
 
+        // Validate non_repeaters and max_repetitions per RFC 3416 Section 4.2.3.
+        if non_repeaters < 0 {
+            return Err(Error::decode(
+                pdu.offset(),
+                DecodeErrorKind::NegativeNonRepeaters {
+                    value: non_repeaters,
+                },
+            ));
+        }
+        if max_repetitions < 0 {
+            return Err(Error::decode(
+                pdu.offset(),
+                DecodeErrorKind::NegativeMaxRepetitions {
+                    value: max_repetitions,
+                },
+            ));
+        }
+
         Ok(GetBulkPdu {
             request_id,
             non_repeaters,
@@ -529,6 +565,81 @@ impl GetBulkPdu {
 mod tests {
     use super::*;
     use crate::oid;
+
+    /// Test helper for encoding PDUs with arbitrary field values.
+    ///
+    /// Unlike `Pdu`, this allows encoding invalid values (negative error_index,
+    /// out-of-bounds indices, etc.) for testing decoder validation.
+    struct RawPdu {
+        pdu_type: u8,
+        request_id: i32,
+        error_status: i32,
+        error_index: i32,
+        varbinds: Vec<VarBind>,
+    }
+
+    impl RawPdu {
+        fn response(
+            request_id: i32,
+            error_status: i32,
+            error_index: i32,
+            varbinds: Vec<VarBind>,
+        ) -> Self {
+            Self {
+                pdu_type: PduType::Response.tag(),
+                request_id,
+                error_status,
+                error_index,
+                varbinds,
+            }
+        }
+
+        fn encode(&self) -> bytes::Bytes {
+            let mut buf = EncodeBuf::new();
+            buf.push_constructed(self.pdu_type, |buf| {
+                encode_varbind_list(buf, &self.varbinds);
+                buf.push_integer(self.error_index);
+                buf.push_integer(self.error_status);
+                buf.push_integer(self.request_id);
+            });
+            buf.finish()
+        }
+    }
+
+    /// Test helper for encoding GETBULK PDUs with arbitrary field values.
+    struct RawGetBulkPdu {
+        request_id: i32,
+        non_repeaters: i32,
+        max_repetitions: i32,
+        varbinds: Vec<VarBind>,
+    }
+
+    impl RawGetBulkPdu {
+        fn new(
+            request_id: i32,
+            non_repeaters: i32,
+            max_repetitions: i32,
+            varbinds: Vec<VarBind>,
+        ) -> Self {
+            Self {
+                request_id,
+                non_repeaters,
+                max_repetitions,
+                varbinds,
+            }
+        }
+
+        fn encode(&self) -> bytes::Bytes {
+            let mut buf = EncodeBuf::new();
+            buf.push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
+                encode_varbind_list(buf, &self.varbinds);
+                buf.push_integer(self.max_repetitions);
+                buf.push_integer(self.non_repeaters);
+                buf.push_integer(self.request_id);
+            });
+            buf.finish()
+        }
+    }
 
     #[test]
     fn test_get_request_roundtrip() {
@@ -748,5 +859,141 @@ mod tests {
         };
         assert!(!trap.is_confirmed());
         assert!(trap.is_notification());
+    }
+
+    #[test]
+    fn test_decode_rejects_negative_error_index() {
+        // Response PDU with negative error_index (-1)
+        let raw = RawPdu::response(1, 0, -1, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = Pdu::decode(&mut decoder);
+
+        assert!(result.is_err(), "should reject negative error_index");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Decode {
+                    kind: crate::error::DecodeErrorKind::NegativeErrorIndex { value: -1 },
+                    ..
+                }
+            ),
+            "expected NegativeErrorIndex, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_rejects_error_index_beyond_varbinds() {
+        // Response PDU with error_index=5 but only 1 varbind
+        let raw = RawPdu::response(1, 5, 5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = Pdu::decode(&mut decoder);
+
+        assert!(result.is_err(), "should reject error_index beyond varbinds");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Decode {
+                    kind: crate::error::DecodeErrorKind::ErrorIndexOutOfBounds {
+                        index: 5,
+                        varbind_count: 1
+                    },
+                    ..
+                }
+            ),
+            "expected ErrorIndexOutOfBounds, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_accepts_valid_error_index_zero() {
+        // error_index=0 with no error is valid
+        let raw = RawPdu::response(1, 0, 0, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let decoded = Pdu::decode(&mut decoder);
+        assert!(decoded.is_ok(), "error_index=0 should be valid");
+    }
+
+    #[test]
+    fn test_decode_accepts_error_index_within_bounds() {
+        // error_index=1 with 1 varbind is valid (1-based indexing)
+        let raw = RawPdu::response(1, 5, 1, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = Pdu::decode(&mut decoder);
+        assert!(
+            result.is_ok(),
+            "error_index=1 with 1 varbind should be valid"
+        );
+    }
+
+    #[test]
+    fn test_decode_rejects_negative_non_repeaters() {
+        let raw = RawGetBulkPdu::new(1, -1, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = GetBulkPdu::decode(&mut decoder);
+
+        assert!(result.is_err(), "should reject negative non_repeaters");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Decode {
+                    kind: crate::error::DecodeErrorKind::NegativeNonRepeaters { value: -1 },
+                    ..
+                }
+            ),
+            "expected NegativeNonRepeaters, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_rejects_negative_max_repetitions() {
+        let raw = RawGetBulkPdu::new(1, 0, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = GetBulkPdu::decode(&mut decoder);
+
+        assert!(result.is_err(), "should reject negative max_repetitions");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Decode {
+                    kind: crate::error::DecodeErrorKind::NegativeMaxRepetitions { value: -5 },
+                    ..
+                }
+            ),
+            "expected NegativeMaxRepetitions, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_accepts_valid_getbulk_params() {
+        let raw = RawGetBulkPdu::new(1, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = GetBulkPdu::decode(&mut decoder);
+        assert!(result.is_ok(), "valid GETBULK params should be accepted");
+
+        let pdu = result.unwrap();
+        assert_eq!(pdu.non_repeaters, 0);
+        assert_eq!(pdu.max_repetitions, 10);
     }
 }
