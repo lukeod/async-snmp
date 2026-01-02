@@ -119,6 +119,41 @@ impl PrivKey {
         Self::from_master_key(&master, priv_protocol, engine_id)
     }
 
+    /// Derive a privacy key with optional key extension.
+    ///
+    /// When `key_extension` is [`super::KeyExtension::Blumenthal`], this method
+    /// extends the localized key to the required length for the privacy protocol,
+    /// even when the authentication protocol produces insufficient key material.
+    ///
+    /// This enables combinations like SHA-1 + AES-256 for interoperability with
+    /// net-snmp and other implementations that support draft-blumenthal-aes-usm-04.
+    pub fn from_password_extended(
+        auth_protocol: AuthProtocol,
+        priv_protocol: PrivProtocol,
+        password: &[u8],
+        engine_id: &[u8],
+        key_extension: super::KeyExtension,
+    ) -> Self {
+        use super::{KeyExtension, MasterKey, auth::extend_key};
+
+        let master = MasterKey::from_password(auth_protocol, password);
+        let localized = master.localize(engine_id);
+        let key_bytes = localized.as_bytes();
+
+        let key = match key_extension {
+            KeyExtension::None => key_bytes.to_vec(),
+            KeyExtension::Blumenthal => {
+                extend_key(auth_protocol, key_bytes, priv_protocol.key_len())
+            }
+        };
+
+        Self {
+            key,
+            protocol: priv_protocol,
+            salt_counter: Self::init_salt(),
+        }
+    }
+
     /// Derive a privacy key from a master key and engine ID.
     ///
     /// This is the efficient path when you have a cached [`MasterKey`](super::MasterKey).

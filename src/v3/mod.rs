@@ -14,7 +14,7 @@ mod engine;
 mod privacy;
 mod usm;
 
-pub use auth::{LocalizedKey, MasterKey, MasterKeys};
+pub use auth::{LocalizedKey, MasterKey, MasterKeys, extend_key};
 pub use engine::{
     DEFAULT_MSG_MAX_SIZE, EngineCache, EngineState, TIME_WINDOW, parse_discovery_response,
     parse_discovery_response_with_limits,
@@ -25,6 +25,23 @@ pub use engine::{
 };
 pub use privacy::{PrivKey, SaltCounter};
 pub use usm::UsmSecurityParams;
+
+/// Key extension strategy for privacy key derivation.
+///
+/// When using AES-192 or AES-256 with authentication protocols that produce
+/// shorter digests (e.g., SHA-1), a key extension algorithm is needed to
+/// generate sufficient key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyExtension {
+    /// No key extension. Requires compatible auth/priv protocol combinations.
+    /// This is the default and will panic if insufficient key material.
+    #[default]
+    None,
+    /// Use the Blumenthal key extension algorithm (draft-blumenthal-aes-usm-04).
+    /// Extends keys by iteratively hashing: Kul' = Kul || H(Kul) || H(Kul||H(Kul)) || ...
+    Blumenthal,
+}
 
 /// Error returned when parsing a protocol name fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +165,13 @@ impl AuthProtocol {
     /// | AES-128          | 16 bytes           | All (MD5+)           |
     /// | AES-192          | 24 bytes           | SHA-224, SHA-256, SHA-384, SHA-512 |
     /// | AES-256          | 32 bytes           | SHA-256, SHA-384, SHA-512 |
+    ///
+    /// # Interoperability with net-snmp
+    ///
+    /// Some implementations (notably net-snmp) support AES-192/256 with shorter
+    /// authentication protocols using key extension. To interoperate with these
+    /// systems, use [`PrivKey::from_password_extended`] with
+    /// [`KeyExtension::Blumenthal`].
     ///
     /// # Example
     ///

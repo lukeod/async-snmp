@@ -545,6 +545,78 @@ impl std::fmt::Debug for MasterKeys {
     }
 }
 
+/// Extend a localized key to the required length using the Blumenthal algorithm.
+///
+/// This implements the key extension algorithm from draft-blumenthal-aes-usm-04
+/// Section 3.1.2.1, which allows AES-192/256 to be used with authentication
+/// protocols that produce shorter digests (e.g., SHA-1 with AES-256).
+///
+/// The algorithm iteratively appends hash digests:
+/// ```text
+/// Kul' = Kul || H(Kul) || H(Kul || H(Kul)) || ...
+/// ```
+///
+/// Where H() is the hash function of the authentication protocol.
+///
+/// # Arguments
+///
+/// * `protocol` - The authentication protocol whose hash function to use
+/// * `key` - The localized key to extend
+/// * `target_len` - The desired key length in bytes
+///
+/// # Returns
+///
+/// A `Vec<u8>` of exactly `target_len` bytes. If `key.len() >= target_len`,
+/// returns the first `target_len` bytes of the key (truncation).
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::{AuthProtocol, v3::extend_key};
+///
+/// // SHA-1 produces 20-byte keys; extend to 32 bytes for AES-256
+/// let sha1_key = vec![0u8; 20];
+/// let extended = extend_key(AuthProtocol::Sha1, &sha1_key, 32);
+/// assert_eq!(extended.len(), 32);
+/// ```
+pub fn extend_key(protocol: AuthProtocol, key: &[u8], target_len: usize) -> Vec<u8> {
+    // If we already have enough bytes, just truncate
+    if key.len() >= target_len {
+        return key[..target_len].to_vec();
+    }
+
+    match protocol {
+        AuthProtocol::Md5 => extend_key_impl::<md5::Md5>(key, target_len),
+        AuthProtocol::Sha1 => extend_key_impl::<sha1::Sha1>(key, target_len),
+        AuthProtocol::Sha224 => extend_key_impl::<sha2::Sha224>(key, target_len),
+        AuthProtocol::Sha256 => extend_key_impl::<sha2::Sha256>(key, target_len),
+        AuthProtocol::Sha384 => extend_key_impl::<sha2::Sha384>(key, target_len),
+        AuthProtocol::Sha512 => extend_key_impl::<sha2::Sha512>(key, target_len),
+    }
+}
+
+/// Generic implementation of Blumenthal key extension.
+///
+/// Algorithm: Kul' = Kul || H(Kul) || H(Kul || H(Kul)) || ...
+fn extend_key_impl<D>(key: &[u8], target_len: usize) -> Vec<u8>
+where
+    D: Digest + Default,
+{
+    let mut result = key.to_vec();
+
+    // Keep appending H(result) until we have enough bytes
+    while result.len() < target_len {
+        let mut hasher = D::new();
+        hasher.update(&result);
+        let hash = hasher.finalize();
+        result.extend_from_slice(&hash);
+    }
+
+    // Truncate to exact length
+    result.truncate(target_len);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

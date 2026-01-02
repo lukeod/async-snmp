@@ -545,3 +545,252 @@ fn test_mac_lengths_per_rfc() {
     // usmHMAC384SHA512AuthProtocol: 48 bytes
     assert_eq!(key_sha512.mac_len(), 48);
 }
+
+// ============================================================================
+// Blumenthal Key Extension Tests (draft-blumenthal-aes-usm-04)
+//
+// These tests verify the key extension algorithm used for AES-192/256 when
+// the authentication protocol produces insufficient key material. This is
+// an interoperability feature for communicating with net-snmp and other
+// implementations that support AES-192/256 with shorter auth protocols.
+// ============================================================================
+
+/// Test vector from draft-blumenthal-aes-usm-04 Appendix A.1.
+///
+/// SHA-1 localized key extended to 256 bits for AES-256.
+/// Password: "maplesyrup"
+/// Engine ID: 000000000000000000000002
+/// SHA-1 Kul (160-bit): 6695febc9288e36282235fc7151f128497b38f3f
+/// Extended Kul (256-bit): 6695febc9288e36282235fc7151f128497b38f3f505e07eb9af25568fa1f5dbe
+#[test]
+fn test_blumenthal_sha1_key_extension_to_256_bits() {
+    use async_snmp::v3::extend_key;
+
+    let original_key = decode("6695febc9288e36282235fc7151f128497b38f3f").unwrap();
+
+    // Extend to 32 bytes for AES-256
+    let extended = extend_key(AuthProtocol::Sha1, &original_key, 32);
+
+    assert_eq!(extended.len(), 32);
+    assert_eq!(
+        encode(&extended),
+        "6695febc9288e36282235fc7151f128497b38f3f505e07eb9af25568fa1f5dbe",
+        "SHA-1 key extension to 256 bits does not match draft test vector"
+    );
+}
+
+/// Verify the intermediate hash step from the Blumenthal algorithm.
+///
+/// For SHA-1, the first extension step is: H(Kul) where Kul is the
+/// original 20-byte localized key. The result should match bytes 20-31
+/// of the extended key from the test vector.
+#[test]
+fn test_blumenthal_sha1_intermediate_hash() {
+    use async_snmp::v3::extend_key;
+
+    let original_key = decode("6695febc9288e36282235fc7151f128497b38f3f").unwrap();
+
+    // Extend to 24 bytes for AES-192 (need 4 more bytes)
+    let extended_24 = extend_key(AuthProtocol::Sha1, &original_key, 24);
+
+    assert_eq!(extended_24.len(), 24);
+    // First 20 bytes should be identical to original
+    assert_eq!(&extended_24[..20], &original_key[..]);
+    // Bytes 20-23 should be first 4 bytes of SHA1(original)
+    assert_eq!(encode(&extended_24[20..]), "505e07eb");
+}
+
+/// Key extension with MD5 produces correct length output.
+///
+/// MD5 produces 16-byte keys. For AES-192 (24 bytes), we need 8 more bytes.
+/// For AES-256 (32 bytes), we need 16 more bytes (full MD5 hash).
+#[test]
+fn test_blumenthal_md5_key_extension_lengths() {
+    use async_snmp::v3::extend_key;
+
+    // Use the MD5 localized key from RFC 3414 test vector
+    let md5_key = decode("526f5eed9fcce26f8964c2930787d82b").unwrap();
+    assert_eq!(md5_key.len(), 16);
+
+    // Extend to 24 bytes for AES-192
+    let extended_24 = extend_key(AuthProtocol::Md5, &md5_key, 24);
+    assert_eq!(extended_24.len(), 24);
+    assert_eq!(
+        &extended_24[..16],
+        &md5_key[..],
+        "first 16 bytes should be original key"
+    );
+
+    // Extend to 32 bytes for AES-256
+    let extended_32 = extend_key(AuthProtocol::Md5, &md5_key, 32);
+    assert_eq!(extended_32.len(), 32);
+    assert_eq!(
+        &extended_32[..16],
+        &md5_key[..],
+        "first 16 bytes should be original key"
+    );
+}
+
+/// Key extension is deterministic - same inputs produce same output.
+#[test]
+fn test_blumenthal_key_extension_deterministic() {
+    use async_snmp::v3::extend_key;
+
+    let original_key = decode("6695febc9288e36282235fc7151f128497b38f3f").unwrap();
+
+    let extended1 = extend_key(AuthProtocol::Sha1, &original_key, 32);
+    let extended2 = extend_key(AuthProtocol::Sha1, &original_key, 32);
+
+    assert_eq!(extended1, extended2);
+}
+
+/// When requested length is less than or equal to input, return input unchanged.
+#[test]
+fn test_blumenthal_no_extension_when_not_needed() {
+    use async_snmp::v3::extend_key;
+
+    let sha256_key =
+        decode("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20").unwrap();
+    assert_eq!(sha256_key.len(), 32);
+
+    // Request 32 bytes from a 32-byte key - no extension needed
+    let result = extend_key(AuthProtocol::Sha256, &sha256_key, 32);
+    assert_eq!(result.len(), 32);
+    assert_eq!(&result[..], &sha256_key[..]);
+
+    // Request 24 bytes from a 32-byte key - just truncate
+    let result = extend_key(AuthProtocol::Sha256, &sha256_key, 24);
+    assert_eq!(result.len(), 24);
+    assert_eq!(&result[..], &sha256_key[..24]);
+}
+
+/// AES-256 encryption/decryption roundtrip with SHA-1 extended key.
+#[test]
+fn test_aes256_with_sha1_extended_key_roundtrip() {
+    use async_snmp::v3::KeyExtension;
+
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+
+    // Create privacy key with Blumenthal extension enabled
+    let mut priv_key = PrivKey::from_password_extended(
+        AuthProtocol::Sha1,
+        PrivProtocol::Aes256,
+        password,
+        &engine_id,
+        KeyExtension::Blumenthal,
+    );
+
+    // Verify the encryption key length is correct for AES-256
+    assert_eq!(priv_key.encryption_key().len(), 32);
+
+    // Encrypt and decrypt
+    let plaintext = b"Test message for AES-256 with extended SHA-1 key";
+    let engine_boots = 100u32;
+    let engine_time = 12345u32;
+
+    let (ciphertext, priv_params) = priv_key
+        .encrypt(plaintext, engine_boots, engine_time, None)
+        .expect("encryption should succeed");
+
+    let decrypted = priv_key
+        .decrypt(&ciphertext, engine_boots, engine_time, &priv_params)
+        .expect("decryption should succeed");
+
+    assert_eq!(decrypted.as_ref(), plaintext);
+}
+
+/// AES-192 encryption/decryption roundtrip with SHA-1 extended key.
+#[test]
+fn test_aes192_with_sha1_extended_key_roundtrip() {
+    use async_snmp::v3::KeyExtension;
+
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+
+    // Create privacy key with Blumenthal extension enabled
+    let mut priv_key = PrivKey::from_password_extended(
+        AuthProtocol::Sha1,
+        PrivProtocol::Aes192,
+        password,
+        &engine_id,
+        KeyExtension::Blumenthal,
+    );
+
+    // Verify the encryption key length is correct for AES-192
+    assert_eq!(priv_key.encryption_key().len(), 24);
+
+    // Encrypt and decrypt
+    let plaintext = b"Test message for AES-192 with extended SHA-1 key";
+    let engine_boots = 200u32;
+    let engine_time = 54321u32;
+
+    let (ciphertext, priv_params) = priv_key
+        .encrypt(plaintext, engine_boots, engine_time, None)
+        .expect("encryption should succeed");
+
+    let decrypted = priv_key
+        .decrypt(&ciphertext, engine_boots, engine_time, &priv_params)
+        .expect("decryption should succeed");
+
+    assert_eq!(decrypted.as_ref(), plaintext);
+}
+
+/// AES-256 with MD5 extended key roundtrip.
+#[test]
+fn test_aes256_with_md5_extended_key_roundtrip() {
+    use async_snmp::v3::KeyExtension;
+
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+
+    let mut priv_key = PrivKey::from_password_extended(
+        AuthProtocol::Md5,
+        PrivProtocol::Aes256,
+        password,
+        &engine_id,
+        KeyExtension::Blumenthal,
+    );
+
+    assert_eq!(priv_key.encryption_key().len(), 32);
+
+    let plaintext = b"Test message for AES-256 with extended MD5 key";
+    let (ciphertext, priv_params) = priv_key
+        .encrypt(plaintext, 300, 67890, None)
+        .expect("encryption should succeed");
+
+    let decrypted = priv_key
+        .decrypt(&ciphertext, 300, 67890, &priv_params)
+        .expect("decryption should succeed");
+
+    assert_eq!(decrypted.as_ref(), plaintext);
+}
+
+/// Extended keys from same password but different engine IDs differ.
+#[test]
+fn test_extended_keys_differ_by_engine_id() {
+    use async_snmp::v3::KeyExtension;
+
+    let password = b"maplesyrup";
+    let engine_id_1 = decode("000000000000000000000001").unwrap();
+    let engine_id_2 = decode("000000000000000000000002").unwrap();
+
+    let priv_key_1 = PrivKey::from_password_extended(
+        AuthProtocol::Sha1,
+        PrivProtocol::Aes256,
+        password,
+        &engine_id_1,
+        KeyExtension::Blumenthal,
+    );
+
+    let priv_key_2 = PrivKey::from_password_extended(
+        AuthProtocol::Sha1,
+        PrivProtocol::Aes256,
+        password,
+        &engine_id_2,
+        KeyExtension::Blumenthal,
+    );
+
+    // Keys should be different because they're localized to different engines
+    assert_ne!(priv_key_1.encryption_key(), priv_key_2.encryption_key());
+}
