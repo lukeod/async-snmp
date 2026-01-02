@@ -210,6 +210,22 @@ pub(crate) enum ContextMatch {
     Prefix,
 }
 
+/// Result of checking whether a subtree is in a view.
+///
+/// This 3-state result enables optimizations for GETBULK/GETNEXT operations
+/// by distinguishing between definite inclusion, definite exclusion, and
+/// mixed/ambiguous subtrees that require per-OID checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewCheckResult {
+    /// The queried OID and all its descendants are definitely in the view.
+    Included,
+    /// The queried OID and all its descendants are definitely not in the view.
+    Excluded,
+    /// The subtree has mixed permissions - some descendants are included,
+    /// others are excluded. Per-OID access checks are required.
+    Ambiguous,
+}
+
 /// A view is a collection of OID subtrees defining accessible objects.
 ///
 /// Views are used by VACM to determine which OIDs a user can access.
@@ -376,6 +392,63 @@ impl View {
 
         // Included and not excluded
         dominated_by_include && !dominated_by_exclude
+    }
+
+    /// Check subtree access status with 3-state result.
+    ///
+    /// Unlike [`contains()`](View::contains) which checks a single OID,
+    /// this method determines the access status for an entire subtree.
+    /// This enables optimizations for GETBULK/GETNEXT operations.
+    ///
+    /// Returns:
+    /// - [`ViewCheckResult::Included`]: OID and all descendants are accessible
+    /// - [`ViewCheckResult::Excluded`]: OID and all descendants are not accessible
+    /// - [`ViewCheckResult::Ambiguous`]: Mixed permissions, check each OID individually
+    pub fn check_subtree(&self, oid: &Oid) -> ViewCheckResult {
+        let mut has_covering_include = false;
+        let mut has_covering_exclude = false;
+        let mut has_child_include = false;
+        let mut has_child_exclude = false;
+
+        let query_arcs = oid.arcs();
+
+        for subtree in &self.subtrees {
+            if subtree.matches(oid) {
+                if subtree.included {
+                    has_covering_include = true;
+                } else {
+                    has_covering_exclude = true;
+                }
+            }
+
+            let subtree_arcs = subtree.oid.arcs();
+            if subtree_arcs.len() > query_arcs.len()
+                && subtree_arcs[..query_arcs.len()] == *query_arcs
+            {
+                if subtree.included {
+                    has_child_include = true;
+                } else {
+                    has_child_exclude = true;
+                }
+            }
+        }
+
+        if has_covering_exclude {
+            return ViewCheckResult::Excluded;
+        }
+
+        if has_covering_include {
+            if has_child_exclude {
+                return ViewCheckResult::Ambiguous;
+            }
+            return ViewCheckResult::Included;
+        }
+
+        if has_child_include {
+            return ViewCheckResult::Ambiguous;
+        }
+
+        ViewCheckResult::Excluded
     }
 }
 
@@ -1521,5 +1594,254 @@ mod tests {
             Bytes::from_static(b"authpriv_view"),
             "higher security level should win regardless of insertion order"
         );
+    }
+
+    // ViewCheckResult and check_subtree tests
+    //
+    // These tests validate the 3-state subtree check semantics from RFC 3415.
+    // For GETBULK/GETNEXT operations, knowing whether a subtree has mixed
+    // permissions enables optimizations:
+    // - Included: Skip per-OID access checks for descendants
+    // - Excluded: Early termination, no descendants accessible
+    // - Ambiguous: Must check each OID individually
+
+    #[test]
+    fn test_check_subtree_empty_view_is_excluded() {
+        // Empty view contains nothing
+        let view = View::new();
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1)),
+            ViewCheckResult::Excluded
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_oid_within_included_subtree() {
+        // OID that falls within an included subtree is included
+        let view = View::new().include(oid!(1, 3, 6, 1, 2, 1));
+
+        // OID within the subtree
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 1, 0)),
+            ViewCheckResult::Included
+        );
+        // OID exactly at subtree root
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1)),
+            ViewCheckResult::Included
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_oid_within_excluded_subtree() {
+        // OID within an excluded subtree (after include) is excluded
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1))
+            .exclude(oid!(1, 3, 6, 1, 2, 1, 1, 7));
+
+        // OID within the excluded subtree
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 1, 7, 0)),
+            ViewCheckResult::Excluded
+        );
+        // OID exactly at exclude root
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 1, 7)),
+            ViewCheckResult::Excluded
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_oid_outside_all_subtrees() {
+        // OID completely outside any defined subtree is excluded
+        let view = View::new().include(oid!(1, 3, 6, 1, 2, 1));
+
+        // Different branch entirely
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 4, 1)),
+            ViewCheckResult::Excluded
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_parent_of_single_include_is_ambiguous() {
+        // Parent OID of an included subtree is ambiguous:
+        // some children (the include) are accessible, others are not
+        let view = View::new().include(oid!(1, 3, 6, 1, 2, 1));
+
+        // Parent of the included subtree
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1)),
+            ViewCheckResult::Ambiguous
+        );
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6)),
+            ViewCheckResult::Ambiguous
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_parent_of_include_with_nested_exclude() {
+        // View with include and nested exclude: parent is ambiguous
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1))
+            .exclude(oid!(1, 3, 6, 1, 2, 1, 1, 7));
+
+        // Parent of the include - ambiguous because it has included descendants
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1)),
+            ViewCheckResult::Ambiguous
+        );
+
+        // The include root itself - ambiguous because it contains excluded subtree
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1)),
+            ViewCheckResult::Ambiguous
+        );
+
+        // Between include root and exclude - ambiguous
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 1)),
+            ViewCheckResult::Ambiguous
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_fully_included_child() {
+        // When querying a subtree that is fully within an include,
+        // with no excludes affecting it, it should be included
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1))
+            .exclude(oid!(1, 3, 6, 1, 2, 1, 25)); // exclude host resources
+
+        // sysDescr subtree - fully included, no excludes affect it
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 1, 1)),
+            ViewCheckResult::Included
+        );
+
+        // But the system group itself is ambiguous because hrMIB is excluded
+        // Wait, hrMIB is .25, not under .1 - so system group should be included
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 1)),
+            ViewCheckResult::Included
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_multiple_includes() {
+        // Multiple disjoint includes - parent is ambiguous
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1, 1)) // system
+            .include(oid!(1, 3, 6, 1, 2, 1, 2)); // interfaces
+
+        // Parent of both - ambiguous (some children included, others not)
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1)),
+            ViewCheckResult::Ambiguous
+        );
+
+        // Each individual include is fully included
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 1)),
+            ViewCheckResult::Included
+        );
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 2)),
+            ViewCheckResult::Included
+        );
+
+        // Sibling not in any include is excluded
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 3)),
+            ViewCheckResult::Excluded
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_exclude_only_is_excluded() {
+        // An exclude without a covering include excludes nothing
+        // (exclude only has effect when there's a matching include)
+        // Actually, per RFC 3415, an exclude without include means the OID
+        // is simply not in the view at all (excluded)
+        let view = View::new().exclude(oid!(1, 3, 6, 1, 2, 1, 1, 7));
+
+        // Everything is excluded because there's no include
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1)),
+            ViewCheckResult::Excluded
+        );
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1)),
+            ViewCheckResult::Excluded
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_with_mask() {
+        // Masked subtree - parent is ambiguous due to partial match
+        let view = View::new().include_masked(
+            oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2), // ifDescr
+            vec![0xFF, 0xC0],                   // arcs 0-9 exact, 10+ wildcard
+        );
+
+        // Within the masked include - included
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1)),
+            ViewCheckResult::Included
+        );
+
+        // Parent of the masked include - ambiguous
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 2)),
+            ViewCheckResult::Ambiguous
+        );
+
+        // Sibling column (ifType) - excluded
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 3)),
+            ViewCheckResult::Excluded
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_vs_contains_consistency() {
+        // Verify that check_subtree is consistent with contains:
+        // If check_subtree returns Included, contains should return true
+        // If check_subtree returns Excluded, contains should return false
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1))
+            .exclude(oid!(1, 3, 6, 1, 2, 1, 25));
+
+        let test_cases = [
+            oid!(1, 3, 6, 1, 2, 1, 1, 0),  // included
+            oid!(1, 3, 6, 1, 2, 1, 25, 1), // excluded
+            oid!(1, 3, 6, 1, 4, 1),        // not in view at all
+        ];
+
+        for oid in &test_cases {
+            let check_result = view.check_subtree(oid);
+            let contains_result = view.contains(oid);
+
+            match check_result {
+                ViewCheckResult::Included => {
+                    assert!(
+                        contains_result,
+                        "check_subtree=Included but contains=false for {:?}",
+                        oid
+                    );
+                }
+                ViewCheckResult::Excluded => {
+                    assert!(
+                        !contains_result,
+                        "check_subtree=Excluded but contains=true for {:?}",
+                        oid
+                    );
+                }
+                ViewCheckResult::Ambiguous => {
+                    // Ambiguous can be either, depending on specific OID
+                }
+            }
+        }
     }
 }
