@@ -276,6 +276,10 @@ impl Transport for TcpTransport {
     fn is_reliable(&self) -> bool {
         true
     }
+
+    fn max_message_size(&self) -> u32 {
+        MAX_TCP_MESSAGE_SIZE as u32
+    }
 }
 
 /// Read a complete BER-encoded SNMP message from a TCP stream.

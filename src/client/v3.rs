@@ -210,12 +210,18 @@ impl<T: Transport> Client<T> {
         // Parse response
         let response = V3Message::decode(response_data)?;
 
-        // Extract engine state from USM params
-        let engine_state = crate::v3::parse_discovery_response(&response.security_params)?;
+        let reported_msg_max_size = response.global_data.msg_max_size as u32;
+        let session_max = self.inner.transport.max_message_size();
+        let engine_state = crate::v3::parse_discovery_response_with_limits(
+            &response.security_params,
+            reported_msg_max_size,
+            session_max,
+        )?;
         tracing::debug!(
             snmp.engine_id = %hex::Bytes(&engine_state.engine_id),
             snmp.engine_boots = engine_state.engine_boots,
             snmp.engine_time = engine_state.engine_time,
+            snmp.msg_max_size = engine_state.msg_max_size,
             "discovered engine"
         );
 

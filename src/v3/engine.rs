@@ -37,6 +37,9 @@ use crate::v3::UsmSecurityParams;
 /// Time window in seconds (RFC 3414 Section 2.2.3).
 pub const TIME_WINDOW: u32 = 150;
 
+/// Default msgMaxSize for UDP transport (65535 - 20 IPv4 - 8 UDP = 65507).
+pub const DEFAULT_MSG_MAX_SIZE: u32 = 65507;
+
 /// USM statistics OIDs used in Report PDUs.
 pub mod report_oids {
     use crate::Oid;
@@ -86,6 +89,8 @@ pub struct EngineState {
     pub synced_at: Instant,
     /// Latest received engine time (for anti-replay, RFC 3414 Section 2.3)
     pub latest_received_engine_time: u32,
+    /// Maximum message size the remote engine can accept (from msgMaxSize header).
+    pub msg_max_size: u32,
 }
 
 impl EngineState {
@@ -97,6 +102,56 @@ impl EngineState {
             engine_time,
             synced_at: Instant::now(),
             latest_received_engine_time: engine_time,
+            msg_max_size: DEFAULT_MSG_MAX_SIZE,
+        }
+    }
+
+    /// Create with explicit msgMaxSize from agent's header.
+    pub fn with_msg_max_size(
+        engine_id: Bytes,
+        engine_boots: u32,
+        engine_time: u32,
+        msg_max_size: u32,
+    ) -> Self {
+        Self {
+            engine_id,
+            engine_boots,
+            engine_time,
+            synced_at: Instant::now(),
+            latest_received_engine_time: engine_time,
+            msg_max_size,
+        }
+    }
+
+    /// Create with msgMaxSize capped to session maximum.
+    ///
+    /// Non-compliant agents may advertise msgMaxSize values larger than they
+    /// can handle. This caps the value to a known safe session limit.
+    pub fn with_msg_max_size_capped(
+        engine_id: Bytes,
+        engine_boots: u32,
+        engine_time: u32,
+        reported_msg_max_size: u32,
+        session_max: u32,
+    ) -> Self {
+        let msg_max_size = if reported_msg_max_size > session_max {
+            tracing::debug!(
+                reported = reported_msg_max_size,
+                session_max = session_max,
+                "capping msgMaxSize to session limit"
+            );
+            session_max
+        } else {
+            reported_msg_max_size
+        };
+
+        Self {
+            engine_id,
+            engine_boots,
+            engine_time,
+            synced_at: Instant::now(),
+            latest_received_engine_time: engine_time,
+            msg_max_size,
         }
     }
 
@@ -263,16 +318,35 @@ impl Clone for EngineCache {
 /// The discovery response (Report PDU) contains the authoritative engine's
 /// ID, boots, and time in the USM security parameters field.
 pub fn parse_discovery_response(security_params: &Bytes) -> Result<EngineState> {
+    parse_discovery_response_with_limits(
+        security_params,
+        DEFAULT_MSG_MAX_SIZE,
+        DEFAULT_MSG_MAX_SIZE,
+    )
+}
+
+/// Extract engine state with explicit msgMaxSize and session limit.
+///
+/// The `reported_msg_max_size` comes from the V3 message header (MsgGlobalData).
+/// The `session_max` is our transport's maximum message size.
+/// Values are capped to prevent issues with non-compliant agents.
+pub fn parse_discovery_response_with_limits(
+    security_params: &Bytes,
+    reported_msg_max_size: u32,
+    session_max: u32,
+) -> Result<EngineState> {
     let usm = UsmSecurityParams::decode(security_params.clone())?;
 
     if usm.engine_id.is_empty() {
         return Err(Error::UnknownEngineId { target: None });
     }
 
-    Ok(EngineState::new(
+    Ok(EngineState::with_msg_max_size_capped(
         usm.engine_id,
         usm.engine_boots,
         usm.engine_time,
+        reported_msg_max_size,
+        session_max,
     ))
 }
 
@@ -868,5 +942,131 @@ mod tests {
             !state.is_in_time_window(2147483647, 2000),
             "Latched engine should reject all time window checks"
         );
+    }
+
+    // ========================================================================
+    // msgMaxSize Capping Tests
+    // ========================================================================
+    //
+    // Per net-snmp behavior, agent-reported msgMaxSize values should be capped
+    // to the session's maximum to prevent buffer issues with non-compliant agents.
+
+    /// Test that EngineState stores the agent's advertised msgMaxSize.
+    ///
+    /// The msg_max_size field tracks the maximum message size the remote engine
+    /// can accept, as reported in SNMPv3 message headers.
+    #[test]
+    fn test_engine_state_stores_msg_max_size() {
+        let state = EngineState::with_msg_max_size(Bytes::from_static(b"engine"), 1, 1000, 65507);
+        assert_eq!(state.msg_max_size, 65507);
+    }
+
+    /// Test that the default constructor uses the maximum UDP message size.
+    ///
+    /// When msgMaxSize is not provided (e.g., during basic discovery),
+    /// default to the maximum safe UDP datagram size (65507 bytes).
+    #[test]
+    fn test_engine_state_default_msg_max_size() {
+        let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
+        assert_eq!(
+            state.msg_max_size, DEFAULT_MSG_MAX_SIZE,
+            "Default msg_max_size should be the maximum UDP datagram size"
+        );
+    }
+
+    /// Test that msgMaxSize is capped to session maximum.
+    ///
+    /// Non-compliant agents may advertise msgMaxSize values larger than they
+    /// (or we) can actually handle. Values exceeding the session maximum are
+    /// silently capped to prevent buffer issues.
+    #[test]
+    fn test_engine_state_msg_max_size_capped_to_session_max() {
+        // Agent advertises 2GB, but we cap to 65507 (our session max)
+        let state = EngineState::with_msg_max_size_capped(
+            Bytes::from_static(b"engine"),
+            1,
+            1000,
+            2_000_000_000, // Agent claims 2GB
+            65507,         // Our session maximum
+        );
+        assert_eq!(
+            state.msg_max_size, 65507,
+            "msg_max_size should be capped to session maximum"
+        );
+    }
+
+    /// Test that msgMaxSize within session maximum is not modified.
+    ///
+    /// When the agent advertises a reasonable value below our maximum,
+    /// it should be stored as-is without capping.
+    #[test]
+    fn test_engine_state_msg_max_size_within_limit_not_capped() {
+        let state = EngineState::with_msg_max_size_capped(
+            Bytes::from_static(b"engine"),
+            1,
+            1000,
+            1472,  // Agent claims 1472 (Ethernet MTU - headers)
+            65507, // Our session maximum
+        );
+        assert_eq!(
+            state.msg_max_size, 1472,
+            "msg_max_size within limit should not be capped"
+        );
+    }
+
+    /// Test msgMaxSize capping at exact boundary.
+    ///
+    /// When agent's msgMaxSize exactly equals session maximum, no capping occurs.
+    #[test]
+    fn test_engine_state_msg_max_size_at_exact_boundary() {
+        let state = EngineState::with_msg_max_size_capped(
+            Bytes::from_static(b"engine"),
+            1,
+            1000,
+            65507, // Exactly at session max
+            65507, // Our session maximum
+        );
+        assert_eq!(state.msg_max_size, 65507);
+    }
+
+    /// Test msgMaxSize capping with TCP transport maximum.
+    ///
+    /// TCP transports may have higher limits. Verify capping works with
+    /// the larger TCP message size limit.
+    #[test]
+    fn test_engine_state_msg_max_size_tcp_limit() {
+        const TCP_MAX: u32 = 0x7FFFFFFF; // net-snmp TCP maximum
+
+        // Agent claims i32::MAX, we have same limit
+        let state = EngineState::with_msg_max_size_capped(
+            Bytes::from_static(b"engine"),
+            1,
+            1000,
+            TCP_MAX,
+            TCP_MAX,
+        );
+        assert_eq!(state.msg_max_size, TCP_MAX);
+
+        // Agent claims more than i32::MAX (wrapped negative), cap to limit
+        let state = EngineState::with_msg_max_size_capped(
+            Bytes::from_static(b"engine"),
+            1,
+            1000,
+            u32::MAX, // Larger than any valid msgMaxSize
+            TCP_MAX,
+        );
+        assert_eq!(
+            state.msg_max_size, TCP_MAX,
+            "Values exceeding session max should be capped"
+        );
+    }
+
+    /// Test that EngineState::new uses the default msg_max_size constant.
+    #[test]
+    fn test_engine_state_new_uses_default_constant() {
+        let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
+
+        // DEFAULT_MSG_MAX_SIZE is the maximum UDP payload (65507)
+        assert_eq!(state.msg_max_size, DEFAULT_MSG_MAX_SIZE);
     }
 }

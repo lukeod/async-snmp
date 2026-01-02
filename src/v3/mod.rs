@@ -15,7 +15,10 @@ mod privacy;
 mod usm;
 
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
-pub use engine::{EngineCache, EngineState, TIME_WINDOW, parse_discovery_response};
+pub use engine::{
+    DEFAULT_MSG_MAX_SIZE, EngineCache, EngineState, TIME_WINDOW, parse_discovery_response,
+    parse_discovery_response_with_limits,
+};
 pub use engine::{
     is_decryption_error_report, is_not_in_time_window_report, is_unknown_engine_id_report,
     is_unknown_user_name_report, is_unsupported_sec_level_report, is_wrong_digest_report,

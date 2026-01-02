@@ -105,6 +105,14 @@ pub trait Transport: Send + Sync + Clone {
     fn register_request(&self, _request_id: i32, _timeout: Duration) {
         // Default: no-op for TCP and other transports that don't need pre-registration
     }
+
+    /// Maximum message size this transport can handle.
+    ///
+    /// Used to cap agent-reported msgMaxSize values. Default is the maximum
+    /// UDP datagram payload (65507 bytes).
+    fn max_message_size(&self) -> u32 {
+        65507
+    }
 }
 
 /// Agent-side transport abstraction (listener mode).
