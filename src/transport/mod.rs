@@ -48,16 +48,20 @@ static REQUEST_ID_COUNTER: LazyLock<AtomicI32> = LazyLock::new(|| {
 
 /// Allocate a globally unique request ID.
 ///
-/// Returns a non-zero i32 that is unique within this process.
-/// The counter is seeded with time + PID to minimize collision
-/// risk across process restarts.
+/// Returns a positive non-zero i32 (range 1..=2147483647) that is unique
+/// within this process. Per RFC 1157/3412, request-id/msgID is defined as
+/// INTEGER (0..2147483647), and some implementations may not handle negative
+/// values correctly.
+///
+/// The counter is seeded with time + PID to minimize collision risk across
+/// process restarts.
 pub fn alloc_request_id() -> i32 {
     loop {
         let id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = id & 0x7FFFFFFF;
         if id != 0 {
             return id;
         }
-        // Skip zero - some agents treat it specially
     }
 }
 
@@ -310,6 +314,68 @@ fn read_ber_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
         }
 
         Some((pos + 1 + num_octets, length))
+    }
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::*;
+    use std::sync::atomic::AtomicI32;
+
+    /// RFC 1157 and RFC 3412 define request-id/msgID as INTEGER (0..2147483647).
+    #[test]
+    fn request_id_is_always_positive() {
+        for _ in 0..10_000 {
+            let id = alloc_request_id();
+            assert!(id > 0, "request ID must be positive, got {}", id);
+        }
+    }
+
+    /// Some SNMP implementations treat request-id 0 specially or reject it.
+    #[test]
+    fn request_id_zero_is_skipped() {
+        for _ in 0..10_000 {
+            let id = alloc_request_id();
+            assert_ne!(id, 0, "request ID must not be zero");
+        }
+    }
+
+    /// Validates wrap-around: counter going from i32::MAX to negative must
+    /// still produce positive values via 31-bit masking (RFC 3412 range).
+    #[test]
+    fn request_id_wrap_around_stays_positive() {
+        let counter = AtomicI32::new(i32::MAX - 100);
+
+        let alloc_test_id = || -> i32 {
+            loop {
+                let id = counter.fetch_add(1, Ordering::Relaxed);
+                let id = id & 0x7FFFFFFF;
+                if id != 0 {
+                    return id;
+                }
+            }
+        };
+
+        for i in 0..200 {
+            let id = alloc_test_id();
+            assert!(
+                id > 0,
+                "request ID must be positive after wrap, iteration {}, got {}",
+                i,
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn request_ids_are_unique() {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        for _ in 0..10_000 {
+            let id = alloc_request_id();
+            assert!(seen.insert(id), "request ID {} was allocated twice", id);
+        }
     }
 }
 
