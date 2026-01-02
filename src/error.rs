@@ -271,6 +271,10 @@ pub enum DecodeErrorKind {
     MsgMaxSizeTooLarge { value: i32 },
     /// msgID outside RFC 3412 range (0..2147483647).
     InvalidMsgId { value: i32 },
+    /// msgAuthoritativeEngineBoots outside RFC 3414 range (0..2147483647).
+    InvalidEngineBoots { value: i32 },
+    /// msgAuthoritativeEngineTime outside RFC 3414 range (0..2147483647).
+    InvalidEngineTime { value: i32 },
     /// NULL with non-zero length.
     InvalidNull,
     /// Expected plaintext, got encrypted.
@@ -323,6 +327,20 @@ impl std::fmt::Display for DecodeErrorKind {
             }
             Self::InvalidMsgId { value } => {
                 write!(f, "msgID {} outside RFC 3412 range 0..2147483647", value)
+            }
+            Self::InvalidEngineBoots { value } => {
+                write!(
+                    f,
+                    "msgAuthoritativeEngineBoots {} outside RFC 3414 range 0..2147483647",
+                    value
+                )
+            }
+            Self::InvalidEngineTime { value } => {
+                write!(
+                    f,
+                    "msgAuthoritativeEngineTime {} outside RFC 3414 range 0..2147483647",
+                    value
+                )
             }
             Self::InvalidNull => write!(f, "NULL with non-zero length"),
             Self::UnexpectedEncryption => write!(f, "expected plaintext scoped PDU"),

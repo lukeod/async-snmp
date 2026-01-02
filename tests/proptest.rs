@@ -1497,3 +1497,79 @@ mod trap_v1_boundary {
         assert!(trap.v2_trap_oid().is_err());
     }
 }
+
+// =============================================================================
+// USM Security Parameters Validation Tests
+// =============================================================================
+
+mod usm_params_boundary {
+    use super::*;
+    use async_snmp::v3::UsmSecurityParams;
+
+    fn encode_usm_with_boots_time(boots: i32, time: i32) -> Bytes {
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_integer(time);
+            buf.push_integer(boots);
+            buf.push_octet_string(b"engine");
+        });
+        buf.finish()
+    }
+
+    #[test]
+    fn usm_engine_boots_min_rejected() {
+        let encoded = encode_usm_with_boots_time(i32::MIN, 0);
+        assert!(UsmSecurityParams::decode(encoded).is_err());
+    }
+
+    #[test]
+    fn usm_engine_time_min_rejected() {
+        let encoded = encode_usm_with_boots_time(0, i32::MIN);
+        assert!(UsmSecurityParams::decode(encoded).is_err());
+    }
+
+    #[test]
+    fn usm_both_negative_rejected() {
+        let encoded = encode_usm_with_boots_time(-1, -1);
+        assert!(UsmSecurityParams::decode(encoded).is_err());
+    }
+
+    #[test]
+    fn usm_max_values_accepted() {
+        let encoded = encode_usm_with_boots_time(i32::MAX, i32::MAX);
+        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        assert_eq!(decoded.engine_boots, i32::MAX as u32);
+        assert_eq!(decoded.engine_time, i32::MAX as u32);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    #[test]
+    fn usm_params_decode_no_panic(boots in any::<i32>(), time in any::<i32>()) {
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_integer(time);
+            buf.push_integer(boots);
+            buf.push_octet_string(b"engine");
+        });
+        let encoded = buf.finish();
+
+        let result = async_snmp::v3::UsmSecurityParams::decode(encoded);
+
+        if boots < 0 || time < 0 {
+            prop_assert!(result.is_err());
+        } else {
+            let decoded = result.unwrap();
+            prop_assert_eq!(decoded.engine_boots, boots as u32);
+            prop_assert_eq!(decoded.engine_time, time as u32);
+        }
+    }
+}

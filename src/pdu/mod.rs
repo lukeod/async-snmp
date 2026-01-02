@@ -2,10 +2,10 @@
 //!
 //! PDUs represent the different SNMP operations.
 
-use crate::ber::{tag, Decoder, EncodeBuf};
+use crate::ber::{Decoder, EncodeBuf, tag};
 use crate::error::{DecodeErrorKind, Error, ErrorStatus, Result};
 use crate::oid::Oid;
-use crate::varbind::{decode_varbind_list, encode_varbind_list, VarBind};
+use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 
 /// PDU type tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

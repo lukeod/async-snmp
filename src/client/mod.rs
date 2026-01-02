@@ -259,7 +259,7 @@ impl<T: Transport> Client<T> {
                         return Err(Error::Snmp {
                             target: Some(self.peer_addr()),
                             status,
-                            index: response_pdu.error_index as u32,
+                            index: response_pdu.error_index.max(0) as u32,
                             oid,
                         });
                     }

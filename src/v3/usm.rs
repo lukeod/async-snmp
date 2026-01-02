@@ -15,7 +15,7 @@
 //! ```
 
 use crate::ber::{Decoder, EncodeBuf};
-use crate::error::Result;
+use crate::error::{DecodeErrorKind, Error, Result};
 use bytes::Bytes;
 
 /// USM security parameters.
@@ -117,8 +117,27 @@ impl UsmSecurityParams {
         let mut seq = decoder.read_sequence()?;
 
         let engine_id = seq.read_octet_string()?;
-        let engine_boots = seq.read_integer()? as u32;
-        let engine_time = seq.read_integer()? as u32;
+
+        // RFC 3414: msgAuthoritativeEngineBoots INTEGER (0..2147483647)
+        let raw_boots = seq.read_integer()?;
+        if raw_boots < 0 {
+            return Err(Error::decode(
+                seq.offset(),
+                DecodeErrorKind::InvalidEngineBoots { value: raw_boots },
+            ));
+        }
+        let engine_boots = raw_boots as u32;
+
+        // RFC 3414: msgAuthoritativeEngineTime INTEGER (0..2147483647)
+        let raw_time = seq.read_integer()?;
+        if raw_time < 0 {
+            return Err(Error::decode(
+                seq.offset(),
+                DecodeErrorKind::InvalidEngineTime { value: raw_time },
+            ));
+        }
+        let engine_time = raw_time as u32;
+
         let username = seq.read_octet_string()?;
         let auth_params = seq.read_octet_string()?;
         let priv_params = seq.read_octet_string()?;
@@ -349,5 +368,97 @@ mod tests {
 
         // Verify the bytes at that offset are zeros
         assert!(encoded[offset..offset + len].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_usm_params_rejects_negative_engine_boots() {
+        use crate::ber::EncodeBuf;
+
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_integer(100);
+            buf.push_integer(-1);
+            buf.push_octet_string(&[]);
+        });
+        let encoded = buf.finish();
+
+        let result = UsmSecurityParams::decode(encoded);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Decode {
+                kind: DecodeErrorKind::InvalidEngineBoots { value },
+                ..
+            } => assert_eq!(value, -1),
+            e => panic!("expected InvalidEngineBoots, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_usm_params_rejects_negative_engine_time() {
+        use crate::ber::EncodeBuf;
+
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_integer(-1);
+            buf.push_integer(100);
+            buf.push_octet_string(&[]);
+        });
+        let encoded = buf.finish();
+
+        let result = UsmSecurityParams::decode(encoded);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Decode {
+                kind: DecodeErrorKind::InvalidEngineTime { value },
+                ..
+            } => assert_eq!(value, -1),
+            e => panic!("expected InvalidEngineTime, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_usm_params_accepts_max_values() {
+        use crate::ber::EncodeBuf;
+
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_integer(i32::MAX);
+            buf.push_integer(i32::MAX);
+            buf.push_octet_string(&[]);
+        });
+        let encoded = buf.finish();
+
+        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        assert_eq!(decoded.engine_boots, i32::MAX as u32);
+        assert_eq!(decoded.engine_time, i32::MAX as u32);
+    }
+
+    #[test]
+    fn test_usm_params_accepts_zero_values() {
+        use crate::ber::EncodeBuf;
+
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_integer(0);
+            buf.push_integer(0);
+            buf.push_octet_string(&[]);
+        });
+        let encoded = buf.finish();
+
+        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        assert_eq!(decoded.engine_boots, 0);
+        assert_eq!(decoded.engine_time, 0);
     }
 }
