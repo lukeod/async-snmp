@@ -647,9 +647,12 @@ impl VacmConfig {
 
     /// Get access entry for context.
     ///
-    /// Returns the best matching entry per RFC 3415 Section 4:
-    /// - Prefer specific security model over Any
-    /// - Prefer longer context prefix
+    /// Returns the best matching entry per RFC 3415 Section 4 (vacmAccessTable DESCRIPTION).
+    /// Selection uses a 4-tier preference order:
+    /// 1. Prefer specific securityModel over Any
+    /// 2. Prefer exact contextMatch over prefix
+    /// 3. Prefer longer contextPrefix
+    /// 4. Prefer higher securityLevel
     pub fn get_access(
         &self,
         group: &[u8],
@@ -657,7 +660,6 @@ impl VacmConfig {
         model: SecurityModel,
         level: SecurityLevel,
     ) -> Option<&VacmAccessEntry> {
-        // Find best matching entry
         self.access_entries
             .iter()
             .filter(|e| {
@@ -667,10 +669,16 @@ impl VacmConfig {
                     && level >= e.security_level
             })
             .max_by_key(|e| {
-                // Prefer specific matches
-                let model_score = if e.security_model == model { 2 } else { 1 };
-                let context_score = e.context_prefix.len();
-                (model_score, context_score)
+                // RFC 3415 Section 4 preference order (tuple comparison is lexicographic)
+                let model_score: u8 = if e.security_model == model { 1 } else { 0 };
+                let match_score: u8 = if e.context_match == ContextMatch::Exact {
+                    1
+                } else {
+                    0
+                };
+                let prefix_len = e.context_prefix.len();
+                let level_score = e.security_level as u8;
+                (model_score, match_score, prefix_len, level_score)
             })
     }
 
@@ -1048,5 +1056,470 @@ mod tests {
 
         assert!(config.get_group(SecurityModel::V2c, b"public").is_some());
         assert!(config.get_group(SecurityModel::Usm, b"admin").is_some());
+    }
+
+    // RFC 3415 Section 4 preference order tests
+    // The vacmAccessTable DESCRIPTION specifies a 4-tier preference order:
+    // 1. Prefer specific securityModel over Any
+    // 2. Prefer exact contextMatch over prefix
+    // 3. Prefer longer contextPrefix
+    // 4. Prefer higher securityLevel
+
+    #[test]
+    fn test_vacm_access_prefers_specific_security_model_over_any() {
+        // Tier 1: Specific securityModel should be preferred over Any
+        let mut config = VacmConfig::new();
+
+        // Add entry with Any security model
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"any_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Add entry with specific V2c security model
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::V2c,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"v2c_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Query with V2c - should get the specific V2c entry
+        let access = config
+            .get_access(
+                b"test_group",
+                b"",
+                SecurityModel::V2c,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"v2c_view"),
+            "should prefer specific security model over Any"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_prefers_exact_context_match_over_prefix() {
+        // Tier 2: Exact contextMatch should be preferred over prefix match
+        let mut config = VacmConfig::new();
+
+        // Add entry with prefix context match
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"prefix_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Add entry with exact context match (same prefix)
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"exact_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Query with exact context "ctx" - should get the exact match entry
+        let access = config
+            .get_access(
+                b"test_group",
+                b"ctx",
+                SecurityModel::V2c,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"exact_view"),
+            "should prefer exact context match over prefix"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_prefers_longer_context_prefix() {
+        // Tier 3: Longer contextPrefix should be preferred
+        let mut config = VacmConfig::new();
+
+        // Add entry with shorter context prefix
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"short_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Add entry with longer context prefix
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx_longer"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"long_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Query with context that matches both - should get the longer prefix
+        let access = config
+            .get_access(
+                b"test_group",
+                b"ctx_longer_suffix",
+                SecurityModel::V2c,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"long_view"),
+            "should prefer longer context prefix"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_prefers_higher_security_level() {
+        // Tier 4: Higher securityLevel should be preferred
+        let mut config = VacmConfig::new();
+
+        // Add entry with NoAuthNoPriv
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"noauth_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Add entry with AuthNoPriv
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::AuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"auth_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Add entry with AuthPriv
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::AuthPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"authpriv_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Query with AuthPriv - should get the AuthPriv entry (highest matching)
+        let access = config
+            .get_access(
+                b"test_group",
+                b"",
+                SecurityModel::V2c,
+                SecurityLevel::AuthPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"authpriv_view"),
+            "should prefer higher security level"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_preference_tier_ordering() {
+        // Test that tier 1 takes precedence over tier 2, which takes precedence
+        // over tier 3, which takes precedence over tier 4.
+        let mut config = VacmConfig::new();
+
+        // Entry: Any model, prefix match, short prefix, high security
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::AuthPriv, // highest security
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"any_prefix_short_high"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Entry: Specific model, prefix match, short prefix, low security
+        // Tier 1 (specific model) should beat tier 4 (high security)
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::V2c,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"v2c_prefix_short_low"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Query - specific model (V2c) should win over Any even though Any has higher security
+        let access = config
+            .get_access(
+                b"test_group",
+                b"ctx_test",
+                SecurityModel::V2c,
+                SecurityLevel::AuthPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"v2c_prefix_short_low"),
+            "tier 1 (specific model) should take precedence over tier 4 (security level)"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_preference_context_match_over_prefix_length() {
+        // Tier 2 (exact match) should beat tier 3 (longer prefix)
+        let mut config = VacmConfig::new();
+
+        // Entry: prefix match with longer prefix
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"context"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"long_prefix_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Entry: exact match with shorter prefix
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"short_exact_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Query with "ctx" - exact match should win even though it's shorter
+        let access = config
+            .get_access(
+                b"test_group",
+                b"ctx",
+                SecurityModel::V2c,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"short_exact_view"),
+            "tier 2 (exact match) should take precedence over tier 3 (longer prefix)"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_preference_prefix_length_over_security() {
+        // Tier 3 (longer prefix) should beat tier 4 (higher security)
+        let mut config = VacmConfig::new();
+
+        // Entry: short prefix with high security
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::AuthPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"short_high_sec"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Entry: longer prefix with low security
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx_test"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"long_low_sec"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Query - longer prefix should win even though short prefix has higher security
+        let access = config
+            .get_access(
+                b"test_group",
+                b"ctx_test_suffix",
+                SecurityModel::V2c,
+                SecurityLevel::AuthPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"long_low_sec"),
+            "tier 3 (longer prefix) should take precedence over tier 4 (security level)"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_all_tiers_combined() {
+        // Test with multiple entries that differ in all tiers
+        let mut config = VacmConfig::new();
+
+        // Entry 1: Any, prefix, short, NoAuth
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"a"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"entry1"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        // Entry 2: V2c (specific), exact, short, NoAuth - should win for "a" context
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"a"),
+            security_model: SecurityModel::V2c,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"entry2"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        let access = config
+            .get_access(
+                b"test_group",
+                b"a",
+                SecurityModel::V2c,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"entry2"),
+            "specific model + exact match should win"
+        );
+    }
+
+    // Tests that verify preference ordering is independent of insertion order
+    #[test]
+    fn test_vacm_access_exact_wins_regardless_of_insertion_order() {
+        // Add exact first, prefix second - exact should still win
+        let mut config = VacmConfig::new();
+
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"exact_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(b"ctx"),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Prefix,
+            read_view: Bytes::from_static(b"prefix_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        let access = config
+            .get_access(
+                b"test_group",
+                b"ctx",
+                SecurityModel::V2c,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"exact_view"),
+            "exact match should win regardless of insertion order"
+        );
+    }
+
+    #[test]
+    fn test_vacm_access_higher_security_wins_regardless_of_insertion_order() {
+        // Add higher security first, lower second - higher should still win
+        let mut config = VacmConfig::new();
+
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::AuthPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"authpriv_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        config.add_access(VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::new(),
+            security_model: SecurityModel::Any,
+            security_level: SecurityLevel::NoAuthNoPriv,
+            context_match: ContextMatch::Exact,
+            read_view: Bytes::from_static(b"noauth_view"),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        });
+
+        let access = config
+            .get_access(
+                b"test_group",
+                b"",
+                SecurityModel::V2c,
+                SecurityLevel::AuthPriv,
+            )
+            .expect("should find access entry");
+        assert_eq!(
+            access.read_view,
+            Bytes::from_static(b"authpriv_view"),
+            "higher security level should win regardless of insertion order"
+        );
     }
 }
