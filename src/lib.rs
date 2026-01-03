@@ -312,17 +312,32 @@
 //! | `snmp.engine_id` | SNMPv3 engine identifier (hex) |
 //! | `snmp.local_addr` | Local bind address |
 //!
-//! ### Filtering Examples
+//! ### Filtering by Target
+//!
+//! Tracing targets follow a stable naming scheme (not tied to internal module paths):
+//!
+//! | Target Prefix | What's Included |
+//! |---------------|-----------------|
+//! | `async_snmp` | Everything |
+//! | `async_snmp::client` | Client operations, requests, retries |
+//! | `async_snmp::agent` | Agent request/response handling |
+//! | `async_snmp::ber` | BER encoding/decoding |
+//! | `async_snmp::v3` | SNMPv3 message processing |
+//! | `async_snmp::transport` | UDP/TCP transport layer |
+//! | `async_snmp::notification` | Trap/inform receiver |
 //!
 //! ```bash
-//! # See all async-snmp logs at debug level
+//! # All library logs at debug level
 //! RUST_LOG=async_snmp=debug cargo run
 //!
-//! # Only see retries and errors
+//! # Only warnings and errors
 //! RUST_LOG=async_snmp=warn cargo run
 //!
-//! # Trace a specific module
-//! RUST_LOG=async_snmp::client=trace cargo run
+//! # Trace client operations, debug everything else
+//! RUST_LOG=async_snmp=debug,async_snmp::client=trace cargo run
+//!
+//! # Debug just BER decoding issues
+//! RUST_LOG=async_snmp::ber=debug cargo run
 //! ```
 //!
 //! ## Agent Compatibility
