@@ -163,20 +163,24 @@ impl Pdu {
 
         // Validate error_index bounds per RFC 3416 Section 3.
         // error_index is 1-based: 0 means no error, 1..=len points to specific varbind.
-        if error_index < 0 {
-            return Err(Error::decode(
-                pdu_decoder.offset(),
-                DecodeErrorKind::NegativeErrorIndex { value: error_index },
-            ));
-        }
-        if error_index > 0 && (error_index as usize) > varbinds.len() {
-            return Err(Error::decode(
-                pdu_decoder.offset(),
-                DecodeErrorKind::ErrorIndexOutOfBounds {
-                    index: error_index,
-                    varbind_count: varbinds.len(),
-                },
-            ));
+        // Note: For GETBULK, error_status holds non_repeaters and error_index holds
+        // max_repetitions, so these validations don't apply.
+        if pdu_type != PduType::GetBulkRequest {
+            if error_index < 0 {
+                return Err(Error::decode(
+                    pdu_decoder.offset(),
+                    DecodeErrorKind::NegativeErrorIndex { value: error_index },
+                ));
+            }
+            if error_index > 0 && (error_index as usize) > varbinds.len() {
+                return Err(Error::decode(
+                    pdu_decoder.offset(),
+                    DecodeErrorKind::ErrorIndexOutOfBounds {
+                        index: error_index,
+                        varbind_count: varbinds.len(),
+                    },
+                ));
+            }
         }
 
         Ok(Pdu {
@@ -995,5 +999,30 @@ mod tests {
         let pdu = result.unwrap();
         assert_eq!(pdu.non_repeaters, 0);
         assert_eq!(pdu.max_repetitions, 10);
+    }
+
+    #[test]
+    fn test_pdu_decode_getbulk_with_large_max_repetitions() {
+        // GETBULK PDU with max_repetitions (25) > varbinds.len() (1)
+        // This is the normal case for GETBULK requests.
+        // The generic Pdu::decode must not reject this as an invalid error_index.
+        let raw = RawGetBulkPdu::new(12345, 0, 25, vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))]);
+        let encoded = raw.encode();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = Pdu::decode(&mut decoder);
+        assert!(
+            result.is_ok(),
+            "Pdu::decode should accept GETBULK with max_repetitions > varbinds.len(), got {:?}",
+            result.err()
+        );
+
+        let pdu = result.unwrap();
+        assert_eq!(pdu.pdu_type, PduType::GetBulkRequest);
+        assert_eq!(pdu.request_id, 12345);
+        // For GETBULK: error_status = non_repeaters, error_index = max_repetitions
+        assert_eq!(pdu.error_status, 0);
+        assert_eq!(pdu.error_index, 25);
+        assert_eq!(pdu.varbinds.len(), 1);
     }
 }
