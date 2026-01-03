@@ -4,7 +4,8 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::ber::Decoder;
-use crate::error::{CryptoErrorKind, DecodeErrorKind, Error, Result};
+use crate::error::internal::{CryptoErrorKind, DecodeErrorKind};
+use crate::error::{Error, Result};
 use crate::handler::{RequestContext, SecurityModel};
 use crate::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
@@ -131,27 +132,7 @@ impl Agent {
 
     /// Handle SNMPv3 request.
     pub(super) async fn handle_v3(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
-        let msg = match V3Message::decode(data.clone()) {
-            Ok(msg) => msg,
-            Err(Error::Decode { kind, .. }) => {
-                // Increment statistics counters for specific decode errors
-                match kind {
-                    DecodeErrorKind::InvalidMsgFlags => {
-                        self.inner.snmp_invalid_msgs.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(snmp.source = %source, "invalid msgFlags (priv without auth)");
-                    }
-                    DecodeErrorKind::UnknownSecurityModel(model) => {
-                        self.inner
-                            .snmp_unknown_security_models
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(snmp.source = %source, snmp.security_model = model, "unknown security model");
-                    }
-                    _ => {}
-                }
-                return Err(Error::Decode { offset: 0, kind });
-            }
-            Err(e) => return Err(e),
-        };
+        let msg = V3Message::decode(data.clone())?;
         let security_level = msg.global_data.msg_flags.security_level;
 
         // Decode USM parameters
@@ -185,7 +166,12 @@ impl Agent {
                     let auth_key = keys.auth_key.as_ref().unwrap();
                     let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data)
                         .ok_or_else(|| {
-                            Error::auth(None, crate::error::AuthErrorKind::AuthParamsNotFound)
+                            tracing::debug!(
+                                target: "async_snmp::agent",
+                                source = %source,
+                                "could not find auth params in message"
+                            );
+                            Error::Auth { target: source }.boxed()
                         })?;
 
                     if !verify_message(auth_key, &data, auth_offset, auth_len) {
@@ -235,29 +221,57 @@ impl Agent {
                     let encrypted_data = match &msg.data {
                         V3MessageData::Encrypted(data) => data,
                         V3MessageData::Plaintext(_) => {
-                            return Err(Error::decode(0, DecodeErrorKind::ExpectedEncryption));
+                            tracing::debug!(
+                                target: "async_snmp::agent",
+                                source = %source,
+                                kind = %DecodeErrorKind::ExpectedEncryption,
+                                "expected encrypted scoped PDU"
+                            );
+                            return Err(Error::MalformedResponse { target: source }.boxed());
                         }
                     };
 
-                    let decrypted = priv_key.decrypt(
-                        encrypted_data,
-                        usm_params.engine_boots,
-                        usm_params.engine_time,
-                        &usm_params.priv_params,
-                    )?;
+                    let decrypted = priv_key
+                        .decrypt(
+                            encrypted_data,
+                            usm_params.engine_boots,
+                            usm_params.engine_time,
+                            &usm_params.priv_params,
+                        )
+                        .map_err(|e| {
+                            tracing::debug!(
+                                target: "async_snmp::agent",
+                                source = %source,
+                                error = %e,
+                                "decryption failed"
+                            );
+                            Error::Auth { target: source }.boxed()
+                        })?;
 
-                    let mut decoder = Decoder::new(decrypted);
+                    let mut decoder = Decoder::with_target(decrypted, source);
                     ScopedPdu::decode(&mut decoder)?
                 }
                 _ => {
-                    return Err(Error::decrypt(None, CryptoErrorKind::NoPrivKey));
+                    tracing::debug!(
+                        target: "async_snmp::agent",
+                        source = %source,
+                        kind = %CryptoErrorKind::NoPrivKey,
+                        "no privacy key configured for user"
+                    );
+                    return Err(Error::Auth { target: source }.boxed());
                 }
             }
         } else {
             match msg.scoped_pdu() {
                 Some(sp) => sp.clone(),
                 None => {
-                    return Err(Error::decode(0, DecodeErrorKind::UnexpectedEncryption));
+                    tracing::debug!(
+                        target: "async_snmp::agent",
+                        source = %source,
+                        kind = %DecodeErrorKind::UnexpectedEncryption,
+                        "unexpected encrypted scoped PDU"
+                    );
+                    return Err(Error::MalformedResponse { target: source }.boxed());
                 }
             }
         };

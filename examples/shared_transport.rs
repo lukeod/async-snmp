@@ -194,11 +194,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 success += 1;
                 println!("  {}: {:?}", addr, vb.value);
             }
-            Err(async_snmp::Error::Timeout { .. }) => {
-                timeout += 1;
-                println!("  {}: timeout", addr);
-            }
-            Err(e) => println!("  {}: {}", addr, e),
+            Err(e) => match *e {
+                async_snmp::Error::Timeout { .. } => {
+                    timeout += 1;
+                    println!("  {}: timeout", addr);
+                }
+                _ => println!("  {}: {}", addr, e),
+            },
         }
     }
 

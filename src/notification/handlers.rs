@@ -8,9 +8,8 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 
 use crate::ber::{Decoder, tag};
-use crate::error::{
-    AuthErrorKind, CryptoErrorKind, DecodeErrorKind, EncodeErrorKind, Error, Result,
-};
+use crate::error::internal::{AuthErrorKind, CryptoErrorKind, DecodeErrorKind, EncodeErrorKind};
+use crate::error::{Error, Result};
 use crate::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
@@ -27,19 +26,25 @@ impl super::NotificationReceiver {
     pub(super) async fn handle_v1(
         &self,
         data: Bytes,
-        _source: SocketAddr,
+        source: SocketAddr,
     ) -> Result<Option<Notification>> {
         // For v1, we need to check if it's a Trap PDU (has different structure)
-        let mut decoder = Decoder::new(data);
+        let mut decoder = Decoder::with_target(data, source);
         let mut seq = decoder.read_sequence()?;
 
         let _version = seq.read_integer()?;
         let community = seq.read_octet_string()?;
 
         // Peek at PDU tag
-        let pdu_tag = seq
-            .peek_tag()
-            .ok_or_else(|| Error::decode(seq.offset(), DecodeErrorKind::TruncatedData))?;
+        let pdu_tag = seq.peek_tag().ok_or_else(|| {
+            tracing::debug!(
+                target: "async_snmp::notification",
+                source = %source,
+                kind = %DecodeErrorKind::TruncatedData,
+                "truncated notification data"
+            );
+            Error::MalformedResponse { target: source }.boxed()
+        })?;
 
         if pdu_tag == tag::pdu::TRAP_V1 {
             let trap = TrapV1Pdu::decode(&mut seq)?;
@@ -81,8 +86,8 @@ impl super::NotificationReceiver {
                     .socket
                     .send_to(&response_bytes, source)
                     .await
-                    .map_err(|e| Error::Io {
-                        target: Some(source),
+                    .map_err(|e| Error::Network {
+                        target: source,
                         source: e,
                     })?;
 
@@ -129,7 +134,15 @@ impl super::NotificationReceiver {
                 Some(keys) if keys.auth_key.is_some() => {
                     let auth_key = keys.auth_key.as_ref().unwrap();
                     let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data)
-                        .ok_or_else(|| Error::auth(None, AuthErrorKind::AuthParamsNotFound))?;
+                        .ok_or_else(|| {
+                            tracing::debug!(
+                                target: "async_snmp::notification",
+                                source = %source,
+                                kind = %AuthErrorKind::AuthParamsNotFound,
+                                "could not find auth params in notification"
+                            );
+                            Error::Auth { target: source }.boxed()
+                        })?;
 
                     if !verify_message(auth_key, &data, auth_offset, auth_len) {
                         tracing::warn!(
@@ -137,7 +150,7 @@ impl super::NotificationReceiver {
                             snmp.username = %String::from_utf8_lossy(&username),
                             "V3 authentication failed"
                         );
-                        return Err(Error::auth(None, AuthErrorKind::HmacMismatch));
+                        return Err(Error::Auth { target: source }.boxed());
                     }
                     tracing::trace!(snmp.source = %source, "V3 authentication verified");
                 }
@@ -160,18 +173,34 @@ impl super::NotificationReceiver {
                     let encrypted_data = match &msg.data {
                         V3MessageData::Encrypted(data) => data,
                         V3MessageData::Plaintext(_) => {
-                            return Err(Error::decode(0, DecodeErrorKind::UnexpectedEncryption));
+                            tracing::debug!(
+                                target: "async_snmp::notification",
+                                source = %source,
+                                kind = %DecodeErrorKind::UnexpectedEncryption,
+                                "expected encrypted scoped PDU in notification"
+                            );
+                            return Err(Error::MalformedResponse { target: source }.boxed());
                         }
                     };
 
-                    let decrypted = priv_key.decrypt(
-                        encrypted_data,
-                        usm_params.engine_boots,
-                        usm_params.engine_time,
-                        &usm_params.priv_params,
-                    )?;
+                    let decrypted = priv_key
+                        .decrypt(
+                            encrypted_data,
+                            usm_params.engine_boots,
+                            usm_params.engine_time,
+                            &usm_params.priv_params,
+                        )
+                        .map_err(|e| {
+                            tracing::debug!(
+                                target: "async_snmp::notification",
+                                source = %source,
+                                error = %e,
+                                "decryption failed"
+                            );
+                            Error::Auth { target: source }.boxed()
+                        })?;
 
-                    let mut decoder = Decoder::new(decrypted);
+                    let mut decoder = Decoder::with_target(decrypted, source);
                     ScopedPdu::decode(&mut decoder)?
                 }
                 _ => {
@@ -231,8 +260,8 @@ impl super::NotificationReceiver {
                     .socket
                     .send_to(&response_bytes, source)
                     .await
-                    .map_err(|e| Error::Io {
-                        target: Some(source),
+                    .map_err(|e| Error::Network {
+                        target: source,
                         source: e,
                     })?;
 
@@ -294,12 +323,23 @@ fn build_v3_response(
         }
         SecurityLevel::AuthNoPriv => {
             // Authentication only
-            let keys =
-                derived_keys.ok_or_else(|| Error::auth(None, AuthErrorKind::NoCredentials))?;
-            let auth_key = keys
-                .auth_key
-                .as_ref()
-                .ok_or_else(|| Error::auth(None, AuthErrorKind::NoAuthKey))?;
+            let local_addr = inner.local_addr;
+            let keys = derived_keys.ok_or_else(|| {
+                tracing::debug!(
+                    target: "async_snmp::notification",
+                    kind = %AuthErrorKind::NoCredentials,
+                    "no credentials for notification response"
+                );
+                Error::Auth { target: local_addr }.boxed()
+            })?;
+            let auth_key = keys.auth_key.as_ref().ok_or_else(|| {
+                tracing::debug!(
+                    target: "async_snmp::notification",
+                    kind = %AuthErrorKind::NoAuthKey,
+                    "no auth key for notification response"
+                );
+                Error::Auth { target: local_addr }.boxed()
+            })?;
 
             let mac_len = auth_key.mac_len();
             let response_usm = UsmSecurityParams::new(
@@ -317,8 +357,14 @@ fn build_v3_response(
 
             // Find and fill in the authentication parameters
             let (auth_offset, auth_len) =
-                UsmSecurityParams::find_auth_params_offset(&response_bytes)
-                    .ok_or_else(|| Error::encode(EncodeErrorKind::MissingAuthParams))?;
+                UsmSecurityParams::find_auth_params_offset(&response_bytes).ok_or_else(|| {
+                    tracing::debug!(
+                        target: "async_snmp::notification",
+                        kind = %EncodeErrorKind::MissingAuthParams,
+                        "could not find auth params in notification response"
+                    );
+                    Error::MalformedResponse { target: local_addr }.boxed()
+                })?;
 
             authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
 
@@ -326,26 +372,50 @@ fn build_v3_response(
         }
         SecurityLevel::AuthPriv => {
             // Authentication and encryption
-            let keys =
-                derived_keys.ok_or_else(|| Error::auth(None, AuthErrorKind::NoCredentials))?;
-            let auth_key = keys
-                .auth_key
-                .as_ref()
-                .ok_or_else(|| Error::auth(None, AuthErrorKind::NoAuthKey))?;
-            let priv_key = keys
-                .priv_key
-                .as_ref()
-                .ok_or_else(|| Error::encrypt(None, CryptoErrorKind::NoPrivKey))?;
+            let local_addr = inner.local_addr;
+            let keys = derived_keys.ok_or_else(|| {
+                tracing::debug!(
+                    target: "async_snmp::notification",
+                    kind = %AuthErrorKind::NoCredentials,
+                    "no credentials for notification response"
+                );
+                Error::Auth { target: local_addr }.boxed()
+            })?;
+            let auth_key = keys.auth_key.as_ref().ok_or_else(|| {
+                tracing::debug!(
+                    target: "async_snmp::notification",
+                    kind = %AuthErrorKind::NoAuthKey,
+                    "no auth key for notification response"
+                );
+                Error::Auth { target: local_addr }.boxed()
+            })?;
+            let priv_key = keys.priv_key.as_ref().ok_or_else(|| {
+                tracing::debug!(
+                    target: "async_snmp::notification",
+                    kind = %CryptoErrorKind::NoPrivKey,
+                    "no privacy key for notification response"
+                );
+                Error::Auth { target: local_addr }.boxed()
+            })?;
 
             // Encrypt the scoped PDU
             let scoped_pdu_bytes = response_scoped.encode_to_bytes();
             let mut priv_key_clone = priv_key.clone();
-            let (encrypted, priv_params) = priv_key_clone.encrypt(
-                &scoped_pdu_bytes,
-                incoming_usm.engine_boots,
-                incoming_usm.engine_time,
-                Some(&inner.salt_counter),
-            )?;
+            let (encrypted, priv_params) = priv_key_clone
+                .encrypt(
+                    &scoped_pdu_bytes,
+                    incoming_usm.engine_boots,
+                    incoming_usm.engine_time,
+                    Some(&inner.salt_counter),
+                )
+                .map_err(|e| {
+                    tracing::debug!(
+                        target: "async_snmp::notification",
+                        error = %e,
+                        "encryption failed for notification response"
+                    );
+                    Error::Auth { target: local_addr }.boxed()
+                })?;
 
             let mac_len = auth_key.mac_len();
             let response_usm = UsmSecurityParams::new(
@@ -364,8 +434,14 @@ fn build_v3_response(
 
             // Find and fill in the authentication parameters
             let (auth_offset, auth_len) =
-                UsmSecurityParams::find_auth_params_offset(&response_bytes)
-                    .ok_or_else(|| Error::encode(EncodeErrorKind::MissingAuthParams))?;
+                UsmSecurityParams::find_auth_params_offset(&response_bytes).ok_or_else(|| {
+                    tracing::debug!(
+                        target: "async_snmp::notification",
+                        kind = %EncodeErrorKind::MissingAuthParams,
+                        "could not find auth params in notification response"
+                    );
+                    Error::MalformedResponse { target: local_addr }.boxed()
+                })?;
 
             authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
 

@@ -237,23 +237,19 @@ impl UdpTransportBuilder {
 
     /// Build the transport.
     pub async fn build(self) -> Result<UdpTransport> {
-        let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| Error::Io {
-            target: None,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid bind address: {}", self.bind_addr),
-            ),
+        let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
+            Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
         let socket = bind_udp_socket(bind_addr, None)
             .await
-            .map_err(|e| Error::Io {
-                target: Some(bind_addr),
+            .map_err(|e| Error::Network {
+                target: bind_addr,
                 source: e,
             })?;
 
-        let local_addr = socket.local_addr().map_err(|e| Error::Io {
-            target: Some(bind_addr),
+        let local_addr = socket.local_addr().map_err(|e| Error::Network {
+            target: bind_addr,
             source: e,
         })?;
 
@@ -303,8 +299,8 @@ impl Transport for UdpHandle {
             .socket
             .send_to(data, self.target)
             .await
-            .map_err(|e| Error::Io {
-                target: Some(self.target),
+            .map_err(|e| Error::Network {
+                target: self.target,
                 source: e,
             })?;
         Ok(())

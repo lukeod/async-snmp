@@ -53,7 +53,7 @@
 //! }
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), async_snmp::Error> {
+//! async fn main() -> Result<(), Box<async_snmp::Error>> {
 //!     let agent = Agent::builder()
 //!         .bind("0.0.0.0:161")
 //!         .community(b"public")
@@ -90,7 +90,8 @@ use std::io::IoSliceMut;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 
 use crate::ber::Decoder;
-use crate::error::{DecodeErrorKind, Error, ErrorStatus, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, ErrorStatus, Result};
 use crate::handler::{GetNextResult, GetResult, MibHandler, RequestContext};
 use crate::notification::UsmUserConfig;
 use crate::oid::Oid;
@@ -138,7 +139,7 @@ pub(crate) struct RegisteredHandler {
 ///     }
 /// }
 ///
-/// # async fn example() -> Result<(), async_snmp::Error> {
+/// # async fn example() -> Result<(), Box<async_snmp::Error>> {
 /// let agent = Agent::builder()
 ///     .bind("0.0.0.0:1161")  // Use non-privileged port
 ///     .community(b"public")
@@ -196,7 +197,7 @@ impl AgentBuilder {
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to all IPv4 interfaces on standard port (requires privileges)
     /// let agent = Agent::builder().bind("0.0.0.0:161").community(b"public").build().await?;
     ///
@@ -214,7 +215,7 @@ impl AgentBuilder {
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to all interfaces via dual-stack (handles both IPv4 and IPv6)
     /// let agent = Agent::builder().bind("[::]:161").community(b"public").build().await?;
     ///
@@ -238,7 +239,7 @@ impl AgentBuilder {
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")   // Read-only access
@@ -260,7 +261,7 @@ impl AgentBuilder {
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let communities = ["public", "private", "monitor"];
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
@@ -298,7 +299,7 @@ impl AgentBuilder {
     /// use async_snmp::agent::Agent;
     /// use async_snmp::{AuthProtocol, PrivProtocol};
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     // Read-only user with authentication only
@@ -335,7 +336,7 @@ impl AgentBuilder {
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .engine_id(b"\x80\x00\x00\x00\x01MyEngine".to_vec())
@@ -414,7 +415,7 @@ impl AgentBuilder {
     ///     }
     /// }
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
@@ -443,7 +444,7 @@ impl AgentBuilder {
     /// use async_snmp::message::SecurityLevel;
     /// use async_snmp::oid;
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:161")
     ///     .community(b"public")
@@ -484,29 +485,25 @@ impl AgentBuilder {
 
     /// Build the agent.
     pub async fn build(mut self) -> Result<Agent> {
-        let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| Error::Io {
-            target: None,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid bind address: {}", self.bind_addr),
-            ),
+        let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
+            Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
         let socket = bind_udp_socket(bind_addr, self.recv_buffer_size)
             .await
-            .map_err(|e| Error::Io {
-                target: Some(bind_addr),
+            .map_err(|e| Error::Network {
+                target: bind_addr,
                 source: e,
             })?;
 
-        let local_addr = socket.local_addr().map_err(|e| Error::Io {
-            target: Some(bind_addr),
+        let local_addr = socket.local_addr().map_err(|e| Error::Network {
+            target: bind_addr,
             source: e,
         })?;
 
         let socket_state =
-            UdpSocketState::new(UdpSockRef::from(&socket)).map_err(|e| Error::Io {
-                target: Some(bind_addr),
+            UdpSocketState::new(UdpSockRef::from(&socket)).map_err(|e| Error::Network {
+                target: bind_addr,
                 source: e,
             })?;
 
@@ -605,7 +602,7 @@ pub(crate) struct AgentInner {
 /// use async_snmp::agent::Agent;
 /// use async_snmp::oid;
 ///
-/// # async fn example() -> Result<(), async_snmp::Error> {
+/// # async fn example() -> Result<(), Box<async_snmp::Error>> {
 /// let agent = Agent::builder()
 ///     .bind("0.0.0.0:161")
 ///     .community(b"public")
@@ -730,10 +727,14 @@ impl Agent {
         let mut meta = [RecvMeta::default()];
 
         loop {
-            self.inner.socket.readable().await.map_err(|e| Error::Io {
-                target: Some(self.inner.local_addr),
-                source: e,
-            })?;
+            self.inner
+                .socket
+                .readable()
+                .await
+                .map_err(|e| Error::Network {
+                    target: self.inner.local_addr,
+                    source: e,
+                })?;
 
             let result = self.inner.socket.try_io(tokio::io::Interest::READABLE, || {
                 let sref = UdpSockRef::from(&*self.inner.socket);
@@ -745,10 +746,11 @@ impl Agent {
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
-                    return Err(Error::Io {
-                        target: Some(self.inner.local_addr),
+                    return Err(Error::Network {
+                        target: self.inner.local_addr,
                         source: e,
-                    });
+                    }
+                    .boxed());
                 }
             }
         }
@@ -784,11 +786,17 @@ impl Agent {
     /// Returns `None` if no response should be sent.
     async fn handle_request(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
         // Peek at version
-        let mut decoder = Decoder::new(data.clone());
+        let mut decoder = Decoder::with_target(data.clone(), source);
         let mut seq = decoder.read_sequence()?;
         let version_num = seq.read_integer()?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
-            Error::decode(seq.offset(), DecodeErrorKind::UnknownVersion(version_num))
+            tracing::debug!(
+                target: "async_snmp::agent",
+                source = %source,
+                kind = %DecodeErrorKind::UnknownVersion(version_num),
+                "unknown SNMP version"
+            );
+            Error::MalformedResponse { target: source }.boxed()
         })?;
         drop(seq);
         drop(decoder);

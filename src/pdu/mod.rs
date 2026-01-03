@@ -3,7 +3,8 @@
 //! PDUs represent the different SNMP operations.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
-use crate::error::{DecodeErrorKind, Error, ErrorStatus, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, ErrorStatus, Result, UNKNOWN_TARGET};
 use crate::oid::Oid;
 use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 
@@ -150,8 +151,19 @@ impl Pdu {
     /// Decode from BER (after tag has been peeked).
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
         let tag = decoder.read_tag()?;
-        let pdu_type = PduType::from_tag(tag)
-            .ok_or_else(|| Error::decode(decoder.offset(), DecodeErrorKind::UnknownPduType(tag)))?;
+        let pdu_type = PduType::from_tag(tag).ok_or_else(|| {
+            tracing::debug!(
+                target: "async_snmp::pdu",
+                offset = decoder.offset(),
+                tag = tag,
+                kind = %DecodeErrorKind::UnknownPduType(tag),
+                "decode error"
+            );
+            Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed()
+        })?;
 
         let len = decoder.read_length()?;
         let mut pdu_decoder = decoder.sub_decoder(len)?;
@@ -167,19 +179,34 @@ impl Pdu {
         // max_repetitions, so these validations don't apply.
         if pdu_type != PduType::GetBulkRequest {
             if error_index < 0 {
-                return Err(Error::decode(
-                    pdu_decoder.offset(),
-                    DecodeErrorKind::NegativeErrorIndex { value: error_index },
-                ));
+                tracing::debug!(
+                    target: "async_snmp::pdu",
+                    offset = pdu_decoder.offset(),
+                    error_index = error_index,
+                    kind = %DecodeErrorKind::NegativeErrorIndex { value: error_index },
+                    "decode error"
+                );
+                return Err(Error::MalformedResponse {
+                    target: UNKNOWN_TARGET,
+                }
+                .boxed());
             }
             if error_index > 0 && (error_index as usize) > varbinds.len() {
-                return Err(Error::decode(
-                    pdu_decoder.offset(),
-                    DecodeErrorKind::ErrorIndexOutOfBounds {
+                tracing::debug!(
+                    target: "async_snmp::pdu",
+                    offset = pdu_decoder.offset(),
+                    error_index = error_index,
+                    varbind_count = varbinds.len(),
+                    kind = %DecodeErrorKind::ErrorIndexOutOfBounds {
                         index: error_index,
                         varbind_count: varbinds.len(),
                     },
-                ));
+                    "decode error"
+                );
+                return Err(Error::MalformedResponse {
+                    target: UNKNOWN_TARGET,
+                }
+                .boxed());
             }
         }
 
@@ -388,9 +415,7 @@ impl TrapV1Pdu {
     pub fn v2_trap_oid(&self) -> crate::Result<Oid> {
         if self.is_enterprise_specific() {
             if self.specific_trap < 0 {
-                return Err(crate::Error::InvalidTrap {
-                    reason: "specific_trap cannot be negative",
-                });
+                return Err(Error::InvalidOid("specific_trap cannot be negative".into()).boxed());
             }
             let mut arcs: Vec<u32> = self.enterprise.arcs().to_vec();
             arcs.push(0);
@@ -398,14 +423,10 @@ impl TrapV1Pdu {
             Ok(Oid::new(arcs))
         } else {
             if self.generic_trap < 0 {
-                return Err(crate::Error::InvalidTrap {
-                    reason: "generic_trap cannot be negative",
-                });
+                return Err(Error::InvalidOid("generic_trap cannot be negative".into()).boxed());
             }
             if self.generic_trap == i32::MAX {
-                return Err(crate::Error::InvalidTrap {
-                    reason: "generic_trap overflow",
-                });
+                return Err(Error::InvalidOid("generic_trap overflow".into()).boxed());
             }
             let trap_num = self.generic_trap + 1;
             Ok(crate::oid!(1, 3, 6, 1, 6, 3, 1, 1, 5).child(trap_num as u32))
@@ -438,20 +459,35 @@ impl TrapV1Pdu {
         // agent-addr NetworkAddress (IpAddress)
         let agent_tag = pdu.read_tag()?;
         if agent_tag != tag::application::IP_ADDRESS {
-            return Err(Error::decode(
-                pdu.offset(),
-                DecodeErrorKind::UnexpectedTag {
+            tracing::debug!(
+                target: "async_snmp::pdu",
+                offset = pdu.offset(),
+                expected = 0x40_u8,
+                actual = agent_tag,
+                kind = %DecodeErrorKind::UnexpectedTag {
                     expected: 0x40,
                     actual: agent_tag,
                 },
-            ));
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
         let agent_len = pdu.read_length()?;
         if agent_len != 4 {
-            return Err(Error::decode(
-                pdu.offset(),
-                DecodeErrorKind::InvalidIpAddressLength { length: agent_len },
-            ));
+            tracing::debug!(
+                target: "async_snmp::pdu",
+                offset = pdu.offset(),
+                length = agent_len,
+                kind = %DecodeErrorKind::InvalidIpAddressLength { length: agent_len },
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
         let agent_bytes = pdu.read_bytes(4)?;
         let agent_addr = [
@@ -470,13 +506,21 @@ impl TrapV1Pdu {
         // time-stamp TimeTicks
         let ts_tag = pdu.read_tag()?;
         if ts_tag != tag::application::TIMETICKS {
-            return Err(Error::decode(
-                pdu.offset(),
-                DecodeErrorKind::UnexpectedTag {
+            tracing::debug!(
+                target: "async_snmp::pdu",
+                offset = pdu.offset(),
+                expected = 0x43_u8,
+                actual = ts_tag,
+                kind = %DecodeErrorKind::UnexpectedTag {
                     expected: 0x43,
                     actual: ts_tag,
                 },
-            ));
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
         let ts_len = pdu.read_length()?;
         let time_stamp = pdu.read_unsigned32_value(ts_len)?;
@@ -540,20 +584,34 @@ impl GetBulkPdu {
 
         // Validate non_repeaters and max_repetitions per RFC 3416 Section 4.2.3.
         if non_repeaters < 0 {
-            return Err(Error::decode(
-                pdu.offset(),
-                DecodeErrorKind::NegativeNonRepeaters {
+            tracing::debug!(
+                target: "async_snmp::pdu",
+                offset = pdu.offset(),
+                non_repeaters = non_repeaters,
+                kind = %DecodeErrorKind::NegativeNonRepeaters {
                     value: non_repeaters,
                 },
-            ));
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
         if max_repetitions < 0 {
-            return Err(Error::decode(
-                pdu.offset(),
-                DecodeErrorKind::NegativeMaxRepetitions {
+            tracing::debug!(
+                target: "async_snmp::pdu",
+                offset = pdu.offset(),
+                max_repetitions = max_repetitions,
+                kind = %DecodeErrorKind::NegativeMaxRepetitions {
                     value: max_repetitions,
                 },
-            ));
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
 
         Ok(GetBulkPdu {
@@ -877,14 +935,8 @@ mod tests {
         assert!(result.is_err(), "should reject negative error_index");
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::Error::Decode {
-                    kind: crate::error::DecodeErrorKind::NegativeErrorIndex { value: -1 },
-                    ..
-                }
-            ),
-            "expected NegativeErrorIndex, got {:?}",
+            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got {:?}",
             err
         );
     }
@@ -901,17 +953,8 @@ mod tests {
         assert!(result.is_err(), "should reject error_index beyond varbinds");
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::Error::Decode {
-                    kind: crate::error::DecodeErrorKind::ErrorIndexOutOfBounds {
-                        index: 5,
-                        varbind_count: 1
-                    },
-                    ..
-                }
-            ),
-            "expected ErrorIndexOutOfBounds, got {:?}",
+            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got {:?}",
             err
         );
     }
@@ -952,14 +995,8 @@ mod tests {
         assert!(result.is_err(), "should reject negative non_repeaters");
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::Error::Decode {
-                    kind: crate::error::DecodeErrorKind::NegativeNonRepeaters { value: -1 },
-                    ..
-                }
-            ),
-            "expected NegativeNonRepeaters, got {:?}",
+            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got {:?}",
             err
         );
     }
@@ -975,14 +1012,8 @@ mod tests {
         assert!(result.is_err(), "should reject negative max_repetitions");
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::Error::Decode {
-                    kind: crate::error::DecodeErrorKind::NegativeMaxRepetitions { value: -5 },
-                    ..
-                }
-            ),
-            "expected NegativeMaxRepetitions, got {:?}",
+            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got {:?}",
             err
         );
     }

@@ -1,7 +1,3 @@
-// Allow large error types - the Error enum includes OIDs inline for debugging convenience.
-// Boxing them would add complexity and allocations for a marginal size reduction.
-#![allow(clippy::result_large_err)]
-
 //! # async-snmp
 //!
 //! Modern, async-first SNMP client library for Rust.
@@ -21,7 +17,7 @@
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), async_snmp::Error> {
+//! async fn main() -> Result<(), Box<async_snmp::Error>> {
 //!     // SNMPv2c client
 //!     let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
 //!         .timeout(Duration::from_secs(5))
@@ -41,7 +37,7 @@
 //! use async_snmp::{Auth, Client, oid, v3::{AuthProtocol, PrivProtocol}};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), async_snmp::Error> {
+//! async fn main() -> Result<(), Box<async_snmp::Error>> {
 //!     let client = Client::builder("192.168.1.1:161",
 //!         Auth::usm("admin")
 //!             .auth(AuthProtocol::Sha256, "authpass123")
@@ -77,13 +73,15 @@
 //!
 //!     match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
 //!         Ok(vb) => Ok(vb.value.as_str().unwrap_or("(non-string)").to_string()),
-//!         Err(Error::Timeout { retries, .. }) => {
-//!             Err(format!("Device unreachable after {} retries", retries))
-//!         }
-//!         Err(Error::Snmp { status: ErrorStatus::NoSuchName, .. }) => {
-//!             Err("OID not supported by device".to_string())
-//!         }
-//!         Err(e) => Err(format!("SNMP error: {}", e)),
+//!         Err(e) => match *e {
+//!             Error::Timeout { retries, .. } => {
+//!                 Err(format!("Device unreachable after {} retries", retries))
+//!             }
+//!             Error::Snmp { status: ErrorStatus::NoSuchName, .. } => {
+//!                 Err("OID not supported by device".to_string())
+//!             }
+//!             _ => Err(format!("SNMP error: {}", e)),
+//!         },
 //!     }
 //! }
 //! ```
@@ -405,10 +403,7 @@ pub use client::{
     Auth, Backoff, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion, OidOrdering,
     Retry, RetryBuilder, UsmAuth, UsmBuilder, V3SecurityConfig, Walk, WalkMode, WalkStream,
 };
-pub use error::{
-    AuthErrorKind, CryptoErrorKind, DecodeErrorKind, EncodeErrorKind, Error, ErrorStatus,
-    OidErrorKind, Result,
-};
+pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, MibHandler, OidTable, RequestContext, Response,
     SecurityModel, SetResult,

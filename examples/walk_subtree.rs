@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = tokio::spawn(async move {
             let walk = client.walk(subtree.clone())?;
             let results = walk.collect().await?;
-            Ok::<_, async_snmp::Error>((subtree, results.len()))
+            Ok::<_, Box<async_snmp::Error>>((subtree, results.len()))
         });
         handles.push(handle);
     }

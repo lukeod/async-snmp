@@ -138,7 +138,7 @@
 //! use async_snmp::agent::{Agent, SecurityModel};
 //! use async_snmp::oid;
 //!
-//! # async fn example() -> Result<(), async_snmp::Error> {
+//! # async fn example() -> Result<(), Box<async_snmp::Error>> {
 //! let agent = Agent::builder()
 //!     .bind("0.0.0.0:161")
 //!     .community(b"public")

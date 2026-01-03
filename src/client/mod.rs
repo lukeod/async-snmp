@@ -41,7 +41,8 @@ impl Client<UdpHandle> {
         ClientBuilder::new(target, auth)
     }
 }
-use crate::error::{DecodeErrorKind, Error, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
 use crate::pdu::{GetBulkPdu, Pdu};
@@ -195,7 +196,7 @@ impl<T: Transport> Client<T> {
     )]
     async fn send_and_recv(&self, request_id: i32, data: &[u8]) -> Result<Pdu> {
         let start = Instant::now();
-        let mut last_error = None;
+        let mut last_error: Option<Box<Error>> = None;
         let max_attempts = if self.inner.transport.is_reliable() {
             0
         } else {
@@ -229,20 +230,34 @@ impl<T: Transport> Client<T> {
                     let response_version = response.version();
                     let expected_version = self.inner.config.version;
                     if response_version != expected_version {
-                        return Err(Error::VersionMismatch {
-                            expected: expected_version,
-                            actual: response_version,
-                        });
+                        tracing::warn!(
+                            target: "async_snmp::client",
+                            ?expected_version,
+                            ?response_version,
+                            peer = %self.peer_addr(),
+                            "version mismatch in response"
+                        );
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
                     }
 
                     let response_pdu = response.into_pdu();
 
                     // Validate request ID
                     if response_pdu.request_id != request_id {
-                        return Err(Error::RequestIdMismatch {
-                            expected: request_id,
-                            actual: response_pdu.request_id,
-                        });
+                        tracing::warn!(
+                            target: "async_snmp::client",
+                            expected_request_id = request_id,
+                            actual_request_id = response_pdu.request_id,
+                            peer = %self.peer_addr(),
+                            "request ID mismatch in response"
+                        );
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
                     }
 
                     // Check for SNMP error
@@ -257,17 +272,18 @@ impl<T: Transport> Client<T> {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                         return Err(Error::Snmp {
-                            target: Some(self.peer_addr()),
+                            target: self.peer_addr(),
                             status,
                             index: response_pdu.error_index.max(0) as u32,
                             oid,
-                        });
+                        }
+                        .boxed());
                     }
 
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                     return Ok(response_pdu);
                 }
-                Err(e @ Error::Timeout { .. }) => {
+                Err(e) if matches!(*e, Error::Timeout { .. }) => {
                     last_error = Some(e);
                     // Apply backoff delay before next retry (if not last attempt)
                     if attempt < max_attempts {
@@ -287,12 +303,23 @@ impl<T: Transport> Client<T> {
         }
 
         // All retries exhausted
-        Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
-        Err(last_error.unwrap_or(Error::Timeout {
-            target: Some(self.peer_addr()),
-            elapsed: start.elapsed(),
+        let elapsed = start.elapsed();
+        Span::current().record("snmp.elapsed_ms", elapsed.as_millis() as u64);
+        tracing::debug!(
+            target: "async_snmp::client",
             request_id,
-            retries: max_attempts,
+            peer = %self.peer_addr(),
+            ?elapsed,
+            retries = max_attempts,
+            "request timed out"
+        );
+        Err(last_error.unwrap_or_else(|| {
+            Error::Timeout {
+                target: self.peer_addr(),
+                elapsed,
+                retries: max_attempts,
+            }
+            .boxed()
         }))
     }
 
@@ -379,11 +406,18 @@ impl<T: Transport> Client<T> {
         let pdu = Pdu::get_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
 
-        response
-            .varbinds
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::decode(0, DecodeErrorKind::EmptyResponse))
+        response.varbinds.into_iter().next().ok_or_else(|| {
+            tracing::debug!(
+                target: "async_snmp::client",
+                peer = %self.peer_addr(),
+                kind = %DecodeErrorKind::EmptyResponse,
+                "empty GET response"
+            );
+            Error::MalformedResponse {
+                target: self.peer_addr(),
+            }
+            .boxed()
+        })
     }
 
     /// GET multiple OIDs.
@@ -456,11 +490,18 @@ impl<T: Transport> Client<T> {
         let pdu = Pdu::get_next_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
 
-        response
-            .varbinds
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::decode(0, DecodeErrorKind::EmptyResponse))
+        response.varbinds.into_iter().next().ok_or_else(|| {
+            tracing::debug!(
+                target: "async_snmp::client",
+                peer = %self.peer_addr(),
+                kind = %DecodeErrorKind::EmptyResponse,
+                "empty GETNEXT response"
+            );
+            Error::MalformedResponse {
+                target: self.peer_addr(),
+            }
+            .boxed()
+        })
     }
 
     /// GETNEXT for multiple OIDs.
@@ -533,11 +574,18 @@ impl<T: Transport> Client<T> {
         let pdu = Pdu::set_request(request_id, vec![varbind]);
         let response = self.send_request(pdu).await?;
 
-        response
-            .varbinds
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::decode(0, DecodeErrorKind::EmptyResponse))
+        response.varbinds.into_iter().next().ok_or_else(|| {
+            tracing::debug!(
+                target: "async_snmp::client",
+                peer = %self.peer_addr(),
+                kind = %DecodeErrorKind::EmptyResponse,
+                "empty SET response"
+            );
+            Error::MalformedResponse {
+                target: self.peer_addr(),
+            }
+            .boxed()
+        })
     }
 
     /// SET multiple OIDs.

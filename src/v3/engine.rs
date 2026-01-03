@@ -348,7 +348,14 @@ pub fn parse_discovery_response_with_limits(
     let usm = UsmSecurityParams::decode(security_params.clone())?;
 
     if usm.engine_id.is_empty() {
-        return Err(Error::UnknownEngineId { target: None });
+        tracing::debug!(
+            target: "async_snmp::engine",
+            "discovery response contained empty engine ID"
+        );
+        return Err(Error::MalformedResponse {
+            target: SocketAddr::from(([0, 0, 0, 0], 0)),
+        }
+        .boxed());
     }
 
     Ok(EngineState::with_msg_max_size_capped(
@@ -755,7 +762,10 @@ mod tests {
         let encoded = usm.encode();
 
         let result = parse_discovery_response(&encoded);
-        assert!(matches!(result, Err(Error::UnknownEngineId { .. })));
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
     #[test]

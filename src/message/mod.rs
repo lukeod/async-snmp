@@ -16,7 +16,8 @@ pub use v3::{
 };
 
 use crate::ber::Decoder;
-use crate::error::{DecodeErrorKind, Error, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::pdu::Pdu;
 use crate::version::Version;
 use bytes::Bytes;
@@ -94,7 +95,16 @@ impl Message {
         // Read version to determine message type
         let version_num = seq.read_integer()?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
-            Error::decode(seq.offset(), DecodeErrorKind::UnknownVersion(version_num))
+            tracing::debug!(
+                target: "async_snmp::ber",
+                offset = seq.offset(),
+                kind = %DecodeErrorKind::UnknownVersion(version_num),
+                "decode error"
+            );
+            Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed()
         })?;
 
         // Decode remainder using version-specific handler

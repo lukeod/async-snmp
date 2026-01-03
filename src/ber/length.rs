@@ -5,7 +5,10 @@
 //! - Long form: Initial byte (bit 8=1, bits 7-1=count), followed by length bytes
 //! - Indefinite form (0x80): Rejected per net-snmp behavior
 
-use crate::error::{DecodeErrorKind, Error, Result};
+use std::net::SocketAddr;
+
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 
 /// Maximum length we'll accept (to prevent DoS).
 ///
@@ -181,20 +184,36 @@ pub fn encode_length(len: usize) -> ([u8; 5], usize) {
 /// Decode a length from bytes, returning (length, bytes_consumed)
 ///
 /// The `base_offset` parameter is used to report error offsets correctly
-/// when this is called from within a decoder.
-pub fn decode_length(data: &[u8], base_offset: usize) -> Result<(usize, usize)> {
+/// when this is called from within a decoder. The `target` parameter provides
+/// the target address for error context.
+pub fn decode_length(
+    data: &[u8],
+    base_offset: usize,
+    target: Option<SocketAddr>,
+) -> Result<(usize, usize)> {
+    let target = target.unwrap_or(UNKNOWN_TARGET);
+
     if data.is_empty() {
-        return Err(Error::decode(base_offset, DecodeErrorKind::TruncatedData));
+        tracing::debug!(
+
+            snmp.offset = %base_offset,
+            kind = %DecodeErrorKind::TruncatedData,
+            "truncated data: unexpected end of input in length"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     }
 
     let first = data[0];
 
     if first == 0x80 {
         // Indefinite length - rejected per net-snmp behavior
-        return Err(Error::decode(
-            base_offset,
-            DecodeErrorKind::IndefiniteLength,
-        ));
+        tracing::debug!(
+
+            snmp.offset = %base_offset,
+            kind = %DecodeErrorKind::IndefiniteLength,
+            "indefinite length encoding not supported"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     }
 
     if first & 0x80 == 0 {
@@ -205,18 +224,33 @@ pub fn decode_length(data: &[u8], base_offset: usize) -> Result<(usize, usize)> 
         let num_octets = (first & 0x7F) as usize;
 
         if num_octets == 0 {
-            return Err(Error::decode(base_offset, DecodeErrorKind::InvalidLength));
+            tracing::debug!(
+
+                snmp.offset = %base_offset,
+                kind = %DecodeErrorKind::InvalidLength,
+                "invalid length encoding: zero octets in long form"
+            );
+            return Err(Error::MalformedResponse { target }.boxed());
         }
 
         if num_octets > 4 {
-            return Err(Error::decode(
-                base_offset,
-                DecodeErrorKind::LengthTooLong { octets: num_octets },
-            ));
+            tracing::debug!(
+
+                snmp.offset = %base_offset,
+                kind = %DecodeErrorKind::LengthTooLong { octets: num_octets },
+                "length encoding too long"
+            );
+            return Err(Error::MalformedResponse { target }.boxed());
         }
 
         if data.len() < 1 + num_octets {
-            return Err(Error::decode(base_offset, DecodeErrorKind::TruncatedData));
+            tracing::debug!(
+
+                snmp.offset = %base_offset,
+                kind = %DecodeErrorKind::InsufficientData { needed: 1 + num_octets, available: data.len() },
+                "truncated data in length field"
+            );
+            return Err(Error::MalformedResponse { target }.boxed());
         }
 
         let mut len: usize = 0;
@@ -225,13 +259,13 @@ pub fn decode_length(data: &[u8], base_offset: usize) -> Result<(usize, usize)> 
         }
 
         if len > MAX_LENGTH {
-            return Err(Error::decode(
-                base_offset,
-                DecodeErrorKind::LengthExceedsMax {
-                    length: len,
-                    max: MAX_LENGTH,
-                },
-            ));
+            tracing::debug!(
+
+                snmp.offset = %base_offset,
+                kind = %DecodeErrorKind::LengthExceedsMax { length: len, max: MAX_LENGTH },
+                "length exceeds maximum"
+            );
+            return Err(Error::MalformedResponse { target }.boxed());
         }
 
         Ok((len, 1 + num_octets))
@@ -244,26 +278,32 @@ mod tests {
 
     #[test]
     fn test_short_form() {
-        assert_eq!(decode_length(&[0], 0).unwrap(), (0, 1));
-        assert_eq!(decode_length(&[127], 0).unwrap(), (127, 1));
-        assert_eq!(decode_length(&[1], 0).unwrap(), (1, 1));
+        assert_eq!(decode_length(&[0], 0, None).unwrap(), (0, 1));
+        assert_eq!(decode_length(&[127], 0, None).unwrap(), (127, 1));
+        assert_eq!(decode_length(&[1], 0, None).unwrap(), (1, 1));
     }
 
     #[test]
     fn test_long_form_1_byte() {
-        assert_eq!(decode_length(&[0x81, 128], 0).unwrap(), (128, 2));
-        assert_eq!(decode_length(&[0x81, 255], 0).unwrap(), (255, 2));
+        assert_eq!(decode_length(&[0x81, 128], 0, None).unwrap(), (128, 2));
+        assert_eq!(decode_length(&[0x81, 255], 0, None).unwrap(), (255, 2));
     }
 
     #[test]
     fn test_long_form_2_bytes() {
-        assert_eq!(decode_length(&[0x82, 0x01, 0x00], 0).unwrap(), (256, 3));
-        assert_eq!(decode_length(&[0x82, 0xFF, 0xFF], 0).unwrap(), (65535, 3));
+        assert_eq!(
+            decode_length(&[0x82, 0x01, 0x00], 0, None).unwrap(),
+            (256, 3)
+        );
+        assert_eq!(
+            decode_length(&[0x82, 0xFF, 0xFF], 0, None).unwrap(),
+            (65535, 3)
+        );
     }
 
     #[test]
     fn test_indefinite_rejected() {
-        assert!(decode_length(&[0x80], 0).is_err());
+        assert!(decode_length(&[0x80], 0, None).is_err());
     }
 
     #[test]
@@ -288,19 +328,19 @@ mod tests {
     fn test_accept_oversized_length_encoding() {
         // Non-minimal length encodings are valid per X.690 Section 8.1.3.5 Note 2
         // 0x82 0x00 0x05 = length 5 using 2 bytes (minimal would be 0x05)
-        let result = decode_length(&[0x82, 0x00, 0x05], 0);
+        let result = decode_length(&[0x82, 0x00, 0x05], 0, None);
         assert_eq!(result.unwrap(), (5, 3));
 
         // 0x81 0x01 = length 1 using long form (non-minimal, minimal would be 0x01)
-        let result = decode_length(&[0x81, 0x01], 0);
+        let result = decode_length(&[0x81, 0x01], 0, None);
         assert_eq!(result.unwrap(), (1, 2));
 
         // 0x82 0x00 0x7F = length 127 using 2 bytes (non-minimal, minimal would be 0x7F)
-        let result = decode_length(&[0x82, 0x00, 0x7F], 0);
+        let result = decode_length(&[0x82, 0x00, 0x7F], 0, None);
         assert_eq!(result.unwrap(), (127, 3));
 
         // 0x83 0x00 0x00 0x80 = length 128 using 3 bytes (non-minimal, minimal would be 0x81 0x80)
-        let result = decode_length(&[0x83, 0x00, 0x00, 0x80], 0);
+        let result = decode_length(&[0x83, 0x00, 0x00, 0x80], 0, None);
         assert_eq!(result.unwrap(), (128, 4));
     }
 
@@ -380,7 +420,7 @@ mod tests {
             ((max >> 8) & 0xFF) as u8,
             (max & 0xFF) as u8,
         ];
-        let result = decode_length(&max_bytes, 0);
+        let result = decode_length(&max_bytes, 0, None);
         assert_eq!(result.unwrap(), (MAX_LENGTH, 4));
 
         // Length exceeding MAX_LENGTH should fail (use 4-byte encoding)
@@ -392,19 +432,14 @@ mod tests {
             ((over >> 8) & 0xFF) as u8,
             (over & 0xFF) as u8,
         ];
-        let result = decode_length(&over_bytes, 0);
+        let result = decode_length(&over_bytes, 0, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        match err {
-            Error::Decode { kind, .. } => {
-                assert!(
-                    matches!(kind, DecodeErrorKind::LengthExceedsMax { .. }),
-                    "Expected LengthExceedsMax, got {:?}",
-                    kind
-                );
-            }
-            _ => panic!("Expected Decode error, got {:?}", err),
-        }
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "Expected MalformedResponse error, got {:?}",
+            err
+        );
     }
 
     mod proptests {

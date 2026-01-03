@@ -14,9 +14,11 @@
 //! }
 //! ```
 
-use crate::ber::{Decoder, EncodeBuf};
-use crate::error::{DecodeErrorKind, Error, Result};
 use bytes::Bytes;
+
+use crate::ber::{Decoder, EncodeBuf};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 
 /// USM security parameters.
 #[derive(Debug, Clone)]
@@ -121,20 +123,34 @@ impl UsmSecurityParams {
         // RFC 3414: msgAuthoritativeEngineBoots INTEGER (0..2147483647)
         let raw_boots = seq.read_integer()?;
         if raw_boots < 0 {
-            return Err(Error::decode(
-                seq.offset(),
-                DecodeErrorKind::InvalidEngineBoots { value: raw_boots },
-            ));
+            tracing::debug!(
+                target: "async_snmp::usm",
+                offset = seq.offset(),
+                value = raw_boots,
+                kind = %DecodeErrorKind::InvalidEngineBoots { value: raw_boots },
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
         let engine_boots = raw_boots as u32;
 
         // RFC 3414: msgAuthoritativeEngineTime INTEGER (0..2147483647)
         let raw_time = seq.read_integer()?;
         if raw_time < 0 {
-            return Err(Error::decode(
-                seq.offset(),
-                DecodeErrorKind::InvalidEngineTime { value: raw_time },
-            ));
+            tracing::debug!(
+                target: "async_snmp::usm",
+                offset = seq.offset(),
+                value = raw_time,
+                kind = %DecodeErrorKind::InvalidEngineTime { value: raw_time },
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
         let engine_time = raw_time as u32;
 
@@ -387,13 +403,10 @@ mod tests {
 
         let result = UsmSecurityParams::decode(encoded);
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Decode {
-                kind: DecodeErrorKind::InvalidEngineBoots { value },
-                ..
-            } => assert_eq!(value, -1),
-            e => panic!("expected InvalidEngineBoots, got {:?}", e),
-        }
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
     #[test]
@@ -413,13 +426,10 @@ mod tests {
 
         let result = UsmSecurityParams::decode(encoded);
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Decode {
-                kind: DecodeErrorKind::InvalidEngineTime { value },
-                ..
-            } => assert_eq!(value, -1),
-            e => panic!("expected InvalidEngineTime, got {:?}", e),
-        }
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
     #[test]

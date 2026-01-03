@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 use futures_core::Stream;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, WalkAbortReason};
 use crate::oid::Oid;
 use crate::transport::Transport;
 use crate::value::Value;
@@ -41,18 +41,18 @@ pub enum WalkMode {
 /// This enum controls how the library handles ordering violations:
 ///
 /// - [`Strict`](Self::Strict) (default): Terminates immediately with
-///   [`Error::NonIncreasingOid`](crate::Error::NonIncreasingOid) on any violation.
+///   [`Error::WalkAborted`](crate::Error::WalkAborted) on any violation.
 ///   Use this unless you know the agent has ordering bugs.
 ///
 /// - [`AllowNonIncreasing`](Self::AllowNonIncreasing): Tolerates out-of-order
 ///   OIDs but tracks all seen OIDs to detect cycles. Returns
-///   [`Error::DuplicateOid`](crate::Error::DuplicateOid) if the same OID appears twice.
+///   [`Error::WalkAborted`](crate::Error::WalkAborted) if the same OID appears twice.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum OidOrdering {
     /// Require strictly increasing OIDs (default).
     ///
-    /// Walk terminates with [`Error::NonIncreasingOid`](crate::Error::NonIncreasingOid)
+    /// Walk terminates with [`Error::WalkAborted`](crate::Error::WalkAborted)
     /// on first violation. Most efficient: O(1) memory, O(1) per-item check.
     #[default]
     Strict,
@@ -88,23 +88,41 @@ impl OidTracker {
         }
     }
 
-    fn check(&mut self, oid: &Oid) -> Result<()> {
+    fn check(&mut self, oid: &Oid, target: std::net::SocketAddr) -> Result<()> {
         match self {
             OidTracker::Strict { last } => {
                 if let Some(prev) = last
                     && oid <= prev
                 {
-                    return Err(Error::NonIncreasingOid {
-                        previous: prev.clone(),
-                        current: oid.clone(),
-                    });
+                    tracing::debug!(
+                        target: "async_snmp::walk",
+                        previous_oid = %prev,
+                        current_oid = %oid,
+                        %target,
+                        "non-increasing OID detected"
+                    );
+                    return Err(Error::WalkAborted {
+                        target,
+                        reason: WalkAbortReason::NonIncreasing,
+                    }
+                    .boxed());
                 }
                 *last = Some(oid.clone());
                 Ok(())
             }
             OidTracker::Relaxed { seen } => {
                 if !seen.insert(oid.clone()) {
-                    return Err(Error::DuplicateOid { oid: oid.clone() });
+                    tracing::debug!(
+                        target: "async_snmp::walk",
+                        %oid,
+                        %target,
+                        "duplicate OID detected (cycle)"
+                    );
+                    return Err(Error::WalkAborted {
+                        target,
+                        reason: WalkAbortReason::Cycle,
+                    }
+                    .boxed());
                 }
                 Ok(())
             }
@@ -213,7 +231,8 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                         }
 
                         // Check OID ordering using the tracker
-                        if let Err(e) = self.oid_tracker.check(&vb.oid) {
+                        let target = self.client.peer_addr();
+                        if let Err(e) = self.oid_tracker.check(&vb.oid, target) {
                             self.done = true;
                             return Poll::Ready(Some(Err(e)));
                         }
@@ -331,7 +350,8 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                 }
 
                 // Check OID ordering using the tracker
-                if let Err(e) = self.oid_tracker.check(&vb.oid) {
+                let target = self.client.peer_addr();
+                if let Err(e) = self.oid_tracker.check(&vb.oid, target) {
                     self.done = true;
                     return Poll::Ready(Some(Err(e)));
                 }
@@ -416,7 +436,7 @@ impl<T: Transport> WalkStream<T> {
             WalkMode::GetNext => false,
             WalkMode::GetBulk => {
                 if version == Version::V1 {
-                    return Err(Error::GetBulkNotSupportedInV1);
+                    return Err(Error::Config("GETBULK is not supported in SNMPv1".into()).boxed());
                 }
                 true
             }

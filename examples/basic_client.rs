@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            handle_error("GET", e);
+            handle_error("GET", &e);
         }
     }
 
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            handle_error("GET_MANY", e);
+            handle_error("GET_MANY", &e);
         }
     }
 
@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Value: {:?}", varbind.value);
         }
         Err(e) => {
-            handle_error("GETNEXT", e);
+            handle_error("GETNEXT", &e);
         }
     }
 
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             // SET operations commonly fail due to access control
-            handle_error("SET", e);
+            handle_error("SET", &e);
         }
     }
 
@@ -142,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Current value: {:?}", varbind.value);
         }
         Err(e) => {
-            handle_error("GET (verify)", e);
+            handle_error("GET (verify)", &e);
         }
     }
 
@@ -153,8 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Handle SNMP errors with informative messages.
 ///
 /// This demonstrates proper error handling patterns for SNMP operations.
-fn handle_error(operation: &str, error: Error) {
-    match &error {
+fn handle_error(operation: &str, error: &Error) {
+    match error {
         // SNMP protocol errors from the agent
         Error::Snmp {
             status, index, oid, ..
@@ -193,17 +193,13 @@ fn handle_error(operation: &str, error: Error) {
                 "{} failed: Timeout after {:?} ({} retries)",
                 operation, elapsed, retries
             );
-            if let Some(addr) = target {
-                println!("  -> Check if agent at {} is reachable", addr);
-            }
+            println!("  -> Check if agent at {} is reachable", target);
         }
 
-        // I/O errors (network issues)
-        Error::Io { target, source, .. } => {
-            println!("{} failed: I/O error - {}", operation, source);
-            if let Some(addr) = target {
-                println!("  -> Target: {}", addr);
-            }
+        // Network errors
+        Error::Network { target, source, .. } => {
+            println!("{} failed: Network error - {}", operation, source);
+            println!("  -> Target: {}", target);
         }
 
         // Other errors

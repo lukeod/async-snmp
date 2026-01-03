@@ -19,10 +19,12 @@
 //! - A plaintext ScopedPDU (SEQUENCE) for noAuthNoPriv/authNoPriv
 //! - An encrypted OCTET STRING for authPriv (decrypts to ScopedPDU)
 
-use crate::ber::{Decoder, EncodeBuf};
-use crate::error::{DecodeErrorKind, Error, Result};
-use crate::pdu::Pdu;
 use bytes::Bytes;
+
+use crate::ber::{Decoder, EncodeBuf};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::pdu::Pdu;
 
 /// SNMPv3 security model identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +117,18 @@ impl MsgFlags {
 
     /// Decode from byte.
     pub fn from_byte(byte: u8) -> Result<Self> {
-        let security_level = SecurityLevel::from_flags(byte)
-            .ok_or_else(|| Error::decode(0, DecodeErrorKind::InvalidMsgFlags))?;
+        let security_level = SecurityLevel::from_flags(byte).ok_or_else(|| {
+            tracing::debug!(
+                target: "async_snmp::v3",
+                byte,
+                kind = %DecodeErrorKind::InvalidMsgFlags,
+                "decode error"
+            );
+            Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed()
+        })?;
         let reportable = byte & 0x04 != 0;
         Ok(Self {
             security_level,
@@ -185,42 +197,63 @@ impl MsgGlobalData {
 
         // RFC 3412 HeaderData: msgID INTEGER (0..2147483647)
         if msg_id < 0 {
-            return Err(Error::decode(
-                seq.offset(),
-                DecodeErrorKind::InvalidMsgId { value: msg_id },
-            ));
+            tracing::debug!(
+                target: "async_snmp::v3",
+                offset = seq.offset(),
+                value = msg_id,
+                kind = %DecodeErrorKind::InvalidMsgId { value: msg_id },
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
 
         // RFC 3412 HeaderData: msgMaxSize INTEGER (484..2147483647)
         // Negative values indicate the sender encoded a value > 2^31-1
         if msg_max_size < 0 {
-            return Err(Error::decode(
-                seq.offset(),
-                DecodeErrorKind::MsgMaxSizeTooLarge {
-                    value: msg_max_size,
-                },
-            ));
+            tracing::debug!(
+                target: "async_snmp::v3",
+                offset = seq.offset(),
+                value = msg_max_size,
+                kind = %DecodeErrorKind::MsgMaxSizeTooLarge { value: msg_max_size },
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
 
         if msg_max_size < MSG_MAX_SIZE_MINIMUM {
-            return Err(Error::decode(
-                seq.offset(),
-                DecodeErrorKind::MsgMaxSizeTooSmall {
-                    value: msg_max_size,
-                    minimum: MSG_MAX_SIZE_MINIMUM,
-                },
-            ));
+            tracing::debug!(
+                target: "async_snmp::v3",
+                offset = seq.offset(),
+                value = msg_max_size,
+                minimum = MSG_MAX_SIZE_MINIMUM,
+                kind = %DecodeErrorKind::MsgMaxSizeTooSmall { value: msg_max_size, minimum: MSG_MAX_SIZE_MINIMUM },
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
 
         let flags_bytes = seq.read_octet_string()?;
         if flags_bytes.len() != 1 {
-            return Err(Error::decode(
-                seq.offset(),
-                DecodeErrorKind::UnexpectedTag {
-                    expected: 1,
-                    actual: flags_bytes.len() as u8,
-                },
-            ));
+            tracing::debug!(
+                target: "async_snmp::v3",
+                offset = seq.offset(),
+                expected = 1,
+                actual = flags_bytes.len(),
+                "invalid msgFlags length"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
         let msg_flags = MsgFlags::from_byte(flags_bytes[0])?;
 
@@ -228,10 +261,17 @@ impl MsgGlobalData {
         // Reject unknown security models per RFC 3412 Section 7.2
         let msg_security_model =
             SecurityModel::from_i32(msg_security_model_raw).ok_or_else(|| {
-                Error::decode(
-                    seq.offset(),
-                    DecodeErrorKind::UnknownSecurityModel(msg_security_model_raw),
-                )
+                tracing::debug!(
+                    target: "async_snmp::v3",
+                    offset = seq.offset(),
+                    model = msg_security_model_raw,
+                    kind = %DecodeErrorKind::UnknownSecurityModel(msg_security_model_raw),
+                    "decode error"
+                );
+                Error::MalformedResponse {
+                    target: UNKNOWN_TARGET,
+                }
+                .boxed()
             })?;
 
         Ok(Self {
@@ -432,10 +472,17 @@ impl V3Message {
         // Version
         let version = seq.read_integer()?;
         if version != 3 {
-            return Err(Error::decode(
-                seq.offset(),
-                DecodeErrorKind::UnknownVersion(version),
-            ));
+            tracing::debug!(
+                target: "async_snmp::v3",
+                offset = seq.offset(),
+                version,
+                kind = %DecodeErrorKind::UnknownVersion(version),
+                "decode error"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
 
         Self::decode_from_sequence(&mut seq)
@@ -622,16 +669,10 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Decode {
-                kind: DecodeErrorKind::MsgMaxSizeTooSmall { value, minimum },
-                ..
-            } => {
-                assert_eq!(value, 400);
-                assert_eq!(minimum, 484);
-            }
-            e => panic!("expected MsgMaxSizeTooSmall error, got {:?}", e),
-        }
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
     #[test]
@@ -666,15 +707,10 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Decode {
-                kind: DecodeErrorKind::UnknownSecurityModel(model),
-                ..
-            } => {
-                assert_eq!(model, 99);
-            }
-            e => panic!("expected UnknownSecurityModel error, got {:?}", e),
-        }
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
     #[test]
@@ -718,15 +754,10 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Decode {
-                kind: DecodeErrorKind::InvalidMsgId { value },
-                ..
-            } => {
-                assert_eq!(value, -1);
-            }
-            e => panic!("expected InvalidMsgId error, got {:?}", e),
-        }
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
     #[test]
@@ -746,15 +777,10 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Decode {
-                kind: DecodeErrorKind::MsgMaxSizeTooLarge { value },
-                ..
-            } => {
-                assert_eq!(value, -1);
-            }
-            e => panic!("expected MsgMaxSizeTooLarge error, got {:?}", e),
-        }
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
     #[test]

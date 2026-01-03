@@ -155,7 +155,7 @@ async fn run_walk(
     let auth = args
         .v3
         .auth(&args.common)
-        .map_err(|e| async_snmp::Error::Config(e.to_string()))?;
+        .map_err(|e| async_snmp::Error::Config(e.to_string().into()))?;
 
     // Set walk mode based on CLI flags
     let walk_mode = if use_getnext {

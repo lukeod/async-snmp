@@ -13,7 +13,7 @@ use bytes::Bytes;
 use crate::client::retry::Retry;
 use crate::client::walk::{OidOrdering, WalkMode};
 use crate::client::{Auth, ClientConfig, CommunityVersion, V3SecurityConfig};
-use crate::error::Error;
+use crate::error::{Error, Result};
 use crate::transport::{TcpTransport, Transport, UdpHandle, UdpTransport};
 use crate::v3::EngineCache;
 use crate::version::Version;
@@ -322,24 +322,24 @@ impl ClientBuilder {
     }
 
     /// Validate the configuration.
-    fn validate(&self) -> Result<(), Error> {
+    fn validate(&self) -> Result<()> {
         if let Auth::Usm(usm) = &self.auth {
             // Privacy requires authentication
             if usm.priv_protocol.is_some() && usm.auth_protocol.is_none() {
-                return Err(Error::Config("privacy requires authentication".into()));
+                return Err(Error::Config("privacy requires authentication".into()).boxed());
             }
             // Protocol requires password (unless using master keys)
             if usm.auth_protocol.is_some()
                 && usm.auth_password.is_none()
                 && usm.master_keys.is_none()
             {
-                return Err(Error::Config("auth protocol requires password".into()));
+                return Err(Error::Config("auth protocol requires password".into()).boxed());
             }
             if usm.priv_protocol.is_some()
                 && usm.priv_password.is_none()
                 && usm.master_keys.is_none()
             {
-                return Err(Error::Config("priv protocol requires password".into()));
+                return Err(Error::Config("priv protocol requires password".into()).boxed());
             }
         }
 
@@ -350,27 +350,23 @@ impl ClientBuilder {
         } = &self.auth
             && self.walk_mode == WalkMode::GetBulk
         {
-            return Err(Error::Config("GETBULK not supported in SNMPv1".into()));
+            return Err(Error::Config("GETBULK not supported in SNMPv1".into()).boxed());
         }
 
         Ok(())
     }
 
     /// Resolve target address to SocketAddr.
-    fn resolve_target(&self) -> Result<SocketAddr, Error> {
+    fn resolve_target(&self) -> Result<SocketAddr> {
         self.target
             .to_socket_addrs()
-            .map_err(|e| Error::Io {
-                target: None,
-                source: e,
+            .map_err(|e| {
+                Error::Config(format!("could not resolve address '{}': {}", self.target, e).into())
+                    .boxed()
             })?
             .next()
-            .ok_or_else(|| Error::Io {
-                target: None,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "could not resolve address",
-                ),
+            .ok_or_else(|| {
+                Error::Config(format!("could not resolve address '{}'", self.target).into()).boxed()
             })
     }
 
@@ -468,7 +464,7 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect(self) -> Result<Client<UdpHandle>, Error> {
+    pub async fn connect(self) -> Result<Client<UdpHandle>> {
         self.validate()?;
         let addr = self.resolve_target()?;
         // Use dual-stack socket for both IPv4 and IPv6 targets
@@ -498,7 +494,7 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>, Error> {
+    pub fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
         self.validate()?;
         let addr = self.resolve_target()?;
         let handle = transport.handle(addr);
@@ -531,7 +527,7 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect_tcp(self) -> Result<Client<TcpTransport>, Error> {
+    pub async fn connect_tcp(self) -> Result<Client<TcpTransport>> {
         self.validate()?;
         let addr = self.resolve_target()?;
         let transport = TcpTransport::connect(addr).await?;
@@ -569,7 +565,7 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn build<T: Transport>(self, transport: T) -> Result<Client<T>, Error> {
+    pub fn build<T: Transport>(self, transport: T) -> Result<Client<T>> {
         self.validate()?;
         Ok(self.build_inner(transport))
     }
@@ -667,7 +663,7 @@ mod tests {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         let err = builder.validate().unwrap_err();
         assert!(
-            matches!(err, Error::Config(msg) if msg.contains("privacy requires authentication"))
+            matches!(*err, Error::Config(ref msg) if msg.contains("privacy requires authentication"))
         );
     }
 
@@ -686,7 +682,7 @@ mod tests {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         let err = builder.validate().unwrap_err();
         assert!(
-            matches!(err, Error::Config(msg) if msg.contains("auth protocol requires password"))
+            matches!(*err, Error::Config(ref msg) if msg.contains("auth protocol requires password"))
         );
     }
 
@@ -705,7 +701,7 @@ mod tests {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         let err = builder.validate().unwrap_err();
         assert!(
-            matches!(err, Error::Config(msg) if msg.contains("priv protocol requires password"))
+            matches!(*err, Error::Config(ref msg) if msg.contains("priv protocol requires password"))
         );
     }
 

@@ -107,12 +107,19 @@ impl UdpCore {
                     }
                 } else {
                     // Slot missing - already expired or cancelled
-                    return Err(Error::Timeout {
-                        target: Some(target),
-                        elapsed: Duration::ZERO,
+                    tracing::debug!(
+                        target: "async_snmp::transport::udp",
                         request_id,
+                        %target,
+                        elapsed = ?Duration::ZERO,
+                        "transport timeout (slot missing)"
+                    );
+                    return Err(Error::Timeout {
+                        target,
+                        elapsed: Duration::ZERO,
                         retries: 0,
-                    });
+                    }
+                    .boxed());
                 }
             }
 
@@ -122,12 +129,19 @@ impl UdpCore {
                 match pending.get(&request_id) {
                     Some(slot) => slot.deadline,
                     None => {
-                        return Err(Error::Timeout {
-                            target: Some(target),
-                            elapsed: Duration::ZERO,
+                        tracing::debug!(
+                            target: "async_snmp::transport::udp",
                             request_id,
+                            %target,
+                            elapsed = ?Duration::ZERO,
+                            "transport timeout (slot removed)"
+                        );
+                        return Err(Error::Timeout {
+                            target,
+                            elapsed: Duration::ZERO,
                             retries: 0,
-                        });
+                        }
+                        .boxed());
                     }
                 }
             };
@@ -136,12 +150,20 @@ impl UdpCore {
             let now = Instant::now();
             if now >= deadline {
                 self.unregister(request_id);
-                return Err(Error::Timeout {
-                    target: Some(target),
-                    elapsed: now.saturating_duration_since(deadline - Duration::from_secs(1)),
+                let elapsed = now.saturating_duration_since(deadline - Duration::from_secs(1));
+                tracing::debug!(
+                    target: "async_snmp::transport::udp",
                     request_id,
+                    %target,
+                    ?elapsed,
+                    "transport timeout"
+                );
+                return Err(Error::Timeout {
+                    target,
+                    elapsed,
                     retries: 0,
-                });
+                }
+                .boxed());
             }
 
             // Wait for notification or timeout

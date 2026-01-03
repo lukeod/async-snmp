@@ -23,7 +23,53 @@ use bytes::Bytes;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{AuthProtocol, PrivProtocol};
-use crate::error::{CryptoErrorKind, Error, Result};
+
+/// Error type for privacy (encryption/decryption) operations.
+///
+/// These errors indicate cryptographic failures. Callers should convert
+/// these to `Error::Auth` with appropriate target context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyError {
+    /// Invalid privParameters length (expected 8 bytes).
+    InvalidPrivParamsLength { expected: usize, actual: usize },
+    /// Ciphertext length not a multiple of block size.
+    InvalidCiphertextLength { length: usize, block_size: usize },
+    /// Invalid key length for cipher.
+    InvalidKeyLength,
+    /// Cipher operation failed.
+    CipherError,
+    /// Unsupported privacy protocol.
+    UnsupportedProtocol,
+}
+
+impl std::fmt::Display for PrivacyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPrivParamsLength { expected, actual } => {
+                write!(
+                    f,
+                    "invalid privParameters length: expected {}, got {}",
+                    expected, actual
+                )
+            }
+            Self::InvalidCiphertextLength { length, block_size } => {
+                write!(
+                    f,
+                    "ciphertext length {} not multiple of block size {}",
+                    length, block_size
+                )
+            }
+            Self::InvalidKeyLength => write!(f, "invalid key length"),
+            Self::CipherError => write!(f, "cipher operation failed"),
+            Self::UnsupportedProtocol => write!(f, "unsupported privacy protocol"),
+        }
+    }
+}
+
+impl std::error::Error for PrivacyError {}
+
+/// Result type for privacy operations.
+pub type PrivacyResult<T> = std::result::Result<T, PrivacyError>;
 
 /// Generate a random non-zero u64 for salt initialization.
 ///
@@ -254,7 +300,7 @@ impl PrivKey {
         engine_boots: u32,
         engine_time: u32,
         salt_counter: Option<&SaltCounter>,
-    ) -> Result<(Bytes, Bytes)> {
+    ) -> PrivacyResult<(Bytes, Bytes)> {
         let salt = salt_counter.map(|c| c.next()).unwrap_or_else(|| {
             let mut s = self.salt_counter;
             self.salt_counter = self.salt_counter.wrapping_add(1);
@@ -298,15 +344,18 @@ impl PrivKey {
         engine_boots: u32,
         engine_time: u32,
         priv_params: &[u8],
-    ) -> Result<Bytes> {
+    ) -> PrivacyResult<Bytes> {
         if priv_params.len() != 8 {
-            return Err(Error::decrypt(
-                None,
-                CryptoErrorKind::InvalidPrivParamsLength {
-                    expected: 8,
-                    actual: priv_params.len(),
-                },
-            ));
+            tracing::debug!(
+                target: "async_snmp::crypto",
+                expected = 8,
+                actual = priv_params.len(),
+                "invalid privParameters length"
+            );
+            return Err(PrivacyError::InvalidPrivParamsLength {
+                expected: 8,
+                actual: priv_params.len(),
+            });
         }
 
         match self.protocol {
@@ -324,7 +373,7 @@ impl PrivKey {
         plaintext: &[u8],
         engine_boots: u32,
         salt_int: u64,
-    ) -> Result<(Bytes, Bytes)> {
+    ) -> PrivacyResult<(Bytes, Bytes)> {
         use cbc::cipher::{BlockEncryptMut, KeyIvInit};
         type DesCbc = cbc::Encryptor<des::Des>;
 
@@ -367,12 +416,17 @@ impl PrivKey {
         buffer[..plaintext.len()].copy_from_slice(plaintext);
 
         // Encrypt in-place
-        let cipher = DesCbc::new_from_slices(key, &iv)
-            .map_err(|_| Error::encrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+        let cipher = DesCbc::new_from_slices(key, &iv).map_err(|_| {
+            tracing::debug!(target: "async_snmp::crypto", "DES encryption failed: invalid key length");
+            PrivacyError::InvalidKeyLength
+        })?;
 
         let ciphertext = cipher
             .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buffer, padded_len)
-            .map_err(|_| Error::encrypt(None, CryptoErrorKind::CipherError))?;
+            .map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "DES encryption failed: cipher error");
+                PrivacyError::CipherError
+            })?;
 
         Ok((
             Bytes::copy_from_slice(ciphertext),
@@ -381,18 +435,21 @@ impl PrivKey {
     }
 
     /// DES-CBC decryption (RFC 3414 Section 8.1.1).
-    fn decrypt_des(&self, ciphertext: &[u8], priv_params: &[u8]) -> Result<Bytes> {
+    fn decrypt_des(&self, ciphertext: &[u8], priv_params: &[u8]) -> PrivacyResult<Bytes> {
         use cbc::cipher::{BlockDecryptMut, KeyIvInit};
         type DesCbc = cbc::Decryptor<des::Des>;
 
         if !ciphertext.len().is_multiple_of(8) {
-            return Err(Error::decrypt(
-                None,
-                CryptoErrorKind::InvalidCiphertextLength {
-                    length: ciphertext.len(),
-                    block_size: 8,
-                },
-            ));
+            tracing::debug!(
+                target: "async_snmp::crypto",
+                length = ciphertext.len(),
+                block_size = 8,
+                "DES decryption failed: invalid ciphertext length"
+            );
+            return Err(PrivacyError::InvalidCiphertextLength {
+                length: ciphertext.len(),
+                block_size: 8,
+            });
         }
 
         // DES key is first 8 bytes
@@ -410,13 +467,18 @@ impl PrivKey {
         }
 
         // Decrypt
-        let cipher = DesCbc::new_from_slices(key, &iv)
-            .map_err(|_| Error::decrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+        let cipher = DesCbc::new_from_slices(key, &iv).map_err(|_| {
+            tracing::debug!(target: "async_snmp::crypto", "DES decryption failed: invalid key length");
+            PrivacyError::InvalidKeyLength
+        })?;
 
         let mut buffer = ciphertext.to_vec();
         let plaintext = cipher
             .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buffer)
-            .map_err(|_| Error::decrypt(None, CryptoErrorKind::CipherError))?;
+            .map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "DES decryption failed: cipher error");
+                PrivacyError::CipherError
+            })?;
 
         Ok(Bytes::copy_from_slice(plaintext))
     }
@@ -427,7 +489,7 @@ impl PrivKey {
         plaintext: &[u8],
         engine_boots: u32,
         salt_int: u64,
-    ) -> Result<(Bytes, Bytes)> {
+    ) -> PrivacyResult<(Bytes, Bytes)> {
         use cbc::cipher::{BlockEncryptMut, KeyIvInit};
         type Des3Cbc = cbc::Encryptor<des::TdesEde3>;
 
@@ -453,12 +515,17 @@ impl PrivKey {
         buffer[..plaintext.len()].copy_from_slice(plaintext);
 
         // Encrypt in-place
-        let cipher = Des3Cbc::new_from_slices(key, &iv)
-            .map_err(|_| Error::encrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+        let cipher = Des3Cbc::new_from_slices(key, &iv).map_err(|_| {
+            tracing::debug!(target: "async_snmp::crypto", "3DES encryption failed: invalid key length");
+            PrivacyError::InvalidKeyLength
+        })?;
 
         let ciphertext = cipher
             .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buffer, padded_len)
-            .map_err(|_| Error::encrypt(None, CryptoErrorKind::CipherError))?;
+            .map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "3DES encryption failed: cipher error");
+                PrivacyError::CipherError
+            })?;
 
         Ok((
             Bytes::copy_from_slice(ciphertext),
@@ -467,18 +534,21 @@ impl PrivKey {
     }
 
     /// 3DES-EDE CBC decryption (draft-reeder-snmpv3-usm-3desede-00 Section 5.1.1.3).
-    fn decrypt_des3(&self, ciphertext: &[u8], priv_params: &[u8]) -> Result<Bytes> {
+    fn decrypt_des3(&self, ciphertext: &[u8], priv_params: &[u8]) -> PrivacyResult<Bytes> {
         use cbc::cipher::{BlockDecryptMut, KeyIvInit};
         type Des3Cbc = cbc::Decryptor<des::TdesEde3>;
 
         if !ciphertext.len().is_multiple_of(8) {
-            return Err(Error::decrypt(
-                None,
-                CryptoErrorKind::InvalidCiphertextLength {
-                    length: ciphertext.len(),
-                    block_size: 8,
-                },
-            ));
+            tracing::debug!(
+                target: "async_snmp::crypto",
+                length = ciphertext.len(),
+                block_size = 8,
+                "3DES decryption failed: invalid ciphertext length"
+            );
+            return Err(PrivacyError::InvalidCiphertextLength {
+                length: ciphertext.len(),
+                block_size: 8,
+            });
         }
 
         // 3DES key is first 24 bytes (K1, K2, K3)
@@ -496,13 +566,18 @@ impl PrivKey {
         }
 
         // Decrypt
-        let cipher = Des3Cbc::new_from_slices(key, &iv)
-            .map_err(|_| Error::decrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+        let cipher = Des3Cbc::new_from_slices(key, &iv).map_err(|_| {
+            tracing::debug!(target: "async_snmp::crypto", "3DES decryption failed: invalid key length");
+            PrivacyError::InvalidKeyLength
+        })?;
 
         let mut buffer = ciphertext.to_vec();
         let plaintext = cipher
             .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buffer)
-            .map_err(|_| Error::decrypt(None, CryptoErrorKind::CipherError))?;
+            .map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "3DES decryption failed: cipher error");
+                PrivacyError::CipherError
+            })?;
 
         Ok(Bytes::copy_from_slice(plaintext))
     }
@@ -515,7 +590,7 @@ impl PrivKey {
         engine_time: u32,
         salt: u64,
         key_len: usize,
-    ) -> Result<(Bytes, Bytes)> {
+    ) -> PrivacyResult<(Bytes, Bytes)> {
         use aes::{Aes128, Aes192, Aes256};
         use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
 
@@ -537,24 +612,31 @@ impl PrivKey {
         match key_len {
             16 => {
                 type Aes128Cfb = cfb_mode::Encryptor<Aes128>;
-                let cipher = Aes128Cfb::new_from_slices(key, &iv)
-                    .map_err(|_| Error::encrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+                let cipher = Aes128Cfb::new_from_slices(key, &iv).map_err(|_| {
+                    tracing::debug!(target: "async_snmp::crypto", "AES-128 encryption failed: invalid key length");
+                    PrivacyError::InvalidKeyLength
+                })?;
                 cipher.encrypt(&mut buffer);
             }
             24 => {
                 type Aes192Cfb = cfb_mode::Encryptor<Aes192>;
-                let cipher = Aes192Cfb::new_from_slices(key, &iv)
-                    .map_err(|_| Error::encrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+                let cipher = Aes192Cfb::new_from_slices(key, &iv).map_err(|_| {
+                    tracing::debug!(target: "async_snmp::crypto", "AES-192 encryption failed: invalid key length");
+                    PrivacyError::InvalidKeyLength
+                })?;
                 cipher.encrypt(&mut buffer);
             }
             32 => {
                 type Aes256Cfb = cfb_mode::Encryptor<Aes256>;
-                let cipher = Aes256Cfb::new_from_slices(key, &iv)
-                    .map_err(|_| Error::encrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+                let cipher = Aes256Cfb::new_from_slices(key, &iv).map_err(|_| {
+                    tracing::debug!(target: "async_snmp::crypto", "AES-256 encryption failed: invalid key length");
+                    PrivacyError::InvalidKeyLength
+                })?;
                 cipher.encrypt(&mut buffer);
             }
             _ => {
-                return Err(Error::encrypt(None, CryptoErrorKind::UnsupportedProtocol));
+                tracing::debug!(target: "async_snmp::crypto", key_len, "AES encryption failed: unsupported key length");
+                return Err(PrivacyError::UnsupportedProtocol);
             }
         }
 
@@ -568,7 +650,7 @@ impl PrivKey {
         engine_boots: u32,
         engine_time: u32,
         priv_params: &[u8],
-    ) -> Result<Bytes> {
+    ) -> PrivacyResult<Bytes> {
         use aes::{Aes128, Aes192, Aes256};
         use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
 
@@ -593,24 +675,31 @@ impl PrivKey {
         match key_len {
             16 => {
                 type Aes128Cfb = cfb_mode::Decryptor<Aes128>;
-                let cipher = Aes128Cfb::new_from_slices(key, &iv)
-                    .map_err(|_| Error::decrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+                let cipher = Aes128Cfb::new_from_slices(key, &iv).map_err(|_| {
+                    tracing::debug!(target: "async_snmp::crypto", "AES-128 decryption failed: invalid key length");
+                    PrivacyError::InvalidKeyLength
+                })?;
                 cipher.decrypt(&mut buffer);
             }
             24 => {
                 type Aes192Cfb = cfb_mode::Decryptor<Aes192>;
-                let cipher = Aes192Cfb::new_from_slices(key, &iv)
-                    .map_err(|_| Error::decrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+                let cipher = Aes192Cfb::new_from_slices(key, &iv).map_err(|_| {
+                    tracing::debug!(target: "async_snmp::crypto", "AES-192 decryption failed: invalid key length");
+                    PrivacyError::InvalidKeyLength
+                })?;
                 cipher.decrypt(&mut buffer);
             }
             32 => {
                 type Aes256Cfb = cfb_mode::Decryptor<Aes256>;
-                let cipher = Aes256Cfb::new_from_slices(key, &iv)
-                    .map_err(|_| Error::decrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+                let cipher = Aes256Cfb::new_from_slices(key, &iv).map_err(|_| {
+                    tracing::debug!(target: "async_snmp::crypto", "AES-256 decryption failed: invalid key length");
+                    PrivacyError::InvalidKeyLength
+                })?;
                 cipher.decrypt(&mut buffer);
             }
             _ => {
-                return Err(Error::decrypt(None, CryptoErrorKind::UnsupportedProtocol));
+                tracing::debug!(target: "async_snmp::crypto", key_len, "AES decryption failed: unsupported key length");
+                return Err(PrivacyError::UnsupportedProtocol);
             }
         }
 

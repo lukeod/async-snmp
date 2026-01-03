@@ -3,7 +3,8 @@
 //! The `Value` enum represents all SNMP data types including exceptions.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
-use crate::error::{DecodeErrorKind, Error, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::format::hex;
 use crate::oid::Oid;
 use bytes::Bytes;
@@ -437,10 +438,16 @@ impl Value {
             }
             tag::universal::NULL => {
                 if len != 0 {
-                    return Err(Error::decode(
-                        decoder.offset(),
-                        DecodeErrorKind::InvalidNull,
-                    ));
+                    tracing::debug!(
+                        target: "async_snmp::value",
+                        offset = decoder.offset(),
+                        kind = %DecodeErrorKind::InvalidNull,
+                        "decode error"
+                    );
+                    return Err(Error::MalformedResponse {
+                        target: UNKNOWN_TARGET,
+                    }
+                    .boxed());
                 }
                 Ok(Value::Null)
             }
@@ -450,10 +457,17 @@ impl Value {
             }
             tag::application::IP_ADDRESS => {
                 if len != 4 {
-                    return Err(Error::decode(
-                        decoder.offset(),
-                        DecodeErrorKind::InvalidIpAddressLength { length: len },
-                    ));
+                    tracing::debug!(
+                        target: "async_snmp::value",
+                        offset = decoder.offset(),
+                        length = len,
+                        kind = %DecodeErrorKind::InvalidIpAddressLength { length: len },
+                        "decode error"
+                    );
+                    return Err(Error::MalformedResponse {
+                        target: UNKNOWN_TARGET,
+                    }
+                    .boxed());
                 }
                 let data = decoder.read_bytes(4)?;
                 Ok(Value::IpAddress([data[0], data[1], data[2], data[3]]))
@@ -498,10 +512,18 @@ impl Value {
             }
             // Reject constructed OCTET STRING (0x24).
             // Net-snmp documents but does not parse constructed form; we follow suit.
-            tag::universal::OCTET_STRING_CONSTRUCTED => Err(Error::decode(
-                decoder.offset(),
-                DecodeErrorKind::ConstructedOctetString,
-            )),
+            tag::universal::OCTET_STRING_CONSTRUCTED => {
+                tracing::debug!(
+                    target: "async_snmp::value",
+                    offset = decoder.offset(),
+                    kind = %DecodeErrorKind::ConstructedOctetString,
+                    "decode error"
+                );
+                Err(Error::MalformedResponse {
+                    target: UNKNOWN_TARGET,
+                }
+                .boxed())
+            }
             _ => {
                 // Unknown tag - preserve for forward compatibility
                 let data = decoder.read_bytes(len)?;
@@ -670,12 +692,12 @@ mod tests {
             result.is_err(),
             "constructed OCTET STRING (0x24) should be rejected"
         );
+        // Verify error is MalformedResponse (detailed error kind is logged via tracing)
         let err = result.unwrap_err();
-        let err_msg = format!("{}", err);
         assert!(
-            err_msg.contains("constructed OCTET STRING"),
-            "error message should mention 'constructed OCTET STRING', got: {}",
-            err_msg
+            matches!(&*err, crate::Error::MalformedResponse { .. }),
+            "expected MalformedResponse error, got: {:?}",
+            err
         );
     }
 

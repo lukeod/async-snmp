@@ -74,7 +74,7 @@
 //! ```
 
 use super::Transport;
-use crate::error::{DecodeErrorKind, Error, Result};
+use crate::error::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -178,26 +178,23 @@ impl TcpTransportBuilder {
         let stream = match self.timeout {
             Some(t) => timeout(t, TcpStream::connect(target))
                 .await
-                .map_err(|_| Error::Timeout {
-                    target: Some(target),
-                    elapsed: t,
-                    request_id: 0,
-                    retries: 0,
+                .map_err(|_| {
+                    Error::Timeout {
+                        target,
+                        elapsed: t,
+                        retries: 0,
+                    }
+                    .boxed()
                 })?
-                .map_err(|e| Error::Io {
-                    target: Some(target),
-                    source: e,
-                })?,
-            None => TcpStream::connect(target).await.map_err(|e| Error::Io {
-                target: Some(target),
-                source: e,
-            })?,
+                .map_err(|e| Error::Network { target, source: e }.boxed())?,
+            None => TcpStream::connect(target)
+                .await
+                .map_err(|e| Error::Network { target, source: e }.boxed())?,
         };
 
-        let local_addr = stream.local_addr().map_err(|e| Error::Io {
-            target: Some(target),
-            source: e,
-        })?;
+        let local_addr = stream
+            .local_addr()
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
         Ok(TcpTransport {
             inner: Arc::new(TcpTransportInner {
@@ -343,15 +340,14 @@ impl TcpTransport {
         target: SocketAddr,
         options: TcpOptions,
     ) -> Result<Self> {
-        let stream = socket.connect(target).await.map_err(|e| Error::Io {
-            target: Some(target),
-            source: e,
-        })?;
+        let stream = socket
+            .connect(target)
+            .await
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
-        let local_addr = stream.local_addr().map_err(|e| Error::Io {
-            target: Some(target),
-            source: e,
-        })?;
+        let local_addr = stream
+            .local_addr()
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
         Ok(Self {
             inner: Arc::new(TcpTransportInner {
@@ -371,17 +367,18 @@ impl Transport for TcpTransport {
         // Acquire owned lock and hold it until recv() completes.
         // This serializes request-response pairs for concurrent callers.
         let mut stream = self.inner.stream.clone().lock_owned().await;
+        let target = self.inner.target;
 
         let result = async {
-            stream.write_all(data).await.map_err(|e| Error::Io {
-                target: Some(self.inner.target),
-                source: e,
-            })?;
-            stream.flush().await.map_err(|e| Error::Io {
-                target: Some(self.inner.target),
-                source: e,
-            })?;
-            Ok::<_, Error>(())
+            stream
+                .write_all(data)
+                .await
+                .map_err(|e| Error::Network { target, source: e }.boxed())?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| Error::Network { target, source: e }.boxed())?;
+            Ok::<_, Box<Error>>(())
         }
         .await;
 
@@ -404,6 +401,7 @@ impl Transport for TcpTransport {
 
     async fn recv(&self, request_id: i32) -> Result<(Bytes, SocketAddr)> {
         let recv_timeout = *self.inner.current_timeout.lock().unwrap();
+        let target = self.inner.target;
 
         // Take the guard that was stored by send().
         // This ensures we're reading the response for our request.
@@ -418,17 +416,30 @@ impl Transport for TcpTransport {
         // Read a complete BER-encoded message using the framing protocol.
         // The guard is dropped when this function returns, releasing the lock.
         let max_alloc = self.inner.max_allocation_size;
-        let result = timeout(recv_timeout, read_ber_message(&mut stream, max_alloc)).await;
+        let result = timeout(
+            recv_timeout,
+            read_ber_message(&mut stream, target, max_alloc),
+        )
+        .await;
 
         match result {
-            Ok(Ok(data)) => Ok((data, self.inner.target)),
+            Ok(Ok(data)) => Ok((data, target)),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::Timeout {
-                target: Some(self.inner.target),
-                elapsed: recv_timeout,
-                request_id,
-                retries: 0,
-            }),
+            Err(_) => {
+                tracing::debug!(
+                    target: "async_snmp::transport::tcp",
+                    request_id,
+                    %target,
+                    elapsed = ?recv_timeout,
+                    "transport timeout"
+                );
+                Err(Error::Timeout {
+                    target,
+                    elapsed: recv_timeout,
+                    retries: 0,
+                }
+                .boxed())
+            }
         }
     }
 
@@ -455,30 +466,28 @@ impl Transport for TcpTransport {
 /// 1. Tag byte (must be 0x30)
 /// 2. Length field (definite form only)
 /// 3. Content bytes
-async fn read_ber_message(stream: &mut TcpStream, max_allocation_size: usize) -> Result<Bytes> {
-    let target: SocketAddr = stream
-        .peer_addr()
-        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-
+async fn read_ber_message(
+    stream: &mut TcpStream,
+    target: SocketAddr,
+    max_allocation_size: usize,
+) -> Result<Bytes> {
     // Read tag byte
     let mut tag_buf = [0u8; 1];
     stream
         .read_exact(&mut tag_buf)
         .await
-        .map_err(|e| Error::Io {
-            target: Some(target),
-            source: e,
-        })?;
+        .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
     let tag = tag_buf[0];
     if tag != 0x30 {
-        return Err(Error::decode(
-            0,
-            DecodeErrorKind::UnexpectedTag {
-                expected: 0x30,
-                actual: tag,
-            },
-        ));
+        tracing::debug!(
+            target: "async_snmp::transport::tcp",
+            expected_tag = 0x30,
+            actual_tag = tag,
+            %target,
+            "invalid SNMP message tag"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     }
 
     // Read length
@@ -486,37 +495,37 @@ async fn read_ber_message(stream: &mut TcpStream, max_allocation_size: usize) ->
     stream
         .read_exact(&mut first_len_byte)
         .await
-        .map_err(|e| Error::Io {
-            target: Some(target),
-            source: e,
-        })?;
+        .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
     let (content_len, len_bytes) = if first_len_byte[0] < 0x80 {
         // Short form: length is directly in this byte
         (first_len_byte[0] as usize, vec![first_len_byte[0]])
     } else if first_len_byte[0] == 0x80 {
         // Indefinite length - not supported
-        return Err(Error::decode(1, DecodeErrorKind::IndefiniteLength));
+        tracing::debug!(
+            target: "async_snmp::transport::tcp",
+            %target,
+            "indefinite length encoding not supported"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     } else {
         // Long form: first byte indicates number of following length bytes
         let num_len_bytes = (first_len_byte[0] & 0x7F) as usize;
         if num_len_bytes > 4 {
-            return Err(Error::decode(
-                1,
-                DecodeErrorKind::LengthTooLong {
-                    octets: num_len_bytes,
-                },
-            ));
+            tracing::debug!(
+                target: "async_snmp::transport::tcp",
+                octets = num_len_bytes,
+                %target,
+                "length encoding too long"
+            );
+            return Err(Error::MalformedResponse { target }.boxed());
         }
 
         let mut len_bytes_buf = vec![0u8; num_len_bytes];
         stream
             .read_exact(&mut len_bytes_buf)
             .await
-            .map_err(|e| Error::Io {
-                target: Some(target),
-                source: e,
-            })?;
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
         let mut length: usize = 0;
         for &b in &len_bytes_buf {
@@ -534,10 +543,14 @@ async fn read_ber_message(stream: &mut TcpStream, max_allocation_size: usize) ->
     // This prevents DoS attacks where a malicious sender claims a huge message
     // size without actually sending that much data.
     if content_len > max_allocation_size {
-        return Err(Error::MessageTooLarge {
-            size: content_len,
-            max: max_allocation_size,
-        });
+        tracing::warn!(
+            target: "async_snmp::transport::tcp",
+            size = content_len,
+            max = max_allocation_size,
+            %target,
+            "message size exceeds limit"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     }
 
     // Read content
@@ -545,10 +558,7 @@ async fn read_ber_message(stream: &mut TcpStream, max_allocation_size: usize) ->
     stream
         .read_exact(&mut content)
         .await
-        .map_err(|e| Error::Io {
-            target: Some(target),
-            source: e,
-        })?;
+        .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
     // Reconstruct complete message: tag + length + content
     let total_len = 1 + len_bytes.len() + content_len;
@@ -729,7 +739,7 @@ mod tests {
 
                 // Verify we got a valid response
                 assert_eq!(response[0], 0x30, "Response should be SEQUENCE");
-                Ok::<_, Error>(i)
+                Ok::<_, Box<Error>>(i)
             });
             handles.push(handle);
         }
@@ -873,8 +883,8 @@ mod tests {
         assert!(result.is_err(), "Should reject excessive claimed size");
         let err = result.unwrap_err();
         assert!(
-            matches!(err, Error::MessageTooLarge { .. }),
-            "Expected MessageTooLarge error, got: {:?}",
+            matches!(*err, Error::MalformedResponse { .. }),
+            "Expected MalformedResponse error, got: {:?}",
             err
         );
 
@@ -924,13 +934,11 @@ mod tests {
             "Should reject message exceeding custom limit"
         );
         let err = result.unwrap_err();
-        match err {
-            Error::MessageTooLarge { size, max } => {
-                assert_eq!(size, 10240);
-                assert_eq!(max, 1024);
-            }
-            _ => panic!("Expected MessageTooLarge error, got: {:?}", err),
-        }
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "Expected MalformedResponse error, got: {:?}",
+            err
+        );
 
         server.await.unwrap();
     }

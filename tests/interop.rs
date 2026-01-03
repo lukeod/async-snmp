@@ -682,9 +682,11 @@ async fn set_writable_oid() {
                 assert_eq!(s.as_ref(), b"admin@example.com");
             }
         }
-        Err(async_snmp::Error::Snmp { .. }) => {
-            // NotWritable is acceptable if agent doesn't allow writes
-        }
-        Err(e) => panic!("SET failed unexpectedly: {}", e),
+        Err(e) => match *e {
+            async_snmp::Error::Snmp { .. } => {
+                // NotWritable is acceptable if agent doesn't allow writes
+            }
+            _ => panic!("SET failed unexpectedly: {}", e),
+        },
     }
 }

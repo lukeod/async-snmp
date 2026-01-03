@@ -2,9 +2,12 @@
 //!
 //! Zero-copy decoding using `Bytes` to avoid allocations.
 
+use std::net::SocketAddr;
+
 use super::length::decode_length;
 use super::tag;
-use crate::error::{DecodeErrorKind, Error, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::oid::Oid;
 use bytes::Bytes;
 
@@ -12,17 +15,36 @@ use bytes::Bytes;
 pub struct Decoder {
     data: Bytes,
     offset: usize,
+    target: Option<SocketAddr>,
 }
 
 impl Decoder {
     /// Create a new decoder from bytes.
     pub fn new(data: Bytes) -> Self {
-        Self { data, offset: 0 }
+        Self {
+            data,
+            offset: 0,
+            target: None,
+        }
+    }
+
+    /// Create a decoder from bytes with a target address for error context.
+    pub fn with_target(data: Bytes, target: SocketAddr) -> Self {
+        Self {
+            data,
+            offset: 0,
+            target: Some(target),
+        }
     }
 
     /// Create a decoder from a byte slice (copies the data).
     pub fn from_slice(data: &[u8]) -> Self {
         Self::new(Bytes::copy_from_slice(data))
+    }
+
+    /// Get the target address for error context.
+    fn target(&self) -> SocketAddr {
+        self.target.unwrap_or(UNKNOWN_TARGET)
     }
 
     /// Get the current offset.
@@ -57,7 +79,16 @@ impl Decoder {
     /// Read a single byte.
     pub fn read_byte(&mut self) -> Result<u8> {
         if self.offset >= self.data.len() {
-            return Err(Error::decode(self.offset, DecodeErrorKind::TruncatedData));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::TruncatedData,
+                "truncated data: unexpected end of input"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         let byte = self.data[self.offset];
         self.offset += 1;
@@ -71,7 +102,7 @@ impl Decoder {
 
     /// Read a length and return (length, bytes consumed).
     pub fn read_length(&mut self) -> Result<usize> {
-        let (len, consumed) = decode_length(&self.data[self.offset..], self.offset)?;
+        let (len, consumed) = decode_length(&self.data[self.offset..], self.offset, self.target)?;
         self.offset += consumed;
         Ok(len)
     }
@@ -80,13 +111,16 @@ impl Decoder {
     pub fn read_bytes(&mut self, len: usize) -> Result<Bytes> {
         // Use saturating_add to prevent overflow from bypassing bounds check
         if self.offset.saturating_add(len) > self.data.len() {
-            return Err(Error::decode(
-                self.offset,
-                DecodeErrorKind::InsufficientData {
-                    needed: len,
-                    available: self.remaining(),
-                },
-            ));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::InsufficientData { needed: len, available: self.remaining() },
+                "insufficient data"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         let bytes = self.data.slice(self.offset..self.offset + len);
         self.offset += len;
@@ -97,13 +131,16 @@ impl Decoder {
     pub fn expect_tag(&mut self, expected: u8) -> Result<usize> {
         let tag = self.read_tag()?;
         if tag != expected {
-            return Err(Error::decode(
-                self.offset - 1,
-                DecodeErrorKind::UnexpectedTag {
-                    expected,
-                    actual: tag,
-                },
-            ));
+            tracing::debug!(
+
+                snmp.offset = %self.offset - 1,
+                kind = %DecodeErrorKind::UnexpectedTag { expected, actual: tag },
+                "unexpected tag"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         self.read_length()
     }
@@ -117,16 +154,23 @@ impl Decoder {
     /// Read integer value given the length.
     pub fn read_integer_value(&mut self, len: usize) -> Result<i32> {
         if len == 0 {
-            return Err(Error::decode(
-                self.offset,
-                DecodeErrorKind::ZeroLengthInteger,
-            ));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::ZeroLengthInteger,
+                "zero-length integer"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         if len > 4 {
             // Permissive: truncate with warning (matches net-snmp)
             tracing::warn!(
-                ber.offset = self.offset,
-                ber.length = len,
+
+                snmp.offset = %self.offset,
+                length = len,
                 "integer too long, truncating to 4 bytes"
             );
         }
@@ -153,17 +197,29 @@ impl Decoder {
     /// Read 64-bit unsigned integer value given the length.
     pub fn read_integer64_value(&mut self, len: usize) -> Result<u64> {
         if len == 0 {
-            return Err(Error::decode(
-                self.offset,
-                DecodeErrorKind::ZeroLengthInteger,
-            ));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::ZeroLengthInteger,
+                "zero-length integer"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         if len > 9 {
             // 9 bytes max: 1 leading zero + 8 bytes for u64
-            return Err(Error::decode(
-                self.offset,
-                DecodeErrorKind::Integer64TooLong { length: len },
-            ));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::Integer64TooLong { length: len },
+                "integer64 too long"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
 
         let bytes = self.read_bytes(len)?;
@@ -185,16 +241,23 @@ impl Decoder {
     /// Read unsigned 32-bit integer value given length.
     pub fn read_unsigned32_value(&mut self, len: usize) -> Result<u32> {
         if len == 0 {
-            return Err(Error::decode(
-                self.offset,
-                DecodeErrorKind::ZeroLengthInteger,
-            ));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::ZeroLengthInteger,
+                "zero-length integer"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         if len > 5 {
             // 5 bytes max: 1 leading zero + 4 bytes for u32
             tracing::warn!(
-                ber.offset = self.offset,
-                ber.length = len,
+
+                snmp.offset = %self.offset,
+                length = len,
                 "unsigned integer too long, truncating to 4 bytes"
             );
         }
@@ -219,7 +282,16 @@ impl Decoder {
     pub fn read_null(&mut self) -> Result<()> {
         let len = self.expect_tag(tag::universal::NULL)?;
         if len != 0 {
-            return Err(Error::decode(self.offset, DecodeErrorKind::InvalidNull));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::InvalidNull,
+                "NULL with non-zero length"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         Ok(())
     }
@@ -241,24 +313,38 @@ impl Decoder {
     pub fn read_sequence(&mut self) -> Result<Decoder> {
         let len = self.expect_tag(tag::universal::SEQUENCE)?;
         let content = self.read_bytes(len)?;
-        Ok(Decoder::new(content))
+        Ok(Decoder {
+            data: content,
+            offset: 0,
+            target: self.target,
+        })
     }
 
     /// Read a constructed type with a specific tag, returning a decoder for its contents.
     pub fn read_constructed(&mut self, expected_tag: u8) -> Result<Decoder> {
         let len = self.expect_tag(expected_tag)?;
         let content = self.read_bytes(len)?;
-        Ok(Decoder::new(content))
+        Ok(Decoder {
+            data: content,
+            offset: 0,
+            target: self.target,
+        })
     }
 
     /// Read an IP address.
     pub fn read_ip_address(&mut self) -> Result<[u8; 4]> {
         let len = self.expect_tag(tag::application::IP_ADDRESS)?;
         if len != 4 {
-            return Err(Error::decode(
-                self.offset,
-                DecodeErrorKind::InvalidIpAddressLength { length: len },
-            ));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::InvalidIpAddressLength { length: len },
+                "IP address must be 4 bytes"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         let bytes = self.read_bytes(4)?;
         Ok([bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -271,7 +357,16 @@ impl Decoder {
         // Use saturating_add and check BEFORE modifying offset to prevent overflow
         let new_offset = self.offset.saturating_add(len);
         if new_offset > self.data.len() {
-            return Err(Error::decode(self.offset, DecodeErrorKind::TlvOverflow));
+            tracing::debug!(
+
+                snmp.offset = %self.offset,
+                kind = %DecodeErrorKind::TlvOverflow,
+                "TLV extends past end of data"
+            );
+            return Err(Error::MalformedResponse {
+                target: self.target(),
+            }
+            .boxed());
         }
         self.offset = new_offset;
         Ok(())
@@ -280,7 +375,11 @@ impl Decoder {
     /// Create a sub-decoder for a portion of the remaining data.
     pub fn sub_decoder(&mut self, len: usize) -> Result<Decoder> {
         let content = self.read_bytes(len)?;
-        Ok(Decoder::new(content))
+        Ok(Decoder {
+            data: content,
+            offset: 0,
+            target: self.target,
+        })
     }
 
     /// Get the underlying bytes for the entire buffer.
@@ -385,24 +484,15 @@ mod tests {
 
     #[test]
     fn test_read_bytes_rejects_oversized_length() {
-        // When length exceeds remaining data, should return InsufficientData error
+        // When length exceeds remaining data, should return MalformedResponse error
         let mut dec = Decoder::from_slice(&[0x01, 0x02, 0x03]);
         // Try to read more bytes than available
         let result = dec.read_bytes(100);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::Error::Decode {
-                    kind: DecodeErrorKind::InsufficientData {
-                        needed: 100,
-                        available: 3
-                    },
-                    ..
-                }
-            ),
-            "expected InsufficientData error, got {:?}",
+            matches!(*err, crate::error::Error::MalformedResponse { .. }),
+            "expected MalformedResponse error, got {:?}",
             err
         );
     }
@@ -416,14 +506,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::error::Error::Decode {
-                    kind: DecodeErrorKind::TlvOverflow,
-                    ..
-                }
-            ),
-            "expected TlvOverflow error, got {:?}",
+            matches!(*err, crate::error::Error::MalformedResponse { .. }),
+            "expected MalformedResponse error, got {:?}",
             err
         );
     }

@@ -2,7 +2,8 @@
 //!
 //! OIDs are stored as `SmallVec<[u32; 16]>` to avoid heap allocation for common OIDs.
 
-use crate::error::{DecodeErrorKind, Error, OidErrorKind, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 use smallvec::SmallVec;
 use std::fmt;
 
@@ -115,9 +116,9 @@ impl Oid {
                 continue;
             }
 
-            let arc: u32 = part.parse().map_err(|_| {
-                Error::invalid_oid_with_input(OidErrorKind::InvalidArc, s.to_string())
-            })?;
+            let arc: u32 = part
+                .parse()
+                .map_err(|_| Error::InvalidOid(format!("'{}': invalid arc", s).into()).boxed())?;
 
             arcs.push(arc);
         }
@@ -259,7 +260,10 @@ impl Oid {
 
         // arc1 must be 0, 1, or 2
         if arc1 > 2 {
-            return Err(Error::invalid_oid(OidErrorKind::InvalidFirstArc(arc1)));
+            return Err(Error::InvalidOid(
+                format!("first arc must be 0, 1, or 2, got {}", arc1).into(),
+            )
+            .boxed());
         }
 
         // Validate arc2 constraints
@@ -268,17 +272,23 @@ impl Oid {
 
             // arc2 must be <= 39 when arc1 < 2
             if arc1 < 2 && arc2 >= 40 {
-                return Err(Error::invalid_oid(OidErrorKind::InvalidSecondArc {
-                    first: arc1,
-                    second: arc2,
-                }));
+                return Err(Error::InvalidOid(
+                    format!(
+                        "second arc must be <= 39 when first arc is {}, got {}",
+                        arc1, arc2
+                    )
+                    .into(),
+                )
+                .boxed());
             }
 
             // Check that first subidentifier (arc1*40 + arc2) won't overflow u32.
             // Max valid arc2 = u32::MAX - arc1*40
             let base = arc1 * 40;
             if arc2 > u32::MAX - base {
-                return Err(Error::invalid_oid(OidErrorKind::SubidentifierOverflow));
+                return Err(
+                    Error::InvalidOid("subidentifier overflow in first two arcs".into()).boxed(),
+                );
             }
         }
 
@@ -305,10 +315,15 @@ impl Oid {
     /// ```
     pub fn validate_length(&self) -> Result<()> {
         if self.arcs.len() > MAX_OID_LEN {
-            return Err(Error::invalid_oid(OidErrorKind::TooManyArcs {
-                count: self.arcs.len(),
-                max: MAX_OID_LEN,
-            }));
+            return Err(Error::InvalidOid(
+                format!(
+                    "OID has {} arcs, exceeds maximum {}",
+                    self.arcs.len(),
+                    MAX_OID_LEN
+                )
+                .into(),
+            )
+            .boxed());
         }
         Ok(())
     }
@@ -455,13 +470,16 @@ impl Oid {
 
             // RFC 2578 Section 3.5: "at most 128 sub-identifiers in a value"
             if arcs.len() > MAX_OID_LEN {
-                return Err(Error::decode(
-                    i,
-                    DecodeErrorKind::OidTooLong {
-                        count: arcs.len(),
-                        max: MAX_OID_LEN,
-                    },
-                ));
+                tracing::debug!(
+
+                    snmp.offset = %i,
+                    kind = %DecodeErrorKind::OidTooLong { count: arcs.len(), max: MAX_OID_LEN },
+                    "OID exceeds maximum arc count"
+                );
+                return Err(Error::MalformedResponse {
+                    target: UNKNOWN_TARGET,
+                }
+                .boxed());
             }
         }
 
@@ -502,7 +520,16 @@ fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
 
     loop {
         if i >= data.len() {
-            return Err(Error::decode(i, DecodeErrorKind::TruncatedData));
+            tracing::debug!(
+
+                snmp.offset = %i,
+                kind = %DecodeErrorKind::TruncatedData,
+                "unexpected end of data in OID subidentifier"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
 
         let byte = data[i];
@@ -510,7 +537,16 @@ fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
 
         // Check for overflow before shifting
         if value > (u32::MAX >> 7) {
-            return Err(Error::decode(i, DecodeErrorKind::IntegerOverflow));
+            tracing::debug!(
+
+                snmp.offset = %i,
+                kind = %DecodeErrorKind::IntegerOverflow,
+                "OID subidentifier overflow"
+            );
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
         }
 
         value = (value << 7) | ((byte & 0x7F) as u32);
@@ -545,9 +581,9 @@ impl fmt::Display for Oid {
 }
 
 impl std::str::FromStr for Oid {
-    type Err = crate::error::Error;
+    type Err = Box<crate::error::Error>;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Self::parse(s)
     }
 }

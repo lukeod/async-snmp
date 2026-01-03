@@ -191,7 +191,7 @@ async fn run_set(
     let auth = args
         .v3
         .auth(&args.common)
-        .map_err(|e| async_snmp::Error::Config(e.to_string()))?;
+        .map_err(|e| async_snmp::Error::Config(e.to_string().into()))?;
 
     let client = Client::builder(target.to_string(), auth)
         .timeout(args.common.timeout_duration())

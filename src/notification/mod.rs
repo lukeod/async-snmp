@@ -12,7 +12,7 @@
 //! use std::net::SocketAddr;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), async_snmp::Error> {
+//! async fn main() -> Result<(), Box<async_snmp::Error>> {
 //!     let receiver = NotificationReceiver::bind("0.0.0.0:162").await?;
 //!
 //!     loop {
@@ -36,7 +36,7 @@
 //! use async_snmp::notification::NotificationReceiver;
 //! use async_snmp::{AuthProtocol, PrivProtocol};
 //!
-//! # async fn example() -> Result<(), async_snmp::Error> {
+//! # async fn example() -> Result<(), Box<async_snmp::Error>> {
 //! let receiver = NotificationReceiver::builder()
 //!     .bind("0.0.0.0:162")
 //!     .usm_user("informuser", |u| {
@@ -62,7 +62,8 @@ use tokio::net::UdpSocket;
 use tracing::instrument;
 
 use crate::ber::Decoder;
-use crate::error::{DecodeErrorKind, Error, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result};
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 use crate::util::bind_udp_socket;
@@ -167,7 +168,7 @@ impl NotificationReceiverBuilder {
     /// use async_snmp::notification::NotificationReceiver;
     /// use async_snmp::{AuthProtocol, PrivProtocol};
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let receiver = NotificationReceiver::builder()
     ///     .bind("0.0.0.0:162")
     ///     .usm_user("trapuser", |u| {
@@ -191,23 +192,19 @@ impl NotificationReceiverBuilder {
 
     /// Build the notification receiver.
     pub async fn build(self) -> Result<NotificationReceiver> {
-        let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| Error::Io {
-            target: None,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid bind address: {}", self.bind_addr),
-            ),
+        let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
+            Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
         let socket = bind_udp_socket(bind_addr, None)
             .await
-            .map_err(|e| Error::Io {
-                target: Some(bind_addr),
+            .map_err(|e| Error::Network {
+                target: bind_addr,
                 source: e,
             })?;
 
-        let local_addr = socket.local_addr().map_err(|e| Error::Io {
-            target: Some(bind_addr),
+        let local_addr = socket.local_addr().map_err(|e| Error::Network {
+            target: bind_addr,
             source: e,
         })?;
 
@@ -382,7 +379,7 @@ impl Notification {
 /// use async_snmp::notification::NotificationReceiver;
 /// use async_snmp::{AuthProtocol, PrivProtocol};
 ///
-/// # async fn example() -> Result<(), async_snmp::Error> {
+/// # async fn example() -> Result<(), Box<async_snmp::Error>> {
 /// let receiver = NotificationReceiver::builder()
 ///     .bind("0.0.0.0:162")
 ///     .usm_user("trapuser", |u| {
@@ -424,7 +421,7 @@ impl NotificationReceiver {
     /// ```rust,no_run
     /// use async_snmp::notification::NotificationReceiver;
     ///
-    /// # async fn example() -> Result<(), async_snmp::Error> {
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to the standard trap port (requires root/admin on most systems)
     /// let receiver = NotificationReceiver::bind("0.0.0.0:162").await?;
     ///
@@ -435,23 +432,19 @@ impl NotificationReceiver {
     /// ```
     pub async fn bind(addr: impl AsRef<str>) -> Result<Self> {
         let addr_str = addr.as_ref();
-        let bind_addr: SocketAddr = addr_str.parse().map_err(|_| Error::Io {
-            target: None,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid bind address: {}", addr_str),
-            ),
-        })?;
+        let bind_addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|_| Error::Config(format!("invalid bind address: {}", addr_str).into()))?;
 
         let socket = bind_udp_socket(bind_addr, None)
             .await
-            .map_err(|e| Error::Io {
-                target: Some(bind_addr),
+            .map_err(|e| Error::Network {
+                target: bind_addr,
                 source: e,
             })?;
 
-        let local_addr = socket.local_addr().map_err(|e| Error::Io {
-            target: Some(bind_addr),
+        let local_addr = socket.local_addr().map_err(|e| Error::Network {
+            target: bind_addr,
             source: e,
         })?;
 
@@ -486,8 +479,8 @@ impl NotificationReceiver {
                     .socket
                     .recv_from(&mut buf)
                     .await
-                    .map_err(|e| Error::Io {
-                        target: None,
+                    .map_err(|e| Error::Network {
+                        target: self.inner.local_addr,
                         source: e,
                     })?;
 
@@ -514,11 +507,17 @@ impl NotificationReceiver {
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
         // First, peek at the version to determine message type
-        let mut decoder = Decoder::new(data.clone());
+        let mut decoder = Decoder::with_target(data.clone(), source);
         let mut seq = decoder.read_sequence()?;
         let version_num = seq.read_integer()?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
-            Error::decode(seq.offset(), DecodeErrorKind::UnknownVersion(version_num))
+            tracing::debug!(
+                target: "async_snmp::notification",
+                source = %source,
+                kind = %DecodeErrorKind::UnknownVersion(version_num),
+                "unknown SNMP version"
+            );
+            Error::MalformedResponse { target: source }.boxed()
         })?;
         drop(seq);
         drop(decoder);

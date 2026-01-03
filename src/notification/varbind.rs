@@ -5,7 +5,8 @@
 //! - Second varbind: snmpTrapOID.0 (1.3.6.1.6.3.1.1.4.1.0) with OID value
 //! - Remaining varbinds: notification-specific data
 
-use crate::error::{DecodeErrorKind, Error, Result};
+use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::oid::Oid;
 use crate::pdu::Pdu;
 use crate::value::Value;
@@ -30,8 +31,15 @@ pub(crate) fn extract_notification_varbinds(pdu: &Pdu) -> Result<(u32, Oid, Vec<
 ///
 /// When `strict` is false (default), only validates the value types.
 fn extract_notification_varbinds_impl(pdu: &Pdu, strict: bool) -> Result<(u32, Oid, Vec<VarBind>)> {
+    let target = UNKNOWN_TARGET;
+
     if pdu.varbinds.len() < 2 {
-        return Err(Error::decode(0, DecodeErrorKind::MissingPdu));
+        tracing::debug!(
+            target: "async_snmp::notification",
+            kind = %DecodeErrorKind::MissingPdu,
+            "notification has fewer than 2 varbinds"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     }
 
     // First varbind: sysUpTime.0
@@ -41,11 +49,23 @@ fn extract_notification_varbinds_impl(pdu: &Pdu, strict: bool) -> Result<(u32, O
             actual = %pdu.varbinds[0].oid,
             "strict mode: first varbind OID is not sysUpTime.0"
         );
-        return Err(Error::decode(0, DecodeErrorKind::InvalidOid));
+        tracing::debug!(
+            target: "async_snmp::notification",
+            kind = %DecodeErrorKind::InvalidOid,
+            "invalid first varbind OID"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     }
     let uptime = match &pdu.varbinds[0].value {
         Value::TimeTicks(t) => *t,
-        _other => return Err(Error::decode(0, DecodeErrorKind::MissingPdu)),
+        _other => {
+            tracing::debug!(
+                target: "async_snmp::notification",
+                kind = %DecodeErrorKind::MissingPdu,
+                "first varbind is not TimeTicks"
+            );
+            return Err(Error::MalformedResponse { target }.boxed());
+        }
     };
 
     // Second varbind: snmpTrapOID.0
@@ -55,11 +75,23 @@ fn extract_notification_varbinds_impl(pdu: &Pdu, strict: bool) -> Result<(u32, O
             actual = %pdu.varbinds[1].oid,
             "strict mode: second varbind OID is not snmpTrapOID.0"
         );
-        return Err(Error::decode(0, DecodeErrorKind::InvalidOid));
+        tracing::debug!(
+            target: "async_snmp::notification",
+            kind = %DecodeErrorKind::InvalidOid,
+            "invalid second varbind OID"
+        );
+        return Err(Error::MalformedResponse { target }.boxed());
     }
     let trap_oid = match &pdu.varbinds[1].value {
         Value::ObjectIdentifier(oid) => oid.clone(),
-        _other => return Err(Error::decode(0, DecodeErrorKind::MissingPdu)),
+        _other => {
+            tracing::debug!(
+                target: "async_snmp::notification",
+                kind = %DecodeErrorKind::MissingPdu,
+                "second varbind is not OID"
+            );
+            return Err(Error::MalformedResponse { target }.boxed());
+        }
     };
 
     // Remaining varbinds
