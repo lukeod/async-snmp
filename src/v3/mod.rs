@@ -14,7 +14,7 @@ mod engine;
 mod privacy;
 mod usm;
 
-pub use auth::{LocalizedKey, MasterKey, MasterKeys, extend_key};
+pub use auth::{LocalizedKey, MasterKey, MasterKeys};
 pub use engine::{
     DEFAULT_MSG_MAX_SIZE, EngineCache, EngineState, MAX_ENGINE_TIME, TIME_WINDOW,
     parse_discovery_response, parse_discovery_response_with_limits,
@@ -28,19 +28,18 @@ pub use usm::UsmSecurityParams;
 
 /// Key extension strategy for privacy key derivation.
 ///
-/// When using AES-192 or AES-256 with authentication protocols that produce
-/// shorter digests (e.g., SHA-1), a key extension algorithm is needed to
-/// generate sufficient key material.
+/// This is an internal type used to select the appropriate key extension
+/// algorithm when deriving privacy keys. The correct algorithm is auto-detected
+/// based on the auth/priv protocol combination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum KeyExtension {
-    /// No key extension. Requires compatible auth/priv protocol combinations.
-    /// This is the default and will panic if insufficient key material.
+pub(crate) enum KeyExtension {
+    /// No key extension. Use standard RFC 3414 key derivation.
     #[default]
     None,
-    /// Use the Blumenthal key extension algorithm (draft-blumenthal-aes-usm-04).
-    /// Extends keys by iteratively hashing: Kul' = Kul || H(Kul) || H(Kul||H(Kul)) || ...
+    /// Blumenthal key extension (draft-blumenthal-aes-usm-04) for AES-192/256.
     Blumenthal,
+    /// Reeder key extension (draft-reeder-snmpv3-usm-3desede-00) for 3DES.
+    Reeder,
 }
 
 /// Error returned when parsing a protocol name fails.
@@ -151,50 +150,22 @@ impl AuthProtocol {
             Self::Sha512 => 48,           // RFC 7860
         }
     }
-
-    /// Check if this authentication protocol produces sufficient key material
-    /// for the given privacy protocol.
-    ///
-    /// Privacy keys are derived from the localized authentication key, so the
-    /// auth protocol must produce at least as many bytes as the privacy
-    /// protocol requires:
-    ///
-    /// | Privacy Protocol | Required Key Length | Compatible Auth Protocols |
-    /// |------------------|--------------------|-----------------------|
-    /// | DES              | 16 bytes           | All (MD5+)           |
-    /// | AES-128          | 16 bytes           | All (MD5+)           |
-    /// | AES-192          | 24 bytes           | SHA-224, SHA-256, SHA-384, SHA-512 |
-    /// | AES-256          | 32 bytes           | SHA-256, SHA-384, SHA-512 |
-    ///
-    /// # Interoperability with net-snmp
-    ///
-    /// Some implementations (notably net-snmp) support AES-192/256 with shorter
-    /// authentication protocols using key extension. To interoperate with these
-    /// systems, use [`PrivKey::from_password_extended`] with
-    /// [`KeyExtension::Blumenthal`].
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{AuthProtocol, PrivProtocol};
-    ///
-    /// // SHA-256 works with all privacy protocols
-    /// assert!(AuthProtocol::Sha256.is_compatible_with(PrivProtocol::Aes256));
-    ///
-    /// // SHA-1 doesn't produce enough key material for AES-256
-    /// assert!(!AuthProtocol::Sha1.is_compatible_with(PrivProtocol::Aes256));
-    /// ```
-    pub fn is_compatible_with(self, priv_protocol: PrivProtocol) -> bool {
-        self.digest_len() >= priv_protocol.key_len()
-    }
 }
 
 /// Privacy protocol identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PrivProtocol {
-    /// DES-CBC (RFC 3414)
+    /// DES-CBC (RFC 3414).
+    ///
+    /// Insecure: 56-bit keys are brute-forceable. Also slower than AES, which
+    /// benefits from hardware acceleration.
     Des,
+    /// 3DES-EDE in "Outside" CBC mode (draft-reeder-snmpv3-usm-3desede-00).
+    ///
+    /// Uses three 56-bit keys for 168-bit effective security (112-bit against
+    /// meet-in-the-middle). Slower than AES and lacks hardware acceleration.
+    Des3,
     /// AES-128-CFB (RFC 3826)
     Aes128,
     /// AES-192-CFB (RFC 3826)
@@ -207,6 +178,7 @@ impl std::fmt::Display for PrivProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Des => write!(f, "DES"),
+            Self::Des3 => write!(f, "3DES"),
             Self::Aes128 => write!(f, "AES"),
             Self::Aes192 => write!(f, "AES-192"),
             Self::Aes256 => write!(f, "AES-256"),
@@ -220,6 +192,7 @@ impl std::str::FromStr for PrivProtocol {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_uppercase().as_str() {
             "DES" => Ok(Self::Des),
+            "3DES" | "3DES-EDE" | "DES3" | "TDES" => Ok(Self::Des3),
             "AES" | "AES128" | "AES-128" => Ok(Self::Aes128),
             "AES192" | "AES-192" => Ok(Self::Aes192),
             "AES256" | "AES-256" => Ok(Self::Aes256),
@@ -235,7 +208,8 @@ impl PrivProtocol {
     /// Get the key length in bytes.
     pub fn key_len(self) -> usize {
         match self {
-            Self::Des => 16, // 8 key + 8 pre-IV
+            Self::Des => 16,  // 8 key + 8 pre-IV
+            Self::Des3 => 32, // 24 key + 8 pre-IV
             Self::Aes128 => 16,
             Self::Aes192 => 24,
             Self::Aes256 => 32,
@@ -247,20 +221,26 @@ impl PrivProtocol {
         8 // All protocols use 8-byte salt
     }
 
-    /// Get the minimum authentication protocol required for this privacy protocol.
+    /// Returns the key extension algorithm to use for this privacy protocol
+    /// given the authentication protocol.
     ///
-    /// Returns the weakest auth protocol that produces sufficient key material.
-    ///
-    /// | Privacy Protocol | Minimum Auth Protocol |
-    /// |------------------|-----------------------|
-    /// | DES, AES-128     | MD5 (16 bytes)       |
-    /// | AES-192          | SHA-224 (28 bytes)   |
-    /// | AES-256          | SHA-256 (32 bytes)   |
-    pub fn min_auth_protocol(self) -> AuthProtocol {
+    /// Key extension is needed when the auth protocol's digest is shorter than
+    /// the privacy protocol's key requirement. The algorithm is determined by
+    /// the privacy protocol:
+    /// - AES-192/256: Blumenthal (draft-blumenthal-aes-usm-04)
+    /// - 3DES: Reeder (draft-reeder-snmpv3-usm-3desede-00)
+    pub(crate) fn key_extension_for(self, auth_protocol: AuthProtocol) -> KeyExtension {
+        let auth_len = auth_protocol.digest_len();
+        let priv_len = self.key_len();
+
+        if auth_len >= priv_len {
+            return KeyExtension::None;
+        }
+
         match self {
-            Self::Des | Self::Aes128 => AuthProtocol::Md5,
-            Self::Aes192 => AuthProtocol::Sha224,
-            Self::Aes256 => AuthProtocol::Sha256,
+            Self::Des3 => KeyExtension::Reeder,
+            Self::Aes192 | Self::Aes256 => KeyExtension::Blumenthal,
+            Self::Des | Self::Aes128 => KeyExtension::None, // Never need extension
         }
     }
 }
@@ -268,64 +248,6 @@ impl PrivProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_auth_protocol_compatibility_all_with_des() {
-        // All auth protocols work with DES (requires 16 bytes)
-        assert!(AuthProtocol::Md5.is_compatible_with(PrivProtocol::Des));
-        assert!(AuthProtocol::Sha1.is_compatible_with(PrivProtocol::Des));
-        assert!(AuthProtocol::Sha224.is_compatible_with(PrivProtocol::Des));
-        assert!(AuthProtocol::Sha256.is_compatible_with(PrivProtocol::Des));
-        assert!(AuthProtocol::Sha384.is_compatible_with(PrivProtocol::Des));
-        assert!(AuthProtocol::Sha512.is_compatible_with(PrivProtocol::Des));
-    }
-
-    #[test]
-    fn test_auth_protocol_compatibility_all_with_aes128() {
-        // All auth protocols work with AES-128 (requires 16 bytes)
-        assert!(AuthProtocol::Md5.is_compatible_with(PrivProtocol::Aes128));
-        assert!(AuthProtocol::Sha1.is_compatible_with(PrivProtocol::Aes128));
-        assert!(AuthProtocol::Sha224.is_compatible_with(PrivProtocol::Aes128));
-        assert!(AuthProtocol::Sha256.is_compatible_with(PrivProtocol::Aes128));
-        assert!(AuthProtocol::Sha384.is_compatible_with(PrivProtocol::Aes128));
-        assert!(AuthProtocol::Sha512.is_compatible_with(PrivProtocol::Aes128));
-    }
-
-    #[test]
-    fn test_auth_protocol_compatibility_with_aes192() {
-        // AES-192 requires 24 bytes - only SHA-224+ work
-        assert!(!AuthProtocol::Md5.is_compatible_with(PrivProtocol::Aes192)); // 16 < 24
-        assert!(!AuthProtocol::Sha1.is_compatible_with(PrivProtocol::Aes192)); // 20 < 24
-        assert!(AuthProtocol::Sha224.is_compatible_with(PrivProtocol::Aes192)); // 28 >= 24
-        assert!(AuthProtocol::Sha256.is_compatible_with(PrivProtocol::Aes192)); // 32 >= 24
-        assert!(AuthProtocol::Sha384.is_compatible_with(PrivProtocol::Aes192)); // 48 >= 24
-        assert!(AuthProtocol::Sha512.is_compatible_with(PrivProtocol::Aes192)); // 64 >= 24
-    }
-
-    #[test]
-    fn test_auth_protocol_compatibility_with_aes256() {
-        // AES-256 requires 32 bytes - only SHA-256+ work
-        assert!(!AuthProtocol::Md5.is_compatible_with(PrivProtocol::Aes256)); // 16 < 32
-        assert!(!AuthProtocol::Sha1.is_compatible_with(PrivProtocol::Aes256)); // 20 < 32
-        assert!(!AuthProtocol::Sha224.is_compatible_with(PrivProtocol::Aes256)); // 28 < 32
-        assert!(AuthProtocol::Sha256.is_compatible_with(PrivProtocol::Aes256)); // 32 >= 32
-        assert!(AuthProtocol::Sha384.is_compatible_with(PrivProtocol::Aes256)); // 48 >= 32
-        assert!(AuthProtocol::Sha512.is_compatible_with(PrivProtocol::Aes256)); // 64 >= 32
-    }
-
-    #[test]
-    fn test_priv_protocol_min_auth_protocol() {
-        assert_eq!(PrivProtocol::Des.min_auth_protocol(), AuthProtocol::Md5);
-        assert_eq!(PrivProtocol::Aes128.min_auth_protocol(), AuthProtocol::Md5);
-        assert_eq!(
-            PrivProtocol::Aes192.min_auth_protocol(),
-            AuthProtocol::Sha224
-        );
-        assert_eq!(
-            PrivProtocol::Aes256.min_auth_protocol(),
-            AuthProtocol::Sha256
-        );
-    }
 
     #[test]
     fn test_auth_protocol_display() {
@@ -371,6 +293,7 @@ mod tests {
     #[test]
     fn test_priv_protocol_display() {
         assert_eq!(format!("{}", PrivProtocol::Des), "DES");
+        assert_eq!(format!("{}", PrivProtocol::Des3), "3DES");
         assert_eq!(format!("{}", PrivProtocol::Aes128), "AES");
         assert_eq!(format!("{}", PrivProtocol::Aes192), "AES-192");
         assert_eq!(format!("{}", PrivProtocol::Aes256), "AES-256");
@@ -380,6 +303,14 @@ mod tests {
     fn test_priv_protocol_from_str() {
         assert_eq!("DES".parse::<PrivProtocol>().unwrap(), PrivProtocol::Des);
         assert_eq!("des".parse::<PrivProtocol>().unwrap(), PrivProtocol::Des);
+        assert_eq!("3DES".parse::<PrivProtocol>().unwrap(), PrivProtocol::Des3);
+        assert_eq!("3des".parse::<PrivProtocol>().unwrap(), PrivProtocol::Des3);
+        assert_eq!(
+            "3DES-EDE".parse::<PrivProtocol>().unwrap(),
+            PrivProtocol::Des3
+        );
+        assert_eq!("DES3".parse::<PrivProtocol>().unwrap(), PrivProtocol::Des3);
+        assert_eq!("TDES".parse::<PrivProtocol>().unwrap(), PrivProtocol::Des3);
         assert_eq!("AES".parse::<PrivProtocol>().unwrap(), PrivProtocol::Aes128);
         assert_eq!("aes".parse::<PrivProtocol>().unwrap(), PrivProtocol::Aes128);
         assert_eq!(

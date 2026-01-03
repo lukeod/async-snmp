@@ -107,7 +107,14 @@ impl PrivKey {
     /// The key derivation uses the same algorithm as authentication keys
     /// (RFC 3414 A.2), but the resulting key is used differently:
     /// - DES: first 8 bytes = key, last 8 bytes = pre-IV
+    /// - 3DES: first 24 bytes = key, last 8 bytes = pre-IV
     /// - AES: first 16/24/32 bytes = key (depending on AES variant)
+    ///
+    /// Key extension is automatically applied when needed based on the auth/priv
+    /// protocol combination:
+    ///
+    /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
+    /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
     ///
     /// # Performance Note
     ///
@@ -115,24 +122,22 @@ impl PrivKey {
     /// polling many engines with shared credentials, use [`MasterKey`](super::MasterKey)
     /// and call [`PrivKey::from_master_key`] for each engine.
     ///
-    /// # Auth/Priv Protocol Compatibility
+    /// # Example
     ///
-    /// The authentication protocol must produce sufficient key material for
-    /// the privacy protocol. If not, a warning is logged and the key will
-    /// be shorter than required, leading to runtime panics during encryption.
+    /// ```rust
+    /// use async_snmp::{AuthProtocol, PrivProtocol, v3::PrivKey};
     ///
-    /// Use [`AuthProtocol::is_compatible_with`] to check compatibility:
+    /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
     ///
-    /// | Privacy Protocol | Required Auth Protocols |
-    /// |------------------|-------------------------|
-    /// | DES, AES-128     | Any (MD5+)             |
-    /// | AES-192          | SHA-224+               |
-    /// | AES-256          | SHA-256+               |
-    ///
-    /// # Panics
-    ///
-    /// Panics during encryption if the privacy protocol requires a longer key
-    /// than the authentication protocol provides.
+    /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
+    /// // Blumenthal extension is automatically applied.
+    /// let priv_key = PrivKey::from_password(
+    ///     AuthProtocol::Sha1,
+    ///     PrivProtocol::Aes256,
+    ///     b"password",
+    ///     &engine_id,
+    /// );
+    /// ```
     pub fn from_password(
         auth_protocol: AuthProtocol,
         priv_protocol: PrivProtocol,
@@ -145,24 +150,41 @@ impl PrivKey {
         Self::from_master_key(&master, priv_protocol, engine_id)
     }
 
-    /// Derive a privacy key with optional key extension.
+    /// Derive a privacy key from a master key and engine ID.
     ///
-    /// When `key_extension` is [`super::KeyExtension::Blumenthal`], this method
-    /// extends the localized key to the required length for the privacy protocol,
-    /// even when the authentication protocol produces insufficient key material.
+    /// This is the efficient path when you have a cached [`MasterKey`](super::MasterKey).
+    /// Key extension is automatically applied when needed based on the auth/priv
+    /// protocol combination:
     ///
-    /// This enables combinations like SHA-1 + AES-256 for interoperability with
-    /// net-snmp and other implementations that support draft-blumenthal-aes-usm-04.
-    pub fn from_password_extended(
-        auth_protocol: AuthProtocol,
+    /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
+    /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::{AuthProtocol, MasterKey, PrivProtocol, v3::PrivKey};
+    ///
+    /// let master = MasterKey::from_password(AuthProtocol::Sha1, b"password");
+    /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
+    ///
+    /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
+    /// // Blumenthal extension is automatically applied.
+    /// let priv_key = PrivKey::from_master_key(&master, PrivProtocol::Aes256, &engine_id);
+    /// ```
+    pub fn from_master_key(
+        master: &super::MasterKey,
         priv_protocol: PrivProtocol,
-        password: &[u8],
         engine_id: &[u8],
-        key_extension: super::KeyExtension,
     ) -> Self {
-        use super::{KeyExtension, MasterKey, auth::extend_key};
+        use super::{
+            KeyExtension,
+            auth::{extend_key, extend_key_reeder},
+        };
 
-        let master = MasterKey::from_password(auth_protocol, password);
+        let auth_protocol = master.protocol();
+        let key_extension = priv_protocol.key_extension_for(auth_protocol);
+
+        // Localize the master key (per RFC 3826 Section 1.2)
         let localized = master.localize(engine_id);
         let key_bytes = localized.as_bytes();
 
@@ -171,51 +193,10 @@ impl PrivKey {
             KeyExtension::Blumenthal => {
                 extend_key(auth_protocol, key_bytes, priv_protocol.key_len())
             }
+            KeyExtension::Reeder => {
+                extend_key_reeder(auth_protocol, key_bytes, engine_id, priv_protocol.key_len())
+            }
         };
-
-        Self {
-            key,
-            protocol: priv_protocol,
-            salt_counter: Self::init_salt(),
-        }
-    }
-
-    /// Derive a privacy key from a master key and engine ID.
-    ///
-    /// This is the efficient path when you have a cached [`MasterKey`](super::MasterKey).
-    /// The master key's auth protocol must be compatible with the privacy protocol.
-    ///
-    /// # Auth/Priv Protocol Compatibility
-    ///
-    /// The authentication protocol used for the master key must produce sufficient
-    /// key material for the privacy protocol. See [`AuthProtocol::is_compatible_with`].
-    ///
-    /// # Panics
-    ///
-    /// Panics during encryption if the privacy protocol requires a longer key
-    /// than the authentication protocol provides.
-    pub fn from_master_key(
-        master: &super::MasterKey,
-        priv_protocol: PrivProtocol,
-        engine_id: &[u8],
-    ) -> Self {
-        let auth_protocol = master.protocol();
-
-        // Check auth/priv protocol compatibility
-        if !auth_protocol.is_compatible_with(priv_protocol) {
-            tracing::warn!(
-                auth_protocol = ?auth_protocol,
-                priv_protocol = ?priv_protocol,
-                auth_key_len = auth_protocol.digest_len(),
-                required_key_len = priv_protocol.key_len(),
-                "authentication protocol produces insufficient key material for privacy protocol; \
-                 use SHA-224+ for AES-192, SHA-256+ for AES-256"
-            );
-        }
-
-        // Localize the master key (per RFC 3826 Section 1.2)
-        let localized = master.localize(engine_id);
-        let key = localized.as_bytes().to_vec();
 
         Self {
             key,
@@ -249,6 +230,7 @@ impl PrivKey {
     pub fn encryption_key(&self) -> &[u8] {
         match self.protocol {
             PrivProtocol::Des => &self.key[..8],
+            PrivProtocol::Des3 => &self.key[..24],
             PrivProtocol::Aes128 => &self.key[..16],
             PrivProtocol::Aes192 => &self.key[..24],
             PrivProtocol::Aes256 => &self.key[..32],
@@ -286,6 +268,7 @@ impl PrivKey {
 
         match self.protocol {
             PrivProtocol::Des => self.encrypt_des(plaintext, engine_boots, salt),
+            PrivProtocol::Des3 => self.encrypt_des3(plaintext, engine_boots, salt),
             PrivProtocol::Aes128 => {
                 self.encrypt_aes(plaintext, engine_boots, engine_time, salt, 16)
             }
@@ -328,6 +311,7 @@ impl PrivKey {
 
         match self.protocol {
             PrivProtocol::Des => self.decrypt_des(ciphertext, priv_params),
+            PrivProtocol::Des3 => self.decrypt_des3(ciphertext, priv_params),
             PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
                 self.decrypt_aes(ciphertext, engine_boots, engine_time, priv_params)
             }
@@ -427,6 +411,92 @@ impl PrivKey {
 
         // Decrypt
         let cipher = DesCbc::new_from_slices(key, &iv)
+            .map_err(|_| Error::decrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+
+        let mut buffer = ciphertext.to_vec();
+        let plaintext = cipher
+            .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buffer)
+            .map_err(|_| Error::decrypt(None, CryptoErrorKind::CipherError))?;
+
+        Ok(Bytes::copy_from_slice(plaintext))
+    }
+
+    /// 3DES-EDE CBC encryption (draft-reeder-snmpv3-usm-3desede-00 Section 5.1.1.2).
+    fn encrypt_des3(
+        &self,
+        plaintext: &[u8],
+        engine_boots: u32,
+        salt_int: u64,
+    ) -> Result<(Bytes, Bytes)> {
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        type Des3Cbc = cbc::Encryptor<des::TdesEde3>;
+
+        // 3DES key is first 24 bytes (K1, K2, K3)
+        let key = &self.key[..24];
+        // Pre-IV is bytes 24-31 of the 32-byte privKey
+        let pre_iv = &self.key[24..32];
+
+        // Salt = engineBoots (4 bytes MSB) || counter (4 bytes MSB)
+        let mut salt = [0u8; 8];
+        salt[..4].copy_from_slice(&engine_boots.to_be_bytes());
+        salt[4..].copy_from_slice(&(salt_int as u32).to_be_bytes());
+
+        // IV = pre-IV XOR salt
+        let mut iv = [0u8; 8];
+        for i in 0..8 {
+            iv[i] = pre_iv[i] ^ salt[i];
+        }
+
+        // Pad plaintext to multiple of 8 bytes
+        let padded_len = plaintext.len().next_multiple_of(8);
+        let mut buffer = vec![0u8; padded_len];
+        buffer[..plaintext.len()].copy_from_slice(plaintext);
+
+        // Encrypt in-place
+        let cipher = Des3Cbc::new_from_slices(key, &iv)
+            .map_err(|_| Error::encrypt(None, CryptoErrorKind::InvalidKeyLength))?;
+
+        let ciphertext = cipher
+            .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buffer, padded_len)
+            .map_err(|_| Error::encrypt(None, CryptoErrorKind::CipherError))?;
+
+        Ok((
+            Bytes::copy_from_slice(ciphertext),
+            Bytes::copy_from_slice(&salt),
+        ))
+    }
+
+    /// 3DES-EDE CBC decryption (draft-reeder-snmpv3-usm-3desede-00 Section 5.1.1.3).
+    fn decrypt_des3(&self, ciphertext: &[u8], priv_params: &[u8]) -> Result<Bytes> {
+        use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+        type Des3Cbc = cbc::Decryptor<des::TdesEde3>;
+
+        if !ciphertext.len().is_multiple_of(8) {
+            return Err(Error::decrypt(
+                None,
+                CryptoErrorKind::InvalidCiphertextLength {
+                    length: ciphertext.len(),
+                    block_size: 8,
+                },
+            ));
+        }
+
+        // 3DES key is first 24 bytes (K1, K2, K3)
+        let key = &self.key[..24];
+        // Pre-IV is bytes 24-31 of the 32-byte privKey
+        let pre_iv = &self.key[24..32];
+
+        // Salt is the privParameters
+        let salt = priv_params;
+
+        // IV = pre-IV XOR salt
+        let mut iv = [0u8; 8];
+        for i in 0..8 {
+            iv[i] = pre_iv[i] ^ salt[i];
+        }
+
+        // Decrypt
+        let cipher = Des3Cbc::new_from_slices(key, &iv)
             .map_err(|_| Error::decrypt(None, CryptoErrorKind::InvalidKeyLength))?;
 
         let mut buffer = ciphertext.to_vec();
@@ -590,6 +660,40 @@ mod tests {
             .expect("decryption failed");
 
         // DES pads to 8-byte boundary, so decrypted may be longer
+        assert!(decrypted.len() >= plaintext.len());
+        assert_eq!(&decrypted[..plaintext.len()], plaintext);
+    }
+
+    #[test]
+    fn test_des3_encrypt_decrypt_roundtrip() {
+        // Create a 32-byte key (24 for 3DES, 8 for pre-IV)
+        let key = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // K1
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // K2
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // K3
+            0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // pre-IV
+        ];
+        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Des3, key);
+
+        let plaintext = b"Hello, SNMPv3 World with 3DES!";
+        let engine_boots = 100u32;
+        let engine_time = 12345u32;
+
+        let (ciphertext, priv_params) = priv_key
+            .encrypt(plaintext, engine_boots, engine_time, None)
+            .expect("encryption failed");
+
+        // Verify ciphertext is different from plaintext
+        assert_ne!(ciphertext.as_ref(), plaintext);
+        // Verify priv_params is 8 bytes
+        assert_eq!(priv_params.len(), 8);
+
+        // Decrypt
+        let decrypted = priv_key
+            .decrypt(&ciphertext, engine_boots, engine_time, &priv_params)
+            .expect("decryption failed");
+
+        // 3DES pads to 8-byte boundary, so decrypted may be longer
         assert!(decrypted.len() >= plaintext.len());
         assert_eq!(&decrypted[..plaintext.len()], plaintext);
     }

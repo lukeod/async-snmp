@@ -216,12 +216,12 @@ impl UsmBuilder {
     ///
     /// # Supported Protocols
     ///
-    /// - `AuthProtocol::Md5` - MD5 (legacy, not recommended)
-    /// - `AuthProtocol::Sha1` - SHA-1 (legacy)
-    /// - `AuthProtocol::Sha224` - SHA-224
-    /// - `AuthProtocol::Sha256` - SHA-256 (recommended)
-    /// - `AuthProtocol::Sha384` - SHA-384
-    /// - `AuthProtocol::Sha512` - SHA-512
+    /// - `AuthProtocol::Md5` - HMAC-MD5-96 (legacy)
+    /// - `AuthProtocol::Sha1` - HMAC-SHA-96 (legacy)
+    /// - `AuthProtocol::Sha224` - HMAC-SHA-224
+    /// - `AuthProtocol::Sha256` - HMAC-SHA-256
+    /// - `AuthProtocol::Sha384` - HMAC-SHA-384
+    /// - `AuthProtocol::Sha512` - HMAC-SHA-512
     ///
     /// # Example
     ///
@@ -243,10 +243,10 @@ impl UsmBuilder {
     ///
     /// # Supported Protocols
     ///
-    /// - `PrivProtocol::Des` - DES (legacy, not recommended)
-    /// - `PrivProtocol::Aes128` - AES-128 (recommended)
-    /// - `PrivProtocol::Aes192` - AES-192
-    /// - `PrivProtocol::Aes256` - AES-256
+    /// - `PrivProtocol::Des` - DES-CBC (legacy, insecure)
+    /// - `PrivProtocol::Aes128` - AES-128-CFB
+    /// - `PrivProtocol::Aes192` - AES-192-CFB
+    /// - `PrivProtocol::Aes256` - AES-256-CFB
     ///
     /// # Example
     ///

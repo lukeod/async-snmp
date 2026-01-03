@@ -288,9 +288,9 @@ impl AgentBuilder {
     ///
     /// # Security Levels
     ///
-    /// - **noAuthNoPriv**: No authentication or encryption (not recommended)
+    /// - **noAuthNoPriv**: No authentication or encryption
     /// - **authNoPriv**: Authentication only (HMAC verification)
-    /// - **authPriv**: Authentication and encryption (most secure)
+    /// - **authPriv**: Authentication and encryption
     ///
     /// # Example
     ///

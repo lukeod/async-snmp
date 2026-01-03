@@ -232,18 +232,6 @@ impl V3Args {
             if self.priv_protocol.is_some() && self.auth_protocol.is_none() {
                 return Err("authentication protocol (-a) required when using privacy".into());
             }
-
-            // Check auth/priv compatibility
-            if let (Some(auth), Some(priv_proto)) = (self.auth_protocol, self.priv_protocol)
-                && !auth.is_compatible_with(priv_proto)
-            {
-                return Err(format!(
-                    "{} authentication does not produce enough key material for {} privacy; use {} or stronger",
-                    auth,
-                    priv_proto,
-                    priv_proto.min_auth_protocol()
-                ));
-            }
         }
         Ok(())
     }
@@ -600,7 +588,7 @@ mod tests {
         };
         assert!(args.validate().is_err());
 
-        // Incompatible auth/priv - invalid (SHA1 with AES256)
+        // SHA-1 with AES-256 - valid (key extension auto-applied)
         let args = V3Args {
             username: Some("admin".to_string()),
             level: None,
@@ -609,7 +597,7 @@ mod tests {
             priv_protocol: Some(PrivProtocol::Aes256),
             priv_password: Some("pass".to_string()),
         };
-        assert!(args.validate().is_err());
+        assert!(args.validate().is_ok());
     }
 
     #[test]

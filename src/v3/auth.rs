@@ -523,6 +523,27 @@ impl MasterKeys {
     ///
     /// Returns (auth_key, priv_key) where priv_key is None if no privacy
     /// was configured.
+    ///
+    /// Key extension is automatically applied when needed based on the auth/priv
+    /// protocol combination:
+    ///
+    /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
+    /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::{AuthProtocol, MasterKeys, PrivProtocol};
+    ///
+    /// let keys = MasterKeys::new(AuthProtocol::Sha1, b"authpassword")
+    ///     .with_privacy_same_password(PrivProtocol::Aes256);
+    ///
+    /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
+    ///
+    /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
+    /// // Blumenthal extension is automatically applied.
+    /// let (auth, priv_key) = keys.localize(&engine_id);
+    /// ```
     pub fn localize(&self, engine_id: &[u8]) -> (LocalizedKey, Option<crate::v3::PrivKey>) {
         let auth_key = self.auth_master.localize(engine_id);
 
@@ -557,29 +578,7 @@ impl std::fmt::Debug for MasterKeys {
 /// ```
 ///
 /// Where H() is the hash function of the authentication protocol.
-///
-/// # Arguments
-///
-/// * `protocol` - The authentication protocol whose hash function to use
-/// * `key` - The localized key to extend
-/// * `target_len` - The desired key length in bytes
-///
-/// # Returns
-///
-/// A `Vec<u8>` of exactly `target_len` bytes. If `key.len() >= target_len`,
-/// returns the first `target_len` bytes of the key (truncation).
-///
-/// # Example
-///
-/// ```rust
-/// use async_snmp::{AuthProtocol, v3::extend_key};
-///
-/// // SHA-1 produces 20-byte keys; extend to 32 bytes for AES-256
-/// let sha1_key = vec![0u8; 20];
-/// let extended = extend_key(AuthProtocol::Sha1, &sha1_key, 32);
-/// assert_eq!(extended.len(), 32);
-/// ```
-pub fn extend_key(protocol: AuthProtocol, key: &[u8], target_len: usize) -> Vec<u8> {
+pub(crate) fn extend_key(protocol: AuthProtocol, key: &[u8], target_len: usize) -> Vec<u8> {
     // If we already have enough bytes, just truncate
     if key.len() >= target_len {
         return key[..target_len].to_vec();
@@ -614,6 +613,60 @@ where
 
     // Truncate to exact length
     result.truncate(target_len);
+    result
+}
+
+/// Extend a localized key using the Reeder key extension algorithm.
+///
+/// This implements the key extension algorithm from draft-reeder-snmpv3-usm-3desede-00
+/// Section 2.1. Unlike Blumenthal, this algorithm re-runs the full password-to-key (P2K)
+/// algorithm using the current localized key as the "passphrase":
+///
+/// ```text
+/// K1 = P2K(passphrase, engine_id)   // Original localized key (input)
+/// K2 = P2K(K1, engine_id)           // Run full P2K with K1 as passphrase
+/// localized_key = K1 || K2
+/// K3 = P2K(K2, engine_id)           // If more bytes needed
+/// localized_key = K1 || K2 || K3
+/// ... and so on
+/// ```
+///
+/// # Performance Warning
+///
+/// This is approximately 1000x slower than [`extend_key`] (Blumenthal) because each
+/// iteration requires the full 1MB password expansion.
+pub(crate) fn extend_key_reeder(
+    protocol: AuthProtocol,
+    key: &[u8],
+    engine_id: &[u8],
+    target_len: usize,
+) -> Vec<u8> {
+    // If we already have enough bytes, just truncate
+    if key.len() >= target_len {
+        return key[..target_len].to_vec();
+    }
+
+    let mut result = key.to_vec();
+    let mut current_kul = key.to_vec();
+
+    // Keep extending until we have enough bytes
+    while result.len() < target_len {
+        // Run full password-to-key using current Kul as the "passphrase"
+        // This is the expensive 1MB expansion step
+        let ku = password_to_key(protocol, &current_kul);
+
+        // Localize the new Ku to get Kul
+        let new_kul = localize_key(protocol, &ku, engine_id);
+
+        // Append as many bytes as we need (or all of them)
+        let bytes_needed = target_len - result.len();
+        let bytes_to_copy = bytes_needed.min(new_kul.len());
+        result.extend_from_slice(&new_kul[..bytes_to_copy]);
+
+        // The next iteration uses the new Kul as input
+        current_kul = new_kul;
+    }
+
     result
 }
 
@@ -853,5 +906,111 @@ mod tests {
             priv_key.as_ref().unwrap().encryption_key(),
             priv_key_same.as_ref().unwrap().encryption_key()
         );
+    }
+
+    // Known-Answer Tests (KAT) for Reeder key extension algorithm
+    // Test vectors from draft-reeder-snmpv3-usm-3desede-00 Appendix B
+
+    #[test]
+    fn test_reeder_extend_key_md5_kat() {
+        // Test vector from draft-reeder Appendix B.1
+        // Password: "maplesyrup"
+        // Engine ID: 00 00 00 00 00 00 00 00 00 00 00 02
+        // Expected 32-byte localized key:
+        //   52 6f 5e ed 9f cc e2 6f 89 64 c2 93 07 87 d8 2b   (first 16 bytes = K1)
+        //   79 ef f4 4a 90 65 0e e0 a3 a4 0a bf ac 5a cc 12   (next 16 bytes = K2)
+        let password = b"maplesyrup";
+        let engine_id = decode_hex("000000000000000000000002").unwrap();
+
+        // Get the standard localized key (K1)
+        let k1 = LocalizedKey::from_password(AuthProtocol::Md5, password, &engine_id);
+        assert_eq!(
+            encode_hex(k1.as_bytes()),
+            "526f5eed9fcce26f8964c2930787d82b"
+        );
+
+        // Extend using Reeder algorithm to 32 bytes
+        let extended = extend_key_reeder(AuthProtocol::Md5, k1.as_bytes(), &engine_id, 32);
+        assert_eq!(extended.len(), 32);
+        assert_eq!(
+            encode_hex(&extended),
+            "526f5eed9fcce26f8964c2930787d82b79eff44a90650ee0a3a40abfac5acc12"
+        );
+    }
+
+    #[test]
+    fn test_reeder_extend_key_sha1_kat() {
+        // Test vector from draft-reeder Appendix B.2
+        // Password: "maplesyrup"
+        // Engine ID: 00 00 00 00 00 00 00 00 00 00 00 02
+        // Expected 40-byte localized key:
+        //   66 95 fe bc 92 88 e3 62 82 23 5f c7 15 1f 12 84 97 b3 8f 3f  (first 20 bytes = K1)
+        //   9b 8b 6d 78 93 6b a6 e7 d1 9d fd 9c d2 d5 06 55 47 74 3f b5  (next 20 bytes = K2)
+        let password = b"maplesyrup";
+        let engine_id = decode_hex("000000000000000000000002").unwrap();
+
+        // Get the standard localized key (K1)
+        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+        assert_eq!(
+            encode_hex(k1.as_bytes()),
+            "6695febc9288e36282235fc7151f128497b38f3f"
+        );
+
+        // Extend using Reeder algorithm to 40 bytes
+        let extended = extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 40);
+        assert_eq!(extended.len(), 40);
+        assert_eq!(
+            encode_hex(&extended),
+            "6695febc9288e36282235fc7151f128497b38f3f9b8b6d78936ba6e7d19dfd9cd2d5065547743fb5"
+        );
+    }
+
+    #[test]
+    fn test_reeder_extend_key_sha1_to_32_bytes() {
+        // Extending SHA-1 key to 32 bytes (for AES-256)
+        // Should be the first 32 bytes of the 40-byte result
+        let password = b"maplesyrup";
+        let engine_id = decode_hex("000000000000000000000002").unwrap();
+
+        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+        let extended = extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 32);
+
+        assert_eq!(extended.len(), 32);
+        // First 20 bytes = K1, next 12 bytes = first 12 bytes of K2
+        assert_eq!(
+            encode_hex(&extended),
+            "6695febc9288e36282235fc7151f128497b38f3f9b8b6d78936ba6e7d19dfd9c"
+        );
+    }
+
+    #[test]
+    fn test_reeder_extend_key_truncation() {
+        // When key is already long enough, should truncate
+        let long_key = vec![0xAAu8; 64];
+        let engine_id = decode_hex("000000000000000000000002").unwrap();
+
+        let extended = extend_key_reeder(AuthProtocol::Sha256, &long_key, &engine_id, 32);
+        assert_eq!(extended.len(), 32);
+        assert_eq!(extended, vec![0xAAu8; 32]);
+    }
+
+    #[test]
+    fn test_reeder_vs_blumenthal_differ() {
+        // Verify that Reeder and Blumenthal produce different results
+        let password = b"maplesyrup";
+        let engine_id = decode_hex("000000000000000000000002").unwrap();
+
+        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+
+        let reeder = extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 32);
+        let blumenthal = extend_key(AuthProtocol::Sha1, k1.as_bytes(), 32);
+
+        assert_eq!(reeder.len(), 32);
+        assert_eq!(blumenthal.len(), 32);
+
+        // First 20 bytes should be identical (both start with K1)
+        assert_eq!(&reeder[..20], &blumenthal[..20]);
+        // Extension bytes should differ (different algorithms)
+        assert_ne!(&reeder[20..], &blumenthal[20..]);
     }
 }
