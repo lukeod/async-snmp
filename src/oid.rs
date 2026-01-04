@@ -224,6 +224,80 @@ impl Oid {
         Oid { arcs }
     }
 
+    /// Strip a prefix OID, returning the remaining arcs as a new Oid.
+    ///
+    /// Returns `None` if `self` doesn't start with the given prefix.
+    /// Follows `str::strip_prefix` semantics - stripping an equal OID returns an empty OID.
+    ///
+    /// This is useful for extracting table indexes from walked OIDs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::{oid, Oid};
+    ///
+    /// let if_descr_5 = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 5);
+    /// let if_descr = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2);
+    ///
+    /// // Extract the index
+    /// let index = if_descr_5.strip_prefix(&if_descr).unwrap();
+    /// assert_eq!(index.arcs(), &[5]);
+    ///
+    /// // Non-matching prefix returns None
+    /// let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1);
+    /// assert!(if_descr_5.strip_prefix(&sys_descr).is_none());
+    ///
+    /// // Equal OIDs return empty
+    /// let same = oid!(1, 3, 6);
+    /// assert!(same.strip_prefix(&same).unwrap().is_empty());
+    ///
+    /// // Empty prefix returns self
+    /// let any = oid!(1, 2, 3);
+    /// assert_eq!(any.strip_prefix(&Oid::empty()).unwrap(), any);
+    /// ```
+    pub fn strip_prefix(&self, prefix: &Oid) -> Option<Oid> {
+        if self.starts_with(prefix) {
+            Some(Oid::from_slice(&self.arcs[prefix.len()..]))
+        } else {
+            None
+        }
+    }
+
+    /// Get the last N arcs as a slice (for multi-level table indexes).
+    ///
+    /// Returns `None` if `n` exceeds the OID length.
+    ///
+    /// This is useful for grouping SNMP table walk results by composite indexes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_snmp::oid;
+    ///
+    /// // ipNetToMediaPhysAddress has index (ifIndex, IpAddress) = 5 arcs
+    /// let oid = oid!(1, 3, 6, 1, 2, 1, 4, 22, 1, 2, 1, 192, 168, 1, 100);
+    ///
+    /// // Get the 5-arc index (ifIndex=1, IP=192.168.1.100)
+    /// let index = oid.suffix(5).unwrap();
+    /// assert_eq!(index, &[1, 192, 168, 1, 100]);
+    ///
+    /// // Get just the last arc
+    /// assert_eq!(oid.suffix(1), Some(&[100][..]));
+    ///
+    /// // suffix(0) returns empty slice
+    /// assert_eq!(oid.suffix(0), Some(&[][..]));
+    ///
+    /// // Too large returns None
+    /// assert!(oid.suffix(100).is_none());
+    /// ```
+    pub fn suffix(&self, n: usize) -> Option<&[u32]> {
+        if n <= self.arcs.len() {
+            Some(&self.arcs[self.arcs.len() - n..])
+        } else {
+            None
+        }
+    }
+
     /// Validate OID arcs per X.690 Section 8.19.4.
     ///
     /// - arc1 must be 0, 1, or 2
@@ -962,5 +1036,63 @@ mod tests {
             result.is_err(),
             "OID exceeding MAX_OID_LEN should fail to decode"
         );
+    }
+
+    // ========================================================================
+    // Suffix Extraction Tests
+    // ========================================================================
+
+    #[test]
+    fn test_strip_prefix() {
+        let if_descr_5 = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 5);
+        let if_descr = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2);
+
+        // Extract the index
+        let index = if_descr_5.strip_prefix(&if_descr).unwrap();
+        assert_eq!(index.arcs(), &[5]);
+
+        // Non-matching prefix returns None
+        let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1);
+        assert!(if_descr_5.strip_prefix(&sys_descr).is_none());
+
+        // Equal OIDs return empty
+        let same = oid!(1, 3, 6);
+        assert!(same.strip_prefix(&same).unwrap().is_empty());
+
+        // Empty prefix returns self
+        let any = oid!(1, 2, 3);
+        assert_eq!(any.strip_prefix(&Oid::empty()).unwrap(), any);
+
+        // Multi-arc index
+        let composite = oid!(1, 3, 6, 1, 2, 1, 4, 22, 1, 2, 1, 192, 168, 1, 100);
+        let column = oid!(1, 3, 6, 1, 2, 1, 4, 22, 1, 2);
+        let idx = composite.strip_prefix(&column).unwrap();
+        assert_eq!(idx.arcs(), &[1, 192, 168, 1, 100]);
+    }
+
+    #[test]
+    fn test_suffix() {
+        let oid = oid!(1, 3, 6, 1, 2, 1, 4, 22, 1, 2, 1, 192, 168, 1, 100);
+
+        // Get the 5-arc index
+        assert_eq!(oid.suffix(5), Some(&[1, 192, 168, 1, 100][..]));
+
+        // Get just the last arc
+        assert_eq!(oid.suffix(1), Some(&[100][..]));
+
+        // suffix(0) returns empty slice
+        assert_eq!(oid.suffix(0), Some(&[][..]));
+
+        // Exact length returns full OID
+        assert_eq!(oid.suffix(15), Some(oid.arcs()));
+
+        // Too large returns None
+        assert!(oid.suffix(16).is_none());
+        assert!(oid.suffix(100).is_none());
+
+        // Empty OID
+        let empty = Oid::empty();
+        assert_eq!(empty.suffix(0), Some(&[][..]));
+        assert!(empty.suffix(1).is_none());
     }
 }
