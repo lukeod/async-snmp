@@ -30,8 +30,8 @@ This library is not currently stable. While pre v1.0, breaking changes are likel
 | GETBULK | - | Y | Y |
 | SET | Y | Y | Y |
 | WALK / BULKWALK | Y | Y | Y |
-| Traps | Y | Y | Y |
-| Informs | - | Y | Y |
+| Receive Traps | Y | Y | Y |
+| Receive Informs | - | Y | Y |
 
 ### SNMPv3 Security
 
@@ -127,16 +127,15 @@ use async_snmp::{Auth, Client, UdpTransport, oid};
 
 #[tokio::main]
 async fn main() -> Result<(), async_snmp::Error> {
-    // Single socket shared across all clients
-    let shared = UdpTransport::bind("0.0.0.0:0").await?;
+    // Single dual-stack socket shared across all clients
+    let shared = UdpTransport::bind("[::]:0").await?;
 
     let targets = vec!["192.168.1.1:161", "192.168.1.2:161", "192.168.1.3:161"];
 
     let clients: Vec<_> = targets.iter()
         .map(|t| {
-            let addr = t.parse().unwrap();
             Client::builder(*t, Auth::v2c("public"))
-                .build(shared.handle(addr))
+                .build_with(&shared)
         })
         .collect::<Result<_, _>>()?;
 
@@ -169,6 +168,23 @@ async fn main() -> Result<(), async_snmp::Error> {
 | Single shared socket | Recommended for most use cases |
 | Multiple shared sockets | Extreme scale (~100,000s+ targets), shard by target |
 | Per-client socket (`.connect()`) | When scrape isolation is required (has FD and syscall overhead) |
+
+### Tracing
+
+The library uses the `tracing` crate for structured logging. Filter by target:
+
+```bash
+# All library logs at debug level
+RUST_LOG=async_snmp=debug cargo run
+
+# Trace client operations only
+RUST_LOG=async_snmp::client=trace cargo run
+
+# Debug transport layer
+RUST_LOG=async_snmp::transport=debug cargo run
+```
+
+Available targets: `async_snmp::client`, `async_snmp::agent`, `async_snmp::ber`, `async_snmp::v3`, `async_snmp::transport`, `async_snmp::notification`
 
 ## Documentation
 

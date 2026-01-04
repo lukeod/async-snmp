@@ -556,7 +556,7 @@ fn test_mac_lengths_per_rfc() {
 // ============================================================================
 
 // Key extension algorithm tests (extend_key, extend_key_reeder) are now internal
-// to the v3::auth module. See src/v3/auth.rs for comprehensive KAT tests.
+// to the v3::auth module. See src/v3/auth.rs for KAT tests.
 
 /// AES-256 encryption/decryption roundtrip with SHA-1 (auto key extension).
 #[test]
