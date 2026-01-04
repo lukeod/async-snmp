@@ -9,6 +9,7 @@
 //!
 //! Run with: cargo run --example walk_subtree
 
+use async_snmp::format::hints;
 use async_snmp::{Auth, Client, OidOrdering, WalkMode, oid};
 use futures::StreamExt;
 use std::time::Duration;
@@ -187,21 +188,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Table walking pattern (ifTable) ---\n");
 
     // Walking SNMP tables: the ifTable structure
-    // Each column has OIDs like: ifTable.ifEntry.ifIndex.{row}
-    //                           1.3.6.1.2.1.2.2.1.1.{row}
+    // Each column has OIDs like: ifEntry.{column}.{row}
+    //                           1.3.6.1.2.1.2.2.1.{column}.{row}
 
-    let if_table = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1);
+    let if_entry = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1);
 
-    let walk = client.walk(if_table)?;
+    let walk = client.walk(if_entry.clone())?;
     let results = walk.collect().await?;
 
-    // Group by column (second-to-last arc)
+    // Group by column using strip_prefix to extract the table index suffix
     let mut columns: std::collections::HashMap<u32, Vec<_>> = std::collections::HashMap::new();
 
     for vb in results {
-        // Get the column number (second-to-last arc for ifTable)
-        let arcs = vb.oid.arcs();
-        if let Some(&column) = arcs.get(arcs.len().saturating_sub(2)) {
+        // strip_prefix returns the suffix: [column, row] for ifEntry OIDs
+        if let Some(suffix) = vb.oid.strip_prefix(&if_entry)
+            && let Some(&column) = suffix.arcs().first()
+        {
             columns.entry(column).or_default().push(vb);
         }
     }
@@ -233,11 +235,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ifPhysAddress (column 6) contains MAC addresses as raw bytes
     if let Some(mac_entries) = columns.get(&6) {
-        println!("MAC addresses (formatted with DISPLAY-HINT '1x:'):");
+        println!("MAC addresses (formatted with hints::MAC_ADDRESS):");
         for vb in mac_entries.iter().take(5) {
             // Value::format_with_hint applies RFC 2579 formatting
-            // "1x:" means: 1 byte, hex format, colon separator
-            if let Some(formatted) = vb.value.format_with_hint("1x:") {
+            // hints::MAC_ADDRESS is "1x:": 1 byte, hex format, colon separator
+            if let Some(formatted) = vb.value.format_with_hint(hints::MAC_ADDRESS) {
                 println!("  {}: {}", vb.oid, formatted);
             } else {
                 // format_with_hint returns None for non-OctetString values

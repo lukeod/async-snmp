@@ -8,7 +8,7 @@ use crate::oid::Oid;
 use crate::value::Value;
 
 /// Variable binding - an OID-value pair.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VarBind {
     /// The object identifier.
     pub oid: Oid,

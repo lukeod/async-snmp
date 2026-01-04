@@ -184,7 +184,12 @@ RUST_LOG=async_snmp::client=trace cargo run
 RUST_LOG=async_snmp::transport=debug cargo run
 ```
 
-Available targets: `async_snmp::client`, `async_snmp::agent`, `async_snmp::ber`, `async_snmp::v3`, `async_snmp::transport`, `async_snmp::notification`
+Available targets:
+- **Core**: `async_snmp::client`, `async_snmp::agent`, `async_snmp::notification`
+- **Protocol**: `async_snmp::ber`, `async_snmp::pdu`, `async_snmp::oid`, `async_snmp::value`
+- **SNMPv3**: `async_snmp::v3`, `async_snmp::usm`, `async_snmp::crypto`, `async_snmp::engine`
+- **Transport**: `async_snmp::transport`, `async_snmp::transport::tcp`, `async_snmp::transport::udp`
+- **Operations**: `async_snmp::walk`, `async_snmp::error`
 
 ## Documentation
 
