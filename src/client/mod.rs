@@ -133,6 +133,11 @@ impl Default for ClientConfig {
 
 impl<T: Transport> Client<T> {
     /// Create a new client with the given transport and config.
+    ///
+    /// For most use cases, prefer [`Client::builder()`] which provides a more
+    /// ergonomic API. Use this constructor when you need fine-grained control
+    /// over transport configuration (e.g., TCP connection timeout, keepalive
+    /// settings) or when using a custom [`Transport`] implementation.
     pub fn new(transport: T, config: ClientConfig) -> Self {
         Self {
             inner: Arc::new(ClientInner {

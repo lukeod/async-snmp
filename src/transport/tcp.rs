@@ -55,7 +55,8 @@
 //! # }
 //! ```
 //!
-//! For direct transport construction:
+//! For advanced TCP configuration (connection timeout, keepalive, buffer sizes),
+//! construct the transport directly:
 //!
 //! ```rust,no_run
 //! use async_snmp::transport::TcpTransport;

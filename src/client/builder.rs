@@ -511,6 +511,9 @@ impl ClientBuilder {
     /// Note that TCP has higher overhead than UDP due to connection setup
     /// and per-message framing.
     ///
+    /// For advanced TCP configuration (connection timeout, keepalive, buffer
+    /// sizes), construct a [`TcpTransport`] directly and use [`Client::new()`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid or the connection fails.
