@@ -76,7 +76,6 @@ impl std::error::Error for ParseProtocolError {}
 
 /// Authentication protocol identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AuthProtocol {
     /// HMAC-MD5-96 (RFC 3414)
     Md5,
@@ -154,7 +153,6 @@ impl AuthProtocol {
 
 /// Privacy protocol identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PrivProtocol {
     /// DES-CBC (RFC 3414).
     ///

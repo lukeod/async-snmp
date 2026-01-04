@@ -19,7 +19,6 @@ use super::Client;
 
 /// Walk operation mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WalkMode {
     /// Auto-select based on version (default).
     /// V1 uses GETNEXT, V2c/V3 uses GETBULK.
@@ -48,7 +47,6 @@ pub enum WalkMode {
 ///   OIDs but tracks all seen OIDs to detect cycles. Returns
 ///   [`Error::WalkAborted`](crate::Error::WalkAborted) if the same OID appears twice.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum OidOrdering {
     /// Require strictly increasing OIDs (default).
     ///

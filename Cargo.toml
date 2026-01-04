@@ -84,8 +84,7 @@ harness = false
 
 [features]
 default = []
-serde = ["dep:serde"]  # Serialize/Deserialize for Auth, WalkMode, etc.
-cli = ["dep:clap", "serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
 tls = []      # Future: SNMP over TLS (RFC 6353)
 dtls = []     # Future: SNMP over DTLS (RFC 6353)
 

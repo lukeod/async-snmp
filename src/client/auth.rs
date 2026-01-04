@@ -26,7 +26,6 @@ use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol};
 
 /// SNMP version for community-based authentication.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CommunityVersion {
     /// SNMPv1
     V1,
@@ -37,13 +36,10 @@ pub enum CommunityVersion {
 
 /// Authentication configuration for SNMP clients.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(untagged))]
 pub enum Auth {
     /// Community string authentication (SNMPv1 or v2c).
     Community {
         /// SNMP version (V1 or V2c)
-        #[cfg_attr(feature = "serde", serde(default))]
         version: CommunityVersion,
         /// Community string
         community: String,
@@ -138,44 +134,22 @@ impl Auth {
 
 /// SNMPv3 USM authentication parameters.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UsmAuth {
     /// SNMPv3 username
     pub username: String,
     /// Authentication protocol (None for noAuthNoPriv)
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
     pub auth_protocol: Option<AuthProtocol>,
     /// Authentication password
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
     pub auth_password: Option<String>,
     /// Privacy protocol (None for noPriv)
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
     pub priv_protocol: Option<PrivProtocol>,
     /// Privacy password
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
     pub priv_password: Option<String>,
     /// SNMPv3 context name for VACM context selection.
     /// Most deployments use empty string (default).
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
     pub context_name: Option<String>,
     /// Pre-computed master keys for caching.
     /// When set, passwords are ignored and keys are derived from master keys.
-    #[cfg_attr(feature = "serde", serde(skip))]
     pub master_keys: Option<MasterKeys>,
 }
 
@@ -466,172 +440,6 @@ mod tests {
                 assert_eq!(usm.context_name, Some("ctx".to_string()));
             }
             _ => panic!("expected Usm variant"),
-        }
-    }
-}
-
-#[cfg(all(test, feature = "serde"))]
-mod serde_tests {
-    use super::*;
-
-    #[test]
-    fn test_community_v2c_roundtrip() {
-        let auth = Auth::v2c("public");
-        let json = serde_json::to_string(&auth).unwrap();
-        let back: Auth = serde_json::from_str(&json).unwrap();
-
-        match back {
-            Auth::Community { version, community } => {
-                assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community, "public");
-            }
-            _ => panic!("expected Community variant"),
-        }
-    }
-
-    #[test]
-    fn test_community_v1_roundtrip() {
-        let auth = Auth::v1("private");
-        let json = serde_json::to_string(&auth).unwrap();
-        let back: Auth = serde_json::from_str(&json).unwrap();
-
-        match back {
-            Auth::Community { version, community } => {
-                assert_eq!(version, CommunityVersion::V1);
-                assert_eq!(community, "private");
-            }
-            _ => panic!("expected Community variant"),
-        }
-    }
-
-    #[test]
-    fn test_usm_no_auth_roundtrip() {
-        let auth: Auth = Auth::usm("readonly").into();
-        let json = serde_json::to_string(&auth).unwrap();
-        let back: Auth = serde_json::from_str(&json).unwrap();
-
-        match back {
-            Auth::Usm(usm) => {
-                assert_eq!(usm.username, "readonly");
-                assert!(usm.auth_protocol.is_none());
-                assert!(usm.auth_password.is_none());
-                assert!(usm.priv_protocol.is_none());
-                assert!(usm.priv_password.is_none());
-            }
-            _ => panic!("expected Usm variant"),
-        }
-    }
-
-    #[test]
-    fn test_usm_auth_priv_roundtrip() {
-        let auth: Auth = Auth::usm("admin")
-            .auth(AuthProtocol::Sha256, "authpass")
-            .privacy(PrivProtocol::Aes128, "privpass")
-            .context_name("vlan100")
-            .into();
-
-        let json = serde_json::to_string(&auth).unwrap();
-        let back: Auth = serde_json::from_str(&json).unwrap();
-
-        match back {
-            Auth::Usm(usm) => {
-                assert_eq!(usm.username, "admin");
-                assert_eq!(usm.auth_protocol, Some(AuthProtocol::Sha256));
-                assert_eq!(usm.auth_password, Some("authpass".to_string()));
-                assert_eq!(usm.priv_protocol, Some(PrivProtocol::Aes128));
-                assert_eq!(usm.priv_password, Some("privpass".to_string()));
-                assert_eq!(usm.context_name, Some("vlan100".to_string()));
-            }
-            _ => panic!("expected Usm variant"),
-        }
-    }
-
-    #[test]
-    fn test_community_deserialize_without_version() {
-        // When deserializing, version should default to V2c if not present
-        let json = r#"{"community":"public"}"#;
-        let auth: Auth = serde_json::from_str(json).unwrap();
-
-        match auth {
-            Auth::Community { version, community } => {
-                assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community, "public");
-            }
-            _ => panic!("expected Community variant"),
-        }
-    }
-
-    #[test]
-    fn test_usm_optional_fields_not_serialized_when_none() {
-        let auth: Auth = Auth::usm("readonly").into();
-        let json = serde_json::to_string(&auth).unwrap();
-
-        // Should only contain username, no None fields
-        assert!(json.contains("username"));
-        assert!(!json.contains("auth_protocol"));
-        assert!(!json.contains("auth_password"));
-        assert!(!json.contains("priv_protocol"));
-        assert!(!json.contains("priv_password"));
-        assert!(!json.contains("context_name"));
-    }
-
-    #[test]
-    fn test_walk_mode_roundtrip() {
-        use crate::client::walk::WalkMode;
-
-        let modes = [WalkMode::Auto, WalkMode::GetNext, WalkMode::GetBulk];
-
-        for mode in modes {
-            let json = serde_json::to_string(&mode).unwrap();
-            let back: WalkMode = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, mode);
-        }
-    }
-
-    #[test]
-    fn test_oid_ordering_roundtrip() {
-        use crate::client::walk::OidOrdering;
-
-        let orderings = [OidOrdering::Strict, OidOrdering::AllowNonIncreasing];
-
-        for ordering in orderings {
-            let json = serde_json::to_string(&ordering).unwrap();
-            let back: OidOrdering = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, ordering);
-        }
-    }
-
-    #[test]
-    fn test_auth_protocol_roundtrip() {
-        let protocols = [
-            AuthProtocol::Md5,
-            AuthProtocol::Sha1,
-            AuthProtocol::Sha224,
-            AuthProtocol::Sha256,
-            AuthProtocol::Sha384,
-            AuthProtocol::Sha512,
-        ];
-
-        for proto in protocols {
-            let json = serde_json::to_string(&proto).unwrap();
-            let back: AuthProtocol = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, proto);
-        }
-    }
-
-    #[test]
-    fn test_priv_protocol_roundtrip() {
-        let protocols = [
-            PrivProtocol::Des,
-            PrivProtocol::Aes128,
-            PrivProtocol::Aes192,
-            PrivProtocol::Aes256,
-        ];
-
-        for proto in protocols {
-            let json = serde_json::to_string(&proto).unwrap();
-            let back: PrivProtocol = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, proto);
         }
     }
 }

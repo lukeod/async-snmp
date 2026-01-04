@@ -199,7 +199,6 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 
 | Feature | Description |
 |---------|-------------|
-| `serde` | Serialize/Deserialize support for configuration types |
 | `cli` | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 
 ## Minimum Supported Rust Version

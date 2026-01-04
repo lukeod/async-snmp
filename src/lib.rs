@@ -389,7 +389,6 @@
 //!
 //! ## Cargo Features
 //!
-//! - `serde` - Enables `Serialize`/`Deserialize` for configuration types (`Auth`, `WalkMode`, etc.)
 //! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
 //! - `tls` - (Placeholder) SNMP over TLS per RFC 6353
 //! - `dtls` - (Placeholder) SNMP over DTLS per RFC 6353
