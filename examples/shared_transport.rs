@@ -5,8 +5,8 @@
 //! using request-ID correlation, reducing file descriptor usage.
 //!
 //! Key concepts:
-//! - UdpTransport: A single UDP socket that provides per-target handles
-//! - UdpHandle: Per-target handle implementing Transport trait
+//! - UdpTransport: A single UDP socket shared across multiple clients
+//! - `.build_with(&transport)`: Creates a client using the shared transport
 //! - Request ID correlation: Responses are matched to requests by ID
 //! - Engine cache: Share SNMPv3 engine discovery across clients
 //!
@@ -17,9 +17,7 @@
 //!   docker run -d -p 11161:161/udp async-snmp-test:latest
 
 use async_snmp::transport::UdpTransport;
-use async_snmp::{
-    Auth, AuthProtocol, Client, ClientConfig, EngineCache, MasterKeys, PrivProtocol, Retry, oid,
-};
+use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, Retry, oid};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,14 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Shared transport bound to {}", shared.local_addr());
 
-    // Create handles for different targets - all use the same underlying socket
-    let handle1 = shared.handle(container_target);
-    let handle2 = shared.handle("192.0.2.1:161".parse()?); // TEST-NET-1 (unreachable)
-
-    // Create clients using the handles
-    let config = ClientConfig::default();
-    let client1 = Client::new(handle1, config.clone());
-    let client2 = Client::new(handle2, config);
+    // Create clients for different targets - all use the same underlying socket
+    let client1 =
+        Client::builder(container_target.to_string(), Auth::v2c("public")).build_with(&shared)?;
+    let client2 = Client::builder("192.0.2.1:161", Auth::v2c("public")) // TEST-NET-1 (unreachable)
+        .build_with(&shared)?;
 
     println!(
         "Created clients for {} and {}",
@@ -79,18 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oid!(1, 3, 6, 1, 2, 1, 1, 6, 0), // sysLocation
     ];
 
-    let config = ClientConfig {
-        timeout: Duration::from_secs(5),
-        retry: Retry::fixed(2, Duration::ZERO),
-        ..Default::default()
-    };
-
     // Spawn concurrent GET requests
     let mut futures = FuturesUnordered::new();
 
     for oid in &oids {
-        let handle = shared.handle(container_target);
-        let client = Client::new(handle, config.clone());
+        let client = Client::builder(container_target.to_string(), Auth::v2c("public"))
+            .timeout(Duration::from_secs(5))
+            .retry(Retry::fixed(2, Duration::ZERO))
+            .build_with(&shared)?;
         let oid = oid.clone();
 
         futures.push(async move {
@@ -157,25 +148,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrates behavior when some targets are unreachable.
     // Uses TEST-NET-1 (192.0.2.0/24) for unreachable addresses.
-    let targets: Vec<SocketAddr> = vec![
-        container_target,         // Reachable
-        "192.0.2.1:161".parse()?, // TEST-NET-1 (unreachable)
-        "192.0.2.2:161".parse()?, // TEST-NET-1 (unreachable)
+    let targets = vec![
+        container_target.to_string(), // Reachable
+        "192.0.2.1:161".to_string(),  // TEST-NET-1 (unreachable)
+        "192.0.2.2:161".to_string(),  // TEST-NET-1 (unreachable)
     ];
 
     let shared = UdpTransport::bind("[::]:0").await?;
 
-    let config = ClientConfig {
-        timeout: Duration::from_millis(500),
-        retry: Retry::none(),
-        ..Default::default()
-    };
-
     let mut futures = FuturesUnordered::new();
 
     for target in &targets {
-        let handle = shared.handle(*target);
-        let client = Client::new(handle, config.clone());
+        let client = Client::builder(target, Auth::v2c("public"))
+            .timeout(Duration::from_millis(500))
+            .retry(Retry::none())
+            .build_with(&shared)?;
 
         futures.push(async move {
             let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;

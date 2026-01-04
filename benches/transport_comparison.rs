@@ -211,11 +211,10 @@ async fn benchmark_shared(
     // Create clients using shared transport
     let mut clients = Vec::with_capacity(targets.len());
     for target in targets {
-        let handle = shared.handle(*target);
         let client = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(1, Duration::ZERO))
-            .build(handle)
+            .build_with(&shared)
             .expect("Failed to build client");
         clients.push(client);
     }

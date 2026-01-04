@@ -446,7 +446,7 @@ impl ClientBuilder {
     /// overhead compared to TCP.
     ///
     /// For polling many targets, consider using a shared
-    /// [`UdpTransport`](crate::transport::UdpTransport) with [`build()`](Self::build).
+    /// [`UdpTransport`](crate::transport::UdpTransport) with [`build_with()`](Self::build_with).
     ///
     /// # Errors
     ///
@@ -531,42 +531,6 @@ impl ClientBuilder {
         self.validate()?;
         let addr = self.resolve_target()?;
         let transport = TcpTransport::connect(addr).await?;
-        Ok(self.build_inner(transport))
-    }
-
-    /// Build a client with a custom transport.
-    ///
-    /// Use this method when you need:
-    /// - A custom transport implementation
-    /// - To reuse an existing transport
-    ///
-    /// For UDP shared transport usage, prefer [`build_with()`](Self::build_with).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configuration is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use async_snmp::{Auth, ClientBuilder};
-    /// use async_snmp::transport::UdpTransport;
-    ///
-    /// # async fn example() -> async_snmp::Result<()> {
-    /// // Create a transport
-    /// let transport = UdpTransport::bind("0.0.0.0:0").await?;
-    ///
-    /// // Create a handle for a specific target
-    /// let handle = transport.handle("192.168.1.1:161".parse().unwrap());
-    ///
-    /// // Build client with the handle
-    /// let client = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
-    ///     .build(handle)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn build<T: Transport>(self, transport: T) -> Result<Client<T>> {
-        self.validate()?;
         Ok(self.build_inner(transport))
     }
 }

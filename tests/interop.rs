@@ -599,12 +599,12 @@ async fn shared_transport_multiple_clients() {
 
     let client1 = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
         .timeout(Duration::from_secs(5))
-        .build(shared.handle(target))
+        .build_with(&shared)
         .expect("Failed to build client1");
 
     let client2 = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
         .timeout(Duration::from_secs(5))
-        .build(shared.handle(target))
+        .build_with(&shared)
         .expect("Failed to build client2");
 
     // Run concurrent requests

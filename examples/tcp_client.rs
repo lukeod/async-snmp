@@ -18,7 +18,9 @@
 //!   docker build -t async-snmp-test:latest tests/containers/snmpd/
 //!   docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
 
-use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, Retry, TcpTransport, Transport, oid};
+use async_snmp::{
+    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, Retry, TcpTransport, Transport, oid,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -74,10 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Remote: {}", transport.peer_addr());
             println!("  Reliable: {}", transport.is_reliable()); // Always true for TCP
 
-            // Use with ClientBuilder
-            let client = Client::builder(target, Auth::v2c("public"))
-                .timeout(Duration::from_secs(10))
-                .build(transport)?;
+            // Use Client::new for manual transport construction
+            let config = ClientConfig {
+                timeout: Duration::from_secs(10),
+                ..Default::default()
+            };
+            let client = Client::new(transport, config);
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
                 Ok(vb) => println!("sysName: {:?}", vb.value),
@@ -101,13 +105,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(transport) => {
             println!("Connected with {}s timeout", connect_timeout.as_secs());
 
-            let client = Client::builder(target, Auth::v2c("public"))
-                .timeout(Duration::from_secs(10))
-                .build(transport)?;
+            let config = ClientConfig {
+                timeout: Duration::from_secs(10),
+                ..Default::default()
+            };
+            let client = Client::new(transport, config);
 
             // Walk system subtree over TCP
             let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;
-            let results = walk.collect().await?;
+            let results: Vec<_> = walk.collect().await?;
 
             println!("Walk found {} OIDs", results.len());
             for vb in &results {
