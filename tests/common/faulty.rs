@@ -76,6 +76,9 @@ impl LossyAgent {
             let _ = agent.run().await;
         });
 
+        // Yield to let the agent task start its receive loop
+        tokio::task::yield_now().await;
+
         Self {
             addr,
             handler,
@@ -140,6 +143,9 @@ impl SlowAgent {
         let task = tokio::spawn(async move {
             let _ = agent.run().await;
         });
+
+        // Yield to let the agent task start its receive loop
+        tokio::task::yield_now().await;
 
         Self {
             addr,
@@ -208,6 +214,9 @@ impl PausableAgent {
         let task = tokio::spawn(async move {
             let _ = agent.run().await;
         });
+
+        // Yield to let the agent task start its receive loop
+        tokio::task::yield_now().await;
 
         Self {
             addr,

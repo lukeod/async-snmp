@@ -72,6 +72,9 @@ impl TestAgent {
             }
         });
 
+        // Yield to let the agent task start its receive loop
+        tokio::task::yield_now().await;
+
         Self {
             addr,
             handler,
