@@ -121,6 +121,16 @@ pub(crate) struct RegisteredHandler {
 /// pattern allows you to chain configuration methods before calling
 /// [`build()`](AgentBuilder::build) to create the agent.
 ///
+/// # Access Control
+///
+/// By default, the agent operates in **permissive mode**: any authenticated
+/// request (valid community string for v1/v2c, valid USM credentials for v3)
+/// has full read and write access to all registered handlers.
+///
+/// For production deployments, use the [`vacm()`](AgentBuilder::vacm) method
+/// to configure View-based Access Control (RFC 3415), which allows fine-grained
+/// control over which security names can access which OID subtrees.
+///
 /// # Minimal Example
 ///
 /// ```rust,no_run
@@ -433,9 +443,12 @@ impl AgentBuilder {
 
     /// Configure VACM (View-based Access Control Model) using a builder function.
     ///
-    /// When VACM is enabled, all requests are checked against the configured
+    /// When VACM is configured, all requests are checked against the configured
     /// access control rules. Requests that don't have proper access are rejected
     /// with `noAccess` error (v2c/v3) or `noSuchName` (v1).
+    ///
+    /// **Without VACM configuration, the agent operates in permissive mode**:
+    /// any authenticated request has full read/write access to all handlers.
     ///
     /// # Example
     ///
