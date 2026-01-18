@@ -28,7 +28,11 @@ impl<T: Transport> Client<T> {
     pub(super) async fn ensure_engine_discovered(&self) -> Result<()> {
         // Check if already discovered
         {
-            let state = self.inner.engine_state.read().unwrap();
+            let state = self
+                .inner
+                .engine_state
+                .read()
+                .expect("engine_state lock poisoned");
             if state.is_some() {
                 return Ok(());
             }
@@ -39,12 +43,20 @@ impl<T: Transport> Client<T> {
             && let Some(cached_state) = cache.get(&self.peer_addr())
         {
             tracing::debug!(target: "async_snmp::client", "using cached engine state");
-            let mut state = self.inner.engine_state.write().unwrap();
+            let mut state = self
+                .inner
+                .engine_state
+                .write()
+                .expect("engine_state lock poisoned");
             *state = Some(cached_state.clone());
             // Derive keys for this engine
             if let Some(security) = &self.inner.config.v3_security {
                 let keys = security.derive_keys(&cached_state.engine_id);
-                let mut derived = self.inner.derived_keys.write().unwrap();
+                let mut derived = self
+                    .inner
+                    .derived_keys
+                    .write()
+                    .expect("derived_keys lock poisoned");
                 *derived = Some(keys);
             }
             return Ok(());
@@ -78,13 +90,21 @@ impl<T: Transport> Client<T> {
         // Derive keys for this engine
         if let Some(security) = &self.inner.config.v3_security {
             let keys = security.derive_keys(&engine_state.engine_id);
-            let mut derived = self.inner.derived_keys.write().unwrap();
+            let mut derived = self
+                .inner
+                .derived_keys
+                .write()
+                .expect("derived_keys lock poisoned");
             *derived = Some(keys);
         }
 
         // Store in local cache
         {
-            let mut state = self.inner.engine_state.write().unwrap();
+            let mut state = self
+                .inner
+                .engine_state
+                .write()
+                .expect("engine_state lock poisoned");
             *state = Some(engine_state.clone());
         }
 
@@ -106,13 +126,21 @@ impl<T: Transport> Client<T> {
             Error::Config("V3 security not configured".into()).boxed()
         })?;
 
-        let engine_state = self.inner.engine_state.read().unwrap();
+        let engine_state = self
+            .inner
+            .engine_state
+            .read()
+            .expect("engine_state lock poisoned");
         let engine_state = engine_state.as_ref().ok_or_else(|| {
             tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::EngineNotDiscovered }, "engine not discovered");
             Error::Config("engine not discovered".into()).boxed()
         })?;
 
-        let derived = self.inner.derived_keys.read().unwrap();
+        let derived = self
+            .inner
+            .derived_keys
+            .read()
+            .expect("derived_keys lock poisoned");
 
         let security_level = security.security_level();
 
@@ -305,7 +333,11 @@ impl<T: Transport> Client<T> {
                     if security_level.requires_auth() {
                         tracing::trace!(target: "async_snmp::client", "verifying HMAC authentication on response");
 
-                        let derived = self.inner.derived_keys.read().unwrap();
+                        let derived = self
+                            .inner
+                            .derived_keys
+                            .read()
+                            .expect("derived_keys lock poisoned");
                         let auth_key = derived
                             .as_ref()
                             .and_then(|d| d.auth_key.as_ref())
@@ -351,7 +383,11 @@ impl<T: Transport> Client<T> {
                             let usm_params =
                                 UsmSecurityParams::decode(response.security_params.clone())?;
                             {
-                                let mut state = self.inner.engine_state.write().unwrap();
+                                let mut state = self
+                                    .inner
+                                    .engine_state
+                                    .write()
+                                    .expect("engine_state lock poisoned");
                                 if let Some(ref mut s) = *state {
                                     s.update_time(usm_params.engine_boots, usm_params.engine_time);
                                 }
@@ -402,7 +438,11 @@ impl<T: Transport> Client<T> {
                                 tracing::trace!(target: "async_snmp::client", { ciphertext_len = ciphertext.len() }, "decrypting response");
 
                                 // Decrypt
-                                let derived = self.inner.derived_keys.read().unwrap();
+                                let derived = self
+                                    .inner
+                                    .derived_keys
+                                    .read()
+                                    .expect("derived_keys lock poisoned");
                                 let priv_key = derived
                                     .as_ref()
                                     .and_then(|d| d.priv_key.as_ref())
@@ -464,7 +504,11 @@ impl<T: Transport> Client<T> {
                     // Update engine time from successful response
                     {
                         let usm_params = UsmSecurityParams::decode(response_security_params)?;
-                        let mut state = self.inner.engine_state.write().unwrap();
+                        let mut state = self
+                            .inner
+                            .engine_state
+                            .write()
+                            .expect("engine_state lock poisoned");
                         if let Some(ref mut s) = *state {
                             s.update_time(usm_params.engine_boots, usm_params.engine_time);
                         }
