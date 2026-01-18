@@ -1,11 +1,11 @@
 [package]
 name = "async-snmp"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Modern async-first SNMP client library for Rust"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/async-snmp/async-snmp"
+repository = "https://github.com/lukeod/async-snmp"
 documentation = "https://docs.rs/async-snmp"
 readme = "README.md"
 keywords = ["snmp", "network", "async", "monitoring"]

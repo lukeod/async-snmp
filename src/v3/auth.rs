@@ -417,7 +417,7 @@ pub fn verify_message(
 /// This struct caches the expensive password-to-key derivation results for
 /// both authentication and privacy passwords. When polling many engines with
 /// shared credentials, create a `MasterKeys` once and use it with
-/// [`UsmConfig`] to avoid repeating the ~850μs key derivation for each engine.
+/// [`UsmBuilder`](crate::UsmBuilder) to avoid repeating the ~850μs key derivation for each engine.
 ///
 /// # Example
 ///

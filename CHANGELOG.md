@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-01-18
+
+### Added
+
+- INTEGER DISPLAY-HINT formatting with `format::hints` constants module
+- OID suffix extraction methods (`suffix_from`, `try_suffix_from`) for table index handling
+- `RowStatus` and `StorageType` enum exports for USM table handling
+- Value type improvements for NMS use cases
+- `value_extraction` example
+
+### Changed
+
+- Use `VecDeque` in `BulkWalk` to avoid cloning varbinds on yield
+
+### Removed
+
+- `V3SecurityConfig` type alias (use `UsmConfig` directly)
+- `context_engine_id` field from `ClientBuilder`
+- Standalone `serde` feature flag
+- `ClientBuilder::build()` method (use `Client::new()` or `build_with()`)
+
+### Documentation
+
+- Document VACM permissive mode default in `AgentBuilder`
+- Clarify when to use `Client::new()` vs builder pattern
+- Improved examples and README
+
 ## [0.4.0] - 2026-01-04
 
 ### Added
@@ -130,7 +157,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/async-snmp/async-snmp/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/async-snmp/async-snmp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/async-snmp/async-snmp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/async-snmp/async-snmp/compare/v0.1.2...v0.2.0
