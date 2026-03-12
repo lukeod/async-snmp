@@ -2,6 +2,7 @@
 
 mod common;
 
+use async_snmp::transport::UdpTransport;
 use async_snmp::{Auth, Client, Retry, Value, oid};
 use common::TestAgent;
 use std::time::Duration;
@@ -189,4 +190,22 @@ async fn getnext_past_end_returns_end_of_mib_view() {
         .unwrap();
 
     assert_eq!(result.value, Value::EndOfMibView);
+}
+
+/// IPv6 shared transport can reach an IPv4 agent via address mapping.
+#[tokio::test]
+async fn ipv6_transport_reaches_ipv4_agent() {
+    let agent = TestAgent::new().await;
+    assert!(agent.addr().is_ipv4(), "TestAgent should bind to IPv4");
+
+    // Bind an IPv6 transport and use it to reach the IPv4 agent.
+    // UdpTransport::handle() maps the IPv4 target to ::ffff:x.x.x.x.
+    let transport = UdpTransport::bind("[::]:0").await.unwrap();
+    let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
+        .timeout(Duration::from_secs(2))
+        .build_with(&transport)
+        .unwrap();
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
 }

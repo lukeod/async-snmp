@@ -47,16 +47,11 @@
 //!
 //! # Address Family
 //!
-//! The bind address must match the address family of the targets you intend to
-//! reach. Bind to `0.0.0.0:0` for IPv4 targets or `[::]:0` for IPv6 targets.
-//!
-//! On Linux, binding to `[::]:0` creates a dual-stack socket that can reach
-//! both IPv4 and IPv6 targets. However, macOS and BSD default to
-//! `IPV6_V6ONLY=true`, so an IPv6 socket cannot reach IPv4 targets on those
-//! platforms. For portable code, match the bind address to the target family
-//! or use [`Client::builder`](crate::Client::builder) with
-//! [`connect()`](crate::ClientBuilder::connect), which selects the correct
-//! family automatically.
+//! Bind to `0.0.0.0:0` for IPv4-only targets, `[::]:0` for IPv6-only targets,
+//! or `[::]:0` for mixed IPv4/IPv6 targets. When an IPv6 transport is given an
+//! IPv4 target, the address is automatically mapped to an IPv4-mapped IPv6
+//! address (`::ffff:x.x.x.x`), ensuring cross-platform compatibility with
+//! macOS and BSD (which default to `IPV6_V6ONLY=true`).
 
 use super::udp_core::UdpCore;
 use super::{Transport, extract_request_id};
@@ -128,11 +123,30 @@ impl UdpTransport {
     /// Create a handle for a specific target.
     ///
     /// Handles implement [`Transport`] and can be used with [`Client`](crate::Client).
+    ///
+    /// When the transport is bound to an IPv6 socket and the target is IPv4,
+    /// the target is automatically mapped to an IPv4-mapped IPv6 address
+    /// (`::ffff:x.x.x.x`) for cross-platform dual-stack compatibility.
     pub fn handle(&self, target: SocketAddr) -> UdpHandle {
+        let target = self.map_to_socket_family(target);
         UdpHandle {
             inner: self.inner.clone(),
             target,
         }
+    }
+
+    /// Map a target address to match this transport's socket family.
+    ///
+    /// Converts IPv4 targets to IPv4-mapped IPv6 addresses when the socket
+    /// is IPv6, enabling dual-stack usage on platforms where the kernel does
+    /// not perform this mapping implicitly (macOS, BSD).
+    fn map_to_socket_family(&self, target: SocketAddr) -> SocketAddr {
+        if self.inner.local_addr.is_ipv6() {
+            if let SocketAddr::V4(v4) = target {
+                return SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port());
+            }
+        }
+        target
     }
 
     /// Get the local bind address.
@@ -331,5 +345,34 @@ impl Transport for UdpHandle {
 
     fn register_request(&self, request_id: i32, timeout: Duration) {
         self.inner.core.register(request_id, timeout);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ipv6_transport_maps_ipv4_target() {
+        let transport = UdpTransport::bind("[::]:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:161".parse().unwrap();
+        assert_eq!(handle.peer_addr(), mapped);
+    }
+
+    #[tokio::test]
+    async fn ipv4_transport_preserves_ipv4_target() {
+        let transport = UdpTransport::bind("0.0.0.0:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        let expected: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        assert_eq!(handle.peer_addr(), expected);
+    }
+
+    #[tokio::test]
+    async fn ipv6_transport_preserves_ipv6_target() {
+        let transport = UdpTransport::bind("[::]:0").await.unwrap();
+        let handle = transport.handle("[::1]:161".parse().unwrap());
+        let expected: SocketAddr = "[::1]:161".parse().unwrap();
+        assert_eq!(handle.peer_addr(), expected);
     }
 }
