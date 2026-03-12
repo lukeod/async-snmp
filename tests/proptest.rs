@@ -36,7 +36,7 @@ impl SharedEnv {
         let runtime = Runtime::new().expect("failed to create runtime");
         let agent = runtime.block_on(TestAgent::new());
         let transport = runtime
-            .block_on(UdpTransport::bind("[::]:0"))
+            .block_on(UdpTransport::bind("0.0.0.0:0"))
             .expect("bind transport");
         Self {
             runtime,

@@ -8,12 +8,12 @@ use tokio::net::UdpSocket;
 
 /// Create and bind a UDP socket with optional receive buffer size.
 ///
-/// For IPv6 addresses, sets `IPV6_V6ONLY = false` to enable dual-stack mode,
-/// allowing both IPv4 and IPv6 traffic on a single socket.
+/// For IPv6 addresses, sets `IPV6_V6ONLY = false` to enable dual-stack mode
+/// where supported (Linux). On macOS/BSD this flag may be ignored.
 ///
 /// # Arguments
 ///
-/// * `addr` - The socket address to bind to. For dual-stack, use `[::]:port`.
+/// * `addr` - The socket address to bind to. Should match the target address family.
 /// * `recv_buffer_size` - Optional receive buffer size. The kernel may cap this
 ///   at `net.core.rmem_max`. Larger buffers prevent packet loss during bursts.
 ///
@@ -32,8 +32,8 @@ pub(crate) async fn bind_udp_socket(
 
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
-    // For IPv6 sockets, set IPV6_V6ONLY to false for dual-stack support.
-    // This allows a single socket to handle both IPv4 and IPv6 traffic.
+    // For IPv6 sockets, attempt dual-stack mode. This works on Linux but
+    // macOS/BSD may ignore it (IPV6_V6ONLY defaults to true on those platforms).
     if addr.is_ipv6() {
         socket.set_only_v6(false)?;
     }

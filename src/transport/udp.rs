@@ -35,24 +35,28 @@
 //!     .connect()
 //!     .await?;
 //!
-//! // High-throughput: share transport across clients (IPv4 and IPv6)
-//! let transport = UdpTransport::bind("[::]:0").await?;
+//! // High-throughput: share transport across clients
+//! let transport = UdpTransport::bind("0.0.0.0:0").await?;
 //! let client1 = Client::builder("192.168.1.1:161", Auth::v2c("public"))
 //!     .build_with(&transport)?;
-//! let client2 = Client::builder("[::1]:161", Auth::v2c("public"))
-//!     .build_with(&transport)?;  // Same transport handles both!
+//! let client2 = Client::builder("192.168.1.2:161", Auth::v2c("public"))
+//!     .build_with(&transport)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! # Dual-Stack Support
+//! # Address Family
 //!
-//! The default bind address `[::]:0` creates a dual-stack socket that handles
-//! both IPv4 and IPv6 targets. IPv4 addresses are transparently mapped to
-//! IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`).
+//! The bind address must match the address family of the targets you intend to
+//! reach. Bind to `0.0.0.0:0` for IPv4 targets or `[::]:0` for IPv6 targets.
 //!
-//! Note: Dual-stack behavior follows Linux conventions. Other platforms
-//! (Windows, BSD) are untested and may require separate IPv4/IPv6 sockets.
+//! On Linux, binding to `[::]:0` creates a dual-stack socket that can reach
+//! both IPv4 and IPv6 targets. However, macOS and BSD default to
+//! `IPV6_V6ONLY=true`, so an IPv6 socket cannot reach IPv4 targets on those
+//! platforms. For portable code, match the bind address to the target family
+//! or use [`Client::builder`](crate::Client::builder) with
+//! [`connect()`](crate::ClientBuilder::connect), which selects the correct
+//! family automatically.
 
 use super::udp_core::UdpCore;
 use super::{Transport, extract_request_id};
@@ -111,7 +115,7 @@ struct UdpTransportInner {
 impl UdpTransport {
     /// Bind to the given address with default configuration.
     ///
-    /// For dual-stack support (both IPv4 and IPv6 targets), bind to `[::]:0`.
+    /// Use `0.0.0.0:0` for IPv4 targets or `[::]:0` for IPv6 targets.
     pub async fn bind(addr: impl AsRef<str>) -> Result<Self> {
         Self::builder().bind(addr).build().await
     }
@@ -195,10 +199,10 @@ pub struct UdpTransportBuilder {
 impl UdpTransportBuilder {
     /// Create a new builder with default settings.
     ///
-    /// Default bind address is `[::]:0` for dual-stack support.
+    /// Default bind address is `0.0.0.0:0` (IPv4).
     pub fn new() -> Self {
         Self {
-            bind_addr: "[::]:0".into(),
+            bind_addr: "0.0.0.0:0".into(),
             config: UdpTransportConfig::default(),
         }
     }
