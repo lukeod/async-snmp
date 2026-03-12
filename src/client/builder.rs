@@ -452,8 +452,15 @@ impl ClientBuilder {
     pub async fn connect(self) -> Result<Client<UdpHandle>> {
         self.validate()?;
         let addr = self.resolve_target()?;
-        // Use dual-stack socket for both IPv4 and IPv6 targets
-        let transport = UdpTransport::bind("[::]:0").await?;
+        // Match bind address to target address family for cross-platform
+        // compatibility. Dual-stack ([::]:0) only works reliably on Linux;
+        // macOS/BSD default to IPV6_V6ONLY=1 and reject IPv4 targets.
+        let bind_addr = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let transport = UdpTransport::bind(bind_addr).await?;
         let handle = transport.handle(addr);
         Ok(self.build_inner(handle))
     }
