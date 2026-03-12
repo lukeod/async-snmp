@@ -141,10 +141,10 @@ impl UdpTransport {
     /// is IPv6, enabling dual-stack usage on platforms where the kernel does
     /// not perform this mapping implicitly (macOS, BSD).
     fn map_to_socket_family(&self, target: SocketAddr) -> SocketAddr {
-        if self.inner.local_addr.is_ipv6() {
-            if let SocketAddr::V4(v4) = target {
-                return SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port());
-            }
+        if let SocketAddr::V4(v4) = target
+            && self.inner.local_addr.is_ipv6()
+        {
+            return SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port());
         }
         target
     }
@@ -192,7 +192,7 @@ impl UdpTransport {
                                     tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, snmp.bytes = len }, "malformed response (no request_id)");
                                 }
                             }
-                            Err(e) if inner.shutdown.is_cancelled() => break,
+                            Err(_) if inner.shutdown.is_cancelled() => break,
                             Err(e) => {
                                 tracing::error!(target: "async_snmp::transport", { error = %e }, "UDP recv error");
                             }
