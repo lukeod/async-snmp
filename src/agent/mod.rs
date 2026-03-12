@@ -226,7 +226,7 @@ impl AgentBuilder {
     /// use async_snmp::agent::Agent;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// // Bind to all interfaces via dual-stack (handles both IPv4 and IPv6)
+    /// // Bind to all interfaces (IPv6, with dual-stack on Linux)
     /// let agent = Agent::builder().bind("[::]:161").community(b"public").build().await?;
     ///
     /// // Bind to IPv6 localhost only

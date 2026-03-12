@@ -41,8 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Basic Shared Transport ---\n");
 
     // Create a shared transport bound to an ephemeral port.
-    // Using [::]:0 creates a dual-stack socket that handles both IPv4 and IPv6.
-    let shared = UdpTransport::bind("[::]:0").await?;
+    let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
     println!("Shared transport bound to {}", shared.local_addr());
 
@@ -65,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Concurrent Polling ---\n");
 
     // Poll multiple OIDs concurrently through the same shared transport
-    let shared = UdpTransport::bind("[::]:0").await?;
+    let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
     let oids = [
         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), // sysDescr
@@ -116,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Master keys derived (one-time cost)");
     println!("Engine cache created for sharing\n");
 
-    let shared_v3 = UdpTransport::bind("[::]:0").await?;
+    let shared_v3 = UdpTransport::bind("0.0.0.0:0").await?;
 
     // Poll multiple OIDs using V3 with shared resources
     let v3_oids = [
@@ -154,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "192.0.2.2:161".to_string(),  // TEST-NET-1 (unreachable)
     ];
 
-    let shared = UdpTransport::bind("[::]:0").await?;
+    let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
     let mut futures = FuturesUnordered::new();
 

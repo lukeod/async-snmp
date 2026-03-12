@@ -35,12 +35,13 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Test (${{ matrix.toolchain }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        toolchain: ['1.88', stable, beta, nightly]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: ['1.88', stable]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master

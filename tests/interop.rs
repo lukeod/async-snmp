@@ -591,8 +591,13 @@ async fn shared_transport_multiple_clients() {
     let info = get_snmpd_container().await;
     let target = parse_target(info);
 
+    let bind_addr = if target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let shared = UdpTransport::builder()
-        .bind("[::]:0")
+        .bind(bind_addr)
         .build()
         .await
         .expect("Failed to bind shared transport");

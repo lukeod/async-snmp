@@ -136,8 +136,8 @@
 //! use futures::future::join_all;
 //!
 //! async fn poll_many_devices(targets: Vec<&str>) -> Vec<(&str, Result<String, String>)> {
-//!     // Single dual-stack socket shared across all clients
-//!     let transport = UdpTransport::bind("[::]:0")
+//!     // Single socket shared across all clients
+//!     let transport = UdpTransport::bind("0.0.0.0:0")
 //!         .await
 //!         .expect("failed to bind");
 //!
@@ -187,7 +187,7 @@
 //! let engine_cache = Arc::new(EngineCache::new());
 //!
 //! // 3. Use shared transport for socket efficiency
-//! let transport = UdpTransport::bind("[::]:0").await?;
+//! let transport = UdpTransport::bind("0.0.0.0:0").await?;
 //!
 //! // Poll multiple targets - only ~1μs key localization per engine
 //! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
