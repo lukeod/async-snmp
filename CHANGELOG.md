@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-03-13
+
+### Fixed
+
+- `Client::connect` binding to IPv6 socket for IPv4 targets on macOS
+- Cross-platform socket binding: default `UdpTransportBuilder` bind address changed from `[::]:0` to `0.0.0.0:0` to avoid assuming Linux dual-stack behavior
+
+### Changed
+
+- `UdpTransport::handle()` auto-maps IPv4 targets to IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) when the socket is IPv6, enabling dual-stack shared transports without caller-managed address families
+- Added macOS and Windows to CI test matrix
+
 ## [0.5.0] - 2026-01-18
 
 ### Added
@@ -157,7 +169,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/async-snmp/async-snmp/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/async-snmp/async-snmp/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/async-snmp/async-snmp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/async-snmp/async-snmp/compare/v0.2.0...v0.3.0
