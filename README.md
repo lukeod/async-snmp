@@ -12,6 +12,8 @@ Modern, async-first SNMP client library for Rust.
 
 This library is not currently stable. While pre v1.0, breaking changes are likely to occur frequently, no attempt will be made to maintain backward compatibility pre-1.0.
 
+MIB parsing is out of scope for this crate. For MIB parsing in Rust, see [mib-rs](https://github.com/lukeod/mib-rs).
+
 ## Features
 
 - **Full protocol support**: SNMPv1, v2c, and v3 (USM)
