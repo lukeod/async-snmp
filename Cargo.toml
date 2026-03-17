@@ -22,7 +22,7 @@ smallvec = "1.15.1"
 socket2 = "0.6"
 quinn-udp = "0.5"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros", "io-util"] }
+tokio = { version = "1.48.0", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1.44"
 
