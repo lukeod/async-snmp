@@ -122,6 +122,9 @@ async fn get_snmpd_container() -> &'static ContainerInfo {
                 .await
                 .expect("Failed to start snmpd container");
 
+            #[cfg(not(target_os = "linux"))]
+            tokio::time::sleep(Duration::from_millis(4000)).await; // Wait a moment for host port forwarding to be ready
+
             let host = container.get_host().await.expect("Failed to get host");
             let udp_port = container
                 .get_host_port_ipv4(161.udp())
