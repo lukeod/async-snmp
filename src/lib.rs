@@ -393,7 +393,9 @@
 //! - `tls` - (Placeholder) SNMP over TLS per RFC 6353
 //! - `dtls` - (Placeholder) SNMP over DTLS per RFC 6353
 
+#[cfg(feature = "agent")]
 pub mod agent;
+
 pub mod ber;
 pub mod client;
 pub mod error;
@@ -416,6 +418,7 @@ pub(crate) mod util;
 pub mod cli;
 
 // Re-exports for convenience
+#[cfg(feature = "agent")]
 pub use agent::{Agent, AgentBuilder, VacmBuilder, VacmConfig, View};
 pub use client::{
     Auth, Backoff, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,

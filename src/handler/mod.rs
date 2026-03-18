@@ -112,5 +112,33 @@ pub use oid_table::OidTable;
 pub use results::{GetNextResult, GetResult, Response, SetResult};
 pub use traits::{BoxFuture, MibHandler};
 
-// Re-export SecurityModel from agent::vacm for convenience
-pub use crate::agent::vacm::SecurityModel;
+/// Security model identifiers (RFC 3411).
+///
+/// Used to specify which SNMP version/security mechanism a mapping applies to.
+///
+/// # Example
+///
+/// ```rust
+/// use async_snmp::agent::{SecurityModel, VacmBuilder};
+///
+/// let vacm = VacmBuilder::new()
+///     // Map communities to groups by security model
+///     .group("public", SecurityModel::V2c, "readonly")
+///     .group("admin", SecurityModel::Usm, "admin_group")
+///     // Any model can match as a fallback
+///     .group("universal", SecurityModel::Any, "universal_group")
+///     .build();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecurityModel {
+    /// Wildcard for VACM matching (matches any model).
+    ///
+    /// Use this when the same mapping should apply regardless of SNMP version.
+    Any = 0,
+    /// SNMPv1.
+    V1 = 1,
+    /// SNMPv2c.
+    V2c = 2,
+    /// SNMPv3 User-based Security Model.
+    Usm = 3,
+}

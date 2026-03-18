@@ -201,6 +201,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 
 | Feature | Description |
 |---------|-------------|
+| `agent` | SNMP Agent |
 | `cli` | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 
 ## Minimum Supported Rust Version
