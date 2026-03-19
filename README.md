@@ -199,9 +199,11 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 
 ## Feature Flags
 
-| Feature | Description |
-|---------|-------------|
-| `cli` | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `agent` | Yes | SNMP agent support (includes `quinn-udp`) |
+| `rt-multi-thread` | No | Multi-threaded tokio runtime |
+| `cli` | No | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 
 ## Minimum Supported Rust Version
 
