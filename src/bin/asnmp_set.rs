@@ -81,7 +81,11 @@ fn parse_varbinds(args: &[String]) -> Result<Vec<SetVarbind>, String> {
     Ok(varbinds)
 }
 
-#[tokio::main]
+#[cfg_attr(feature = "rt-multi-thread", tokio::main)]
+#[cfg_attr(
+    not(feature = "rt-multi-thread"),
+    tokio::main(flavor = "current_thread")
+)]
 async fn main() -> ExitCode {
     let args = Args::parse();
 
