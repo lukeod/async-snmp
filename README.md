@@ -51,7 +51,7 @@ Or add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-async-snmp = "0.5"
+async-snmp = "0.7"
 ```
 
 ## Quick Start
