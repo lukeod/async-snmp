@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-03-19
+
+### Added
+
+- `agent` feature flag to gate SNMP agent module and `quinn-udp` dependency (default-on)
+- `rt-multi-thread` feature flag for opt-in multi-threaded tokio runtime
+
+### Changed
+
+- Default tokio runtime is now single-threaded (`current_thread`); enable `rt-multi-thread` for multi-threaded runtime
+- `SecurityModel` enum moved from `agent::vacm` to `handler` module (re-exported from `agent::vacm` for compatibility)
+- Bumped `quinn-udp` from 0.5 to 0.6
+
 ## [0.6.0] - 2026-03-13
 
 ### Fixed
@@ -169,7 +182,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/async-snmp/async-snmp/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/async-snmp/async-snmp/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/async-snmp/async-snmp/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/async-snmp/async-snmp/compare/v0.3.0...v0.4.0
