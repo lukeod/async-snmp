@@ -283,15 +283,28 @@ pub struct VarBindResult {
     pub raw_hex: Option<String>,
 }
 
+/// Trait for formatting OIDs and values using external metadata.
+///
+/// Implementors provide symbolic OID formatting and type-aware value rendering.
+/// Used by [`OutputContext`] to produce richer output when available.
+pub trait VarBindFormatter {
+    /// Format a numeric OID symbolically (e.g., "IF-MIB::ifDescr.1").
+    fn format_oid(&self, oid: &Oid) -> String;
+    /// Format a value using type metadata for the given OID.
+    fn format_value(&self, oid: &Oid, value: &Value) -> String;
+}
+
 /// Output context for formatting.
-pub struct OutputContext {
+pub struct OutputContext<'a> {
     pub format: OutputFormat,
     pub show_hints: bool,
     pub force_hex: bool,
     pub show_timing: bool,
+    /// Optional formatter for symbolic OID names and type-aware values.
+    pub formatter: Option<&'a dyn VarBindFormatter>,
 }
 
-impl OutputContext {
+impl<'a> OutputContext<'a> {
     /// Create a new output context with default settings.
     pub fn new(format: OutputFormat) -> Self {
         Self {
@@ -299,6 +312,7 @@ impl OutputContext {
             show_hints: true,
             force_hex: false,
             show_timing: false,
+            formatter: None,
         }
     }
 
@@ -341,6 +355,10 @@ impl OutputContext {
     }
 
     fn format_varbind(&self, vb: &VarBind) -> VarBindResult {
+        if let Some(fmt) = self.formatter {
+            return self.format_varbind_with_formatter(fmt, vb);
+        }
+
         let oid_str = format_oid(&vb.oid);
         let hint = if self.show_hints {
             hints::lookup(&vb.oid).map(String::from)
@@ -356,6 +374,21 @@ impl OutputContext {
             value_type,
             value,
             formatted,
+            raw_hex,
+        }
+    }
+
+    fn format_varbind_with_formatter(&self, fmt: &dyn VarBindFormatter, vb: &VarBind) -> VarBindResult {
+        let oid_str = fmt.format_oid(&vb.oid);
+        let formatted_value = fmt.format_value(&vb.oid, &vb.value);
+        let (value_type, value, _, raw_hex) = format_value(&vb.value, self.force_hex);
+
+        VarBindResult {
+            oid: oid_str,
+            hint: None, // Formatter provides the OID name directly
+            value_type,
+            value,
+            formatted: Some(formatted_value),
             raw_hex,
         }
     }
@@ -548,31 +581,12 @@ fn hex_string(bytes: &[u8]) -> String {
 
 /// Format bytes as spaced hex for display.
 fn format_hex_string(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::fmt::format_hex_display(bytes)
 }
 
 /// Format TimeTicks as human-readable duration.
 fn format_timeticks(centiseconds: u32) -> String {
-    let total_seconds = centiseconds / 100;
-    let cs = centiseconds % 100;
-
-    let days = total_seconds / 86400;
-    let hours = (total_seconds % 86400) / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-
-    if days > 0 {
-        format!(
-            "{}d {:02}:{:02}:{:02}.{:02}",
-            days, hours, minutes, seconds, cs
-        )
-    } else {
-        format!("{:02}:{:02}:{:02}.{:02}", hours, minutes, seconds, cs)
-    }
+    crate::fmt::format_timeticks(centiseconds)
 }
 
 /// Write an error message to stderr.

@@ -7,4 +7,6 @@
 
 pub mod args;
 pub mod hints;
+#[cfg(feature = "mib")]
+pub mod mib_cli;
 pub mod output;

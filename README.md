@@ -12,7 +12,7 @@ Modern, async-first SNMP client library for Rust.
 
 This library is not currently stable. While pre v1.0, breaking changes are likely to occur frequently, no attempt will be made to maintain backward compatibility pre-1.0.
 
-MIB parsing is out of scope for this crate. For MIB parsing in Rust, see [mib-rs](https://github.com/lukeod/mib-rs).
+MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the `mib` feature flag for integrated OID name resolution, symbolic formatting, and type-aware value rendering.
 
 ## Features
 
@@ -204,6 +204,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 | `agent` | Yes | SNMP agent support (includes `quinn-udp`) |
 | `rt-multi-thread` | No | Multi-threaded tokio runtime |
 | `cli` | No | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
+| `mib` | No | MIB integration via [mib-rs](https://github.com/lukeod/mib-rs) (OID name resolution, value formatting) |
 
 ## Minimum Supported Rust Version
 

@@ -3,7 +3,8 @@
 //! Part of the async-snmp CLI utilities.
 
 use async_snmp::cli::args::{CommonArgs, OutputArgs, SnmpVersion, V3Args};
-use async_snmp::cli::hints::parse_oid;
+#[cfg(feature = "mib")]
+use async_snmp::cli::output::VarBindFormatter;
 use async_snmp::cli::output::{
     OperationType, OutputContext, RequestInfo, SecurityInfo, write_error, write_verbose_request,
     write_verbose_response,
@@ -25,6 +26,10 @@ struct Args {
 
     #[command(flatten)]
     output: OutputArgs,
+
+    #[cfg(feature = "mib")]
+    #[command(flatten)]
+    mib: async_snmp::cli::mib_cli::MibArgs,
 
     /// OIDs to retrieve (dotted notation or well-known names).
     #[arg(required = true, value_name = "OID")]
@@ -57,8 +62,23 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Parse OIDs
-    let oids: Vec<Oid> = match args.oids.iter().map(|s| parse_oid(s)).collect() {
+    // Load MIBs if requested
+    #[cfg(feature = "mib")]
+    let mib = match args.mib.load().await {
+        Ok(mib) => mib,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Parse OIDs (use MIB resolution when available)
+    let oids: Vec<Oid> = match args.oids.iter().map(|s| {
+        #[cfg(feature = "mib")]
+        { async_snmp::cli::mib_cli::resolve_oid_arg(mib.as_ref(), s) }
+        #[cfg(not(feature = "mib"))]
+        { async_snmp::cli::hints::parse_oid(s) }
+    }).collect() {
         Ok(oids) => oids,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -107,12 +127,14 @@ async fn main() -> ExitCode {
                 write_verbose_response(&varbinds, elapsed, !args.output.no_hints);
             }
 
-            let output_ctx = OutputContext {
-                format: args.output.format,
-                show_hints: !args.output.no_hints,
-                force_hex: args.output.hex,
-                show_timing: args.output.timing,
-            };
+            let mut output_ctx = OutputContext::new(args.output.format);
+            output_ctx.show_hints = !args.output.no_hints;
+            output_ctx.force_hex = args.output.hex;
+            output_ctx.show_timing = args.output.timing;
+            #[cfg(feature = "mib")]
+            if let Some(m) = &mib {
+                output_ctx.formatter = Some(m as &dyn VarBindFormatter);
+            }
 
             let timing = if args.output.timing {
                 Some(elapsed)

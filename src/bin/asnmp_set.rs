@@ -3,7 +3,8 @@
 //! Part of the async-snmp CLI utilities.
 
 use async_snmp::cli::args::{CommonArgs, OutputArgs, SnmpVersion, V3Args, ValueType};
-use async_snmp::cli::hints::parse_oid;
+#[cfg(feature = "mib")]
+use async_snmp::cli::output::VarBindFormatter;
 use async_snmp::cli::output::{
     OperationType, OutputContext, RequestInfo, SecurityInfo, write_error, write_verbose_request,
     write_verbose_response,
@@ -37,6 +38,10 @@ struct Args {
     #[command(flatten)]
     output: OutputArgs,
 
+    #[cfg(feature = "mib")]
+    #[command(flatten)]
+    mib: async_snmp::cli::mib_cli::MibArgs,
+
     /// OID TYPE VALUE triplets (e.g., sysContact.0 s "admin@example.com").
     /// Can specify multiple triplets for atomic SET of multiple values.
     #[arg(required = true, value_name = "OID TYPE VALUE", num_args = 3..)]
@@ -49,7 +54,10 @@ struct SetVarbind {
     value: Value,
 }
 
-fn parse_varbinds(args: &[String]) -> Result<Vec<SetVarbind>, String> {
+fn parse_varbinds(
+    args: &[String],
+    resolve_oid: impl Fn(&str) -> Result<Oid, String>,
+) -> Result<Vec<SetVarbind>, String> {
     if !args.len().is_multiple_of(3) {
         return Err("arguments must be OID TYPE VALUE triplets".into());
     }
@@ -61,8 +69,7 @@ fn parse_varbinds(args: &[String]) -> Result<Vec<SetVarbind>, String> {
         let type_str = &chunk[1];
         let value_str = &chunk[2];
 
-        // Parse OID
-        let oid = parse_oid(oid_str)?;
+        let oid = resolve_oid(oid_str)?;
 
         // Parse type specifier
         let value_type: ValueType = type_str.parse().map_err(|_| {
@@ -107,8 +114,23 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Load MIBs if requested
+    #[cfg(feature = "mib")]
+    let mib = match args.mib.load().await {
+        Ok(mib) => mib,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Parse varbinds
-    let varbinds = match parse_varbinds(&args.varbinds) {
+    let varbinds = match parse_varbinds(&args.varbinds, |s| {
+        #[cfg(feature = "mib")]
+        { async_snmp::cli::mib_cli::resolve_oid_arg(mib.as_ref(), s) }
+        #[cfg(not(feature = "mib"))]
+        { async_snmp::cli::hints::parse_oid(s) }
+    }) {
         Ok(vb) => vb,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -158,12 +180,14 @@ async fn main() -> ExitCode {
             if args.output.verbose {
                 write_verbose_response(&result_varbinds, elapsed, !args.output.no_hints);
             }
-            let output_ctx = OutputContext {
-                format: args.output.format,
-                show_hints: !args.output.no_hints,
-                force_hex: args.output.hex,
-                show_timing: args.output.timing,
-            };
+            let mut output_ctx = OutputContext::new(args.output.format);
+            output_ctx.show_hints = !args.output.no_hints;
+            output_ctx.force_hex = args.output.hex;
+            output_ctx.show_timing = args.output.timing;
+            #[cfg(feature = "mib")]
+            if let Some(m) = &mib {
+                output_ctx.formatter = Some(m as &dyn VarBindFormatter);
+            }
 
             let timing = if args.output.timing {
                 Some(elapsed)
