@@ -699,6 +699,36 @@ macro_rules! oid {
     };
 }
 
+// ========================================================================
+// mib-rs OID conversions (feature = "mib")
+// ========================================================================
+
+#[cfg(feature = "mib")]
+impl From<&mib_rs::Oid> for Oid {
+    fn from(oid: &mib_rs::Oid) -> Self {
+        Oid::from_slice(oid.as_ref())
+    }
+}
+
+#[cfg(feature = "mib")]
+impl From<mib_rs::Oid> for Oid {
+    fn from(oid: mib_rs::Oid) -> Self {
+        Oid::from_slice(oid.as_ref())
+    }
+}
+
+#[cfg(feature = "mib")]
+impl Oid {
+    /// Convert to a mib-rs OID.
+    ///
+    /// This is a method rather than a `From` impl because the orphan rule
+    /// prevents implementing `From<&Oid> for mib_rs::Oid` (foreign trait
+    /// for foreign type).
+    pub fn to_mib_oid(&self) -> mib_rs::Oid {
+        mib_rs::Oid::from(self.arcs())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

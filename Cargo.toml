@@ -32,6 +32,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+# MIB integration (optional)
+mib-rs = { version = "0.8", path = "../mib-rs", optional = true, default-features = false }
+
 # V3 crypto dependencies
 aes = "0.8.4"
 getrandom = "0.4"
@@ -87,6 +90,7 @@ default = ["agent"]
 agent = ["dep:quinn-udp"]  # SNMP agent
 rt-multi-thread = ["tokio/rt-multi-thread"]  # Multi-threaded tokio runtime
 cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
+mib = ["dep:mib-rs"]       # MIB integration (OID conversions, helpers)
 tls = []      # Future: SNMP over TLS (RFC 6353)
 dtls = []     # Future: SNMP over DTLS (RFC 6353)
 
@@ -104,3 +108,15 @@ required-features = ["cli"]
 name = "asnmp-set"
 path = "src/bin/asnmp_set.rs"
 required-features = ["cli"]
+
+[[example]]
+name = "mib_get"
+required-features = ["mib"]
+
+[[example]]
+name = "mib_walk"
+required-features = ["mib"]
+
+[[example]]
+name = "mib_table"
+required-features = ["mib"]

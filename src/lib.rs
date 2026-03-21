@@ -391,6 +391,7 @@
 //!
 //! - `agent` - SNMP agent (enabled by default)
 //! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
+//! - `mib` - MIB integration via mib-rs (OID conversions, value formatting helpers)
 //! - `rt-multi-thread` - Multi-threaded tokio runtime
 //! - `tls` - (Placeholder) SNMP over TLS per RFC 6353
 //! - `dtls` - (Placeholder) SNMP over DTLS per RFC 6353
@@ -413,10 +414,14 @@ pub mod value;
 pub mod varbind;
 pub mod version;
 
+pub(crate) mod fmt;
 pub(crate) mod util;
 
 #[cfg(feature = "cli")]
 pub mod cli;
+
+#[cfg(feature = "mib")]
+pub mod mib_support;
 
 // Re-exports for convenience
 #[cfg(feature = "agent")]
