@@ -378,7 +378,11 @@ impl<'a> OutputContext<'a> {
         }
     }
 
-    fn format_varbind_with_formatter(&self, fmt: &dyn VarBindFormatter, vb: &VarBind) -> VarBindResult {
+    fn format_varbind_with_formatter(
+        &self,
+        fmt: &dyn VarBindFormatter,
+        vb: &VarBind,
+    ) -> VarBindResult {
         let oid_str = fmt.format_oid(&vb.oid);
         let formatted_value = fmt.format_value(&vb.oid, &vb.value);
         let (value_type, value, _, raw_hex) = format_value(&vb.value, self.force_hex);

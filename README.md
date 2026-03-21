@@ -47,13 +47,6 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 cargo add async-snmp
 ```
 
-Or add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-async-snmp = "0.7"
-```
-
 ## Quick Start
 
 ### SNMPv2c

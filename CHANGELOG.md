@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-03-21
+
+### Added
+
+- `mib` feature flag for optional mib-rs integration
+- `mib_support` module with OID name resolution, symbolic formatting, type-aware value rendering (enum labels, display hints), and structured varbind metadata
+- `VarBindFormatter` trait for pluggable output formatting in CLI tools
+- OID conversions between async-snmp and mib-rs types
+- Re-export core mib-rs types from `mib_support` so users don't need a direct mib-rs dependency
+- MIB CLI args (`--mib-dir`, `--load-mibs`, `--system-mibs`) for asnmp-get, asnmp-walk, asnmp-set
+- Examples: `mib_get`, `mib_walk`, `mib_table`
+
 ## [0.7.0] - 2026-03-19
 
 ### Added
@@ -182,7 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/async-snmp/async-snmp/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/async-snmp/async-snmp/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/async-snmp/async-snmp/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/async-snmp/async-snmp/compare/v0.4.0...v0.5.0

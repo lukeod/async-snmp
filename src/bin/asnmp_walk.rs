@@ -76,12 +76,11 @@ async fn main() -> ExitCode {
     };
 
     // Parse OID (use MIB resolution when available)
-    let oid = match {
-        #[cfg(feature = "mib")]
-        { async_snmp::cli::mib_cli::resolve_oid_arg(mib.as_ref(), &args.oid) }
-        #[cfg(not(feature = "mib"))]
-        { async_snmp::cli::hints::parse_oid(&args.oid) }
-    } {
+    #[cfg(feature = "mib")]
+    let oid_result = async_snmp::cli::mib_cli::resolve_oid_arg(mib.as_ref(), &args.oid);
+    #[cfg(not(feature = "mib"))]
+    let oid_result = async_snmp::cli::hints::parse_oid(&args.oid);
+    let oid = match oid_result {
         Ok(oid) => oid,
         Err(e) => {
             eprintln!("Error: {}", e);
