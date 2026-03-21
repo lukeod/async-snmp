@@ -44,11 +44,10 @@ impl MibArgs {
         let load_mibs = self.load_mibs.clone();
         let system_mibs = self.system_mibs;
 
-        let mib = tokio::task::spawn_blocking(move || {
-            load_mib_sync(&mib_dirs, &load_mibs, system_mibs)
-        })
-        .await
-        .map_err(|e| format!("MIB loading task failed: {}", e))??;
+        let mib =
+            tokio::task::spawn_blocking(move || load_mib_sync(&mib_dirs, &load_mibs, system_mibs))
+                .await
+                .map_err(|e| format!("MIB loading task failed: {}", e))??;
 
         Ok(Some(mib))
     }
@@ -82,7 +81,9 @@ fn load_mib_sync(
     // Use quiet diagnostics for CLI
     loader = loader.diagnostic_config(DiagnosticConfig::quiet());
 
-    loader.load().map_err(|e| format!("MIB loading failed: {}", e))
+    loader
+        .load()
+        .map_err(|e| format!("MIB loading failed: {}", e))
 }
 
 /// Resolve an OID argument that may be a name (when MIBs are loaded) or
@@ -91,10 +92,7 @@ fn load_mib_sync(
 /// Arguments starting with a digit are parsed as dotted-decimal OIDs without
 /// attempting MIB resolution. Named arguments are resolved through the MIB
 /// if one is loaded, otherwise they fall back to the static hints table.
-pub fn resolve_oid_arg(
-    mib: Option<&Mib>,
-    s: &str,
-) -> Result<crate::Oid, String> {
+pub fn resolve_oid_arg(mib: Option<&Mib>, s: &str) -> Result<crate::Oid, String> {
     // If it starts with a digit, try dotted notation first
     if s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return crate::Oid::parse(s).map_err(|e| format!("invalid OID '{}': {}", s, e));

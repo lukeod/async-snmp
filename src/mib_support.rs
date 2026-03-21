@@ -15,10 +15,7 @@ use mib_rs::mib::display_hint::HexCase;
 use smallvec::SmallVec;
 
 // Re-export core mib-rs types so users don't need a direct mib-rs dependency.
-pub use mib_rs::{
-    Access, DiagnosticConfig, Kind, Loader, Mib, ResolveOidError,
-    source,
-};
+pub use mib_rs::{Access, DiagnosticConfig, Kind, Loader, Mib, ResolveOidError, source};
 
 /// Resolve a name like "sysDescr.0" or "IF-MIB::ifTable" to an async-snmp OID.
 ///
@@ -83,10 +80,7 @@ pub fn describe_varbind<'a>(mib: &'a Mib, vb: &VarBind) -> Option<VarBindInfo<'a
     let node = lookup.node();
     let object = node.object()?;
 
-    let module_name = object
-        .module()
-        .map(|m| m.name())
-        .unwrap_or("");
+    let module_name = object.module().map(|m| m.name()).unwrap_or("");
 
     let formatted_value = format_object_value(mib, &object, &vb.value);
 
@@ -141,16 +135,16 @@ fn format_object_value(mib: &Mib, object: &mib_rs::Object<'_>, value: &Value) ->
             }
             // Fall back to UTF-8, then hex
             if let Ok(s) = std::str::from_utf8(bytes) {
-                if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                if s.chars()
+                    .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+                {
                     return s.to_string();
                 }
             }
             format_hex(bytes)
         }
 
-        Value::ObjectIdentifier(oid) => {
-            format_oid(mib, oid)
-        }
+        Value::ObjectIdentifier(oid) => format_oid(mib, oid),
 
         Value::TimeTicks(v) => {
             let formatted = crate::fmt::format_timeticks(*v);

@@ -29,7 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resolve "ifTable" by name
     let if_table = mib_support::resolve_oid(&mib, "ifTable")?;
-    println!("Walking {} ({})", mib_support::format_oid(&mib, &if_table), if_table);
+    println!(
+        "Walking {} ({})",
+        mib_support::format_oid(&mib, &if_table),
+        if_table
+    );
 
     // Connect and walk
     let client = Client::builder(format!("{}:161", target), Auth::v2c("public"))

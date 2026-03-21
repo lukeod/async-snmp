@@ -127,9 +127,13 @@ async fn main() -> ExitCode {
     // Parse varbinds
     let varbinds = match parse_varbinds(&args.varbinds, |s| {
         #[cfg(feature = "mib")]
-        { async_snmp::cli::mib_cli::resolve_oid_arg(mib.as_ref(), s) }
+        {
+            async_snmp::cli::mib_cli::resolve_oid_arg(mib.as_ref(), s)
+        }
         #[cfg(not(feature = "mib"))]
-        { async_snmp::cli::hints::parse_oid(s) }
+        {
+            async_snmp::cli::hints::parse_oid(s)
+        }
     }) {
         Ok(vb) => vb,
         Err(e) => {
