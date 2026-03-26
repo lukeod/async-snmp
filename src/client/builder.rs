@@ -66,7 +66,9 @@ impl ClientBuilder {
     ///
     /// # Arguments
     ///
-    /// * `target` - The target address (e.g., "192.168.1.1:161")
+    /// * `target` - The target address (e.g., "192.168.1.1" or "192.168.1.1:161").
+    ///   Port defaults to 161 if not specified. IPv6 addresses are supported
+    ///   as bare (`::1`) or bracketed (`[::1]:162`) forms.
     /// * `auth` - Authentication configuration (community or USM)
     ///
     /// # Example
@@ -342,19 +344,24 @@ impl ClientBuilder {
         Ok(())
     }
 
-    /// Resolve target address to SocketAddr.
+    /// Resolve target address to SocketAddr, defaulting to port 161.
+    ///
+    /// Accepts IPv4 (`192.168.1.1`, `192.168.1.1:162`), IPv6 (`::1`,
+    /// `[::1]:162`), and hostnames (`switch.local`, `switch.local:162`).
+    /// When no port is specified, SNMP port 161 is used.
     ///
     /// IP addresses are parsed directly without DNS. Hostnames are resolved
     /// asynchronously via `tokio::net::lookup_host`, bounded by the builder's
-    /// configured timeout. To bypass DNS entirely, pass a resolved IP:port
-    /// as the target.
+    /// configured timeout. To bypass DNS entirely, pass a resolved IP:port.
     async fn resolve_target(&self) -> Result<SocketAddr> {
+        let (host, port) = split_host_port(&self.target);
+
         // Try direct parse first to avoid unnecessary async DNS lookup
-        if let Ok(addr) = self.target.parse() {
-            return Ok(addr);
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
         }
 
-        let lookup = tokio::net::lookup_host(&self.target);
+        let lookup = tokio::net::lookup_host((host, port));
         let mut addrs = tokio::time::timeout(self.timeout, lookup)
             .await
             .map_err(|_| {
@@ -544,6 +551,38 @@ impl ClientBuilder {
     }
 }
 
+/// Default SNMP port.
+const DEFAULT_PORT: u16 = 161;
+
+/// Split a target string into (host, port), defaulting to port 161.
+///
+/// Handles IPv4 (`192.168.1.1`), IPv4 with port (`192.168.1.1:162`),
+/// bare IPv6 (`fe80::1`), bracketed IPv6 (`[::1]`, `[::1]:162`),
+/// and hostnames (`switch.local`, `switch.local:162`).
+fn split_host_port(target: &str) -> (&str, u16) {
+    // Bracketed IPv6: [addr]:port or [addr]
+    if let Some(rest) = target.strip_prefix('[') {
+        if let Some((addr, port)) = rest.rsplit_once("]:")
+            && let Ok(p) = port.parse()
+        {
+            return (addr, p);
+        }
+        return (rest.trim_end_matches(']'), DEFAULT_PORT);
+    }
+
+    // IPv4 or hostname: last colon is the port separator, but only if the
+    // host part doesn't also contain colons (which would make it bare IPv6)
+    if let Some((host, port)) = target.rsplit_once(':')
+        && !host.contains(':')
+        && let Ok(p) = port.parse::<u16>()
+    {
+        return (host, p);
+    }
+
+    // No port found (bare IPv4, IPv6, or hostname)
+    (target, DEFAULT_PORT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +757,45 @@ mod tests {
         };
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         assert!(builder.validate().is_ok());
+    }
+
+    #[test]
+    fn test_split_host_port_ipv4_with_port() {
+        assert_eq!(split_host_port("192.168.1.1:162"), ("192.168.1.1", 162));
+    }
+
+    #[test]
+    fn test_split_host_port_ipv4_default() {
+        assert_eq!(split_host_port("192.168.1.1"), ("192.168.1.1", 161));
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_bare() {
+        assert_eq!(split_host_port("fe80::1"), ("fe80::1", 161));
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_loopback() {
+        assert_eq!(split_host_port("::1"), ("::1", 161));
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_bracketed_with_port() {
+        assert_eq!(split_host_port("[fe80::1]:162"), ("fe80::1", 162));
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_bracketed_default() {
+        assert_eq!(split_host_port("[::1]"), ("::1", 161));
+    }
+
+    #[test]
+    fn test_split_host_port_hostname() {
+        assert_eq!(split_host_port("switch.local"), ("switch.local", 161));
+    }
+
+    #[test]
+    fn test_split_host_port_hostname_with_port() {
+        assert_eq!(split_host_port("switch.local:162"), ("switch.local", 162));
     }
 }

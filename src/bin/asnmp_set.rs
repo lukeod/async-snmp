@@ -105,14 +105,7 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Parse target address
-    let target = match args.common.target_addr().await {
-        Ok(addr) => addr,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let target = &args.common.target;
 
     // Load MIBs if requested
     #[cfg(feature = "mib")]
@@ -164,7 +157,7 @@ async fn main() -> ExitCode {
         let oids: Vec<_> = varbinds.iter().map(|vb| vb.oid.clone()).collect();
 
         let request_info = RequestInfo {
-            target,
+            target: target.as_str(),
             version: version.into(),
             security,
             operation: OperationType::Set,
@@ -175,7 +168,7 @@ async fn main() -> ExitCode {
 
     // Build and run the SET request
     let start = Instant::now();
-    let result = run_set(target, &args, varbinds).await;
+    let result = run_set(target.as_str(), &args, varbinds).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -199,9 +192,13 @@ async fn main() -> ExitCode {
                 None
             };
 
-            if let Err(e) =
-                output_ctx.write_results(target, version.into(), &result_varbinds, timing, None)
-            {
+            if let Err(e) = output_ctx.write_results(
+                target.as_str(),
+                version.into(),
+                &result_varbinds,
+                timing,
+                None,
+            ) {
                 eprintln!("Error writing output: {}", e);
                 return ExitCode::FAILURE;
             }
@@ -216,7 +213,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run_set(
-    target: std::net::SocketAddr,
+    target: &str,
     args: &Args,
     varbinds: Vec<SetVarbind>,
 ) -> async_snmp::Result<Vec<VarBind>> {
@@ -225,7 +222,7 @@ async fn run_set(
         .auth(&args.common)
         .map_err(|e| async_snmp::Error::Config(e.to_string().into()))?;
 
-    let client = Client::builder(target.to_string(), auth)
+    let client = Client::builder(target, auth)
         .timeout(args.common.timeout_duration())
         .retry(args.common.retry_config())
         .connect()
