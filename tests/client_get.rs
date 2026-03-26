@@ -204,6 +204,7 @@ async fn ipv6_transport_reaches_ipv4_agent() {
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
         .timeout(Duration::from_secs(2))
         .build_with(&transport)
+        .await
         .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();

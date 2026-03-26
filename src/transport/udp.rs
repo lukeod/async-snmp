@@ -38,9 +38,9 @@
 //! // High-throughput: share transport across clients
 //! let transport = UdpTransport::bind("0.0.0.0:0").await?;
 //! let client1 = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .build_with(&transport)?;
+//!     .build_with(&transport).await?;
 //! let client2 = Client::builder("192.168.1.2:161", Auth::v2c("public"))
-//!     .build_with(&transport)?;
+//!     .build_with(&transport).await?;
 //! # Ok(())
 //! # }
 //! ```
