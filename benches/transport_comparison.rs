@@ -215,6 +215,7 @@ async fn benchmark_shared(
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(1, Duration::ZERO))
             .build_with(&shared)
+            .await
             .expect("Failed to build client");
         clients.push(client);
     }

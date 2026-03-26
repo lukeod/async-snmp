@@ -6,7 +6,7 @@
 //!
 //! Key concepts:
 //! - UdpTransport: A single UDP socket shared across multiple clients
-//! - `.build_with(&transport)`: Creates a client using the shared transport
+//! - `.build_with(&transport).await`: Creates a client using the shared transport
 //! - Request ID correlation: Responses are matched to requests by ID
 //! - Engine cache: Share SNMPv3 engine discovery across clients
 //!
@@ -46,10 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Shared transport bound to {}", shared.local_addr());
 
     // Create clients for different targets - all use the same underlying socket
-    let client1 =
-        Client::builder(container_target.to_string(), Auth::v2c("public")).build_with(&shared)?;
+    let client1 = Client::builder(container_target.to_string(), Auth::v2c("public"))
+        .build_with(&shared)
+        .await?;
     let client2 = Client::builder("192.0.2.1:161", Auth::v2c("public")) // TEST-NET-1 (unreachable)
-        .build_with(&shared)?;
+        .build_with(&shared)
+        .await?;
 
     println!(
         "Created clients for {} and {}",
@@ -80,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::builder(container_target.to_string(), Auth::v2c("public"))
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
-            .build_with(&shared)?;
+            .build_with(&shared)
+            .await?;
         let oid = oid.clone();
 
         futures.push(async move {
@@ -132,7 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
             .engine_cache(engine_cache.clone())
-            .build_with(&shared_v3)?;
+            .build_with(&shared_v3)
+            .await?;
 
         match client.get(oid).await {
             Ok(vb) => println!("  {}: {:?}", oid, vb.value),
@@ -161,7 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::builder(target, Auth::v2c("public"))
             .timeout(Duration::from_millis(500))
             .retry(Retry::none())
-            .build_with(&shared)?;
+            .build_with(&shared)
+            .await?;
 
         futures.push(async move {
             let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;

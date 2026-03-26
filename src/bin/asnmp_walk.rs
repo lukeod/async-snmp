@@ -57,7 +57,7 @@ async fn main() -> ExitCode {
     }
 
     // Parse target address
-    let target = match args.common.target_addr() {
+    let target = match args.common.target_addr().await {
         Ok(addr) => addr,
         Err(e) => {
             eprintln!("Error: {}", e);

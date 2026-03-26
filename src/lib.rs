@@ -144,13 +144,14 @@
 //!     let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 //!
 //!     // Create clients for each target
-//!     let clients: Vec<_> = targets.iter()
-//!         .map(|t| {
-//!             Client::builder(*t, Auth::v2c("public"))
-//!                 .build_with(&transport)
-//!         })
-//!         .collect::<Result<_, _>>()
-//!         .expect("failed to build clients");
+//!     let mut clients = Vec::new();
+//!     for t in &targets {
+//!         let client = Client::builder(*t, Auth::v2c("public"))
+//!             .build_with(&transport)
+//!             .await
+//!             .expect("failed to build client");
+//!         clients.push(client);
+//!     }
 //!
 //!     // Poll all targets concurrently
 //!     let results = join_all(
@@ -195,7 +196,7 @@
 //!
 //!     let client = Client::builder(target, auth)
 //!         .engine_cache(engine_cache.clone())
-//!         .build_with(&transport)?;
+//!         .build_with(&transport).await?;
 //!
 //!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
 //!     println!("{}: {:?}", target, result.value);

@@ -287,6 +287,7 @@ proptest! {
         env.runtime.block_on(async {
             let client = Client::builder(env.agent.addr().to_string(), Auth::v2c("public"))
                 .build_with(&env.transport)
+                .await
                 .unwrap();
 
             let result = client.get(&test_oid).await.unwrap();
@@ -305,6 +306,7 @@ proptest! {
         env.runtime.block_on(async {
             let client = Client::builder(env.agent.addr().to_string(), Auth::v2c("public"))
                 .build_with(&env.transport)
+                .await
                 .unwrap();
 
             let result = client.get(&oid).await.unwrap();
@@ -330,6 +332,7 @@ proptest! {
         env.runtime.block_on(async {
             let client = Client::builder(env.agent.addr().to_string(), Auth::v2c("public"))
                 .build_with(&env.transport)
+                .await
                 .unwrap();
 
             let results = client.get_many(&oids).await.unwrap();
@@ -357,6 +360,7 @@ proptest! {
         env.runtime.block_on(async {
             let client = Client::builder(env.agent.addr().to_string(), Auth::v2c("public"))
                 .build_with(&env.transport)
+                .await
                 .unwrap();
 
             let walk_root = Oid::from_slice(&[1, 3, 6, 1, 99, 4, case_id]);
@@ -388,6 +392,7 @@ proptest! {
         env.runtime.block_on(async {
             let client = Client::builder(env.agent.addr().to_string(), Auth::v2c("public"))
                 .build_with(&env.transport)
+                .await
                 .unwrap();
 
             client.set(&test_oid, value.clone()).await.unwrap();

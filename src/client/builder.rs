@@ -4,7 +4,7 @@
 //! constructing SNMP clients with any authentication mode (v1/v2c community
 //! or v3 USM).
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -343,17 +343,31 @@ impl ClientBuilder {
     }
 
     /// Resolve target address to SocketAddr.
-    fn resolve_target(&self) -> Result<SocketAddr> {
-        self.target
-            .to_socket_addrs()
+    ///
+    /// IP addresses are parsed directly without DNS. Hostnames are resolved
+    /// asynchronously via `tokio::net::lookup_host`, bounded by the builder's
+    /// configured timeout. To bypass DNS entirely, pass a resolved IP:port
+    /// as the target.
+    async fn resolve_target(&self) -> Result<SocketAddr> {
+        // Try direct parse first to avoid unnecessary async DNS lookup
+        if let Ok(addr) = self.target.parse() {
+            return Ok(addr);
+        }
+
+        let lookup = tokio::net::lookup_host(&self.target);
+        let mut addrs = tokio::time::timeout(self.timeout, lookup)
+            .await
+            .map_err(|_| {
+                Error::Config(format!("DNS lookup timed out for '{}'", self.target).into()).boxed()
+            })?
             .map_err(|e| {
                 Error::Config(format!("could not resolve address '{}': {}", self.target, e).into())
                     .boxed()
-            })?
-            .next()
-            .ok_or_else(|| {
-                Error::Config(format!("could not resolve address '{}'", self.target).into()).boxed()
-            })
+            })?;
+
+        addrs.next().ok_or_else(|| {
+            Error::Config(format!("could not resolve address '{}'", self.target).into()).boxed()
+        })
     }
 
     /// Build ClientConfig from the builder settings.
@@ -451,7 +465,7 @@ impl ClientBuilder {
     /// ```
     pub async fn connect(self) -> Result<Client<UdpHandle>> {
         self.validate()?;
-        let addr = self.resolve_target()?;
+        let addr = self.resolve_target().await?;
         // Match bind address to target address family for cross-platform
         // compatibility. Dual-stack ([::]:0) only works reliably on Linux;
         // macOS/BSD default to IPV6_V6ONLY=1 and reject IPv4 targets.
@@ -480,15 +494,15 @@ impl ClientBuilder {
     /// let transport = UdpTransport::bind("0.0.0.0:0").await?;
     ///
     /// let client1 = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
-    ///     .build_with(&transport)?;
+    ///     .build_with(&transport).await?;
     /// let client2 = ClientBuilder::new("192.168.1.2:161", Auth::v2c("public"))
-    ///     .build_with(&transport)?;
+    ///     .build_with(&transport).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
+    pub async fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
         self.validate()?;
-        let addr = self.resolve_target()?;
+        let addr = self.resolve_target().await?;
         let handle = transport.handle(addr);
         Ok(self.build_inner(handle))
     }
@@ -524,7 +538,7 @@ impl ClientBuilder {
     /// ```
     pub async fn connect_tcp(self) -> Result<Client<TcpTransport>> {
         self.validate()?;
-        let addr = self.resolve_target()?;
+        let addr = self.resolve_target().await?;
         let transport = TcpTransport::connect(addr).await?;
         Ok(self.build_inner(transport))
     }
