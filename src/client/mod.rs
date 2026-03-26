@@ -7,7 +7,7 @@ mod v3;
 mod walk;
 
 pub use auth::{Auth, CommunityVersion, UsmAuth, UsmBuilder};
-pub use builder::ClientBuilder;
+pub use builder::{ClientBuilder, Target};
 pub use retry::{Backoff, Retry, RetryBuilder};
 
 // New unified entry point
@@ -37,7 +37,7 @@ impl Client<UdpHandle> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn builder(target: impl Into<String>, auth: impl Into<Auth>) -> ClientBuilder {
+    pub fn builder(target: impl Into<Target>, auth: impl Into<Auth>) -> ClientBuilder {
         ClientBuilder::new(target, auth)
     }
 }

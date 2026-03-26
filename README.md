@@ -57,7 +57,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), async_snmp::Error> {
-    let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+    let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
         .connect()
         .await?;
@@ -69,6 +69,18 @@ async fn main() -> Result<(), async_snmp::Error> {
 }
 ```
 
+The target accepts a `(host, port)` tuple or a combined string (`"192.168.1.1:161"`). The tuple form avoids bracket-formatting for IPv6 addresses:
+
+```rust
+// IPv6 - no bracket escaping needed
+let client = Client::builder(("fe80::1", 161), Auth::v2c("public"))
+    .connect().await?;
+
+// Combined string also works (port defaults to 161 if omitted)
+let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+    .connect().await?;
+```
+
 ### SNMPv3 with Authentication and Privacy
 
 ```rust
@@ -76,7 +88,7 @@ use async_snmp::{Auth, Client, oid, v3::{AuthProtocol, PrivProtocol}};
 
 #[tokio::main]
 async fn main() -> Result<(), async_snmp::Error> {
-    let client = Client::builder("192.168.1.1:161",
+    let client = Client::builder(("192.168.1.1", 161),
         Auth::usm("admin")
             .auth(AuthProtocol::Sha256, "authpass123")
             .privacy(PrivProtocol::Aes128, "privpass123"))
@@ -98,7 +110,7 @@ use futures::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), async_snmp::Error> {
-    let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+    let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
         .connect()
         .await?;
 
@@ -125,7 +137,7 @@ async fn main() -> Result<(), async_snmp::Error> {
     // Single socket shared across all clients
     let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
-    let targets = vec!["192.168.1.1", "192.168.1.2", "192.168.1.3"];
+    let targets = vec![("192.168.1.1", 161), ("192.168.1.2", 161), ("192.168.1.3", 161)];
 
     let mut clients = Vec::new();
     for t in &targets {

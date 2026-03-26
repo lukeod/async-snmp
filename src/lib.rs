@@ -18,8 +18,8 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<async_snmp::Error>> {
-//!     // SNMPv2c client
-//!     let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     // SNMPv2c client - target accepts (host, port) or a combined string
+//!     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
 //!         .timeout(Duration::from_secs(5))
 //!         .connect()
 //!         .await?;
@@ -38,7 +38,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<async_snmp::Error>> {
-//!     let client = Client::builder("192.168.1.1:161",
+//!     let client = Client::builder(("192.168.1.1", 161),
 //!         Auth::usm("admin")
 //!             .auth(AuthProtocol::Sha256, "authpass123")
 //!             .privacy(PrivProtocol::Aes128, "privpass123"))
@@ -143,10 +143,10 @@
 //!
 //!     let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 //!
-//!     // Create clients for each target
+//!     // Create clients for each target - (host, port) tuples work naturally
 //!     let mut clients = Vec::new();
 //!     for t in &targets {
-//!         let client = Client::builder(*t, Auth::v2c("public"))
+//!         let client = Client::builder((*t, 161), Auth::v2c("public"))
 //!             .build_with(&transport)
 //!             .await
 //!             .expect("failed to build client");
@@ -430,7 +430,7 @@ pub use agent::{Agent, AgentBuilder, VacmBuilder, VacmConfig, View};
 pub use client::{
     Auth, Backoff, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
     DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT, OidOrdering, Retry,
-    RetryBuilder, UsmAuth, UsmBuilder, Walk, WalkMode, WalkStream,
+    RetryBuilder, Target, UsmAuth, UsmBuilder, Walk, WalkMode, WalkStream,
 };
 pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
 pub use handler::{

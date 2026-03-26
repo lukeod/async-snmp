@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("--- Basic TCP Client ---\n");
 
-    let target = "127.0.0.1:11161";
+    let target = ("127.0.0.1", 11161);
 
     // Use connect_tcp() instead of connect()
     let client = Client::builder(target, Auth::v2c("public"))

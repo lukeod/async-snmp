@@ -23,6 +23,64 @@ use crate::version::Version;
 
 use super::Client;
 
+/// Target address for an SNMP client.
+///
+/// Specifies where to connect. Accepts either a combined address string
+/// or a separate host and port, which is useful when host and port are
+/// stored independently (avoids needing to format IPv6 bracket syntax).
+///
+/// # Examples
+///
+/// ```rust
+/// use async_snmp::Target;
+///
+/// // From a string (port defaults to 161 if omitted)
+/// let t: Target = "192.168.1.1:161".into();
+/// let t: Target = "switch.local".into();
+///
+/// // From a (host, port) tuple - no bracket formatting needed for IPv6
+/// let t: Target = ("fe80::1", 161).into();
+/// let t: Target = ("switch.local".to_string(), 162).into();
+/// ```
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// A combined address string, e.g. `"192.168.1.1:161"` or `"[::1]:162"`.
+    /// Port defaults to 161 if not specified.
+    Address(String),
+    /// A separate host and port, e.g. `("fe80::1", 161)`.
+    HostPort(String, u16),
+}
+
+impl From<&str> for Target {
+    fn from(s: &str) -> Self {
+        Target::Address(s.to_string())
+    }
+}
+
+impl From<String> for Target {
+    fn from(s: String) -> Self {
+        Target::Address(s)
+    }
+}
+
+impl From<&String> for Target {
+    fn from(s: &String) -> Self {
+        Target::Address(s.clone())
+    }
+}
+
+impl From<(&str, u16)> for Target {
+    fn from((host, port): (&str, u16)) -> Self {
+        Target::HostPort(host.to_string(), port)
+    }
+}
+
+impl From<(String, u16)> for Target {
+    fn from((host, port): (String, u16)) -> Self {
+        Target::HostPort(host, port)
+    }
+}
+
 /// Builder for constructing SNMP clients.
 ///
 /// This is the single entry point for client construction. It supports all
@@ -39,6 +97,10 @@ use super::Client;
 /// let client = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
 ///     .connect().await?;
 ///
+/// // Using separate host and port (convenient for IPv6)
+/// let client = ClientBuilder::new(("fe80::1", 161), Auth::v2c("public"))
+///     .connect().await?;
+///
 /// // v3 client with authentication
 /// let client = ClientBuilder::new("192.168.1.1:161",
 ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"))
@@ -49,7 +111,7 @@ use super::Client;
 /// # }
 /// ```
 pub struct ClientBuilder {
-    target: String,
+    target: Target,
     auth: Auth,
     timeout: Duration,
     retry: Retry,
@@ -66,7 +128,8 @@ impl ClientBuilder {
     ///
     /// # Arguments
     ///
-    /// * `target` - The target address (e.g., "192.168.1.1" or "192.168.1.1:161").
+    /// * `target` - The target address. Accepts a string (e.g., `"192.168.1.1"` or
+    ///   `"192.168.1.1:161"`), or a `(host, port)` tuple (e.g., `("fe80::1", 161)`).
     ///   Port defaults to 161 if not specified. IPv6 addresses are supported
     ///   as bare (`::1`) or bracketed (`[::1]:162`) forms.
     /// * `auth` - Authentication configuration (community or USM)
@@ -79,6 +142,9 @@ impl ClientBuilder {
     /// // Using Auth::default() for v2c with "public" community
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::default());
     ///
+    /// // Using separate host and port
+    /// let builder = ClientBuilder::new(("192.168.1.1", 161), Auth::default());
+    ///
     /// // Using Auth::v1() for SNMPv1
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v1("private"));
     ///
@@ -86,7 +152,7 @@ impl ClientBuilder {
     /// let builder = ClientBuilder::new("192.168.1.1:161",
     ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"));
     /// ```
-    pub fn new(target: impl Into<String>, auth: impl Into<Auth>) -> Self {
+    pub fn new(target: impl Into<Target>, auth: impl Into<Auth>) -> Self {
         Self {
             target: target.into(),
             auth: auth.into(),
@@ -347,33 +413,47 @@ impl ClientBuilder {
     /// Resolve target address to SocketAddr, defaulting to port 161.
     ///
     /// Accepts IPv4 (`192.168.1.1`, `192.168.1.1:162`), IPv6 (`::1`,
-    /// `[::1]:162`), and hostnames (`switch.local`, `switch.local:162`).
-    /// When no port is specified, SNMP port 161 is used.
+    /// `[::1]:162`), hostnames (`switch.local`, `switch.local:162`), and
+    /// `(host, port)` tuples. When no port is specified, SNMP port 161 is used.
     ///
     /// IP addresses are parsed directly without DNS. Hostnames are resolved
     /// asynchronously via `tokio::net::lookup_host`, bounded by the builder's
-    /// configured timeout. To bypass DNS entirely, pass a resolved IP:port.
+    /// configured timeout. To bypass DNS entirely, pass a resolved IP address.
     async fn resolve_target(&self) -> Result<SocketAddr> {
-        let (host, port) = split_host_port(&self.target);
+        let (host, port) = match &self.target {
+            Target::Address(addr) => {
+                let (h, p) = split_host_port(addr);
+                (h.to_string(), p)
+            }
+            Target::HostPort(host, port) => (host.clone(), *port),
+        };
 
         // Try direct parse first to avoid unnecessary async DNS lookup
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }
 
-        let lookup = tokio::net::lookup_host((host, port));
+        let target_display = match &self.target {
+            Target::Address(addr) => addr.clone(),
+            Target::HostPort(host, port) => format!("{}:{}", host, port),
+        };
+
+        let lookup = tokio::net::lookup_host((host.as_str(), port));
         let mut addrs = tokio::time::timeout(self.timeout, lookup)
             .await
             .map_err(|_| {
-                Error::Config(format!("DNS lookup timed out for '{}'", self.target).into()).boxed()
+                Error::Config(format!("DNS lookup timed out for '{}'", target_display).into())
+                    .boxed()
             })?
             .map_err(|e| {
-                Error::Config(format!("could not resolve address '{}': {}", self.target, e).into())
-                    .boxed()
+                Error::Config(
+                    format!("could not resolve address '{}': {}", target_display, e).into(),
+                )
+                .boxed()
             })?;
 
         addrs.next().ok_or_else(|| {
-            Error::Config(format!("could not resolve address '{}'", self.target).into()).boxed()
+            Error::Config(format!("could not resolve address '{}'", target_display).into()).boxed()
         })
     }
 
@@ -591,7 +671,7 @@ mod tests {
     #[test]
     fn test_builder_defaults() {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::default());
-        assert_eq!(builder.target, "192.168.1.1:161");
+        assert!(matches!(builder.target, Target::Address(ref s) if s == "192.168.1.1:161"));
         assert_eq!(builder.timeout, DEFAULT_TIMEOUT);
         assert_eq!(builder.retry.max_attempts, 3);
         assert_eq!(builder.max_oids_per_request, DEFAULT_MAX_OIDS_PER_REQUEST);
@@ -757,6 +837,57 @@ mod tests {
         };
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         assert!(builder.validate().is_ok());
+    }
+
+    #[test]
+    fn test_builder_with_host_port_tuple() {
+        let builder = ClientBuilder::new(("fe80::1", 161), Auth::default());
+        assert!(matches!(
+            builder.target,
+            Target::HostPort(ref h, 161) if h == "fe80::1"
+        ));
+    }
+
+    #[test]
+    fn test_builder_with_string_host_port_tuple() {
+        let builder = ClientBuilder::new(("switch.local".to_string(), 162), Auth::v2c("public"));
+        assert!(matches!(
+            builder.target,
+            Target::HostPort(ref h, 162) if h == "switch.local"
+        ));
+    }
+
+    #[test]
+    fn test_target_from_str() {
+        let t: Target = "192.168.1.1:161".into();
+        assert!(matches!(t, Target::Address(ref s) if s == "192.168.1.1:161"));
+    }
+
+    #[test]
+    fn test_target_from_tuple() {
+        let t: Target = ("fe80::1", 161).into();
+        assert!(matches!(t, Target::HostPort(ref h, 161) if h == "fe80::1"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_target_host_port_ipv4() {
+        let builder = ClientBuilder::new(("192.168.1.1", 162), Auth::default());
+        let addr = builder.resolve_target().await.unwrap();
+        assert_eq!(addr, "192.168.1.1:162".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_target_host_port_ipv6() {
+        let builder = ClientBuilder::new(("::1", 161), Auth::default());
+        let addr = builder.resolve_target().await.unwrap();
+        assert_eq!(addr, "[::1]:161".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_target_string_still_works() {
+        let builder = ClientBuilder::new("10.0.0.1:162", Auth::default());
+        let addr = builder.resolve_target().await.unwrap();
+        assert_eq!(addr, "10.0.0.1:162".parse().unwrap());
     }
 
     #[test]
