@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create multiple clients using the cached master keys
     // Note: These TEST-NET-1 addresses are for demonstration - they won't be reachable
-    let targets = ["192.0.2.1:161", "192.0.2.2:161", "192.0.2.3:161"];
+    let targets = ["192.0.2.1", "192.0.2.2", "192.0.2.3"];
 
     for target_addr in &targets {
         // Clone master keys (cheap - just Arc increment)

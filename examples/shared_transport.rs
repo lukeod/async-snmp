@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client1 = Client::builder(container_target.to_string(), Auth::v2c("public"))
         .build_with(&shared)
         .await?;
-    let client2 = Client::builder("192.0.2.1:161", Auth::v2c("public")) // TEST-NET-1 (unreachable)
+    let client2 = Client::builder("192.0.2.1", Auth::v2c("public")) // TEST-NET-1 (unreachable)
         .build_with(&shared)
         .await?;
 
@@ -153,8 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Uses TEST-NET-1 (192.0.2.0/24) for unreachable addresses.
     let targets = vec![
         container_target.to_string(), // Reachable
-        "192.0.2.1:161".to_string(),  // TEST-NET-1 (unreachable)
-        "192.0.2.2:161".to_string(),  // TEST-NET-1 (unreachable)
+        "192.0.2.1".to_string(),      // TEST-NET-1 (unreachable)
+        "192.0.2.2".to_string(),      // TEST-NET-1 (unreachable)
     ];
 
     let shared = UdpTransport::bind("0.0.0.0:0").await?;

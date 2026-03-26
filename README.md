@@ -125,14 +125,15 @@ async fn main() -> Result<(), async_snmp::Error> {
     // Single socket shared across all clients
     let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
-    let targets = vec!["192.168.1.1:161", "192.168.1.2:161", "192.168.1.3:161"];
+    let targets = vec!["192.168.1.1", "192.168.1.2", "192.168.1.3"];
 
-    let clients: Vec<_> = targets.iter()
-        .map(|t| {
-            Client::builder(*t, Auth::v2c("public"))
-                .build_with(&shared)
-        })
-        .collect::<Result<_, _>>()?;
+    let mut clients = Vec::new();
+    for t in &targets {
+        let client = Client::builder(*t, Auth::v2c("public"))
+            .build_with(&shared)
+            .await?;
+        clients.push(client);
+    }
 
     // Poll all targets concurrently - sharing one UDP socket
     let results = futures::future::join_all(

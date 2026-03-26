@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-03-27
+
+### Added
+
+- `UdpTransport` now implements `Clone` (cheap `Arc` increment) - thanks @sjthomason (#16)
+
+### Changed
+
+- **Breaking:** `ClientBuilder::build_with()` is now `async` and must be `.await`ed
+- **Breaking:** `ClientBuilder::resolve_target()` uses async DNS resolution (`tokio::net::lookup_host`) instead of blocking `std::net::ToSocketAddrs`, preventing worker threads from stalling on slow or failing DNS - reported by @sjthomason (#17)
+- DNS resolution is bounded by the builder's configured timeout
+- Target address now defaults to port 161 when no port is specified, matching standard SNMP behavior. Accepts bare IPv4 (`192.168.1.1`), bare IPv6 (`::1`, `fe80::1`), bracketed IPv6 (`[::1]:162`), and hostnames (`switch.local`)
+- CLI tools pass the raw target string to the builder instead of pre-resolving, removing redundant DNS resolution
+
+### Fixed
+
+- Bare IPv6 addresses (e.g., `fe80::1`) were incorrectly parsed as having a port due to colon detection
+
 ## [0.8.0] - 2026-03-21
 
 ### Added
@@ -194,7 +212,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/async-snmp/async-snmp/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/async-snmp/async-snmp/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/async-snmp/async-snmp/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/async-snmp/async-snmp/compare/v0.5.0...v0.6.0
