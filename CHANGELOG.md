@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Target` enum for specifying client target addresses. `ClientBuilder::new()` and `Client::builder()` now accept `(host, port)` tuples in addition to combined address strings. This avoids IPv6 bracket formatting when host and port are stored separately - requested by @sjthomason (#17)
+
 ## [0.9.0] - 2026-03-27
 
 ### Added

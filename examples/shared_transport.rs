@@ -19,7 +19,6 @@
 use async_snmp::transport::UdpTransport;
 use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, Retry, oid};
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let container_target: SocketAddr = "127.0.0.1:11161".parse()?;
+    let container_target = ("127.0.0.1", 11161);
 
     // =========================================================================
     // Example 1: Basic shared transport setup
@@ -46,10 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Shared transport bound to {}", shared.local_addr());
 
     // Create clients for different targets - all use the same underlying socket
-    let client1 = Client::builder(container_target.to_string(), Auth::v2c("public"))
+    let client1 = Client::builder(container_target, Auth::v2c("public"))
         .build_with(&shared)
         .await?;
-    let client2 = Client::builder("192.0.2.1", Auth::v2c("public")) // TEST-NET-1 (unreachable)
+    let client2 = Client::builder(("192.0.2.1", 161), Auth::v2c("public")) // TEST-NET-1 (unreachable)
         .build_with(&shared)
         .await?;
 
@@ -79,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut futures = FuturesUnordered::new();
 
     for oid in &oids {
-        let client = Client::builder(container_target.to_string(), Auth::v2c("public"))
+        let client = Client::builder(container_target, Auth::v2c("public"))
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
             .build_with(&shared)
@@ -131,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Uses container user: privaes192_user (SHA-256 + AES-192)
         let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
 
-        let client = Client::builder(container_target.to_string(), auth)
+        let client = Client::builder(container_target, auth)
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
             .engine_cache(engine_cache.clone())
@@ -151,10 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrates behavior when some targets are unreachable.
     // Uses TEST-NET-1 (192.0.2.0/24) for unreachable addresses.
-    let targets = vec![
-        container_target.to_string(), // Reachable
-        "192.0.2.1".to_string(),      // TEST-NET-1 (unreachable)
-        "192.0.2.2".to_string(),      // TEST-NET-1 (unreachable)
+    let targets: Vec<(&str, u16)> = vec![
+        container_target,   // Reachable
+        ("192.0.2.1", 161), // TEST-NET-1 (unreachable)
+        ("192.0.2.2", 161), // TEST-NET-1 (unreachable)
     ];
 
     let shared = UdpTransport::bind("0.0.0.0:0").await?;
@@ -162,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut futures = FuturesUnordered::new();
 
     for target in &targets {
-        let client = Client::builder(target, Auth::v2c("public"))
+        let client = Client::builder(*target, Auth::v2c("public"))
             .timeout(Duration::from_millis(500))
             .retry(Retry::none())
             .build_with(&shared)

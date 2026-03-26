@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Target address - change to match your SNMP agent
-    let target = "127.0.0.1:11161";
+    let target = ("127.0.0.1", 11161);
 
     // Create a v2c client with the "public" community string
     // The builder pattern allows configuring timeout, retries, etc.

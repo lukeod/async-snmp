@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let target = "127.0.0.1:11161";
+    let target = ("127.0.0.1", 11161);
 
     // =========================================================================
     // Example 1: authPriv (SHA-1 + AES-128) - Most secure
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create multiple clients using the cached master keys
     // Note: These TEST-NET-1 addresses are for demonstration - they won't be reachable
-    let targets = ["192.0.2.1", "192.0.2.2", "192.0.2.3"];
+    let targets = [("192.0.2.1", 161), ("192.0.2.2", 161), ("192.0.2.3", 161)];
 
     for target_addr in &targets {
         // Clone master keys (cheap - just Arc increment)
@@ -122,13 +122,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         {
             Ok(client) => {
-                println!("Connected to {} (using cached master keys)", target_addr);
+                println!(
+                    "Connected to {} (using cached master keys)",
+                    client.peer_addr()
+                );
                 // In a real scenario, you would poll OIDs here
                 drop(client);
             }
             Err(e) => {
                 // Expected to fail if hosts are not reachable
-                println!("Could not connect to {}: {}", target_addr, e);
+                println!(
+                    "Could not connect to {}:{}: {}",
+                    target_addr.0, target_addr.1, e
+                );
             }
         }
     }
