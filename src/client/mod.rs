@@ -24,15 +24,17 @@ impl Client<UdpHandle> {
     /// use std::time::Duration;
     ///
     /// # async fn example() -> async_snmp::Result<()> {
-    /// // Simple v2c client with default settings
-    /// let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+    /// // (host, port) tuple - convenient when host and port are separate
+    /// let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
     ///     .connect().await?;
     ///
-    /// // v3 client with authentication
-    /// let client = Client::builder("192.168.1.1:161",
-    ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"))
-    ///     .timeout(Duration::from_secs(10))
-    ///     .retry(Retry::fixed(5, Duration::ZERO))
+    /// // Combined address string (port defaults to 161 if omitted)
+    /// let client = Client::builder("switch.local", Auth::v2c("public"))
+    ///     .connect().await?;
+    ///
+    /// // SocketAddr works too
+    /// let addr: std::net::SocketAddr = "192.168.1.1:161".parse().unwrap();
+    /// let client = Client::builder(addr, Auth::v2c("public"))
     ///     .connect().await?;
     /// # Ok(())
     /// # }

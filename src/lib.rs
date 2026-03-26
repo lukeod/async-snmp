@@ -18,7 +18,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<async_snmp::Error>> {
-//!     // SNMPv2c client - target accepts (host, port) or a combined string
+//!     // SNMPv2c client - target accepts (host, port), a string, or a SocketAddr
 //!     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
 //!         .timeout(Duration::from_secs(5))
 //!         .connect()

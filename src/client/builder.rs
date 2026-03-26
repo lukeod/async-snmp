@@ -4,6 +4,7 @@
 //! constructing SNMP clients with any authentication mode (v1/v2c community
 //! or v3 USM).
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,9 @@ use super::Client;
 /// // From a (host, port) tuple - no bracket formatting needed for IPv6
 /// let t: Target = ("fe80::1", 161).into();
 /// let t: Target = ("switch.local".to_string(), 162).into();
+///
+/// // From a SocketAddr
+/// let t: Target = "192.168.1.1:161".parse::<std::net::SocketAddr>().unwrap().into();
 /// ```
 #[derive(Debug, Clone)]
 pub enum Target {
@@ -49,6 +53,15 @@ pub enum Target {
     Address(String),
     /// A separate host and port, e.g. `("fe80::1", 161)`.
     HostPort(String, u16),
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Target::Address(addr) => f.write_str(addr),
+            Target::HostPort(host, port) => write!(f, "{}:{}", host, port),
+        }
+    }
 }
 
 impl From<&str> for Target {
@@ -78,6 +91,12 @@ impl From<(&str, u16)> for Target {
 impl From<(String, u16)> for Target {
     fn from((host, port): (String, u16)) -> Self {
         Target::HostPort(host, port)
+    }
+}
+
+impl From<SocketAddr> for Target {
+    fn from(addr: SocketAddr) -> Self {
+        Target::HostPort(addr.ip().to_string(), addr.port())
     }
 }
 
@@ -129,9 +148,10 @@ impl ClientBuilder {
     /// # Arguments
     ///
     /// * `target` - The target address. Accepts a string (e.g., `"192.168.1.1"` or
-    ///   `"192.168.1.1:161"`), or a `(host, port)` tuple (e.g., `("fe80::1", 161)`).
-    ///   Port defaults to 161 if not specified. IPv6 addresses are supported
-    ///   as bare (`::1`) or bracketed (`[::1]:162`) forms.
+    ///   `"192.168.1.1:161"`), a `(host, port)` tuple (e.g., `("fe80::1", 161)`),
+    ///   or a [`SocketAddr`](std::net::SocketAddr). Port defaults to 161 if not
+    ///   specified. IPv6 addresses are supported as bare (`::1`) or bracketed
+    ///   (`[::1]:162`) forms.
     /// * `auth` - Authentication configuration (community or USM)
     ///
     /// # Example
@@ -421,11 +441,8 @@ impl ClientBuilder {
     /// configured timeout. To bypass DNS entirely, pass a resolved IP address.
     async fn resolve_target(&self) -> Result<SocketAddr> {
         let (host, port) = match &self.target {
-            Target::Address(addr) => {
-                let (h, p) = split_host_port(addr);
-                (h.to_string(), p)
-            }
-            Target::HostPort(host, port) => (host.clone(), *port),
+            Target::Address(addr) => split_host_port(addr),
+            Target::HostPort(host, port) => (host.as_str(), *port),
         };
 
         // Try direct parse first to avoid unnecessary async DNS lookup
@@ -433,27 +450,19 @@ impl ClientBuilder {
             return Ok(SocketAddr::new(ip, port));
         }
 
-        let target_display = match &self.target {
-            Target::Address(addr) => addr.clone(),
-            Target::HostPort(host, port) => format!("{}:{}", host, port),
-        };
-
-        let lookup = tokio::net::lookup_host((host.as_str(), port));
+        let lookup = tokio::net::lookup_host((host, port));
         let mut addrs = tokio::time::timeout(self.timeout, lookup)
             .await
             .map_err(|_| {
-                Error::Config(format!("DNS lookup timed out for '{}'", target_display).into())
-                    .boxed()
+                Error::Config(format!("DNS lookup timed out for '{}'", self.target).into()).boxed()
             })?
             .map_err(|e| {
-                Error::Config(
-                    format!("could not resolve address '{}': {}", target_display, e).into(),
-                )
-                .boxed()
+                Error::Config(format!("could not resolve address '{}': {}", self.target, e).into())
+                    .boxed()
             })?;
 
         addrs.next().ok_or_else(|| {
-            Error::Config(format!("could not resolve address '{}'", target_display).into()).boxed()
+            Error::Config(format!("could not resolve address '{}'", self.target).into()).boxed()
         })
     }
 
@@ -867,6 +876,34 @@ mod tests {
     fn test_target_from_tuple() {
         let t: Target = ("fe80::1", 161).into();
         assert!(matches!(t, Target::HostPort(ref h, 161) if h == "fe80::1"));
+    }
+
+    #[test]
+    fn test_target_from_socket_addr() {
+        let addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let t: Target = addr.into();
+        assert!(matches!(t, Target::HostPort(ref h, 162) if h == "192.168.1.1"));
+    }
+
+    #[test]
+    fn test_target_display() {
+        let t: Target = "192.168.1.1:161".into();
+        assert_eq!(t.to_string(), "192.168.1.1:161");
+
+        let t: Target = ("fe80::1", 161).into();
+        assert_eq!(t.to_string(), "fe80::1:161");
+
+        let addr: SocketAddr = "[::1]:162".parse().unwrap();
+        let t: Target = addr.into();
+        assert_eq!(t.to_string(), "::1:162");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_target_socket_addr() {
+        let addr: SocketAddr = "10.0.0.1:162".parse().unwrap();
+        let builder = ClientBuilder::new(addr, Auth::default());
+        let resolved = builder.resolve_target().await.unwrap();
+        assert_eq!(resolved, addr);
     }
 
     #[tokio::test]

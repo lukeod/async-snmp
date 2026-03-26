@@ -69,15 +69,20 @@ async fn main() -> Result<(), async_snmp::Error> {
 }
 ```
 
-The target accepts a `(host, port)` tuple or a combined string (`"192.168.1.1:161"`). The tuple form avoids bracket-formatting for IPv6 addresses:
+The target accepts a `(host, port)` tuple, a combined string, or a `SocketAddr`:
 
 ```rust
-// IPv6 - no bracket escaping needed
+// (host, port) tuple - no bracket formatting needed for IPv6
 let client = Client::builder(("fe80::1", 161), Auth::v2c("public"))
     .connect().await?;
 
-// Combined string also works (port defaults to 161 if omitted)
+// Combined string (port defaults to 161 if omitted)
 let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+    .connect().await?;
+
+// SocketAddr - useful when the address is already resolved
+let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
+let client = Client::builder(addr, Auth::v2c("public"))
     .connect().await?;
 ```
 

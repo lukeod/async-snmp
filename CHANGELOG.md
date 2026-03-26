@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-03-27
+
 ### Added
 
-- `Target` enum for specifying client target addresses. `ClientBuilder::new()` and `Client::builder()` now accept `(host, port)` tuples in addition to combined address strings. This avoids IPv6 bracket formatting when host and port are stored separately - requested by @sjthomason (#17)
+- `Target` enum for specifying client target addresses. `ClientBuilder::new()` and `Client::builder()` now accept `(host, port)` tuples and `SocketAddr` in addition to combined address strings. This avoids IPv6 bracket formatting when host and port are stored separately - requested by @sjthomason (#17)
+- `Target` implements `Display`
+- `From<SocketAddr>` for `Target`, for use when the address is already resolved
+
+### Changed
+
+- **Breaking:** `ClientBuilder::new()` and `Client::builder()` now accept `impl Into<Target>` instead of `impl Into<String>`. `Target` converts from `&str`, `String`, `(&str, u16)`, `(String, u16)`, and `SocketAddr`. All existing `&str` and `String` callers work unchanged, but code relying on other `Into<String>` types may need adjustment
 
 ## [0.9.0] - 2026-03-27
 
