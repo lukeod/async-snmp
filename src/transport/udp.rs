@@ -95,6 +95,7 @@ impl Default for UdpTransportConfig {
 ///
 /// Owns a single UDP socket and spawns a background receiver task.
 /// Create [`UdpHandle`]s for each target via [`handle()`](Self::handle).
+#[derive(Clone)]
 pub struct UdpTransport {
     inner: Arc<UdpTransportInner>,
 }
