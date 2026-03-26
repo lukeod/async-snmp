@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve ifTable and walk it
     let if_table = mib_support::resolve_oid(&mib, "ifTable")?;
 
-    let client = Client::builder(format!("{}:161", target), Auth::v2c("public"))
+    let client = Client::builder(target, Auth::v2c("public"))
         .connect()
         .await?;
 

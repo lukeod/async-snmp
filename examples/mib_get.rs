@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     // Connect and GET
-    let client = Client::builder(format!("{}:161", target), Auth::v2c("public"))
+    let client = Client::builder(target, Auth::v2c("public"))
         .connect()
         .await?;
 
