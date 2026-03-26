@@ -3,8 +3,6 @@
 //! This module provides reusable clap argument structures for the `asnmp-*` CLI tools.
 
 use clap::{Parser, ValueEnum};
-use std::net::SocketAddr;
-use std::str::FromStr;
 use std::time::Duration;
 
 use crate::Version;
@@ -101,36 +99,6 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
-    /// Parse the target into a SocketAddr, defaulting to port 161.
-    pub async fn target_addr(&self) -> Result<SocketAddr, String> {
-        // If the target doesn't contain a port, add the default SNMP port
-        let addr_str = if self.target.contains(':') {
-            self.target.clone()
-        } else {
-            format!("{}:161", self.target)
-        };
-
-        // Try direct parse first to avoid unnecessary async DNS lookup
-        if let Ok(addr) = SocketAddr::from_str(&addr_str) {
-            return Ok(addr);
-        }
-
-        // Async DNS resolution, bounded by the configured timeout
-        let lookup = tokio::net::lookup_host(&addr_str);
-        let timeout = self.timeout_duration();
-        let mut addrs = tokio::time::timeout(timeout, lookup)
-            .await
-            .map_err(|_| format!("DNS lookup timed out for '{}'", self.target))?
-            .map_err(|e| format!("invalid target '{}': {}", self.target, e))?;
-
-        addrs.next().ok_or_else(|| {
-            format!(
-                "invalid target '{}': could not resolve hostname",
-                self.target,
-            )
-        })
-    }
-
     /// Get the timeout as a Duration.
     pub fn timeout_duration(&self) -> Duration {
         Duration::from_secs_f64(self.timeout)
@@ -447,40 +415,6 @@ fn parse_hex_string(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_target_addr_with_port() {
-        let args = CommonArgs {
-            target: "192.168.1.1:162".to_string(),
-            snmp_version: SnmpVersion::V2c,
-            community: "public".to_string(),
-            timeout: 5.0,
-            retries: 3,
-            backoff: BackoffStrategy::None,
-            backoff_delay: 100,
-            backoff_max: 5000,
-            backoff_jitter: 0.25,
-        };
-        let addr = args.target_addr().await.unwrap();
-        assert_eq!(addr.port(), 162);
-    }
-
-    #[tokio::test]
-    async fn test_target_addr_default_port() {
-        let args = CommonArgs {
-            target: "192.168.1.1".to_string(),
-            snmp_version: SnmpVersion::V2c,
-            community: "public".to_string(),
-            timeout: 5.0,
-            retries: 3,
-            backoff: BackoffStrategy::None,
-            backoff_delay: 100,
-            backoff_max: 5000,
-            backoff_jitter: 0.25,
-        };
-        let addr = args.target_addr().await.unwrap();
-        assert_eq!(addr.port(), 161);
-    }
 
     #[test]
     fn test_retry_config_none() {

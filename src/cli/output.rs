@@ -7,7 +7,6 @@ use crate::cli::hints;
 use crate::{Oid, Value, VarBind, Version};
 use serde::Serialize;
 use std::io::{self, Write};
-use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Operation type for verbose output.
@@ -52,8 +51,8 @@ pub enum SecurityInfo {
 
 /// Request metadata for verbose output.
 #[derive(Debug)]
-pub struct RequestInfo {
-    pub target: SocketAddr,
+pub struct RequestInfo<'a> {
+    pub target: &'a str,
     pub version: Version,
     pub security: SecurityInfo,
     pub operation: OperationType,
@@ -319,7 +318,7 @@ impl<'a> OutputContext<'a> {
     /// Write operation results to stdout.
     pub fn write_results(
         &self,
-        target: SocketAddr,
+        target: &str,
         version: Version,
         varbinds: &[VarBind],
         elapsed: Option<Duration>,
@@ -337,7 +336,7 @@ impl<'a> OutputContext<'a> {
 
     fn build_result(
         &self,
-        target: SocketAddr,
+        target: &str,
         version: Version,
         varbinds: &[VarBind],
         elapsed: Option<Duration>,

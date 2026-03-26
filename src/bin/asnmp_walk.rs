@@ -56,14 +56,7 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Parse target address
-    let target = match args.common.target_addr().await {
-        Ok(addr) => addr,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let target = &args.common.target;
 
     // Load MIBs if requested
     #[cfg(feature = "mib")]
@@ -119,7 +112,7 @@ async fn main() -> ExitCode {
         };
 
         let request_info = RequestInfo {
-            target,
+            target: target.as_str(),
             version: version.into(),
             security,
             operation,
@@ -130,7 +123,7 @@ async fn main() -> ExitCode {
 
     // Build and run the walk
     let start = Instant::now();
-    let result = run_walk(target, &args, oid, use_getnext).await;
+    let result = run_walk(target.as_str(), &args, oid, use_getnext).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -156,7 +149,7 @@ async fn main() -> ExitCode {
             };
 
             if let Err(e) =
-                output_ctx.write_results(target, version.into(), &varbinds, timing, None)
+                output_ctx.write_results(target.as_str(), version.into(), &varbinds, timing, None)
             {
                 eprintln!("Error writing output: {}", e);
                 return ExitCode::FAILURE;
@@ -172,7 +165,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run_walk(
-    target: std::net::SocketAddr,
+    target: &str,
     args: &Args,
     oid: Oid,
     use_getnext: bool,
@@ -189,7 +182,7 @@ async fn run_walk(
         WalkMode::GetBulk
     };
 
-    let client = Client::builder(target.to_string(), auth)
+    let client = Client::builder(target, auth)
         .timeout(args.common.timeout_duration())
         .retry(args.common.retry_config())
         .walk_mode(walk_mode)
