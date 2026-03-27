@@ -275,20 +275,29 @@ impl std::fmt::Debug for LocalizedKey {
     }
 }
 
+/// Dispatch a generic function over the hash type for a given `AuthProtocol`.
+///
+/// Usage: `dispatch_auth!(protocol, fn_name, arg1, arg2, ...)`
+/// Expands to `fn_name::<HashType>(arg1, arg2, ...)` for the matching hash.
+macro_rules! dispatch_auth {
+    ($protocol:expr, $fn:ident, $($arg:expr),*) => {
+        match $protocol {
+            AuthProtocol::Md5 => $fn::<md5::Md5>($($arg),*),
+            AuthProtocol::Sha1 => $fn::<sha1::Sha1>($($arg),*),
+            AuthProtocol::Sha224 => $fn::<sha2::Sha224>($($arg),*),
+            AuthProtocol::Sha256 => $fn::<sha2::Sha256>($($arg),*),
+            AuthProtocol::Sha384 => $fn::<sha2::Sha384>($($arg),*),
+            AuthProtocol::Sha512 => $fn::<sha2::Sha512>($($arg),*),
+        }
+    };
+}
+
 /// Password to key transformation (RFC 3414 Section A.2.1).
 ///
 /// Creates a 1MB string by repeating the password, then hashes it.
 fn password_to_key(protocol: AuthProtocol, password: &[u8]) -> Vec<u8> {
     const EXPANSION_SIZE: usize = 1_048_576; // 1MB
-
-    match protocol {
-        AuthProtocol::Md5 => password_to_key_impl::<md5::Md5>(password, EXPANSION_SIZE),
-        AuthProtocol::Sha1 => password_to_key_impl::<sha1::Sha1>(password, EXPANSION_SIZE),
-        AuthProtocol::Sha224 => password_to_key_impl::<sha2::Sha224>(password, EXPANSION_SIZE),
-        AuthProtocol::Sha256 => password_to_key_impl::<sha2::Sha256>(password, EXPANSION_SIZE),
-        AuthProtocol::Sha384 => password_to_key_impl::<sha2::Sha384>(password, EXPANSION_SIZE),
-        AuthProtocol::Sha512 => password_to_key_impl::<sha2::Sha512>(password, EXPANSION_SIZE),
-    }
+    dispatch_auth!(protocol, password_to_key_impl, password, EXPANSION_SIZE)
 }
 
 fn password_to_key_impl<D>(password: &[u8], expansion_size: usize) -> Vec<u8>
@@ -327,14 +336,7 @@ where
 /// Binds a master key to a specific engine ID:
 /// localized_key = H(master_key || engine_id || master_key)
 fn localize_key(protocol: AuthProtocol, master_key: &[u8], engine_id: &[u8]) -> Vec<u8> {
-    match protocol {
-        AuthProtocol::Md5 => localize_key_impl::<md5::Md5>(master_key, engine_id),
-        AuthProtocol::Sha1 => localize_key_impl::<sha1::Sha1>(master_key, engine_id),
-        AuthProtocol::Sha224 => localize_key_impl::<sha2::Sha224>(master_key, engine_id),
-        AuthProtocol::Sha256 => localize_key_impl::<sha2::Sha256>(master_key, engine_id),
-        AuthProtocol::Sha384 => localize_key_impl::<sha2::Sha384>(master_key, engine_id),
-        AuthProtocol::Sha512 => localize_key_impl::<sha2::Sha512>(master_key, engine_id),
-    }
+    dispatch_auth!(protocol, localize_key_impl, master_key, engine_id)
 }
 
 fn localize_key_impl<D>(master_key: &[u8], engine_id: &[u8]) -> Vec<u8>
@@ -350,14 +352,8 @@ where
 
 /// Compute HMAC with the appropriate algorithm.
 fn compute_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> Vec<u8> {
-    match protocol {
-        AuthProtocol::Md5 => compute_hmac_impl::<md5::Md5>(key, data, 12),
-        AuthProtocol::Sha1 => compute_hmac_impl::<sha1::Sha1>(key, data, 12),
-        AuthProtocol::Sha224 => compute_hmac_impl::<sha2::Sha224>(key, data, 16),
-        AuthProtocol::Sha256 => compute_hmac_impl::<sha2::Sha256>(key, data, 24),
-        AuthProtocol::Sha384 => compute_hmac_impl::<sha2::Sha384>(key, data, 32),
-        AuthProtocol::Sha512 => compute_hmac_impl::<sha2::Sha512>(key, data, 48),
-    }
+    let truncate_len = protocol.mac_len();
+    dispatch_auth!(protocol, compute_hmac_impl, key, data, truncate_len)
 }
 
 /// Generic HMAC computation with truncation.

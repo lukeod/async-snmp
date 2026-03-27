@@ -350,92 +350,52 @@ pub fn parse_discovery_response_with_limits(
     ))
 }
 
+/// Returns true if `pdu` is a Report PDU containing a varbind with the given OID.
+fn pdu_has_report_oid(pdu: &crate::pdu::Pdu, expected_oid: &crate::Oid) -> bool {
+    use crate::pdu::PduType;
+    pdu.pdu_type == PduType::Report && pdu.varbinds.iter().any(|vb| &vb.oid == expected_oid)
+}
+
 /// Check if a Report PDU indicates "unknown engine ID" (discovery response).
 ///
 /// Returns true if the PDU contains usmStatsUnknownEngineIDs varbind.
 pub fn is_unknown_engine_id_report(pdu: &crate::pdu::Pdu) -> bool {
-    use crate::pdu::PduType;
-
-    if pdu.pdu_type != PduType::Report {
-        return false;
-    }
-
-    let unknown_engine_ids_oid = report_oids::unknown_engine_ids();
-    pdu.varbinds
-        .iter()
-        .any(|vb| vb.oid == unknown_engine_ids_oid)
+    pdu_has_report_oid(pdu, &report_oids::unknown_engine_ids())
 }
 
 /// Check if a Report PDU indicates "not in time window".
 ///
 /// Returns true if the PDU contains usmStatsNotInTimeWindows varbind.
 pub fn is_not_in_time_window_report(pdu: &crate::pdu::Pdu) -> bool {
-    use crate::pdu::PduType;
-
-    if pdu.pdu_type != PduType::Report {
-        return false;
-    }
-
-    let not_in_time_windows_oid = report_oids::not_in_time_windows();
-    pdu.varbinds
-        .iter()
-        .any(|vb| vb.oid == not_in_time_windows_oid)
+    pdu_has_report_oid(pdu, &report_oids::not_in_time_windows())
 }
 
 /// Check if a Report PDU indicates "wrong digest" (authentication failure).
 ///
 /// Returns true if the PDU contains usmStatsWrongDigests varbind.
 pub fn is_wrong_digest_report(pdu: &crate::pdu::Pdu) -> bool {
-    use crate::pdu::PduType;
-
-    if pdu.pdu_type != PduType::Report {
-        return false;
-    }
-
-    let wrong_digests_oid = report_oids::wrong_digests();
-    pdu.varbinds.iter().any(|vb| vb.oid == wrong_digests_oid)
+    pdu_has_report_oid(pdu, &report_oids::wrong_digests())
 }
 
 /// Check if a Report PDU indicates "unsupported security level".
 ///
 /// Returns true if the PDU contains usmStatsUnsupportedSecLevels varbind.
 pub fn is_unsupported_sec_level_report(pdu: &crate::pdu::Pdu) -> bool {
-    use crate::pdu::PduType;
-
-    if pdu.pdu_type != PduType::Report {
-        return false;
-    }
-
-    let oid = report_oids::unsupported_sec_levels();
-    pdu.varbinds.iter().any(|vb| vb.oid == oid)
+    pdu_has_report_oid(pdu, &report_oids::unsupported_sec_levels())
 }
 
 /// Check if a Report PDU indicates "unknown user name".
 ///
 /// Returns true if the PDU contains usmStatsUnknownUserNames varbind.
 pub fn is_unknown_user_name_report(pdu: &crate::pdu::Pdu) -> bool {
-    use crate::pdu::PduType;
-
-    if pdu.pdu_type != PduType::Report {
-        return false;
-    }
-
-    let oid = report_oids::unknown_user_names();
-    pdu.varbinds.iter().any(|vb| vb.oid == oid)
+    pdu_has_report_oid(pdu, &report_oids::unknown_user_names())
 }
 
 /// Check if a Report PDU indicates "decryption error".
 ///
 /// Returns true if the PDU contains usmStatsDecryptionErrors varbind.
 pub fn is_decryption_error_report(pdu: &crate::pdu::Pdu) -> bool {
-    use crate::pdu::PduType;
-
-    if pdu.pdu_type != PduType::Report {
-        return false;
-    }
-
-    let oid = report_oids::decryption_errors();
-    pdu.varbinds.iter().any(|vb| vb.oid == oid)
+    pdu_has_report_oid(pdu, &report_oids::decryption_errors())
 }
 
 #[cfg(test)]
