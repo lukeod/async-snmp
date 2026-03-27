@@ -32,10 +32,11 @@ impl Agent {
             return Ok(None);
         }
 
-        // Skip non-request PDUs
-        if !is_request_pdu(msg.pdu.pdu_type) {
-            return Ok(None);
-        }
+        // Skip non-request PDUs (TrapV1 and other non-request types are ignored)
+        let pdu = match msg.pdu.standard() {
+            Some(p) if is_request_pdu(p.pdu_type) => p,
+            _ => return Ok(None),
+        };
 
         // Build request context
         let mut ctx = RequestContext {
@@ -45,8 +46,8 @@ impl Agent {
             security_name: msg.community.clone(),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
-            request_id: msg.pdu.request_id,
-            pdu_type: msg.pdu.pdu_type,
+            request_id: pdu.request_id,
+            pdu_type: pdu.pdu_type,
             group_name: None,
             read_view: None,
             write_view: None,
@@ -68,7 +69,7 @@ impl Agent {
             }
         }
 
-        let response_pdu = self.dispatch_request(&ctx, &msg.pdu).await?;
+        let response_pdu = self.dispatch_request(&ctx, pdu).await?;
         let response_msg = CommunityMessage::v1(msg.community, response_pdu);
 
         Ok(Some(response_msg.encode()))
@@ -89,9 +90,10 @@ impl Agent {
         }
 
         // Skip non-request PDUs
-        if !is_request_pdu(msg.pdu.pdu_type) {
-            return Ok(None);
-        }
+        let pdu = match msg.pdu.standard() {
+            Some(p) if is_request_pdu(p.pdu_type) => p,
+            _ => return Ok(None),
+        };
 
         // Build request context
         let mut ctx = RequestContext {
@@ -101,8 +103,8 @@ impl Agent {
             security_name: msg.community.clone(),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
-            request_id: msg.pdu.request_id,
-            pdu_type: msg.pdu.pdu_type,
+            request_id: pdu.request_id,
+            pdu_type: pdu.pdu_type,
             group_name: None,
             read_view: None,
             write_view: None,
@@ -124,7 +126,7 @@ impl Agent {
             }
         }
 
-        let response_pdu = self.dispatch_request(&ctx, &msg.pdu).await?;
+        let response_pdu = self.dispatch_request(&ctx, pdu).await?;
         let response_msg = CommunityMessage::v2c(msg.community, response_pdu);
 
         Ok(Some(response_msg.encode()))

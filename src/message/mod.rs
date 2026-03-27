@@ -10,7 +10,7 @@
 mod community;
 mod v3;
 
-pub use community::CommunityMessage;
+pub use community::{CommunityMessage, CommunityPdu};
 pub use v3::{
     MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, SecurityModel, V3Message, V3MessageData,
 };
@@ -37,28 +37,31 @@ pub enum Message {
 impl Message {
     /// Get a reference to the PDU.
     ///
-    /// For V3 messages with encrypted data, this will panic.
+    /// Panics for V3 messages with encrypted data or SNMPv1 Trap messages.
     /// Use `try_pdu()` for a fallible version.
     pub fn pdu(&self) -> &Pdu {
         match self {
-            Message::Community(m) => &m.pdu,
+            Message::Community(m) => m
+                .pdu
+                .standard()
+                .expect("community message contains TrapV1; use try_pdu()"),
             Message::V3(m) => m.pdu().expect("V3 message is encrypted; use try_pdu()"),
         }
     }
 
     /// Try to get a reference to the PDU.
     ///
-    /// Returns `None` for encrypted V3 messages.
+    /// Returns `None` for encrypted V3 messages or SNMPv1 Trap messages.
     pub fn try_pdu(&self) -> Option<&Pdu> {
         match self {
-            Message::Community(m) => Some(&m.pdu),
+            Message::Community(m) => m.pdu.standard(),
             Message::V3(m) => m.pdu(),
         }
     }
 
     /// Consume and return the PDU.
     ///
-    /// For V3 messages with encrypted data, this will panic.
+    /// Panics for V3 messages with encrypted data or SNMPv1 Trap messages.
     /// Use `try_into_pdu()` for a fallible version.
     pub fn into_pdu(self) -> Pdu {
         match self {
@@ -69,10 +72,13 @@ impl Message {
 
     /// Try to consume and return the PDU.
     ///
-    /// Returns `None` for encrypted V3 messages.
+    /// Returns `None` for encrypted V3 messages or SNMPv1 Trap messages.
     pub fn try_into_pdu(self) -> Option<Pdu> {
         match self {
-            Message::Community(m) => Some(m.into_pdu()),
+            Message::Community(m) => match m.pdu {
+                CommunityPdu::Standard(p) => Some(p),
+                CommunityPdu::TrapV1(_) => None,
+            },
             Message::V3(m) => m.into_pdu(),
         }
     }
