@@ -1081,13 +1081,7 @@ impl std::fmt::Display for Value {
             Value::Counter32(v) => write!(f, "{}", v),
             Value::Gauge32(v) => write!(f, "{}", v),
             Value::TimeTicks(v) => {
-                // Display as time
-                let secs = v / 100;
-                let days = secs / 86400;
-                let hours = (secs % 86400) / 3600;
-                let mins = (secs % 3600) / 60;
-                let s = secs % 60;
-                write!(f, "{}d {}h {}m {}s", days, hours, mins, s)
+                write!(f, "{}", crate::format::format_timeticks(*v))
             }
             Value::Opaque(data) => write!(f, "Opaque(0x{})", hex::encode(data)),
             Value::Counter64(v) => write!(f, "{}", v),
@@ -1573,10 +1567,9 @@ mod tests {
 
     #[test]
     fn test_display_timeticks() {
-        // 123456 hundredths = 1234.56 seconds
-        // = 0d 0h 20m 34s
+        // 123456 hundredths = 1234.56 seconds = 20m 34.56s
         let v = Value::TimeTicks(123456);
-        assert_eq!(format!("{}", v), "0d 0h 20m 34s");
+        assert_eq!(format!("{}", v), "00:20:34.56");
     }
 
     #[test]

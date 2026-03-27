@@ -21,6 +21,8 @@
 
 use std::fmt::Write;
 
+use crate::format::hex;
+
 /// Apply RFC 2579 DISPLAY-HINT formatting to raw bytes.
 ///
 /// Parses the hint string and applies it to the data in a single pass.
@@ -61,7 +63,7 @@ use std::fmt::Write;
 /// ```
 pub fn apply(hint: &str, data: &[u8]) -> String {
     if hint.is_empty() || data.is_empty() {
-        return hex_encode(data);
+        return hex::encode(data);
     }
 
     let hint = hint.as_bytes();
@@ -88,7 +90,7 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
 
         // (2) Octet length - one or more decimal digits (required)
         if hint_pos >= hint.len() || !is_digit(hint[hint_pos]) {
-            return hex_encode(data);
+            return hex::encode(data);
         }
 
         let mut take = 0usize;
@@ -98,17 +100,17 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
         }
 
         if take == 0 {
-            return hex_encode(data);
+            return hex::encode(data);
         }
 
         // (3) Format character (required)
         if hint_pos >= hint.len() {
-            return hex_encode(data);
+            return hex::encode(data);
         }
 
         let fmt_char = hint[hint_pos];
         if !matches!(fmt_char, b'd' | b'x' | b'o' | b'a' | b't') {
-            return hex_encode(data);
+            return hex::encode(data);
         }
         hint_pos += 1;
 
@@ -164,7 +166,7 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                 }
                 b'x' => {
                     // Hex encoding - zero-padded per byte
-                    write_hex(&mut result, chunk);
+                    hex::write_to(&mut result, chunk);
                 }
                 b'o' => {
                     // Big-endian octal
@@ -181,7 +183,7 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                     // UTF-8 text - decode as proper UTF-8, fall back to hex on error
                     match std::str::from_utf8(chunk) {
                         Ok(s) => result.push_str(s),
-                        Err(_) => write_hex(&mut result, chunk),
+                        Err(_) => hex::write_to(&mut result, chunk),
                     }
                 }
                 _ => unreachable!(),
@@ -207,22 +209,6 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
     }
 
     result
-}
-
-/// Encode bytes as lowercase hex string.
-fn hex_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 2);
-    write_hex(&mut out, data);
-    out
-}
-
-/// Write hex-encoded bytes to a String.
-fn write_hex(out: &mut String, data: &[u8]) {
-    const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
-    for &b in data {
-        out.push(HEX_TABLE[(b >> 4) as usize] as char);
-        out.push(HEX_TABLE[(b & 0x0f) as usize] as char);
-    }
 }
 
 #[inline]
