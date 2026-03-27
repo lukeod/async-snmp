@@ -171,10 +171,17 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                     let val = chunk.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
                     let _ = write!(result, "{:o}", val);
                 }
-                b'a' | b't' => {
-                    // ASCII/UTF-8 - write bytes directly
+                b'a' => {
+                    // ASCII - write bytes directly (single-byte characters)
                     for &b in chunk {
                         result.push(b as char);
+                    }
+                }
+                b't' => {
+                    // UTF-8 text - decode as proper UTF-8, fall back to hex on error
+                    match std::str::from_utf8(chunk) {
+                        Ok(s) => result.push_str(s),
+                        Err(_) => write_hex(&mut result, chunk),
                     }
                 }
                 _ => unreachable!(),
@@ -416,6 +423,28 @@ mod tests {
     #[test]
     fn utf8_format() {
         assert_eq!(apply("10t", b"hello"), "hello");
+    }
+
+    #[test]
+    fn utf8_multibyte_sequences() {
+        // "café" in UTF-8: c, a, f, e-with-acute (0xc3 0xa9)
+        let bytes = "café".as_bytes();
+        assert_eq!(apply("255t", bytes), "café");
+    }
+
+    #[test]
+    fn utf8_multibyte_cjk() {
+        // U+4E16 (世) = 0xe4 0xb8 0x96
+        let bytes = "世界".as_bytes();
+        assert_eq!(apply("255t", bytes), "世界");
+    }
+
+    #[test]
+    fn utf8_invalid_bytes_fallback_to_hex() {
+        // Invalid UTF-8 sequence should not produce garbage chars
+        let bytes = &[0xff, 0xfe];
+        // Invalid UTF-8 falls back to hex
+        assert_eq!(apply("2t", bytes), "fffe");
     }
 
     #[test]
