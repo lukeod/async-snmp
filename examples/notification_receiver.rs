@@ -118,20 +118,27 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
     // Common fields available on all notification types
     println!("  Version: {:?}", notification.version());
     println!("  Confirmed: {}", notification.is_confirmed());
-    println!("  Trap OID: {}", notification.trap_oid());
+    let trap_oid = match notification.trap_oid() {
+        Ok(oid) => oid,
+        Err(err) => {
+            println!("  Trap OID: <invalid: {}>", err);
+            return;
+        }
+    };
+
+    println!("  Trap OID: {}", trap_oid);
     println!("  Uptime: {} centiseconds", notification.uptime());
 
     // Identify well-known trap types
-    let trap_oid = notification.trap_oid();
-    let trap_name = if *trap_oid == oids::cold_start() {
+    let trap_name = if trap_oid == oids::cold_start() {
         "coldStart"
-    } else if *trap_oid == oids::warm_start() {
+    } else if trap_oid == oids::warm_start() {
         "warmStart"
-    } else if *trap_oid == oids::link_down() {
+    } else if trap_oid == oids::link_down() {
         "linkDown"
-    } else if *trap_oid == oids::link_up() {
+    } else if trap_oid == oids::link_up() {
         "linkUp"
-    } else if *trap_oid == oids::auth_failure() {
+    } else if trap_oid == oids::auth_failure() {
         "authenticationFailure"
     } else {
         "enterprise-specific"
