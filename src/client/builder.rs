@@ -502,6 +502,10 @@ impl ClientBuilder {
             }
             Auth::Usm(usm) => {
                 let mut security = UsmConfig::new(Bytes::copy_from_slice(usm.username.as_bytes()));
+                if let Some(context_name) = &usm.context_name {
+                    security =
+                        security.context_name(Bytes::copy_from_slice(context_name.as_bytes()));
+                }
 
                 // Prefer master_keys over passwords if available
                 if let Some(ref master_keys) = usm.master_keys {
@@ -870,6 +874,23 @@ mod tests {
         };
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
         assert!(builder.validate().is_ok());
+    }
+
+    #[test]
+    fn test_build_config_preserves_v3_context_name() {
+        let builder = ClientBuilder::new(
+            "192.168.1.1:161",
+            Auth::usm("admin")
+                .auth(AuthProtocol::Sha256, "authpass")
+                .context_name("vlan100"),
+        );
+
+        let config = builder.build_config();
+        let security = config
+            .v3_security
+            .expect("expected v3 security config to be built");
+
+        assert_eq!(security.context_name.as_ref(), b"vlan100");
     }
 
     #[test]

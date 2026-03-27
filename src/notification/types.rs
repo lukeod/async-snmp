@@ -27,6 +27,8 @@ pub struct UsmConfig {
     pub auth: Option<(AuthProtocol, Vec<u8>)>,
     /// Privacy protocol and password
     pub privacy: Option<(PrivProtocol, Vec<u8>)>,
+    /// SNMPv3 context name for VACM context selection.
+    pub context_name: Bytes,
     /// Pre-computed master keys for efficient key derivation
     pub master_keys: Option<crate::v3::MasterKeys>,
 }
@@ -38,6 +40,7 @@ impl UsmConfig {
             username: username.into(),
             auth: None,
             privacy: None,
+            context_name: Bytes::new(),
             master_keys: None,
         }
     }
@@ -51,6 +54,12 @@ impl UsmConfig {
     /// Add privacy/encryption (authPriv).
     pub fn privacy(mut self, protocol: PrivProtocol, password: impl AsRef<[u8]>) -> Self {
         self.privacy = Some((protocol, password.as_ref().to_vec()));
+        self
+    }
+
+    /// Set the SNMPv3 context name for scoped PDUs.
+    pub fn context_name(mut self, context_name: impl Into<Bytes>) -> Self {
+        self.context_name = context_name.into();
         self
     }
 
@@ -130,6 +139,7 @@ impl std::fmt::Debug for UsmConfig {
             .field("username", &String::from_utf8_lossy(&self.username))
             .field("auth", &self.auth.as_ref().map(|(p, _)| p))
             .field("privacy", &self.privacy.as_ref().map(|(p, _)| p))
+            .field("context_name", &String::from_utf8_lossy(&self.context_name))
             .field(
                 "master_keys",
                 &self.master_keys.as_ref().map(|mk| {
@@ -176,6 +186,7 @@ mod tests {
         assert_eq!(config.security_level(), SecurityLevel::AuthNoPriv);
         assert!(config.auth.is_some());
         assert!(config.privacy.is_none());
+        assert!(config.context_name.is_empty());
     }
 
     #[test]
@@ -186,6 +197,12 @@ mod tests {
         assert_eq!(config.security_level(), SecurityLevel::AuthPriv);
         assert!(config.auth.is_some());
         assert!(config.privacy.is_some());
+    }
+
+    #[test]
+    fn test_usm_user_config_context_name() {
+        let config = UsmUserConfig::new(Bytes::from_static(b"testuser")).context_name("ctx");
+        assert_eq!(config.context_name.as_ref(), b"ctx");
     }
 
     #[test]
