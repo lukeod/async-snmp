@@ -2,12 +2,12 @@
 //!
 //! Part of the async-snmp CLI utilities.
 
-use async_snmp::cli::args::{CommonArgs, OutputArgs, SnmpVersion, V3Args, ValueType};
+use async_snmp::cli::args::{CommonArgs, OutputArgs, V3Args, ValueType};
 #[cfg(feature = "mib")]
 use async_snmp::cli::output::VarBindFormatter;
 use async_snmp::cli::output::{
-    OperationType, OutputContext, RequestInfo, SecurityInfo, write_error, write_verbose_request,
-    write_verbose_response,
+    OperationType, OutputContext, RequestInfo, build_security_info, write_error,
+    write_verbose_request, write_verbose_response,
 };
 use async_snmp::{Client, Oid, Value, VarBind};
 use clap::Parser;
@@ -136,30 +136,16 @@ async fn main() -> ExitCode {
     };
 
     // Determine version (V3 if username provided)
-    let version = if args.v3.is_v3() {
-        SnmpVersion::V3
-    } else {
-        args.common.snmp_version
-    };
+    let version = args.common.effective_version(&args.v3);
 
     // Verbose output: show request info before executing
     if args.output.verbose {
-        let security = if args.v3.is_v3() {
-            SecurityInfo::V3 {
-                username: args.v3.username.clone().unwrap_or_default(),
-                auth_protocol: args.v3.auth_protocol.map(|p| format!("{}", p)),
-                priv_protocol: args.v3.priv_protocol.map(|p| format!("{}", p)),
-            }
-        } else {
-            SecurityInfo::Community(args.common.community.clone())
-        };
-
         let oids: Vec<_> = varbinds.iter().map(|vb| vb.oid.clone()).collect();
 
         let request_info = RequestInfo {
             target: target.as_str(),
             version: version.into(),
-            security,
+            security: build_security_info(&args.v3, &args.common),
             operation: OperationType::Set,
             oids,
         };
@@ -177,26 +163,18 @@ async fn main() -> ExitCode {
             if args.output.verbose {
                 write_verbose_response(&result_varbinds, elapsed, !args.output.no_hints);
             }
-            let mut output_ctx = OutputContext::new(args.output.format);
-            output_ctx.show_hints = !args.output.no_hints;
-            output_ctx.force_hex = args.output.hex;
-            output_ctx.show_timing = args.output.timing;
+
+            let mut output_ctx = OutputContext::from_args(&args.output);
             #[cfg(feature = "mib")]
             if let Some(m) = &mib {
                 output_ctx.formatter = Some(m as &dyn VarBindFormatter);
             }
 
-            let timing = if args.output.timing {
-                Some(elapsed)
-            } else {
-                None
-            };
-
             if let Err(e) = output_ctx.write_results(
                 target.as_str(),
                 version.into(),
                 &result_varbinds,
-                timing,
+                args.output.elapsed(elapsed),
                 None,
             ) {
                 eprintln!("Error writing output: {}", e);

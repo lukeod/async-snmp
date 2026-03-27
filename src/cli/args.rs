@@ -105,6 +105,15 @@ impl CommonArgs {
         Duration::from_secs_f64(self.timeout)
     }
 
+    /// Resolve the effective SNMP version, upgrading to V3 when a username is set.
+    pub fn effective_version(&self, v3: &V3Args) -> SnmpVersion {
+        if v3.is_v3() {
+            SnmpVersion::V3
+        } else {
+            self.snmp_version
+        }
+    }
+
     /// Build a Retry configuration from the CLI arguments.
     pub fn retry_config(&self) -> Retry {
         let backoff = match self.backoff {
@@ -243,6 +252,11 @@ pub struct OutputArgs {
 }
 
 impl OutputArgs {
+    /// Return elapsed as Some if timing output is enabled, None otherwise.
+    pub fn elapsed(&self, elapsed: Duration) -> Option<Duration> {
+        if self.timing { Some(elapsed) } else { None }
+    }
+
     /// Initialize tracing based on debug/trace flags.
     ///
     /// Note: --verbose is handled separately and shows structured request/response info.
