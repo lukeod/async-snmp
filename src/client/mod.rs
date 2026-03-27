@@ -65,6 +65,34 @@ pub use crate::notification::{DerivedKeys, UsmConfig};
 pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 
 // ============================================================================
+// Shared helpers
+// ============================================================================
+
+/// Extract an SNMP-level error from a PDU and convert it to an `Error::Snmp`.
+///
+/// Returns `Some(err)` if the PDU carries an SNMP error status, `None` otherwise.
+/// The `error_index` field is 1-based; 0 means the error applies to the whole PDU.
+pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Error>> {
+    if !pdu.is_error() {
+        return None;
+    }
+    let status = pdu.error_status_enum();
+    let oid = (pdu.error_index as usize)
+        .checked_sub(1)
+        .and_then(|idx| pdu.varbinds.get(idx))
+        .map(|vb| vb.oid.clone());
+    Some(
+        Error::Snmp {
+            target,
+            status,
+            index: pdu.error_index.max(0) as u32,
+            oid,
+        }
+        .boxed(),
+    )
+}
+
+// ============================================================================
 // Default configuration constants
 // ============================================================================
 
@@ -274,23 +302,10 @@ impl<T: Transport> Client<T> {
                     }
 
                     // Check for SNMP error
-                    if response_pdu.is_error() {
-                        let status = response_pdu.error_status_enum();
-                        // error_index is 1-based; 0 means error applies to PDU, not a specific varbind
-                        let oid = (response_pdu.error_index as usize)
-                            .checked_sub(1)
-                            .and_then(|idx| response_pdu.varbinds.get(idx))
-                            .map(|vb| vb.oid.clone());
-
+                    if let Some(err) = pdu_to_snmp_error(&response_pdu, self.peer_addr()) {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
-                        return Err(Error::Snmp {
-                            target: self.peer_addr(),
-                            status,
-                            index: response_pdu.error_index.max(0) as u32,
-                            oid,
-                        }
-                        .boxed());
+                        return Err(err);
                     }
 
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
