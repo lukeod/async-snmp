@@ -111,6 +111,12 @@ pub(crate) enum DecodeErrorKind {
     NegativeMaxRepetitions { value: i32 },
     /// OID exceeds maximum arc count during decode.
     OidTooLong { count: usize, max: usize },
+    /// Signed integer encoding exceeds 4 bytes.
+    IntegerTooLong { length: usize },
+    /// Unsigned 32-bit integer encoding exceeds 5 bytes.
+    Unsigned32TooLong { length: usize },
+    /// 9-octet integer64 encoding is missing required leading zero byte.
+    Integer64MissingLeadingZero,
 }
 
 impl std::fmt::Display for DecodeErrorKind {
@@ -197,6 +203,15 @@ impl std::fmt::Display for DecodeErrorKind {
             }
             Self::OidTooLong { count, max } => {
                 write!(f, "OID has {} arcs, exceeds maximum {}", count, max)
+            }
+            Self::IntegerTooLong { length } => {
+                write!(f, "integer encoding too long: {} bytes (max 4)", length)
+            }
+            Self::Unsigned32TooLong { length } => {
+                write!(f, "unsigned32 encoding too long: {} bytes (max 5)", length)
+            }
+            Self::Integer64MissingLeadingZero => {
+                write!(f, "9-octet integer64 missing required leading zero byte")
             }
         }
     }
