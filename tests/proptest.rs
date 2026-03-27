@@ -1001,14 +1001,13 @@ mod integer_overflow {
     use super::*;
 
     #[test]
-    fn integer_5_bytes_rejected() {
-        // Integer encoded with 5 bytes must be rejected (BER: signed i32 max 4 bytes)
-        // 02 05 01 02 03 04 05
+    fn integer_5_bytes_truncates() {
+        // 5-byte integers are accepted and truncated to i32, matching net-snmp CHECK_OVERFLOW_S.
+        // 0x0102030405 -> lower 32 bits -> 0x02030405
         let mut decoder = Decoder::new(Bytes::from_static(&[
             0x02, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05,
         ]));
-        let result = decoder.read_integer();
-        assert!(result.is_err(), "5-byte integer must be rejected");
+        assert_eq!(decoder.read_integer().unwrap(), 0x02030405_i32);
     }
 
     #[test]

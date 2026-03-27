@@ -295,7 +295,16 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
-                    let response_pdu = response.into_pdu();
+                    let response_pdu = match response.try_into_pdu() {
+                        Some(p) => p,
+                        None => {
+                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "received TrapV1 in response to request");
+                            return Err(Error::MalformedResponse {
+                                target: self.peer_addr(),
+                            }
+                            .boxed());
+                        }
+                    };
 
                     // Validate request ID
                     if response_pdu.request_id != request_id {
@@ -506,7 +515,7 @@ impl<T: Transport> Client<T> {
             let pdu = op(request_id, oids);
             let response = self.send_request(pdu).await?;
             if response.varbinds.len() > oids.len() {
-                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has more varbinds than requested");
+                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has more varbinds than requested");
                 return Err(Error::MalformedResponse {
                     target: self.peer_addr(),
                 }
@@ -529,7 +538,7 @@ impl<T: Transport> Client<T> {
             let pdu = op(request_id, chunk);
             let response = self.send_request(pdu).await?;
             if response.varbinds.len() > chunk.len() {
-                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1, snmp.op = op_name }, "response has more varbinds than requested in batch");
+                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1, snmp.op = op_name }, "response has more varbinds than requested in batch");
                 return Err(Error::MalformedResponse {
                     target: self.peer_addr(),
                 }
@@ -615,7 +624,7 @@ impl<T: Transport> Client<T> {
         let pdu = Pdu::set_request(request_id, vbs);
         let response = self.send_request(pdu).await?;
         if response.varbinds.len() > expected_count {
-            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response has more varbinds than requested");
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response has more varbinds than requested");
             return Err(Error::MalformedResponse {
                 target: self.peer_addr(),
             }

@@ -117,6 +117,8 @@ pub(crate) enum DecodeErrorKind {
     Unsigned32TooLong { length: usize },
     /// 9-octet integer64 encoding is missing required leading zero byte.
     Integer64MissingLeadingZero,
+    /// 5-octet unsigned32 encoding is missing required leading zero byte.
+    Unsigned32MissingLeadingZero,
 }
 
 impl std::fmt::Display for DecodeErrorKind {
@@ -205,13 +207,16 @@ impl std::fmt::Display for DecodeErrorKind {
                 write!(f, "OID has {} arcs, exceeds maximum {}", count, max)
             }
             Self::IntegerTooLong { length } => {
-                write!(f, "integer encoding too long: {} bytes (max 4)", length)
+                write!(f, "integer encoding too long: {} bytes (max 8)", length)
             }
             Self::Unsigned32TooLong { length } => {
-                write!(f, "unsigned32 encoding too long: {} bytes (max 5)", length)
+                write!(f, "unsigned32 encoding too long: {} bytes (max 9)", length)
             }
             Self::Integer64MissingLeadingZero => {
                 write!(f, "9-octet integer64 missing required leading zero byte")
+            }
+            Self::Unsigned32MissingLeadingZero => {
+                write!(f, "5-octet unsigned32 missing required leading zero byte")
             }
         }
     }

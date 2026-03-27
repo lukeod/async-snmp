@@ -57,7 +57,7 @@ static REQUEST_ID_COUNTER: LazyLock<AtomicI32> = LazyLock::new(|| {
 /// INTEGER (0..2147483647), and some implementations may not handle negative
 /// values correctly.
 ///
-/// The counter is seeded with time + PID to minimize collision risk across
+/// The counter is seeded with random bytes to minimize collision risk across
 /// process restarts.
 pub fn alloc_request_id() -> i32 {
     loop {

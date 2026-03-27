@@ -243,7 +243,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
             let human = format_timeticks(*v);
             DecodedValue {
                 type_name: "TimeTicks".into(),
-                display: format!("{} ({})", v, human),
+                display: format!("({}) {}", v, human),
                 json_value: (*v).into(),
                 formatted: Some(format!("({}) {}", v, human)),
                 raw_hex: None,

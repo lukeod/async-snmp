@@ -158,22 +158,24 @@ impl Decoder {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::ZeroLengthInteger }, "zero-length integer");
             return Err(self.malformed());
         }
-        if len > 4 {
+        if len > 8 {
+            // Net-snmp accepts up to sizeof(long)=8 bytes for INTEGER; longer is truly malformed.
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::IntegerTooLong { length: len } }, "integer encoding too long");
             return Err(self.malformed());
         }
 
         let bytes = self.read_bytes(len)?;
 
-        // Sign extend
+        // Sign-extend into i64, then truncate to i32. Net-snmp does the same (CHECK_OVERFLOW_S)
+        // to stay compatible with devices that send oversized but otherwise valid encodings.
         let is_negative = bytes[0] & 0x80 != 0;
-        let mut value: i32 = if is_negative { -1 } else { 0 };
+        let mut value: i64 = if is_negative { -1 } else { 0 };
 
         for &byte in bytes.iter() {
-            value = (value << 8) | (byte as i32);
+            value = (value << 8) | (byte as i64);
         }
 
-        Ok(value)
+        Ok(value as i32)
     }
 
     /// Read a 64-bit unsigned integer (Counter64).
@@ -222,20 +224,28 @@ impl Decoder {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::ZeroLengthInteger }, "zero-length integer");
             return Err(self.malformed());
         }
-        if len > 5 {
-            // 5 bytes max: 1 leading zero + 4 bytes for u32
+        if len > 9 {
+            // Net-snmp accepts up to sizeof(long)+1=9 bytes for unsigned32; longer is truly malformed.
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Unsigned32TooLong { length: len } }, "unsigned32 encoding too long");
             return Err(self.malformed());
         }
 
         let bytes = self.read_bytes(len)?;
-        let mut value: u32 = 0;
 
-        for &byte in bytes.iter() {
-            value = (value << 8) | (byte as u32);
+        if len == 9 && bytes[0] != 0x00 {
+            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Unsigned32MissingLeadingZero }, "9-octet unsigned32 missing leading zero");
+            return Err(self.malformed());
         }
 
-        Ok(value)
+        // Accumulate into u64, then truncate to u32. Net-snmp does the same (CHECK_OVERFLOW_U)
+        // to stay compatible with devices that send oversized but otherwise valid encodings.
+        let mut value: u64 = 0;
+
+        for &byte in bytes.iter() {
+            value = (value << 8) | (byte as u64);
+        }
+
+        Ok(value as u32)
     }
 
     /// Read an OCTET STRING.
@@ -401,29 +411,48 @@ mod tests {
     }
 
     #[test]
-    fn test_integer_too_long_is_rejected() {
-        // 5-byte integer must be rejected (BER: signed i32 max 4 bytes)
+    fn test_integer_too_long_truncates() {
+        // 5-8 byte integers are accepted and truncated to i32, matching net-snmp CHECK_OVERFLOW_S.
+        // 5 bytes: 0x0102030405 -> truncated to 0x02030405
         let mut dec = Decoder::from_slice(&[0x02, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05]);
-        let result = dec.read_integer();
-        assert!(result.is_err(), "expected error for 5-byte integer");
+        assert_eq!(dec.read_integer().unwrap(), 0x02030405_i32);
 
-        // 6-byte integer also rejected
-        let mut dec = Decoder::from_slice(&[0x02, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
-        let result = dec.read_integer();
-        assert!(result.is_err(), "expected error for 6-byte integer");
+        // 8 bytes: last 4 bytes kept
+        let mut dec =
+            Decoder::from_slice(&[0x02, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(dec.read_integer().unwrap(), 0x05060708_i32);
+
+        // 9 bytes is rejected (exceeds net-snmp's sizeof(long)=8 limit)
+        let mut dec = Decoder::from_slice(&[
+            0x02, 0x09, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+        ]);
+        assert!(
+            dec.read_integer().is_err(),
+            "9-byte integer must be rejected"
+        );
     }
 
     #[test]
-    fn test_unsigned32_too_long_is_rejected() {
-        // 6-byte unsigned32 must be rejected (max 5: 1 leading zero + 4 value bytes)
+    fn test_unsigned32_too_long_truncates() {
+        // 6-9 byte unsigned32 values are accepted and truncated to u32, matching net-snmp CHECK_OVERFLOW_U.
+        // 6 bytes: 0x010203040506 -> truncated to 0x03040506
         let mut dec = Decoder::from_slice(&[0x42, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
-        let result = dec.read_unsigned32(0x42);
-        assert!(result.is_err(), "expected error for 6-byte unsigned32");
+        assert_eq!(dec.read_unsigned32(0x42).unwrap(), 0x03040506_u32);
 
-        // 7-byte unsigned32 also rejected
-        let mut dec = Decoder::from_slice(&[0x42, 0x07, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
-        let result = dec.read_unsigned32(0x42);
-        assert!(result.is_err(), "expected error for 7-byte unsigned32");
+        // 9 bytes with leading zero: accepted, value fits in u32
+        let mut dec = Decoder::from_slice(&[
+            0x42, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        assert_eq!(dec.read_unsigned32(0x42).unwrap(), u32::MAX);
+
+        // 10 bytes is rejected (exceeds net-snmp's sizeof(long)+1=9 limit)
+        let mut dec = Decoder::from_slice(&[
+            0x42, 0x0A, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+        ]);
+        assert!(
+            dec.read_unsigned32(0x42).is_err(),
+            "10-byte unsigned32 must be rejected"
+        );
     }
 
     #[test]
@@ -449,6 +478,28 @@ mod tests {
             "expected success for 9-byte Counter64 with leading zero"
         );
         assert_eq!(result.unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn test_unsigned32_nine_bytes_requires_leading_zero() {
+        // 9-byte unsigned32 without a leading zero is rejected (matches net-snmp).
+        let mut dec = Decoder::from_slice(&[
+            0x42, 0x09, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+        ]);
+        assert!(
+            dec.read_unsigned32(0x42).is_err(),
+            "9-byte unsigned32 without leading zero must be rejected"
+        );
+
+        // 9-byte unsigned32 with 0x00 first byte is accepted and truncated to u32.
+        let mut dec = Decoder::from_slice(&[
+            0x42, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        assert_eq!(dec.read_unsigned32(0x42).unwrap(), u32::MAX);
+
+        // 5-byte unsigned32 with a non-zero first byte is accepted and truncated (matches net-snmp).
+        let mut dec = Decoder::from_slice(&[0x42, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(dec.read_unsigned32(0x42).unwrap(), 0u32);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use async_snmp::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3M
 use async_snmp::pdu::{Pdu, PduType};
 use async_snmp::v3::{AuthProtocol, PrivProtocol, UsmSecurityParams};
 use async_snmp::varbind::VarBind;
-use async_snmp::{Auth, Client, Retry, Value, oid};
+use async_snmp::{Auth, Client, Error, Retry, Value, oid};
 use bytes::Bytes;
 use common::{TestAgentBuilder, V3User};
 use std::time::Duration;
@@ -164,7 +164,11 @@ async fn v3_wrong_password_fails() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
+        "expected Auth error, got {:?}",
+        result
+    );
 }
 
 /// Unknown user with authentication fails.
@@ -194,7 +198,11 @@ async fn v3_unknown_user_auth_fails() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
+        "expected Auth error, got {:?}",
+        result
+    );
 }
 
 /// Unknown user with noAuthNoPriv fails (RFC 3414 section 3.2 step 1).
@@ -220,8 +228,9 @@ async fn v3_unknown_user_no_auth_fails() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     assert!(
-        result.is_err(),
-        "unknown noAuthNoPriv user should be rejected"
+        matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
+        "expected Auth error for unknown noAuthNoPriv user, got {:?}",
+        result
     );
 }
 
@@ -303,8 +312,13 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     let pdu1 = decoded1.pdu().unwrap();
     assert_eq!(pdu1.pdu_type, PduType::Report, "expected Report PDU");
 
-    // The varbind counter value should be 1 (first request)
+    // The varbind should be usmStatsUnknownEngineIDs (1.3.6.1.6.3.15.1.1.4.0) with value 1
     let vb1 = &pdu1.varbinds[0];
+    assert_eq!(
+        vb1.oid,
+        oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0),
+        "Report should contain usmStatsUnknownEngineIDs OID"
+    );
     let counter1 = match vb1.value {
         Value::Counter32(v) => v,
         ref v => panic!("expected Counter32, got {:?}", v),
@@ -327,6 +341,11 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     assert_eq!(pdu2.pdu_type, PduType::Report);
 
     let vb2 = &pdu2.varbinds[0];
+    assert_eq!(
+        vb2.oid,
+        oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0),
+        "second Report should contain usmStatsUnknownEngineIDs OID"
+    );
     let counter2 = match vb2.value {
         Value::Counter32(v) => v,
         ref v => panic!("expected Counter32, got {:?}", v),

@@ -115,7 +115,7 @@ impl Agent {
             return self.send_v3_report(
                 &msg,
                 &usm_params,
-                crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0), // usmStatsUnknownEngineIDs
+                crate::v3::report_oids::unknown_engine_ids(),
                 count,
                 source,
             );
@@ -137,7 +137,7 @@ impl Agent {
             return self.send_v3_report(
                 &msg,
                 &usm_params,
-                crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 3, 0), // usmStatsUnknownUserNames
+                crate::v3::report_oids::unknown_user_names(),
                 count,
                 source,
             );
@@ -162,7 +162,7 @@ impl Agent {
                         return self.send_v3_report(
                             &msg,
                             &usm_params,
-                            crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0), // usmStatsWrongDigests
+                            crate::v3::report_oids::wrong_digests(),
                             count,
                             source,
                         );
@@ -181,7 +181,7 @@ impl Agent {
                         return self.send_v3_report(
                             &msg,
                             &usm_params,
-                            crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0), // usmStatsNotInTimeWindows
+                            crate::v3::report_oids::not_in_time_windows(),
                             count,
                             source,
                         );
@@ -194,7 +194,7 @@ impl Agent {
                     return self.send_v3_report(
                         &msg,
                         &usm_params,
-                        crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0), // usmStatsWrongDigests
+                        crate::v3::report_oids::wrong_digests(),
                         count,
                         source,
                     );
@@ -337,7 +337,7 @@ impl Agent {
             error_status: 0,
             error_index: 0,
             varbinds: vec![VarBind::new(
-                crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0), // usmStatsUnknownEngineIDs
+                crate::v3::report_oids::unknown_engine_ids(),
                 Value::Counter32(unknown_engine_ids_count),
             )],
         };

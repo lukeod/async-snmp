@@ -287,7 +287,7 @@ impl std::fmt::Display for GenericTrap {
             Self::AuthenticationFailure => write!(f, "authenticationFailure"),
             Self::EgpNeighborLoss => write!(f, "egpNeighborLoss"),
             Self::EnterpriseSpecific => write!(f, "enterpriseSpecific"),
-            Self::Unknown(v) => write!(f, "enterpriseSpecific({v})"),
+            Self::Unknown(v) => write!(f, "unknown({v})"),
         }
     }
 }
