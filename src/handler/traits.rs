@@ -280,12 +280,15 @@ pub trait MibHandler: Send + Sync + 'static {
         Box::pin(async {})
     }
 
-    /// Check if this handler handles the given OID prefix.
+    /// Check if this handler handles the given OID.
     ///
     /// Default implementation returns true if the OID starts with
-    /// the registered prefix or is lexicographically before it
-    /// (for GETNEXT support). Override for more complex matching.
+    /// the registered prefix (i.e., the OID is within this handler's subtree).
+    /// Override for more complex matching.
+    ///
+    /// This method is used to route GET and SET requests. GETNEXT and GETBULK
+    /// consult all handlers regardless of this method.
     fn handles(&self, registered_prefix: &Oid, oid: &Oid) -> bool {
-        oid.starts_with(registered_prefix) || oid < registered_prefix
+        oid.starts_with(registered_prefix)
     }
 }

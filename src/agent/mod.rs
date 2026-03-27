@@ -1291,8 +1291,12 @@ mod tests {
         // OID within prefix
         assert!(handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)));
 
-        // OID before prefix (GETNEXT should still try)
-        assert!(handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99998)));
+        // Exact prefix match
+        assert!(handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99999)));
+
+        // OID before prefix - should NOT be handled (GET/SET routing must not claim
+        // OIDs outside the registered subtree)
+        assert!(!handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99998)));
 
         // OID after prefix (not handled)
         assert!(!handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 100000)));
