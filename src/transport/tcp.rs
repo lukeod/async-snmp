@@ -410,9 +410,9 @@ impl Transport for TcpTransport {
             .inner
             .active_guard
             .lock()
-            .unwrap()
+            .map_err(|_| Error::Config("TCP transport lock poisoned".into()).boxed())?
             .take()
-            .expect("recv() called without prior send() - this is a bug");
+            .ok_or_else(|| Error::Config("recv() called without prior send()".into()).boxed())?;
 
         // Read a complete BER-encoded message using the framing protocol.
         // The guard is dropped when this function returns, releasing the lock.

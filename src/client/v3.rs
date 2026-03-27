@@ -33,7 +33,7 @@ impl<T: Transport> Client<T> {
                 .inner
                 .engine_state
                 .read()
-                .expect("engine_state lock poisoned");
+                .map_err(|_| Error::Config("engine_state lock poisoned".into()).boxed())?;
             if state.is_some() {
                 return Ok(());
             }
@@ -48,7 +48,7 @@ impl<T: Transport> Client<T> {
                 .inner
                 .engine_state
                 .write()
-                .expect("engine_state lock poisoned");
+                .map_err(|_| Error::Config("engine_state lock poisoned".into()).boxed())?;
             *state = Some(cached_state.clone());
             // Derive keys for this engine
             if let Some(security) = &self.inner.config.v3_security {
@@ -57,7 +57,7 @@ impl<T: Transport> Client<T> {
                     .inner
                     .derived_keys
                     .write()
-                    .expect("derived_keys lock poisoned");
+                    .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
                 *derived = Some(keys);
             }
             return Ok(());
@@ -139,7 +139,7 @@ impl<T: Transport> Client<T> {
                 .inner
                 .derived_keys
                 .write()
-                .expect("derived_keys lock poisoned");
+                .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
             *derived = Some(keys);
         }
 
@@ -149,7 +149,7 @@ impl<T: Transport> Client<T> {
                 .inner
                 .engine_state
                 .write()
-                .expect("engine_state lock poisoned");
+                .map_err(|_| Error::Config("engine_state lock poisoned".into()).boxed())?;
             *state = Some(engine_state.clone());
         }
 
@@ -175,7 +175,7 @@ impl<T: Transport> Client<T> {
             .inner
             .engine_state
             .read()
-            .expect("engine_state lock poisoned");
+            .map_err(|_| Error::Config("engine_state lock poisoned".into()).boxed())?;
         let engine_state = engine_state.as_ref().ok_or_else(|| {
             tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::EngineNotDiscovered }, "engine not discovered");
             Error::Config("engine not discovered".into()).boxed()
@@ -185,7 +185,7 @@ impl<T: Transport> Client<T> {
             .inner
             .derived_keys
             .read()
-            .expect("derived_keys lock poisoned");
+            .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
 
         let security_level = security.security_level();
 
@@ -325,7 +325,7 @@ impl<T: Transport> Client<T> {
             .inner
             .derived_keys
             .read()
-            .expect("derived_keys lock poisoned");
+            .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
         let auth_key = derived
             .as_ref()
             .and_then(|d| d.auth_key.as_ref())
@@ -369,7 +369,7 @@ impl<T: Transport> Client<T> {
                     .inner
                     .derived_keys
                     .read()
-                    .expect("derived_keys lock poisoned");
+                    .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
                 let priv_key =
                     derived
                         .as_ref()
@@ -484,11 +484,9 @@ impl<T: Transport> Client<T> {
                             let usm_params =
                                 UsmSecurityParams::decode(response.security_params.clone())?;
                             {
-                                let mut state = self
-                                    .inner
-                                    .engine_state
-                                    .write()
-                                    .expect("engine_state lock poisoned");
+                                let mut state = self.inner.engine_state.write().map_err(|_| {
+                                    Error::Config("engine_state lock poisoned".into()).boxed()
+                                })?;
                                 if let Some(ref mut s) = *state {
                                     s.update_time(usm_params.engine_boots, usm_params.engine_time);
                                 }
@@ -559,11 +557,9 @@ impl<T: Transport> Client<T> {
                     // Update engine time from successful response
                     {
                         let usm_params = UsmSecurityParams::decode(response_security_params)?;
-                        let mut state = self
-                            .inner
-                            .engine_state
-                            .write()
-                            .expect("engine_state lock poisoned");
+                        let mut state = self.inner.engine_state.write().map_err(|_| {
+                            Error::Config("engine_state lock poisoned".into()).boxed()
+                        })?;
                         if let Some(ref mut s) = *state {
                             s.update_time(usm_params.engine_boots, usm_params.engine_time);
                         }
