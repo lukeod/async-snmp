@@ -1028,7 +1028,24 @@ impl Agent {
 
         // Handle non-repeaters (first N varbinds get one GETNEXT each)
         for vb in pdu.varbinds.iter().take(non_repeaters) {
-            let next_vb = match self.get_next_oid(ctx, &vb.oid).await {
+            let next = self.get_next_oid(ctx, &vb.oid).await;
+
+            // Check VACM access for the returned OID (if VACM enabled)
+            let next = if let Some(ref next_vb) = next {
+                if let Some(ref vacm) = self.inner.vacm {
+                    if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
+                        next
+                    } else {
+                        None
+                    }
+                } else {
+                    next
+                }
+            } else {
+                next
+            };
+
+            let next_vb = match next {
                 Some(next_vb) => next_vb,
                 None => VarBind::new(vb.oid.clone(), Value::EndOfMibView),
             };
@@ -1064,7 +1081,24 @@ impl Agent {
                     let next_vb = if all_done[i] {
                         VarBind::new(oid.clone(), Value::EndOfMibView)
                     } else {
-                        match self.get_next_oid(ctx, oid).await {
+                        let next = self.get_next_oid(ctx, oid).await;
+
+                        // Check VACM access for the returned OID
+                        let next = if let Some(ref next_vb) = next {
+                            if let Some(ref vacm) = self.inner.vacm {
+                                if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
+                                    next
+                                } else {
+                                    None
+                                }
+                            } else {
+                                next
+                            }
+                        } else {
+                            next
+                        };
+
+                        match next {
                             Some(next_vb) => {
                                 *oid = next_vb.oid.clone();
                                 row_complete = false;
@@ -1307,5 +1341,134 @@ mod tests {
             .get_next(&ctx, &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0))
             .await;
         assert!(next.is_end_of_mib_view());
+    }
+
+    /// Build an agent bound to a random port for testing, with a VACM view
+    /// that only permits reading OIDs under 1.3.6.1.4.1.99999.1 (not .99999.2).
+    async fn test_agent_with_restricted_vacm() -> Agent {
+        Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .vacm(|v| {
+                v.group("public", SecurityModel::V2c, "readers")
+                    .access("readers", |a| a.read_view("restricted"))
+                    .view("restricted", |v| {
+                        v.include(oid!(1, 3, 6, 1, 4, 1, 99999, 1))
+                    })
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_vacm_filters_inaccessible_oids() {
+        let agent = test_agent_with_restricted_vacm().await;
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+
+        // GETBULK starting before the handler prefix, requesting up to 10 repeats
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 0, // non_repeaters
+            error_index: 10, // max_repetitions
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        // oid1 (.99999.1.0) is in the view, so it should appear
+        assert!(
+            response
+                .varbinds
+                .iter()
+                .any(|vb| vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)),
+            "expected oid1 in response"
+        );
+
+        // oid2 (.99999.2.0) is NOT in the view, so it must not appear with a real value
+        for vb in &response.varbinds {
+            if vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
+                panic!("GETBULK returned OID outside read view: {:?}", vb);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_non_repeaters_vacm_filtered() {
+        let agent = test_agent_with_restricted_vacm().await;
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+
+        // GETBULK with non_repeaters=2, max_repetitions=0
+        // Two varbinds: one that walks to oid1 (accessible) and one that
+        // walks to oid2 (inaccessible).
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 2,
+            error_status: 2, // non_repeaters
+            error_index: 0,  // max_repetitions
+            varbinds: vec![
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null),
+            ],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        // First non-repeater walks to oid1 (accessible)
+        assert_eq!(
+            response.varbinds[0].oid,
+            oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)
+        );
+        assert!(matches!(response.varbinds[0].value, Value::Integer(42)));
+
+        // Second non-repeater walks to oid2 (inaccessible), should be EndOfMibView
+        assert_eq!(response.varbinds[1].value, Value::EndOfMibView);
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_without_vacm_returns_all_oids() {
+        // Sanity check: without VACM, both OIDs should be returned
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .build()
+            .await
+            .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 10,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        // Both OIDs should appear
+        assert!(
+            response
+                .varbinds
+                .iter()
+                .any(|vb| vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0))
+        );
+        assert!(
+            response
+                .varbinds
+                .iter()
+                .any(|vb| vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0))
+        );
     }
 }
