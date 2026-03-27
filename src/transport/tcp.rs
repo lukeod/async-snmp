@@ -200,7 +200,7 @@ impl TcpTransportBuilder {
         Ok(TcpTransport {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                active_guard: std::sync::Mutex::new(None),
+                active_guard: Mutex::new(None),
                 current_timeout: std::sync::Mutex::new(Duration::from_secs(30)),
                 target,
                 local_addr,
@@ -265,8 +265,9 @@ pub struct TcpTransport {
 struct TcpTransportInner {
     /// The TCP stream, wrapped in Arc for owned guard pattern
     stream: Arc<Mutex<TcpStream>>,
-    /// Holds the stream lock between send() and recv() to serialize operations
-    active_guard: std::sync::Mutex<Option<OwnedMutexGuard<TcpStream>>>,
+    /// Holds the stream lock between send() and recv() to serialize operations.
+    /// Uses tokio::sync::Mutex so the guard is dropped on task cancellation.
+    active_guard: Mutex<Option<OwnedMutexGuard<TcpStream>>>,
     /// Timeout for current request (set by register_request)
     current_timeout: std::sync::Mutex<Duration>,
     target: SocketAddr,
@@ -353,7 +354,7 @@ impl TcpTransport {
         Ok(Self {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                active_guard: std::sync::Mutex::new(None),
+                active_guard: Mutex::new(None),
                 current_timeout: std::sync::Mutex::new(Duration::from_secs(30)),
                 target,
                 local_addr,
@@ -386,7 +387,7 @@ impl Transport for TcpTransport {
         match result {
             Ok(()) => {
                 // Store the guard to hold the lock until recv()
-                *self.inner.active_guard.lock().unwrap() = Some(stream);
+                *self.inner.active_guard.lock().await = Some(stream);
                 Ok(())
             }
             Err(e) => {
@@ -406,13 +407,10 @@ impl Transport for TcpTransport {
 
         // Take the guard that was stored by send().
         // This ensures we're reading the response for our request.
-        let mut stream = self
-            .inner
-            .active_guard
-            .lock()
-            .map_err(|_| Error::Config("TCP transport lock poisoned".into()).boxed())?
-            .take()
-            .ok_or_else(|| Error::Config("recv() called without prior send()".into()).boxed())?;
+        let mut stream =
+            self.inner.active_guard.lock().await.take().ok_or_else(|| {
+                Error::Config("recv() called without prior send()".into()).boxed()
+            })?;
 
         // Read a complete BER-encoded message using the framing protocol.
         // The guard is dropped when this function returns, releasing the lock.
