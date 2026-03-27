@@ -535,11 +535,17 @@ impl<T: Transport> Client<T> {
         })
     }
 
-    /// SET multiple OIDs.
+    /// SET multiple OIDs in a single atomic PDU.
     ///
-    /// If the varbind list exceeds `max_oids_per_request`, the request is
-    /// automatically split into multiple batches. Results are returned
-    /// in the same order as the input varbinds.
+    /// RFC 3416 requires that a SET request be atomic: either all variables
+    /// in the request are set, or none are. To preserve this guarantee,
+    /// `set_many` refuses to split the varbind list across multiple PDUs.
+    ///
+    /// If `varbinds.len()` exceeds `max_oids_per_request`, this method
+    /// returns `Error::Config` rather than silently batching the request.
+    /// Callers that need to set more variables than the per-request limit
+    /// must issue multiple explicit `set_many` calls and handle partial
+    /// failure themselves.
     ///
     /// # Example
     ///
@@ -562,37 +568,27 @@ impl<T: Transport> Client<T> {
 
         let max_per_request = self.inner.config.max_oids_per_request;
 
-        // Fast path: single request if within limit
-        if varbinds.len() <= max_per_request {
-            let request_id = self.next_request_id();
-            let vbs: Vec<VarBind> = varbinds
-                .iter()
-                .map(|(oid, value)| VarBind::new(oid.clone(), value.clone()))
-                .collect();
-            let pdu = Pdu::set_request(request_id, vbs);
-            let response = self.send_request(pdu).await?;
-            return Ok(response.varbinds);
+        if varbinds.len() > max_per_request {
+            return Err(Error::Config(
+                format!(
+                    "set_many: {} varbinds exceeds max_oids_per_request ({}); \
+                     SET must be atomic and cannot be split across PDUs",
+                    varbinds.len(),
+                    max_per_request,
+                )
+                .into(),
+            )
+            .boxed());
         }
 
-        // Batched path: split into chunks
-        let num_batches = varbinds.len().div_ceil(max_per_request);
-        tracing::debug!(target: "async_snmp::client", { snmp.oid_count = varbinds.len(), snmp.max_per_request = max_per_request, snmp.batch_count = num_batches }, "splitting SET request into batches");
-
-        let mut all_results = Vec::with_capacity(varbinds.len());
-
-        for (batch_idx, chunk) in varbinds.chunks(max_per_request).enumerate() {
-            tracing::debug!(target: "async_snmp::client", { snmp.batch = batch_idx + 1, snmp.batch_total = num_batches, snmp.batch_oid_count = chunk.len() }, "sending SET batch");
-            let request_id = self.next_request_id();
-            let vbs: Vec<VarBind> = chunk
-                .iter()
-                .map(|(oid, value)| VarBind::new(oid.clone(), value.clone()))
-                .collect();
-            let pdu = Pdu::set_request(request_id, vbs);
-            let response = self.send_request(pdu).await?;
-            all_results.extend(response.varbinds);
-        }
-
-        Ok(all_results)
+        let request_id = self.next_request_id();
+        let vbs: Vec<VarBind> = varbinds
+            .iter()
+            .map(|(oid, value)| VarBind::new(oid.clone(), value.clone()))
+            .collect();
+        let pdu = Pdu::set_request(request_id, vbs);
+        let response = self.send_request(pdu).await?;
+        Ok(response.varbinds)
     }
 
     /// GETBULK request (SNMPv2c/v3 only).

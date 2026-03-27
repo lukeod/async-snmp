@@ -3,7 +3,7 @@
 mod common;
 
 use async_snmp::transport::UdpTransport;
-use async_snmp::{Auth, Client, Retry, Value, oid};
+use async_snmp::{Auth, Client, Error, Retry, Value, oid};
 use common::TestAgent;
 use std::time::Duration;
 
@@ -137,6 +137,42 @@ async fn set_many_modifies_values() {
         let result = client.get(oid).await.unwrap();
         assert_eq!(&result.value, expected);
     }
+}
+
+/// set_many returns an error when varbind count exceeds max_oids_per_request.
+///
+/// SET must be atomic (RFC 3416). Splitting across PDUs would break that
+/// guarantee, so set_many refuses to batch and returns Error::Config instead.
+#[tokio::test]
+async fn set_many_rejects_oversized_request() {
+    let agent = TestAgent::new().await;
+
+    let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
+        .max_oids_per_request(2)
+        .connect()
+        .await
+        .unwrap();
+
+    let varbinds = [
+        (
+            oid!(1, 3, 6, 1, 2, 1, 1, 4, 0),
+            Value::OctetString("a".into()),
+        ),
+        (
+            oid!(1, 3, 6, 1, 2, 1, 1, 5, 0),
+            Value::OctetString("b".into()),
+        ),
+        (
+            oid!(1, 3, 6, 1, 2, 1, 1, 6, 0),
+            Value::OctetString("c".into()),
+        ),
+    ];
+
+    let err = client.set_many(&varbinds).await.unwrap_err();
+    assert!(
+        matches!(*err, Error::Config(ref msg) if msg.contains("set_many") && msg.contains("atomic")),
+        "expected Config error about atomicity, got: {err}"
+    );
 }
 
 /// V1 GET works (if supported).
