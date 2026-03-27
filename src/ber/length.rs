@@ -157,6 +157,42 @@ pub fn encode_length(len: usize) -> ([u8; 5], usize) {
     }
 }
 
+/// Parse a BER length from a byte slice, returning `Some((length, bytes_consumed))`.
+///
+/// Returns `None` if the data is empty, uses indefinite form, or contains an
+/// invalid or unsupported encoding. This is the infallible variant for contexts
+/// that use `Option`-based error handling rather than `Result`.
+pub(crate) fn parse_ber_length(data: &[u8]) -> Option<(usize, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let first = data[0];
+
+    if first < 0x80 {
+        // Short form
+        return Some((first as usize, 1));
+    }
+
+    if first == 0x80 {
+        // Indefinite form - not supported
+        return None;
+    }
+
+    // Long form
+    let num_octets = (first & 0x7F) as usize;
+    if num_octets == 0 || num_octets > 4 || data.len() < 1 + num_octets {
+        return None;
+    }
+
+    let mut len: usize = 0;
+    for i in 0..num_octets {
+        len = (len << 8) | (data[1 + i] as usize);
+    }
+
+    Some((len, 1 + num_octets))
+}
+
 /// Decode a length from bytes, returning (length, bytes_consumed)
 ///
 /// The `base_offset` parameter is used to report error offsets correctly

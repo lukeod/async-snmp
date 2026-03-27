@@ -5,7 +5,7 @@
 
 mod decode;
 mod encode;
-mod length;
+pub(crate) mod length;
 pub mod tag;
 
 pub use decode::*;

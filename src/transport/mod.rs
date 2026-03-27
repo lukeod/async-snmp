@@ -23,6 +23,7 @@ mod udp_core;
 pub use tcp::*;
 pub use udp::*;
 
+use crate::ber::length::parse_ber_length;
 use crate::error::Result;
 use bytes::Bytes;
 use std::future::Future;
@@ -163,15 +164,16 @@ pub(crate) fn extract_request_id(data: &[u8]) -> Option<i32> {
     pos += 1;
 
     // Skip outer SEQUENCE length
-    pos = skip_ber_length(data, pos)?;
+    let (_, consumed) = parse_ber_length(&data[pos..])?;
+    pos += consumed;
 
     // Version (INTEGER)
     if pos >= data.len() || data[pos] != 0x02 {
         return None;
     }
     pos += 1;
-    let (new_pos, version_len) = read_ber_length(data, pos)?;
-    pos = new_pos;
+    let (version_len, consumed) = parse_ber_length(&data[pos..])?;
+    pos += consumed;
 
     // Read version value
     if pos + version_len > data.len() {
@@ -216,7 +218,8 @@ fn extract_v3_msg_id(data: &[u8], mut pos: usize) -> Option<i32> {
     pos += 1;
 
     // Skip msgGlobalData SEQUENCE length
-    pos = skip_ber_length(data, pos)?;
+    let (_, consumed) = parse_ber_length(&data[pos..])?;
+    pos += consumed;
 
     // First INTEGER inside msgGlobalData is msgID
     if pos >= data.len() || data[pos] != 0x02 {
@@ -225,8 +228,8 @@ fn extract_v3_msg_id(data: &[u8], mut pos: usize) -> Option<i32> {
     pos += 1;
 
     // Read msgID length
-    let (new_pos, id_len) = read_ber_length(data, pos)?;
-    pos = new_pos;
+    let (id_len, consumed) = parse_ber_length(&data[pos..])?;
+    pos += consumed;
 
     if pos + id_len > data.len() {
         return None;
@@ -243,8 +246,8 @@ fn extract_v1v2c_request_id(data: &[u8], mut pos: usize) -> Option<i32> {
         return None;
     }
     pos += 1;
-    let (new_pos, community_len) = read_ber_length(data, pos)?;
-    pos = new_pos + community_len;
+    let (community_len, consumed) = parse_ber_length(&data[pos..])?;
+    pos += consumed + community_len;
 
     // PDU (context-specific, e.g., 0xA2 for Response)
     if pos >= data.len() {
@@ -258,7 +261,8 @@ fn extract_v1v2c_request_id(data: &[u8], mut pos: usize) -> Option<i32> {
     pos += 1;
 
     // Skip PDU length
-    pos = skip_ber_length(data, pos)?;
+    let (_, consumed) = parse_ber_length(&data[pos..])?;
+    pos += consumed;
 
     // Request ID (INTEGER)
     if pos >= data.len() || data[pos] != 0x02 {
@@ -267,8 +271,8 @@ fn extract_v1v2c_request_id(data: &[u8], mut pos: usize) -> Option<i32> {
     pos += 1;
 
     // Read request_id length
-    let (new_pos, id_len) = read_ber_length(data, pos)?;
-    pos = new_pos;
+    let (id_len, consumed) = parse_ber_length(&data[pos..])?;
+    pos += consumed;
 
     if pos + id_len > data.len() {
         return None;
@@ -292,43 +296,6 @@ fn decode_ber_signed_integer(bytes: &[u8]) -> Option<i32> {
     }
 
     Some(value)
-}
-
-/// Skip BER length field and return new position.
-fn skip_ber_length(data: &[u8], pos: usize) -> Option<usize> {
-    let (new_pos, _) = read_ber_length(data, pos)?;
-    Some(new_pos)
-}
-
-/// Read BER length field.
-/// Returns (new_position, length_value).
-fn read_ber_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
-    if pos >= data.len() {
-        return None;
-    }
-
-    let first = data[pos];
-
-    if first < 0x80 {
-        // Short form
-        Some((pos + 1, first as usize))
-    } else if first == 0x80 {
-        // Indefinite length - not supported
-        None
-    } else {
-        // Long form
-        let num_octets = (first & 0x7F) as usize;
-        if pos + 1 + num_octets > data.len() {
-            return None;
-        }
-
-        let mut length: usize = 0;
-        for i in 0..num_octets {
-            length = (length << 8) | (data[pos + 1 + i] as usize);
-        }
-
-        Some((pos + 1 + num_octets, length))
-    }
 }
 
 #[cfg(test)]
