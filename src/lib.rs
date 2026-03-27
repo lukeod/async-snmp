@@ -415,7 +415,6 @@ pub mod value;
 pub mod varbind;
 pub mod version;
 
-pub(crate) mod fmt;
 pub(crate) mod util;
 
 #[cfg(feature = "cli")]

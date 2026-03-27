@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::Version;
 use crate::client::{Auth, Backoff, Retry};
+use crate::format::hex;
 use crate::v3::{AuthProtocol, PrivProtocol};
 
 /// SNMP version for CLI argument parsing.
@@ -347,7 +348,8 @@ impl ValueType {
             }
             ValueType::String => Ok(Value::OctetString(s.as_bytes().to_vec().into())),
             ValueType::HexString => {
-                let bytes = parse_hex_string(s)?;
+                let bytes = hex::decode_relaxed(s)
+                    .map_err(|_| "hex string must have even number of hex digits".to_string())?;
                 Ok(Value::OctetString(bytes.into()))
             }
             ValueType::Oid => {
@@ -387,25 +389,6 @@ impl ValueType {
             }
         }
     }
-}
-
-/// Parse a hex string (with or without spaces/separators) into bytes.
-fn parse_hex_string(s: &str) -> Result<Vec<u8>, String> {
-    // Remove common separators: spaces, colons, dashes
-    let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-
-    if !clean.len().is_multiple_of(2) {
-        return Err("hex string must have even number of digits".into());
-    }
-
-    clean
-        .as_bytes()
-        .chunks(2)
-        .map(|chunk| {
-            let hex = std::str::from_utf8(chunk).unwrap();
-            u8::from_str_radix(hex, 16).map_err(|_| format!("invalid hex: {}", hex))
-        })
-        .collect()
 }
 
 #[cfg(test)]

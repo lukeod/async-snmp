@@ -4,6 +4,7 @@
 
 use crate::cli::args::OutputFormat;
 use crate::cli::hints;
+use crate::format::hex;
 use crate::{Oid, Value, VarBind, Version};
 use serde::Serialize;
 use std::io::{self, Write};
@@ -165,7 +166,7 @@ fn format_verbose_value(value: &Value) -> (String, String, Option<String>, Optio
             let raw_hex = format_hex_string(bytes);
             let size = Some(bytes.len());
 
-            if is_printable(bytes) {
+            if hex::is_printable(bytes) {
                 let decoded = String::from_utf8_lossy(bytes).to_string();
                 (
                     "STRING".into(),
@@ -469,9 +470,9 @@ fn format_value(
         Value::Integer(v) => ("INTEGER".into(), (*v).into(), None, None),
 
         Value::OctetString(bytes) => {
-            let raw_hex = Some(hex_string(bytes));
+            let raw_hex = Some(hex::encode(bytes));
 
-            if force_hex || !is_printable(bytes) {
+            if force_hex || !hex::is_printable(bytes) {
                 let formatted = format_hex_string(bytes);
                 (
                     "Hex-STRING".into(),
@@ -517,7 +518,7 @@ fn format_value(
         }
 
         Value::Opaque(bytes) => {
-            let hex = hex_string(bytes);
+            let hex = hex::encode(bytes);
             (
                 "Opaque".into(),
                 serde_json::Value::String(hex.clone()),
@@ -550,7 +551,7 @@ fn format_value(
         ),
 
         Value::Unknown { tag, data } => {
-            let hex = hex_string(data);
+            let hex = hex::encode(data);
             (
                 format!("Unknown(0x{:02X})", tag),
                 serde_json::Value::String(hex.clone()),
@@ -561,35 +562,14 @@ fn format_value(
     }
 }
 
-/// Check if bytes are printable ASCII/UTF-8.
-fn is_printable(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return true;
-    }
-
-    // Try UTF-8 first
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        // Check that all characters are printable
-        s.chars()
-            .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
-    } else {
-        false
-    }
-}
-
-/// Format bytes as hex string (lowercase, no separator).
-fn hex_string(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 /// Format bytes as spaced hex for display.
 fn format_hex_string(bytes: &[u8]) -> String {
-    crate::fmt::format_hex_display(bytes)
+    crate::format::format_hex_display(bytes)
 }
 
 /// Format TimeTicks as human-readable duration.
 fn format_timeticks(centiseconds: u32) -> String {
-    crate::fmt::format_timeticks(centiseconds)
+    crate::format::format_timeticks(centiseconds)
 }
 
 /// Write an error message to stderr.
@@ -615,16 +595,16 @@ mod tests {
 
     #[test]
     fn test_is_printable() {
-        assert!(is_printable(b"Hello World"));
-        assert!(is_printable(b"Line 1\nLine 2"));
-        assert!(is_printable(b""));
-        assert!(!is_printable(&[0x00, 0x01, 0x02]));
-        assert!(!is_printable(&[0x80, 0x81]));
+        assert!(hex::is_printable(b"Hello World"));
+        assert!(hex::is_printable(b"Line 1\nLine 2"));
+        assert!(hex::is_printable(b""));
+        assert!(!hex::is_printable(&[0x00, 0x01, 0x02]));
+        assert!(!hex::is_printable(&[0x80, 0x81]));
     }
 
     #[test]
-    fn test_hex_string() {
-        assert_eq!(hex_string(&[0x00, 0x1A, 0x2B]), "001a2b");
+    fn test_hex_encode() {
+        assert_eq!(hex::encode(&[0x00, 0x1A, 0x2B]), "001a2b");
     }
 
     #[test]

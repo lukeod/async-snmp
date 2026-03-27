@@ -10,6 +10,7 @@
 //! Key mib-rs types are re-exported here so users can depend on `async-snmp`
 //! alone without adding `mib-rs` as a direct dependency.
 
+use crate::format::hex;
 use crate::{Oid, Value, VarBind};
 use mib_rs::mib::display_hint::HexCase;
 use smallvec::SmallVec;
@@ -134,11 +135,8 @@ fn format_object_value(mib: &Mib, object: &mib_rs::Object<'_>, value: &Value) ->
                 return formatted;
             }
             // Fall back to UTF-8, then hex
-            if let Ok(s) = std::str::from_utf8(bytes)
-                && s.chars()
-                    .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
-            {
-                return s.to_string();
+            if hex::is_printable(bytes) {
+                return String::from_utf8_lossy(bytes).into_owned();
             }
             format_hex(bytes)
         }
@@ -146,7 +144,7 @@ fn format_object_value(mib: &Mib, object: &mib_rs::Object<'_>, value: &Value) ->
         Value::ObjectIdentifier(oid) => format_oid(mib, oid),
 
         Value::TimeTicks(v) => {
-            let formatted = crate::fmt::format_timeticks(*v);
+            let formatted = crate::format::format_timeticks(*v);
             format!("({}) {}", v, formatted)
         }
 
@@ -181,7 +179,7 @@ fn format_object_value(mib: &Mib, object: &mib_rs::Object<'_>, value: &Value) ->
 
 /// Format bytes as space-separated uppercase hex for display.
 fn format_hex(bytes: &[u8]) -> String {
-    crate::fmt::format_hex_display(bytes)
+    crate::format::format_hex_display(bytes)
 }
 
 #[cfg(feature = "cli")]
