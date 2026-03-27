@@ -234,6 +234,19 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                         Poll::Ready(Some(Ok(vb)))
                     }
                     Err(e) => {
+                        if self.client.inner.config.version == Version::V1
+                            && matches!(
+                                &*e,
+                                Error::Snmp {
+                                    status: crate::error::ErrorStatus::NoSuchName,
+                                    ..
+                                }
+                            )
+                        {
+                            self.done = true;
+                            return Poll::Ready(None);
+                        }
+
                         self.done = true;
                         Poll::Ready(Some(Err(e)))
                     }
