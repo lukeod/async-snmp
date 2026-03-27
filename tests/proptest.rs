@@ -1376,7 +1376,10 @@ proptest! {
 
     #[test]
     fn pdu_is_error_consistent(pdu in arb_pdu_full_range()) {
-        prop_assert_eq!(pdu.is_error(), pdu.error_status != 0);
+        prop_assert_eq!(
+            pdu.is_error(),
+            pdu.pdu_type == PduType::Response && pdu.error_status != 0
+        );
     }
 
     #[test]
