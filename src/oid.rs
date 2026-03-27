@@ -113,7 +113,7 @@ impl Oid {
 
         for part in s.split('.') {
             if part.is_empty() {
-                continue;
+                return Err(Error::InvalidOid(format!("'{}': empty arc", s).into()).boxed());
             }
 
             let arc: u32 = part
@@ -737,6 +737,14 @@ mod tests {
     fn test_parse() {
         let oid = Oid::parse("1.3.6.1.2.1.1.1.0").unwrap();
         assert_eq!(oid.arcs(), &[1, 3, 6, 1, 2, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_parse_rejects_empty_components() {
+        assert!(Oid::parse(".1.3.6").is_err());
+        assert!(Oid::parse("1.3.6.").is_err());
+        assert!(Oid::parse("1..3.6").is_err());
+        assert!(Oid::parse("...").is_err());
     }
 
     #[test]
