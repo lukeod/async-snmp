@@ -1189,6 +1189,11 @@ impl From<u64> for Value {
     }
 }
 
+/// Converts a 4-byte array into [`Value::IpAddress`].
+///
+/// The bytes are interpreted as a big-endian IPv4 address, matching the IpAddress
+/// SNMP type (RFC 2578 Section 7.1.5). Use this when you already have an address
+/// in `[u8; 4]` form (e.g., from `Ipv4Addr::octets()`).
 impl From<[u8; 4]> for Value {
     fn from(addr: [u8; 4]) -> Self {
         Value::IpAddress(addr)

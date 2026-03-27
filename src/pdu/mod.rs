@@ -72,7 +72,7 @@ impl std::fmt::Display for PduType {
 }
 
 /// Generic PDU structure for request/response operations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdu {
     /// PDU type
     pub pdu_type: PduType,
@@ -275,6 +275,21 @@ pub enum GenericTrap {
     EnterpriseSpecific,
     /// An unrecognized generic trap value received on the wire.
     Unknown(i32),
+}
+
+impl std::fmt::Display for GenericTrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ColdStart => write!(f, "coldStart"),
+            Self::WarmStart => write!(f, "warmStart"),
+            Self::LinkDown => write!(f, "linkDown"),
+            Self::LinkUp => write!(f, "linkUp"),
+            Self::AuthenticationFailure => write!(f, "authenticationFailure"),
+            Self::EgpNeighborLoss => write!(f, "egpNeighborLoss"),
+            Self::EnterpriseSpecific => write!(f, "enterpriseSpecific"),
+            Self::Unknown(v) => write!(f, "enterpriseSpecific({v})"),
+        }
+    }
 }
 
 impl GenericTrap {

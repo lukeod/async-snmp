@@ -491,6 +491,12 @@ mod tests {
                 Just(Value::NoSuchObject),
                 Just(Value::NoSuchInstance),
                 Just(Value::EndOfMibView),
+                (any::<u8>(), prop::collection::vec(any::<u8>(), 0..256)).prop_map(
+                    |(tag, data)| Value::Unknown {
+                        tag,
+                        data: Bytes::from(data),
+                    }
+                ),
             ]
         }
 
