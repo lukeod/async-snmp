@@ -425,21 +425,13 @@ impl Oid {
             return bytes;
         }
 
-        // First two arcs combined into first subidentifier
-        // Uses base-128 encoding because arc2 can be > 127 when arc1=2
-        if self.arcs.len() >= 2 {
-            let first_subid = self.arcs[0] * 40 + self.arcs[1];
-            encode_subidentifier_smallvec(&mut bytes, first_subid);
-        } else if self.arcs.len() == 1 {
-            let first_subid = self.arcs[0] * 40;
-            encode_subidentifier_smallvec(&mut bytes, first_subid);
-        }
+        // First two arcs combined into first subidentifier.
+        // Uses base-128 encoding because arc2 can be > 127 when arc1=2.
+        encode_subidentifier_smallvec(&mut bytes, first_subidentifier(&self.arcs));
 
-        // Remaining arcs (only if there are more than 2)
-        if self.arcs.len() > 2 {
-            for &arc in &self.arcs[2..] {
-                encode_subidentifier_smallvec(&mut bytes, arc);
-            }
+        // Remaining arcs
+        for &arc in self.arcs.iter().skip(2) {
+            encode_subidentifier_smallvec(&mut bytes, arc);
         }
 
         bytes
@@ -484,14 +476,7 @@ impl Oid {
         let mut len = 0;
 
         // First subidentifier (arc1*40 + arc2)
-        if self.arcs.len() >= 2 {
-            let first_subid = self.arcs[0] * 40 + self.arcs[1];
-            len += base128_len(first_subid);
-        } else {
-            // Single arc: arc1 * 40
-            let first_subid = self.arcs[0] * 40;
-            len += base128_len(first_subid);
-        }
+        len += base128_len(first_subidentifier(&self.arcs));
 
         // Remaining arcs
         for &arc in self.arcs.iter().skip(2) {
@@ -553,6 +538,19 @@ impl Oid {
         }
 
         Ok(Self { arcs })
+    }
+}
+
+/// Compute the first OID subidentifier value from an arc slice.
+///
+/// Per X.690 Section 8.19: the first two arcs are encoded as `arc1 * 40 + arc2`.
+/// If there is only one arc, it is encoded as `arc1 * 40`.
+#[inline]
+fn first_subidentifier(arcs: &SmallVec<[u32; 16]>) -> u32 {
+    if arcs.len() >= 2 {
+        arcs[0] * 40 + arcs[1]
+    } else {
+        arcs[0] * 40
     }
 }
 
