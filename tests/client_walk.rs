@@ -29,6 +29,27 @@ async fn walk_iterates_subtree() {
     assert_eq!(results[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
 }
 
+/// SNMPv1 WALK iterates through subtree and stops cleanly on noSuchName.
+#[tokio::test]
+async fn v1_walk_iterates_subtree() {
+    let agent = TestAgent::new().await;
+
+    let client = Client::builder(agent.addr().to_string(), Auth::v1("public"))
+        .connect()
+        .await
+        .unwrap();
+
+    let results = client
+        .walk(oid!(1, 3, 6, 1, 2, 1, 1))
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 7);
+    assert_eq!(results[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+}
+
 /// WALK stops at subtree boundary.
 #[tokio::test]
 async fn walk_stops_at_boundary() {
@@ -65,6 +86,26 @@ async fn walk_empty_subtree_returns_nothing() {
     let agent = TestAgent::new().await;
 
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
+        .connect()
+        .await
+        .unwrap();
+
+    let results = client
+        .walk(oid!(1, 3, 6, 1, 99))
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+/// SNMPv1 WALK on empty subtree returns nothing instead of noSuchName.
+#[tokio::test]
+async fn v1_walk_empty_subtree_returns_nothing() {
+    let agent = TestAgent::new().await;
+
+    let client = Client::builder(agent.addr().to_string(), Auth::v1("public"))
         .connect()
         .await
         .unwrap();
