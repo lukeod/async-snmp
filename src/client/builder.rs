@@ -59,7 +59,13 @@ impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Target::Address(addr) => f.write_str(addr),
-            Target::HostPort(host, port) => write!(f, "{}:{}", host, port),
+            Target::HostPort(host, port) => {
+                if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+                    write!(f, "[{}]:{}", host, port)
+                } else {
+                    write!(f, "{}:{}", host, port)
+                }
+            }
         }
     }
 }
@@ -909,11 +915,11 @@ mod tests {
         assert_eq!(t.to_string(), "192.168.1.1:161");
 
         let t: Target = ("fe80::1", 161).into();
-        assert_eq!(t.to_string(), "fe80::1:161");
+        assert_eq!(t.to_string(), "[fe80::1]:161");
 
         let addr: SocketAddr = "[::1]:162".parse().unwrap();
         let t: Target = addr.into();
-        assert_eq!(t.to_string(), "::1:162");
+        assert_eq!(t.to_string(), "[::1]:162");
     }
 
     #[tokio::test]
