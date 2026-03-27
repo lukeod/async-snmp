@@ -34,6 +34,7 @@ pub struct TestAgent {
     handler: Arc<TestHandler>,
     cancel: CancellationToken,
     _task: JoinHandle<()>,
+    agent: Agent,
 }
 
 impl TestAgent {
@@ -62,6 +63,7 @@ impl TestAgent {
             .expect("failed to build test agent");
 
         let addr = agent.local_addr();
+        let agent_handle = agent.clone();
 
         let task = tokio::spawn(async move {
             if let Err(e) = agent.run().await {
@@ -80,6 +82,7 @@ impl TestAgent {
             handler,
             cancel,
             _task: task,
+            agent: agent_handle,
         }
     }
 
@@ -123,6 +126,11 @@ impl TestAgent {
     /// Called automatically on drop, but can be called early if needed.
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+
+    /// Get a reference to the underlying Agent for counter access.
+    pub fn agent(&self) -> &Agent {
+        &self.agent
     }
 }
 
@@ -242,6 +250,7 @@ impl TestAgentBuilder {
 
         let agent = builder.build().await.expect("failed to build test agent");
         let addr = agent.local_addr();
+        let agent_handle = agent.clone();
 
         let task = tokio::spawn(async move {
             let _ = agent.run().await;
@@ -252,6 +261,7 @@ impl TestAgentBuilder {
             handler,
             cancel,
             _task: task,
+            agent: agent_handle,
         }
     }
 }

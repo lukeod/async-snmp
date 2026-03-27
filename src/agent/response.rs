@@ -31,6 +31,7 @@ impl Agent {
         incoming: &V3Message,
         incoming_usm: &UsmSecurityParams,
         report_oid: Oid,
+        counter_value: u32,
         _source: SocketAddr,
     ) -> Result<Option<Bytes>> {
         // Check reportableFlag before sending Report (RFC 3412 Section 7.1 Step 3)
@@ -47,7 +48,7 @@ impl Agent {
             request_id: incoming.global_data.msg_id,
             error_status: 0,
             error_index: 0,
-            varbinds: vec![VarBind::new(report_oid, Value::Counter32(0))],
+            varbinds: vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
         };
 
         let response_global = MsgGlobalData::new(
