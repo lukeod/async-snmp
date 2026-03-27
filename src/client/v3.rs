@@ -16,6 +16,7 @@ use crate::v3::{
     is_not_in_time_window_report, is_unknown_engine_id_report,
 };
 use bytes::Bytes;
+use std::net::SocketAddr;
 use std::time::Instant;
 use tracing::{Span, instrument};
 
@@ -62,18 +63,62 @@ impl<T: Transport> Client<T> {
             return Ok(());
         }
 
-        // Perform discovery
+        // Perform discovery with retry (same policy as normal requests)
         tracing::debug!(target: "async_snmp::client", "performing engine discovery");
-        let msg_id = self.next_request_id();
-        let discovery_msg = V3Message::discovery_request(msg_id);
-        let discovery_data = discovery_msg.encode();
 
-        // Register request and send discovery
-        self.inner
-            .transport
-            .register_request(msg_id, self.inner.config.timeout);
-        self.inner.transport.send(&discovery_data).await?;
-        let (response_data, _source) = self.inner.transport.recv(msg_id).await?;
+        let max_attempts = if self.inner.transport.is_reliable() {
+            0
+        } else {
+            self.inner.config.retry.max_attempts
+        };
+
+        let mut last_error: Option<Box<Error>> = None;
+        let mut response_data_opt: Option<(Bytes, SocketAddr)> = None;
+
+        'discovery: for attempt in 0..=max_attempts {
+            if attempt > 0 {
+                tracing::debug!(target: "async_snmp::client", "retrying engine discovery");
+            }
+
+            let msg_id = self.next_request_id();
+            let discovery_msg = V3Message::discovery_request(msg_id);
+            let discovery_data = discovery_msg.encode();
+
+            self.inner
+                .transport
+                .register_request(msg_id, self.inner.config.timeout);
+            self.inner.transport.send(&discovery_data).await?;
+
+            match self.inner.transport.recv(msg_id).await {
+                Ok(result) => {
+                    response_data_opt = Some(result);
+                    break 'discovery;
+                }
+                Err(e) if matches!(*e, Error::Timeout { .. }) => {
+                    last_error = Some(e);
+                    if attempt < max_attempts {
+                        let delay = self.inner.config.retry.compute_delay(attempt);
+                        if !delay.is_zero() {
+                            tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let (response_data, _source) = response_data_opt.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                Error::Timeout {
+                    target: self.peer_addr(),
+                    elapsed: std::time::Duration::ZERO,
+                    retries: max_attempts,
+                }
+                .boxed()
+            })
+        })?;
 
         // Parse response
         let response = V3Message::decode(response_data)?;
@@ -593,6 +638,8 @@ mod tests {
     use bytes::Bytes;
     use std::future::ready;
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     #[derive(Clone)]
@@ -669,5 +716,184 @@ mod tests {
         };
 
         assert_eq!(scoped.context_name.as_ref(), b"ctx");
+    }
+
+    /// Transport that times out on the first recv call, then returns a valid
+    /// discovery response on subsequent calls.
+    #[derive(Clone)]
+    struct RetryTestTransport {
+        peer: SocketAddr,
+        recv_count: Arc<AtomicU32>,
+        discovery_response: Bytes,
+    }
+
+    impl RetryTestTransport {
+        fn new(discovery_response: Bytes) -> Self {
+            Self {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+                recv_count: Arc::new(AtomicU32::new(0)),
+                discovery_response,
+            }
+        }
+    }
+
+    impl Transport for RetryTestTransport {
+        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            ready(Ok(()))
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let count = self.recv_count.fetch_add(1, Ordering::Relaxed);
+            let peer = self.peer;
+            let response = self.discovery_response.clone();
+            async move {
+                if count == 0 {
+                    // First call: simulate a timeout
+                    Err(Error::Timeout {
+                        target: peer,
+                        elapsed: Duration::from_secs(5),
+                        retries: 0,
+                    }
+                    .boxed())
+                } else {
+                    Ok((response, peer))
+                }
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+
+        fn register_request(&self, _request_id: i32, _timeout: Duration) {}
+    }
+
+    /// Build a minimal valid discovery response with the given engine ID.
+    fn build_discovery_response(engine_id: &[u8]) -> Bytes {
+        use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+        use crate::pdu::{Pdu, PduType};
+        use crate::v3::UsmSecurityParams;
+        use crate::value::Value;
+        use crate::varbind::VarBind;
+
+        let report_pdu = Pdu {
+            pdu_type: PduType::Report,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0),
+                Value::Counter32(0),
+            )],
+        };
+
+        let global = MsgGlobalData::new(
+            1,
+            65507,
+            MsgFlags::new(crate::message::SecurityLevel::NoAuthNoPriv, false),
+        );
+        let usm = UsmSecurityParams::new(Bytes::copy_from_slice(engine_id), 1, 100, Bytes::new());
+        let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), report_pdu);
+
+        V3Message::new(global, usm.encode(), scoped).encode()
+    }
+
+    #[tokio::test]
+    async fn test_discovery_retries_on_timeout() {
+        let engine_id = b"test-engine";
+        let response = build_discovery_response(engine_id);
+        let transport = RetryTestTransport::new(response);
+        let recv_count = transport.recv_count.clone();
+
+        let config = ClientConfig {
+            version: crate::version::Version::V3,
+            v3_security: Some(UsmConfig::new("user")),
+            retry: crate::client::Retry::fixed(1, Duration::ZERO),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config);
+
+        client
+            .ensure_engine_discovered()
+            .await
+            .expect("discovery should succeed after retry");
+
+        // recv was called twice: once for the timeout, once for the success
+        assert_eq!(recv_count.load(Ordering::Relaxed), 2);
+
+        // Engine state should be set
+        let state = client
+            .inner
+            .engine_state
+            .read()
+            .expect("engine_state lock poisoned");
+        assert!(state.is_some());
+        assert_eq!(state.as_ref().unwrap().engine_id.as_ref(), engine_id);
+    }
+
+    #[tokio::test]
+    async fn test_discovery_fails_when_all_retries_timeout() {
+        // Transport that always times out
+        #[derive(Clone)]
+        struct AlwaysTimeoutTransport {
+            peer: SocketAddr,
+        }
+        impl Transport for AlwaysTimeoutTransport {
+            fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+                ready(Ok(()))
+            }
+            fn recv(
+                &self,
+                _request_id: i32,
+            ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+                let peer = self.peer;
+                async move {
+                    Err(Error::Timeout {
+                        target: peer,
+                        elapsed: Duration::from_secs(5),
+                        retries: 0,
+                    }
+                    .boxed())
+                }
+            }
+            fn peer_addr(&self) -> SocketAddr {
+                self.peer
+            }
+            fn local_addr(&self) -> SocketAddr {
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+            }
+            fn is_reliable(&self) -> bool {
+                false
+            }
+            fn register_request(&self, _request_id: i32, _timeout: Duration) {}
+        }
+
+        let transport = AlwaysTimeoutTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+        };
+        let config = ClientConfig {
+            version: crate::version::Version::V3,
+            v3_security: Some(UsmConfig::new("user")),
+            retry: crate::client::Retry::fixed(2, Duration::ZERO),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config);
+
+        let result = client.ensure_engine_discovered().await;
+        assert!(
+            matches!(*result.unwrap_err(), Error::Timeout { .. }),
+            "should return Timeout after all retries exhausted"
+        );
     }
 }
