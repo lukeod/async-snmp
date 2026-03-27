@@ -202,7 +202,7 @@ impl Pdu {
 
     /// Check if this is an error response.
     pub fn is_error(&self) -> bool {
-        self.error_status != 0
+        self.pdu_type == PduType::Response && self.error_status != 0
     }
 
     /// Get the error status as an enum.
@@ -1004,5 +1004,33 @@ mod tests {
         assert_eq!(pdu.error_status, 0);
         assert_eq!(pdu.error_index, 25);
         assert_eq!(pdu.varbinds.len(), 1);
+    }
+
+    #[test]
+    fn test_getbulk_request_is_not_treated_as_error() {
+        let pdu = Pdu::get_bulk(
+            12345,
+            2,
+            10,
+            vec![
+                VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1)),
+                VarBind::null(oid!(1, 3, 6, 1, 2, 1, 2)),
+            ],
+        );
+
+        assert!(!pdu.is_error());
+    }
+
+    #[test]
+    fn test_response_with_error_status_is_treated_as_error() {
+        let pdu = Pdu {
+            pdu_type: PduType::Response,
+            request_id: 12345,
+            error_status: ErrorStatus::TooBig.as_i32(),
+            error_index: 1,
+            varbinds: vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))],
+        };
+
+        assert!(pdu.is_error());
     }
 }
