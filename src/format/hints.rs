@@ -50,11 +50,6 @@ pub const DOTTED_DECIMAL: &str = "1d.";
 /// For explicitly UTF-8 encoded strings.
 pub const UTF8_STRING: &str = "255t";
 
-/// Octet string as binary bits: "1b" - each byte as 8 binary digits.
-///
-/// Useful for displaying bitmasks and flags.
-pub const BINARY_STRING: &str = "1b";
-
 /// Integer as hex: "x" - integer value in lowercase hexadecimal.
 pub const INTEGER_HEX: &str = "x";
 
@@ -137,5 +132,19 @@ mod tests {
             Value::Integer(255).format_with_hint(INTEGER_HEX),
             Some("ff".to_string())
         );
+    }
+
+    #[test]
+    fn test_hex_string_hint_displays_as_hex() {
+        // HEX_STRING uses "1x" which is valid RFC 2579
+        let data = Value::OctetString(Bytes::from_static(&[0x0f, 0xff]));
+        assert_eq!(data.format_with_hint(HEX_STRING), Some("0fff".to_string()));
+    }
+
+    #[test]
+    fn test_utf8_string_multibyte() {
+        // UTF8_STRING uses "255t" and must decode multi-byte UTF-8 correctly
+        let data = Value::OctetString(Bytes::from("café".as_bytes()));
+        assert_eq!(data.format_with_hint(UTF8_STRING), Some("café".to_string()));
     }
 }
