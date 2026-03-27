@@ -430,6 +430,13 @@ impl<T: Transport> Client<T> {
             let request_id = self.next_request_id();
             let pdu = Pdu::get_request(request_id, oids);
             let response = self.send_request(pdu).await?;
+            if response.varbinds.len() != oids.len() {
+                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len() }, "GET response varbind count mismatch");
+                return Err(Error::MalformedResponse {
+                    target: self.peer_addr(),
+                }
+                .boxed());
+            }
             return Ok(response.varbinds);
         }
 
@@ -444,6 +451,13 @@ impl<T: Transport> Client<T> {
             let request_id = self.next_request_id();
             let pdu = Pdu::get_request(request_id, chunk);
             let response = self.send_request(pdu).await?;
+            if response.varbinds.len() != chunk.len() {
+                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1 }, "GET response varbind count mismatch in batch");
+                return Err(Error::MalformedResponse {
+                    target: self.peer_addr(),
+                }
+                .boxed());
+            }
             all_results.extend(response.varbinds);
         }
 
@@ -498,6 +512,13 @@ impl<T: Transport> Client<T> {
             let request_id = self.next_request_id();
             let pdu = Pdu::get_next_request(request_id, oids);
             let response = self.send_request(pdu).await?;
+            if response.varbinds.len() != oids.len() {
+                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len() }, "GETNEXT response varbind count mismatch");
+                return Err(Error::MalformedResponse {
+                    target: self.peer_addr(),
+                }
+                .boxed());
+            }
             return Ok(response.varbinds);
         }
 
@@ -512,6 +533,13 @@ impl<T: Transport> Client<T> {
             let request_id = self.next_request_id();
             let pdu = Pdu::get_next_request(request_id, chunk);
             let response = self.send_request(pdu).await?;
+            if response.varbinds.len() != chunk.len() {
+                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1 }, "GETNEXT response varbind count mismatch in batch");
+                return Err(Error::MalformedResponse {
+                    target: self.peer_addr(),
+                }
+                .boxed());
+            }
             all_results.extend(response.varbinds);
         }
 
@@ -586,8 +614,16 @@ impl<T: Transport> Client<T> {
             .iter()
             .map(|(oid, value)| VarBind::new(oid.clone(), value.clone()))
             .collect();
+        let expected_count = vbs.len();
         let pdu = Pdu::set_request(request_id, vbs);
         let response = self.send_request(pdu).await?;
+        if response.varbinds.len() != expected_count {
+            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response varbind count mismatch");
+            return Err(Error::MalformedResponse {
+                target: self.peer_addr(),
+            }
+            .boxed());
+        }
         Ok(response.varbinds)
     }
 
@@ -781,5 +817,252 @@ impl<T: Transport> Client<T> {
         let max_results = self.inner.config.max_walk_results;
         let max_repetitions = self.inner.config.max_repetitions as i32;
         BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::CommunityMessage;
+    use crate::oid::Oid;
+    use crate::pdu::{Pdu, PduType};
+    use crate::varbind::VarBind;
+    use crate::version::Version;
+    use bytes::Bytes;
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    // -------------------------------------------------------------------------
+    // Mock transport that returns a response with a configurable number of
+    // varbinds, regardless of how many were requested.
+    // -------------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct TruncatingTransport {
+        /// Number of varbinds to include in each response.
+        response_varbind_count: usize,
+        /// Captured (request_id) values from sent requests, stored for building
+        /// responses.
+        pending: Arc<Mutex<VecDeque<i32>>>,
+    }
+
+    impl TruncatingTransport {
+        fn new(response_varbind_count: usize) -> Self {
+            Self {
+                response_varbind_count,
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+    }
+
+    impl Transport for TruncatingTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            // Decode the sent request to extract the request_id.
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            {
+                let mut q = self.pending.lock().unwrap();
+                q.push_back(request_id);
+            }
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let request_id = {
+                let mut q = self.pending.lock().unwrap();
+                q.pop_front().unwrap_or(1)
+            };
+            let n = self.response_varbind_count;
+            let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();
+
+            async move {
+                // Build a response PDU with n varbinds (NULL values).
+                let varbinds: Vec<VarBind> = (0..n)
+                    .map(|i| {
+                        VarBind::new(
+                            Oid::from_slice(&[1, 3, 6, 1, i as u32]),
+                            crate::value::Value::Null,
+                        )
+                    })
+                    .collect();
+
+                let pdu = Pdu {
+                    pdu_type: PduType::Response,
+                    request_id,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds,
+                };
+
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                let encoded = msg.encode();
+                Ok((encoded, peer))
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    fn make_client(response_varbind_count: usize) -> Client<TruncatingTransport> {
+        let transport = TruncatingTransport::new(response_varbind_count);
+        let config = ClientConfig {
+            version: Version::V2c,
+            max_oids_per_request: 10,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        Client::new(transport, config)
+    }
+
+    #[tokio::test]
+    async fn get_many_rejects_truncated_response() {
+        // Request 3 OIDs but the mock returns only 1 varbind.
+        let client = make_client(1);
+        let oids = [
+            Oid::from_slice(&[1, 3, 6, 1, 1]),
+            Oid::from_slice(&[1, 3, 6, 1, 2]),
+            Oid::from_slice(&[1, 3, 6, 1, 3]),
+        ];
+
+        let err = client.get_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_many_accepts_correct_response_count() {
+        // Request 3 OIDs and the mock returns exactly 3 varbinds.
+        let client = make_client(3);
+        let oids = [
+            Oid::from_slice(&[1, 3, 6, 1, 1]),
+            Oid::from_slice(&[1, 3, 6, 1, 2]),
+            Oid::from_slice(&[1, 3, 6, 1, 3]),
+        ];
+
+        let result = client.get_many(&oids).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn get_next_many_rejects_truncated_response() {
+        // Request 3 OIDs but the mock returns only 1 varbind.
+        let client = make_client(1);
+        let oids = [
+            Oid::from_slice(&[1, 3, 6, 1, 1]),
+            Oid::from_slice(&[1, 3, 6, 1, 2]),
+            Oid::from_slice(&[1, 3, 6, 1, 3]),
+        ];
+
+        let err = client.get_next_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_next_many_accepts_correct_response_count() {
+        // Request 3 OIDs and the mock returns exactly 3 varbinds.
+        let client = make_client(3);
+        let oids = [
+            Oid::from_slice(&[1, 3, 6, 1, 1]),
+            Oid::from_slice(&[1, 3, 6, 1, 2]),
+            Oid::from_slice(&[1, 3, 6, 1, 3]),
+        ];
+
+        let result = client.get_next_many(&oids).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn set_many_rejects_truncated_response() {
+        // Request 3 varbinds but the mock returns only 1.
+        let client = make_client(1);
+        let varbinds = [
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 1]),
+                crate::value::Value::Integer(1),
+            ),
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 2]),
+                crate::value::Value::Integer(2),
+            ),
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 3]),
+                crate::value::Value::Integer(3),
+            ),
+        ];
+
+        let err = client.set_many(&varbinds).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_many_accepts_correct_response_count() {
+        // Request 3 varbinds and the mock returns exactly 3.
+        let client = make_client(3);
+        let varbinds = [
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 1]),
+                crate::value::Value::Integer(1),
+            ),
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 2]),
+                crate::value::Value::Integer(2),
+            ),
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 3]),
+                crate::value::Value::Integer(3),
+            ),
+        ];
+
+        let result = client.set_many(&varbinds).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    // Batched path: get_many with more OIDs than max_per_request.
+    // The first batch will have truncated response.
+    #[tokio::test]
+    async fn get_many_batched_rejects_truncated_response() {
+        // max_oids_per_request = 10, request 12 OIDs, mock returns 1 per batch
+        let transport = TruncatingTransport::new(1);
+        let config = ClientConfig {
+            version: Version::V2c,
+            max_oids_per_request: 10,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+
+        let oids: Vec<Oid> = (0..12u32)
+            .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
+            .collect();
+
+        let err = client.get_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
     }
 }
