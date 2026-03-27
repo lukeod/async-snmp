@@ -107,10 +107,16 @@ impl Agent {
         // Verify engine ID matches ours
         if usm_params.engine_id.as_ref() != self.inner.engine_id.as_slice() {
             tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "engine ID mismatch");
+            let count = self
+                .inner
+                .usm_unknown_engine_ids
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             return self.send_v3_report(
                 &msg,
                 &usm_params,
                 crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0), // usmStatsUnknownEngineIDs
+                count,
                 source,
             );
         }
@@ -123,10 +129,16 @@ impl Agent {
         // the user MUST exist in the local user database regardless of security level.
         if user_config.is_none() {
             tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "unknown user");
+            let count = self
+                .inner
+                .usm_unknown_usernames
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             return self.send_v3_report(
                 &msg,
                 &usm_params,
                 crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 3, 0), // usmStatsUnknownUserNames
+                count,
                 source,
             );
         }
@@ -145,10 +157,13 @@ impl Agent {
 
                     if !verify_message(auth_key, &data, auth_offset, auth_len) {
                         tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "authentication failed");
+                        let count =
+                            self.inner.usm_wrong_digests.fetch_add(1, Ordering::Relaxed) + 1;
                         return self.send_v3_report(
                             &msg,
                             &usm_params,
                             crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0), // usmStatsWrongDigests
+                            count,
                             source,
                         );
                     }
@@ -158,10 +173,16 @@ impl Agent {
                     let time_diff = (usm_params.engine_time as i64 - our_time as i64).abs();
                     if time_diff > 150 {
                         tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "message outside time window");
+                        let count = self
+                            .inner
+                            .usm_not_in_time_windows
+                            .fetch_add(1, Ordering::Relaxed)
+                            + 1;
                         return self.send_v3_report(
                             &msg,
                             &usm_params,
                             crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0), // usmStatsNotInTimeWindows
+                            count,
                             source,
                         );
                     }
@@ -169,10 +190,12 @@ impl Agent {
                 _ => {
                     // User exists but has no auth key configured - authentication cannot proceed
                     tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user has no auth credentials");
+                    let count = self.inner.usm_wrong_digests.fetch_add(1, Ordering::Relaxed) + 1;
                     return self.send_v3_report(
                         &msg,
                         &usm_params,
                         crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0), // usmStatsWrongDigests
+                        count,
                         source,
                     );
                 }
@@ -300,6 +323,13 @@ impl Agent {
         let engine_boots = self.inner.engine_boots.load(Ordering::Relaxed);
         let engine_time = self.inner.engine_time.load(Ordering::Relaxed);
 
+        // Increment usmStatsUnknownEngineIDs for discovery requests (RFC 3414 Section 3.2 Step 3b)
+        let unknown_engine_ids_count = self
+            .inner
+            .usm_unknown_engine_ids
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+
         // Build Report PDU with usmStatsUnknownEngineIDs
         let report_pdu = Pdu {
             pdu_type: PduType::Report,
@@ -308,7 +338,7 @@ impl Agent {
             error_index: 0,
             varbinds: vec![VarBind::new(
                 crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0), // usmStatsUnknownEngineIDs
-                Value::Counter32(0),
+                Value::Counter32(unknown_engine_ids_count),
             )],
         };
 

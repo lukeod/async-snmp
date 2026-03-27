@@ -563,6 +563,10 @@ impl AgentBuilder {
                 snmp_invalid_msgs: AtomicU32::new(0),
                 snmp_unknown_security_models: AtomicU32::new(0),
                 snmp_silent_drops: AtomicU32::new(0),
+                usm_unknown_engine_ids: AtomicU32::new(0),
+                usm_unknown_usernames: AtomicU32::new(0),
+                usm_wrong_digests: AtomicU32::new(0),
+                usm_not_in_time_windows: AtomicU32::new(0),
                 cancel,
             }),
         })
@@ -601,6 +605,19 @@ pub(crate) struct AgentInner {
     /// snmpSilentDrops (1.3.6.1.6.3.11.2.1.3) - confirmed-class PDUs silently
     /// dropped because even an empty response would exceed max message size
     pub(crate) snmp_silent_drops: AtomicU32,
+    // RFC 3414 USM statistics counters
+    /// usmStatsUnknownEngineIDs (1.3.6.1.6.3.15.1.1.4) - messages with
+    /// unknown engine ID
+    pub(crate) usm_unknown_engine_ids: AtomicU32,
+    /// usmStatsUnknownUserNames (1.3.6.1.6.3.15.1.1.3) - messages with
+    /// unknown user name
+    pub(crate) usm_unknown_usernames: AtomicU32,
+    /// usmStatsWrongDigests (1.3.6.1.6.3.15.1.1.5) - messages with incorrect
+    /// authentication digest
+    pub(crate) usm_wrong_digests: AtomicU32,
+    /// usmStatsNotInTimeWindows (1.3.6.1.6.3.15.1.1.2) - messages outside
+    /// the time window
+    pub(crate) usm_not_in_time_windows: AtomicU32,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
 }
@@ -684,6 +701,50 @@ impl Agent {
     /// OID: 1.3.6.1.6.3.11.2.1.3
     pub fn snmp_silent_drops(&self) -> u32 {
         self.inner.snmp_silent_drops.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsUnknownEngineIDs counter value.
+    ///
+    /// This counter tracks messages with unknown engine IDs.
+    /// Incremented when a non-discovery request arrives with an engine ID that
+    /// does not match the local engine (RFC 3414 Section 3.2 Step 3).
+    ///
+    /// OID: 1.3.6.1.6.3.15.1.1.4
+    pub fn usm_unknown_engine_ids(&self) -> u32 {
+        self.inner.usm_unknown_engine_ids.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsUnknownUserNames counter value.
+    ///
+    /// This counter tracks messages with unknown user names.
+    /// Incremented when a message arrives with a user name not in the local
+    /// user database (RFC 3414 Section 3.2 Step 1).
+    ///
+    /// OID: 1.3.6.1.6.3.15.1.1.3
+    pub fn usm_unknown_usernames(&self) -> u32 {
+        self.inner.usm_unknown_usernames.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsWrongDigests counter value.
+    ///
+    /// This counter tracks messages with incorrect authentication digests,
+    /// as well as messages where the user has no auth key configured.
+    /// (RFC 3414 Section 3.2 Steps 6 and 7).
+    ///
+    /// OID: 1.3.6.1.6.3.15.1.1.5
+    pub fn usm_wrong_digests(&self) -> u32 {
+        self.inner.usm_wrong_digests.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsNotInTimeWindows counter value.
+    ///
+    /// This counter tracks messages that fall outside the time window.
+    /// Incremented when the message time differs from the local time by
+    /// more than 150 seconds (RFC 3414 Section 3.2 Step 8).
+    ///
+    /// OID: 1.3.6.1.6.3.15.1.1.2
+    pub fn usm_not_in_time_windows(&self) -> u32 {
+        self.inner.usm_not_in_time_windows.load(Ordering::Relaxed)
     }
 
     /// Run the agent, processing requests concurrently.
