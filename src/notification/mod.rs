@@ -314,13 +314,13 @@ impl Notification {
     ///
     /// For TrapV1, this is derived from enterprise + generic/specific trap.
     /// For v2c/v3, this is the snmpTrapOID.0 value.
-    pub fn trap_oid(&self) -> &Oid {
+    pub fn trap_oid(&self) -> Result<Oid> {
         match self {
-            Notification::TrapV1 { trap, .. } => &trap.enterprise,
+            Notification::TrapV1 { trap, .. } => trap.v2_trap_oid(),
             Notification::TrapV2c { trap_oid, .. }
             | Notification::TrapV3 { trap_oid, .. }
             | Notification::InformV2c { trap_oid, .. }
-            | Notification::InformV3 { trap_oid, .. } => trap_oid,
+            | Notification::InformV3 { trap_oid, .. } => Ok(trap_oid.clone()),
         }
     }
 
@@ -559,6 +559,7 @@ mod tests {
         assert!(!notification.is_confirmed());
         assert_eq!(notification.version(), Version::V1);
         assert_eq!(notification.uptime(), 12345);
+        assert_eq!(notification.trap_oid().unwrap(), oids::link_down());
     }
 
     #[test]
@@ -574,7 +575,7 @@ mod tests {
         assert!(!notification.is_confirmed());
         assert_eq!(notification.version(), Version::V2c);
         assert_eq!(notification.uptime(), 54321);
-        assert_eq!(notification.trap_oid(), &oids::link_up());
+        assert_eq!(notification.trap_oid().unwrap(), oids::link_up());
     }
 
     #[test]
@@ -629,6 +630,28 @@ mod tests {
         assert!(notification.is_confirmed());
         assert_eq!(notification.version(), Version::V3);
         assert_eq!(notification.uptime(), 99999);
-        assert_eq!(notification.trap_oid(), &oids::warm_start());
+        assert_eq!(notification.trap_oid().unwrap(), oids::warm_start());
+    }
+
+    #[test]
+    fn test_notification_trap_v1_enterprise_specific_oid() {
+        let trap = TrapV1Pdu::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999, 1, 2),
+            [192, 168, 1, 1],
+            GenericTrap::EnterpriseSpecific,
+            42,
+            12345,
+            vec![],
+        );
+
+        let notification = Notification::TrapV1 {
+            community: Bytes::from_static(b"public"),
+            trap,
+        };
+
+        assert_eq!(
+            notification.trap_oid().unwrap(),
+            oid!(1, 3, 6, 1, 4, 1, 9999, 1, 2, 0, 42)
+        );
     }
 }
