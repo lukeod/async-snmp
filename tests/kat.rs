@@ -566,7 +566,7 @@ fn test_aes256_with_sha1_auto_key_extension_roundtrip() {
 
     // Create privacy key - Blumenthal extension is auto-applied because
     // SHA-1 (20 bytes) < AES-256 (32 bytes)
-    let mut priv_key = PrivKey::from_password(
+    let priv_key = PrivKey::from_password(
         AuthProtocol::Sha1,
         PrivProtocol::Aes256,
         password,
@@ -600,7 +600,7 @@ fn test_aes192_with_sha1_auto_key_extension_roundtrip() {
 
     // Create privacy key - Blumenthal extension is auto-applied because
     // SHA-1 (20 bytes) < AES-192 (24 bytes)
-    let mut priv_key = PrivKey::from_password(
+    let priv_key = PrivKey::from_password(
         AuthProtocol::Sha1,
         PrivProtocol::Aes192,
         password,
@@ -633,7 +633,7 @@ fn test_aes256_with_md5_auto_key_extension_roundtrip() {
     let engine_id = decode("000000000000000000000002").unwrap();
 
     // Blumenthal extension is auto-applied because MD5 (16 bytes) < AES-256 (32 bytes)
-    let mut priv_key = PrivKey::from_password(
+    let priv_key = PrivKey::from_password(
         AuthProtocol::Md5,
         PrivProtocol::Aes256,
         password,

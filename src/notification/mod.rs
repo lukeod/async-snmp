@@ -72,7 +72,7 @@ use crate::varbind::VarBind;
 use crate::version::Version;
 
 // Re-exports
-pub use types::{DerivedKeys, UsmConfig, UsmUserConfig};
+pub use types::{DerivedKeys, UsmConfig};
 pub use varbind::validate_notification_varbinds;
 
 /// Well-known OIDs for notification varbinds.
@@ -135,7 +135,7 @@ pub mod oids {
 /// Allows configuration of bind address and USM credentials for V3 support.
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
-    usm_users: HashMap<Bytes, UsmUserConfig>,
+    usm_users: HashMap<Bytes, UsmConfig>,
 }
 
 impl NotificationReceiverBuilder {
@@ -181,10 +181,10 @@ impl NotificationReceiverBuilder {
     /// ```
     pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
     where
-        F: FnOnce(UsmUserConfig) -> UsmUserConfig,
+        F: FnOnce(UsmConfig) -> UsmConfig,
     {
         let username_bytes: Bytes = username.into();
-        let config = configure(UsmUserConfig::new(username_bytes.clone()));
+        let config = configure(UsmConfig::new(username_bytes.clone()));
         self.usm_users.insert(username_bytes, config);
         self
     }
@@ -397,7 +397,7 @@ struct ReceiverInner {
     socket: UdpSocket,
     local_addr: SocketAddr,
     /// Configured USM users for V3 authentication
-    usm_users: HashMap<Bytes, UsmUserConfig>,
+    usm_users: HashMap<Bytes, UsmConfig>,
     /// Salt counter for privacy operations
     salt_counter: SaltCounter,
 }

@@ -125,19 +125,19 @@ fn bench_encrypt(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         // DES
-        let mut key = des_key.clone();
+        let key = des_key.clone();
         group.bench_with_input(BenchmarkId::new("DES", size), &data, |b, data| {
             b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
         });
 
         // AES-128
-        let mut key = aes128_key.clone();
+        let key = aes128_key.clone();
         group.bench_with_input(BenchmarkId::new("AES-128", size), &data, |b, data| {
             b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
         });
 
         // AES-256
-        let mut key = aes256_key.clone();
+        let key = aes256_key.clone();
         group.bench_with_input(BenchmarkId::new("AES-256", size), &data, |b, data| {
             b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
         });
@@ -152,7 +152,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
     let data_sizes = [64, 128, 256, 512];
 
-    let mut des_key = PrivKey::from_bytes(
+    let des_key = PrivKey::from_bytes(
         PrivProtocol::Des,
         vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
@@ -160,7 +160,7 @@ fn bench_decrypt(c: &mut Criterion) {
         ],
     );
 
-    let mut aes128_key = PrivKey::from_bytes(
+    let aes128_key = PrivKey::from_bytes(
         PrivProtocol::Aes128,
         vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
@@ -168,7 +168,7 @@ fn bench_decrypt(c: &mut Criterion) {
         ],
     );
 
-    let mut aes256_key = PrivKey::from_bytes(
+    let aes256_key = PrivKey::from_bytes(
         PrivProtocol::Aes256,
         vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
@@ -243,7 +243,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
 
     // Pre-derive keys
     let auth_key = LocalizedKey::from_password(AuthProtocol::Sha256, PASSWORD, ENGINE_ID);
-    let mut priv_key = PrivKey::from_bytes(
+    let priv_key = PrivKey::from_bytes(
         PrivProtocol::Aes128,
         vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,

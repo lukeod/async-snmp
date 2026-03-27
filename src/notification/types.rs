@@ -154,9 +154,6 @@ impl std::fmt::Debug for UsmConfig {
     }
 }
 
-/// Type alias for backward compatibility.
-pub type UsmUserConfig = UsmConfig;
-
 /// Derived keys for a specific engine ID.
 ///
 /// Used internally for V3 authentication in both client and notification receiver.
@@ -173,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_usm_user_config_no_auth() {
-        let config = UsmUserConfig::new(Bytes::from_static(b"testuser"));
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"));
         assert_eq!(config.security_level(), SecurityLevel::NoAuthNoPriv);
         assert!(config.auth.is_none());
         assert!(config.privacy.is_none());
@@ -181,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_usm_user_config_auth_only() {
-        let config = UsmUserConfig::new(Bytes::from_static(b"testuser"))
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"))
             .auth(AuthProtocol::Sha1, b"password123");
         assert_eq!(config.security_level(), SecurityLevel::AuthNoPriv);
         assert!(config.auth.is_some());
@@ -191,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_usm_user_config_auth_priv() {
-        let config = UsmUserConfig::new(Bytes::from_static(b"testuser"))
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"))
             .auth(AuthProtocol::Sha256, b"authpass")
             .privacy(PrivProtocol::Aes128, b"privpass");
         assert_eq!(config.security_level(), SecurityLevel::AuthPriv);
@@ -201,13 +198,13 @@ mod tests {
 
     #[test]
     fn test_usm_user_config_context_name() {
-        let config = UsmUserConfig::new(Bytes::from_static(b"testuser")).context_name("ctx");
+        let config = UsmConfig::new(Bytes::from_static(b"testuser")).context_name("ctx");
         assert_eq!(config.context_name.as_ref(), b"ctx");
     }
 
     #[test]
     fn test_usm_user_config_derive_keys() {
-        let config = UsmUserConfig::new(Bytes::from_static(b"testuser"))
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"))
             .auth(AuthProtocol::Sha1, b"password123");
 
         let engine_id = b"test-engine-id";
@@ -219,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_usm_user_config_derive_keys_with_privacy() {
-        let config = UsmUserConfig::new(Bytes::from_static(b"testuser"))
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"))
             .auth(AuthProtocol::Sha256, b"authpass")
             .privacy(PrivProtocol::Aes128, b"privpass");
 

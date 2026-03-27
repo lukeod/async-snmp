@@ -438,7 +438,7 @@ pub use handler::{
 };
 pub use message::SecurityLevel;
 pub use notification::{
-    Notification, NotificationReceiver, NotificationReceiverBuilder, UsmConfig, UsmUserConfig,
+    Notification, NotificationReceiver, NotificationReceiverBuilder, UsmConfig,
     validate_notification_varbinds,
 };
 pub use oid::Oid;

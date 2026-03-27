@@ -108,6 +108,16 @@ struct UdpTransportInner {
     shutdown: CancellationToken,
 }
 
+impl Drop for UdpTransport {
+    fn drop(&mut self) {
+        // Cancel the background receiver task when the last UdpTransport handle is dropped.
+        // Arc::get_mut succeeds only when this is the last reference.
+        if Arc::get_mut(&mut self.inner).is_some() {
+            self.inner.shutdown.cancel();
+        }
+    }
+}
+
 impl UdpTransport {
     /// Bind to the given address with default configuration.
     ///
