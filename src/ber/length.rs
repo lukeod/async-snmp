@@ -60,32 +60,8 @@ pub(crate) const fn base128_len(value: u32) -> usize {
 
 /// Returns the number of content bytes needed to encode a signed i32 in BER.
 #[inline]
-pub(crate) const fn integer_content_len(value: i32) -> usize {
-    let bytes = value.to_be_bytes();
-
-    if value >= 0 {
-        // For positive/zero, skip leading 0x00 bytes (but keep one if next byte has MSB set)
-        if bytes[0] != 0 {
-            4
-        } else if bytes[1] != 0 || bytes[2] & 0x80 != 0 {
-            if bytes[1] & 0x80 != 0 { 4 } else { 3 }
-        } else if bytes[2] != 0 || bytes[3] & 0x80 != 0 {
-            if bytes[2] & 0x80 != 0 { 3 } else { 2 }
-        } else {
-            1
-        }
-    } else {
-        // For negative, skip leading 0xFF bytes (but keep one if next byte has MSB clear)
-        if bytes[0] != 0xFF {
-            4
-        } else if bytes[1] != 0xFF || bytes[2] & 0x80 == 0 {
-            if bytes[1] & 0x80 == 0 { 4 } else { 3 }
-        } else if bytes[2] != 0xFF || bytes[3] & 0x80 == 0 {
-            if bytes[2] & 0x80 == 0 { 3 } else { 2 }
-        } else {
-            1
-        }
-    }
+pub(crate) fn integer_content_len(value: i32) -> usize {
+    super::encode::encode_integer_stack(value).1
 }
 
 /// Returns the number of content bytes needed to encode an unsigned u32 in BER.

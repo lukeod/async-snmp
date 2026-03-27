@@ -59,6 +59,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{Span, instrument};
 
 pub use crate::notification::{DerivedKeys, UsmConfig};
@@ -129,6 +130,8 @@ struct ClientInner<T: Transport> {
     salt_counter: SaltCounter,
     /// Shared engine cache (V3, optional)
     engine_cache: Option<Arc<EngineCache>>,
+    /// Serializes concurrent discovery attempts so only one runs at a time.
+    discovery_lock: AsyncMutex<()>,
 }
 
 /// Client configuration.
@@ -194,6 +197,7 @@ impl<T: Transport> Client<T> {
                 derived_keys: RwLock::new(None),
                 salt_counter: SaltCounter::new(),
                 engine_cache: None,
+                discovery_lock: AsyncMutex::new(()),
             }),
         }
     }
@@ -212,6 +216,7 @@ impl<T: Transport> Client<T> {
                 derived_keys: RwLock::new(None),
                 salt_counter: SaltCounter::new(),
                 engine_cache: Some(engine_cache),
+                discovery_lock: AsyncMutex::new(()),
             }),
         }
     }

@@ -165,7 +165,7 @@ impl Default for EncodeBuf {
 /// Returns a stack-allocated array and the number of valid bytes.
 /// The valid bytes are at the END of the array (for reverse-buffer compatibility).
 #[inline]
-fn encode_integer_stack(value: i32) -> ([u8; 4], usize) {
+pub(super) fn encode_integer_stack(value: i32) -> ([u8; 4], usize) {
     let bytes = value.to_be_bytes();
 
     // Find first significant byte
