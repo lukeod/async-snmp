@@ -678,15 +678,19 @@ impl VacmConfig {
 
     /// Resolve group name for a request.
     pub fn get_group(&self, model: SecurityModel, name: &[u8]) -> Option<&Bytes> {
-        let name_bytes = Bytes::copy_from_slice(name);
-        // Try exact match first
-        self.security_to_group
-            .get(&(model, name_bytes.clone()))
-            // Fall back to Any security model
-            .or_else(|| {
-                self.security_to_group
-                    .get(&(SecurityModel::Any, name_bytes))
-            })
+        // Try exact model match first, then fall back to Any.
+        // Iterate to avoid allocating a Bytes for the lookup key.
+        let mut any_match = None;
+        for ((entry_model, entry_name), group) in &self.security_to_group {
+            if entry_name.as_ref() == name {
+                if *entry_model == model {
+                    return Some(group);
+                } else if *entry_model == SecurityModel::Any {
+                    any_match = Some(group);
+                }
+            }
+        }
+        any_match
     }
 
     /// Get access entry for context.

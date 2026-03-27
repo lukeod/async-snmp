@@ -309,16 +309,6 @@ impl EngineCache {
     }
 }
 
-impl Clone for EngineCache {
-    fn clone(&self) -> Self {
-        // Clone creates a new cache with the same contents
-        let engines = self.engines.read().map(|e| e.clone()).unwrap_or_default();
-        Self {
-            engines: RwLock::new(engines),
-        }
-    }
-}
-
 /// Extract engine state from a discovery response's USM security parameters.
 ///
 /// The discovery response (Report PDU) contains the authoritative engine's
@@ -715,27 +705,6 @@ mod tests {
         let removed = cache.remove(&addr).unwrap();
         assert_eq!(removed.latest_received_engine_time, 1100);
         assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn test_engine_cache_clone() {
-        let cache1 = EngineCache::new();
-        let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
-
-        cache1.insert(
-            addr,
-            EngineState::new(Bytes::from_static(b"engine1"), 1, 1000),
-        );
-
-        // Clone should have same content
-        let cache2 = cache1.clone();
-        assert_eq!(cache2.len(), 1);
-        assert!(cache2.get(&addr).is_some());
-
-        // But modifications are independent
-        cache2.clear();
-        assert_eq!(cache1.len(), 1);
-        assert_eq!(cache2.len(), 0);
     }
 
     #[test]
