@@ -1001,25 +1001,7 @@ impl Agent {
             // Try to find the next OID from any handler, skipping OIDs denied by
             // VACM. RFC 3413 classifies GETNEXT as Read-Class and requires
             // continuing the walk until an accessible OID is found.
-            let mut search_from = vb.oid.clone();
-            let next = loop {
-                let candidate = self.get_next_oid(ctx, &search_from).await;
-                match candidate {
-                    None => break None,
-                    Some(ref next_vb) => {
-                        if let Some(ref vacm) = self.inner.vacm {
-                            if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
-                                break candidate;
-                            } else {
-                                // Denied - advance past this OID and keep searching
-                                search_from = next_vb.oid.clone();
-                            }
-                        } else {
-                            break candidate;
-                        }
-                    }
-                }
-            };
+            let next = self.get_next_accessible_oid(ctx, &vb.oid).await;
 
             match next {
                 Some(next_vb) => {
@@ -1067,22 +1049,7 @@ impl Agent {
 
         // Handle non-repeaters (first N varbinds get one GETNEXT each)
         for vb in pdu.varbinds.iter().take(non_repeaters) {
-            let next = self.get_next_oid(ctx, &vb.oid).await;
-
-            // Check VACM access for the returned OID (if VACM enabled)
-            let next = if let Some(ref next_vb) = next {
-                if let Some(ref vacm) = self.inner.vacm {
-                    if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
-                        next
-                    } else {
-                        None
-                    }
-                } else {
-                    next
-                }
-            } else {
-                next
-            };
+            let next = self.get_next_accessible_oid(ctx, &vb.oid).await;
 
             let next_vb = match next {
                 Some(next_vb) => next_vb,
@@ -1114,22 +1081,7 @@ impl Agent {
                     let next_vb = if all_done[i] {
                         VarBind::new(oid.clone(), Value::EndOfMibView)
                     } else {
-                        let next = self.get_next_oid(ctx, oid).await;
-
-                        // Check VACM access for the returned OID
-                        let next = if let Some(ref next_vb) = next {
-                            if let Some(ref vacm) = self.inner.vacm {
-                                if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
-                                    next
-                                } else {
-                                    None
-                                }
-                            } else {
-                                next
-                            }
-                        } else {
-                            next
-                        };
+                        let next = self.get_next_accessible_oid(ctx, oid).await;
 
                         match next {
                             Some(next_vb) => {
@@ -1177,6 +1129,34 @@ impl Agent {
             .iter()
             .find(|&handler| handler.handler.handles(&handler.prefix, oid))
             .map(|v| v as _)
+    }
+
+    /// Find the next OID accessible under VACM, skipping denied OIDs by
+    /// continuing the walk. Returns None when end-of-MIB is reached or all
+    /// remaining candidates are denied.
+    async fn get_next_accessible_oid(
+        &self,
+        ctx: &RequestContext,
+        from_oid: &Oid,
+    ) -> Option<VarBind> {
+        let mut search_from = from_oid.clone();
+        loop {
+            let candidate = self.get_next_oid(ctx, &search_from).await;
+            match candidate {
+                None => return None,
+                Some(ref next_vb) => {
+                    if let Some(ref vacm) = self.inner.vacm {
+                        if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
+                            return candidate;
+                        } else {
+                            search_from = next_vb.oid.clone();
+                        }
+                    } else {
+                        return candidate;
+                    }
+                }
+            }
+        }
     }
 
     /// Get the next OID from any handler.
@@ -1391,18 +1371,55 @@ mod tests {
         assert!(next.is_end_of_mib_view());
     }
 
+    // FiveOidHandler has OIDs at .99999.{1,2,3,4,5}.0 with integer values 1-5.
+    struct FiveOidHandler;
+
+    impl MibHandler for FiveOidHandler {
+        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+            Box::pin(async move {
+                for i in 1u32..=5 {
+                    if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, i, 0) {
+                        return GetResult::Value(Value::Integer(i as i32));
+                    }
+                }
+                GetResult::NoSuchObject
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, GetNextResult> {
+            Box::pin(async move {
+                for i in 1u32..=5 {
+                    let candidate = oid!(1, 3, 6, 1, 4, 1, 99999, i, 0);
+                    if oid < &candidate {
+                        return GetNextResult::Value(VarBind::new(
+                            candidate,
+                            Value::Integer(i as i32),
+                        ));
+                    }
+                }
+                GetNextResult::EndOfMibView
+            })
+        }
+    }
+
     /// Build an agent bound to a random port for testing, with a VACM view
-    /// that only permits reading OIDs under 1.3.6.1.4.1.99999.1 (not .99999.2).
+    /// that only permits reading OIDs under .99999.2 and .99999.4 (odd OIDs
+    /// 1, 3, 5 are denied). This exercises the VACM walk-past logic.
     async fn test_agent_with_restricted_vacm() -> Agent {
         Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .vacm(|v| {
                 v.group("public", SecurityModel::V2c, "readers")
                     .access("readers", |a| a.read_view("restricted"))
                     .view("restricted", |v| {
-                        v.include(oid!(1, 3, 6, 1, 4, 1, 99999, 1))
+                        v.include(oid!(1, 3, 6, 1, 4, 1, 99999, 2))
+                            .include(oid!(1, 3, 6, 1, 4, 1, 99999, 4))
                     })
             })
             .build()
@@ -1418,7 +1435,9 @@ mod tests {
         ctx.pdu_type = PduType::GetBulkRequest;
         ctx.read_view = Some(Bytes::from_static(b"restricted"));
 
-        // GETBULK starting before the handler prefix, requesting up to 10 repeats
+        // GETBULK starting before the handler prefix, requesting up to 10 repeats.
+        // The handler has OIDs {1,2,3,4,5}.0 but only {2,4} are in the view.
+        // The walk must skip denied OIDs and continue, returning both 2 and 4.
         let pdu = Pdu {
             pdu_type: PduType::GetBulkRequest,
             request_id: 1,
@@ -1429,20 +1448,37 @@ mod tests {
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        // oid1 (.99999.1.0) is in the view, so it should appear
+        // Collect the OIDs returned (excluding EndOfMibView sentinels)
+        let returned_oids: Vec<&Oid> = response
+            .varbinds
+            .iter()
+            .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
+            .map(|vb| &vb.oid)
+            .collect();
+
+        // Both accessible OIDs must appear - the walk must not stop at the first one
         assert!(
-            response
-                .varbinds
-                .iter()
-                .any(|vb| vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)),
-            "expected oid1 in response"
+            returned_oids.contains(&&oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0)),
+            "expected .99999.2.0 in response, got: {:?}",
+            returned_oids
+        );
+        assert!(
+            returned_oids.contains(&&oid!(1, 3, 6, 1, 4, 1, 99999, 4, 0)),
+            "expected .99999.4.0 in response (walk must continue past denied OIDs), got: {:?}",
+            returned_oids
         );
 
-        // oid2 (.99999.2.0) is NOT in the view, so it must not appear with a real value
-        for vb in &response.varbinds {
-            if vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
-                panic!("GETBULK returned OID outside read view: {:?}", vb);
-            }
+        // Denied OIDs must not appear
+        for &oid in &[
+            &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+            &oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0),
+            &oid!(1, 3, 6, 1, 4, 1, 99999, 5, 0),
+        ] {
+            assert!(
+                !returned_oids.contains(&oid),
+                "GETBULK returned OID outside read view: {:?}",
+                oid
+            );
         }
     }
 
@@ -1454,9 +1490,11 @@ mod tests {
         ctx.pdu_type = PduType::GetBulkRequest;
         ctx.read_view = Some(Bytes::from_static(b"restricted"));
 
-        // GETBULK with non_repeaters=2, max_repetitions=0
-        // Two varbinds: one that walks to oid1 (accessible) and one that
-        // walks to oid2 (inaccessible).
+        // GETBULK with non_repeaters=2, max_repetitions=0.
+        // First varbind starts before the subtree: walks past denied .99999.1.0
+        // and returns the first accessible .99999.2.0.
+        // Second varbind starts at .99999.4.0 (the last accessible OID): walks
+        // to .99999.5.0 (denied) and then hits end-of-MIB, returning EndOfMibView.
         let pdu = Pdu {
             pdu_type: PduType::GetBulkRequest,
             request_id: 2,
@@ -1464,20 +1502,20 @@ mod tests {
             error_index: 0,  // max_repetitions
             varbinds: vec![
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null),
-                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 4, 0), Value::Null),
             ],
         };
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        // First non-repeater walks to oid1 (accessible)
+        // First non-repeater skips denied .99999.1.0 and returns accessible .99999.2.0
         assert_eq!(
             response.varbinds[0].oid,
-            oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)
+            oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0)
         );
-        assert!(matches!(response.varbinds[0].value, Value::Integer(42)));
+        assert!(matches!(response.varbinds[0].value, Value::Integer(2)));
 
-        // Second non-repeater walks to oid2 (inaccessible), should be EndOfMibView
+        // Second non-repeater walks to .99999.5.0 (denied), then end-of-MIB
         assert_eq!(response.varbinds[1].value, Value::EndOfMibView);
     }
 
@@ -1579,6 +1617,8 @@ mod tests {
     #[tokio::test]
     async fn test_getnext_vacm_all_remaining_denied_returns_end_of_mib() {
         // When all remaining OIDs are denied, GETNEXT should return EndOfMibView.
+        // Start at .99999.4.0 (the last accessible OID). The only OID after it
+        // is .99999.5.0 which is denied, so the walk reaches end-of-MIB.
         let agent = test_agent_with_restricted_vacm().await;
 
         let mut ctx = test_ctx();
@@ -1591,7 +1631,7 @@ mod tests {
             error_status: 0,
             error_index: 0,
             varbinds: vec![VarBind::new(
-                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                oid!(1, 3, 6, 1, 4, 1, 99999, 4, 0),
                 Value::Null,
             )],
         };

@@ -15,6 +15,7 @@ mod privacy;
 mod usm;
 
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
+pub use engine::report_oids;
 pub use engine::{
     DEFAULT_MSG_MAX_SIZE, EngineCache, EngineState, MAX_ENGINE_TIME, TIME_WINDOW,
     parse_discovery_response, parse_discovery_response_with_limits,

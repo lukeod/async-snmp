@@ -13,7 +13,8 @@ use crate::transport::Transport;
 use crate::v3::{
     UsmSecurityParams,
     auth::{authenticate_message, verify_message},
-    is_not_in_time_window_report, is_unknown_engine_id_report,
+    is_decryption_error_report, is_not_in_time_window_report, is_unknown_engine_id_report,
+    is_unknown_user_name_report, is_unsupported_sec_level_report, is_wrong_digest_report,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -525,6 +526,18 @@ impl<T: Transport> Client<T> {
                         // Check for unknown engine ID
                         if is_unknown_engine_id_report(&scoped_pdu.pdu) {
                             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "unknown engine ID");
+                            return Err(Error::Auth {
+                                target: self.peer_addr(),
+                            }
+                            .boxed());
+                        }
+
+                        // Security/authentication failure Reports
+                        if is_unknown_user_name_report(&scoped_pdu.pdu)
+                            || is_wrong_digest_report(&scoped_pdu.pdu)
+                            || is_unsupported_sec_level_report(&scoped_pdu.pdu)
+                            || is_decryption_error_report(&scoped_pdu.pdu)
+                        {
                             return Err(Error::Auth {
                                 target: self.peer_addr(),
                             }
