@@ -158,6 +158,18 @@ impl Agent {
         let user_config = self.inner.usm_users.get(&usm_params.username);
         let derived_keys = user_config.map(|u| u.derive_keys(&self.inner.engine_id));
 
+        // RFC 3414 section 3.2 step 1: for non-discovery messages (non-empty username),
+        // the user MUST exist in the local user database regardless of security level.
+        if user_config.is_none() {
+            tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "unknown user");
+            return self.send_v3_report(
+                &msg,
+                &usm_params,
+                crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 3, 0), // usmStatsUnknownUserNames
+                source,
+            );
+        }
+
         // Verify authentication if required
         if security_level == SecurityLevel::AuthNoPriv || security_level == SecurityLevel::AuthPriv
         {
@@ -194,11 +206,12 @@ impl Agent {
                     }
                 }
                 _ => {
-                    tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "unknown user or no credentials");
+                    // User exists but has no auth key configured - authentication cannot proceed
+                    tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user has no auth credentials");
                     return self.send_v3_report(
                         &msg,
                         &usm_params,
-                        crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 3, 0), // usmStatsUnknownUserNames
+                        crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0), // usmStatsWrongDigests
                         source,
                     );
                 }
