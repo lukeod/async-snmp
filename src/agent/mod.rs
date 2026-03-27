@@ -957,25 +957,27 @@ impl Agent {
         let mut response_varbinds = Vec::with_capacity(pdu.varbinds.len());
 
         for (index, vb) in pdu.varbinds.iter().enumerate() {
-            // Try to find the next OID from any handler
-            let next = self.get_next_oid(ctx, &vb.oid).await;
-
-            // Check VACM access for the returned OID (if VACM enabled)
-            let next = if let Some(ref next_vb) = next {
-                if let Some(ref vacm) = self.inner.vacm {
-                    if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
-                        next
-                    } else {
-                        // OID not accessible, continue searching
-                        // For simplicity, we just return EndOfMibView here
-                        // A more complete implementation would continue the search
-                        None
+            // Try to find the next OID from any handler, skipping OIDs denied by
+            // VACM. RFC 3413 classifies GETNEXT as Read-Class and requires
+            // continuing the walk until an accessible OID is found.
+            let mut search_from = vb.oid.clone();
+            let next = loop {
+                let candidate = self.get_next_oid(ctx, &search_from).await;
+                match candidate {
+                    None => break None,
+                    Some(ref next_vb) => {
+                        if let Some(ref vacm) = self.inner.vacm {
+                            if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
+                                break candidate;
+                            } else {
+                                // Denied - advance past this OID and keep searching
+                                search_from = next_vb.oid.clone();
+                            }
+                        } else {
+                            break candidate;
+                        }
                     }
-                } else {
-                    next
                 }
-            } else {
-                next
             };
 
             match next {
@@ -1431,6 +1433,130 @@ mod tests {
 
         // Second non-repeater walks to oid2 (inaccessible), should be EndOfMibView
         assert_eq!(response.varbinds[1].value, Value::EndOfMibView);
+    }
+
+    // TestHandler with three OIDs: .99999.1.0, .99999.2.0, .99999.3.0
+    struct ThreeOidHandler;
+
+    impl MibHandler for ThreeOidHandler {
+        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+            Box::pin(async move {
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
+                    return GetResult::Value(Value::Integer(1));
+                }
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
+                    return GetResult::Value(Value::Integer(2));
+                }
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0) {
+                    return GetResult::Value(Value::Integer(3));
+                }
+                GetResult::NoSuchObject
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, GetNextResult> {
+            Box::pin(async move {
+                let oid1 = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
+                let oid2 = oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0);
+                let oid3 = oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0);
+
+                if oid < &oid1 {
+                    return GetNextResult::Value(VarBind::new(oid1, Value::Integer(1)));
+                }
+                if oid < &oid2 {
+                    return GetNextResult::Value(VarBind::new(oid2, Value::Integer(2)));
+                }
+                if oid < &oid3 {
+                    return GetNextResult::Value(VarBind::new(oid3, Value::Integer(3)));
+                }
+                GetNextResult::EndOfMibView
+            })
+        }
+    }
+
+    /// Build an agent with ThreeOidHandler and a VACM view that includes
+    /// .99999.1 and .99999.3 but excludes .99999.2.
+    async fn test_agent_with_gap_vacm() -> Agent {
+        Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(ThreeOidHandler))
+            .vacm(|v| {
+                v.group("public", SecurityModel::V2c, "readers")
+                    .access("readers", |a| a.read_view("gap"))
+                    .view("gap", |v| {
+                        v.include(oid!(1, 3, 6, 1, 4, 1, 99999, 1))
+                            .include(oid!(1, 3, 6, 1, 4, 1, 99999, 3))
+                    })
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_getnext_vacm_skips_inaccessible_continues_walk() {
+        // GETNEXT must continue past denied OIDs to find the next accessible one.
+        // .99999.2.0 is excluded from the view; .99999.3.0 is included.
+        // GETNEXT from .99999.1.0 should skip .99999.2.0 and return .99999.3.0.
+        let agent = test_agent_with_gap_vacm().await;
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetNextRequest;
+        ctx.read_view = Some(Bytes::from_static(b"gap"));
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetNextRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Null,
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.varbinds.len(), 1);
+        assert_eq!(
+            response.varbinds[0].oid,
+            oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0),
+            "GETNEXT should skip denied .99999.2.0 and return accessible .99999.3.0"
+        );
+        assert!(matches!(response.varbinds[0].value, Value::Integer(3)));
+    }
+
+    #[tokio::test]
+    async fn test_getnext_vacm_all_remaining_denied_returns_end_of_mib() {
+        // When all remaining OIDs are denied, GETNEXT should return EndOfMibView.
+        let agent = test_agent_with_restricted_vacm().await;
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetNextRequest;
+        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetNextRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Null,
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.varbinds.len(), 1);
+        assert_eq!(
+            response.varbinds[0].value,
+            Value::EndOfMibView,
+            "GETNEXT should return EndOfMibView when all remaining OIDs are denied"
+        );
     }
 
     #[tokio::test]
