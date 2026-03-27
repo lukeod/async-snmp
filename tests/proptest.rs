@@ -1001,15 +1001,14 @@ mod integer_overflow {
     use super::*;
 
     #[test]
-    fn integer_5_bytes_truncates() {
-        // Integer encoded with 5 bytes - should truncate to 4 bytes with warning
-        // 02 05 01 02 03 04 05 (value would be ~4.3 billion if full)
+    fn integer_5_bytes_rejected() {
+        // Integer encoded with 5 bytes must be rejected (BER: signed i32 max 4 bytes)
+        // 02 05 01 02 03 04 05
         let mut decoder = Decoder::new(Bytes::from_static(&[
             0x02, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05,
         ]));
-        // Should succeed (permissive truncation per net-snmp behavior)
         let result = decoder.read_integer();
-        assert!(result.is_ok(), "should truncate, not fail");
+        assert!(result.is_err(), "5-byte integer must be rejected");
     }
 
     #[test]
