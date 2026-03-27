@@ -27,7 +27,24 @@ impl<T: Transport> Client<T> {
     /// Ensure engine ID is discovered for V3 operations.
     #[instrument(level = "debug", skip(self), fields(snmp.target = %self.peer_addr()))]
     pub(super) async fn ensure_engine_discovered(&self) -> Result<()> {
-        // Check if already discovered
+        // Fast path: already discovered.
+        {
+            let state = self
+                .inner
+                .engine_state
+                .read()
+                .map_err(|_| Error::Config("engine_state lock poisoned".into()).boxed())?;
+            if state.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Serialize concurrent discovery attempts. Only one task runs discovery
+        // at a time; the rest wait here and then take the fast path above.
+        let _guard = self.inner.discovery_lock.lock().await;
+
+        // Re-check after acquiring the lock: a previous waiter may have
+        // completed discovery while we were blocked.
         {
             let state = self
                 .inner
