@@ -584,9 +584,6 @@ impl PrivKey {
         salt: u64,
         key_len: usize,
     ) -> PrivacyResult<(Bytes, Bytes)> {
-        use aes::{Aes128, Aes192, Aes256};
-        use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
-
         // AES key is first key_len bytes
         let key = &self.key[..key_len];
 
@@ -601,37 +598,7 @@ impl PrivKey {
         iv[8..].copy_from_slice(&salt_bytes);
 
         let mut buffer = plaintext.to_vec();
-
-        match key_len {
-            16 => {
-                type Aes128Cfb = cfb_mode::Encryptor<Aes128>;
-                let cipher = Aes128Cfb::new_from_slices(key, &iv).map_err(|_| {
-                    tracing::debug!(target: "async_snmp::crypto", "AES-128 encryption failed: invalid key length");
-                    PrivacyError::InvalidKeyLength
-                })?;
-                cipher.encrypt(&mut buffer);
-            }
-            24 => {
-                type Aes192Cfb = cfb_mode::Encryptor<Aes192>;
-                let cipher = Aes192Cfb::new_from_slices(key, &iv).map_err(|_| {
-                    tracing::debug!(target: "async_snmp::crypto", "AES-192 encryption failed: invalid key length");
-                    PrivacyError::InvalidKeyLength
-                })?;
-                cipher.encrypt(&mut buffer);
-            }
-            32 => {
-                type Aes256Cfb = cfb_mode::Encryptor<Aes256>;
-                let cipher = Aes256Cfb::new_from_slices(key, &iv).map_err(|_| {
-                    tracing::debug!(target: "async_snmp::crypto", "AES-256 encryption failed: invalid key length");
-                    PrivacyError::InvalidKeyLength
-                })?;
-                cipher.encrypt(&mut buffer);
-            }
-            _ => {
-                tracing::debug!(target: "async_snmp::crypto", { key_len }, "AES encryption failed: unsupported key length");
-                return Err(PrivacyError::UnsupportedProtocol);
-            }
-        }
+        aes_cfb_encrypt(key, &iv, &mut buffer)?;
 
         Ok((Bytes::from(buffer), Bytes::copy_from_slice(&salt_bytes)))
     }
@@ -644,9 +611,6 @@ impl PrivKey {
         engine_time: u32,
         priv_params: &[u8],
     ) -> PrivacyResult<Bytes> {
-        use aes::{Aes128, Aes192, Aes256};
-        use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
-
         let key_len = match self.protocol {
             PrivProtocol::Aes128 => 16,
             PrivProtocol::Aes192 => 24,
@@ -664,40 +628,90 @@ impl PrivKey {
         iv[8..].copy_from_slice(priv_params);
 
         let mut buffer = ciphertext.to_vec();
-
-        match key_len {
-            16 => {
-                type Aes128Cfb = cfb_mode::Decryptor<Aes128>;
-                let cipher = Aes128Cfb::new_from_slices(key, &iv).map_err(|_| {
-                    tracing::debug!(target: "async_snmp::crypto", "AES-128 decryption failed: invalid key length");
-                    PrivacyError::InvalidKeyLength
-                })?;
-                cipher.decrypt(&mut buffer);
-            }
-            24 => {
-                type Aes192Cfb = cfb_mode::Decryptor<Aes192>;
-                let cipher = Aes192Cfb::new_from_slices(key, &iv).map_err(|_| {
-                    tracing::debug!(target: "async_snmp::crypto", "AES-192 decryption failed: invalid key length");
-                    PrivacyError::InvalidKeyLength
-                })?;
-                cipher.decrypt(&mut buffer);
-            }
-            32 => {
-                type Aes256Cfb = cfb_mode::Decryptor<Aes256>;
-                let cipher = Aes256Cfb::new_from_slices(key, &iv).map_err(|_| {
-                    tracing::debug!(target: "async_snmp::crypto", "AES-256 decryption failed: invalid key length");
-                    PrivacyError::InvalidKeyLength
-                })?;
-                cipher.decrypt(&mut buffer);
-            }
-            _ => {
-                tracing::debug!(target: "async_snmp::crypto", { key_len }, "AES decryption failed: unsupported key length");
-                return Err(PrivacyError::UnsupportedProtocol);
-            }
-        }
+        aes_cfb_decrypt(key, &iv, &mut buffer)?;
 
         Ok(Bytes::from(buffer))
     }
+}
+
+/// AES-CFB in-place encryption.
+///
+/// Dispatches to AES-128, AES-192, or AES-256 based on `key.len()`.
+fn aes_cfb_encrypt(key: &[u8], iv: &[u8; 16], buffer: &mut [u8]) -> PrivacyResult<()> {
+    use aes::{Aes128, Aes192, Aes256};
+    use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+
+    match key.len() {
+        16 => {
+            type Aes128Cfb = cfb_mode::Encryptor<Aes128>;
+            let cipher = Aes128Cfb::new_from_slices(key, iv).map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "AES-128 encryption failed: invalid key length");
+                PrivacyError::InvalidKeyLength
+            })?;
+            cipher.encrypt(buffer);
+        }
+        24 => {
+            type Aes192Cfb = cfb_mode::Encryptor<Aes192>;
+            let cipher = Aes192Cfb::new_from_slices(key, iv).map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "AES-192 encryption failed: invalid key length");
+                PrivacyError::InvalidKeyLength
+            })?;
+            cipher.encrypt(buffer);
+        }
+        32 => {
+            type Aes256Cfb = cfb_mode::Encryptor<Aes256>;
+            let cipher = Aes256Cfb::new_from_slices(key, iv).map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "AES-256 encryption failed: invalid key length");
+                PrivacyError::InvalidKeyLength
+            })?;
+            cipher.encrypt(buffer);
+        }
+        key_len => {
+            tracing::debug!(target: "async_snmp::crypto", { key_len }, "AES encryption failed: unsupported key length");
+            return Err(PrivacyError::UnsupportedProtocol);
+        }
+    }
+    Ok(())
+}
+
+/// AES-CFB in-place decryption.
+///
+/// Dispatches to AES-128, AES-192, or AES-256 based on `key.len()`.
+fn aes_cfb_decrypt(key: &[u8], iv: &[u8; 16], buffer: &mut [u8]) -> PrivacyResult<()> {
+    use aes::{Aes128, Aes192, Aes256};
+    use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+
+    match key.len() {
+        16 => {
+            type Aes128Cfb = cfb_mode::Decryptor<Aes128>;
+            let cipher = Aes128Cfb::new_from_slices(key, iv).map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "AES-128 decryption failed: invalid key length");
+                PrivacyError::InvalidKeyLength
+            })?;
+            cipher.decrypt(buffer);
+        }
+        24 => {
+            type Aes192Cfb = cfb_mode::Decryptor<Aes192>;
+            let cipher = Aes192Cfb::new_from_slices(key, iv).map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "AES-192 decryption failed: invalid key length");
+                PrivacyError::InvalidKeyLength
+            })?;
+            cipher.decrypt(buffer);
+        }
+        32 => {
+            type Aes256Cfb = cfb_mode::Decryptor<Aes256>;
+            let cipher = Aes256Cfb::new_from_slices(key, iv).map_err(|_| {
+                tracing::debug!(target: "async_snmp::crypto", "AES-256 decryption failed: invalid key length");
+                PrivacyError::InvalidKeyLength
+            })?;
+            cipher.decrypt(buffer);
+        }
+        key_len => {
+            tracing::debug!(target: "async_snmp::crypto", { key_len }, "AES decryption failed: unsupported key length");
+            return Err(PrivacyError::UnsupportedProtocol);
+        }
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for PrivKey {
