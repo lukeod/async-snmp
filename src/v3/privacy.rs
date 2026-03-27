@@ -97,7 +97,7 @@ fn random_nonzero_u64() -> u64 {
 /// Key material is automatically zeroed from memory when the key is dropped,
 /// using the `zeroize` crate. This provides defense-in-depth against memory
 /// scraping attacks.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PrivKey {
     /// The localized key bytes
     key: Vec<u8>,
@@ -130,14 +130,22 @@ impl SaltCounter {
     ///
     /// This method never returns zero. Per net-snmp behavior, zero is skipped
     /// on wraparound to avoid potential IV reuse issues.
+    ///
+    /// Uses the post-increment value as the salt and a single compare_exchange
+    /// to skip zero atomically, avoiding the two-fetch_add race that could
+    /// cause IV reuse under concurrent access.
     pub fn next(&self) -> u64 {
-        let val = self.0.fetch_add(1, Ordering::SeqCst);
-        // Skip zero on wraparound (matches net-snmp behavior)
-        if val == 0 {
-            self.0.fetch_add(1, Ordering::SeqCst)
-        } else {
-            val
+        let old = self.0.fetch_add(1, Ordering::SeqCst);
+        let val = old.wrapping_add(1);
+        if val != 0 {
+            return val;
         }
+        // Counter wrapped to zero. Only one thread reaches here (only one fetch_add
+        // returns u64::MAX). Atomically advance from 0 to 1, then return 1.
+        let _ = self
+            .0
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        1
     }
 }
 
@@ -701,6 +709,17 @@ impl std::fmt::Debug for PrivKey {
     }
 }
 
+impl Clone for PrivKey {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            protocol: self.protocol,
+            // Fresh counter so the clone does not replay the same salt sequence.
+            salt_counter: Self::init_salt(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,14 +867,17 @@ mod tests {
     /// skipped to avoid potential IV reuse issues on wraparound.
     #[test]
     fn test_salt_counter_skips_zero() {
-        // Create a counter initialized to u64::MAX
-        let counter = SaltCounter::from_value(u64::MAX);
+        // Create a counter initialized to u64::MAX - 1 so the next call wraps through MAX.
+        // next() returns post-increment, so:
+        //   call 1: old=MAX-1, val=MAX, returns MAX
+        //   call 2: old=MAX,   val=0 (wrapped), skips 0, returns 1
+        //   call 3: old=1,     val=2, returns 2
+        let counter = SaltCounter::from_value(u64::MAX - 1);
 
-        // First call returns u64::MAX
         let s1 = counter.next();
         assert_eq!(s1, u64::MAX);
 
-        // Second call would normally return 0 (wraparound), but should skip to 1
+        // This call wraps to zero; should skip and return 1
         let s2 = counter.next();
         assert_ne!(s2, 0, "SaltCounter should never return zero");
         assert_eq!(s2, 1, "SaltCounter should skip 0 and return 1");
@@ -1249,6 +1271,63 @@ mod tests {
             .decrypt(&ciphertext, engine_boots, engine_time, &correct_priv_params)
             .expect("correct decryption failed");
         assert_eq!(&correct_decrypted[..plaintext.len()], plaintext);
+    }
+
+    /// Test that SaltCounter never emits duplicate salts under concurrent access.
+    ///
+    /// This is a regression test for the two-fetch_add race where two threads
+    /// could both return 1 after a wraparound left the counter at 0.
+    #[test]
+    fn test_salt_counter_no_duplicates_concurrent() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let counter = Arc::new(SaltCounter::new());
+        let results = Arc::new(Mutex::new(HashSet::new()));
+        let iterations = 10_000usize;
+        let threads = 8usize;
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                let results = Arc::clone(&results);
+                thread::spawn(move || {
+                    for _ in 0..iterations {
+                        let salt = counter.next();
+                        assert_ne!(salt, 0, "SaltCounter must never return zero");
+                        let mut set = results.lock().unwrap();
+                        assert!(set.insert(salt), "SaltCounter emitted duplicate: {salt}");
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+    }
+
+    /// Test that a cloned PrivKey starts with an independent salt counter.
+    ///
+    /// This is a regression test for derive(Clone) copying the salt_counter
+    /// field, which caused clones to emit identical salts for their first encryptions.
+    #[test]
+    fn test_priv_key_clone_independent_salts() {
+        let key = vec![0u8; 16];
+        let mut original = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+        let mut cloned = original.clone();
+
+        let plaintext = b"test";
+
+        // Encrypt once with each key; the priv_params (salt) must differ.
+        let (_, salt_orig) = original.encrypt(plaintext, 0, 0, None).unwrap();
+        let (_, salt_clone) = cloned.encrypt(plaintext, 0, 0, None).unwrap();
+
+        assert_ne!(
+            salt_orig, salt_clone,
+            "cloned PrivKey must start with an independent salt counter"
+        );
     }
 
     #[test]
