@@ -260,7 +260,7 @@ mod tests {
             CommunityPdu::TrapV1(ref t) => {
                 assert_eq!(t.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
                 assert_eq!(t.agent_addr, [192, 168, 1, 1]);
-                assert_eq!(t.generic_trap, GenericTrap::LinkDown.as_i32());
+                assert_eq!(t.generic_trap, GenericTrap::LinkDown);
                 assert_eq!(t.time_stamp, 12345);
             }
             CommunityPdu::Standard(_) => panic!("expected TrapV1 pdu"),

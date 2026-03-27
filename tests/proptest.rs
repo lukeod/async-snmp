@@ -8,7 +8,7 @@ mod common;
 
 use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::oid::Oid;
-use async_snmp::pdu::{GetBulkPdu, Pdu, PduType, TrapV1Pdu};
+use async_snmp::pdu::{GenericTrap, GetBulkPdu, Pdu, PduType, TrapV1Pdu};
 use async_snmp::transport::UdpTransport;
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
@@ -250,11 +250,11 @@ fn arb_trap_v1_pdu() -> impl Strategy<Value = TrapV1Pdu> {
         arb_varbinds(),
     )
         .prop_map(
-            |(enterprise, agent_addr, generic_trap, specific_trap, time_stamp, varbinds)| {
+            |(enterprise, agent_addr, generic_trap_raw, specific_trap, time_stamp, varbinds)| {
                 TrapV1Pdu {
                     enterprise,
                     agent_addr,
-                    generic_trap,
+                    generic_trap: GenericTrap::from_i32(generic_trap_raw),
                     specific_trap,
                     time_stamp,
                     varbinds,
@@ -1248,8 +1248,6 @@ fn unknown_value_tag_preserved() {
 // Full-Range Property Tests for Arithmetic/Conversion Safety
 // =============================================================================
 
-use async_snmp::pdu::GenericTrap;
-
 fn arb_trap_v1_pdu_full_range() -> impl Strategy<Value = TrapV1Pdu> {
     (
         arb_oid(),
@@ -1260,11 +1258,11 @@ fn arb_trap_v1_pdu_full_range() -> impl Strategy<Value = TrapV1Pdu> {
         arb_varbinds(),
     )
         .prop_map(
-            |(enterprise, agent_addr, generic_trap, specific_trap, time_stamp, varbinds)| {
+            |(enterprise, agent_addr, generic_trap_raw, specific_trap, time_stamp, varbinds)| {
                 TrapV1Pdu {
                     enterprise,
                     agent_addr,
-                    generic_trap,
+                    generic_trap: GenericTrap::from_i32(generic_trap_raw),
                     specific_trap,
                     time_stamp,
                     varbinds,
@@ -1312,7 +1310,7 @@ proptest! {
         let pdu = TrapV1Pdu {
             enterprise: enterprise.clone(),
             agent_addr: [0, 0, 0, 0],
-            generic_trap: GenericTrap::EnterpriseSpecific as i32,
+            generic_trap: GenericTrap::EnterpriseSpecific,
             specific_trap,
             time_stamp: 0,
             varbinds: vec![],
@@ -1329,23 +1327,10 @@ proptest! {
     }
 
     #[test]
-    fn trap_v1_generic_trap_enum_no_panic(generic_trap in any::<i32>()) {
-        let pdu = TrapV1Pdu {
-            enterprise: Oid::empty(),
-            agent_addr: [0, 0, 0, 0],
-            generic_trap,
-            specific_trap: 0,
-            time_stamp: 0,
-            varbinds: vec![],
-        };
-
-        let result = pdu.generic_trap_enum();
-
-        if (0..=6).contains(&generic_trap) {
-            prop_assert!(result.is_some());
-        } else {
-            prop_assert!(result.is_none());
-        }
+    fn trap_v1_generic_trap_from_i32_no_panic(generic_trap in any::<i32>()) {
+        let gt = GenericTrap::from_i32(generic_trap);
+        // Round-trip: as_i32() must return the original value
+        prop_assert_eq!(gt.as_i32(), generic_trap);
     }
 
     #[test]
@@ -1353,7 +1338,7 @@ proptest! {
         let pdu = TrapV1Pdu {
             enterprise: Oid::empty(),
             agent_addr: [0, 0, 0, 0],
-            generic_trap,
+            generic_trap: GenericTrap::from_i32(generic_trap),
             specific_trap: 0,
             time_stamp: 0,
             varbinds: vec![],
@@ -1397,12 +1382,12 @@ proptest! {
     #[test]
     fn generic_trap_from_i32_range(value in any::<i32>()) {
         let result = GenericTrap::from_i32(value);
-
+        // from_i32 always returns a value; as_i32 must round-trip
+        prop_assert_eq!(result.as_i32(), value);
         if (0..=6).contains(&value) {
-            prop_assert!(result.is_some());
-            prop_assert_eq!(result.unwrap().as_i32(), value);
+            prop_assert!(!matches!(result, GenericTrap::Unknown(_)));
         } else {
-            prop_assert!(result.is_none());
+            prop_assert!(matches!(result, GenericTrap::Unknown(_)));
         }
     }
 
@@ -1455,7 +1440,7 @@ proptest! {
 mod trap_v1_boundary {
     use super::*;
 
-    fn make_trap(generic_trap: i32, specific_trap: i32) -> TrapV1Pdu {
+    fn make_trap(generic_trap: GenericTrap, specific_trap: i32) -> TrapV1Pdu {
         TrapV1Pdu {
             enterprise: Oid::from_slice(&[1, 3, 6, 1, 4, 1, 9999]),
             agent_addr: [192, 168, 1, 1],
@@ -1468,37 +1453,37 @@ mod trap_v1_boundary {
 
     #[test]
     fn v2_trap_oid_generic_trap_max() {
-        let trap = make_trap(i32::MAX, 0);
+        let trap = make_trap(GenericTrap::Unknown(i32::MAX), 0);
         assert!(trap.v2_trap_oid().is_err());
     }
 
     #[test]
     fn v2_trap_oid_generic_trap_min() {
-        let trap = make_trap(i32::MIN, 0);
+        let trap = make_trap(GenericTrap::Unknown(i32::MIN), 0);
         assert!(trap.v2_trap_oid().is_err());
     }
 
     #[test]
     fn v2_trap_oid_generic_trap_negative() {
-        let trap = make_trap(-1, 0);
+        let trap = make_trap(GenericTrap::Unknown(-1), 0);
         assert!(trap.v2_trap_oid().is_err());
     }
 
     #[test]
     fn v2_trap_oid_specific_trap_negative() {
-        let trap = make_trap(GenericTrap::EnterpriseSpecific as i32, -1);
+        let trap = make_trap(GenericTrap::EnterpriseSpecific, -1);
         assert!(trap.v2_trap_oid().is_err());
     }
 
     #[test]
     fn v2_trap_oid_specific_trap_min() {
-        let trap = make_trap(GenericTrap::EnterpriseSpecific as i32, i32::MIN);
+        let trap = make_trap(GenericTrap::EnterpriseSpecific, i32::MIN);
         assert!(trap.v2_trap_oid().is_err());
     }
 
     #[test]
     fn v2_trap_oid_both_max() {
-        let trap = make_trap(i32::MAX, i32::MAX);
+        let trap = make_trap(GenericTrap::Unknown(i32::MAX), i32::MAX);
         assert!(trap.v2_trap_oid().is_err());
     }
 }

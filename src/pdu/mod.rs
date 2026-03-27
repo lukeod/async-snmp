@@ -258,42 +258,52 @@ impl Pdu {
 
 /// SNMPv1 generic trap types (RFC 1157 Section 4.1.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
 pub enum GenericTrap {
     /// coldStart(0) - agent is reinitializing, config may change
-    ColdStart = 0,
+    ColdStart,
     /// warmStart(1) - agent is reinitializing, config unchanged
-    WarmStart = 1,
+    WarmStart,
     /// linkDown(2) - communication link failure
-    LinkDown = 2,
+    LinkDown,
     /// linkUp(3) - communication link came up
-    LinkUp = 3,
+    LinkUp,
     /// authenticationFailure(4) - improperly authenticated message received
-    AuthenticationFailure = 4,
+    AuthenticationFailure,
     /// egpNeighborLoss(5) - EGP peer marked down
-    EgpNeighborLoss = 5,
+    EgpNeighborLoss,
     /// enterpriseSpecific(6) - vendor-specific trap, see specific_trap field
-    EnterpriseSpecific = 6,
+    EnterpriseSpecific,
+    /// An unrecognized generic trap value received on the wire.
+    Unknown(i32),
 }
 
 impl GenericTrap {
     /// Create from integer value.
-    pub fn from_i32(v: i32) -> Option<Self> {
+    pub fn from_i32(v: i32) -> Self {
         match v {
-            0 => Some(Self::ColdStart),
-            1 => Some(Self::WarmStart),
-            2 => Some(Self::LinkDown),
-            3 => Some(Self::LinkUp),
-            4 => Some(Self::AuthenticationFailure),
-            5 => Some(Self::EgpNeighborLoss),
-            6 => Some(Self::EnterpriseSpecific),
-            _ => None,
+            0 => Self::ColdStart,
+            1 => Self::WarmStart,
+            2 => Self::LinkDown,
+            3 => Self::LinkUp,
+            4 => Self::AuthenticationFailure,
+            5 => Self::EgpNeighborLoss,
+            6 => Self::EnterpriseSpecific,
+            _ => Self::Unknown(v),
         }
     }
 
     /// Get the integer value.
     pub fn as_i32(self) -> i32 {
-        self as i32
+        match self {
+            Self::ColdStart => 0,
+            Self::WarmStart => 1,
+            Self::LinkDown => 2,
+            Self::LinkUp => 3,
+            Self::AuthenticationFailure => 4,
+            Self::EgpNeighborLoss => 5,
+            Self::EnterpriseSpecific => 6,
+            Self::Unknown(v) => v,
+        }
     }
 }
 
@@ -308,7 +318,7 @@ pub struct TrapV1Pdu {
     /// Agent address (IP address of the agent generating the trap)
     pub agent_addr: [u8; 4],
     /// Generic trap type
-    pub generic_trap: i32,
+    pub generic_trap: GenericTrap,
     /// Specific trap code (meaningful when generic_trap is enterpriseSpecific)
     pub specific_trap: i32,
     /// Time since the network entity was last (re)initialized (in hundredths of seconds)
@@ -330,21 +340,16 @@ impl TrapV1Pdu {
         Self {
             enterprise,
             agent_addr,
-            generic_trap: generic_trap.as_i32(),
+            generic_trap,
             specific_trap,
             time_stamp,
             varbinds,
         }
     }
 
-    /// Get the generic trap type as an enum.
-    pub fn generic_trap_enum(&self) -> Option<GenericTrap> {
-        GenericTrap::from_i32(self.generic_trap)
-    }
-
     /// Check if this is an enterprise-specific trap.
     pub fn is_enterprise_specific(&self) -> bool {
-        self.generic_trap == GenericTrap::EnterpriseSpecific as i32
+        self.generic_trap == GenericTrap::EnterpriseSpecific
     }
 
     /// Convert to SNMPv2 trap OID (RFC 3584 Section 3).
@@ -361,8 +366,8 @@ impl TrapV1Pdu {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOid`] if:
-    /// - `generic_trap < 0` (undefined per RFC 1157)
-    /// - `generic_trap == i32::MAX` (would overflow when adding 1)
+    /// - `generic_trap` is `Unknown` with a negative value (undefined per RFC 1157)
+    /// - `generic_trap` is `Unknown` with value `i32::MAX` (would overflow when adding 1)
     /// - `specific_trap < 0` for enterprise-specific traps (OID arcs must be non-negative)
     ///
     /// # Example
@@ -403,13 +408,14 @@ impl TrapV1Pdu {
             arcs.push(self.specific_trap as u32);
             Ok(Oid::new(arcs))
         } else {
-            if self.generic_trap < 0 {
+            let raw = self.generic_trap.as_i32();
+            if raw < 0 {
                 return Err(Error::InvalidOid("generic_trap cannot be negative".into()).boxed());
             }
-            if self.generic_trap == i32::MAX {
+            if raw == i32::MAX {
                 return Err(Error::InvalidOid("generic_trap overflow".into()).boxed());
             }
-            let trap_num = self.generic_trap + 1;
+            let trap_num = raw + 1;
             Ok(crate::oid!(1, 3, 6, 1, 6, 3, 1, 1, 5).child(trap_num as u32))
         }
     }
@@ -420,7 +426,7 @@ impl TrapV1Pdu {
             encode_varbind_list(buf, &self.varbinds);
             buf.push_unsigned32(tag::application::TIMETICKS, self.time_stamp);
             buf.push_integer(self.specific_trap);
-            buf.push_integer(self.generic_trap);
+            buf.push_integer(self.generic_trap.as_i32());
             // NetworkAddress is APPLICATION 0 IMPLICIT IpAddress
             // IpAddress is APPLICATION 0 IMPLICIT OCTET STRING (SIZE (4))
             buf.push_bytes(&self.agent_addr);
@@ -466,7 +472,7 @@ impl TrapV1Pdu {
         ];
 
         // generic-trap INTEGER
-        let generic_trap = pdu.read_integer()?;
+        let generic_trap = GenericTrap::from_i32(pdu.read_integer()?);
 
         // specific-trap INTEGER
         let specific_trap = pdu.read_integer()?;
@@ -710,7 +716,7 @@ mod tests {
 
         assert_eq!(decoded.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
         assert_eq!(decoded.agent_addr, [192, 168, 1, 1]);
-        assert_eq!(decoded.generic_trap, GenericTrap::LinkDown as i32);
+        assert_eq!(decoded.generic_trap, GenericTrap::LinkDown);
         assert_eq!(decoded.specific_trap, 0);
         assert_eq!(decoded.time_stamp, 12345678);
         assert_eq!(decoded.varbinds.len(), 1);
@@ -728,10 +734,7 @@ mod tests {
         );
 
         assert!(trap.is_enterprise_specific());
-        assert_eq!(
-            trap.generic_trap_enum(),
-            Some(GenericTrap::EnterpriseSpecific)
-        );
+        assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
 
         let mut buf = EncodeBuf::new();
         trap.encode(&mut buf);
