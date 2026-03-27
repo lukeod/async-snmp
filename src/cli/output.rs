@@ -2,7 +2,7 @@
 //!
 //! Supports human-readable, JSON, and raw output formats.
 
-use crate::cli::args::OutputFormat;
+use crate::cli::args::{CommonArgs, OutputArgs, OutputFormat, V3Args};
 use crate::cli::hints;
 use crate::format::hex;
 use crate::{Oid, Value, VarBind, Version};
@@ -128,6 +128,193 @@ pub fn write_verbose_response(varbinds: &[VarBind], elapsed: Duration, show_hint
     }
 }
 
+/// Decoded representation of a Value, used by both verbose and normal output paths.
+struct DecodedValue {
+    type_name: String,
+    /// Human-readable display string (used by verbose output).
+    display: String,
+    /// JSON-serializable representation (used by structured output).
+    json_value: serde_json::Value,
+    /// Formatted display string for human output (timeticks, error messages, hex display).
+    formatted: Option<String>,
+    /// Compact hex encoding of raw bytes (used by JSON/structured output).
+    raw_hex: Option<String>,
+    /// Byte length (used by verbose output for byte types).
+    size: Option<usize>,
+}
+
+/// Decode a Value into its display components.
+fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
+    match value {
+        Value::Integer(v) => DecodedValue {
+            type_name: "INTEGER".into(),
+            display: v.to_string(),
+            json_value: (*v).into(),
+            formatted: None,
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::OctetString(bytes) => {
+            let compact_hex = hex::encode(bytes);
+            let spaced_hex = format_hex_string(bytes);
+            let size = Some(bytes.len());
+
+            if force_hex || !hex::is_printable(bytes) {
+                DecodedValue {
+                    type_name: "Hex-STRING".into(),
+                    display: spaced_hex.clone(),
+                    json_value: serde_json::Value::String(compact_hex.clone()),
+                    formatted: Some(spaced_hex),
+                    raw_hex: Some(compact_hex),
+                    size,
+                }
+            } else {
+                let s = String::from_utf8_lossy(bytes).to_string();
+                DecodedValue {
+                    type_name: "STRING".into(),
+                    display: format!("\"{}\"", s),
+                    json_value: serde_json::Value::String(s),
+                    formatted: None,
+                    raw_hex: Some(compact_hex),
+                    size,
+                }
+            }
+        }
+
+        Value::Null => DecodedValue {
+            type_name: "NULL".into(),
+            display: "(null)".into(),
+            json_value: serde_json::Value::Null,
+            formatted: None,
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::ObjectIdentifier(oid) => {
+            let s = format_oid(oid);
+            let hint = hints::lookup(oid);
+            let display = if let Some(h) = hint {
+                format!("{} ({})", s, h)
+            } else {
+                s.clone()
+            };
+            DecodedValue {
+                type_name: "OID".into(),
+                display,
+                json_value: serde_json::Value::String(s),
+                formatted: None,
+                raw_hex: None,
+                size: None,
+            }
+        }
+
+        Value::IpAddress(bytes) => {
+            let s = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
+            DecodedValue {
+                type_name: "IpAddress".into(),
+                display: s.clone(),
+                json_value: serde_json::Value::String(s),
+                formatted: None,
+                raw_hex: None,
+                size: None,
+            }
+        }
+
+        Value::Counter32(v) => DecodedValue {
+            type_name: "Counter32".into(),
+            display: v.to_string(),
+            json_value: (*v).into(),
+            formatted: None,
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::Gauge32(v) => DecodedValue {
+            type_name: "Gauge32".into(),
+            display: v.to_string(),
+            json_value: (*v).into(),
+            formatted: None,
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::TimeTicks(v) => {
+            let human = format_timeticks(*v);
+            DecodedValue {
+                type_name: "TimeTicks".into(),
+                display: format!("{} ({})", v, human),
+                json_value: (*v).into(),
+                formatted: Some(format!("({}) {}", v, human)),
+                raw_hex: None,
+                size: None,
+            }
+        }
+
+        Value::Opaque(bytes) => {
+            let compact_hex = hex::encode(bytes);
+            let spaced_hex = format_hex_string(bytes);
+            DecodedValue {
+                type_name: "Opaque".into(),
+                display: spaced_hex.clone(),
+                json_value: serde_json::Value::String(compact_hex.clone()),
+                formatted: Some(spaced_hex),
+                raw_hex: Some(compact_hex),
+                size: Some(bytes.len()),
+            }
+        }
+
+        Value::Counter64(v) => DecodedValue {
+            type_name: "Counter64".into(),
+            display: v.to_string(),
+            json_value: (*v).into(),
+            formatted: None,
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::NoSuchObject => DecodedValue {
+            type_name: "NoSuchObject".into(),
+            display: "No Such Object available".into(),
+            json_value: serde_json::Value::Null,
+            formatted: Some("No Such Object available".into()),
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::NoSuchInstance => DecodedValue {
+            type_name: "NoSuchInstance".into(),
+            display: "No Such Instance currently exists".into(),
+            json_value: serde_json::Value::Null,
+            formatted: Some("No Such Instance currently exists".into()),
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::EndOfMibView => DecodedValue {
+            type_name: "EndOfMibView".into(),
+            display: "No more variables left in this MIB View".into(),
+            json_value: serde_json::Value::Null,
+            formatted: Some("No more variables left in this MIB View".into()),
+            raw_hex: None,
+            size: None,
+        },
+
+        Value::Unknown { tag, data } => {
+            let compact_hex = hex::encode(data);
+            let spaced_hex = format_hex_string(data);
+            DecodedValue {
+                type_name: format!("Unknown(0x{:02X})", tag),
+                display: spaced_hex.clone(),
+                json_value: serde_json::Value::String(compact_hex.clone()),
+                formatted: Some(spaced_hex),
+                raw_hex: Some(compact_hex),
+                size: Some(data.len()),
+            }
+        }
+    }
+}
+
 /// Write detailed varbind information for verbose output.
 fn write_verbose_varbind<W: Write>(w: &mut W, vb: &VarBind, show_hints: bool) {
     // OID with optional hint
@@ -142,117 +329,17 @@ fn write_verbose_varbind<W: Write>(w: &mut W, vb: &VarBind, show_hints: bool) {
         let _ = writeln!(w, "  {}", format_oid(&vb.oid));
     }
 
-    // Type and value details
-    let (type_name, decoded, raw_hex, size) = format_verbose_value(&vb.value);
+    let decoded = decode_value(&vb.value, false);
 
-    let _ = writeln!(w, "    Type:    {}", type_name);
-    let _ = writeln!(w, "    Value:   {}", decoded);
+    let _ = writeln!(w, "    Type:    {}", decoded.type_name);
+    let _ = writeln!(w, "    Value:   {}", decoded.display);
 
-    if let Some(hex) = raw_hex {
-        let _ = writeln!(w, "    Raw:     {}", hex);
+    if let Some(ref raw) = decoded.raw_hex {
+        let _ = writeln!(w, "    Raw:     {}", raw);
     }
 
-    if let Some(s) = size {
+    if let Some(s) = decoded.size {
         let _ = writeln!(w, "    Size:    {} bytes", s);
-    }
-}
-
-/// Format a value for verbose output, returning (type_name, decoded_value, raw_hex, size).
-fn format_verbose_value(value: &Value) -> (String, String, Option<String>, Option<usize>) {
-    match value {
-        Value::Integer(v) => ("INTEGER".into(), format!("{}", v), None, None),
-
-        Value::OctetString(bytes) => {
-            let raw_hex = format_hex_string(bytes);
-            let size = Some(bytes.len());
-
-            if hex::is_printable(bytes) {
-                let decoded = String::from_utf8_lossy(bytes).to_string();
-                (
-                    "STRING".into(),
-                    format!("\"{}\"", decoded),
-                    Some(raw_hex),
-                    size,
-                )
-            } else {
-                ("Hex-STRING".into(), raw_hex.clone(), Some(raw_hex), size)
-            }
-        }
-
-        Value::Null => ("NULL".into(), "(null)".into(), None, None),
-
-        Value::ObjectIdentifier(oid) => {
-            let s = format_oid(oid);
-            let hint = hints::lookup(oid);
-            let decoded = if let Some(h) = hint {
-                format!("{} ({})", s, h)
-            } else {
-                s
-            };
-            ("OID".into(), decoded, None, None)
-        }
-
-        Value::IpAddress(bytes) => {
-            let s = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
-            ("IpAddress".into(), s, None, None)
-        }
-
-        Value::Counter32(v) => ("Counter32".into(), format!("{}", v), None, None),
-
-        Value::Gauge32(v) => ("Gauge32".into(), format!("{}", v), None, None),
-
-        Value::TimeTicks(v) => {
-            let formatted = format_timeticks(*v);
-            (
-                "TimeTicks".into(),
-                format!("{} ({})", v, formatted),
-                None,
-                None,
-            )
-        }
-
-        Value::Opaque(bytes) => {
-            let raw_hex = format_hex_string(bytes);
-            (
-                "Opaque".into(),
-                raw_hex.clone(),
-                Some(raw_hex),
-                Some(bytes.len()),
-            )
-        }
-
-        Value::Counter64(v) => ("Counter64".into(), format!("{}", v), None, None),
-
-        Value::NoSuchObject => (
-            "NoSuchObject".into(),
-            "No Such Object available".into(),
-            None,
-            None,
-        ),
-
-        Value::NoSuchInstance => (
-            "NoSuchInstance".into(),
-            "No Such Instance currently exists".into(),
-            None,
-            None,
-        ),
-
-        Value::EndOfMibView => (
-            "EndOfMibView".into(),
-            "No more variables left in this MIB View".into(),
-            None,
-            None,
-        ),
-
-        Value::Unknown { tag, data } => {
-            let raw_hex = format_hex_string(data);
-            (
-                format!("Unknown(0x{:02X})", tag),
-                raw_hex.clone(),
-                Some(raw_hex),
-                Some(data.len()),
-            )
-        }
     }
 }
 
@@ -316,6 +403,17 @@ impl<'a> OutputContext<'a> {
         }
     }
 
+    /// Create an output context from CLI output arguments.
+    pub fn from_args(output: &OutputArgs) -> Self {
+        Self {
+            format: output.format,
+            show_hints: !output.no_hints,
+            force_hex: output.hex,
+            show_timing: output.timing,
+            formatter: None,
+        }
+    }
+
     /// Write operation results to stdout.
     pub fn write_results(
         &self,
@@ -366,15 +464,15 @@ impl<'a> OutputContext<'a> {
             None
         };
 
-        let (value_type, value, formatted, raw_hex) = format_value(&vb.value, self.force_hex);
+        let decoded = decode_value(&vb.value, self.force_hex);
 
         VarBindResult {
             oid: oid_str,
             hint,
-            value_type,
-            value,
-            formatted,
-            raw_hex,
+            value_type: decoded.type_name,
+            value: decoded.json_value,
+            formatted: decoded.formatted,
+            raw_hex: decoded.raw_hex,
         }
     }
 
@@ -385,15 +483,15 @@ impl<'a> OutputContext<'a> {
     ) -> VarBindResult {
         let oid_str = fmt.format_oid(&vb.oid);
         let formatted_value = fmt.format_value(&vb.oid, &vb.value);
-        let (value_type, value, _, raw_hex) = format_value(&vb.value, self.force_hex);
+        let decoded = decode_value(&vb.value, self.force_hex);
 
         VarBindResult {
             oid: oid_str,
             hint: None, // Formatter provides the OID name directly
-            value_type,
-            value,
+            value_type: decoded.type_name,
+            value: decoded.json_value,
             formatted: Some(formatted_value),
-            raw_hex,
+            raw_hex: decoded.raw_hex,
         }
     }
 
@@ -461,107 +559,6 @@ fn format_oid(oid: &Oid) -> String {
         .join(".")
 }
 
-/// Format a value, returning (type_name, json_value, formatted_string, raw_hex).
-fn format_value(
-    value: &Value,
-    force_hex: bool,
-) -> (String, serde_json::Value, Option<String>, Option<String>) {
-    match value {
-        Value::Integer(v) => ("INTEGER".into(), (*v).into(), None, None),
-
-        Value::OctetString(bytes) => {
-            let raw_hex = Some(hex::encode(bytes));
-
-            if force_hex || !hex::is_printable(bytes) {
-                let formatted = format_hex_string(bytes);
-                (
-                    "Hex-STRING".into(),
-                    serde_json::Value::String(raw_hex.clone().unwrap()),
-                    Some(formatted),
-                    raw_hex,
-                )
-            } else {
-                let s = String::from_utf8_lossy(bytes);
-                (
-                    "STRING".into(),
-                    serde_json::Value::String(s.to_string()),
-                    None,
-                    raw_hex,
-                )
-            }
-        }
-
-        Value::Null => ("NULL".into(), serde_json::Value::Null, None, None),
-
-        Value::ObjectIdentifier(oid) => {
-            let s = format_oid(oid);
-            ("OID".into(), serde_json::Value::String(s), None, None)
-        }
-
-        Value::IpAddress(bytes) => {
-            let s = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
-            ("IpAddress".into(), serde_json::Value::String(s), None, None)
-        }
-
-        Value::Counter32(v) => ("Counter32".into(), (*v).into(), None, None),
-
-        Value::Gauge32(v) => ("Gauge32".into(), (*v).into(), None, None),
-
-        Value::TimeTicks(v) => {
-            let formatted = format_timeticks(*v);
-            (
-                "TimeTicks".into(),
-                (*v).into(),
-                Some(format!("({}) {}", v, formatted)),
-                None,
-            )
-        }
-
-        Value::Opaque(bytes) => {
-            let hex = hex::encode(bytes);
-            (
-                "Opaque".into(),
-                serde_json::Value::String(hex.clone()),
-                Some(format_hex_string(bytes)),
-                Some(hex),
-            )
-        }
-
-        Value::Counter64(v) => ("Counter64".into(), (*v).into(), None, None),
-
-        Value::NoSuchObject => (
-            "NoSuchObject".into(),
-            serde_json::Value::Null,
-            Some("No Such Object available".into()),
-            None,
-        ),
-
-        Value::NoSuchInstance => (
-            "NoSuchInstance".into(),
-            serde_json::Value::Null,
-            Some("No Such Instance currently exists".into()),
-            None,
-        ),
-
-        Value::EndOfMibView => (
-            "EndOfMibView".into(),
-            serde_json::Value::Null,
-            Some("No more variables left in this MIB View".into()),
-            None,
-        ),
-
-        Value::Unknown { tag, data } => {
-            let hex = hex::encode(data);
-            (
-                format!("Unknown(0x{:02X})", tag),
-                serde_json::Value::String(hex.clone()),
-                Some(format_hex_string(data)),
-                Some(hex),
-            )
-        }
-    }
-}
-
 /// Format bytes as spaced hex for display.
 fn format_hex_string(bytes: &[u8]) -> String {
     crate::format::format_hex_display(bytes)
@@ -570,6 +567,19 @@ fn format_hex_string(bytes: &[u8]) -> String {
 /// Format TimeTicks as human-readable duration.
 fn format_timeticks(centiseconds: u32) -> String {
     crate::format::format_timeticks(centiseconds)
+}
+
+/// Build a SecurityInfo from CLI arguments.
+pub fn build_security_info(v3: &V3Args, common: &CommonArgs) -> SecurityInfo {
+    if v3.is_v3() {
+        SecurityInfo::V3 {
+            username: v3.username.clone().unwrap_or_default(),
+            auth_protocol: v3.auth_protocol.map(|p| format!("{}", p)),
+            priv_protocol: v3.priv_protocol.map(|p| format!("{}", p)),
+        }
+    } else {
+        SecurityInfo::Community(common.community.clone())
+    }
 }
 
 /// Write an error message to stderr.
