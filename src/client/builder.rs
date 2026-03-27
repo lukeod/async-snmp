@@ -245,7 +245,8 @@ impl ClientBuilder {
     ///
     /// Requests with more OIDs than this limit are automatically split
     /// into multiple batches. Some devices have lower limits on the number
-    /// of OIDs they can handle in a single request.
+    /// of OIDs they can handle in a single request. Values must be greater
+    /// than zero.
     ///
     /// # Example
     ///
@@ -397,6 +398,12 @@ impl ClientBuilder {
 
     /// Validate the configuration.
     fn validate(&self) -> Result<()> {
+        if self.max_oids_per_request == 0 {
+            return Err(
+                Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
+            );
+        }
+
         if let Auth::Usm(usm) = &self.auth {
             // Privacy requires authentication
             if usm.priv_protocol.is_some() && usm.auth_protocol.is_none() {
@@ -718,6 +725,17 @@ mod tests {
     fn test_validate_community_ok() {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"));
         assert!(builder.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_zero_max_oids_per_request_error() {
+        let builder =
+            ClientBuilder::new("192.168.1.1:161", Auth::v2c("public")).max_oids_per_request(0);
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(
+            *err,
+            Error::Config(ref msg) if msg.contains("max_oids_per_request must be greater than 0")
+        ));
     }
 
     #[test]
