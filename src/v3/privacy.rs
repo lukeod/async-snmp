@@ -397,24 +397,8 @@ impl PrivKey {
         }
 
         // Pad plaintext to multiple of 8 bytes
-        let pad_len = (8 - (plaintext.len() % 8)) % 8;
-        let padded_len = plaintext.len() + if pad_len == 0 { 0 } else { pad_len };
-        // DES requires at least some padding if not aligned
-        let padded_len = if padded_len == plaintext.len() && !plaintext.len().is_multiple_of(8) {
-            plaintext.len() + (8 - plaintext.len() % 8)
-        } else {
-            padded_len
-        };
-
-        let mut buffer = vec![
-            0u8;
-            if padded_len > plaintext.len() {
-                padded_len
-            } else {
-                plaintext.len() + 8 - (plaintext.len() % 8)
-            }
-        ];
-        let padded_len = buffer.len();
+        let padded_len = plaintext.len().next_multiple_of(8);
+        let mut buffer = vec![0u8; padded_len];
         buffer[..plaintext.len()].copy_from_slice(plaintext);
 
         // Encrypt in-place

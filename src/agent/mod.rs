@@ -521,7 +521,7 @@ impl AgentBuilder {
             })?;
 
         // Generate default engine ID if not provided
-        let engine_id = self.engine_id.unwrap_or_else(|| {
+        let engine_id: Bytes = self.engine_id.map(Bytes::from).unwrap_or_else(|| {
             // RFC 3411 format: enterprise number + format + local identifier
             // Use a simple format: 0x80 (local) + timestamp + random
             let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01]; // Enterprise format indicator
@@ -530,7 +530,7 @@ impl AgentBuilder {
                 .unwrap_or_default()
                 .as_secs();
             id.extend_from_slice(&timestamp.to_be_bytes());
-            id
+            Bytes::from(id)
         });
 
         // Sort handlers by prefix length (longest first) for matching
@@ -587,7 +587,7 @@ pub(crate) struct AgentInner {
     pub(crate) communities: Vec<Vec<u8>>,
     pub(crate) usm_users: HashMap<Bytes, UsmConfig>,
     pub(crate) handlers: Vec<RegisteredHandler>,
-    pub(crate) engine_id: Vec<u8>,
+    pub(crate) engine_id: Bytes,
     pub(crate) engine_boots: AtomicU32,
     pub(crate) engine_time: AtomicU32,
     pub(crate) engine_start: Instant,
