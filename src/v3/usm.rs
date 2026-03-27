@@ -191,6 +191,9 @@ impl UsmSecurityParams {
         offset += 1;
         let (_, len_size) = parse_length(&encoded_msg[offset..])?;
         offset += len_size;
+        if offset >= encoded_msg.len() {
+            return None;
+        }
 
         // Version INTEGER
         if encoded_msg[offset] != 0x02 {
@@ -198,7 +201,10 @@ impl UsmSecurityParams {
         }
         offset += 1;
         let (ver_len, len_size) = parse_length(&encoded_msg[offset..])?;
-        offset += len_size + ver_len;
+        offset = offset.checked_add(len_size)?.checked_add(ver_len)?;
+        if offset >= encoded_msg.len() {
+            return None;
+        }
 
         // msgGlobalData SEQUENCE
         if encoded_msg[offset] != 0x30 {
@@ -206,7 +212,10 @@ impl UsmSecurityParams {
         }
         offset += 1;
         let (global_len, len_size) = parse_length(&encoded_msg[offset..])?;
-        offset += len_size + global_len;
+        offset = offset.checked_add(len_size)?.checked_add(global_len)?;
+        if offset >= encoded_msg.len() {
+            return None;
+        }
 
         // msgSecurityParameters OCTET STRING
         if encoded_msg[offset] != 0x04 {
@@ -214,7 +223,10 @@ impl UsmSecurityParams {
         }
         offset += 1;
         let (_, len_size) = parse_length(&encoded_msg[offset..])?;
-        offset += len_size;
+        offset = offset.checked_add(len_size)?;
+        if offset >= encoded_msg.len() {
+            return None;
+        }
 
         // Now we're inside the USM params SEQUENCE
 
@@ -224,7 +236,10 @@ impl UsmSecurityParams {
         }
         offset += 1;
         let (_, len_size) = parse_length(&encoded_msg[offset..])?;
-        offset += len_size;
+        offset = offset.checked_add(len_size)?;
+        if offset >= encoded_msg.len() {
+            return None;
+        }
 
         // engineID OCTET STRING
         offset = skip_tlv(encoded_msg, offset)?;
@@ -239,12 +254,20 @@ impl UsmSecurityParams {
         offset = skip_tlv(encoded_msg, offset)?;
 
         // authParams OCTET STRING - this is what we're looking for
+        if offset >= encoded_msg.len() {
+            return None;
+        }
         if encoded_msg[offset] != 0x04 {
             return None;
         }
         offset += 1;
         let (auth_len, len_size) = parse_length(&encoded_msg[offset..])?;
-        let auth_start = offset + len_size;
+        let auth_start = offset.checked_add(len_size)?;
+
+        // Validate the claimed auth range fits within the buffer
+        if auth_start.checked_add(auth_len)? > encoded_msg.len() {
+            return None;
+        }
 
         Some((auth_start, auth_len))
     }
@@ -458,5 +481,83 @@ mod tests {
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
         assert_eq!(decoded.engine_boots, 0);
         assert_eq!(decoded.engine_time, 0);
+    }
+
+    // Regression tests for malformed auth-parameter offset parsing
+    // Crafted messages with lengths that advance offset past buffer end must
+    // return None rather than panicking.
+
+    #[test]
+    fn test_find_auth_params_offset_truncated_returns_none() {
+        // Completely empty buffer
+        assert_eq!(UsmSecurityParams::find_auth_params_offset(&[]), None);
+
+        // Only the outer SEQUENCE tag, no length byte
+        assert_eq!(UsmSecurityParams::find_auth_params_offset(&[0x30]), None);
+
+        // Outer SEQUENCE with length claiming 100 bytes, but buffer is tiny
+        // offset will advance past buffer when trying to read version INTEGER tag
+        let msg: &[u8] = &[
+            0x30, 0x64, // SEQUENCE, length=100 (but buffer ends here)
+        ];
+        assert_eq!(UsmSecurityParams::find_auth_params_offset(msg), None);
+    }
+
+    #[test]
+    fn test_find_auth_params_offset_inflated_global_len_returns_none() {
+        // Build a message where version INTEGER is valid but msgGlobalData
+        // length claims far more bytes than exist in the buffer.
+        //
+        // Layout:
+        //   30 xx          outer SEQUENCE (length covers rest)
+        //   02 01 03       INTEGER version=3
+        //   30 7f ...      SEQUENCE global with length=127 (but no real content)
+        let msg: &[u8] = &[
+            0x30, 0x06, // outer SEQUENCE, length=6
+            0x02, 0x01, 0x03, // INTEGER version=3
+            0x30, 0x7f, // SEQUENCE global, length=127 - advances past buffer end
+        ];
+        assert_eq!(UsmSecurityParams::find_auth_params_offset(msg), None);
+    }
+
+    #[test]
+    fn test_find_auth_params_offset_auth_len_overflow_returns_none() {
+        // Build a structurally plausible but minimal message where the auth
+        // params OCTET STRING tag is present but the encoded length claims
+        // more bytes than remain in the buffer.  The function must return
+        // None, not panic when the caller later slices with auth_start+auth_len.
+        //
+        // We need to craft enough structure so the parser gets past:
+        //   outer SEQUENCE -> version INTEGER -> global SEQUENCE ->
+        //   msgSecurityParameters OCTET STRING -> USM SEQUENCE ->
+        //   engineID, boots, time, username (all skipped) ->
+        //   authParams tag + inflated length
+        //
+        // Use a real V3 message encoding as a base, then corrupt the auth
+        // params length field to claim 255 bytes.
+        use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
+        use crate::oid;
+        use crate::pdu::Pdu;
+
+        let global = MsgGlobalData::new(1, 1472, MsgFlags::new(SecurityLevel::AuthNoPriv, true));
+        let usm_params = UsmSecurityParams::new(b"eng".as_slice(), 1, 1, b"u".as_slice())
+            .with_auth_placeholder(12);
+        let pdu = Pdu::get_request(1, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
+        let scoped = ScopedPdu::with_empty_context(pdu);
+        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        let encoded_bytes = msg.encode();
+        let mut encoded: Vec<u8> = encoded_bytes.to_vec();
+
+        // Locate the real auth params offset so we can corrupt its length byte
+        let (auth_start, auth_len) = UsmSecurityParams::find_auth_params_offset(&encoded).unwrap();
+        assert_eq!(auth_len, 12);
+
+        // The BER length byte for the auth params is just before auth_start.
+        // Set it to 0x40 (64, short-form) so auth_start + auth_len > buffer.
+        encoded[auth_start - 1] = 0x40;
+
+        // Must not panic - must return None because the claimed extent
+        // (auth_start + 64) exceeds the buffer length.
+        assert_eq!(UsmSecurityParams::find_auth_params_offset(&encoded), None);
     }
 }

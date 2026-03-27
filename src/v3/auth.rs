@@ -385,11 +385,16 @@ pub fn authenticate_message(
     auth_offset: usize,
     auth_len: usize,
 ) {
+    let end = match auth_offset.checked_add(auth_len) {
+        Some(e) if e <= message.len() => e,
+        _ => return,
+    };
+
     // Compute HMAC over the message with zeros in auth params position
     let mac = key.compute_hmac(message);
 
     // Replace zeros with actual MAC
-    message[auth_offset..auth_offset + auth_len].copy_from_slice(&mac);
+    message[auth_offset..end].copy_from_slice(&mac);
 }
 
 /// Verify the authentication of an incoming message.
@@ -401,12 +406,17 @@ pub fn verify_message(
     auth_offset: usize,
     auth_len: usize,
 ) -> bool {
+    let end = match auth_offset.checked_add(auth_len) {
+        Some(e) if e <= message.len() => e,
+        _ => return false,
+    };
+
     // Extract the received MAC
-    let received_mac = &message[auth_offset..auth_offset + auth_len];
+    let received_mac = &message[auth_offset..end];
 
     // Create a copy with zeros in the auth position
     let mut msg_copy = message.to_vec();
-    msg_copy[auth_offset..auth_offset + auth_len].fill(0);
+    msg_copy[auth_offset..end].fill(0);
 
     // Compute expected MAC
     key.verify_hmac(&msg_copy, received_mac)
