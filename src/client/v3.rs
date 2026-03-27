@@ -147,7 +147,7 @@ impl<T: Transport> Client<T> {
         // Build scoped PDU
         let scoped_pdu = ScopedPdu::new(
             engine_state.engine_id.clone(),
-            Bytes::new(), // empty context name
+            security.context_name.clone(),
             pdu.clone(),
         );
 
@@ -578,5 +578,96 @@ impl<T: Transport> Client<T> {
             }
             .boxed()
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::UsmConfig;
+    use crate::client::ClientConfig;
+    use crate::message::V3MessageData;
+    use crate::oid;
+    use crate::transport::Transport;
+    use crate::v3::EngineState;
+    use bytes::Bytes;
+    use std::future::ready;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct TestTransport {
+        peer: SocketAddr,
+    }
+
+    impl TestTransport {
+        fn new() -> Self {
+            Self {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            }
+        }
+    }
+
+    impl Transport for TestTransport {
+        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            ready(Ok(()))
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            ready(Err(Error::Config(
+                "test transport does not receive data".into(),
+            )
+            .boxed()))
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+
+        fn register_request(&self, _request_id: i32, _timeout: Duration) {}
+    }
+
+    #[test]
+    fn test_build_v3_message_uses_configured_context_name() {
+        let transport = TestTransport::new();
+        let config = ClientConfig {
+            version: crate::version::Version::V3,
+            v3_security: Some(UsmConfig::new("user").context_name("ctx")),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config);
+
+        {
+            let mut state = client
+                .inner
+                .engine_state
+                .write()
+                .expect("engine_state lock poisoned");
+            *state = Some(EngineState::new(Bytes::from_static(b"engine"), 1, 42));
+        }
+
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
+
+        let encoded = client
+            .build_v3_message(&pdu, 456)
+            .expect("v3 message should encode");
+        let decoded = V3Message::decode(Bytes::from(encoded)).expect("v3 message should decode");
+        let scoped = match decoded.data {
+            V3MessageData::Plaintext(scoped) => scoped,
+            V3MessageData::Encrypted(_) => panic!("expected plaintext scoped PDU"),
+        };
+
+        assert_eq!(scoped.context_name.as_ref(), b"ctx");
     }
 }
