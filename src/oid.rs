@@ -418,7 +418,7 @@ impl Oid {
     /// OID encoding (X.690 Section 8.19):
     /// - First two arcs encoded as (arc1 * 40) + arc2 using base-128
     /// - Remaining arcs encoded as base-128 variable length
-    pub fn to_ber_smallvec(&self) -> SmallVec<[u8; 64]> {
+    pub(crate) fn to_ber_smallvec(&self) -> SmallVec<[u8; 64]> {
         let mut bytes = SmallVec::new();
 
         if self.arcs.is_empty() {
