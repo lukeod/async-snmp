@@ -105,7 +105,7 @@ impl Agent {
         }
 
         // Verify engine ID matches ours
-        if usm_params.engine_id.as_ref() != self.inner.engine_id.as_slice() {
+        if usm_params.engine_id.as_ref() != self.inner.engine_id.as_ref() {
             tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "engine ID mismatch");
             let count = self
                 .inner
@@ -349,17 +349,14 @@ impl Agent {
         );
 
         let response_usm = UsmSecurityParams::new(
-            Bytes::copy_from_slice(&self.inner.engine_id),
+            self.inner.engine_id.clone(),
             engine_boots,
             engine_time,
             Bytes::new(),
         );
 
-        let response_scoped = ScopedPdu::new(
-            Bytes::copy_from_slice(&self.inner.engine_id),
-            Bytes::new(),
-            report_pdu,
-        );
+        let response_scoped =
+            ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
 
         let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
 

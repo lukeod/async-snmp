@@ -80,8 +80,16 @@ impl Decoder {
     }
 
     /// Peek at the next tag without consuming it.
+    ///
+    /// Returns `None` if the buffer is empty or if the next byte signals a
+    /// multi-byte tag (low five bits all set, i.e. `byte & 0x1F == 0x1F`).
+    /// Valid SNMP uses only single-byte tags (all defined tags are below 31).
     pub fn peek_tag(&self) -> Option<u8> {
-        self.peek_byte()
+        let byte = self.peek_byte()?;
+        if byte & 0x1F == 0x1F {
+            return None;
+        }
+        Some(byte)
     }
 
     /// Read a single byte.
@@ -96,8 +104,17 @@ impl Decoder {
     }
 
     /// Read a tag byte.
+    ///
+    /// Returns an error if the tag byte signals a multi-byte tag
+    /// (low five bits all set, i.e. `byte & 0x1F == 0x1F`).
+    /// Valid SNMP uses only single-byte tags (all defined tags are below 31).
     pub fn read_tag(&mut self) -> Result<u8> {
-        self.read_byte()
+        let tag = self.read_byte()?;
+        if tag & 0x1F == 0x1F {
+            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset - 1, kind = %DecodeErrorKind::UnexpectedTag { expected: 0, actual: tag } }, "multi-byte tag not supported");
+            return Err(self.malformed());
+        }
+        Ok(tag)
     }
 
     /// Read a length and return (length, bytes consumed).
@@ -462,5 +479,52 @@ mod tests {
             "expected MalformedResponse error, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn test_read_tag_rejects_multi_byte_tag() {
+        // A tag byte with all 5 lower bits set (0x1F) signals a multi-byte tag in BER.
+        // Valid SNMP uses single-byte tags only, so this must be rejected.
+        let mut dec = Decoder::from_slice(&[0x1F, 0x02, 0x00]);
+        let result = dec.read_tag();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(*err, crate::error::Error::MalformedResponse { .. }),
+            "expected MalformedResponse error for multi-byte tag, got {:?}",
+            err
+        );
+
+        // 0x3F: constructed form with tag bits all set - also multi-byte
+        let mut dec = Decoder::from_slice(&[0x3F, 0x02, 0x00]);
+        let result = dec.read_tag();
+        assert!(result.is_err());
+
+        // 0x9F: context-specific, primitive, multi-byte
+        let mut dec = Decoder::from_slice(&[0x9F, 0x02, 0x00]);
+        let result = dec.read_tag();
+        assert!(result.is_err());
+
+        // Normal single-byte tags must still be accepted
+        let mut dec = Decoder::from_slice(&[0x02, 0x01, 0x00]);
+        let result = dec.read_tag();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0x02);
+    }
+
+    #[test]
+    fn test_peek_tag_rejects_multi_byte_tag() {
+        // peek_tag must also reject multi-byte tags
+        let dec = Decoder::from_slice(&[0x1F, 0x02, 0x00]);
+        let result = dec.peek_tag();
+        assert!(
+            result.is_none(),
+            "peek_tag should return None for multi-byte tag"
+        );
+
+        // Normal tag should peek as Some
+        let dec = Decoder::from_slice(&[0x30, 0x00]);
+        let result = dec.peek_tag();
+        assert_eq!(result, Some(0x30));
     }
 }
