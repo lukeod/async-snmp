@@ -58,22 +58,29 @@ impl super::NotificationReceiver {
     ) -> Result<Option<Notification>> {
         let msg = CommunityMessage::decode(data)?;
 
-        match msg.pdu.pdu_type {
+        // V2c messages carry standard PDUs; TrapV1 is only valid in V1 messages.
+        let pdu = match msg.pdu.standard() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        match pdu.pdu_type {
             PduType::TrapV2 => {
-                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(&msg.pdu)?;
+                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(pdu)?;
                 Ok(Some(Notification::TrapV2c {
                     community: msg.community,
                     uptime,
                     trap_oid,
                     varbinds,
-                    request_id: msg.pdu.request_id,
+                    request_id: pdu.request_id,
                 }))
             }
             PduType::InformRequest => {
-                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(&msg.pdu)?;
+                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(pdu)?;
+                let request_id = pdu.request_id;
 
                 // Send response
-                let response = msg.pdu.to_response();
+                let response = pdu.to_response();
                 let response_msg = CommunityMessage::v2c(msg.community.clone(), response);
                 let response_bytes = response_msg.encode();
 
@@ -86,14 +93,14 @@ impl super::NotificationReceiver {
                         source: e,
                     })?;
 
-                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = msg.pdu.request_id }, "sent Inform response");
+                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
 
                 Ok(Some(Notification::InformV2c {
                     community: msg.community,
                     uptime,
                     trap_oid,
                     varbinds,
-                    request_id: msg.pdu.request_id,
+                    request_id,
                 }))
             }
             _ => Ok(None), // Not a notification PDU

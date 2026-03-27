@@ -4,18 +4,80 @@
 //! `SEQUENCE { version INTEGER, community OCTET STRING, pdu PDU }`
 //!
 //! The only difference is the version number (0 for v1, 1 for v2c).
+//! SNMPv1 Trap PDUs (tag 0xA4) have a distinct wire format from standard PDUs
+//! and are represented by the `CommunityPdu::TrapV1` variant.
 
-use crate::ber::{Decoder, EncodeBuf};
+use crate::ber::{Decoder, EncodeBuf, tag};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
-use crate::pdu::{GetBulkPdu, Pdu};
+use crate::pdu::{GetBulkPdu, Pdu, PduType, TrapV1Pdu};
 use crate::version::Version;
 use bytes::Bytes;
+
+/// PDU carried inside a community (v1/v2c) message.
+///
+/// SNMPv1 Trap PDUs have a different wire layout from all other PDU types,
+/// so they are decoded into a distinct variant.
+#[derive(Debug, Clone)]
+pub enum CommunityPdu {
+    /// Standard PDU (Get, GetNext, Response, Set, GetBulk, Inform, TrapV2, Report).
+    Standard(Pdu),
+    /// SNMPv1 Trap PDU (distinct wire format, only valid in V1 messages).
+    TrapV1(TrapV1Pdu),
+}
+
+impl CommunityPdu {
+    /// Return a reference to the standard PDU, or `None` if this is a TrapV1.
+    pub fn standard(&self) -> Option<&Pdu> {
+        match self {
+            Self::Standard(p) => Some(p),
+            Self::TrapV1(_) => None,
+        }
+    }
+
+    /// Return a reference to the TrapV1 PDU, or `None` if this is a standard PDU.
+    pub fn trap_v1(&self) -> Option<&TrapV1Pdu> {
+        match self {
+            Self::TrapV1(t) => Some(t),
+            Self::Standard(_) => None,
+        }
+    }
+
+    /// Return the PDU type.
+    pub fn pdu_type(&self) -> PduType {
+        match self {
+            Self::Standard(p) => p.pdu_type,
+            Self::TrapV1(_) => PduType::TrapV1,
+        }
+    }
+
+    /// Encode to BER.
+    pub(crate) fn encode(&self, buf: &mut EncodeBuf) {
+        match self {
+            Self::Standard(p) => p.encode(buf),
+            Self::TrapV1(t) => t.encode(buf),
+        }
+    }
+}
+
+impl From<Pdu> for CommunityPdu {
+    fn from(p: Pdu) -> Self {
+        Self::Standard(p)
+    }
+}
+
+impl From<TrapV1Pdu> for CommunityPdu {
+    fn from(t: TrapV1Pdu) -> Self {
+        Self::TrapV1(t)
+    }
+}
 
 /// Community-based SNMP message (v1/v2c).
 ///
 /// This unified type handles both SNMPv1 and SNMPv2c messages,
 /// which share identical structure but differ in version number.
+/// The `pdu` field is a `CommunityPdu` that can hold either a standard
+/// PDU or a TrapV1 PDU.
 #[derive(Debug, Clone)]
 pub struct CommunityMessage {
     /// SNMP version (V1 or V2c)
@@ -23,11 +85,11 @@ pub struct CommunityMessage {
     /// Community string for authentication
     pub community: Bytes,
     /// Protocol data unit
-    pub pdu: Pdu,
+    pub pdu: CommunityPdu,
 }
 
 impl CommunityMessage {
-    /// Create a new community message.
+    /// Create a new community message with a standard PDU.
     ///
     /// # Panics
     /// Panics if version is V3 (use V3Message instead).
@@ -40,7 +102,7 @@ impl CommunityMessage {
         Self {
             version,
             community: community.into(),
-            pdu,
+            pdu: CommunityPdu::Standard(pdu),
         }
     }
 
@@ -49,9 +111,18 @@ impl CommunityMessage {
         Self::new(Version::V2c, community, pdu)
     }
 
-    /// Create a V1 message (convenience constructor).
+    /// Create a V1 message with a standard PDU (convenience constructor).
     pub fn v1(community: impl Into<Bytes>, pdu: Pdu) -> Self {
         Self::new(Version::V1, community, pdu)
+    }
+
+    /// Create a V1 message carrying a TrapV1 PDU.
+    pub fn v1_trap(community: impl Into<Bytes>, trap: TrapV1Pdu) -> Self {
+        Self {
+            version: Version::V1,
+            community: community.into(),
+            pdu: CommunityPdu::TrapV1(trap),
+        }
     }
 
     /// Encode to BER.
@@ -102,7 +173,21 @@ impl CommunityMessage {
         }
 
         let community = seq.read_octet_string()?;
-        let pdu = Pdu::decode(seq)?;
+
+        // Peek at the PDU tag to dispatch between standard and TrapV1 layouts.
+        let pdu_tag = seq.peek_tag().ok_or_else(|| {
+            tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::TruncatedData }, "truncated community message");
+            Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed()
+        })?;
+
+        let pdu = if pdu_tag == tag::pdu::TRAP_V1 {
+            CommunityPdu::TrapV1(TrapV1Pdu::decode(seq)?)
+        } else {
+            CommunityPdu::Standard(Pdu::decode(seq)?)
+        };
 
         Ok(CommunityMessage {
             version,
@@ -111,8 +196,21 @@ impl CommunityMessage {
         })
     }
 
-    /// Consume and return the PDU.
+    /// Consume and return the standard PDU.
+    ///
+    /// # Panics
+    /// Panics if the PDU is a TrapV1. Use `into_community_pdu()` for a non-panicking version.
     pub fn into_pdu(self) -> Pdu {
+        match self.pdu {
+            CommunityPdu::Standard(p) => p,
+            CommunityPdu::TrapV1(_) => {
+                panic!("community message contains TrapV1; use pdu directly")
+            }
+        }
+    }
+
+    /// Consume and return the `CommunityPdu`.
+    pub fn into_community_pdu(self) -> CommunityPdu {
         self.pdu
     }
 
@@ -139,6 +237,35 @@ impl CommunityMessage {
 mod tests {
     use super::*;
     use crate::oid;
+    use crate::pdu::{GenericTrap, TrapV1Pdu};
+
+    #[test]
+    fn test_v1_trap_roundtrip() {
+        let trap = TrapV1Pdu::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999),
+            [192, 168, 1, 1],
+            GenericTrap::LinkDown,
+            0,
+            12345,
+            vec![],
+        );
+        let msg = CommunityMessage::v1_trap(b"public".as_slice(), trap);
+
+        let encoded = msg.encode();
+        let decoded = CommunityMessage::decode(encoded).unwrap();
+
+        assert_eq!(decoded.version, Version::V1);
+        assert_eq!(decoded.community.as_ref(), b"public");
+        match decoded.pdu {
+            CommunityPdu::TrapV1(ref t) => {
+                assert_eq!(t.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
+                assert_eq!(t.agent_addr, [192, 168, 1, 1]);
+                assert_eq!(t.generic_trap, GenericTrap::LinkDown.as_i32());
+                assert_eq!(t.time_stamp, 12345);
+            }
+            CommunityPdu::Standard(_) => panic!("expected TrapV1 pdu"),
+        }
+    }
 
     #[test]
     fn test_v1_roundtrip() {
@@ -150,7 +277,7 @@ mod tests {
 
         assert_eq!(decoded.version, Version::V1);
         assert_eq!(decoded.community.as_ref(), b"public");
-        assert_eq!(decoded.pdu.request_id, 42);
+        assert_eq!(decoded.pdu.standard().unwrap().request_id, 42);
     }
 
     #[test]
@@ -163,7 +290,7 @@ mod tests {
 
         assert_eq!(decoded.version, Version::V2c);
         assert_eq!(decoded.community.as_ref(), b"private");
-        assert_eq!(decoded.pdu.request_id, 123);
+        assert_eq!(decoded.pdu.standard().unwrap().request_id, 123);
     }
 
     #[test]
