@@ -295,7 +295,7 @@ impl<T: Transport> Client<T> {
 
         // Build global data
         let msg_flags = MsgFlags::new(security_level, true); // reportable=true for requests
-        let global_data = MsgGlobalData::new(msg_id, 65507, msg_flags);
+        let global_data = MsgGlobalData::new(msg_id, engine_state.msg_max_size as i32, msg_flags);
 
         // Build complete message
         let msg = match msg_data {
