@@ -16,6 +16,7 @@
 
 use bytes::Bytes;
 
+use crate::ber::length::parse_ber_length;
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
@@ -189,7 +190,7 @@ impl UsmSecurityParams {
             return None;
         }
         offset += 1;
-        let (_, len_size) = parse_length(&encoded_msg[offset..])?;
+        let (_, len_size) = parse_ber_length(&encoded_msg[offset..])?;
         offset += len_size;
         if offset >= encoded_msg.len() {
             return None;
@@ -200,7 +201,7 @@ impl UsmSecurityParams {
             return None;
         }
         offset += 1;
-        let (ver_len, len_size) = parse_length(&encoded_msg[offset..])?;
+        let (ver_len, len_size) = parse_ber_length(&encoded_msg[offset..])?;
         offset = offset.checked_add(len_size)?.checked_add(ver_len)?;
         if offset >= encoded_msg.len() {
             return None;
@@ -211,7 +212,7 @@ impl UsmSecurityParams {
             return None;
         }
         offset += 1;
-        let (global_len, len_size) = parse_length(&encoded_msg[offset..])?;
+        let (global_len, len_size) = parse_ber_length(&encoded_msg[offset..])?;
         offset = offset.checked_add(len_size)?.checked_add(global_len)?;
         if offset >= encoded_msg.len() {
             return None;
@@ -222,7 +223,7 @@ impl UsmSecurityParams {
             return None;
         }
         offset += 1;
-        let (_, len_size) = parse_length(&encoded_msg[offset..])?;
+        let (_, len_size) = parse_ber_length(&encoded_msg[offset..])?;
         offset = offset.checked_add(len_size)?;
         if offset >= encoded_msg.len() {
             return None;
@@ -235,7 +236,7 @@ impl UsmSecurityParams {
             return None;
         }
         offset += 1;
-        let (_, len_size) = parse_length(&encoded_msg[offset..])?;
+        let (_, len_size) = parse_ber_length(&encoded_msg[offset..])?;
         offset = offset.checked_add(len_size)?;
         if offset >= encoded_msg.len() {
             return None;
@@ -261,7 +262,7 @@ impl UsmSecurityParams {
             return None;
         }
         offset += 1;
-        let (auth_len, len_size) = parse_length(&encoded_msg[offset..])?;
+        let (auth_len, len_size) = parse_ber_length(&encoded_msg[offset..])?;
         let auth_start = offset.checked_add(len_size)?;
 
         // Validate the claimed auth range fits within the buffer
@@ -270,34 +271,6 @@ impl UsmSecurityParams {
         }
 
         Some((auth_start, auth_len))
-    }
-}
-
-/// Parse a BER length, returning (length, bytes_consumed).
-fn parse_length(data: &[u8]) -> Option<(usize, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-
-    let first = data[0];
-    if first < 0x80 {
-        // Short form
-        Some((first as usize, 1))
-    } else if first == 0x80 {
-        // Indefinite form - not supported
-        None
-    } else {
-        // Long form
-        let count = (first & 0x7F) as usize;
-        if count > 4 || count == 0 || data.len() < 1 + count {
-            return None;
-        }
-
-        let mut len = 0usize;
-        for i in 0..count {
-            len = (len << 8) | (data[1 + i] as usize);
-        }
-        Some((len, 1 + count))
     }
 }
 
@@ -314,7 +287,7 @@ fn skip_tlv(data: &[u8], offset: usize) -> Option<usize> {
     }
 
     // Parse length
-    let (len, len_size) = parse_length(&data[pos..])?;
+    let (len, len_size) = parse_ber_length(&data[pos..])?;
     pos += len_size + len;
 
     if pos > data.len() {

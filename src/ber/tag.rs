@@ -86,21 +86,3 @@ pub mod pdu {
     /// Report PDU tag (0xA8).
     pub const REPORT: u8 = CONTEXT_SPECIFIC | CONSTRUCTED | 0x08;
 }
-
-/// Check if a tag indicates a constructed type
-#[inline]
-pub const fn is_constructed(tag: u8) -> bool {
-    tag & CONSTRUCTED != 0
-}
-
-/// Get the class of a tag
-#[inline]
-pub const fn tag_class(tag: u8) -> u8 {
-    tag & 0xC0
-}
-
-/// Get the tag number (bits 4-0)
-#[inline]
-pub const fn tag_number(tag: u8) -> u8 {
-    tag & 0x1F
-}
