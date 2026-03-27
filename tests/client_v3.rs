@@ -166,9 +166,8 @@ async fn v3_wrong_password_fails() {
 /// Unknown user with authentication fails.
 ///
 /// When authentication is required, the agent rejects unknown users.
-/// For noAuthNoPriv, username verification is not enforced (per RFC 3414).
 #[tokio::test]
-async fn v3_unknown_user_fails() {
+async fn v3_unknown_user_auth_fails() {
     let agent = TestAgentBuilder::new()
         .usm_user(V3User::auth_only(
             b"validuser".to_vec(),
@@ -192,6 +191,34 @@ async fn v3_unknown_user_fails() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     assert!(result.is_err());
+}
+
+/// Unknown user with noAuthNoPriv fails (RFC 3414 section 3.2 step 1).
+///
+/// Non-discovery messages with an unknown username must be rejected with
+/// usmStatsUnknownUserNames even when security level is noAuthNoPriv.
+/// Only discovery messages (empty msgUserName) are exempt.
+#[tokio::test]
+async fn v3_unknown_user_no_auth_fails() {
+    let agent = TestAgentBuilder::new()
+        .usm_user(V3User::no_auth(b"knownuser".to_vec()))
+        .build()
+        .await;
+
+    // Try to use unknown user with noAuthNoPriv - must fail per RFC 3414
+    let client = Client::builder(agent.addr().to_string(), Auth::usm("unknownuser"))
+        .timeout(Duration::from_millis(500))
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
+
+    assert!(
+        result.is_err(),
+        "unknown noAuthNoPriv user should be rejected"
+    );
 }
 
 /// Engine discovery works.
