@@ -24,6 +24,25 @@ use super::Agent;
 impl Agent {
     /// Handle SNMPv1 request.
     pub(super) async fn handle_v1(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
+        self.handle_community(data, source, Version::V1).await
+    }
+
+    /// Handle SNMPv2c request.
+    pub(super) async fn handle_v2c(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+    ) -> Result<Option<Bytes>> {
+        self.handle_community(data, source, Version::V2c).await
+    }
+
+    /// Handle an SNMPv1 or SNMPv2c community-based request.
+    async fn handle_community(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        version: Version,
+    ) -> Result<Option<Bytes>> {
         let msg = CommunityMessage::decode(data)?;
 
         // Validate community
@@ -38,11 +57,17 @@ impl Agent {
             _ => return Ok(None),
         };
 
+        let security_model = match version {
+            Version::V1 => SecurityModel::V1,
+            Version::V2c => SecurityModel::V2c,
+            Version::V3 => unreachable!("handle_community called with V3"),
+        };
+
         // Build request context
         let mut ctx = RequestContext {
             source,
-            version: Version::V1,
-            security_model: SecurityModel::V1,
+            version,
+            security_model,
             security_name: msg.community.clone(),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
@@ -54,80 +79,14 @@ impl Agent {
         };
 
         // VACM resolution (if enabled)
-        if let Some(ref vacm) = self.inner.vacm
-            && let Some(group) = vacm.get_group(SecurityModel::V1, &ctx.security_name)
-        {
-            ctx.group_name = Some(group.clone());
-            if let Some(access) = vacm.get_access(
-                group,
-                &ctx.context_name,
-                ctx.security_model,
-                ctx.security_level,
-            ) {
-                ctx.read_view = Some(access.read_view.clone());
-                ctx.write_view = Some(access.write_view.clone());
-            }
-        }
+        self.resolve_vacm(&mut ctx);
 
         let response_pdu = self.dispatch_request(&ctx, pdu).await?;
-        let response_msg = CommunityMessage::v1(msg.community, response_pdu);
-
-        Ok(Some(response_msg.encode()))
-    }
-
-    /// Handle SNMPv2c request.
-    pub(super) async fn handle_v2c(
-        &self,
-        data: Bytes,
-        source: SocketAddr,
-    ) -> Result<Option<Bytes>> {
-        let msg = CommunityMessage::decode(data)?;
-
-        // Validate community
-        if !self.validate_community(&msg.community) {
-            tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "invalid community string");
-            return Ok(None);
-        }
-
-        // Skip non-request PDUs
-        let pdu = match msg.pdu.standard() {
-            Some(p) if is_request_pdu(p.pdu_type) => p,
-            _ => return Ok(None),
+        let response_msg = match version {
+            Version::V1 => CommunityMessage::v1(msg.community, response_pdu),
+            Version::V2c => CommunityMessage::v2c(msg.community, response_pdu),
+            Version::V3 => unreachable!("handle_community called with V3"),
         };
-
-        // Build request context
-        let mut ctx = RequestContext {
-            source,
-            version: Version::V2c,
-            security_model: SecurityModel::V2c,
-            security_name: msg.community.clone(),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_name: Bytes::new(),
-            request_id: pdu.request_id,
-            pdu_type: pdu.pdu_type,
-            group_name: None,
-            read_view: None,
-            write_view: None,
-        };
-
-        // VACM resolution (if enabled)
-        if let Some(ref vacm) = self.inner.vacm
-            && let Some(group) = vacm.get_group(SecurityModel::V2c, &ctx.security_name)
-        {
-            ctx.group_name = Some(group.clone());
-            if let Some(access) = vacm.get_access(
-                group,
-                &ctx.context_name,
-                ctx.security_model,
-                ctx.security_level,
-            ) {
-                ctx.read_view = Some(access.read_view.clone());
-                ctx.write_view = Some(access.write_view.clone());
-            }
-        }
-
-        let response_pdu = self.dispatch_request(&ctx, pdu).await?;
-        let response_msg = CommunityMessage::v2c(msg.community, response_pdu);
 
         Ok(Some(response_msg.encode()))
     }
@@ -286,20 +245,7 @@ impl Agent {
         };
 
         // VACM resolution (if enabled)
-        if let Some(ref vacm) = self.inner.vacm
-            && let Some(group) = vacm.get_group(SecurityModel::Usm, &ctx.security_name)
-        {
-            ctx.group_name = Some(group.clone());
-            if let Some(access) = vacm.get_access(
-                group,
-                &ctx.context_name,
-                ctx.security_model,
-                ctx.security_level,
-            ) {
-                ctx.read_view = Some(access.read_view.clone());
-                ctx.write_view = Some(access.write_view.clone());
-            }
-        }
+        self.resolve_vacm(&mut ctx);
 
         let response_pdu = self.dispatch_request(&ctx, pdu).await?;
 
@@ -312,6 +258,24 @@ impl Agent {
             scoped_pdu.context_name.clone(),
             derived_keys.as_ref(),
         )
+    }
+
+    /// Populate VACM group and view fields on a request context.
+    fn resolve_vacm(&self, ctx: &mut RequestContext) {
+        if let Some(ref vacm) = self.inner.vacm
+            && let Some(group) = vacm.get_group(ctx.security_model, &ctx.security_name)
+        {
+            ctx.group_name = Some(group.clone());
+            if let Some(access) = vacm.get_access(
+                group,
+                &ctx.context_name,
+                ctx.security_model,
+                ctx.security_level,
+            ) {
+                ctx.read_view = Some(access.read_view.clone());
+                ctx.write_view = Some(access.write_view.clone());
+            }
+        }
     }
 
     /// Handle SNMPv3 discovery request.
