@@ -276,8 +276,8 @@ pub trait MibHandler: Send + Sync + 'static {
         _ctx: &'a RequestContext,
         _oid: &'a Oid,
         _value: &'a Value,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
+    ) -> BoxFuture<'a, SetResult> {
+        Box::pin(async { SetResult::Ok })
     }
 
     /// Check if this handler handles the given OID.

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::error::{ErrorStatus, Result};
 use crate::handler::{MibHandler, RequestContext};
 use crate::oid::Oid;
-use crate::pdu::{Pdu, PduType};
+use crate::pdu::Pdu;
 use crate::value::Value;
 use crate::version::Version;
 
@@ -35,59 +35,31 @@ impl Agent {
             if let Some(ref vacm) = self.inner.vacm
                 && !vacm.check_access(ctx.write_view.as_ref(), &vb.oid)
             {
-                if ctx.version == Version::V1 {
-                    return Ok(Pdu {
-                        pdu_type: PduType::Response,
-                        request_id: pdu.request_id,
-                        error_status: ErrorStatus::NoSuchName.as_i32(),
-                        error_index: (index + 1) as i32,
-                        varbinds: pdu.varbinds.clone(),
-                    });
+                let status = if ctx.version == Version::V1 {
+                    ErrorStatus::NoSuchName
                 } else {
-                    return Ok(Pdu {
-                        pdu_type: PduType::Response,
-                        request_id: pdu.request_id,
-                        error_status: ErrorStatus::NoAccess.as_i32(),
-                        error_index: (index + 1) as i32,
-                        varbinds: pdu.varbinds.clone(),
-                    });
-                }
+                    ErrorStatus::NoAccess
+                };
+                return Ok(pdu.to_error_response(status, (index + 1) as i32));
             }
 
             let handler = self.find_handler(&vb.oid);
 
             if handler.is_none() {
                 // No handler for this OID
-                if ctx.version == Version::V1 {
-                    return Ok(Pdu {
-                        pdu_type: PduType::Response,
-                        request_id: pdu.request_id,
-                        error_status: ErrorStatus::NoSuchName.as_i32(),
-                        error_index: (index + 1) as i32,
-                        varbinds: pdu.varbinds.clone(),
-                    });
+                let status = if ctx.version == Version::V1 {
+                    ErrorStatus::NoSuchName
                 } else {
-                    return Ok(Pdu {
-                        pdu_type: PduType::Response,
-                        request_id: pdu.request_id,
-                        error_status: ErrorStatus::NotWritable.as_i32(),
-                        error_index: (index + 1) as i32,
-                        varbinds: pdu.varbinds.clone(),
-                    });
-                }
+                    ErrorStatus::NotWritable
+                };
+                return Ok(pdu.to_error_response(status, (index + 1) as i32));
             }
 
             let handler = handler.unwrap();
             let result = handler.handler.test_set(ctx, &vb.oid, &vb.value).await;
 
             if !result.is_ok() {
-                return Ok(Pdu {
-                    pdu_type: PduType::Response,
-                    request_id: pdu.request_id,
-                    error_status: result.to_error_status().as_i32(),
-                    error_index: (index + 1) as i32,
-                    varbinds: pdu.varbinds.clone(),
-                });
+                return Ok(pdu.to_error_response(result.to_error_status(), (index + 1) as i32));
             }
 
             pending.push(PendingSet {
@@ -107,28 +79,19 @@ impl Agent {
             if !result.is_ok() {
                 // Commit failed - rollback all previously committed varbinds
                 for c in committed.iter().rev() {
-                    c.handler.undo_set(ctx, &c.oid, &c.value).await;
+                    let undo_result = c.handler.undo_set(ctx, &c.oid, &c.value).await;
+                    if !undo_result.is_ok() {
+                        tracing::warn!(target: "async_snmp::agent", { oid = %c.oid }, "undo_set failed during rollback");
+                    }
                 }
 
-                return Ok(Pdu {
-                    pdu_type: PduType::Response,
-                    request_id: pdu.request_id,
-                    error_status: ErrorStatus::CommitFailed.as_i32(),
-                    error_index: (index + 1) as i32,
-                    varbinds: pdu.varbinds.clone(),
-                });
+                return Ok(pdu.to_error_response(ErrorStatus::CommitFailed, (index + 1) as i32));
             }
 
             committed.push(p);
         }
 
         // All commits succeeded
-        Ok(Pdu {
-            pdu_type: PduType::Response,
-            request_id: pdu.request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: pdu.varbinds.clone(),
-        })
+        Ok(pdu.to_response())
     }
 }

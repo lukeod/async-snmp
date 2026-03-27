@@ -118,9 +118,8 @@ impl MibHandler for TestHandler {
         _ctx: &'a RequestContext,
         _oid: &'a Oid,
         _value: &'a Value,
-    ) -> BoxFuture<'a, ()> {
-        // Best-effort undo - for testing we just ignore
-        Box::pin(async {})
+    ) -> BoxFuture<'a, SetResult> {
+        Box::pin(async { SetResult::Ok })
     }
 }
 

@@ -111,16 +111,8 @@ impl Agent {
             }
             SecurityLevel::AuthNoPriv => {
                 let local_addr = self.inner.local_addr;
-                let keys = derived_keys.ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoCredentials }, "no credentials for response");
-                    Error::Auth { target: local_addr }.boxed()
-                })?;
-                let auth_key = keys.auth_key.as_ref().ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoAuthKey }, "no auth key for response");
-                    Error::Auth { target: local_addr }.boxed()
-                })?;
+                let (auth_key, mac_len) = self.extract_auth_key(derived_keys, local_addr)?;
 
-                let mac_len = auth_key.mac_len();
                 let response_usm = UsmSecurityParams::new(
                     Bytes::copy_from_slice(&self.inner.engine_id),
                     engine_boots,
@@ -132,30 +124,15 @@ impl Agent {
                 let response_msg =
                     V3Message::new(response_global, response_usm.encode(), response_scoped);
 
-                let mut response_bytes = response_msg.encode().to_vec();
-
-                let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(
-                    &response_bytes,
-                )
-                .ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in response");
-                    Error::MalformedResponse { target: local_addr }.boxed()
-                })?;
-
-                authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
+                let response_bytes =
+                    self.sign_response(response_msg.encode().to_vec(), auth_key, local_addr)?;
 
                 Ok(Some(Bytes::from(response_bytes)))
             }
             SecurityLevel::AuthPriv => {
                 let local_addr = self.inner.local_addr;
-                let keys = derived_keys.ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoCredentials }, "no credentials for response");
-                    Error::Auth { target: local_addr }.boxed()
-                })?;
-                let auth_key = keys.auth_key.as_ref().ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoAuthKey }, "no auth key for response");
-                    Error::Auth { target: local_addr }.boxed()
-                })?;
+                let (auth_key, mac_len) = self.extract_auth_key(derived_keys, local_addr)?;
+                let keys = derived_keys.unwrap(); // already verified above
                 let priv_key = keys.priv_key.as_ref().ok_or_else(|| {
                     tracing::debug!(target: "async_snmp::agent", { kind = %CryptoErrorKind::NoPrivKey }, "no privacy key for response");
                     Error::Auth { target: local_addr }.boxed()
@@ -176,7 +153,6 @@ impl Agent {
                         Error::Auth { target: local_addr }.boxed()
                     })?;
 
-                let mac_len = auth_key.mac_len();
                 let response_usm = UsmSecurityParams::new(
                     Bytes::copy_from_slice(&self.inner.engine_id),
                     engine_boots,
@@ -189,20 +165,45 @@ impl Agent {
                 let response_msg =
                     V3Message::new_encrypted(response_global, response_usm.encode(), encrypted);
 
-                let mut response_bytes = response_msg.encode().to_vec();
-
-                let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(
-                    &response_bytes,
-                )
-                .ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in response");
-                    Error::MalformedResponse { target: local_addr }.boxed()
-                })?;
-
-                authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
+                let response_bytes =
+                    self.sign_response(response_msg.encode().to_vec(), auth_key, local_addr)?;
 
                 Ok(Some(Bytes::from(response_bytes)))
             }
         }
+    }
+
+    /// Validate `derived_keys` and return a reference to the auth key with its MAC length.
+    fn extract_auth_key<'a>(
+        &self,
+        derived_keys: Option<&'a DerivedKeys>,
+        local_addr: SocketAddr,
+    ) -> Result<(&'a crate::v3::LocalizedKey, usize)> {
+        let keys = derived_keys.ok_or_else(|| {
+            tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoCredentials }, "no credentials for response");
+            Error::Auth { target: local_addr }.boxed()
+        })?;
+        let auth_key = keys.auth_key.as_ref().ok_or_else(|| {
+            tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoAuthKey }, "no auth key for response");
+            Error::Auth { target: local_addr }.boxed()
+        })?;
+        let mac_len = auth_key.mac_len();
+        Ok((auth_key, mac_len))
+    }
+
+    /// Apply HMAC authentication to an already-encoded response message.
+    fn sign_response(
+        &self,
+        mut response_bytes: Vec<u8>,
+        auth_key: &crate::v3::LocalizedKey,
+        local_addr: SocketAddr,
+    ) -> Result<Vec<u8>> {
+        let (auth_offset, auth_len) =
+            UsmSecurityParams::find_auth_params_offset(&response_bytes).ok_or_else(|| {
+                tracing::debug!(target: "async_snmp::agent", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in response");
+                Error::MalformedResponse { target: local_addr }.boxed()
+            })?;
+        authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
+        Ok(response_bytes)
     }
 }
