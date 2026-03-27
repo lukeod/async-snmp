@@ -131,10 +131,6 @@ pub struct V3Args {
     #[arg(short = 'u', long = "username")]
     pub username: Option<String>,
 
-    /// Security level: noAuthNoPriv, authNoPriv, or authPriv.
-    #[arg(short = 'l', long = "level")]
-    pub level: Option<String>,
-
     /// Authentication protocol: MD5, SHA, SHA-224, SHA-256, SHA-384, SHA-512.
     #[arg(short = 'a', long = "auth-protocol")]
     pub auth_protocol: Option<AuthProtocol>,
@@ -489,7 +485,6 @@ mod tests {
         // No username - valid (not v3)
         let args = V3Args {
             username: None,
-            level: None,
             auth_protocol: None,
             auth_password: None,
             priv_protocol: None,
@@ -500,7 +495,6 @@ mod tests {
         // Username only - valid (noAuthNoPriv)
         let args = V3Args {
             username: Some("admin".to_string()),
-            level: None,
             auth_protocol: None,
             auth_password: None,
             priv_protocol: None,
@@ -511,7 +505,6 @@ mod tests {
         // Auth protocol without password - invalid
         let args = V3Args {
             username: Some("admin".to_string()),
-            level: None,
             auth_protocol: Some(AuthProtocol::Sha256),
             auth_password: None,
             priv_protocol: None,
@@ -522,7 +515,6 @@ mod tests {
         // Privacy without auth - invalid
         let args = V3Args {
             username: Some("admin".to_string()),
-            level: None,
             auth_protocol: None,
             auth_password: None,
             priv_protocol: Some(PrivProtocol::Aes128),
@@ -533,7 +525,6 @@ mod tests {
         // SHA-1 with AES-256 - valid (key extension auto-applied)
         let args = V3Args {
             username: Some("admin".to_string()),
-            level: None,
             auth_protocol: Some(AuthProtocol::Sha1),
             auth_password: Some("pass".to_string()),
             priv_protocol: Some(PrivProtocol::Aes256),
