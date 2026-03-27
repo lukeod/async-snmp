@@ -929,13 +929,7 @@ impl Agent {
     /// request-id and varbind list.
     fn handle_inform(&self, pdu: &Pdu) -> Result<Pdu> {
         // Simply acknowledge by returning the same varbinds in a Response
-        Ok(Pdu {
-            pdu_type: PduType::Response,
-            request_id: pdu.request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: pdu.varbinds.clone(),
-        })
+        Ok(pdu.to_response())
     }
 
     /// Handle GET request.
@@ -949,13 +943,7 @@ impl Agent {
             {
                 // v1: noSuchName, v2c/v3: noAccess or NoSuchObject
                 if ctx.version == Version::V1 {
-                    return Ok(Pdu {
-                        pdu_type: PduType::Response,
-                        request_id: pdu.request_id,
-                        error_status: ErrorStatus::NoSuchName.as_i32(),
-                        error_index: (index + 1) as i32,
-                        varbinds: pdu.varbinds.clone(),
-                    });
+                    return Ok(pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32));
                 } else {
                     // For GET, return NoSuchObject for inaccessible OIDs per RFC 3415
                     response_varbinds.push(VarBind::new(vb.oid.clone(), Value::NoSuchObject));
@@ -974,13 +962,9 @@ impl Agent {
                 GetResult::NoSuchObject => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchObject exception
                     if ctx.version == Version::V1 {
-                        return Ok(Pdu {
-                            pdu_type: PduType::Response,
-                            request_id: pdu.request_id,
-                            error_status: ErrorStatus::NoSuchName.as_i32(),
-                            error_index: (index + 1) as i32,
-                            varbinds: pdu.varbinds.clone(),
-                        });
+                        return Ok(
+                            pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
+                        );
                     } else {
                         Value::NoSuchObject
                     }
@@ -988,13 +972,9 @@ impl Agent {
                 GetResult::NoSuchInstance => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchInstance exception
                     if ctx.version == Version::V1 {
-                        return Ok(Pdu {
-                            pdu_type: PduType::Response,
-                            request_id: pdu.request_id,
-                            error_status: ErrorStatus::NoSuchName.as_i32(),
-                            error_index: (index + 1) as i32,
-                            varbinds: pdu.varbinds.clone(),
-                        });
+                        return Ok(
+                            pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
+                        );
                     } else {
                         Value::NoSuchInstance
                     }
@@ -1048,13 +1028,9 @@ impl Agent {
                 None => {
                     // v1 returns noSuchName, v2c/v3 returns endOfMibView
                     if ctx.version == Version::V1 {
-                        return Ok(Pdu {
-                            pdu_type: PduType::Response,
-                            request_id: pdu.request_id,
-                            error_status: ErrorStatus::NoSuchName.as_i32(),
-                            error_index: (index + 1) as i32,
-                            varbinds: pdu.varbinds.clone(),
-                        });
+                        return Ok(
+                            pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
+                        );
                     } else {
                         response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
                     }
@@ -1116,13 +1092,7 @@ impl Agent {
             if !can_add(&next_vb, current_size) {
                 // Can't fit even non-repeaters, return tooBig if we have nothing
                 if response_varbinds.is_empty() {
-                    return Ok(Pdu {
-                        pdu_type: PduType::Response,
-                        request_id: pdu.request_id,
-                        error_status: ErrorStatus::TooBig.as_i32(),
-                        error_index: 0,
-                        varbinds: pdu.varbinds.clone(),
-                    });
+                    return Ok(pdu.to_error_response(ErrorStatus::TooBig, 0));
                 }
                 // Otherwise return what we have
                 break;
