@@ -1211,10 +1211,21 @@ impl Agent {
 
     /// Get the next OID from any handler.
     async fn get_next_oid(&self, ctx: &RequestContext, oid: &Oid) -> Option<VarBind> {
-        // Find the first handler that can provide a next OID
+        // Find the first handler that can provide a next OID.
+        //
+        // A handler can only return an OID > oid if:
+        //   - oid falls within the handler's subtree (oid starts with handler prefix), OR
+        //   - the handler's entire subtree is after oid (handler prefix > oid)
+        //
+        // Handlers whose prefix is <= oid and whose subtree does not contain oid
+        // cannot return anything useful and are skipped.
         let mut best_result: Option<VarBind> = None;
 
         for handler in &self.inner.handlers {
+            let prefix = &handler.prefix;
+            if prefix <= oid && !oid.starts_with(prefix) {
+                continue;
+            }
             if let GetNextResult::Value(next) = handler.handler.get_next(ctx, oid).await {
                 // Must be lexicographically greater than the request OID
                 if next.oid > *oid {
