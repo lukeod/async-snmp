@@ -69,11 +69,13 @@ pub enum Backoff {
 }
 
 impl Default for Retry {
-    /// Default: 3 retries with no delay between attempts.
+    /// Default: 3 retries with 1-second fixed delay between attempts.
     fn default() -> Self {
         Self {
             max_attempts: 3,
-            backoff: Backoff::None,
+            backoff: Backoff::Fixed {
+                delay: Duration::from_secs(1),
+            },
         }
     }
 }
@@ -251,7 +253,9 @@ mod tests {
     fn test_retry_default() {
         let retry = Retry::default();
         assert_eq!(retry.max_attempts, 3);
-        assert!(matches!(retry.backoff, Backoff::None));
+        assert!(
+            matches!(retry.backoff, Backoff::Fixed { delay } if delay == Duration::from_secs(1))
+        );
     }
 
     #[test]
@@ -303,9 +307,16 @@ mod tests {
 
     #[test]
     fn test_compute_delay_none() {
-        let retry = Retry::default();
+        let retry = Retry::none();
         assert_eq!(retry.compute_delay(0), Duration::ZERO);
         assert_eq!(retry.compute_delay(5), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_compute_delay_default() {
+        let retry = Retry::default();
+        assert_eq!(retry.compute_delay(0), Duration::from_secs(1));
+        assert_eq!(retry.compute_delay(5), Duration::from_secs(1));
     }
 
     #[test]

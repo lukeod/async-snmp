@@ -5,6 +5,30 @@
 // which triggers this lint but is the standard pattern for storing futures.
 #![allow(clippy::type_complexity)]
 
+/// Implement `next()` and `collect()` for a Stream type that implements poll_next.
+macro_rules! impl_stream_helpers {
+    ($type:ident < $($gen:tt),+ >) => {
+        impl<$($gen),+> $type<$($gen),+>
+        where
+            $($gen: crate::transport::Transport + 'static,)+
+        {
+            /// Get the next varbind, or None when complete.
+            pub async fn next(&mut self) -> Option<crate::error::Result<crate::varbind::VarBind>> {
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut *self).poll_next(cx)).await
+            }
+
+            /// Collect all remaining varbinds.
+            pub async fn collect(mut self) -> crate::error::Result<Vec<crate::varbind::VarBind>> {
+                let mut results = Vec::new();
+                while let Some(result) = self.next().await {
+                    results.push(result?);
+                }
+                Ok(results)
+            }
+        }
+    };
+}
+
 use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -189,21 +213,7 @@ impl<T: Transport> Walk<T> {
     }
 }
 
-impl<T: Transport + 'static> Walk<T> {
-    /// Get the next varbind, or None when complete.
-    pub async fn next(&mut self) -> Option<Result<VarBind>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
-    }
-
-    /// Collect all remaining varbinds.
-    pub async fn collect(mut self) -> Result<Vec<VarBind>> {
-        let mut results = Vec::new();
-        while let Some(result) = self.next().await {
-            results.push(result?);
-        }
-        Ok(results)
-    }
-}
+impl_stream_helpers!(Walk<T>);
 
 impl<T: Transport + 'static> Stream for Walk<T> {
     type Item = Result<VarBind>;
@@ -326,21 +336,7 @@ impl<T: Transport> BulkWalk<T> {
     }
 }
 
-impl<T: Transport + 'static> BulkWalk<T> {
-    /// Get the next varbind, or None when complete.
-    pub async fn next(&mut self) -> Option<Result<VarBind>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
-    }
-
-    /// Collect all remaining varbinds.
-    pub async fn collect(mut self) -> Result<Vec<VarBind>> {
-        let mut results = Vec::new();
-        while let Some(result) = self.next().await {
-            results.push(result?);
-        }
-        Ok(results)
-    }
-}
+impl_stream_helpers!(BulkWalk<T>);
 
 impl<T: Transport + 'static> Stream for BulkWalk<T> {
     type Item = Result<VarBind>;
@@ -474,21 +470,7 @@ impl<T: Transport> WalkStream<T> {
     }
 }
 
-impl<T: Transport + 'static> WalkStream<T> {
-    /// Get the next varbind, or None when complete.
-    pub async fn next(&mut self) -> Option<Result<VarBind>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
-    }
-
-    /// Collect all remaining varbinds.
-    pub async fn collect(mut self) -> Result<Vec<VarBind>> {
-        let mut results = Vec::new();
-        while let Some(result) = self.next().await {
-            results.push(result?);
-        }
-        Ok(results)
-    }
-}
+impl_stream_helpers!(WalkStream<T>);
 
 impl<T: Transport + 'static> Stream for WalkStream<T> {
     type Item = Result<VarBind>;

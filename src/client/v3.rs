@@ -221,20 +221,17 @@ impl<T: Transport> Client<T> {
         let (msg_data, priv_params) = if security_level.requires_priv() {
             tracing::trace!(target: "async_snmp::client", "encrypting scoped PDU");
 
-            // Get mutable priv_key - we need interior mutability for salt counter
-            // Since PrivKey uses internal counter, we need to clone and use
             let derived_ref = derived.as_ref().ok_or_else(|| {
                 tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::KeysNotDerived }, "keys not derived");
                 Error::Config("keys not derived".into()).boxed()
             })?;
-            let mut priv_key = derived_ref
+            let priv_key = derived_ref
                 .priv_key
                 .as_ref()
                 .ok_or_else(|| {
                     tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::NoPrivKey }, "privacy key not available");
                     Error::Config("privacy key not available".into()).boxed()
-                })?
-                .clone();
+                })?;
 
             // Encode scoped PDU
             let scoped_pdu_bytes = scoped_pdu.encode_to_bytes();

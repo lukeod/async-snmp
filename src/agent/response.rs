@@ -140,8 +140,7 @@ impl Agent {
 
                 // Encrypt the scoped PDU
                 let scoped_pdu_bytes = response_scoped.encode_to_bytes();
-                let mut priv_key_clone = priv_key.clone();
-                let (encrypted, priv_params) = priv_key_clone
+                let (encrypted, priv_params) = priv_key
                     .encrypt(
                         &scoped_pdu_bytes,
                         engine_boots,

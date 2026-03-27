@@ -93,7 +93,7 @@ use crate::ber::Decoder;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::handler::{GetNextResult, GetResult, MibHandler, RequestContext};
-use crate::notification::UsmUserConfig;
+use crate::notification::UsmConfig;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::util::bind_udp_socket;
@@ -162,7 +162,7 @@ pub(crate) struct RegisteredHandler {
 pub struct AgentBuilder {
     bind_addr: String,
     communities: Vec<Vec<u8>>,
-    usm_users: HashMap<Bytes, UsmUserConfig>,
+    usm_users: HashMap<Bytes, UsmConfig>,
     handlers: Vec<RegisteredHandler>,
     engine_id: Option<Vec<u8>>,
     max_message_size: usize,
@@ -328,10 +328,10 @@ impl AgentBuilder {
     /// ```
     pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
     where
-        F: FnOnce(UsmUserConfig) -> UsmUserConfig,
+        F: FnOnce(UsmConfig) -> UsmConfig,
     {
         let username_bytes: Bytes = username.into();
-        let config = configure(UsmUserConfig::new(username_bytes.clone()));
+        let config = configure(UsmConfig::new(username_bytes.clone()));
         self.usm_users.insert(username_bytes, config);
         self
     }
@@ -585,7 +585,7 @@ pub(crate) struct AgentInner {
     pub(crate) socket_state: UdpSocketState,
     pub(crate) local_addr: SocketAddr,
     pub(crate) communities: Vec<Vec<u8>>,
-    pub(crate) usm_users: HashMap<Bytes, UsmUserConfig>,
+    pub(crate) usm_users: HashMap<Bytes, UsmConfig>,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) engine_id: Vec<u8>,
     pub(crate) engine_boots: AtomicU32,

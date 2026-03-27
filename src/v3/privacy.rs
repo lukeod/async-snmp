@@ -104,10 +104,10 @@ pub struct PrivKey {
     /// Privacy protocol
     #[zeroize(skip)]
     protocol: PrivProtocol,
-    /// Salt counter for generating unique IVs
-    /// For thread safety, each PrivKey instance gets its own counter
+    /// Salt counter for generating unique IVs.
+    /// Uses interior mutability so encrypt() can take &self.
     #[zeroize(skip)]
-    salt_counter: u64,
+    salt_counter: AtomicU64,
 }
 
 /// Thread-safe salt counter for shared use across multiple encryptions.
@@ -268,11 +268,11 @@ impl PrivKey {
         }
     }
 
-    /// Initialize salt from cryptographic randomness.
+    /// Initialize salt counter from cryptographic randomness.
     ///
     /// Never returns zero to avoid IV reuse issues on wraparound.
-    fn init_salt() -> u64 {
-        random_nonzero_u64()
+    fn init_salt() -> AtomicU64 {
+        AtomicU64::new(random_nonzero_u64())
     }
 
     /// Get the privacy protocol.
@@ -303,21 +303,20 @@ impl PrivKey {
     /// * `Ok((ciphertext, priv_params))` on success
     /// * `Err` on encryption failure
     pub fn encrypt(
-        &mut self,
+        &self,
         plaintext: &[u8],
         engine_boots: u32,
         engine_time: u32,
         salt_counter: Option<&SaltCounter>,
     ) -> PrivacyResult<(Bytes, Bytes)> {
         let salt = salt_counter.map(|c| c.next()).unwrap_or_else(|| {
-            let mut s = self.salt_counter;
-            self.salt_counter = self.salt_counter.wrapping_add(1);
-            // Skip zero on wraparound (matches net-snmp behavior)
-            if s == 0 {
-                s = self.salt_counter;
-                self.salt_counter = self.salt_counter.wrapping_add(1);
+            // Fetch the current value, then increment. Skip zero.
+            let val = self.salt_counter.fetch_add(1, Ordering::Relaxed);
+            if val != 0 {
+                return val;
             }
-            s
+            // Counter was zero (initial or wrapped). Fetch the next value.
+            self.salt_counter.fetch_add(1, Ordering::Relaxed)
         });
 
         match self.protocol {
@@ -746,7 +745,7 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // DES key
             0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // pre-IV
         ];
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Des, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Des, key);
 
         let plaintext = b"Hello, SNMPv3 World!";
         let engine_boots = 100u32;
@@ -780,7 +779,7 @@ mod tests {
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // K3
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // pre-IV
         ];
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Des3, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Des3, key);
 
         let plaintext = b"Hello, SNMPv3 World with 3DES!";
         let engine_boots = 100u32;
@@ -812,7 +811,7 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10,
         ];
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
 
         let plaintext = b"Hello, SNMPv3 AES World!";
         let engine_boots = 200u32;
@@ -908,10 +907,10 @@ mod tests {
     #[test]
     fn test_priv_key_internal_salt_skips_zero() {
         let key = vec![0u8; 16];
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
 
         // Set the internal counter to u64::MAX
-        priv_key.salt_counter = u64::MAX;
+        priv_key.salt_counter.store(u64::MAX, Ordering::Relaxed);
 
         let plaintext = b"test";
 
@@ -937,7 +936,7 @@ mod tests {
     #[test]
     fn test_multiple_encryptions_different_salt() {
         let key = vec![0u8; 16];
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
 
         let plaintext = b"test data";
 
@@ -954,7 +953,7 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let mut priv_key = PrivKey::from_password(
+        let priv_key = PrivKey::from_password(
             AuthProtocol::Sha1,
             PrivProtocol::Aes128,
             password,
@@ -978,7 +977,7 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
         ];
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, key);
 
         let plaintext = b"Hello, SNMPv3 AES-192 World!";
         let engine_boots = 300u32;
@@ -1011,7 +1010,7 @@ mod tests {
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
             0x1d, 0x1e, 0x1f, 0x20,
         ];
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key);
 
         let plaintext = b"Hello, SNMPv3 AES-256 World!";
         let engine_boots = 400u32;
@@ -1042,7 +1041,7 @@ mod tests {
         let password = b"longpassword123";
         let engine_id = decode_hex("80001f8880e9b104617361000000").unwrap();
 
-        let mut priv_key = PrivKey::from_password(
+        let priv_key = PrivKey::from_password(
             AuthProtocol::Sha256, // SHA-256 produces 32 bytes, enough for AES-192
             PrivProtocol::Aes192,
             password,
@@ -1064,7 +1063,7 @@ mod tests {
         let password = b"anotherlongpassword456";
         let engine_id = decode_hex("80001f8880e9b104617361000000").unwrap();
 
-        let mut priv_key = PrivKey::from_password(
+        let priv_key = PrivKey::from_password(
             AuthProtocol::Sha256, // SHA-256 produces 32 bytes, exactly enough for AES-256
             PrivProtocol::Aes256,
             password,
@@ -1102,7 +1101,7 @@ mod tests {
             0xE1, 0xE0,
         ];
 
-        let mut correct_priv_key = PrivKey::from_bytes(PrivProtocol::Des, correct_key);
+        let correct_priv_key = PrivKey::from_bytes(PrivProtocol::Des, correct_key);
         let wrong_priv_key = PrivKey::from_bytes(PrivProtocol::Des, wrong_key);
 
         let plaintext = b"Secret SNMPv3 message data!";
@@ -1148,7 +1147,7 @@ mod tests {
             0xF1, 0xF0,
         ];
 
-        let mut correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, correct_key);
+        let correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, correct_key);
         let wrong_priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, wrong_key);
 
         let plaintext = b"Secret AES-128 message data!";
@@ -1190,7 +1189,7 @@ mod tests {
             0xF1, 0xF0, 0xEF, 0xEE, 0xED, 0xEC, 0xEB, 0xEA, 0xE9, 0xE8,
         ];
 
-        let mut correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, correct_key);
+        let correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, correct_key);
         let wrong_priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, wrong_key);
 
         let plaintext = b"Secret AES-192 message data!";
@@ -1225,7 +1224,7 @@ mod tests {
             0xE3, 0xE2, 0xE1, 0xE0,
         ];
 
-        let mut correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, correct_key);
+        let correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, correct_key);
         let wrong_priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, wrong_key);
 
         let plaintext = b"Secret AES-256 message data!";
@@ -1256,7 +1255,7 @@ mod tests {
             0x17, 0x18,
         ];
 
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Des, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Des, key);
 
         let plaintext = b"DES test message";
         let engine_boots = 100u32;
@@ -1329,8 +1328,8 @@ mod tests {
     #[test]
     fn test_priv_key_clone_independent_salts() {
         let key = vec![0u8; 16];
-        let mut original = PrivKey::from_bytes(PrivProtocol::Aes128, key);
-        let mut cloned = original.clone();
+        let original = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+        let cloned = original.clone();
 
         let plaintext = b"test";
 
@@ -1353,7 +1352,7 @@ mod tests {
             0x0f, 0x10,
         ];
 
-        let mut priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
 
         let plaintext = b"AES test message";
         let engine_boots = 200u32;

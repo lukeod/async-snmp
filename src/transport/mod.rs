@@ -38,19 +38,16 @@ use std::time::Duration;
 /// Used as the default value for [`Transport::max_message_size()`].
 pub const MAX_UDP_PAYLOAD: u32 = 65507;
 
-/// Global request ID counter, initialized with random seed.
+/// Global request ID counter, initialized with a cryptographically random seed.
 ///
 /// Using a global counter ensures request IDs are unique across all
 /// transports within the process, preventing collisions when multiple
 /// transports exist or when sockets are rapidly recreated.
 static REQUEST_ID_COUNTER: LazyLock<AtomicI32> = LazyLock::new(|| {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let time_component = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i32)
-        .unwrap_or(1);
-    let pid_component = std::process::id() as i32;
-    AtomicI32::new(time_component.wrapping_add(pid_component))
+    let mut buf = [0u8; 4];
+    getrandom::fill(&mut buf).expect("getrandom failed");
+    let seed = i32::from_ne_bytes(buf);
+    AtomicI32::new(seed)
 });
 
 /// Allocate a globally unique request ID.
