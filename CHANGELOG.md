@@ -24,10 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking:** `TrapV1Pdu.generic_trap` field type changed from `i32` to `GenericTrap`; `generic_trap_enum()` removed - use the field directly
 - **Breaking:** `Notification::trap_oid()` return type changed from `&Oid` to `Result<Oid>`; RFC 3584 OID conversion for TrapV1 enterprise-specific traps is fallible
-- **Breaking:** `MibHandler::undo_set` return type changed from `BoxFuture<'a, ()>` to `BoxFuture<'a, SetResult>`
+- **Breaking:** `MibHandler::undo_set` return type changed from `BoxFuture<'a, ()>` to `BoxFuture<'a, SetResult>`; the return value lets the agent framework detect and log failed rollbacks. Implementations that cannot undo should return `SetResult::CommitFailed`.
 - **Breaking:** `set_many` now returns `Error::Config` when the varbind count exceeds the per-request OID limit; SET must be atomic per RFC 3416 and silent batching across PDUs violates that guarantee
 - **Breaking:** `UsmUserConfig` type alias removed; use `UsmConfig` directly
-- **Breaking:** `EngineCache::Clone` removed; share instances via `Arc<EngineCache>`
+- **Breaking:** `EngineCache::Clone` removed; share instances via `Arc<EngineCache>`. Cloning produced a snapshot rather than a shared reference, so callers using clone for sharing would silently split the cache.
 - **Breaking:** `--level` flag removed from V3 CLI tools; security level is inferred from auth/priv configuration
 - `error_index` in response PDUs is no longer bounds-checked at parse time; negative values and values exceeding the varbind count are now accepted, matching net-snmp behavior
 - INTEGER values 5-8 bytes are now accepted and sign-extended to i32, matching net-snmp `CHECK_OVERFLOW_S`; values longer than 8 bytes are rejected
