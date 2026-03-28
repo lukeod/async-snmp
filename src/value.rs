@@ -977,6 +977,21 @@ impl Value {
                 Ok(Value::Integer(value))
             }
             tag::universal::OCTET_STRING => {
+                let available = decoder.remaining();
+                let len = if len > available {
+                    // Some devices (notably MikroTik) send OctetString values
+                    // where the declared length exceeds the enclosing varbind
+                    // SEQUENCE boundary by 1-2 bytes (firmware bug). Trust the
+                    // SEQUENCE boundary over the value length field and clamp.
+                    tracing::warn!(
+                        target: "async_snmp::value",
+                        { snmp.offset = %decoder.offset(), declared = len, available },
+                        "OctetString length exceeds varbind SEQUENCE boundary, clamping to available bytes"
+                    );
+                    available
+                } else {
+                    len
+                };
                 let data = decoder.read_bytes(len)?;
                 Ok(Value::OctetString(data))
             }
@@ -1018,6 +1033,17 @@ impl Value {
                 Ok(Value::TimeTicks(value))
             }
             tag::application::OPAQUE => {
+                let available = decoder.remaining();
+                let len = if len > available {
+                    tracing::warn!(
+                        target: "async_snmp::value",
+                        { snmp.offset = %decoder.offset(), declared = len, available },
+                        "Opaque length exceeds varbind SEQUENCE boundary, clamping to available bytes"
+                    );
+                    available
+                } else {
+                    len
+                };
                 let data = decoder.read_bytes(len)?;
                 Ok(Value::Opaque(data))
             }

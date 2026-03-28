@@ -217,6 +217,32 @@ mod tests {
         assert_eq!(vb.value, Value::EndOfMibView);
     }
 
+    #[test]
+    fn test_varbind_octetstring_length_exceeds_sequence() {
+        // MikroTik firmware bug: OctetString value declares a length 1 byte
+        // larger than what fits in the enclosing varbind SEQUENCE. We clamp to
+        // the available bytes rather than rejecting the varbind.
+        //
+        // Packet: 30 0e 06 08 2b 06 01 02 01 01 01 00 04 03 61 62
+        //   30 0e  - varbind SEQUENCE, length 14
+        //   06 08  - OID tag, length 8
+        //   2b 06 01 02 01 01 01 00  - OID content (1.3.6.1.2.1.1.1.0)
+        //   04 03  - OctetString tag, declared length 3 (WRONG - only 2 bytes remain)
+        //   61 62  - 2 bytes of actual data ("ab")
+        let bytes = bytes::Bytes::from_static(&[
+            0x30, 0x0e, // SEQUENCE length 14
+            0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00, // OID
+            0x04, 0x03, 0x61, 0x62, // OctetString: declares 3, has 2
+        ]);
+        let mut decoder = Decoder::new(bytes);
+        let vb = VarBind::decode(&mut decoder).unwrap();
+        assert_eq!(vb.oid, crate::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+        assert_eq!(
+            vb.value,
+            Value::OctetString(bytes::Bytes::from_static(b"ab"))
+        );
+    }
+
     // ========================================================================
     // VarBind List Edge Cases
     // ========================================================================
