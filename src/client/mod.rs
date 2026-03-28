@@ -439,49 +439,8 @@ impl<T: Transport> Client<T> {
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
     pub async fn get_many(&self, oids: &[Oid]) -> Result<Vec<VarBind>> {
-        if oids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let max_per_request = self.inner.config.max_oids_per_request;
-
-        // Fast path: single request if within limit
-        if oids.len() <= max_per_request {
-            let request_id = self.next_request_id();
-            let pdu = Pdu::get_request(request_id, oids);
-            let response = self.send_request(pdu).await?;
-            if response.varbinds.len() != oids.len() {
-                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len() }, "GET response varbind count mismatch");
-                return Err(Error::MalformedResponse {
-                    target: self.peer_addr(),
-                }
-                .boxed());
-            }
-            return Ok(response.varbinds);
-        }
-
-        // Batched path: split into chunks
-        let num_batches = oids.len().div_ceil(max_per_request);
-        tracing::debug!(target: "async_snmp::client", { snmp.oid_count = oids.len(), snmp.max_per_request = max_per_request, snmp.batch_count = num_batches }, "splitting GET request into batches");
-
-        let mut all_results = Vec::with_capacity(oids.len());
-
-        for (batch_idx, chunk) in oids.chunks(max_per_request).enumerate() {
-            tracing::debug!(target: "async_snmp::client", { snmp.batch = batch_idx + 1, snmp.batch_total = num_batches, snmp.batch_oid_count = chunk.len() }, "sending GET batch");
-            let request_id = self.next_request_id();
-            let pdu = Pdu::get_request(request_id, chunk);
-            let response = self.send_request(pdu).await?;
-            if response.varbinds.len() != chunk.len() {
-                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1 }, "GET response varbind count mismatch in batch");
-                return Err(Error::MalformedResponse {
-                    target: self.peer_addr(),
-                }
-                .boxed());
-            }
-            all_results.extend(response.varbinds);
-        }
-
-        Ok(all_results)
+        self.get_or_getnext_many(oids, "GET", Pdu::get_request)
+            .await
     }
 
     /// GETNEXT for a single OID.
@@ -521,6 +480,20 @@ impl<T: Transport> Client<T> {
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
     pub async fn get_next_many(&self, oids: &[Oid]) -> Result<Vec<VarBind>> {
+        self.get_or_getnext_many(oids, "GETNEXT", Pdu::get_next_request)
+            .await
+    }
+
+    /// Shared implementation for GET-many and GETNEXT-many.
+    ///
+    /// `op` is the PDU constructor (`Pdu::get_request` or `Pdu::get_next_request`).
+    /// `op_name` is used only for log messages.
+    async fn get_or_getnext_many(
+        &self,
+        oids: &[Oid],
+        op_name: &'static str,
+        op: fn(i32, &[Oid]) -> Pdu,
+    ) -> Result<Vec<VarBind>> {
         if oids.is_empty() {
             return Ok(Vec::new());
         }
@@ -530,35 +503,39 @@ impl<T: Transport> Client<T> {
         // Fast path: single request if within limit
         if oids.len() <= max_per_request {
             let request_id = self.next_request_id();
-            let pdu = Pdu::get_next_request(request_id, oids);
+            let pdu = op(request_id, oids);
             let response = self.send_request(pdu).await?;
-            if response.varbinds.len() != oids.len() {
-                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len() }, "GETNEXT response varbind count mismatch");
+            if response.varbinds.len() > oids.len() {
+                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has more varbinds than requested");
                 return Err(Error::MalformedResponse {
                     target: self.peer_addr(),
                 }
                 .boxed());
+            } else if response.varbinds.len() < oids.len() {
+                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has fewer varbinds than requested");
             }
             return Ok(response.varbinds);
         }
 
         // Batched path: split into chunks
         let num_batches = oids.len().div_ceil(max_per_request);
-        tracing::debug!(target: "async_snmp::client", { snmp.oid_count = oids.len(), snmp.max_per_request = max_per_request, snmp.batch_count = num_batches }, "splitting GETNEXT request into batches");
+        tracing::debug!(target: "async_snmp::client", { snmp.oid_count = oids.len(), snmp.max_per_request = max_per_request, snmp.batch_count = num_batches, snmp.op = op_name }, "splitting request into batches");
 
         let mut all_results = Vec::with_capacity(oids.len());
 
         for (batch_idx, chunk) in oids.chunks(max_per_request).enumerate() {
-            tracing::debug!(target: "async_snmp::client", { snmp.batch = batch_idx + 1, snmp.batch_total = num_batches, snmp.batch_oid_count = chunk.len() }, "sending GETNEXT batch");
+            tracing::debug!(target: "async_snmp::client", { snmp.batch = batch_idx + 1, snmp.batch_total = num_batches, snmp.batch_oid_count = chunk.len(), snmp.op = op_name }, "sending batch");
             let request_id = self.next_request_id();
-            let pdu = Pdu::get_next_request(request_id, chunk);
+            let pdu = op(request_id, chunk);
             let response = self.send_request(pdu).await?;
-            if response.varbinds.len() != chunk.len() {
-                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1 }, "GETNEXT response varbind count mismatch in batch");
+            if response.varbinds.len() > chunk.len() {
+                tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1, snmp.op = op_name }, "response has more varbinds than requested in batch");
                 return Err(Error::MalformedResponse {
                     target: self.peer_addr(),
                 }
                 .boxed());
+            } else if response.varbinds.len() < chunk.len() {
+                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1, snmp.op = op_name }, "response has fewer varbinds than requested in batch");
             }
             all_results.extend(response.varbinds);
         }
@@ -637,12 +614,14 @@ impl<T: Transport> Client<T> {
         let expected_count = vbs.len();
         let pdu = Pdu::set_request(request_id, vbs);
         let response = self.send_request(pdu).await?;
-        if response.varbinds.len() != expected_count {
-            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response varbind count mismatch");
+        if response.varbinds.len() > expected_count {
+            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response has more varbinds than requested");
             return Err(Error::MalformedResponse {
                 target: self.peer_addr(),
             }
             .boxed());
+        } else if response.varbinds.len() < expected_count {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response has fewer varbinds than requested");
         }
         Ok(response.varbinds)
     }
@@ -948,9 +927,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_many_rejects_truncated_response() {
-        // Request 3 OIDs but the mock returns only 1 varbind.
+    async fn get_many_warns_on_truncated_response() {
+        // Request 3 OIDs but the mock returns only 1 varbind - should warn and return what we got.
         let client = make_client(1);
+        let oids = [
+            Oid::from_slice(&[1, 3, 6, 1, 1]),
+            Oid::from_slice(&[1, 3, 6, 1, 2]),
+            Oid::from_slice(&[1, 3, 6, 1, 3]),
+        ];
+
+        let result = client.get_many(&oids).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_many_rejects_inflated_response() {
+        // Request 3 OIDs but the mock returns 5 varbinds.
+        let client = make_client(5);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
             Oid::from_slice(&[1, 3, 6, 1, 2]),
@@ -980,9 +974,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_next_many_rejects_truncated_response() {
-        // Request 3 OIDs but the mock returns only 1 varbind.
+    async fn get_next_many_warns_on_truncated_response() {
+        // Request 3 OIDs but the mock returns only 1 varbind - should warn and return what we got.
         let client = make_client(1);
+        let oids = [
+            Oid::from_slice(&[1, 3, 6, 1, 1]),
+            Oid::from_slice(&[1, 3, 6, 1, 2]),
+            Oid::from_slice(&[1, 3, 6, 1, 3]),
+        ];
+
+        let result = client.get_next_many(&oids).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_next_many_rejects_inflated_response() {
+        // Request 3 OIDs but the mock returns 5 varbinds.
+        let client = make_client(5);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
             Oid::from_slice(&[1, 3, 6, 1, 2]),
@@ -1012,9 +1021,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_many_rejects_truncated_response() {
-        // Request 3 varbinds but the mock returns only 1.
+    async fn set_many_warns_on_truncated_response() {
+        // Request 3 varbinds but the mock returns only 1 - should warn and return what we got.
         let client = make_client(1);
+        let varbinds = [
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 1]),
+                crate::value::Value::Integer(1),
+            ),
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 2]),
+                crate::value::Value::Integer(2),
+            ),
+            (
+                Oid::from_slice(&[1, 3, 6, 1, 3]),
+                crate::value::Value::Integer(3),
+            ),
+        ];
+
+        let result = client.set_many(&varbinds).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_many_rejects_inflated_response() {
+        // Request 3 varbinds but the mock returns 5.
+        let client = make_client(5);
         let varbinds = [
             (
                 Oid::from_slice(&[1, 3, 6, 1, 1]),
@@ -1062,11 +1095,32 @@ mod tests {
     }
 
     // Batched path: get_many with more OIDs than max_per_request.
-    // The first batch will have truncated response.
     #[tokio::test]
-    async fn get_many_batched_rejects_truncated_response() {
-        // max_oids_per_request = 10, request 12 OIDs, mock returns 1 per batch
+    async fn get_many_batched_warns_on_truncated_response() {
+        // max_oids_per_request = 10, request 12 OIDs, mock returns 1 per batch.
+        // Should warn and return 2 varbinds (1 per batch).
         let transport = TruncatingTransport::new(1);
+        let config = ClientConfig {
+            version: Version::V2c,
+            max_oids_per_request: 10,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+
+        let oids: Vec<Oid> = (0..12u32)
+            .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
+            .collect();
+
+        let result = client.get_many(&oids).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 2); // 1 varbind per batch, 2 batches
+    }
+
+    #[tokio::test]
+    async fn get_many_batched_rejects_inflated_response() {
+        // max_oids_per_request = 10, request 12 OIDs, mock returns 12 per batch.
+        let transport = TruncatingTransport::new(12);
         let config = ClientConfig {
             version: Version::V2c,
             max_oids_per_request: 10,

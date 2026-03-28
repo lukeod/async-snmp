@@ -301,31 +301,42 @@ impl ErrorStatus {
             Self::Unknown(code) => *code,
         }
     }
+
+    /// Return the canonical SMI name for this status code.
+    ///
+    /// For `Unknown` variants, returns `None`; callers should format the
+    /// numeric code directly in that case.
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            Self::NoError => Some("noError"),
+            Self::TooBig => Some("tooBig"),
+            Self::NoSuchName => Some("noSuchName"),
+            Self::BadValue => Some("badValue"),
+            Self::ReadOnly => Some("readOnly"),
+            Self::GenErr => Some("genErr"),
+            Self::NoAccess => Some("noAccess"),
+            Self::WrongType => Some("wrongType"),
+            Self::WrongLength => Some("wrongLength"),
+            Self::WrongEncoding => Some("wrongEncoding"),
+            Self::WrongValue => Some("wrongValue"),
+            Self::NoCreation => Some("noCreation"),
+            Self::InconsistentValue => Some("inconsistentValue"),
+            Self::ResourceUnavailable => Some("resourceUnavailable"),
+            Self::CommitFailed => Some("commitFailed"),
+            Self::UndoFailed => Some("undoFailed"),
+            Self::AuthorizationError => Some("authorizationError"),
+            Self::NotWritable => Some("notWritable"),
+            Self::InconsistentName => Some("inconsistentName"),
+            Self::Unknown(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ErrorStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoError => write!(f, "noError"),
-            Self::TooBig => write!(f, "tooBig"),
-            Self::NoSuchName => write!(f, "noSuchName"),
-            Self::BadValue => write!(f, "badValue"),
-            Self::ReadOnly => write!(f, "readOnly"),
-            Self::GenErr => write!(f, "genErr"),
-            Self::NoAccess => write!(f, "noAccess"),
-            Self::WrongType => write!(f, "wrongType"),
-            Self::WrongLength => write!(f, "wrongLength"),
-            Self::WrongEncoding => write!(f, "wrongEncoding"),
-            Self::WrongValue => write!(f, "wrongValue"),
-            Self::NoCreation => write!(f, "noCreation"),
-            Self::InconsistentValue => write!(f, "inconsistentValue"),
-            Self::ResourceUnavailable => write!(f, "resourceUnavailable"),
-            Self::CommitFailed => write!(f, "commitFailed"),
-            Self::UndoFailed => write!(f, "undoFailed"),
-            Self::AuthorizationError => write!(f, "authorizationError"),
-            Self::NotWritable => write!(f, "notWritable"),
-            Self::InconsistentName => write!(f, "inconsistentName"),
-            Self::Unknown(code) => write!(f, "unknown({})", code),
+        match self.as_str() {
+            Some(name) => f.write_str(name),
+            None => write!(f, "unknown({})", self.as_i32()),
         }
     }
 }

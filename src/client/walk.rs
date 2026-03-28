@@ -79,6 +79,38 @@ enum OidTracker {
     Relaxed { seen: HashSet<Oid> },
 }
 
+/// Outcome of validating a single varbind from a walk response.
+enum VarbindOutcome {
+    /// Varbind is valid and within the subtree; emit it.
+    Yield,
+    /// Walk is complete (end-of-MIB or out-of-subtree).
+    Done,
+    /// Walk should abort with the given error.
+    Abort(Box<Error>),
+}
+
+/// Validate a varbind received during a walk.
+///
+/// Checks end-of-MIB, subtree containment, and OID ordering.
+/// Returns the outcome, updating `oid_tracker` on success.
+fn validate_walk_varbind(
+    vb: &VarBind,
+    base_oid: &Oid,
+    oid_tracker: &mut OidTracker,
+    target: std::net::SocketAddr,
+) -> VarbindOutcome {
+    if matches!(vb.value, Value::EndOfMibView) {
+        return VarbindOutcome::Done;
+    }
+    if !vb.oid.starts_with(base_oid) {
+        return VarbindOutcome::Done;
+    }
+    match oid_tracker.check(&vb.oid, target) {
+        Ok(()) => VarbindOutcome::Yield,
+        Err(e) => VarbindOutcome::Abort(e),
+    }
+}
+
 impl OidTracker {
     fn new(ordering: OidOrdering) -> Self {
         match ordering {
@@ -208,23 +240,18 @@ impl<T: Transport + 'static> Stream for Walk<T> {
 
                 match result {
                     Ok(vb) => {
-                        // Check for end conditions
-                        if matches!(vb.value, Value::EndOfMibView) {
-                            self.done = true;
-                            return Poll::Ready(None);
-                        }
-
-                        // Check if OID left the subtree
-                        if !vb.oid.starts_with(&self.base_oid) {
-                            self.done = true;
-                            return Poll::Ready(None);
-                        }
-
-                        // Check OID ordering using the tracker
                         let target = self.client.peer_addr();
-                        if let Err(e) = self.oid_tracker.check(&vb.oid, target) {
-                            self.done = true;
-                            return Poll::Ready(Some(Err(e)));
+                        let base_oid = self.base_oid.clone();
+                        match validate_walk_varbind(&vb, &base_oid, &mut self.oid_tracker, target) {
+                            VarbindOutcome::Done => {
+                                self.done = true;
+                                return Poll::Ready(None);
+                            }
+                            VarbindOutcome::Abort(e) => {
+                                self.done = true;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                            VarbindOutcome::Yield => {}
                         }
 
                         // Update current OID for next iteration
@@ -334,23 +361,18 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
 
             // Check if we have buffered results to return
             if let Some(vb) = self.buffer.pop_front() {
-                // Check for end conditions
-                if matches!(vb.value, Value::EndOfMibView) {
-                    self.done = true;
-                    return Poll::Ready(None);
-                }
-
-                // Check if OID left the subtree
-                if !vb.oid.starts_with(&self.base_oid) {
-                    self.done = true;
-                    return Poll::Ready(None);
-                }
-
-                // Check OID ordering using the tracker
                 let target = self.client.peer_addr();
-                if let Err(e) = self.oid_tracker.check(&vb.oid, target) {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(e)));
+                let base_oid = self.base_oid.clone();
+                match validate_walk_varbind(&vb, &base_oid, &mut self.oid_tracker, target) {
+                    VarbindOutcome::Done => {
+                        self.done = true;
+                        return Poll::Ready(None);
+                    }
+                    VarbindOutcome::Abort(e) => {
+                        self.done = true;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    VarbindOutcome::Yield => {}
                 }
 
                 // Update current OID for next request
