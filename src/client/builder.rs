@@ -212,7 +212,7 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the retry configuration (default: 3 retries, no backoff).
+    /// Set the retry configuration (default: 3 retries, 1-second delay).
     ///
     /// On timeout, the client resends the request up to this many times before
     /// returning an error. Retries are disabled for TCP (which handles

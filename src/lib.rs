@@ -101,7 +101,7 @@
 //!     .retry(Retry::none())
 //!     .connect().await?;
 //!
-//! // 3 retries with no delay (default behavior)
+//! // 3 retries with no delay between attempts
 //! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
 //!     .retry(Retry::fixed(3, Duration::ZERO))
 //!     .connect().await?;

@@ -145,7 +145,7 @@ pub struct ClientConfig {
     pub community: Bytes,
     /// Request timeout (default: 5 seconds)
     pub timeout: Duration,
-    /// Retry configuration (default: 3 retries, no backoff)
+    /// Retry configuration (default: 3 retries, 1-second delay)
     pub retry: Retry,
     /// Maximum OIDs per request (default: 10)
     pub max_oids_per_request: usize,

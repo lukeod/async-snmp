@@ -41,10 +41,6 @@ pub struct Retry {
 #[derive(Clone, Debug, Default)]
 pub enum Backoff {
     /// No delay between retries (immediate retry on timeout).
-    ///
-    /// This is the default for backward compatibility. Consider using
-    /// [`Backoff::Exponential`] for production use to avoid overwhelming
-    /// agents under load.
     #[default]
     None,
 
