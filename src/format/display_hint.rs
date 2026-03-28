@@ -180,11 +180,8 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                     }
                 }
                 b't' => {
-                    // UTF-8 text - decode as proper UTF-8, fall back to hex on error
-                    match std::str::from_utf8(chunk) {
-                        Ok(s) => result.push_str(s),
-                        Err(_) => hex::write_to(&mut result, chunk),
-                    }
+                    // UTF-8 text - replace invalid sequences with U+FFFD per RFC 2579
+                    result.push_str(&String::from_utf8_lossy(chunk));
                 }
                 _ => unreachable!(),
             }
@@ -426,11 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn utf8_invalid_bytes_fallback_to_hex() {
-        // Invalid UTF-8 sequence should not produce garbage chars
+    fn utf8_invalid_bytes_replaced_with_replacement_char() {
+        // Invalid UTF-8 sequences are replaced with U+FFFD per RFC 2579
         let bytes = &[0xff, 0xfe];
-        // Invalid UTF-8 falls back to hex
-        assert_eq!(apply("2t", bytes), "fffe");
+        assert_eq!(apply("2t", bytes), "\u{fffd}\u{fffd}");
     }
 
     #[test]

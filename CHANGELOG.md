@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GenericTrap::Unknown` displayed as `enterpriseSpecific`; now displays as `unknown`
 - `TimeTicks` verbose display used inconsistent format
 - Display hint `"1b"` (RFC 2579 OCTET STRING format) was not a valid format character; removed
-- Display hint `"t"` (UTF-8) format incorrectly cast each byte to `char` instead of decoding UTF-8; invalid sequences fall back to hex
+- Display hint `"t"` (UTF-8) format incorrectly cast each byte to `char` instead of decoding UTF-8; invalid sequences are now replaced with U+FFFD per RFC 2579
 - Inflated varbind count responses (more varbinds than requested) now return `MalformedResponse`; truncated responses warn and return partial results
 
 ### Removed
