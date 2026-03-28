@@ -187,8 +187,9 @@ impl Decoder {
     /// Read 64-bit unsigned integer value given the length.
     pub fn read_integer64_value(&mut self, len: usize) -> Result<u64> {
         if len == 0 {
-            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::ZeroLengthInteger }, "zero-length integer");
-            return Err(self.malformed());
+            // Net-snmp accepts zero-length Counter64 silently (loop runs 0 times, value is 0).
+            tracing::warn!(target: "async_snmp::ber", { snmp.offset = %self.offset }, "zero-length Counter64; interpreting as 0");
+            return Ok(0);
         }
         if len > 9 {
             // 9 bytes max: 1 leading zero + 8 bytes for u64
@@ -453,6 +454,15 @@ mod tests {
             dec.read_unsigned32(0x42).is_err(),
             "10-byte unsigned32 must be rejected"
         );
+    }
+
+    #[test]
+    fn test_zero_length_counter64_accepted() {
+        // Net-snmp accepts zero-length Counter64, producing 0. We match that.
+        let mut dec = Decoder::from_slice(&[0x46, 0x00]);
+        let result = dec.read_integer64(0x46);
+        assert!(result.is_ok(), "zero-length Counter64 should be accepted");
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]

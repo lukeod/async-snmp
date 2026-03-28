@@ -181,7 +181,7 @@ pub(crate) fn parse_ber_length(data: &[u8]) -> Option<(usize, usize)> {
 
     // Long form
     let num_octets = (first & 0x7F) as usize;
-    if num_octets == 0 || num_octets > 4 || data.len() < 1 + num_octets {
+    if num_octets == 0 || num_octets > 8 || data.len() < 1 + num_octets {
         return None;
     }
 
@@ -230,7 +230,8 @@ pub fn decode_length(
             return Err(Error::MalformedResponse { target }.boxed());
         }
 
-        if num_octets > 4 {
+        if num_octets > 8 {
+            // Net-snmp on 64-bit rejects > sizeof(long) = 8 length octets.
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %base_offset, kind = %DecodeErrorKind::LengthTooLong { octets: num_octets } }, "length encoding too long");
             return Err(Error::MalformedResponse { target }.boxed());
         }
@@ -390,6 +391,30 @@ mod tests {
         assert_eq!(unsigned64_content_len(127), 1);
         assert_eq!(unsigned64_content_len(128), 2); // needs padding
         assert_eq!(unsigned64_content_len(u64::MAX), 9); // needs padding
+    }
+
+    #[test]
+    fn test_long_form_5_to_8_byte_length_accepted() {
+        // Net-snmp on 64-bit allows up to sizeof(long)=8 length octets.
+        // Non-minimal 5-byte encoding of length 5.
+        let result = decode_length(&[0x85, 0x00, 0x00, 0x00, 0x00, 0x05], 0, None);
+        assert_eq!(result.unwrap(), (5, 6));
+
+        // 8-byte encoding of length 1.
+        let result = decode_length(
+            &[0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            0,
+            None,
+        );
+        assert_eq!(result.unwrap(), (1, 9));
+
+        // 9 bytes (> 8) must still be rejected.
+        let result = decode_length(
+            &[0x89, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            0,
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
