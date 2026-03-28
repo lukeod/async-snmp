@@ -903,6 +903,20 @@ mod tests {
     }
 
     #[test]
+    fn test_from_ber_zero_length() {
+        // A zero-length OID content (BER encoding 06 00) is accepted and returns
+        // an empty OID. This matches net-snmp's behavior in snmplib/asn1.c which
+        // treats the same encoding as 0.0 rather than rejecting it. Our empty OID
+        // differs from net-snmp's 0.0 - net-snmp encodes empty OIDs as [0x00]
+        // (a single zero byte yielding 0.0), while we produce truly zero arcs.
+        // Devices send this when returning endOfMibView with a malformed zero-length
+        // OID instead of echoing back the requested OID (RFC 3416 violation).
+        let result = Oid::from_ber(&[]);
+        assert!(result.is_ok(), "zero-length OID content should be accepted");
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
     fn test_oid_non_minimal_subidentifier() {
         // Non-minimal subidentifier encoding with leading 0x80 bytes should be accepted
         // 0x80 0x01 should decode as 1 (non-minimal: minimal would be just 0x01)
