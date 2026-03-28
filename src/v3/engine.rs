@@ -228,7 +228,9 @@ impl EngineState {
 /// # Example
 ///
 /// ```ignore
-/// let cache = EngineCache::new();
+/// use std::sync::Arc;
+///
+/// let cache = Arc::new(EngineCache::new());
 ///
 /// let client1 = Client::builder("192.168.1.1:161")
 ///     .username("admin")
