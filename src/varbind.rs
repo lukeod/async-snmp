@@ -201,6 +201,22 @@ mod tests {
         assert!(decoded.value.is_exception());
     }
 
+    #[test]
+    fn test_varbind_zero_length_oid_end_of_mib_view() {
+        // Some devices send endOfMibView with a zero-length OID instead of echoing
+        // back the requested OID (RFC 3416 violation). net-snmp accepts this by
+        // treating 06 00 as OID 0.0; we accept it by returning an empty OID.
+        // The bytes are: 30 04 06 00 82 00
+        //   30 04  - SEQUENCE length 4
+        //   06 00  - OID tag, zero-length content (malformed)
+        //   82 00  - endOfMibView, length 0
+        let bytes = bytes::Bytes::from_static(&[0x30, 0x04, 0x06, 0x00, 0x82, 0x00]);
+        let mut decoder = Decoder::new(bytes);
+        let vb = VarBind::decode(&mut decoder).unwrap();
+        assert!(vb.oid.is_empty());
+        assert_eq!(vb.value, Value::EndOfMibView);
+    }
+
     // ========================================================================
     // VarBind List Edge Cases
     // ========================================================================
