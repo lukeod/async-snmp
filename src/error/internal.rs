@@ -101,10 +101,6 @@ pub(crate) enum DecodeErrorKind {
     InsufficientData { needed: usize, available: usize },
     /// Invalid OID in notification varbinds.
     InvalidOid,
-    /// Negative error_index in PDU.
-    NegativeErrorIndex { value: i32 },
-    /// error_index exceeds number of varbinds.
-    ErrorIndexOutOfBounds { index: i32, varbind_count: usize },
     /// Negative non_repeaters in GETBULK PDU.
     NegativeNonRepeaters { value: i32 },
     /// Negative max_repetitions in GETBULK PDU.
@@ -184,19 +180,6 @@ impl std::fmt::Display for DecodeErrorKind {
                 write!(f, "need {} bytes but only {} remaining", needed, available)
             }
             Self::InvalidOid => write!(f, "invalid OID in notification varbinds"),
-            Self::NegativeErrorIndex { value } => {
-                write!(f, "negative error_index: {}", value)
-            }
-            Self::ErrorIndexOutOfBounds {
-                index,
-                varbind_count,
-            } => {
-                write!(
-                    f,
-                    "error_index {} exceeds varbind count {}",
-                    index, varbind_count
-                )
-            }
             Self::NegativeNonRepeaters { value } => {
                 write!(f, "negative non_repeaters: {}", value)
             }

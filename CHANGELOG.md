@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-03-28
+
+### Added
+
+- `GenericTrap` enum with `Unknown(i32)` variant for wire values outside the standard 0-6 range
+- `Display` impl for `GenericTrap`
+- `PartialEq`, `Eq` for `Pdu`
+- `ErrorStatus::as_str()` returning `Option<&'static str>`
+- USM stats counters (`usmStatsUnknownEngineIDs`, `usmStatsUnknownUserNames`, `usmStatsWrongDigests`, `usmStatsNotInTimeWindows`) on `AgentInner`; public accessors on `Agent`
+- `CommunityPdu` enum wrapping either a standard `Pdu` or `TrapV1Pdu` in community message decoding
+- Error kinds `IntegerTooLong`, `Unsigned32TooLong`, `Integer64MissingLeadingZero`
+- V3 outbound messages now use the negotiated `msgMaxSize` from engine discovery instead of a hardcoded value
+- Retry policy applied to V3 engine discovery; previously a single unreliable discovery probe caused all subsequent V3 operations to fail on packet loss
+- Discovery lock prevents redundant concurrent discovery attempts from multiple tasks racing on the same client
+
+### Changed
+
+- **Breaking:** `TrapV1Pdu.generic_trap` field type changed from `i32` to `GenericTrap`; `generic_trap_enum()` removed - use the field directly
+- **Breaking:** `Notification::trap_oid()` return type changed from `&Oid` to `Result<Oid>`; RFC 3584 OID conversion for TrapV1 enterprise-specific traps is fallible
+- **Breaking:** `MibHandler::undo_set` return type changed from `BoxFuture<'a, ()>` to `BoxFuture<'a, SetResult>`
+- **Breaking:** `set_many` now returns `Error::Config` when the varbind count exceeds the per-request OID limit; SET must be atomic per RFC 3416 and silent batching across PDUs violates that guarantee
+- **Breaking:** `UsmUserConfig` type alias removed; use `UsmConfig` directly
+- **Breaking:** `EngineCache::Clone` removed; share instances via `Arc<EngineCache>`
+- **Breaking:** `--level` flag removed from V3 CLI tools; security level is inferred from auth/priv configuration
+- `error_index` in response PDUs is no longer bounds-checked at parse time; negative values and values exceeding the varbind count are now accepted, matching net-snmp behavior
+- INTEGER values 5-8 bytes are now accepted and sign-extended to i32, matching net-snmp `CHECK_OVERFLOW_S`; values longer than 8 bytes are rejected
+- Unsigned32 values up to 9 bytes (with leading zero) are now truncated to u32, matching net-snmp `CHECK_OVERFLOW_U`
+- `Counter64` zero-length encoding now accepted with a warning instead of an error
+- Long-form BER length limited to 8 octets (was 4), matching net-snmp's `sizeof(long)` threshold on 64-bit
+- `PrivKey` clones now start with an independent salt counter instead of sharing the same atomic
+
+### Fixed
+
+- Salt counter race in `PrivKey::encrypt` could produce duplicate IVs under concurrent use; counter now uses `compare_exchange` and skips zero atomically
+- Bounds checks on USM auth parameter offset were missing; malformed messages could panic
+- Lock poison in V3 client and TCP transport caused panics; both now return `Error::Config`
+- TCP `active_guard` held a sync `Mutex` guard across `.await` points; replaced with `tokio::sync::Mutex`
+- SNMPv1 Trap PDUs (tag `0xA4`) were rejected instead of decoded through the community message path
+- V3 concurrent discovery race where multiple callers could all run discovery simultaneously; callers now wait on a lock and reuse the result
+- Unknown USM users for non-discovery `noAuthNoPriv` messages were not rejected per RFC 3414 Section 3.2; they now are
+- GETNEXT did not advance past VACM-denied OIDs per RFC 3413 read-class semantics
+- GETBULK did not apply VACM access checks; GETBULK also stopped at the first denied OID instead of continuing
+- `handles()` default impl matched OIDs below the registered prefix, causing incorrect GET/SET routing; now only matches OIDs within the subtree
+- SNMPv3 context names not forwarded from client config to scoped PDU
+- `Pdu::is_error` incorrectly matched non-response PDUs (e.g. GETBULK requests)
+- SNMPv1 `noSuchName` was not treated as normal walk termination
+- Multi-byte BER tags were incorrectly accepted; now rejected (only single-byte tags are valid for SNMP)
+- DES padding calculation was incorrect; simplified to `next_multiple_of(8)` matching the 3DES path
+- OctetString/Opaque BER length clamped to enclosing SEQUENCE boundary for devices that send inflated lengths (e.g. MikroTik)
+- IPv6 targets were not bracketed in display output
+- `UdpTransport` background receiver task was not cancelled when the last clone was dropped
+- Request ID counter seeded with time+PID; now uses `getrandom`
+- `Retry::default()` used zero delay; now 1s fixed delay
+- `GenericTrap::Unknown` displayed as `enterpriseSpecific`; now displays as `unknown`
+- `TimeTicks` verbose display used inconsistent format
+- Display hint `"1b"` (RFC 2579 OCTET STRING format) was not a valid format character; removed
+- Display hint `"t"` (UTF-8) format incorrectly cast each byte to `char` instead of decoding UTF-8; invalid sequences fall back to hex
+- Inflated varbind count responses (more varbinds than requested) now return `MalformedResponse`; truncated responses warn and return partial results
+
+### Removed
+
+- `TrapV1Pdu::generic_trap_enum()` - use the `generic_trap` field directly
+- `UsmUserConfig` type alias
+- `EngineCache::Clone`
+
 ## [0.10.0] - 2026-03-27
 
 ### Added
@@ -224,7 +289,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/async-snmp/async-snmp/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/async-snmp/async-snmp/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/async-snmp/async-snmp/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/async-snmp/async-snmp/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/async-snmp/async-snmp/compare/v0.6.0...v0.7.0

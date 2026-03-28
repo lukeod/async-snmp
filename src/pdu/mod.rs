@@ -167,29 +167,12 @@ impl Pdu {
         let error_index = pdu_decoder.read_integer()?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
 
-        // Validate error_index bounds per RFC 3416 Section 3.
-        // error_index is 1-based: 0 means no error, 1..=len points to specific varbind.
-        // Note: For GETBULK, error_status holds non_repeaters and error_index holds
-        // max_repetitions, so these validations don't apply.
-        if pdu_type != PduType::GetBulkRequest {
-            if error_index < 0 {
-                tracing::debug!(target: "async_snmp::pdu", { offset = pdu_decoder.offset(), error_index = error_index, kind = %DecodeErrorKind::NegativeErrorIndex { value: error_index } }, "decode error");
-                return Err(Error::MalformedResponse {
-                    target: UNKNOWN_TARGET,
-                }
-                .boxed());
-            }
-            if error_index > 0 && (error_index as usize) > varbinds.len() {
-                tracing::debug!(target: "async_snmp::pdu", { offset = pdu_decoder.offset(), error_index = error_index, varbind_count = varbinds.len(), kind = %DecodeErrorKind::ErrorIndexOutOfBounds {
-                        index: error_index,
-                        varbind_count: varbinds.len(),
-                    } }, "decode error");
-                return Err(Error::MalformedResponse {
-                    target: UNKNOWN_TARGET,
-                }
-                .boxed());
-            }
-        }
+        // error_index is not validated here. net-snmp performs no bounds checking
+        // on this field (validation code in snmp_client.c is wrapped in
+        // #ifdef TEMPORARILY_DISABLED). RFC 3416 Section 3 annotates it "sometimes
+        // ignored" and places no MUST/SHOULD obligation on receivers. Rejecting
+        // out-of-range values would break compatibility with buggy agents that
+        // work fine with net-snmp.
 
         Ok(Pdu {
             pdu_type,
@@ -891,39 +874,45 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_rejects_negative_error_index() {
-        // Response PDU with negative error_index (-1)
+    fn test_decode_accepts_negative_error_index() {
+        // net-snmp does not validate error_index at parse time; validation code
+        // that once existed in snmp_client.c is wrapped in #ifdef TEMPORARILY_DISABLED
+        // and is never compiled. Buggy agents that send negative error_index values
+        // are accepted by net-snmp and must be accepted here too, or users will
+        // report "works with net-snmp but not your library".
         let raw = RawPdu::response(1, 0, -1, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
         let mut decoder = Decoder::new(encoded);
         let result = Pdu::decode(&mut decoder);
 
-        assert!(result.is_err(), "should reject negative error_index");
-        let err = result.unwrap_err();
         assert!(
-            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got {:?}",
-            err
+            result.is_ok(),
+            "negative error_index must be accepted to match net-snmp behavior, got {:?}",
+            result.err()
         );
+        assert_eq!(result.unwrap().error_index, -1);
     }
 
     #[test]
-    fn test_decode_rejects_error_index_beyond_varbinds() {
-        // Response PDU with error_index=5 but only 1 varbind
+    fn test_decode_accepts_error_index_beyond_varbinds() {
+        // net-snmp does not bounds-check error_index against the varbind list length.
+        // RFC 3416 Section 3 defines error-index as INTEGER (0..max-bindings) and
+        // annotates it "sometimes ignored"; it places no MUST/SHOULD obligation on
+        // receivers to reject out-of-range values. Buggy agents that send an
+        // error_index larger than the varbind count are accepted by net-snmp.
         let raw = RawPdu::response(1, 5, 5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
         let mut decoder = Decoder::new(encoded);
         let result = Pdu::decode(&mut decoder);
 
-        assert!(result.is_err(), "should reject error_index beyond varbinds");
-        let err = result.unwrap_err();
         assert!(
-            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got {:?}",
-            err
+            result.is_ok(),
+            "error_index beyond varbind count must be accepted to match net-snmp behavior, got {:?}",
+            result.err()
         );
+        assert_eq!(result.unwrap().error_index, 5);
     }
 
     #[test]
