@@ -84,6 +84,7 @@ pub(crate) enum DecodeErrorKind {
     /// Expected plaintext, got encrypted.
     UnexpectedEncryption,
     /// Expected encrypted, got plaintext.
+    #[cfg(feature = "agent")]
     ExpectedEncryption,
     /// Invalid IP address length.
     InvalidIpAddressLength { length: usize },
@@ -161,6 +162,7 @@ impl std::fmt::Display for DecodeErrorKind {
             }
             Self::InvalidNull => write!(f, "NULL with non-zero length"),
             Self::UnexpectedEncryption => write!(f, "expected plaintext scoped PDU"),
+            #[cfg(feature = "agent")]
             Self::ExpectedEncryption => write!(f, "expected encrypted scoped PDU"),
             Self::InvalidIpAddressLength { length } => {
                 write!(f, "IP address must be 4 bytes, got {}", length)

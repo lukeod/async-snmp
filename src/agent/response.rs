@@ -199,7 +199,8 @@ impl Agent {
                 tracing::debug!(target: "async_snmp::agent", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in response");
                 Error::MalformedResponse { target: local_addr }.boxed()
             })?;
-        authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
+        authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len)
+            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
         Ok(response_bytes)
     }
 }

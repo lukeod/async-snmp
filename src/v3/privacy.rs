@@ -22,25 +22,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use super::crypto::CryptoProvider;
+use super::crypto::{CryptoError, CryptoProvider};
 use super::{AuthProtocol, PrivProtocol};
 
 /// Error type for privacy (encryption/decryption) operations.
 ///
 /// These errors indicate cryptographic failures. Callers should convert
 /// these to `Error::Auth` with appropriate target context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivacyError {
     /// Invalid privParameters length (expected 8 bytes).
     InvalidPrivParamsLength { expected: usize, actual: usize },
     /// Ciphertext length not a multiple of block size.
     InvalidCiphertextLength { length: usize, block_size: usize },
-    /// Invalid key length for cipher.
-    InvalidKeyLength,
-    /// Cipher operation failed.
-    CipherError,
-    /// Unsupported privacy protocol.
-    UnsupportedProtocol,
+    /// Cryptographic provider error (unsupported algorithm, invalid key, cipher failure).
+    Crypto(CryptoError),
+}
+
+impl From<CryptoError> for PrivacyError {
+    fn from(e: CryptoError) -> Self {
+        Self::Crypto(e)
+    }
 }
 
 impl std::fmt::Display for PrivacyError {
@@ -60,14 +62,19 @@ impl std::fmt::Display for PrivacyError {
                     length, block_size
                 )
             }
-            Self::InvalidKeyLength => write!(f, "invalid key length"),
-            Self::CipherError => write!(f, "cipher operation failed"),
-            Self::UnsupportedProtocol => write!(f, "unsupported privacy protocol"),
+            Self::Crypto(e) => write!(f, "{}", e),
         }
     }
 }
 
-impl std::error::Error for PrivacyError {}
+impl std::error::Error for PrivacyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Crypto(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// Result type for privacy operations.
 pub type PrivacyResult<T> = std::result::Result<T, PrivacyError>;
@@ -191,17 +198,17 @@ impl PrivKey {
     ///     PrivProtocol::Aes256,
     ///     b"password",
     ///     &engine_id,
-    /// );
+    /// ).unwrap();
     /// ```
     pub fn from_password(
         auth_protocol: AuthProtocol,
         priv_protocol: PrivProtocol,
         password: &[u8],
         engine_id: &[u8],
-    ) -> Self {
+    ) -> super::crypto::CryptoResult<Self> {
         use super::MasterKey;
 
-        let master = MasterKey::from_password(auth_protocol, password);
+        let master = MasterKey::from_password(auth_protocol, password)?;
         Self::from_master_key(&master, priv_protocol, engine_id)
     }
 
@@ -219,18 +226,18 @@ impl PrivKey {
     /// ```rust
     /// use async_snmp::{AuthProtocol, MasterKey, PrivProtocol, v3::PrivKey};
     ///
-    /// let master = MasterKey::from_password(AuthProtocol::Sha1, b"password");
+    /// let master = MasterKey::from_password(AuthProtocol::Sha1, b"password").unwrap();
     /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
     ///
     /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
     /// // Blumenthal extension is automatically applied.
-    /// let priv_key = PrivKey::from_master_key(&master, PrivProtocol::Aes256, &engine_id);
+    /// let priv_key = PrivKey::from_master_key(&master, PrivProtocol::Aes256, &engine_id).unwrap();
     /// ```
     pub fn from_master_key(
         master: &super::MasterKey,
         priv_protocol: PrivProtocol,
         engine_id: &[u8],
-    ) -> Self {
+    ) -> super::crypto::CryptoResult<Self> {
         use super::{
             KeyExtension,
             auth::{extend_key, extend_key_reeder},
@@ -240,24 +247,24 @@ impl PrivKey {
         let key_extension = priv_protocol.key_extension_for(auth_protocol);
 
         // Localize the master key (per RFC 3826 Section 1.2)
-        let localized = master.localize(engine_id);
+        let localized = master.localize(engine_id)?;
         let key_bytes = localized.as_bytes();
 
         let key = match key_extension {
             KeyExtension::None => key_bytes.to_vec(),
             KeyExtension::Blumenthal => {
-                extend_key(auth_protocol, key_bytes, priv_protocol.key_len())
+                extend_key(auth_protocol, key_bytes, priv_protocol.key_len())?
             }
             KeyExtension::Reeder => {
-                extend_key_reeder(auth_protocol, key_bytes, engine_id, priv_protocol.key_len())
+                extend_key_reeder(auth_protocol, key_bytes, engine_id, priv_protocol.key_len())?
             }
         };
 
-        Self {
+        Ok(Self {
             key,
             protocol: priv_protocol,
             salt_counter: Self::init_salt(),
-        }
+        })
     }
 
     /// Create a privacy key from raw localized key bytes.
@@ -804,7 +811,8 @@ mod tests {
             PrivProtocol::Aes128,
             password,
             &engine_id,
-        );
+        )
+        .unwrap();
 
         // Just verify we can encrypt/decrypt with the derived key
         let plaintext = b"test message";
@@ -892,7 +900,8 @@ mod tests {
             PrivProtocol::Aes192,
             password,
             &engine_id,
-        );
+        )
+        .unwrap();
 
         let plaintext = b"test message for AES-192";
         let (ciphertext, priv_params) = priv_key.encrypt(plaintext, 100, 200, None).unwrap();
@@ -914,7 +923,8 @@ mod tests {
             PrivProtocol::Aes256,
             password,
             &engine_id,
-        );
+        )
+        .unwrap();
 
         let plaintext = b"test message for AES-256";
         let (ciphertext, priv_params) = priv_key.encrypt(plaintext, 100, 200, None).unwrap();

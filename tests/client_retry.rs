@@ -1,3 +1,4 @@
+#![cfg(feature = "agent")]
 //! Retry and timeout behavior tests.
 
 mod common;

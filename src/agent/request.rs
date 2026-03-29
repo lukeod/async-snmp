@@ -123,7 +123,10 @@ impl Agent {
 
         // Look up user credentials
         let user_config = self.inner.usm_users.get(&usm_params.username);
-        let derived_keys = user_config.map(|u| u.derive_keys(&self.inner.engine_id));
+        let derived_keys = user_config
+            .map(|u| u.derive_keys(&self.inner.engine_id))
+            .transpose()
+            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
         // RFC 3414 section 3.2 step 1: for non-discovery messages (non-empty username),
         // the user MUST exist in the local user database regardless of security level.
@@ -155,7 +158,9 @@ impl Agent {
                             Error::Auth { target: source }.boxed()
                         })?;
 
-                    if !verify_message(auth_key, &data, auth_offset, auth_len) {
+                    if !verify_message(auth_key, &data, auth_offset, auth_len)
+                        .map_err(|_| Error::Auth { target: source }.boxed())?
+                    {
                         tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "authentication failed");
                         let count =
                             self.inner.usm_wrong_digests.fetch_add(1, Ordering::Relaxed) + 1;

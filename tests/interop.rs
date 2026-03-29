@@ -164,9 +164,11 @@ const PRIV_PASS: &str = "privpass123";
 
 mod users {
     pub const NOAUTH_USER: &str = "noauth_user";
+    #[cfg(feature = "crypto-rustcrypto")]
     pub const AUTHMD5_USER: &str = "authmd5_user";
     pub const AUTHSHA1_USER: &str = "authsha1_user";
     pub const AUTHSHA256_USER: &str = "authsha256_user";
+    #[cfg(feature = "crypto-rustcrypto")]
     pub const PRIVDES_USER: &str = "privdes_user";
     pub const PRIVAES128_USER: &str = "privaes128_user";
 }
@@ -373,6 +375,7 @@ async fn v3_auth_priv() {
 // V3 Auth Protocol Tests
 // ============================================================================
 
+#[cfg(feature = "crypto-rustcrypto")]
 #[tokio::test]
 async fn v3_auth_md5() {
     require_container_runtime!();
@@ -437,6 +440,7 @@ async fn v3_auth_sha256() {
 // V3 Priv Protocol Tests
 // ============================================================================
 
+#[cfg(feature = "crypto-rustcrypto")]
 #[tokio::test]
 async fn v3_priv_des() {
     require_container_runtime!();

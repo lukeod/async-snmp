@@ -21,7 +21,7 @@ cargo fmt
 Check for lint issues:
 
 ```bash
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
 ```
 
 ### Testing
@@ -29,7 +29,7 @@ cargo clippy --all-targets --all-features
 Run the full test suite:
 
 ```bash
-cargo test --all-features
+cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
 ```
 
 Container integration tests require Docker:
@@ -44,7 +44,7 @@ cargo test --test testcontainers
 Build and preview documentation:
 
 ```bash
-cargo doc --all-features --open
+cargo doc --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --open
 ```
 
 ## Pull Requests

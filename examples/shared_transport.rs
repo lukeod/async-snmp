@@ -111,8 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pre-compute master keys once (expensive: ~850us for SHA-256).
     // These can be reused across all clients with the same credentials.
-    let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")
-        .with_privacy(PrivProtocol::Aes192, b"privpass123");
+    let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")?
+        .with_privacy(PrivProtocol::Aes192, b"privpass123")?;
 
     println!("Master keys derived (one-time cost)");
     println!("Engine cache created for sharing\n");

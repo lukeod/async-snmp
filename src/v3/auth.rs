@@ -23,17 +23,17 @@
 //! use async_snmp::{AuthProtocol, MasterKey};
 //!
 //! // Expensive: ~850μs - do once per password
-//! let master = MasterKey::from_password(AuthProtocol::Sha256, b"authpassword");
+//! let master = MasterKey::from_password(AuthProtocol::Sha256, b"authpassword").unwrap();
 //!
 //! // Cheap: ~1μs each - do per engine
-//! let key1 = master.localize(b"\x80\x00\x1f\x88\x80...");
-//! let key2 = master.localize(b"\x80\x00\x1f\x88\x81...");
+//! let key1 = master.localize(b"\x80\x00\x1f\x88\x80...").unwrap();
+//! let key2 = master.localize(b"\x80\x00\x1f\x88\x81...").unwrap();
 //! ```
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::AuthProtocol;
-use super::crypto::CryptoProvider;
+use super::crypto::{CryptoProvider, CryptoResult};
 
 /// Minimum password length recommended by net-snmp.
 ///
@@ -70,14 +70,14 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// use async_snmp::{AuthProtocol, MasterKey};
 ///
 /// // Derive master key once (expensive)
-/// let master = MasterKey::from_password(AuthProtocol::Sha256, b"authpassword");
+/// let master = MasterKey::from_password(AuthProtocol::Sha256, b"authpassword").unwrap();
 ///
 /// // Localize to different engines (cheap)
 /// let engine1_id = b"\x80\x00\x1f\x88\x80\xe9\xb1\x04\x61\x73\x61\x00\x00\x00";
 /// let engine2_id = b"\x80\x00\x1f\x88\x80\xe9\xb1\x04\x61\x73\x61\x00\x00\x01";
 ///
-/// let key1 = master.localize(engine1_id);
-/// let key2 = master.localize(engine2_id);
+/// let key1 = master.localize(engine1_id).unwrap();
+/// let key2 = master.localize(engine2_id).unwrap();
 /// ```
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MasterKey {
@@ -93,21 +93,31 @@ impl MasterKey {
     /// repetition, then hash the result. This is computationally expensive
     /// (~850μs for SHA-256) but only needs to be done once per password.
     ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+    /// backend does not support the requested authentication protocol.
+    ///
     /// # Empty and Short Passwords
     ///
     /// Empty passwords result in an all-zero key. A warning is logged when
     /// the password is shorter than [`MIN_PASSWORD_LENGTH`] (8 characters).
-    pub fn from_password(protocol: AuthProtocol, password: &[u8]) -> Self {
+    pub fn from_password(protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Self> {
         if password.len() < MIN_PASSWORD_LENGTH {
             tracing::warn!(target: "async_snmp::v3", { password_len = password.len(), min_len = MIN_PASSWORD_LENGTH }, "SNMPv3 password is shorter than recommended minimum; \
                  net-snmp rejects passwords shorter than 8 characters");
         }
-        let key = password_to_key(protocol, password);
-        Self { key, protocol }
+        let key = password_to_key(protocol, password)?;
+        Ok(Self { key, protocol })
     }
 
     /// Derive a master key from a string password.
-    pub fn from_str_password(protocol: AuthProtocol, password: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+    /// backend does not support the requested authentication protocol.
+    pub fn from_str_password(protocol: AuthProtocol, password: &str) -> CryptoResult<Self> {
         Self::from_password(protocol, password.as_bytes())
     }
 
@@ -128,12 +138,17 @@ impl MasterKey {
     /// `localized_key = H(master_key || engine_id || master_key)`
     ///
     /// This operation is cheap (~1μs) compared to master key derivation.
-    pub fn localize(&self, engine_id: &[u8]) -> LocalizedKey {
-        let localized = localize_key(self.protocol, &self.key, engine_id);
-        LocalizedKey {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+    /// backend does not support the key's authentication protocol.
+    pub fn localize(&self, engine_id: &[u8]) -> CryptoResult<LocalizedKey> {
+        let localized = localize_key(self.protocol, &self.key, engine_id)?;
+        Ok(LocalizedKey {
             key: localized,
             protocol: self.protocol,
-        }
+        })
     }
 
     /// Get the protocol this key is for.
@@ -202,15 +217,23 @@ impl LocalizedKey {
     /// While empty/short passwords are accepted for flexibility, they provide
     /// minimal security. A warning is logged at the `WARN` level when the
     /// password is shorter than [`MIN_PASSWORD_LENGTH`] (8 characters).
-    pub fn from_password(protocol: AuthProtocol, password: &[u8], engine_id: &[u8]) -> Self {
-        MasterKey::from_password(protocol, password).localize(engine_id)
+    pub fn from_password(
+        protocol: AuthProtocol,
+        password: &[u8],
+        engine_id: &[u8],
+    ) -> CryptoResult<Self> {
+        MasterKey::from_password(protocol, password)?.localize(engine_id)
     }
 
     /// Derive a localized key from a string password and engine ID.
     ///
     /// This is a convenience method that converts the string to bytes and calls
     /// [`from_password`](Self::from_password).
-    pub fn from_str_password(protocol: AuthProtocol, password: &str, engine_id: &[u8]) -> Self {
+    pub fn from_str_password(
+        protocol: AuthProtocol,
+        password: &str,
+        engine_id: &[u8],
+    ) -> CryptoResult<Self> {
         Self::from_password(protocol, password.as_bytes(), engine_id)
     }
 
@@ -218,7 +241,7 @@ impl LocalizedKey {
     ///
     /// This is the efficient path when you have a cached [`MasterKey`].
     /// Equivalent to calling [`MasterKey::localize`].
-    pub fn from_master_key(master: &MasterKey, engine_id: &[u8]) -> Self {
+    pub fn from_master_key(master: &MasterKey, engine_id: &[u8]) -> CryptoResult<Self> {
         master.localize(engine_id)
     }
 
@@ -251,24 +274,34 @@ impl LocalizedKey {
     ///
     /// The returned MAC is truncated to the appropriate length for the protocol
     /// (12 bytes for MD5/SHA-1, variable for SHA-2).
-    pub fn compute_hmac(&self, data: &[u8]) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+    /// backend does not support the key's authentication protocol.
+    pub fn compute_hmac(&self, data: &[u8]) -> CryptoResult<Vec<u8>> {
         compute_hmac(self.protocol, &self.key, data)
     }
 
     /// Verify an HMAC.
     ///
     /// Returns `true` if the MAC matches, `false` otherwise.
-    pub fn verify_hmac(&self, data: &[u8], expected: &[u8]) -> bool {
-        let computed = self.compute_hmac(data);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+    /// backend does not support the key's authentication protocol.
+    pub fn verify_hmac(&self, data: &[u8], expected: &[u8]) -> CryptoResult<bool> {
+        let computed = self.compute_hmac(data)?;
         // Constant-time comparison
         if computed.len() != expected.len() {
-            return false;
+            return Ok(false);
         }
         let mut result = 0u8;
         for (a, b) in computed.iter().zip(expected.iter()) {
             result |= a ^ b;
         }
-        result == 0
+        Ok(result == 0)
     }
 }
 
@@ -290,28 +323,36 @@ impl AsRef<[u8]> for LocalizedKey {
 /// Password to key transformation (RFC 3414 Section A.2.1).
 ///
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
-fn password_to_key(protocol: AuthProtocol, password: &[u8]) -> Vec<u8> {
+fn password_to_key(protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Vec<u8>> {
     super::crypto::provider().password_to_key(protocol, password)
 }
 
 /// Key localization (RFC 3414 Section A.2.2).
 ///
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
-fn localize_key(protocol: AuthProtocol, master_key: &[u8], engine_id: &[u8]) -> Vec<u8> {
+fn localize_key(
+    protocol: AuthProtocol,
+    master_key: &[u8],
+    engine_id: &[u8],
+) -> CryptoResult<Vec<u8>> {
     super::crypto::provider().localize_key(protocol, master_key, engine_id)
 }
 
 /// Compute HMAC with the appropriate algorithm.
 ///
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
-fn compute_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> Vec<u8> {
+fn compute_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> CryptoResult<Vec<u8>> {
     super::crypto::provider().compute_hmac(protocol, key, &[data], protocol.mac_len())
 }
 
 /// HMAC computation over multiple data slices (avoids concatenation allocation).
 ///
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
-fn compute_hmac_slices(protocol: AuthProtocol, key: &[u8], slices: &[&[u8]]) -> Vec<u8> {
+fn compute_hmac_slices(
+    protocol: AuthProtocol,
+    key: &[u8],
+    slices: &[&[u8]],
+) -> CryptoResult<Vec<u8>> {
     super::crypto::provider().compute_hmac(protocol, key, slices, protocol.mac_len())
 }
 
@@ -320,36 +361,47 @@ fn compute_hmac_slices(protocol: AuthProtocol, key: &[u8], slices: &[&[u8]]) -> 
 /// The message must already have placeholder zeros in the auth params field.
 /// This function computes the HMAC over the entire message (with zeros in place)
 /// and returns the message with the actual HMAC inserted.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+/// backend does not support the key's authentication protocol.
 pub fn authenticate_message(
     key: &LocalizedKey,
     message: &mut [u8],
     auth_offset: usize,
     auth_len: usize,
-) {
+) -> CryptoResult<()> {
     let end = match auth_offset.checked_add(auth_len) {
         Some(e) if e <= message.len() => e,
-        _ => return,
+        _ => return Ok(()),
     };
 
     // Compute HMAC over the message with zeros in auth params position
-    let mac = key.compute_hmac(message);
+    let mac = key.compute_hmac(message)?;
 
     // Replace zeros with actual MAC
     message[auth_offset..end].copy_from_slice(&mac);
+    Ok(())
 }
 
 /// Verify the authentication of an incoming message.
 ///
 /// Returns `true` if the MAC is valid, `false` otherwise.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+/// backend does not support the key's authentication protocol.
 pub fn verify_message(
     key: &LocalizedKey,
     message: &[u8],
     auth_offset: usize,
     auth_len: usize,
-) -> bool {
+) -> CryptoResult<bool> {
     let end = match auth_offset.checked_add(auth_len) {
         Some(e) if e <= message.len() => e,
-        _ => return false,
+        _ => return Ok(false),
     };
 
     // Extract the received MAC
@@ -363,17 +415,17 @@ pub fn verify_message(
         key.protocol,
         key.as_bytes(),
         &[&message[..auth_offset], &zeros[..auth_len], &message[end..]],
-    );
+    )?;
 
     // Constant-time comparison
     if computed.len() != received_mac.len() {
-        return false;
+        return Ok(false);
     }
     let mut result = 0u8;
     for (a, b) in computed.iter().zip(received_mac.iter()) {
         result |= a ^ b;
     }
-    result == 0
+    Ok(result == 0)
 }
 
 /// Pre-computed master keys for SNMPv3 authentication and privacy.
@@ -389,8 +441,8 @@ pub fn verify_message(
 /// use async_snmp::{AuthProtocol, PrivProtocol, MasterKeys};
 ///
 /// // Create master keys once (expensive)
-/// let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
-///     .with_privacy(PrivProtocol::Aes128, b"privpassword");
+/// let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
+///     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 ///
 /// // Use with multiple clients - localization is cheap (~1μs per engine)
 /// ```
@@ -408,19 +460,24 @@ pub struct MasterKeys {
 impl MasterKeys {
     /// Create master keys with just authentication.
     ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+    /// backend does not support the requested authentication protocol.
+    ///
     /// # Example
     ///
     /// ```rust
     /// use async_snmp::{AuthProtocol, MasterKeys};
     ///
-    /// let keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword");
+    /// let keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap();
     /// ```
-    pub fn new(auth_protocol: AuthProtocol, auth_password: &[u8]) -> Self {
-        Self {
-            auth_master: MasterKey::from_password(auth_protocol, auth_password),
+    pub fn new(auth_protocol: AuthProtocol, auth_password: &[u8]) -> CryptoResult<Self> {
+        Ok(Self {
+            auth_master: MasterKey::from_password(auth_protocol, auth_password)?,
             priv_protocol: None,
             priv_master: None,
-        }
+        })
     }
 
     /// Add privacy with the same password as authentication.
@@ -437,18 +494,24 @@ impl MasterKeys {
     ///
     /// Use this when auth and priv passwords differ. A separate master key
     /// derivation is performed for the privacy password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
+    /// backend does not support the authentication protocol used for key
+    /// derivation.
     pub fn with_privacy(
         mut self,
         priv_protocol: super::PrivProtocol,
         priv_password: &[u8],
-    ) -> Self {
+    ) -> CryptoResult<Self> {
         self.priv_protocol = Some(priv_protocol);
         // Use the auth protocol for priv key derivation (per RFC 3826 Section 1.2)
         self.priv_master = Some(MasterKey::from_password(
             self.auth_master.protocol(),
             priv_password,
-        ));
-        self
+        )?);
+        Ok(self)
     }
 
     /// Get the authentication master key.
@@ -494,24 +557,30 @@ impl MasterKeys {
     /// ```rust
     /// use async_snmp::{AuthProtocol, MasterKeys, PrivProtocol};
     ///
-    /// let keys = MasterKeys::new(AuthProtocol::Sha1, b"authpassword")
+    /// let keys = MasterKeys::new(AuthProtocol::Sha1, b"authpassword").unwrap()
     ///     .with_privacy_same_password(PrivProtocol::Aes256);
     ///
     /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
     ///
     /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
     /// // Blumenthal extension is automatically applied.
-    /// let (auth, priv_key) = keys.localize(&engine_id);
+    /// let (auth, priv_key) = keys.localize(&engine_id).unwrap();
     /// ```
-    pub fn localize(&self, engine_id: &[u8]) -> (LocalizedKey, Option<crate::v3::PrivKey>) {
-        let auth_key = self.auth_master.localize(engine_id);
+    pub fn localize(
+        &self,
+        engine_id: &[u8],
+    ) -> CryptoResult<(LocalizedKey, Option<crate::v3::PrivKey>)> {
+        let auth_key = self.auth_master.localize(engine_id)?;
 
-        let priv_key = self.priv_protocol.map(|priv_protocol| {
-            let master = self.priv_master.as_ref().unwrap_or(&self.auth_master);
-            crate::v3::PrivKey::from_master_key(master, priv_protocol, engine_id)
-        });
+        let priv_key = self
+            .priv_protocol
+            .map(|priv_protocol| {
+                let master = self.priv_master.as_ref().unwrap_or(&self.auth_master);
+                crate::v3::PrivKey::from_master_key(master, priv_protocol, engine_id)
+            })
+            .transpose()?;
 
-        (auth_key, priv_key)
+        Ok((auth_key, priv_key))
     }
 }
 
@@ -537,10 +606,14 @@ impl std::fmt::Debug for MasterKeys {
 /// ```
 ///
 /// Where H() is the hash function of the authentication protocol.
-pub(crate) fn extend_key(protocol: AuthProtocol, key: &[u8], target_len: usize) -> Vec<u8> {
+pub(crate) fn extend_key(
+    protocol: AuthProtocol,
+    key: &[u8],
+    target_len: usize,
+) -> CryptoResult<Vec<u8>> {
     // If we already have enough bytes, just truncate
     if key.len() >= target_len {
-        return key[..target_len].to_vec();
+        return Ok(key[..target_len].to_vec());
     }
 
     let provider = super::crypto::provider();
@@ -548,13 +621,13 @@ pub(crate) fn extend_key(protocol: AuthProtocol, key: &[u8], target_len: usize) 
 
     // Keep appending H(result) until we have enough bytes
     while result.len() < target_len {
-        let hash = provider.hash(protocol, &result);
+        let hash = provider.hash(protocol, &result)?;
         result.extend_from_slice(&hash);
     }
 
     // Truncate to exact length
     result.truncate(target_len);
-    result
+    Ok(result)
 }
 
 /// Extend a localized key using the Reeder key extension algorithm.
@@ -581,10 +654,10 @@ pub(crate) fn extend_key_reeder(
     key: &[u8],
     engine_id: &[u8],
     target_len: usize,
-) -> Vec<u8> {
+) -> CryptoResult<Vec<u8>> {
     // If we already have enough bytes, just truncate
     if key.len() >= target_len {
-        return key[..target_len].to_vec();
+        return Ok(key[..target_len].to_vec());
     }
 
     let mut result = key.to_vec();
@@ -594,10 +667,10 @@ pub(crate) fn extend_key_reeder(
     while result.len() < target_len {
         // Run full password-to-key using current Kul as the "passphrase"
         // This is the expensive 1MB expansion step
-        let ku = password_to_key(protocol, &current_kul);
+        let ku = password_to_key(protocol, &current_kul)?;
 
         // Localize the new Ku to get Kul
-        let new_kul = localize_key(protocol, &ku, engine_id);
+        let new_kul = localize_key(protocol, &ku, engine_id)?;
 
         // Append as many bytes as we need (or all of them)
         let bytes_needed = target_len - result.len();
@@ -608,7 +681,7 @@ pub(crate) fn extend_key_reeder(
         current_kul = new_kul;
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -623,7 +696,7 @@ mod tests {
         // Password: "maplesyrup"
         // Expected Ku (hex): 9faf 3283 884e 9283 4ebc 9847 d8ed d963
         let password = b"maplesyrup";
-        let key = password_to_key(AuthProtocol::Md5, password);
+        let key = password_to_key(AuthProtocol::Md5, password).unwrap();
 
         assert_eq!(key.len(), 16);
         assert_eq!(encode_hex(&key), "9faf3283884e92834ebc9847d8edd963");
@@ -635,7 +708,7 @@ mod tests {
         // Password: "maplesyrup"
         // Expected Ku (hex): 9fb5 cc03 8149 7b37 9352 8939 ff78 8d5d 7914 5211
         let password = b"maplesyrup";
-        let key = password_to_key(AuthProtocol::Sha1, password);
+        let key = password_to_key(AuthProtocol::Sha1, password).unwrap();
 
         assert_eq!(key.len(), 20);
         assert_eq!(encode_hex(&key), "9fb5cc0381497b3793528939ff788d5d79145211");
@@ -651,7 +724,7 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let key = LocalizedKey::from_password(AuthProtocol::Md5, password, &engine_id);
+        let key = LocalizedKey::from_password(AuthProtocol::Md5, password, &engine_id).unwrap();
 
         assert_eq!(key.as_bytes().len(), 16);
         assert_eq!(
@@ -668,7 +741,7 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let key = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+        let key = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id).unwrap();
 
         assert_eq!(key.as_bytes().len(), 20);
         assert_eq!(
@@ -689,24 +762,24 @@ mod tests {
         );
 
         let data = b"test message";
-        let mac = key.compute_hmac(data);
+        let mac = key.compute_hmac(data).unwrap();
 
         // HMAC-MD5-96: 12 bytes
         assert_eq!(mac.len(), 12);
 
         // Verify returns true for correct MAC
-        assert!(key.verify_hmac(data, &mac));
+        assert!(key.verify_hmac(data, &mac).unwrap());
 
         // Verify returns false for wrong MAC
         let mut wrong_mac = mac.clone();
         wrong_mac[0] ^= 0xFF;
-        assert!(!key.verify_hmac(data, &wrong_mac));
+        assert!(!key.verify_hmac(data, &wrong_mac).unwrap());
     }
 
     #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_empty_password() {
-        let key = password_to_key(AuthProtocol::Md5, b"");
+        let key = password_to_key(AuthProtocol::Md5, b"").unwrap();
         assert_eq!(key.len(), 16);
         assert!(key.iter().all(|&b| b == 0));
     }
@@ -717,9 +790,9 @@ mod tests {
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
         let key_from_bytes =
-            LocalizedKey::from_password(AuthProtocol::Sha1, b"maplesyrup", &engine_id);
+            LocalizedKey::from_password(AuthProtocol::Sha1, b"maplesyrup", &engine_id).unwrap();
         let key_from_str =
-            LocalizedKey::from_str_password(AuthProtocol::Sha1, "maplesyrup", &engine_id);
+            LocalizedKey::from_str_password(AuthProtocol::Sha1, "maplesyrup", &engine_id).unwrap();
 
         assert_eq!(key_from_bytes.as_bytes(), key_from_str.as_bytes());
         assert_eq!(key_from_bytes.protocol(), key_from_str.protocol());
@@ -732,9 +805,10 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let master = MasterKey::from_password(AuthProtocol::Md5, password);
-        let localized_via_master = master.localize(&engine_id);
-        let localized_direct = LocalizedKey::from_password(AuthProtocol::Md5, password, &engine_id);
+        let master = MasterKey::from_password(AuthProtocol::Md5, password).unwrap();
+        let localized_via_master = master.localize(&engine_id).unwrap();
+        let localized_direct =
+            LocalizedKey::from_password(AuthProtocol::Md5, password, &engine_id).unwrap();
 
         assert_eq!(localized_via_master.as_bytes(), localized_direct.as_bytes());
         assert_eq!(localized_via_master.protocol(), localized_direct.protocol());
@@ -751,10 +825,10 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let master = MasterKey::from_password(AuthProtocol::Sha1, password);
-        let localized_via_master = master.localize(&engine_id);
+        let master = MasterKey::from_password(AuthProtocol::Sha1, password).unwrap();
+        let localized_via_master = master.localize(&engine_id).unwrap();
         let localized_direct =
-            LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+            LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id).unwrap();
 
         assert_eq!(localized_via_master.as_bytes(), localized_direct.as_bytes());
 
@@ -772,17 +846,19 @@ mod tests {
         let engine_id_1 = decode_hex("000000000000000000000001").unwrap();
         let engine_id_2 = decode_hex("000000000000000000000002").unwrap();
 
-        let master = MasterKey::from_password(AuthProtocol::Sha256, password);
+        let master = MasterKey::from_password(AuthProtocol::Sha256, password).unwrap();
 
-        let key1 = master.localize(&engine_id_1);
-        let key2 = master.localize(&engine_id_2);
+        let key1 = master.localize(&engine_id_1).unwrap();
+        let key2 = master.localize(&engine_id_2).unwrap();
 
         // Keys should be different for different engines
         assert_ne!(key1.as_bytes(), key2.as_bytes());
 
         // Each key should match what from_password produces
-        let direct1 = LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id_1);
-        let direct2 = LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id_2);
+        let direct1 =
+            LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id_1).unwrap();
+        let direct2 =
+            LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id_2).unwrap();
 
         assert_eq!(key1.as_bytes(), direct1.as_bytes());
         assert_eq!(key2.as_bytes(), direct2.as_bytes());
@@ -793,9 +869,9 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let master = MasterKey::from_password(AuthProtocol::Sha256, password);
-        let key_via_localize = master.localize(&engine_id);
-        let key_via_from_master = LocalizedKey::from_master_key(&master, &engine_id);
+        let master = MasterKey::from_password(AuthProtocol::Sha256, password).unwrap();
+        let key_via_localize = master.localize(&engine_id).unwrap();
+        let key_via_from_master = LocalizedKey::from_master_key(&master, &engine_id).unwrap();
 
         assert_eq!(key_via_localize.as_bytes(), key_via_from_master.as_bytes());
     }
@@ -803,13 +879,13 @@ mod tests {
     #[test]
     fn test_master_keys_auth_only() {
         let engine_id = decode_hex("000000000000000000000002").unwrap();
-        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword");
+        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap();
 
         assert_eq!(master_keys.auth_protocol(), AuthProtocol::Sha256);
         assert!(master_keys.priv_protocol().is_none());
         assert!(master_keys.priv_master().is_none());
 
-        let (auth_key, priv_key) = master_keys.localize(&engine_id);
+        let (auth_key, priv_key) = master_keys.localize(&engine_id).unwrap();
         assert!(priv_key.is_none());
         assert_eq!(auth_key.protocol(), AuthProtocol::Sha256);
     }
@@ -820,12 +896,13 @@ mod tests {
 
         let engine_id = decode_hex("000000000000000000000002").unwrap();
         let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"sharedpassword")
+            .unwrap()
             .with_privacy_same_password(PrivProtocol::Aes128);
 
         assert_eq!(master_keys.auth_protocol(), AuthProtocol::Sha256);
         assert_eq!(master_keys.priv_protocol(), Some(PrivProtocol::Aes128));
 
-        let (auth_key, priv_key) = master_keys.localize(&engine_id);
+        let (auth_key, priv_key) = master_keys.localize(&engine_id).unwrap();
         assert!(priv_key.is_some());
         assert_eq!(auth_key.protocol(), AuthProtocol::Sha256);
     }
@@ -836,15 +913,18 @@ mod tests {
 
         let engine_id = decode_hex("000000000000000000000002").unwrap();
         let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
-            .with_privacy(PrivProtocol::Aes128, b"privpassword");
+            .unwrap()
+            .with_privacy(PrivProtocol::Aes128, b"privpassword")
+            .unwrap();
 
-        let (_auth_key, priv_key) = master_keys.localize(&engine_id);
+        let (_auth_key, priv_key) = master_keys.localize(&engine_id).unwrap();
         assert!(priv_key.is_some());
 
         // Verify that different passwords produce different keys
         let same_password_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
+            .unwrap()
             .with_privacy_same_password(PrivProtocol::Aes128);
-        let (_, priv_key_same) = same_password_keys.localize(&engine_id);
+        let (_, priv_key_same) = same_password_keys.localize(&engine_id).unwrap();
 
         // The priv keys should differ when using different passwords
         // (auth keys are the same since they use same auth password)
@@ -870,14 +950,14 @@ mod tests {
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
         // Get the standard localized key (K1)
-        let k1 = LocalizedKey::from_password(AuthProtocol::Md5, password, &engine_id);
+        let k1 = LocalizedKey::from_password(AuthProtocol::Md5, password, &engine_id).unwrap();
         assert_eq!(
             encode_hex(k1.as_bytes()),
             "526f5eed9fcce26f8964c2930787d82b"
         );
 
         // Extend using Reeder algorithm to 32 bytes
-        let extended = extend_key_reeder(AuthProtocol::Md5, k1.as_bytes(), &engine_id, 32);
+        let extended = extend_key_reeder(AuthProtocol::Md5, k1.as_bytes(), &engine_id, 32).unwrap();
         assert_eq!(extended.len(), 32);
         assert_eq!(
             encode_hex(&extended),
@@ -897,14 +977,15 @@ mod tests {
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
         // Get the standard localized key (K1)
-        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id).unwrap();
         assert_eq!(
             encode_hex(k1.as_bytes()),
             "6695febc9288e36282235fc7151f128497b38f3f"
         );
 
         // Extend using Reeder algorithm to 40 bytes
-        let extended = extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 40);
+        let extended =
+            extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 40).unwrap();
         assert_eq!(extended.len(), 40);
         assert_eq!(
             encode_hex(&extended),
@@ -919,8 +1000,9 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
-        let extended = extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 32);
+        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id).unwrap();
+        let extended =
+            extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 32).unwrap();
 
         assert_eq!(extended.len(), 32);
         // First 20 bytes = K1, next 12 bytes = first 12 bytes of K2
@@ -936,7 +1018,7 @@ mod tests {
         let long_key = vec![0xAAu8; 64];
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let extended = extend_key_reeder(AuthProtocol::Sha256, &long_key, &engine_id, 32);
+        let extended = extend_key_reeder(AuthProtocol::Sha256, &long_key, &engine_id, 32).unwrap();
         assert_eq!(extended.len(), 32);
         assert_eq!(extended, vec![0xAAu8; 32]);
     }
@@ -947,10 +1029,10 @@ mod tests {
         let password = b"maplesyrup";
         let engine_id = decode_hex("000000000000000000000002").unwrap();
 
-        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+        let k1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id).unwrap();
 
-        let reeder = extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 32);
-        let blumenthal = extend_key(AuthProtocol::Sha1, k1.as_bytes(), 32);
+        let reeder = extend_key_reeder(AuthProtocol::Sha1, k1.as_bytes(), &engine_id, 32).unwrap();
+        let blumenthal = extend_key(AuthProtocol::Sha1, k1.as_bytes(), 32).unwrap();
 
         assert_eq!(reeder.len(), 32);
         assert_eq!(blumenthal.len(), 32);

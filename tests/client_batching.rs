@@ -1,3 +1,4 @@
+#![cfg(feature = "agent")]
 //! Request batching tests using TestAgent.
 
 mod common;

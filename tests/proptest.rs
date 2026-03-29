@@ -1,3 +1,4 @@
+#![cfg(feature = "agent")]
 //! Property-based tests for async-snmp.
 //!
 //! High-level tests exercise the full protocol stack with a shared TestAgent

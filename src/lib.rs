@@ -181,8 +181,8 @@
 //!
 //! # async fn example() -> async_snmp::Result<()> {
 //! // 1. Derive master keys once (expensive: ~850μs)
-//! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
-//!     .with_privacy(PrivProtocol::Aes128, b"privpassword");
+//! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
+//!     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 //!
 //! // 2. Share engine discovery results across clients
 //! let engine_cache = Arc::new(EngineCache::new());
@@ -444,14 +444,14 @@ pub use notification::{
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};
 pub use transport::{MAX_UDP_PAYLOAD, TcpTransport, Transport, UdpHandle, UdpTransport};
-pub use v3::{
-    AuthProtocol, CryptoProvider, EngineCache, LocalizedKey, MasterKey, MasterKeys,
-    ParseProtocolError, PrivProtocol,
-};
-#[cfg(feature = "crypto-rustcrypto")]
-pub use v3::RustCryptoProvider;
 #[cfg(feature = "crypto-fips")]
 pub use v3::AwsLcFipsProvider;
+#[cfg(feature = "crypto-rustcrypto")]
+pub use v3::RustCryptoProvider;
+pub use v3::{
+    AuthProtocol, CryptoError, CryptoProvider, CryptoResult, EngineCache, LocalizedKey, MasterKey,
+    MasterKeys, ParseProtocolError, PrivProtocol,
+};
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;
 pub use version::Version;

@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn test_validate_master_keys_bypass_auth_password() {
         // When master keys are set, auth password is not required
-        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass");
+        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
         let usm = crate::client::UsmAuth {
             username: "user".to_string(),
             auth_protocol: Some(AuthProtocol::Sha256),
@@ -862,7 +862,9 @@ mod tests {
     fn test_validate_master_keys_bypass_priv_password() {
         // When master keys are set, priv password is not required
         let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass")
-            .with_privacy(PrivProtocol::Aes128, b"privpass");
+            .unwrap()
+            .with_privacy(PrivProtocol::Aes128, b"privpass")
+            .unwrap();
         let usm = crate::client::UsmAuth {
             username: "user".to_string(),
             auth_protocol: Some(AuthProtocol::Sha256),

@@ -1,3 +1,4 @@
+#![cfg(feature = "agent")]
 //! WALK and BULKWALK operation tests using TestAgent.
 
 mod common;

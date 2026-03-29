@@ -1,3 +1,4 @@
+#![cfg(feature = "agent")]
 //! SNMPv3 security tests using TestAgent.
 
 mod common;
@@ -87,6 +88,7 @@ async fn v3_auth_priv_sha256_aes128() {
 }
 
 /// V3 with MD5 auth (legacy support).
+#[cfg(feature = "crypto-rustcrypto")]
 #[tokio::test]
 async fn v3_auth_md5() {
     let agent = TestAgentBuilder::new()
@@ -112,6 +114,7 @@ async fn v3_auth_md5() {
 }
 
 /// V3 with DES privacy (legacy support).
+#[cfg(feature = "crypto-rustcrypto")]
 #[tokio::test]
 async fn v3_auth_priv_sha1_des() {
     let agent = TestAgentBuilder::new()
