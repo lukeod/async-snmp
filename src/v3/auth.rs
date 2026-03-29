@@ -382,6 +382,33 @@ where
     result[..truncate_len].to_vec()
 }
 
+/// HMAC computation over multiple data slices (avoids concatenation allocation).
+fn compute_hmac_slices(protocol: AuthProtocol, key: &[u8], slices: &[&[u8]]) -> Vec<u8> {
+    let truncate_len = protocol.mac_len();
+    dispatch_auth!(
+        protocol,
+        compute_hmac_slices_impl,
+        key,
+        slices,
+        truncate_len
+    )
+}
+
+fn compute_hmac_slices_impl<D>(key: &[u8], slices: &[&[u8]], truncate_len: usize) -> Vec<u8>
+where
+    D: Digest + BlockSizeUser + Clone,
+{
+    use hmac::SimpleHmac;
+
+    let mut mac =
+        <SimpleHmac<D> as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
+    for slice in slices {
+        Mac::update(&mut mac, slice);
+    }
+    let result = mac.finalize().into_bytes();
+    result[..truncate_len].to_vec()
+}
+
 /// Authenticate an outgoing message by computing and inserting the HMAC.
 ///
 /// The message must already have placeholder zeros in the auth params field.
@@ -422,12 +449,25 @@ pub fn verify_message(
     // Extract the received MAC
     let received_mac = &message[auth_offset..end];
 
-    // Create a copy with zeros in the auth position
-    let mut msg_copy = message.to_vec();
-    msg_copy[auth_offset..end].fill(0);
+    // Compute HMAC over the message with zeros in the auth position,
+    // feeding three slices to avoid copying the entire message.
+    const MAX_MAC_LEN: usize = 48; // SHA-512
+    let zeros = [0u8; MAX_MAC_LEN];
+    let computed = compute_hmac_slices(
+        key.protocol,
+        key.as_bytes(),
+        &[&message[..auth_offset], &zeros[..auth_len], &message[end..]],
+    );
 
-    // Compute expected MAC
-    key.verify_hmac(&msg_copy, received_mac)
+    // Constant-time comparison
+    if computed.len() != received_mac.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (a, b) in computed.iter().zip(received_mac.iter()) {
+        result |= a ^ b;
+    }
+    result == 0
 }
 
 /// Pre-computed master keys for SNMPv3 authentication and privacy.
