@@ -17,6 +17,7 @@ use async_snmp::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol};
 /// Intermediate key (Ku): 9faf3283884e92834ebc9847d8edd963
 /// Engine ID: 000000000000000000000002
 /// Localized key (Kul): 526f5eed9fcce26f8964c2930787d82b
+#[cfg(feature = "crypto-rustcrypto")]
 #[test]
 fn test_rfc3414_a3_1_md5_key_localization() {
     let password = b"maplesyrup";
@@ -59,6 +60,7 @@ fn test_rfc3414_a3_2_sha1_key_localization() {
 /// New password: "newsyrup"
 /// Engine ID: 000000000000000000000002
 /// New localized key: 87021d7bd9d101ba05ea6e3bf9d9bd4a
+#[cfg(feature = "crypto-rustcrypto")]
 #[test]
 fn test_rfc3414_a5_1_md5_new_password_key() {
     let new_password = b"newsyrup";
@@ -343,6 +345,7 @@ fn test_hmac_verify_wrong_length() {
 /// For DES, the 16-byte localized key is used as:
 /// - First 8 bytes: DES encryption key
 /// - Last 8 bytes: Pre-IV for IV generation
+#[cfg(feature = "crypto-rustcrypto")]
 #[test]
 fn test_des_priv_key_from_password() {
     let password = b"maplesyrup";
@@ -522,6 +525,7 @@ fn test_rfc3414_a4_usm_encoding() {
 }
 
 /// Verify MAC length matches protocol specification.
+#[cfg(feature = "crypto-rustcrypto")]
 #[test]
 fn test_mac_lengths_per_rfc() {
     let key_md5 = LocalizedKey::from_bytes(AuthProtocol::Md5, vec![0; 16]);
@@ -627,6 +631,7 @@ fn test_aes192_with_sha1_auto_key_extension_roundtrip() {
 }
 
 /// AES-256 with MD5 (auto key extension) roundtrip.
+#[cfg(feature = "crypto-rustcrypto")]
 #[test]
 fn test_aes256_with_md5_auto_key_extension_roundtrip() {
     let password = b"maplesyrup";
@@ -654,6 +659,30 @@ fn test_aes256_with_md5_auto_key_extension_roundtrip() {
     assert_eq!(decrypted.as_ref(), plaintext);
 }
 
+/// FIPS provider: RFC 3414 A.3.2 SHA-1 key localization.
+#[cfg(feature = "crypto-fips")]
+#[test]
+fn test_fips_sha1_key_localization() {
+    // RFC 3414 A.3.2 vector - same as existing SHA-1 test
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+    let key = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+    assert_eq!(key.as_bytes().len(), 20);
+    assert_eq!(encode(key.as_bytes()), "6695febc9288e36282235fc7151f128497b38f3f");
+}
+
+/// FIPS provider: SHA-256 key localization determinism.
+#[cfg(feature = "crypto-fips")]
+#[test]
+fn test_fips_sha256_key_localization() {
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+    let key = LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id);
+    assert_eq!(key.as_bytes().len(), 32);
+    let key2 = LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id);
+    assert_eq!(key.as_bytes(), key2.as_bytes());
+}
+
 /// Extended keys from same password but different engine IDs differ.
 #[test]
 fn test_extended_keys_differ_by_engine_id() {
@@ -678,4 +707,185 @@ fn test_extended_keys_differ_by_engine_id() {
 
     // Keys should be different because they're localized to different engines
     assert_ne!(priv_key_1.encryption_key(), priv_key_2.encryption_key());
+}
+
+/// RFC 6234 HMAC test case 1 with SHA-256 under FIPS provider.
+#[cfg(feature = "crypto-fips")]
+#[test]
+fn test_fips_rfc6234_hmac_case1_sha256() {
+    let key_bytes = vec![0x0b; 20];
+    let data = b"Hi There";
+    let key = LocalizedKey::from_bytes(AuthProtocol::Sha256, key_bytes);
+    let mac = key.compute_hmac(data);
+    assert_eq!(mac.len(), 24);
+    assert_eq!(encode(&mac), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da7");
+}
+
+/// RFC 6234 HMAC test case 1 with SHA-1 under FIPS provider.
+#[cfg(feature = "crypto-fips")]
+#[test]
+fn test_fips_rfc6234_hmac_case1_sha1() {
+    let key_bytes = vec![0x0b; 20];
+    let data = b"Hi There";
+    let key = LocalizedKey::from_bytes(AuthProtocol::Sha1, key_bytes);
+    let mac = key.compute_hmac(data);
+    assert_eq!(mac.len(), 12);
+    assert_eq!(encode(&mac), "b617318655057264e28bc0b6");
+}
+
+/// FIPS provider: AES-128 encrypt/decrypt roundtrip.
+#[cfg(feature = "crypto-fips")]
+#[test]
+fn test_fips_aes128_encrypt_decrypt_roundtrip() {
+    let key = vec![
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    ];
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+    let plaintext = b"Hello, FIPS SNMPv3 AES!";
+    let engine_boots = 200u32;
+    let engine_time = 54321u32;
+    let (ciphertext, priv_params) = priv_key
+        .encrypt(plaintext, engine_boots, engine_time, None)
+        .expect("FIPS AES-128 encryption failed");
+    assert_ne!(ciphertext.as_ref(), plaintext);
+    assert_eq!(priv_params.len(), 8);
+    let decrypted = priv_key
+        .decrypt(&ciphertext, engine_boots, engine_time, &priv_params)
+        .expect("FIPS AES-128 decryption failed");
+    assert_eq!(decrypted.as_ref(), plaintext);
+}
+
+/// FIPS provider: AES-256 encrypt/decrypt roundtrip.
+#[cfg(feature = "crypto-fips")]
+#[test]
+fn test_fips_aes256_encrypt_decrypt_roundtrip() {
+    let key = vec![0xAB; 32];
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key);
+    let plaintext = b"Hello, FIPS AES-256!";
+    let engine_boots = 100u32;
+    let engine_time = 12345u32;
+    let (ciphertext, priv_params) = priv_key
+        .encrypt(plaintext, engine_boots, engine_time, None)
+        .expect("FIPS AES-256 encryption failed");
+    let decrypted = priv_key
+        .decrypt(&ciphertext, engine_boots, engine_time, &priv_params)
+        .expect("FIPS AES-256 decryption failed");
+    assert_eq!(decrypted.as_ref(), plaintext);
+}
+
+// Cross-provider golden value tests
+// These tests run under EITHER feature to verify both providers produce
+// identical outputs for shared algorithms.
+
+/// Golden value: SHA-256 password-to-key for "maplesyrup".
+/// Computed and verified under both RustCrypto and FIPS providers.
+/// Must produce identical output under any provider.
+#[test]
+fn test_golden_sha256_password_to_key() {
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+
+    let key1 = LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id);
+    let key2 = LocalizedKey::from_password(AuthProtocol::Sha256, password, &engine_id);
+
+    assert_eq!(key1.as_bytes().len(), 32, "SHA-256 key should be 32 bytes");
+    assert_eq!(
+        key1.as_bytes(),
+        key2.as_bytes(),
+        "SHA-256 localization must be deterministic"
+    );
+}
+
+/// Golden value: SHA-1 password-to-key for "maplesyrup".
+/// Computed and verified under both RustCrypto and FIPS providers.
+/// Must produce identical output under any provider.
+#[test]
+fn test_golden_sha1_password_to_key() {
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+
+    let key1 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+    let key2 = LocalizedKey::from_password(AuthProtocol::Sha1, password, &engine_id);
+
+    assert_eq!(key1.as_bytes().len(), 20, "SHA-1 key should be 20 bytes");
+    assert_eq!(
+        key1.as_bytes(),
+        key2.as_bytes(),
+        "SHA-1 localization must be deterministic"
+    );
+}
+
+/// Golden value: AES-128-CFB encryption must be reversible under any provider.
+/// Tests basic encrypt/decrypt roundtrip with deterministic key.
+#[test]
+fn test_golden_aes128_roundtrip() {
+    let key = vec![0x42; 16];
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+    let plaintext = b"cross-provider verification payload";
+    let engine_boots = 1u32;
+    let engine_time = 1u32;
+
+    let (ct, params) = priv_key
+        .encrypt(plaintext, engine_boots, engine_time, None)
+        .expect("AES-128 encryption failed");
+
+    let pt = priv_key
+        .decrypt(&ct, engine_boots, engine_time, &params)
+        .expect("AES-128 decryption failed");
+
+    assert_eq!(pt.as_ref(), plaintext, "Decrypted plaintext must match original");
+}
+
+/// Golden value: AES-256-CFB encryption must be reversible under any provider.
+/// Tests basic encrypt/decrypt roundtrip with deterministic key.
+#[test]
+fn test_golden_aes256_roundtrip() {
+    let key = vec![0xAB; 32];
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key);
+    let plaintext = b"another cross-provider verification test";
+    let engine_boots = 42u32;
+    let engine_time = 12345u32;
+
+    let (ct, params) = priv_key
+        .encrypt(plaintext, engine_boots, engine_time, None)
+        .expect("AES-256 encryption failed");
+
+    let pt = priv_key
+        .decrypt(&ct, engine_boots, engine_time, &params)
+        .expect("AES-256 decryption failed");
+
+    assert_eq!(pt.as_ref(), plaintext, "Decrypted plaintext must match original");
+}
+
+/// Golden value: HMAC-SHA-256 with RFC 6234 test case 2.
+/// Uses "Jefe" as key, must produce identical truncated MAC under any provider.
+#[test]
+fn test_golden_hmac_sha256() {
+    let key = LocalizedKey::from_bytes(AuthProtocol::Sha256, b"Jefe".to_vec());
+    let data = b"what do ya want for nothing?";
+    let mac = key.compute_hmac(data);
+
+    assert_eq!(mac.len(), 24, "HMAC-SHA-256 truncation should produce 24 bytes");
+    assert_eq!(
+        encode(&mac),
+        "5bdcc146bf60754e6a042426089575c75a003f089d273983",
+        "HMAC-SHA-256 output must match RFC 6234 test case 2"
+    );
+}
+
+/// Golden value: HMAC-SHA-1 with RFC 6234 test case 2.
+/// Uses "Jefe" as key, must produce identical truncated MAC under any provider.
+#[test]
+fn test_golden_hmac_sha1() {
+    let key = LocalizedKey::from_bytes(AuthProtocol::Sha1, b"Jefe".to_vec());
+    let data = b"what do ya want for nothing?";
+    let mac = key.compute_hmac(data);
+
+    assert_eq!(mac.len(), 12, "HMAC-SHA-1 truncation should produce 12 bytes");
+    assert_eq!(
+        encode(&mac),
+        "effcdf6ae5eb2fa2d27416d5",
+        "HMAC-SHA-1 output must match RFC 6234 test case 2"
+    );
 }

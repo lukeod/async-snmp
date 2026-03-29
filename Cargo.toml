@@ -12,7 +12,7 @@ keywords = ["snmp", "network", "async", "monitoring"]
 categories = ["network-programming", "asynchronous"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["agent", "crypto-rustcrypto", "cli", "mib", "rt-multi-thread"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -35,19 +35,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # MIB integration (optional)
 mib-rs = { version = "0.8", optional = true, default-features = false }
 
+# V3 crypto dependencies (FIPS backend)
+aws-lc-rs = { version = "1", optional = true, features = ["fips"] }
+
 # V3 crypto dependencies
-aes = "0.8.4"
 getrandom = "0.4"
 subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
-cbc = "0.1.2"
-cfb-mode = "0.8.2"
-des = "0.8.1"
-digest = "0.10.7"
-hmac = "0.12.1"
-md-5 = "0.10.6"
-sha1 = "0.10.6"
-sha2 = "0.10.9"
+aes = { version = "0.8.4", optional = true }
+cbc = { version = "0.1.2", optional = true }
+cfb-mode = { version = "0.8.2", optional = true }
+des = { version = "0.8.1", optional = true }
+digest = { version = "0.10.7", optional = true }
+hmac = { version = "0.12.1", optional = true }
+md-5 = { version = "0.10.6", optional = true }
+sha1 = { version = "0.10.6", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
 testcontainers = "0.27"
@@ -86,8 +89,13 @@ name = "transport_comparison"
 harness = false
 
 [features]
-default = ["agent"]
+default = ["agent", "crypto-rustcrypto"]
 agent = ["dep:quinn-udp"]  # SNMP agent
+crypto-rustcrypto = [
+    "dep:aes", "dep:cbc", "dep:cfb-mode", "dep:des",
+    "dep:digest", "dep:hmac", "dep:md-5", "dep:sha1", "dep:sha2",
+]
+crypto-fips = ["dep:aws-lc-rs"]
 rt-multi-thread = ["tokio/rt-multi-thread"]  # Multi-threaded tokio runtime
 cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
 mib = ["dep:mib-rs"]       # MIB integration (OID conversions, helpers)

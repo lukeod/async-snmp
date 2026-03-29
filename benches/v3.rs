@@ -19,11 +19,11 @@ fn bench_key_derivation(c: &mut Criterion) {
     // Key derivation is slow, reduce sample size
     group.sample_size(10);
 
-    let protocols = [
-        ("MD5", AuthProtocol::Md5),
-        ("SHA-1", AuthProtocol::Sha1),
-        ("SHA-256", AuthProtocol::Sha256),
-    ];
+    let mut protocols: Vec<(&str, AuthProtocol)> = Vec::new();
+    #[cfg(feature = "crypto-rustcrypto")]
+    protocols.push(("MD5", AuthProtocol::Md5));
+    protocols.push(("SHA-1", AuthProtocol::Sha1));
+    protocols.push(("SHA-256", AuthProtocol::Sha256));
 
     for (name, protocol) in protocols {
         group.bench_function(BenchmarkId::new("from_password", name), |b| {
@@ -43,12 +43,12 @@ fn bench_hmac(c: &mut Criterion) {
     // Typical SNMP message sizes
     let message_sizes = [64, 128, 256, 512, 1024];
 
-    let protocols = [
-        ("MD5", AuthProtocol::Md5),
-        ("SHA-1", AuthProtocol::Sha1),
-        ("SHA-256", AuthProtocol::Sha256),
-        ("SHA-512", AuthProtocol::Sha512),
-    ];
+    let mut protocols: Vec<(&str, AuthProtocol)> = Vec::new();
+    #[cfg(feature = "crypto-rustcrypto")]
+    protocols.push(("MD5", AuthProtocol::Md5));
+    protocols.push(("SHA-1", AuthProtocol::Sha1));
+    protocols.push(("SHA-256", AuthProtocol::Sha256));
+    protocols.push(("SHA-512", AuthProtocol::Sha512));
 
     // Pre-derive keys (don't include derivation in HMAC benchmark)
     let keys: Vec<_> = protocols
@@ -91,6 +91,7 @@ fn bench_encrypt(c: &mut Criterion) {
     let data_sizes = [64, 128, 256, 512];
 
     // Create keys for each privacy protocol
+    #[cfg(feature = "crypto-rustcrypto")]
     let des_key = PrivKey::from_bytes(
         PrivProtocol::Des,
         vec![
@@ -125,10 +126,13 @@ fn bench_encrypt(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         // DES
-        let key = des_key.clone();
-        group.bench_with_input(BenchmarkId::new("DES", size), &data, |b, data| {
-            b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
-        });
+        #[cfg(feature = "crypto-rustcrypto")]
+        {
+            let key = des_key.clone();
+            group.bench_with_input(BenchmarkId::new("DES", size), &data, |b, data| {
+                b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
+            });
+        }
 
         // AES-128
         let key = aes128_key.clone();
@@ -152,6 +156,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
     let data_sizes = [64, 128, 256, 512];
 
+    #[cfg(feature = "crypto-rustcrypto")]
     let des_key = PrivKey::from_bytes(
         PrivProtocol::Des,
         vec![
@@ -186,16 +191,21 @@ fn bench_decrypt(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         // DES
-        let (ciphertext, priv_params) = des_key
-            .encrypt(&plaintext, engine_boots, engine_time, None)
-            .unwrap();
-        group.bench_with_input(
-            BenchmarkId::new("DES", size),
-            &(&ciphertext, &priv_params),
-            |b, (ct, pp)| {
-                b.iter(|| black_box(des_key.decrypt(ct, engine_boots, engine_time, pp).unwrap()))
-            },
-        );
+        #[cfg(feature = "crypto-rustcrypto")]
+        {
+            let (ciphertext, priv_params) = des_key
+                .encrypt(&plaintext, engine_boots, engine_time, None)
+                .unwrap();
+            group.bench_with_input(
+                BenchmarkId::new("DES", size),
+                &(&ciphertext, &priv_params),
+                |b, (ct, pp)| {
+                    b.iter(|| {
+                        black_box(des_key.decrypt(ct, engine_boots, engine_time, pp).unwrap())
+                    })
+                },
+            );
+        }
 
         // AES-128
         let (ciphertext, priv_params) = aes128_key
