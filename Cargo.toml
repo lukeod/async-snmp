@@ -46,7 +46,7 @@ aes = { version = "0.8.4", optional = true }
 cbc = { version = "0.1.2", optional = true }
 cfb-mode = { version = "0.8.2", optional = true }
 des = { version = "0.8.1", optional = true }
-digest = { version = "0.10.7", optional = true }
+digest = { version = "0.11.2", optional = true }
 hmac = { version = "0.12.1", optional = true }
 md-5 = { version = "0.10.6", optional = true }
 sha1 = { version = "0.10.6", optional = true }
