@@ -22,7 +22,7 @@ use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 
 /// USM security parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsmSecurityParams {
     /// Authoritative engine ID
     pub engine_id: Bytes,
@@ -532,5 +532,19 @@ mod tests {
         // Must not panic - must return None because the claimed extent
         // (auth_start + 64) exceeds the buffer length.
         assert_eq!(UsmSecurityParams::find_auth_params_offset(&encoded), None);
+    }
+
+    #[test]
+    fn usm_security_params_equality() {
+        let a = UsmSecurityParams {
+            engine_id: Bytes::from_static(b"\x80\x00\x01"),
+            engine_boots: 1,
+            engine_time: 100,
+            username: Bytes::from_static(b"user"),
+            auth_params: Bytes::new(),
+            priv_params: Bytes::new(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
     }
 }
