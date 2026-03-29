@@ -157,6 +157,7 @@ impl std::fmt::Debug for UsmConfig {
 /// Derived keys for a specific engine ID.
 ///
 /// Used internally for V3 authentication in both client and notification receiver.
+#[derive(Debug)]
 pub struct DerivedKeys {
     /// Localized authentication key
     pub auth_key: Option<LocalizedKey>,
