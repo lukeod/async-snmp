@@ -123,7 +123,10 @@ impl super::NotificationReceiver {
 
         // Look up user credentials if we have them configured
         let user_config = self.inner.usm_users.get(&username);
-        let derived_keys = user_config.map(|u| u.derive_keys(&engine_id));
+        let derived_keys = user_config
+            .map(|u| u.derive_keys(&engine_id))
+            .transpose()
+            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
         // Verify authentication if required
         if security_level == SecurityLevel::AuthNoPriv || security_level == SecurityLevel::AuthPriv
@@ -137,7 +140,9 @@ impl super::NotificationReceiver {
                             Error::Auth { target: source }.boxed()
                         })?;
 
-                    if !verify_message(auth_key, &data, auth_offset, auth_len) {
+                    if !verify_message(auth_key, &data, auth_offset, auth_len)
+                        .map_err(|_| Error::Auth { target: source }.boxed())?
+                    {
                         tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "V3 authentication failed");
                         return Err(Error::Auth { target: source }.boxed());
                     }
@@ -320,7 +325,8 @@ fn build_v3_response(
                     Error::MalformedResponse { target: local_addr }.boxed()
                 })?;
 
-            authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
+            authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len)
+                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
             Ok(Bytes::from(response_bytes))
         }
@@ -376,7 +382,8 @@ fn build_v3_response(
                     Error::MalformedResponse { target: local_addr }.boxed()
                 })?;
 
-            authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len);
+            authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len)
+                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
             Ok(Bytes::from(response_bytes))
         }

@@ -27,7 +27,9 @@ fn bench_key_derivation(c: &mut Criterion) {
 
     for (name, protocol) in protocols {
         group.bench_function(BenchmarkId::new("from_password", name), |b| {
-            b.iter(|| black_box(LocalizedKey::from_password(protocol, PASSWORD, ENGINE_ID)))
+            b.iter(|| {
+                black_box(LocalizedKey::from_password(protocol, PASSWORD, ENGINE_ID).unwrap())
+            })
         });
     }
 
@@ -53,7 +55,7 @@ fn bench_hmac(c: &mut Criterion) {
     // Pre-derive keys (don't include derivation in HMAC benchmark)
     let keys: Vec<_> = protocols
         .iter()
-        .map(|(_, p)| LocalizedKey::from_password(*p, PASSWORD, ENGINE_ID))
+        .map(|(_, p)| LocalizedKey::from_password(*p, PASSWORD, ENGINE_ID).unwrap())
         .collect();
 
     for (i, (name, _)) in protocols.iter().enumerate() {
@@ -66,18 +68,19 @@ fn bench_hmac(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(format!("compute_{}", name), size),
                 &data,
-                |b, data| b.iter(|| black_box(key.compute_hmac(data))),
+                |b, data| b.iter(|| black_box(key.compute_hmac(data).unwrap())),
             );
         }
     }
 
     // Benchmark verify (compute + compare)
-    let key_sha256 = LocalizedKey::from_password(AuthProtocol::Sha256, PASSWORD, ENGINE_ID);
+    let key_sha256 =
+        LocalizedKey::from_password(AuthProtocol::Sha256, PASSWORD, ENGINE_ID).unwrap();
     let data = vec![0xABu8; 256];
-    let mac = key_sha256.compute_hmac(&data);
+    let mac = key_sha256.compute_hmac(&data).unwrap();
 
     group.bench_function("verify_SHA-256_256bytes", |b| {
-        b.iter(|| black_box(key_sha256.verify_hmac(&data, &mac)))
+        b.iter(|| black_box(key_sha256.verify_hmac(&data, &mac).unwrap()))
     });
 
     group.finish();
@@ -252,7 +255,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("v3_authpriv");
 
     // Pre-derive keys
-    let auth_key = LocalizedKey::from_password(AuthProtocol::Sha256, PASSWORD, ENGINE_ID);
+    let auth_key = LocalizedKey::from_password(AuthProtocol::Sha256, PASSWORD, ENGINE_ID).unwrap();
     let priv_key = PrivKey::from_bytes(
         PrivProtocol::Aes128,
         vec![
@@ -276,7 +279,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
             let (encrypted, _priv_params) = priv_key
                 .encrypt(&scoped_pdu, engine_boots, engine_time, None)
                 .unwrap();
-            let _hmac = auth_key.compute_hmac(&full_message);
+            let _hmac = auth_key.compute_hmac(&full_message).unwrap();
             black_box(encrypted)
         })
     });
@@ -285,11 +288,11 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
     let (ciphertext, priv_params) = priv_key
         .encrypt(&scoped_pdu, engine_boots, engine_time, None)
         .unwrap();
-    let hmac = auth_key.compute_hmac(&full_message);
+    let hmac = auth_key.compute_hmac(&full_message).unwrap();
 
     group.bench_function("incoming_verify_then_decrypt", |b| {
         b.iter(|| {
-            let valid = auth_key.verify_hmac(&full_message, &hmac);
+            let valid = auth_key.verify_hmac(&full_message, &hmac).unwrap();
             assert!(valid);
             let decrypted = priv_key
                 .decrypt(&ciphertext, engine_boots, engine_time, &priv_params)

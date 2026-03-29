@@ -70,7 +70,9 @@ impl<T: Transport> Client<T> {
             *state = Some(cached_state.clone());
             // Derive keys for this engine
             if let Some(security) = &self.inner.config.v3_security {
-                let keys = security.derive_keys(&cached_state.engine_id);
+                let keys = security
+                    .derive_keys(&cached_state.engine_id)
+                    .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
                 let mut derived = self
                     .inner
                     .derived_keys
@@ -152,7 +154,9 @@ impl<T: Transport> Client<T> {
 
         // Derive keys for this engine
         if let Some(security) = &self.inner.config.v3_security {
-            let keys = security.derive_keys(&engine_state.engine_id);
+            let keys = security
+                .derive_keys(&engine_state.engine_id)
+                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
             let mut derived = self
                 .inner
                 .derived_keys
@@ -263,17 +267,24 @@ impl<T: Transport> Client<T> {
             )
         };
 
-        // Build USM security parameters
-        let mac_len = if security_level.requires_auth() {
-            derived
-                .as_ref()
-                .and_then(|d| d.auth_key.as_ref())
-                .map(|k| k.mac_len())
-                .unwrap_or(12)
+        // Resolve auth key up front if authentication is required.
+        // This avoids a redundant lookup later and makes the error visible
+        // before we bother encoding the message.
+        let auth_key = if security_level.requires_auth() {
+            Some(
+                derived
+                    .as_ref()
+                    .and_then(|d| d.auth_key.as_ref())
+                    .ok_or_else(|| {
+                        tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::MissingAuthKey }, "auth key not available for encoding");
+                        Error::Config("auth key not available".into()).boxed()
+                    })?,
+            )
         } else {
-            0
+            None
         };
 
+        // Build USM security parameters
         let mut usm_params = UsmSecurityParams::new(
             engine_state.engine_id.clone(),
             engine_boots,
@@ -281,8 +292,8 @@ impl<T: Transport> Client<T> {
             security.username.clone(),
         );
 
-        if security_level.requires_auth() {
-            usm_params = usm_params.with_auth_placeholder(mac_len);
+        if let Some(key) = &auth_key {
+            usm_params = usm_params.with_auth_placeholder(key.mac_len());
         }
 
         if security_level.requires_priv() {
@@ -308,20 +319,13 @@ impl<T: Transport> Client<T> {
         let mut encoded = msg.encode().to_vec();
 
         // Apply authentication if needed
-        if security_level.requires_auth() {
+        if let Some(key) = &auth_key {
             tracing::trace!(target: "async_snmp::client", "applying HMAC authentication");
-
-            let auth_key = derived
-                .as_ref()
-                .and_then(|d| d.auth_key.as_ref())
-                .ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::MissingAuthKey }, "auth key not available for encoding");
-                    Error::Config("auth key not available".into()).boxed()
-                })?;
 
             // Find auth params position and apply HMAC
             if let Some((offset, len)) = UsmSecurityParams::find_auth_params_offset(&encoded) {
-                authenticate_message(auth_key, &mut encoded, offset, len);
+                authenticate_message(key, &mut encoded, offset, len)
+                    .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
                 tracing::trace!(target: "async_snmp::client", { auth_params_offset = offset, auth_params_len = len }, "applied HMAC authentication");
             } else {
                 tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params position");
@@ -362,7 +366,9 @@ impl<T: Transport> Client<T> {
             },
         )?;
 
-        if !verify_message(auth_key, response_data, offset, len) {
+        if !verify_message(auth_key, response_data, offset, len)
+            .map_err(|e| Error::Config(e.to_string().into()).boxed())?
+        {
             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %AuthErrorKind::HmacMismatch }, "authentication failed");
             return Err(Error::Auth {
                 target: self.peer_addr(),

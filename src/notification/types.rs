@@ -95,16 +95,16 @@ impl UsmConfig {
     /// If master keys are configured, uses the cached master keys for efficient
     /// localization (~1us). Otherwise, performs full password-to-key derivation
     /// (~850us for SHA-256).
-    pub fn derive_keys(&self, engine_id: &[u8]) -> DerivedKeys {
+    pub fn derive_keys(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
         // Use master keys if available (efficient path)
         if let Some(ref master_keys) = self.master_keys {
             tracing::trace!(target: "async_snmp::client", { engine_id_len = engine_id.len(), auth_protocol = ?master_keys.auth_protocol(), priv_protocol = ?master_keys.priv_protocol() }, "localizing from cached master keys");
-            let (auth_key, priv_key) = master_keys.localize(engine_id);
+            let (auth_key, priv_key) = master_keys.localize(engine_id)?;
             tracing::trace!(target: "async_snmp::client", "key localization complete");
-            return DerivedKeys {
+            return Ok(DerivedKeys {
                 auth_key: Some(auth_key),
                 priv_key,
-            };
+            });
         }
 
         // Fall back to password-based derivation
@@ -113,7 +113,7 @@ impl UsmConfig {
         let auth_key = self.auth.as_ref().map(|(protocol, password)| {
             tracing::trace!(target: "async_snmp::client", { auth_protocol = ?protocol }, "deriving auth key");
             LocalizedKey::from_password(*protocol, password, engine_id)
-        });
+        }).transpose()?;
 
         let priv_key = match (&self.auth, &self.privacy) {
             (Some((auth_protocol, _)), Some((priv_protocol, priv_password))) => {
@@ -123,13 +123,13 @@ impl UsmConfig {
                     *priv_protocol,
                     priv_password,
                     engine_id,
-                ))
+                )?)
             }
             _ => None,
         };
 
         tracing::trace!(target: "async_snmp::client", "key derivation complete");
-        DerivedKeys { auth_key, priv_key }
+        Ok(DerivedKeys { auth_key, priv_key })
     }
 }
 
@@ -209,7 +209,7 @@ mod tests {
             .auth(AuthProtocol::Sha1, b"password123");
 
         let engine_id = b"test-engine-id";
-        let keys = config.derive_keys(engine_id);
+        let keys = config.derive_keys(engine_id).unwrap();
 
         assert!(keys.auth_key.is_some());
         assert!(keys.priv_key.is_none());
@@ -222,7 +222,7 @@ mod tests {
             .privacy(PrivProtocol::Aes128, b"privpass");
 
         let engine_id = b"test-engine-id";
-        let keys = config.derive_keys(engine_id);
+        let keys = config.derive_keys(engine_id).unwrap();
 
         assert!(keys.auth_key.is_some());
         assert!(keys.priv_key.is_some());

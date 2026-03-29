@@ -8,14 +8,52 @@
 //! provider uses RustCrypto crates (sha2, aes, hmac, etc.). Alternative backends
 //! (e.g., aws-lc-rs for FIPS 140-3) can be added as feature-gated implementations.
 
-use super::privacy::PrivacyResult;
 use super::{AuthProtocol, PrivProtocol};
 
+/// Error type for cryptographic provider operations.
+///
+/// This covers failures that originate from the crypto backend itself:
+/// unsupported algorithms, invalid key material, and cipher-level errors.
+/// Protocol-level framing errors (e.g., wrong privParameters length) live
+/// in [`PrivacyError`](super::privacy::PrivacyError).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CryptoError {
+    /// The crypto backend does not support the requested algorithm.
+    ///
+    /// For example, the FIPS provider does not support MD5 or DES.
+    UnsupportedAlgorithm(&'static str),
+    /// The key length is invalid for the requested operation.
+    InvalidKeyLength,
+    /// The cipher operation failed internally.
+    CipherError,
+}
+
+impl std::fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedAlgorithm(name) => {
+                write!(f, "unsupported algorithm: {}", name)
+            }
+            Self::InvalidKeyLength => write!(f, "invalid key length"),
+            Self::CipherError => write!(f, "cipher operation failed"),
+        }
+    }
+}
+
+impl std::error::Error for CryptoError {}
+
+/// Result type for cryptographic provider operations.
+pub type CryptoResult<T> = Result<T, CryptoError>;
+
 #[cfg(all(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-compile_error!("Features \"crypto-rustcrypto\" and \"crypto-fips\" are mutually exclusive. Choose one crypto backend.");
+compile_error!(
+    "Features \"crypto-rustcrypto\" and \"crypto-fips\" are mutually exclusive. If you used --all-features, specify features explicitly instead."
+);
 
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-compile_error!("A crypto backend is required. Enable either \"crypto-rustcrypto\" (default) or \"crypto-fips\".");
+compile_error!(
+    "A crypto backend is required. Enable either \"crypto-rustcrypto\" (default) or \"crypto-fips\"."
+);
 
 #[cfg(feature = "crypto-rustcrypto")]
 mod rustcrypto;
@@ -29,8 +67,8 @@ pub use fips::AwsLcFipsProvider;
 
 /// Trait defining the cryptographic primitives needed by the SNMPv3 USM layer.
 ///
-/// This trait captures the five core operations that vary between crypto backends:
-/// password-to-key derivation, key localization, HMAC computation, and
+/// This trait captures the six core operations that vary between crypto backends:
+/// hashing, password-to-key derivation, key localization, HMAC computation, and
 /// symmetric encryption/decryption.
 ///
 /// # Implementors
@@ -49,24 +87,38 @@ pub trait CryptoProvider: Send + Sync + 'static {
     /// hash function. Returns the raw digest bytes.
     ///
     /// Empty passwords should return an all-zero key of the protocol's digest length.
-    fn password_to_key(&self, protocol: AuthProtocol, password: &[u8]) -> Vec<u8>;
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`] if the backend does not
+    /// support the requested authentication protocol.
+    fn password_to_key(&self, protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Vec<u8>>;
 
     /// Localize a master key to a specific engine ID (RFC 3414 Section A.2.2).
     ///
     /// Computes: `H(master_key || engine_id || master_key)`
-    fn localize_key(&self, protocol: AuthProtocol, master_key: &[u8], engine_id: &[u8]) -> Vec<u8>;
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`] if the backend does not
+    /// support the requested authentication protocol.
+    fn localize_key(
+        &self,
+        protocol: AuthProtocol,
+        master_key: &[u8],
+        engine_id: &[u8],
+    ) -> CryptoResult<Vec<u8>>;
 
     /// Compute HMAC over one or more data slices, truncated to `truncate_len` bytes.
     ///
     /// The multi-slice interface avoids allocations when computing HMACs over
     /// non-contiguous data (e.g., message verification with zeroed auth params).
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`] if the backend does not
+    /// support the requested authentication protocol.
     fn compute_hmac(
         &self,
         protocol: AuthProtocol,
         key: &[u8],
         slices: &[&[u8]],
         truncate_len: usize,
-    ) -> Vec<u8>;
+    ) -> CryptoResult<Vec<u8>>;
 
     /// Encrypt data in place using the specified privacy protocol.
     ///
@@ -79,10 +131,13 @@ pub trait CryptoProvider: Send + Sync + 'static {
         key: &[u8],
         iv: &[u8],
         data: &mut [u8],
-    ) -> PrivacyResult<()>;
+    ) -> CryptoResult<()>;
 
     /// Compute a bare hash digest using the protocol's hash function.
-    fn hash(&self, protocol: AuthProtocol, data: &[u8]) -> Vec<u8>;
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`] if the backend does not
+    /// support the requested authentication protocol.
+    fn hash(&self, protocol: AuthProtocol, data: &[u8]) -> CryptoResult<Vec<u8>>;
 
     /// Decrypt data in place using the specified privacy protocol.
     ///
@@ -94,7 +149,7 @@ pub trait CryptoProvider: Send + Sync + 'static {
         key: &[u8],
         iv: &[u8],
         data: &mut [u8],
-    ) -> PrivacyResult<()>;
+    ) -> CryptoResult<()>;
 }
 
 /// Returns the active crypto provider.

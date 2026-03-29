@@ -101,8 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only the cheap localization (~1us) is done per engine.
 
     // Uses container user: privaes192_user (SHA-256 + AES-192)
-    let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")
-        .with_privacy(PrivProtocol::Aes192, b"privpass123");
+    let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")?
+        .with_privacy(PrivProtocol::Aes192, b"privpass123")?;
 
     println!("Master keys derived once (expensive operation)");
 

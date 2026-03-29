@@ -1,3 +1,4 @@
+#![cfg(feature = "agent")]
 //! GET and SET operation tests using TestAgent.
 
 mod common;

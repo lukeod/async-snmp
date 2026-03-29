@@ -6,10 +6,13 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-pub mod agent;
-pub mod faulty;
 pub mod fixtures;
 pub mod handler;
+
+#[cfg(feature = "agent")]
+pub mod agent;
+#[cfg(feature = "agent")]
+pub mod faulty;
 
 // Re-export MIB data fixtures
 pub use fixtures::system_mib;
@@ -28,6 +31,8 @@ pub use fixtures::{
 // Re-export BTreeMap fixtures
 pub use fixtures::{combined, interface_table};
 
+#[cfg(feature = "agent")]
 pub use agent::{TestAgent, TestAgentBuilder, V3User};
+#[cfg(feature = "agent")]
 pub use faulty::{LossyAgent, PausableAgent, SlowAgent};
 pub use handler::TestHandler;

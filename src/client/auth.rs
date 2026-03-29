@@ -13,8 +13,8 @@
 //! use async_snmp::{Auth, AuthProtocol, PrivProtocol, MasterKeys};
 //!
 //! // Derive master keys once (expensive: ~850μs for SHA-256)
-//! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
-//!     .with_privacy(PrivProtocol::Aes128, b"privpassword");
+//! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
+//!     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 //!
 //! // Use with USM builder - localization is cheap (~1μs per engine)
 //! let auth: Auth = Auth::usm("admin")
@@ -253,8 +253,8 @@ impl UsmBuilder {
     /// use async_snmp::{Auth, AuthProtocol, PrivProtocol, MasterKeys};
     ///
     /// // Derive master keys once
-    /// let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
-    ///     .with_privacy(PrivProtocol::Aes128, b"privpassword");
+    /// let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
+    ///     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
     ///
     /// // Use with multiple clients
     /// let auth: Auth = Auth::usm("admin")
