@@ -88,6 +88,24 @@ pub use fips::AwsLcFipsProvider;
 ///
 /// Implementations must be `Send + Sync + 'static` to support use across
 /// async tasks and threads.
+///
+/// # Security Requirements
+///
+/// Implementations must uphold the following properties for correct and secure
+/// SNMPv3 operation:
+///
+/// - **Constant-time HMAC comparison.** The caller (`verify_message`) performs
+///   the constant-time comparison, but `compute_hmac` must not short-circuit
+///   or leak timing information about intermediate state.
+/// - **IV/salt uniqueness.** Encryption callers supply the IV, but if your
+///   provider wraps a stateful cipher context that generates IVs internally,
+///   it must guarantee uniqueness across calls (RFC 3826 Section 3.1.4.1).
+/// - **Key material hygiene.** Intermediate key material (e.g., expanded
+///   password hashes) should be zeroized after use. Implementations backed
+///   by HSMs or FIPS modules should keep keys in hardware where possible.
+/// - **Algorithm support errors.** Return [`CryptoError::UnsupportedAlgorithm`]
+///   rather than panicking when asked to perform an operation the backend
+///   does not support.
 pub trait CryptoProvider: Send + Sync + 'static {
     /// Derive a master key from a password using the RFC 3414 Section A.2.1 algorithm.
     ///

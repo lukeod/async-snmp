@@ -781,7 +781,17 @@ impl Agent {
 
                 match agent.handle_request(data, recv_meta.addr).await {
                     Ok(Some(response_bytes)) => {
-                        if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
+                        // RFC 3413 Section 3.2 step 4: if the encoded response
+                        // exceeds the max message size, silently drop it.
+                        if response_bytes.len() > agent.inner.max_message_size {
+                            agent
+                                .inner
+                                .snmp_silent_drops
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, response_size = response_bytes.len(), max_size = agent.inner.max_message_size }, "response exceeds max message size, silently dropped");
+                        } else if let Err(e) =
+                            agent.send_response(&response_bytes, &recv_meta).await
+                        {
                             tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "failed to send response");
                         }
                     }

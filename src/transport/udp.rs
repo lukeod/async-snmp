@@ -62,6 +62,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum UDP datagram size for receiving.
@@ -106,6 +107,7 @@ struct UdpTransportInner {
     core: UdpCore,
     config: UdpTransportConfig,
     shutdown: CancellationToken,
+    recv_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for UdpTransport {
@@ -167,13 +169,19 @@ impl UdpTransport {
 
     /// Shutdown the transport, stopping the background receiver.
     ///
+    /// Signals the background recv task to stop and waits for it to exit.
     /// Pending requests will fail with timeout errors.
-    pub fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
+        let handle = self.inner.recv_task.lock().await.take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
     }
 
-    fn start_recv_loop(inner: Arc<UdpTransportInner>) {
-        tokio::spawn(async move {
+    fn start_recv_loop(inner: &Arc<UdpTransportInner>) {
+        let task_inner = inner.clone();
+        let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
 
@@ -181,29 +189,29 @@ impl UdpTransport {
                 tokio::select! {
                     biased;
 
-                    _ = inner.shutdown.cancelled() => {
-                        tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %inner.local_addr }, "UDP transport shutdown");
+                    _ = task_inner.shutdown.cancelled() => {
+                        tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %task_inner.local_addr }, "UDP transport shutdown");
                         break;
                     }
 
                     _ = cleanup_interval.tick() => {
-                        inner.core.cleanup_expired();
+                        task_inner.core.cleanup_expired();
                     }
 
-                    result = inner.socket.recv_from(&mut buf) => {
+                    result = task_inner.socket.recv_from(&mut buf) => {
                         match result {
                             Ok((len, source)) => {
                                 let data = Bytes::copy_from_slice(&buf[..len]);
 
                                 if let Some(request_id) = extract_request_id(&data) {
-                                    if !inner.core.deliver(request_id, data, source) {
+                                    if !task_inner.core.deliver(request_id, data, source) {
                                         tracing::debug!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.source = %source }, "response for unknown request");
                                     }
                                 } else {
                                     tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, snmp.bytes = len }, "malformed response (no request_id)");
                                 }
                             }
-                            Err(_) if inner.shutdown.is_cancelled() => break,
+                            Err(_) if task_inner.shutdown.is_cancelled() => break,
                             Err(e) => {
                                 tracing::error!(target: "async_snmp::transport", { error = %e }, "UDP recv error");
                             }
@@ -212,6 +220,11 @@ impl UdpTransport {
                 }
             }
         });
+        // Safe: mutex was just created, no contention possible
+        *inner
+            .recv_task
+            .try_lock()
+            .expect("recv_task lock at startup") = Some(handle);
     }
 }
 
@@ -279,9 +292,10 @@ impl UdpTransportBuilder {
             core: UdpCore::new(),
             config: self.config,
             shutdown: CancellationToken::new(),
+            recv_task: tokio::sync::Mutex::new(None),
         });
 
-        UdpTransport::start_recv_loop(inner.clone());
+        UdpTransport::start_recv_loop(&inner);
 
         Ok(UdpTransport { inner })
     }
