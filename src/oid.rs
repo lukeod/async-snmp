@@ -665,6 +665,12 @@ impl From<Vec<u32>> for Oid {
     }
 }
 
+impl AsRef<[u32]> for Oid {
+    fn as_ref(&self) -> &[u32] {
+        self.arcs()
+    }
+}
+
 impl PartialOrd for Oid {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -793,6 +799,13 @@ mod tests {
         let v = vec![1, 3, 6, 1, 2, 1];
         let oid = Oid::from(v);
         assert_eq!(oid.arcs(), &[1, 3, 6, 1, 2, 1]);
+    }
+
+    #[test]
+    fn oid_as_ref() {
+        let oid = Oid::new([1, 3, 6, 1]);
+        let slice: &[u32] = oid.as_ref();
+        assert_eq!(slice, &[1, 3, 6, 1]);
     }
 
     // AUDIT-001: Test arc validation

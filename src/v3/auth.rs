@@ -156,6 +156,12 @@ impl std::fmt::Debug for MasterKey {
     }
 }
 
+impl AsRef<[u8]> for MasterKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 /// Localized authentication key.
 ///
 /// A key that has been derived from a password and bound to a specific engine ID.
@@ -272,6 +278,12 @@ impl std::fmt::Debug for LocalizedKey {
             .field("protocol", &self.protocol)
             .field("key", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl AsRef<[u8]> for LocalizedKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
