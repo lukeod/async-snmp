@@ -54,6 +54,7 @@ pub fn format_varbind(mib: &Mib, vb: &VarBind) -> String {
 /// The struct borrows `object_name`, `module_name`, and `units` from the
 /// `Mib`, while `suffix` and `formatted_value` are owned. Callers cannot
 /// detach the struct from the `Mib` lifetime.
+#[derive(Debug)]
 pub struct VarBindInfo<'a> {
     /// The object name (e.g., "ifDescr").
     pub object_name: &'a str,
