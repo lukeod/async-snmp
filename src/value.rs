@@ -54,20 +54,28 @@ pub enum RowStatus {
     Destroy = 6,
 }
 
+impl TryFrom<i32> for RowStatus {
+    type Error = i32;
+
+    fn try_from(value: i32) -> std::result::Result<Self, i32> {
+        match value {
+            1 => Ok(Self::Active),
+            2 => Ok(Self::NotInService),
+            3 => Ok(Self::NotReady),
+            4 => Ok(Self::CreateAndGo),
+            5 => Ok(Self::CreateAndWait),
+            6 => Ok(Self::Destroy),
+            _ => Err(value),
+        }
+    }
+}
+
 impl RowStatus {
-    /// Convert an integer value to RowStatus.
+    /// Create from raw SNMP integer value.
     ///
     /// Returns `None` for values outside the valid range (1-6).
     pub fn from_i32(value: i32) -> Option<Self> {
-        match value {
-            1 => Some(Self::Active),
-            2 => Some(Self::NotInService),
-            3 => Some(Self::NotReady),
-            4 => Some(Self::CreateAndGo),
-            5 => Some(Self::CreateAndWait),
-            6 => Some(Self::Destroy),
-            _ => None,
-        }
+        Self::try_from(value).ok()
     }
 }
 
@@ -131,19 +139,27 @@ pub enum StorageType {
     ReadOnly = 5,
 }
 
+impl TryFrom<i32> for StorageType {
+    type Error = i32;
+
+    fn try_from(value: i32) -> std::result::Result<Self, i32> {
+        match value {
+            1 => Ok(Self::Other),
+            2 => Ok(Self::Volatile),
+            3 => Ok(Self::NonVolatile),
+            4 => Ok(Self::Permanent),
+            5 => Ok(Self::ReadOnly),
+            _ => Err(value),
+        }
+    }
+}
+
 impl StorageType {
-    /// Convert an integer value to StorageType.
+    /// Create from raw SNMP integer value.
     ///
     /// Returns `None` for values outside the valid range (1-5).
     pub fn from_i32(value: i32) -> Option<Self> {
-        match value {
-            1 => Some(Self::Other),
-            2 => Some(Self::Volatile),
-            3 => Some(Self::NonVolatile),
-            4 => Some(Self::Permanent),
-            5 => Some(Self::ReadOnly),
-            _ => None,
-        }
+        Self::try_from(value).ok()
     }
 }
 
@@ -1973,6 +1989,15 @@ mod tests {
     }
 
     #[test]
+    fn test_row_status_try_from() {
+        assert_eq!(RowStatus::try_from(1), Ok(RowStatus::Active));
+        assert_eq!(RowStatus::try_from(6), Ok(RowStatus::Destroy));
+        assert_eq!(RowStatus::try_from(0), Err(0));
+        assert_eq!(RowStatus::try_from(7), Err(7));
+        assert_eq!(RowStatus::try_from(-1), Err(-1));
+    }
+
+    #[test]
     fn test_row_status_into_value() {
         let v: Value = RowStatus::Active.into();
         assert_eq!(v, Value::Integer(1));
@@ -2022,6 +2047,15 @@ mod tests {
         assert_eq!(StorageType::from_i32(0), None);
         assert_eq!(StorageType::from_i32(6), None);
         assert_eq!(StorageType::from_i32(-1), None);
+    }
+
+    #[test]
+    fn test_storage_type_try_from() {
+        assert_eq!(StorageType::try_from(1), Ok(StorageType::Other));
+        assert_eq!(StorageType::try_from(5), Ok(StorageType::ReadOnly));
+        assert_eq!(StorageType::try_from(0), Err(0));
+        assert_eq!(StorageType::try_from(6), Err(6));
+        assert_eq!(StorageType::try_from(-1), Err(-1));
     }
 
     #[test]
