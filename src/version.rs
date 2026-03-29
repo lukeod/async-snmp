@@ -56,6 +56,14 @@ impl Version {
     }
 }
 
+impl TryFrom<i32> for Version {
+    type Error = i32;
+
+    fn try_from(value: i32) -> std::result::Result<Self, i32> {
+        Self::from_i32(value).ok_or(value)
+    }
+}
+
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -63,5 +71,19 @@ impl std::fmt::Display for Version {
             Version::V2c => write!(f, "SNMPv2c"),
             Version::V3 => write!(f, "SNMPv3"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_version_try_from() {
+        assert_eq!(Version::try_from(0), Ok(Version::V1));
+        assert_eq!(Version::try_from(1), Ok(Version::V2c));
+        assert_eq!(Version::try_from(3), Ok(Version::V3));
+        assert_eq!(Version::try_from(2), Err(2));
+        assert_eq!(Version::try_from(-1), Err(-1));
     }
 }
