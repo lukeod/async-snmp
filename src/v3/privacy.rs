@@ -581,6 +581,7 @@ mod tests {
     use super::*;
     use crate::format::hex::decode as decode_hex;
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_des_encrypt_decrypt_roundtrip() {
         // Create a 16-byte key (8 for DES, 8 for pre-IV)
@@ -613,6 +614,7 @@ mod tests {
         assert_eq!(&decrypted[..plaintext.len()], plaintext);
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_des3_encrypt_decrypt_roundtrip() {
         // Create a 32-byte key (24 for 3DES, 8 for pre-IV)
@@ -679,6 +681,7 @@ mod tests {
         assert_eq!(decrypted.as_ref(), plaintext);
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_des_invalid_ciphertext_length() {
         let key = vec![0u8; 16];
@@ -931,6 +934,7 @@ mod tests {
     // layer (HMAC) is what detects tampering/wrong keys in practice (RFC 3414).
     // ========================================================================
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_des_wrong_key_produces_garbage() {
         // Correct 16-byte key
@@ -1089,6 +1093,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_des_wrong_priv_params_produces_garbage() {
         // Verify that even with the correct key, wrong priv_params (salt/IV)

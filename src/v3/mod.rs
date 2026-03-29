@@ -16,7 +16,11 @@ mod privacy;
 mod usm;
 
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
-pub use crypto::{CryptoProvider, RustCryptoProvider};
+pub use crypto::CryptoProvider;
+#[cfg(feature = "crypto-rustcrypto")]
+pub use crypto::RustCryptoProvider;
+#[cfg(feature = "crypto-fips")]
+pub use crypto::AwsLcFipsProvider;
 pub use engine::report_oids;
 pub use engine::{
     DEFAULT_MSG_MAX_SIZE, EngineCache, EngineState, MAX_ENGINE_TIME, TIME_WINDOW,

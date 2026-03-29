@@ -616,6 +616,7 @@ mod tests {
     use super::*;
     use crate::format::hex::{decode as decode_hex, encode as encode_hex};
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_password_to_key_md5() {
         // Test vector from RFC 3414 Appendix A.3.1
@@ -640,6 +641,7 @@ mod tests {
         assert_eq!(encode_hex(&key), "9fb5cc0381497b3793528939ff788d5d79145211");
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_localize_key_md5() {
         // Test vector from RFC 3414 Appendix A.3.1
@@ -675,6 +677,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_hmac_computation() {
         let key = LocalizedKey::from_bytes(
@@ -700,6 +703,7 @@ mod tests {
         assert!(!key.verify_hmac(data, &wrong_mac));
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_empty_password() {
         let key = password_to_key(AuthProtocol::Md5, b"");
@@ -721,6 +725,7 @@ mod tests {
         assert_eq!(key_from_bytes.protocol(), key_from_str.protocol());
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_master_key_localize_md5() {
         // Verify MasterKey produces same result as LocalizedKey::from_password
@@ -852,6 +857,7 @@ mod tests {
     // Known-Answer Tests (KAT) for Reeder key extension algorithm
     // Test vectors from draft-reeder-snmpv3-usm-3desede-00 Appendix B
 
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn test_reeder_extend_key_md5_kat() {
         // Test vector from draft-reeder Appendix B.1

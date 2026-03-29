@@ -446,8 +446,12 @@ pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};
 pub use transport::{MAX_UDP_PAYLOAD, TcpTransport, Transport, UdpHandle, UdpTransport};
 pub use v3::{
     AuthProtocol, CryptoProvider, EngineCache, LocalizedKey, MasterKey, MasterKeys,
-    ParseProtocolError, PrivProtocol, RustCryptoProvider,
+    ParseProtocolError, PrivProtocol,
 };
+#[cfg(feature = "crypto-rustcrypto")]
+pub use v3::RustCryptoProvider;
+#[cfg(feature = "crypto-fips")]
+pub use v3::AwsLcFipsProvider;
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;
 pub use version::Version;
