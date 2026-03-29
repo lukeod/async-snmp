@@ -19,7 +19,7 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 - **Full protocol support**: SNMPv1, v2c, and v3 (USM)
 - **Async-first**: Built on Tokio for high-performance async I/O
 - **All operations**: GET, GETNEXT, GETBULK, SET, WALK, BULKWALK
-- **SNMPv3 security**: MD5/SHA-1/SHA-2 authentication, DES/3DES/AES-128/192/256 privacy
+- **SNMPv3 security**: MD5/SHA-1/SHA-2 authentication, DES/3DES/AES-128/192/256 privacy, with pluggable crypto backends including a FIPS 140-3 option
 - **Multiple transports**: UDP, TCP, and shared UDP for scalable polling
 - **Zero-copy decoding**: Minimal allocations using `bytes` crate
 - **Type-safe**: Compile-time OID validation with `oid!` macro
