@@ -879,7 +879,12 @@ impl Agent {
 
     /// Update engine time based on elapsed time since start.
     fn update_engine_time(&self) {
-        let elapsed = self.inner.engine_start.elapsed().as_secs() as u32;
+        let elapsed = self
+            .inner
+            .engine_start
+            .elapsed()
+            .as_secs()
+            .min(u32::MAX as u64) as u32;
         self.inner.engine_time.store(elapsed, Ordering::Relaxed);
     }
 

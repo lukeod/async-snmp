@@ -302,6 +302,15 @@ impl Agent {
             ) {
                 ctx.read_view = Some(access.read_view.clone());
                 ctx.write_view = Some(access.write_view.clone());
+            } else {
+                tracing::warn!(
+                    target: "async_snmp::agent",
+                    group = %String::from_utf8_lossy(group),
+                    context = %String::from_utf8_lossy(&ctx.context_name),
+                    security_model = ?ctx.security_model,
+                    security_level = ?ctx.security_level,
+                    "VACM group has no matching access entry, denying access"
+                );
             }
         }
     }

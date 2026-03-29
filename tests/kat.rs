@@ -750,7 +750,7 @@ fn test_extended_keys_differ_by_engine_id() {
 #[cfg(feature = "crypto-fips")]
 #[test]
 fn test_fips_rejects_des_encrypt() {
-    let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0; 16]);
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0; 16]).unwrap();
     let result = priv_key.encrypt(b"test data", 1, 1, None);
     assert!(
         matches!(
@@ -768,7 +768,7 @@ fn test_fips_rejects_des_encrypt() {
 #[cfg(feature = "crypto-fips")]
 #[test]
 fn test_fips_rejects_3des_encrypt() {
-    let priv_key = PrivKey::from_bytes(PrivProtocol::Des3, vec![0; 32]);
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Des3, vec![0; 32]).unwrap();
     let result = priv_key.encrypt(b"test data", 1, 1, None);
     assert!(
         matches!(
@@ -826,7 +826,7 @@ fn test_golden_sha2_key_localization() {
 #[test]
 fn test_golden_aes128_roundtrip() {
     let key = vec![0x42; 16];
-    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key);
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key).unwrap();
     let plaintext = b"cross-provider verification payload";
     let engine_boots = 1u32;
     let engine_time = 1u32;
@@ -851,7 +851,7 @@ fn test_golden_aes128_roundtrip() {
 #[test]
 fn test_golden_aes256_roundtrip() {
     let key = vec![0xAB; 32];
-    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key);
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key).unwrap();
     let plaintext = b"another cross-provider verification test";
     let engine_boots = 42u32;
     let engine_time = 12345u32;
