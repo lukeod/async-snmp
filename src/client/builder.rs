@@ -440,6 +440,14 @@ impl ClientBuilder {
             return Err(Error::Config("GETBULK not supported in SNMPv1".into()).boxed());
         }
 
+        // AllowNonIncreasing uses O(n) memory for cycle detection; require a bound
+        if self.oid_ordering == OidOrdering::AllowNonIncreasing && self.max_walk_results.is_none() {
+            return Err(Error::Config(
+                "AllowNonIncreasing requires max_walk_results to bound memory usage".into(),
+            )
+            .boxed());
+        }
+
         Ok(())
     }
 

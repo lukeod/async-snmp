@@ -1145,6 +1145,15 @@ impl Agent {
             match candidate {
                 None => return None,
                 Some(ref next_vb) => {
+                    if next_vb.oid <= search_from {
+                        tracing::error!(
+                            target: "async_snmp::agent",
+                            from = %search_from,
+                            got = %next_vb.oid,
+                            "handler returned non-increasing OID in GETNEXT"
+                        );
+                        return None;
+                    }
                     if let Some(ref vacm) = self.inner.vacm {
                         if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
                             return candidate;
