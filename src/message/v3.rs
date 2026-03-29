@@ -97,6 +97,20 @@ impl SecurityLevel {
     }
 }
 
+impl TryFrom<u8> for SecurityLevel {
+    type Error = u8;
+
+    fn try_from(flags: u8) -> std::result::Result<Self, u8> {
+        Self::from_flags(flags).ok_or(flags)
+    }
+}
+
+impl From<SecurityLevel> for u8 {
+    fn from(level: SecurityLevel) -> u8 {
+        level.to_flags()
+    }
+}
+
 /// Message flags (RFC 3412 Section 6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsgFlags {
@@ -518,6 +532,24 @@ mod tests {
             Some(SecurityLevel::AuthPriv)
         );
         assert_eq!(SecurityLevel::from_flags(0x02), None); // Invalid
+    }
+
+    #[test]
+    fn security_level_try_from_u8() {
+        assert_eq!(
+            SecurityLevel::try_from(0x00),
+            Ok(SecurityLevel::NoAuthNoPriv)
+        );
+        assert_eq!(SecurityLevel::try_from(0x01), Ok(SecurityLevel::AuthNoPriv));
+        assert_eq!(SecurityLevel::try_from(0x03), Ok(SecurityLevel::AuthPriv));
+        assert_eq!(SecurityLevel::try_from(0x02), Err(0x02));
+    }
+
+    #[test]
+    fn security_level_into_u8() {
+        assert_eq!(u8::from(SecurityLevel::NoAuthNoPriv), 0x00);
+        assert_eq!(u8::from(SecurityLevel::AuthNoPriv), 0x01);
+        assert_eq!(u8::from(SecurityLevel::AuthPriv), 0x03);
     }
 
     #[test]
