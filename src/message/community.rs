@@ -198,14 +198,11 @@ impl CommunityMessage {
 
     /// Consume and return the standard PDU.
     ///
-    /// # Panics
-    /// Panics if the PDU is a TrapV1. Use `into_community_pdu()` for a non-panicking version.
-    pub fn into_pdu(self) -> Pdu {
+    /// Returns `None` if the PDU is a TrapV1.
+    pub fn into_pdu(self) -> Option<Pdu> {
         match self.pdu {
-            CommunityPdu::Standard(p) => p,
-            CommunityPdu::TrapV1(_) => {
-                panic!("community message contains TrapV1; use pdu directly")
-            }
+            CommunityPdu::Standard(p) => Some(p),
+            CommunityPdu::TrapV1(_) => None,
         }
     }
 

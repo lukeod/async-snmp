@@ -302,7 +302,7 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
-                    let response_pdu = match response.try_into_pdu() {
+                    let response_pdu = match response.into_pdu() {
                         Some(p) => p,
                         None => {
                             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "received TrapV1 in response to request");
