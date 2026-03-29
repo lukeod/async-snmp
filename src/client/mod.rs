@@ -114,9 +114,16 @@ pub const DEFAULT_MAX_REPETITIONS: u32 = 25;
 /// SNMP client.
 ///
 /// Generic over transport type, with `UdpHandle` as default.
-#[derive(Clone)]
 pub struct Client<T: Transport = UdpHandle> {
     inner: Arc<ClientInner<T>>,
+}
+
+impl<T: Transport> Clone for Client<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 struct ClientInner<T: Transport> {
