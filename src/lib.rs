@@ -445,8 +445,8 @@ pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};
 pub use transport::{MAX_UDP_PAYLOAD, TcpTransport, Transport, UdpHandle, UdpTransport};
 pub use v3::{
-    AuthProtocol, EngineCache, LocalizedKey, MasterKey, MasterKeys, ParseProtocolError,
-    PrivProtocol,
+    AuthProtocol, CryptoProvider, EngineCache, LocalizedKey, MasterKey, MasterKeys,
+    ParseProtocolError, PrivProtocol, RustCryptoProvider,
 };
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;

@@ -24,4 +24,5 @@ Cargo.lock
 # Project-specific
 /docs
 /fuzz/target
+/reference
 /tests/vendor/

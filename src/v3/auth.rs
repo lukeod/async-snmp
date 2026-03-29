@@ -30,10 +30,10 @@
 //! let key2 = master.localize(b"\x80\x00\x1f\x88\x81...");
 //! ```
 
-use digest::{Digest, KeyInit, Mac, OutputSizeUser, core_api::BlockSizeUser};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::AuthProtocol;
+use super::crypto::CryptoProvider;
 
 /// Minimum password length recommended by net-snmp.
 ///
@@ -287,126 +287,32 @@ impl AsRef<[u8]> for LocalizedKey {
     }
 }
 
-/// Dispatch a generic function over the hash type for a given `AuthProtocol`.
-///
-/// Usage: `dispatch_auth!(protocol, fn_name, arg1, arg2, ...)`
-/// Expands to `fn_name::<HashType>(arg1, arg2, ...)` for the matching hash.
-macro_rules! dispatch_auth {
-    ($protocol:expr, $fn:ident, $($arg:expr),*) => {
-        match $protocol {
-            AuthProtocol::Md5 => $fn::<md5::Md5>($($arg),*),
-            AuthProtocol::Sha1 => $fn::<sha1::Sha1>($($arg),*),
-            AuthProtocol::Sha224 => $fn::<sha2::Sha224>($($arg),*),
-            AuthProtocol::Sha256 => $fn::<sha2::Sha256>($($arg),*),
-            AuthProtocol::Sha384 => $fn::<sha2::Sha384>($($arg),*),
-            AuthProtocol::Sha512 => $fn::<sha2::Sha512>($($arg),*),
-        }
-    };
-}
-
 /// Password to key transformation (RFC 3414 Section A.2.1).
 ///
-/// Creates a 1MB string by repeating the password, then hashes it.
+/// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
 fn password_to_key(protocol: AuthProtocol, password: &[u8]) -> Vec<u8> {
-    const EXPANSION_SIZE: usize = 1_048_576; // 1MB
-    dispatch_auth!(protocol, password_to_key_impl, password, EXPANSION_SIZE)
-}
-
-fn password_to_key_impl<D>(password: &[u8], expansion_size: usize) -> Vec<u8>
-where
-    D: Digest + Default,
-{
-    if password.is_empty() {
-        // Empty password results in all-zero key
-        return vec![0u8; <D as OutputSizeUser>::output_size()];
-    }
-
-    let mut hasher = D::new();
-
-    // RFC 3414 A.2.1: Form a 1MB string by repeating the password
-    // and hash it in 64-byte chunks (matching net-snmp's approach)
-    let mut buf = [0u8; 64];
-    let password_len = password.len();
-    let mut password_index = 0;
-    let mut count = 0;
-
-    while count < expansion_size {
-        // Fill buffer with password bytes
-        for byte in &mut buf {
-            *byte = password[password_index];
-            password_index = (password_index + 1) % password_len;
-        }
-        hasher.update(buf);
-        count += 64;
-    }
-
-    hasher.finalize().to_vec()
+    super::crypto::provider().password_to_key(protocol, password)
 }
 
 /// Key localization (RFC 3414 Section A.2.2).
 ///
-/// Binds a master key to a specific engine ID:
-/// localized_key = H(master_key || engine_id || master_key)
+/// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
 fn localize_key(protocol: AuthProtocol, master_key: &[u8], engine_id: &[u8]) -> Vec<u8> {
-    dispatch_auth!(protocol, localize_key_impl, master_key, engine_id)
-}
-
-fn localize_key_impl<D>(master_key: &[u8], engine_id: &[u8]) -> Vec<u8>
-where
-    D: Digest + Default,
-{
-    let mut hasher = D::new();
-    hasher.update(master_key);
-    hasher.update(engine_id);
-    hasher.update(master_key);
-    hasher.finalize().to_vec()
+    super::crypto::provider().localize_key(protocol, master_key, engine_id)
 }
 
 /// Compute HMAC with the appropriate algorithm.
+///
+/// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
 fn compute_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> Vec<u8> {
-    let truncate_len = protocol.mac_len();
-    dispatch_auth!(protocol, compute_hmac_impl, key, data, truncate_len)
-}
-
-/// Generic HMAC computation with truncation.
-fn compute_hmac_impl<D>(key: &[u8], data: &[u8], truncate_len: usize) -> Vec<u8>
-where
-    D: Digest + BlockSizeUser + Clone,
-{
-    use hmac::SimpleHmac;
-
-    let mut mac =
-        <SimpleHmac<D> as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
-    Mac::update(&mut mac, data);
-    let result = mac.finalize().into_bytes();
-    result[..truncate_len].to_vec()
+    super::crypto::provider().compute_hmac(protocol, key, &[data], protocol.mac_len())
 }
 
 /// HMAC computation over multiple data slices (avoids concatenation allocation).
+///
+/// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
 fn compute_hmac_slices(protocol: AuthProtocol, key: &[u8], slices: &[&[u8]]) -> Vec<u8> {
-    let truncate_len = protocol.mac_len();
-    dispatch_auth!(
-        protocol,
-        compute_hmac_slices_impl,
-        key,
-        slices,
-        truncate_len
-    )
-}
-
-fn compute_hmac_slices_impl<D>(key: &[u8], slices: &[&[u8]], truncate_len: usize) -> Vec<u8>
-where
-    D: Digest + BlockSizeUser + Clone,
-{
-    use hmac::SimpleHmac;
-
-    let mut mac =
-        <SimpleHmac<D> as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
-    for slice in slices {
-        Mac::update(&mut mac, slice);
-    }
-    let result = mac.finalize().into_bytes();
-    result[..truncate_len].to_vec()
+    super::crypto::provider().compute_hmac(protocol, key, slices, protocol.mac_len())
 }
 
 /// Authenticate an outgoing message by computing and inserting the HMAC.
@@ -637,30 +543,12 @@ pub(crate) fn extend_key(protocol: AuthProtocol, key: &[u8], target_len: usize) 
         return key[..target_len].to_vec();
     }
 
-    match protocol {
-        AuthProtocol::Md5 => extend_key_impl::<md5::Md5>(key, target_len),
-        AuthProtocol::Sha1 => extend_key_impl::<sha1::Sha1>(key, target_len),
-        AuthProtocol::Sha224 => extend_key_impl::<sha2::Sha224>(key, target_len),
-        AuthProtocol::Sha256 => extend_key_impl::<sha2::Sha256>(key, target_len),
-        AuthProtocol::Sha384 => extend_key_impl::<sha2::Sha384>(key, target_len),
-        AuthProtocol::Sha512 => extend_key_impl::<sha2::Sha512>(key, target_len),
-    }
-}
-
-/// Generic implementation of Blumenthal key extension.
-///
-/// Algorithm: Kul' = Kul || H(Kul) || H(Kul || H(Kul)) || ...
-fn extend_key_impl<D>(key: &[u8], target_len: usize) -> Vec<u8>
-where
-    D: Digest + Default,
-{
+    let provider = super::crypto::provider();
     let mut result = key.to_vec();
 
     // Keep appending H(result) until we have enough bytes
     while result.len() < target_len {
-        let mut hasher = D::new();
-        hasher.update(&result);
-        let hash = hasher.finalize();
+        let hash = provider.hash(protocol, &result);
         result.extend_from_slice(&hash);
     }
 
