@@ -657,6 +657,14 @@ impl<const N: usize> From<[u32; N]> for Oid {
     }
 }
 
+impl From<Vec<u32>> for Oid {
+    fn from(arcs: Vec<u32>) -> Self {
+        Self {
+            arcs: SmallVec::from_vec(arcs),
+        }
+    }
+}
+
 impl PartialOrd for Oid {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -778,6 +786,13 @@ mod tests {
     fn test_macro() {
         let oid = oid!(1, 3, 6, 1);
         assert_eq!(oid.arcs(), &[1, 3, 6, 1]);
+    }
+
+    #[test]
+    fn from_vec_u32() {
+        let v = vec![1, 3, 6, 1, 2, 1];
+        let oid = Oid::from(v);
+        assert_eq!(oid.arcs(), &[1, 3, 6, 1, 2, 1]);
     }
 
     // AUDIT-001: Test arc validation
