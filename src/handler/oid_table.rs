@@ -138,6 +138,16 @@ impl<V> Default for OidTable<V> {
     }
 }
 
+impl<'a, V> IntoIterator for &'a OidTable<V> {
+    type Item = (&'a Oid, &'a V);
+    type IntoIter =
+        std::iter::Map<std::slice::Iter<'a, (Oid, V)>, fn(&'a (Oid, V)) -> (&'a Oid, &'a V)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(o, v)| (o, v))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

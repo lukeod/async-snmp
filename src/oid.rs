@@ -671,6 +671,24 @@ impl AsRef<[u32]> for Oid {
     }
 }
 
+impl<'a> IntoIterator for &'a Oid {
+    type Item = &'a u32;
+    type IntoIter = std::slice::Iter<'a, u32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.arcs().iter()
+    }
+}
+
+impl IntoIterator for Oid {
+    type Item = u32;
+    type IntoIter = smallvec::IntoIter<[u32; 16]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.arcs.into_iter()
+    }
+}
+
 impl PartialOrd for Oid {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -1172,5 +1190,29 @@ mod tests {
         let empty = Oid::empty();
         assert_eq!(empty.suffix(0), Some(&[][..]));
         assert!(empty.suffix(1).is_none());
+    }
+
+    #[test]
+    fn oid_into_iter_ref() {
+        let oid = Oid::new([1, 3, 6]);
+        let arcs: Vec<&u32> = (&oid).into_iter().collect();
+        assert_eq!(arcs, vec![&1, &3, &6]);
+    }
+
+    #[test]
+    fn oid_into_iter_owned() {
+        let oid = Oid::new([1, 3, 6]);
+        let arcs: Vec<u32> = oid.into_iter().collect();
+        assert_eq!(arcs, vec![1, 3, 6]);
+    }
+
+    #[test]
+    fn oid_for_loop() {
+        let oid = Oid::new([1, 3, 6]);
+        let mut sum = 0u32;
+        for arc in &oid {
+            sum += arc;
+        }
+        assert_eq!(sum, 10);
     }
 }
