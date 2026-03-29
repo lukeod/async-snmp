@@ -73,7 +73,7 @@ pub fn alloc_request_id() -> i32 {
 ///
 /// All transports implement this trait uniformly. For shared transports,
 /// handles (not the pool itself) implement Transport.
-pub trait Transport: Send + Sync + Clone {
+pub trait Transport: Send + Sync {
     /// Send request data to the target.
     fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
