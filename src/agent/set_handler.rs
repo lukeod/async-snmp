@@ -78,14 +78,21 @@ impl Agent {
 
             if !result.is_ok() {
                 // Commit failed - rollback all previously committed varbinds
+                let mut undo_failed = false;
                 for c in committed.iter().rev() {
                     let undo_result = c.handler.undo_set(ctx, &c.oid, &c.value).await;
                     if !undo_result.is_ok() {
+                        undo_failed = true;
                         tracing::warn!(target: "async_snmp::agent", { oid = %c.oid }, "undo_set failed during rollback");
                     }
                 }
 
-                return Ok(pdu.to_error_response(ErrorStatus::CommitFailed, (index + 1) as i32));
+                let status = if undo_failed {
+                    ErrorStatus::UndoFailed
+                } else {
+                    ErrorStatus::CommitFailed
+                };
+                return Ok(pdu.to_error_response(status, (index + 1) as i32));
             }
 
             committed.push(p);

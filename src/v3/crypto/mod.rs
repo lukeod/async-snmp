@@ -26,6 +26,8 @@ pub enum CryptoError {
     InvalidKeyLength,
     /// The cipher operation failed internally.
     CipherError,
+    /// The OS random source is unavailable.
+    RandomSource,
 }
 
 impl std::fmt::Display for CryptoError {
@@ -36,6 +38,7 @@ impl std::fmt::Display for CryptoError {
             }
             Self::InvalidKeyLength => write!(f, "invalid key length"),
             Self::CipherError => write!(f, "cipher operation failed"),
+            Self::RandomSource => write!(f, "OS random source unavailable"),
         }
     }
 }

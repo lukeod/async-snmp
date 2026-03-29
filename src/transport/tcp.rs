@@ -79,6 +79,7 @@ use crate::error::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -201,7 +202,7 @@ impl TcpTransportBuilder {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
                 active_guard: Mutex::new(None),
-                current_timeout: std::sync::Mutex::new(Duration::from_secs(30)),
+                current_timeout_ms: AtomicU64::new(30_000),
                 target,
                 local_addr,
                 max_allocation_size: self.options.max_allocation_size,
@@ -268,8 +269,8 @@ struct TcpTransportInner {
     /// Holds the stream lock between send() and recv() to serialize operations.
     /// Uses tokio::sync::Mutex so the guard is dropped on task cancellation.
     active_guard: Mutex<Option<OwnedMutexGuard<TcpStream>>>,
-    /// Timeout for current request (set by register_request)
-    current_timeout: std::sync::Mutex<Duration>,
+    /// Timeout for current request in milliseconds (set by register_request)
+    current_timeout_ms: AtomicU64,
     target: SocketAddr,
     local_addr: SocketAddr,
     /// Maximum allocation size for incoming messages
@@ -355,7 +356,7 @@ impl TcpTransport {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
                 active_guard: Mutex::new(None),
-                current_timeout: std::sync::Mutex::new(Duration::from_secs(30)),
+                current_timeout_ms: AtomicU64::new(30_000),
                 target,
                 local_addr,
                 max_allocation_size: options.max_allocation_size,
@@ -398,11 +399,14 @@ impl Transport for TcpTransport {
     }
 
     fn register_request(&self, _request_id: i32, timeout: Duration) {
-        *self.inner.current_timeout.lock().unwrap() = timeout;
+        self.inner
+            .current_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
     }
 
     async fn recv(&self, request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        let recv_timeout = *self.inner.current_timeout.lock().unwrap();
+        let recv_timeout =
+            Duration::from_millis(self.inner.current_timeout_ms.load(Ordering::Relaxed));
         let target = self.inner.target;
 
         // Take the guard that was stored by send().

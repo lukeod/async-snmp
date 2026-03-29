@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::RwLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -220,10 +220,48 @@ impl EngineState {
     }
 }
 
-/// Thread-safe cache of discovered engine state.
+/// Default TTL for engine cache entries (5 minutes).
 ///
-/// Use this to share engine discovery results across multiple clients
-/// targeting different engines.
+/// Entries not refreshed by a successful authenticated exchange within
+/// this duration are considered stale. This handles device replacement
+/// (new engine ID at the same IP) without requiring unauthenticated
+/// re-discovery on Report PDUs.
+const DEFAULT_ENGINE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Thread-safe cache of discovered SNMPv3 engine state.
+///
+/// Before sending authenticated SNMPv3 messages, a client must discover
+/// the target engine's ID, boot counter, and time (RFC 3414 Section 4).
+/// This cache stores those results so that subsequent requests, or other
+/// clients sharing the same cache via [`Arc`], skip the discovery round trip.
+///
+/// # Entry lifetime
+///
+/// Each entry tracks a `synced_at` timestamp that is reset on every
+/// successful time update ([`update_time`](Self::update_time)). Entries
+/// whose `synced_at` exceeds the configured TTL (default 5 minutes) are
+/// treated as expired: [`get`](Self::get) returns `None` and the stale
+/// entry is removed, causing the next request to re-run discovery.
+///
+/// This TTL-based expiry handles **device replacement** (a new device with
+/// a different engine ID appearing at the same IP address). Without it,
+/// the client would hold a stale engine ID indefinitely and every request
+/// would fail with `usmStatsUnknownEngineIDs`. Automatic re-discovery on
+/// that Report PDU was considered but rejected because Report PDUs are
+/// unauthenticated, making it possible for a spoofed report to force
+/// re-discovery toward a rogue engine. The TTL approach avoids this: only
+/// entries that have not been refreshed by a successful authenticated
+/// exchange are expired.
+///
+/// Actively polled targets refresh their entry on every response, so the
+/// TTL has no effect during normal operation.
+///
+/// # Capacity
+///
+/// The cache is unbounded by default. Each entry is roughly 100-150 bytes,
+/// so even 100k targets uses only ~10-15 MB. For deployments that scan
+/// very large address ranges, [`with_max_capacity`](Self::with_max_capacity)
+/// sets a hard limit with oldest-entry eviction.
 ///
 /// # Example
 ///
@@ -246,27 +284,86 @@ impl EngineState {
 ///     .connect()
 ///     .await?;
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct EngineCache {
     engines: RwLock<HashMap<SocketAddr, EngineState>>,
+    max_capacity: Option<usize>,
+    ttl: Duration,
+}
+
+impl Default for EngineCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EngineCache {
-    /// Create a new empty engine cache.
+    /// Create a new empty engine cache with default settings.
     pub fn new() -> Self {
         Self {
             engines: RwLock::new(HashMap::new()),
+            max_capacity: None,
+            ttl: DEFAULT_ENGINE_CACHE_TTL,
         }
     }
 
+    /// Set a maximum capacity. When full, the oldest entry is evicted on insert.
+    pub fn with_max_capacity(mut self, max_capacity: usize) -> Self {
+        self.max_capacity = Some(max_capacity.max(1));
+        self
+    }
+
+    /// Set the TTL for cache entries. Entries not refreshed within this
+    /// duration are removed on lookup, triggering re-discovery.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
     /// Get cached engine state for a target.
+    ///
+    /// Returns `None` if the entry does not exist or has expired.
+    /// Expired entries are removed from the cache.
     pub fn get(&self, target: &SocketAddr) -> Option<EngineState> {
-        self.engines.read().ok()?.get(target).cloned()
+        // Fast path: read lock, check existence and TTL.
+        {
+            let engines = self.engines.read().ok()?;
+            match engines.get(target) {
+                None => return None,
+                Some(state) if state.synced_at.elapsed() <= self.ttl => {
+                    return Some(state.clone());
+                }
+                Some(_) => {} // expired, fall through to evict
+            }
+        }
+        // Slow path: write lock to remove the stale entry.
+        if let Ok(mut engines) = self.engines.write() {
+            if let Some(state) = engines.get(target) {
+                if state.synced_at.elapsed() > self.ttl {
+                    engines.remove(target);
+                }
+            }
+        }
+        None
     }
 
     /// Store engine state for a target.
+    ///
+    /// If a max capacity is set and the cache is full, the entry with
+    /// the oldest `synced_at` time is evicted.
     pub fn insert(&self, target: SocketAddr, state: EngineState) {
         if let Ok(mut engines) = self.engines.write() {
+            if let Some(cap) = self.max_capacity {
+                if !engines.contains_key(&target) && engines.len() >= cap {
+                    if let Some(oldest) = engines
+                        .iter()
+                        .min_by_key(|(_, s)| s.synced_at)
+                        .map(|(k, _)| *k)
+                    {
+                        engines.remove(&oldest);
+                    }
+                }
+            }
             engines.insert(target, state);
         }
     }
@@ -300,7 +397,7 @@ impl EngineCache {
         }
     }
 
-    /// Get the number of cached engines.
+    /// Get the number of cached engines (including expired entries).
     pub fn len(&self) -> usize {
         self.engines.read().map(|e| e.len()).unwrap_or(0)
     }
@@ -667,6 +764,60 @@ mod tests {
         let removed = cache.remove(&addr).unwrap();
         assert_eq!(removed.latest_received_engine_time, 1100);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_engine_cache_ttl_expiry() {
+        let cache = EngineCache::new().with_ttl(Duration::from_millis(50));
+        let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
+
+        let state = EngineState::new(Bytes::from_static(b"engine1"), 1, 1000);
+        cache.insert(addr, state);
+        assert!(cache.get(&addr).is_some());
+
+        // Wait for TTL to expire
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cache.get(&addr).is_none(), "expired entry should return None");
+        assert!(cache.is_empty(), "expired entry should be removed");
+    }
+
+    #[test]
+    fn test_engine_cache_ttl_refresh_on_time_update() {
+        let cache = EngineCache::new().with_ttl(Duration::from_millis(80));
+        let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
+
+        let state = EngineState::new(Bytes::from_static(b"engine1"), 1, 1000);
+        cache.insert(addr, state);
+
+        // Wait partway, then refresh via update_time
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(cache.update_time(&addr, 1, 1050));
+
+        // Wait again - would have expired without the refresh
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(cache.get(&addr).is_some(), "refreshed entry should still be alive");
+    }
+
+    #[test]
+    fn test_engine_cache_max_capacity_eviction() {
+        let cache = EngineCache::new().with_max_capacity(2);
+        let addr1: SocketAddr = "192.168.1.1:161".parse().unwrap();
+        let addr2: SocketAddr = "192.168.1.2:161".parse().unwrap();
+        let addr3: SocketAddr = "192.168.1.3:161".parse().unwrap();
+
+        cache.insert(addr1, EngineState::new(Bytes::from_static(b"e1"), 1, 100));
+        std::thread::sleep(Duration::from_millis(10));
+        cache.insert(addr2, EngineState::new(Bytes::from_static(b"e2"), 1, 200));
+        std::thread::sleep(Duration::from_millis(10));
+
+        assert_eq!(cache.len(), 2);
+
+        // Third insert should evict addr1 (oldest synced_at)
+        cache.insert(addr3, EngineState::new(Bytes::from_static(b"e3"), 1, 300));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&addr1).is_none(), "oldest entry should be evicted");
+        assert!(cache.get(&addr2).is_some());
+        assert!(cache.get(&addr3).is_some());
     }
 
     #[test]
