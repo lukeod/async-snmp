@@ -38,7 +38,7 @@ pub struct Retry {
 }
 
 /// Backoff strategy between retry attempts.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum Backoff {
     /// No delay between retries (immediate retry on timeout).
     #[default]

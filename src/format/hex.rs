@@ -104,7 +104,7 @@ pub fn is_printable(bytes: &[u8]) -> bool {
 }
 
 /// Error type for hex decoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     /// Input has odd length (must be pairs of hex digits)
     OddLength,
