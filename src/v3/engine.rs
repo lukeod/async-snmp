@@ -233,7 +233,7 @@ const DEFAULT_ENGINE_CACHE_TTL: Duration = Duration::from_secs(300);
 /// Before sending authenticated SNMPv3 messages, a client must discover
 /// the target engine's ID, boot counter, and time (RFC 3414 Section 4).
 /// This cache stores those results so that subsequent requests, or other
-/// clients sharing the same cache via [`Arc`], skip the discovery round trip.
+/// clients sharing the same cache via [`Arc`](std::sync::Arc), skip the discovery round trip.
 ///
 /// # Entry lifetime
 ///
@@ -777,7 +777,10 @@ mod tests {
 
         // Wait for TTL to expire
         std::thread::sleep(Duration::from_millis(60));
-        assert!(cache.get(&addr).is_none(), "expired entry should return None");
+        assert!(
+            cache.get(&addr).is_none(),
+            "expired entry should return None"
+        );
         assert!(cache.is_empty(), "expired entry should be removed");
     }
 
@@ -795,7 +798,10 @@ mod tests {
 
         // Wait again - would have expired without the refresh
         std::thread::sleep(Duration::from_millis(50));
-        assert!(cache.get(&addr).is_some(), "refreshed entry should still be alive");
+        assert!(
+            cache.get(&addr).is_some(),
+            "refreshed entry should still be alive"
+        );
     }
 
     #[test]
@@ -815,7 +821,10 @@ mod tests {
         // Third insert should evict addr1 (oldest synced_at)
         cache.insert(addr3, EngineState::new(Bytes::from_static(b"e3"), 1, 300));
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(&addr1).is_none(), "oldest entry should be evicted");
+        assert!(
+            cache.get(&addr1).is_none(),
+            "oldest entry should be evicted"
+        );
         assert!(cache.get(&addr2).is_some());
         assert!(cache.get(&addr3).is_some());
     }

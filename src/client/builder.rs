@@ -135,6 +135,7 @@ impl From<SocketAddr> for Target {
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct ClientBuilder {
     target: Target,
     auth: Auth,

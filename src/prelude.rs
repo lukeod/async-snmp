@@ -15,7 +15,7 @@
 //! - V3 protocols: [`AuthProtocol`], [`PrivProtocol`]
 //! - The [`oid!`] macro for compile-time OID construction
 
-pub use crate::client::Client;
+pub use crate::client::{Auth, Client, ClientBuilder, Retry};
 pub use crate::error::{Error, Result};
 pub use crate::oid::Oid;
 pub use crate::v3::{AuthProtocol, PrivProtocol};

@@ -391,11 +391,17 @@
 //! ## Cargo Features
 //!
 //! - `agent` - SNMP agent (enabled by default)
+//! - `crypto-rustcrypto` - RustCrypto-based crypto backend (enabled by default). Supports all auth and privacy protocols.
+//! - `crypto-fips` - FIPS 140-3 crypto backend via aws-lc-rs. Rejects MD5, DES, and 3DES. Mutually exclusive with `crypto-rustcrypto`.
 //! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
 //! - `mib` - MIB integration via mib-rs (OID conversions, value formatting helpers)
 //! - `rt-multi-thread` - Multi-threaded tokio runtime
 //! - `tls` - (Placeholder) SNMP over TLS per RFC 6353
 //! - `dtls` - (Placeholder) SNMP over DTLS per RFC 6353
+//!
+//! **Note:** `crypto-rustcrypto` and `crypto-fips` are mutually exclusive.
+//! Exactly one must be enabled. Using `--all-features` will not compile;
+//! specify features explicitly instead.
 
 #[cfg(feature = "agent")]
 pub mod agent;

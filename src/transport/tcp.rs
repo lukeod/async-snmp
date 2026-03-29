@@ -144,6 +144,7 @@ impl Default for TcpOptions {
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct TcpTransportBuilder {
     timeout: Option<Duration>,
     options: TcpOptions,

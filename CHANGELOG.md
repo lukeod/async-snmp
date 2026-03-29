@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pluggable crypto backend via the `CryptoProvider` trait for SNMPv3 USM operations
+- `crypto-rustcrypto` feature (default) backed by RustCrypto crates, supporting all auth and privacy protocols
+- `crypto-fips` feature backed by aws-lc-rs for FIPS 140-3 compliance; rejects MD5, DES, and 3DES at runtime with `CryptoError::UnsupportedAlgorithm`
+- `CryptoProvider` trait, `CryptoError` enum, and `CryptoResult` type alias exported from crate root
+- `RustCryptoProvider` and `AwsLcFipsProvider` concrete provider types (feature-gated)
 - `GenericTrap` enum with `Unknown(i32)` variant for wire values outside the standard 0-6 range
 - `Display` impl for `GenericTrap`
 - `PartialEq`, `Eq` for `Pdu`
@@ -22,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `crypto-rustcrypto` is now an explicit default feature instead of unconditional RustCrypto dependencies. Callers using `default-features = false` must now enable `crypto-rustcrypto` explicitly. The features are mutually exclusive; `--all-features` will not compile.
+- **Breaking:** `MasterKey::from_password()`, `MasterKeys::new()`, `MasterKeys::with_privacy()`, and `LocalizedKey` construction methods now return `Result` to propagate `CryptoError` from the active provider
 - **Breaking:** `TrapV1Pdu.generic_trap` field type changed from `i32` to `GenericTrap`; `generic_trap_enum()` removed - use the field directly
 - **Breaking:** `Notification::trap_oid()` return type changed from `&Oid` to `Result<Oid>`; RFC 3584 OID conversion for TrapV1 enterprise-specific traps is fallible
 - **Breaking:** `MibHandler::undo_set` return type changed from `BoxFuture<'a, ()>` to `BoxFuture<'a, SetResult>`; the return value lets the agent framework detect and log failed rollbacks. Implementations that cannot undo should return `SetResult::CommitFailed`.

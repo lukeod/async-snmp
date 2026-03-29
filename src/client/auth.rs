@@ -154,6 +154,7 @@ pub struct UsmAuth {
 }
 
 /// Builder for SNMPv3 USM authentication.
+#[derive(Debug)]
 pub struct UsmBuilder {
     username: String,
     auth: Option<(AuthProtocol, String)>,

@@ -152,6 +152,7 @@ impl Retry {
 }
 
 /// Builder for exponential backoff retry configuration.
+#[derive(Debug, Clone)]
 pub struct RetryBuilder {
     max_attempts: u32,
     initial: Duration,

@@ -46,8 +46,8 @@ impl VarBind {
         use crate::ber::length_encoded_len;
 
         // VarBind is SEQUENCE { oid, value }
-        let oid_len = self.oid.ber_encoded_len();
-        let value_len = self.value.ber_encoded_len();
+        let oid_len = self.oid.ber_encoded_size();
+        let value_len = self.value.ber_encoded_size();
         let content_len = oid_len + value_len;
 
         // SEQUENCE tag (1) + length encoding + content

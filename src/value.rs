@@ -872,8 +872,8 @@ impl Value {
         )
     }
 
-    /// Returns the total BER-encoded length (tag + length + content).
-    pub(crate) fn ber_encoded_len(&self) -> usize {
+    /// Returns the total BER-encoded size (tag + length + content).
+    pub(crate) fn ber_encoded_size(&self) -> usize {
         use crate::ber::{
             integer_content_len, length_encoded_len, unsigned32_content_len, unsigned64_content_len,
         };
@@ -888,7 +888,7 @@ impl Value {
                 1 + length_encoded_len(content_len) + content_len
             }
             Value::Null => 2, // tag + length(0)
-            Value::ObjectIdentifier(oid) => oid.ber_encoded_len(),
+            Value::ObjectIdentifier(oid) => oid.ber_encoded_size(),
             Value::IpAddress(_) => 6, // tag + length(4) + 4 bytes
             Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => {
                 let content_len = unsigned32_content_len(*v);

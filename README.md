@@ -41,6 +41,10 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 
 **Privacy:** DES, 3DES, AES-128, AES-192, AES-256
 
+**Crypto backends:** Pluggable via the `CryptoProvider` trait. Two built-in providers:
+- `crypto-rustcrypto` (default) - RustCrypto crates, supports all protocols
+- `crypto-fips` - aws-lc-rs for FIPS 140-3 compliance (rejects MD5, DES, 3DES)
+
 ## Installation
 
 ```bash
@@ -247,9 +251,17 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `agent` | Yes | SNMP agent support (includes `quinn-udp`) |
+| `crypto-rustcrypto` | Yes | RustCrypto-based crypto backend (all auth/priv protocols) |
+| `crypto-fips` | No | FIPS 140-3 crypto via aws-lc-rs (rejects MD5, DES, 3DES) |
 | `rt-multi-thread` | No | Multi-threaded tokio runtime |
 | `cli` | No | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 | `mib` | No | MIB integration via [mib-rs](https://github.com/lukeod/mib-rs) (OID name resolution, value formatting) |
+
+`crypto-rustcrypto` and `crypto-fips` are mutually exclusive. Exactly one must be enabled. To use the FIPS backend:
+
+```bash
+cargo add async-snmp --no-default-features --features agent,crypto-fips
+```
 
 ## Minimum Supported Rust Version
 

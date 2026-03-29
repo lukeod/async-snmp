@@ -465,8 +465,8 @@ impl Oid {
         Ok(self.to_ber())
     }
 
-    /// Returns the BER content length (excluding tag and length bytes).
-    pub(crate) fn ber_content_len(&self) -> usize {
+    /// Returns the BER content size (excluding tag and length bytes).
+    pub(crate) fn ber_content_size(&self) -> usize {
         use crate::ber::base128_len;
 
         if self.arcs.is_empty() {
@@ -486,11 +486,11 @@ impl Oid {
         len
     }
 
-    /// Returns the total BER-encoded length (tag + length + content).
-    pub(crate) fn ber_encoded_len(&self) -> usize {
+    /// Returns the total BER-encoded size (tag + length + content).
+    pub(crate) fn ber_encoded_size(&self) -> usize {
         use crate::ber::length_encoded_len;
 
-        let content_len = self.ber_content_len();
+        let content_len = self.ber_content_size();
         1 + length_encoded_len(content_len) + content_len
     }
 

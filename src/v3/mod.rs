@@ -6,8 +6,13 @@
 //! - USM security parameters encoding/decoding
 //! - Key localization (password-to-key derivation)
 //! - Authentication (HMAC-MD5-96, HMAC-SHA-96, HMAC-SHA-224/256/384/512)
-//! - Privacy (DES-CBC, AES-128/192/256-CFB)
+//! - Privacy (DES-CBC, 3DES-EDE-CBC, AES-128/192/256-CFB)
 //! - Engine discovery and time synchronization
+//! - Pluggable cryptographic backends via the [`CryptoProvider`] trait
+//!
+//! The crypto backend is selected at compile time via the `crypto-rustcrypto`
+//! (default) or `crypto-fips` feature flags. See [`CryptoProvider`] and
+//! the crate-level documentation for details.
 
 pub mod auth;
 mod crypto;

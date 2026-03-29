@@ -1,12 +1,17 @@
 //! Pluggable cryptographic provider for SNMPv3 security operations.
 //!
 //! This module defines the [`CryptoProvider`] trait that captures the primitive
-//! cryptographic operations needed by the USM layer, and provides the default
-//! [`RustCryptoProvider`] implementation backed by the RustCrypto crate ecosystem.
+//! cryptographic operations needed by the USM layer, and provides two built-in
+//! implementations:
 //!
-//! The active provider is selected at compile time via feature flags. The default
-//! provider uses RustCrypto crates (sha2, aes, hmac, etc.). Alternative backends
-//! (e.g., aws-lc-rs for FIPS 140-3) can be added as feature-gated implementations.
+//! - [`RustCryptoProvider`] (feature `crypto-rustcrypto`, **default**) - backed by
+//!   the RustCrypto crate ecosystem. Supports all auth and privacy protocols.
+//! - [`AwsLcFipsProvider`] (feature `crypto-fips`) - backed by aws-lc-rs for
+//!   FIPS 140-3 compliance. Rejects MD5, DES, and 3DES as non-FIPS algorithms.
+//!
+//! The active provider is selected at compile time via mutually exclusive feature
+//! flags. Only one provider can be active per build. See the crate-level
+//! documentation for usage.
 
 use super::{AuthProtocol, PrivProtocol};
 
