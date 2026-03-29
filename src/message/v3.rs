@@ -156,7 +156,7 @@ impl MsgFlags {
 }
 
 /// Message global data header (msgGlobalData).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsgGlobalData {
     /// Message identifier for request/response correlation
     pub msg_id: i32,
@@ -262,7 +262,7 @@ impl MsgGlobalData {
 }
 
 /// Scoped PDU (contextEngineID + contextName + PDU).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedPdu {
     /// Context engine ID (typically same as authoritative engine ID)
     pub context_engine_id: Bytes,
@@ -328,7 +328,7 @@ impl ScopedPdu {
 }
 
 /// SNMPv3 message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V3Message {
     /// Global data (header)
     pub global_data: MsgGlobalData,
@@ -339,7 +339,7 @@ pub struct V3Message {
 }
 
 /// Message data payload.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V3MessageData {
     /// Plaintext scoped PDU (noAuthNoPriv or authNoPriv)
     Plaintext(ScopedPdu),

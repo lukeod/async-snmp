@@ -46,7 +46,7 @@ use crate::oid::Oid;
 ///     }
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OidTable<V> {
     /// Entries are kept sorted by OID for efficient GETNEXT
     entries: Vec<(Oid, V)>,
