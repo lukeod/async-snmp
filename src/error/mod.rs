@@ -57,7 +57,7 @@ pub(crate) const UNKNOWN_TARGET: SocketAddr =
 pub type Result<T> = std::result::Result<T, Box<Error>>;
 
 /// Reason a walk operation was aborted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WalkAbortReason {
     /// Agent returned an OID that is not greater than the previous OID.
     NonIncreasing,
@@ -73,6 +73,8 @@ impl std::fmt::Display for WalkAbortReason {
         }
     }
 }
+
+impl std::error::Error for WalkAbortReason {}
 
 /// The main error type for all async-snmp operations.
 ///
@@ -201,7 +203,7 @@ impl Error {
 /// assert_eq!(status.as_i32(), 2);
 /// println!("Error: {}", status); // prints "noSuchName"
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorStatus {
     /// Operation completed successfully (status = 0).
@@ -344,6 +346,13 @@ impl std::fmt::Display for ErrorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_abort_reason_is_error() {
+        let reason = WalkAbortReason::NonIncreasing;
+        let err: &dyn std::error::Error = &reason;
+        assert_eq!(err.to_string(), "non-increasing OID");
+    }
 
     #[test]
     fn error_size_budget() {

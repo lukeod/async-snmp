@@ -9,7 +9,7 @@ use crate::oid::Oid;
 use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 
 /// PDU type tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PduType {
     /// GET request - retrieve specific OID values.
@@ -240,7 +240,7 @@ impl Pdu {
 }
 
 /// SNMPv1 generic trap types (RFC 1157 Section 4.1.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenericTrap {
     /// coldStart(0) - agent is reinitializing, config may change
     ColdStart,
@@ -1039,5 +1039,15 @@ mod tests {
         };
 
         assert!(pdu.is_error());
+    }
+
+    #[test]
+    fn pdu_type_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(PduType::GetRequest);
+        set.insert(PduType::GetNextRequest);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&PduType::GetRequest));
     }
 }
