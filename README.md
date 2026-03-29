@@ -182,6 +182,40 @@ async fn main() -> Result<(), async_snmp::Error> {
 | Multiple shared sockets | Extreme scale (~100,000s+ targets), shard by target |
 | Per-client socket (`.connect()`) | When scrape isolation is required (has FD and syscall overhead) |
 
+### Using from Synchronous Code
+
+async-snmp doesn't require your whole application to be async. For CLI tools, scripts, or sync codebases, use a lightweight single-threaded runtime:
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), async_snmp::Error> {
+    let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
+        .connect().await?;
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
+    println!("{:?}", result.value);
+    Ok(())
+}
+```
+
+Or wrap async-snmp for use in a fully synchronous call chain with `block_on()`:
+
+```rust
+fn snmp_get(target: (&str, u16), community: &str) -> Result<VarBind, async_snmp::Error> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime");
+
+    rt.block_on(async {
+        let client = Client::builder(target, Auth::v2c(community))
+            .connect().await?;
+        client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await
+    })
+}
+```
+
+See [examples/lightweight_runtime.rs](examples/lightweight_runtime.rs) and [examples/sync_wrapper.rs](examples/sync_wrapper.rs) for complete examples, including a persistent wrapper struct that reuses the runtime and client across calls.
+
 ### Tracing
 
 The library uses the `tracing` crate for structured logging. Filter by target:
