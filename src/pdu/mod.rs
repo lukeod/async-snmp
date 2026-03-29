@@ -309,7 +309,7 @@ impl GenericTrap {
 ///
 /// This PDU type has a completely different structure from other PDUs.
 /// It is only used in SNMPv1 and is replaced by SNMPv2-Trap in v2c/v3.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrapV1Pdu {
     /// Enterprise OID (sysObjectID of the entity generating the trap)
     pub enterprise: Oid,

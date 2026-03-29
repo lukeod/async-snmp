@@ -18,7 +18,7 @@ use bytes::Bytes;
 ///
 /// SNMPv1 Trap PDUs have a different wire layout from all other PDU types,
 /// so they are decoded into a distinct variant.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommunityPdu {
     /// Standard PDU (Get, GetNext, Response, Set, GetBulk, Inform, TrapV2, Report).
     Standard(Pdu),
