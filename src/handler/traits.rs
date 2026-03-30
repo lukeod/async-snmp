@@ -44,6 +44,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// - [`test_set`](MibHandler::test_set): Validate SET operations (default: read-only)
 /// - [`commit_set`](MibHandler::commit_set): Apply SET operations (default: read-only)
 /// - [`undo_set`](MibHandler::undo_set): Rollback failed SET operations
+/// - [`free_set`](MibHandler::free_set): Cleanup resources on test failure
 /// - [`handles`](MibHandler::handles): Custom OID matching logic
 ///
 /// # GET Implementation
@@ -66,10 +67,13 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// # SET Two-Phase Commit (RFC 3416)
 ///
-/// SET operations use a two-phase commit protocol for atomicity:
+/// SET operations use a multi-phase protocol modeled after net-snmp's
+/// RESERVE1/RESERVE2/ACTION/COMMIT/FREE/UNDO phases:
 ///
 /// 1. **Test phase**: [`test_set`](MibHandler::test_set) is called for ALL varbinds
-///    before any commits. If any test fails, no changes are made.
+///    before any commits. If any test fails, [`free_set`](MibHandler::free_set)
+///    is called for all previously successful varbinds (in reverse order) to
+///    release resources allocated during the test phase.
 ///
 /// 2. **Commit phase**: [`commit_set`](MibHandler::commit_set) is called for each
 ///    varbind in order. If a commit fails, [`undo_set`](MibHandler::undo_set) is
@@ -278,6 +282,24 @@ pub trait MibHandler: Send + Sync + 'static {
         _value: &'a Value,
     ) -> BoxFuture<'a, SetResult> {
         Box::pin(async { SetResult::Ok })
+    }
+
+    /// Free resources allocated during test_set (cleanup on test failure).
+    ///
+    /// Called for varbinds whose test_set succeeded when a later varbind's
+    /// test_set fails. This allows handlers to release any resources
+    /// (locks, temporary allocations) acquired during the test phase.
+    ///
+    /// Called in reverse order, matching the undo_set convention.
+    ///
+    /// Default implementation does nothing.
+    fn free_set<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
     }
 
     /// Check if this handler handles the given OID.

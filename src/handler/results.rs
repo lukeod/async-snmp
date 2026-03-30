@@ -14,10 +14,11 @@ use crate::varbind::VarBind;
 
 /// Result of a SET operation phase (RFC 3416).
 ///
-/// This enum is used by the two-phase SET protocol:
+/// This enum is used by the multi-phase SET protocol:
 /// - [`MibHandler::test_set`](super::MibHandler::test_set): Returns `Ok` if the SET would succeed
 /// - [`MibHandler::commit_set`](super::MibHandler::commit_set): Returns `Ok` if the change was applied
-/// - [`MibHandler::undo_set`](super::MibHandler::undo_set): Does not return `SetResult` (best-effort)
+/// - [`MibHandler::undo_set`](super::MibHandler::undo_set): Returns `Ok` on successful rollback
+/// - [`MibHandler::free_set`](super::MibHandler::free_set): Returns `()` (cleanup is best-effort)
 ///
 /// # Choosing the Right Error
 ///

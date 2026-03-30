@@ -46,12 +46,14 @@
 //! }
 //! ```
 //!
-//! # SET Operations and Two-Phase Commit
+//! # SET Operations and Multi-Phase Protocol
 //!
-//! SET operations follow a two-phase commit protocol as defined in RFC 3416:
+//! SET operations follow a multi-phase protocol as defined in RFC 3416, modeled
+//! after net-snmp's RESERVE/ACTION/COMMIT/FREE/UNDO phases:
 //!
 //! 1. **Test Phase**: [`MibHandler::test_set`] is called for ALL varbinds before any
-//!    commits. If any test fails, no changes are made and the appropriate error is
+//!    commits. If any test fails, [`MibHandler::free_set`] is called for all previously
+//!    successful varbinds (in reverse order) to release resources, then the error is
 //!    returned.
 //!
 //! 2. **Commit Phase**: [`MibHandler::commit_set`] is called for each varbind in order.
