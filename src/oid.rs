@@ -105,6 +105,10 @@ impl Oid {
     /// assert!(invalid.validate().is_err());
     /// ```
     pub fn parse(s: &str) -> Result<Self> {
+        // Accept leading-dot notation (e.g. ".1.3.6.1.2.1") used by net-snmp
+        // and common in SNMP documentation to indicate absolute OIDs.
+        let s = s.strip_prefix('.').unwrap_or(s);
+
         if s.is_empty() {
             return Ok(Self::empty());
         }
@@ -770,11 +774,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_leading_dot() {
+        let oid = Oid::parse(".1.3.6").unwrap();
+        assert_eq!(oid.arcs(), &[1, 3, 6]);
+
+        let oid = Oid::parse(".1.3.6.1.2.1").unwrap();
+        assert_eq!(oid.arcs(), &[1, 3, 6, 1, 2, 1]);
+
+        // Leading dot on single arc
+        let oid = Oid::parse(".0").unwrap();
+        assert_eq!(oid.arcs(), &[0]);
+
+        // Just a dot yields empty OID
+        let oid = Oid::parse(".").unwrap();
+        assert!(oid.is_empty());
+    }
+
+    #[test]
     fn test_parse_rejects_empty_components() {
-        assert!(Oid::parse(".1.3.6").is_err());
-        assert!(Oid::parse("1.3.6.").is_err());
-        assert!(Oid::parse("1..3.6").is_err());
-        assert!(Oid::parse("...").is_err());
+        assert!(Oid::parse("1.3.6.").is_err());  // Trailing dot
+        assert!(Oid::parse("1..3.6").is_err());   // Double dot
+        assert!(Oid::parse("..1.3").is_err());     // Double leading dot
+        assert!(Oid::parse("...").is_err());       // All dots
     }
 
     #[test]
