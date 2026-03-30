@@ -97,7 +97,7 @@ use crate::notification::UsmConfig;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::util::bind_udp_socket;
-use crate::v3::SaltCounter;
+use crate::v3::{MAX_ENGINE_TIME, SaltCounter};
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -556,6 +556,7 @@ impl AgentBuilder {
                 engine_boots: AtomicU32::new(1),
                 engine_time: AtomicU32::new(0),
                 engine_start: Instant::now(),
+                engine_boots_base: 1,
                 salt_counter: SaltCounter::new(),
                 max_message_size: self.max_message_size,
                 concurrency_limit,
@@ -591,6 +592,8 @@ pub(crate) struct AgentInner {
     pub(crate) engine_boots: AtomicU32,
     pub(crate) engine_time: AtomicU32,
     pub(crate) engine_start: Instant,
+    /// Initial engine_boots value at startup, used to compute overflow-adjusted boots.
+    pub(crate) engine_boots_base: u32,
     pub(crate) salt_counter: SaltCounter,
     pub(crate) max_message_size: usize,
     pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
@@ -620,6 +623,21 @@ pub(crate) struct AgentInner {
     pub(crate) usm_not_in_time_windows: AtomicU32,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
+}
+
+/// Compute engine boots and time from a base boots value and total elapsed
+/// seconds since engine start.
+///
+/// Per RFC 3414 Section 2.3, each time the elapsed seconds reaches
+/// MAX_ENGINE_TIME (2^31-1), boots increments by one and time wraps to zero.
+/// The boots value is capped at MAX_ENGINE_TIME (the "latched" state per
+/// RFC 3414 Section 2.2.3).
+fn compute_engine_boots_time(boots_base: u32, total_elapsed_secs: u64) -> (u32, u32) {
+    let max = MAX_ENGINE_TIME as u64;
+    let additional_boots = total_elapsed_secs / max;
+    let current_time = (total_elapsed_secs % max) as u32;
+    let boots = (boots_base as u64 + additional_boots).min(max) as u32;
+    (boots, current_time)
 }
 
 /// SNMP Agent.
@@ -887,15 +905,28 @@ impl Agent {
         }
     }
 
-    /// Update engine time based on elapsed time since start.
+    /// Update engine boots and time based on elapsed time since start.
+    ///
+    /// Per RFC 3414 Section 2.3, when snmpEngineTime reaches MAX_ENGINE_TIME
+    /// (2^31-1), snmpEngineBoots is incremented and snmpEngineTime resets to
+    /// zero. The boots/time pair is derived from total elapsed seconds and
+    /// the base boots value at startup, so no mutable state beyond the
+    /// atomics is needed.
     fn update_engine_time(&self) {
-        let elapsed = self
-            .inner
-            .engine_start
-            .elapsed()
-            .as_secs()
-            .min(u32::MAX as u64) as u32;
-        self.inner.engine_time.store(elapsed, Ordering::Relaxed);
+        let total_secs = self.inner.engine_start.elapsed().as_secs();
+        let (boots, time) =
+            compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+
+        if boots != self.inner.engine_boots.load(Ordering::Relaxed) && boots > self.inner.engine_boots_base {
+            tracing::warn!(
+                target: "async_snmp::agent",
+                engine_boots = boots,
+                "engine time wrapped past MAX_ENGINE_TIME, incrementing engine boots"
+            );
+        }
+
+        self.inner.engine_boots.store(boots, Ordering::Relaxed);
+        self.inner.engine_time.store(time, Ordering::Relaxed);
     }
 
     /// Validate community string using constant-time comparison.
@@ -2000,5 +2031,82 @@ mod tests {
             "should skip Counter64 and return next non-Counter64 OID"
         );
         assert!(matches!(response.varbinds[0].value, Value::Integer(42)));
+    }
+
+    #[test]
+    fn test_engine_time_no_overflow() {
+        // Normal operation: elapsed < MAX_ENGINE_TIME, boots stays at base
+        let (boots, time) = super::compute_engine_boots_time(1, 1000);
+        assert_eq!(boots, 1);
+        assert_eq!(time, 1000);
+    }
+
+    #[test]
+    fn test_engine_time_zero_elapsed() {
+        let (boots, time) = super::compute_engine_boots_time(1, 0);
+        assert_eq!(boots, 1);
+        assert_eq!(time, 0);
+    }
+
+    #[test]
+    fn test_engine_time_just_below_max() {
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let (boots, time) = super::compute_engine_boots_time(1, max as u64 - 1);
+        assert_eq!(boots, 1);
+        assert_eq!(time, max - 1);
+    }
+
+    #[test]
+    fn test_engine_time_at_max_wraps() {
+        // Exactly at MAX_ENGINE_TIME seconds: boots increments, time resets to 0
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let (boots, time) = super::compute_engine_boots_time(1, max as u64);
+        assert_eq!(boots, 2, "boots should increment when elapsed reaches MAX_ENGINE_TIME");
+        assert_eq!(time, 0, "time should wrap to 0");
+    }
+
+    #[test]
+    fn test_engine_time_past_max() {
+        // 500 seconds past the first wrap
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let (boots, time) = super::compute_engine_boots_time(1, max as u64 + 500);
+        assert_eq!(boots, 2);
+        assert_eq!(time, 500);
+    }
+
+    #[test]
+    fn test_engine_time_multiple_wraps() {
+        // Three full cycles
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let elapsed = max as u64 * 3 + 42;
+        let (boots, time) = super::compute_engine_boots_time(1, elapsed);
+        assert_eq!(boots, 4, "base 1 + 3 wraps = 4");
+        assert_eq!(time, 42);
+    }
+
+    #[test]
+    fn test_engine_time_boots_capped_at_max() {
+        // If enough wraps happen that boots would exceed MAX_ENGINE_TIME, cap it
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let elapsed = max as u64 * (max as u64); // way more wraps than max allows
+        let (boots, _time) = super::compute_engine_boots_time(1, elapsed);
+        assert_eq!(boots, max, "boots should be capped at MAX_ENGINE_TIME");
+    }
+
+    #[test]
+    fn test_engine_time_base_boots_preserved() {
+        // A non-1 base boots (e.g. from persistence) is respected
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let (boots, time) = super::compute_engine_boots_time(5, max as u64 + 100);
+        assert_eq!(boots, 6, "base 5 + 1 wrap = 6");
+        assert_eq!(time, 100);
+    }
+
+    #[test]
+    fn test_engine_time_high_base_boots_capped() {
+        // Base boots near MAX_ENGINE_TIME with a wrap should cap
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let (boots, _time) = super::compute_engine_boots_time(max - 1, max as u64 * 2);
+        assert_eq!(boots, max, "should cap at MAX_ENGINE_TIME, not overflow");
     }
 }

@@ -161,7 +161,15 @@ impl EngineState {
     /// Get the estimated current engine time.
     ///
     /// This adds elapsed local time to the synced engine time.
-    /// Per RFC 3414 Section 2.2.1, the result is capped at MAX_ENGINE_TIME (2^31-1).
+    /// Per RFC 3414 Section 2.2.1, the result is capped at MAX_ENGINE_TIME
+    /// (2^31-1).
+    ///
+    /// Note: the client does not locally increment engine_boots when the
+    /// estimated time reaches MAX_ENGINE_TIME. The authoritative engine
+    /// (agent) is responsible for the boots increment; the client will
+    /// learn the new boots value from the agent's next response or from
+    /// a notInTimeWindow Report. Until that happens, the capped time is
+    /// the best estimate the client can produce.
     pub fn estimated_time(&self) -> u32 {
         let elapsed = self.synced_at.elapsed().as_secs() as u32;
         self.engine_time
