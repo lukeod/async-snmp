@@ -123,7 +123,10 @@ fn validate_walk_varbind(
     oid_tracker: &mut OidTracker,
     target: std::net::SocketAddr,
 ) -> VarbindOutcome {
-    if matches!(vb.value, Value::EndOfMibView) {
+    if matches!(
+        vb.value,
+        Value::EndOfMibView | Value::NoSuchObject | Value::NoSuchInstance
+    ) {
         return VarbindOutcome::Done;
     }
     if !vb.oid.starts_with(base_oid) {
@@ -481,5 +484,59 @@ impl<T: Transport + 'static> Stream for WalkStream<T> {
             WalkStream::GetNext(walk) => Pin::new(walk).poll_next(cx),
             WalkStream::GetBulk(bulk_walk) => Pin::new(bulk_walk).poll_next(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oid;
+
+    fn target_addr() -> std::net::SocketAddr {
+        "127.0.0.1:161".parse().unwrap()
+    }
+
+    #[test]
+    fn test_walk_terminates_on_no_such_object() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::NoSuchObject);
+        assert!(matches!(
+            validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Done
+        ));
+    }
+
+    #[test]
+    fn test_walk_terminates_on_no_such_instance() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::NoSuchInstance);
+        assert!(matches!(
+            validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Done
+        ));
+    }
+
+    #[test]
+    fn test_walk_terminates_on_end_of_mib_view() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::EndOfMibView);
+        assert!(matches!(
+            validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Done
+        ));
+    }
+
+    #[test]
+    fn test_walk_yields_normal_value() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Integer(42));
+        assert!(matches!(
+            validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Yield
+        ));
     }
 }
