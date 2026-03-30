@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.11.0] - 2026-03-28
+## [Unreleased]
 
 ### Added
 
@@ -14,6 +14,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `crypto-fips` feature backed by aws-lc-rs for FIPS 140-3 compliance; rejects MD5, DES, and 3DES at runtime with `CryptoError::UnsupportedAlgorithm`
 - `CryptoProvider` trait, `CryptoError` enum, and `CryptoResult` type alias exported from crate root
 - `RustCryptoProvider` and `AwsLcFipsProvider` concrete provider types (feature-gated)
+- Security requirements documentation on `CryptoProvider` trait for custom implementations
+- Trait impls across public types: `TryFrom<i32>` for `Version`/`RowStatus`/`StorageType`, `TryFrom<u8>`/`Into<u8>` for `SecurityLevel`, `From<Vec<u32>>` for `Oid`, `Hash` for `PduType`/`GenericTrap`/`ErrorStatus`/`WalkAbortReason`, `PartialEq`/`Eq` for `UsmSecurityParams` and message types, `AsRef` for `Oid`/`MasterKey`/`LocalizedKey`, `IntoIterator` for `Oid`/`OidTable`, `Copy` for `Backoff`/`DecodeError`, `Debug` for `DerivedKeys`/`VarBindInfo`
+- `ClientBuilder`, `UsmBuilder`, `RetryBuilder`, `TcpTransportBuilder` now derive `Debug`; `RetryBuilder` also derives `Clone`
+- `Auth`, `ClientBuilder`, and `Retry` re-exported from the prelude
+- Examples for sync and lightweight runtime usage
+
+### Changed
+
+- **Breaking:** `crypto-rustcrypto` is now an explicit default feature instead of unconditional RustCrypto dependencies. Callers using `default-features = false` must now enable `crypto-rustcrypto` explicitly. The features are mutually exclusive; `--all-features` will not compile.
+- **Breaking:** `MasterKey::from_password()`, `MasterKeys::new()`, `MasterKeys::with_privacy()`, and `LocalizedKey` construction methods now return `Result` to propagate `CryptoError` from the active provider
+- **Breaking:** `Transport` trait no longer requires `Clone`
+- **Breaking:** `Message::pdu()`, `Message::into_pdu()`, and `CommunityMessage::into_pdu()` now return `Option` instead of panicking; removed redundant `try_pdu()`/`try_into_pdu()`
+- `UdpTransport::shutdown()` is now async and awaits the background recv task for clean shutdown confirmation
+- Internal BER methods renamed from `ber_encoded_len`/`ber_content_len` to `ber_encoded_size`/`ber_content_size` to match public `encoded_size` convention
+
+### Fixed
+
+- GETNEXT loop in agent could run forever with buggy handlers; `get_next_accessible_oid()` now checks OID monotonicity
+- Engine time truncation in agent; now uses saturating cast via `.min(u32::MAX as u64)`
+- `getrandom` failure in `random_nonzero_u64()` could panic; now returns `CryptoResult`
+- TCP timeout `std::sync::Mutex` could poison; replaced with `AtomicU64`
+- VACM misconfiguration was silent; `resolve_vacm()` now logs a warning when a group has no matching access entry
+- Response auth key could unwrap on None; `extract_auth_key()` now returns `&DerivedKeys` alongside the auth key
+- SET `undo_set` failure during rollback returned `CommitFailed` instead of `UndoFailed` per RFC 3416
+- `EngineCache` grew without bound; now unbounded by default (negligible per-entry cost) with `with_max_capacity()` for hard limits
+- UDP pending requests HashMap had no cleanup; recv loop now runs `cleanup_expired()` every second
+- `snmpSilentDrops` counter was defined but never incremented; agent run loop now checks encoded response size against max message size per RFC 3413
+- Unnecessary allocation in `verify_message`
+
+## [0.11.0] - 2026-03-28
+
+### Added
+
 - `GenericTrap` enum with `Unknown(i32)` variant for wire values outside the standard 0-6 range
 - `Display` impl for `GenericTrap`
 - `PartialEq`, `Eq` for `Pdu`
@@ -27,8 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `crypto-rustcrypto` is now an explicit default feature instead of unconditional RustCrypto dependencies. Callers using `default-features = false` must now enable `crypto-rustcrypto` explicitly. The features are mutually exclusive; `--all-features` will not compile.
-- **Breaking:** `MasterKey::from_password()`, `MasterKeys::new()`, `MasterKeys::with_privacy()`, and `LocalizedKey` construction methods now return `Result` to propagate `CryptoError` from the active provider
 - **Breaking:** `TrapV1Pdu.generic_trap` field type changed from `i32` to `GenericTrap`; `generic_trap_enum()` removed - use the field directly
 - **Breaking:** `Notification::trap_oid()` return type changed from `&Oid` to `Result<Oid>`; RFC 3584 OID conversion for TrapV1 enterprise-specific traps is fallible
 - **Breaking:** `MibHandler::undo_set` return type changed from `BoxFuture<'a, ()>` to `BoxFuture<'a, SetResult>`; the return value lets the agent framework detect and log failed rollbacks. Implementations that cannot undo should return `SetResult::CommitFailed`.
@@ -294,6 +325,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.11.0...HEAD
 [0.11.0]: https://github.com/async-snmp/async-snmp/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/async-snmp/async-snmp/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/async-snmp/async-snmp/compare/v0.8.0...v0.9.0
