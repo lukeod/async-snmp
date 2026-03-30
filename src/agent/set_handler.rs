@@ -59,7 +59,13 @@ impl Agent {
             let result = handler.handler.test_set(ctx, &vb.oid, &vb.value).await;
 
             if !result.is_ok() {
-                return Ok(pdu.to_error_response(result.to_error_status(), (index + 1) as i32));
+                let status = result.to_error_status();
+                let status = if ctx.version == Version::V1 {
+                    status.to_v1()
+                } else {
+                    status
+                };
+                return Ok(pdu.to_error_response(status, (index + 1) as i32));
             }
 
             pending.push(PendingSet {
@@ -91,6 +97,11 @@ impl Agent {
                     ErrorStatus::UndoFailed
                 } else {
                     ErrorStatus::CommitFailed
+                };
+                let status = if ctx.version == Version::V1 {
+                    status.to_v1()
+                } else {
+                    status
                 };
                 return Ok(pdu.to_error_response(status, (index + 1) as i32));
             }

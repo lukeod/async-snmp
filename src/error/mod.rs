@@ -304,6 +304,30 @@ impl ErrorStatus {
         }
     }
 
+    /// Map a v2c+ error status to its v1 equivalent per RFC 2576 Section 4.3.
+    ///
+    /// V1-native statuses (0-5) pass through unchanged.
+    pub fn to_v1(&self) -> Self {
+        match self {
+            // V1-native statuses
+            Self::NoError | Self::TooBig | Self::NoSuchName | Self::BadValue
+            | Self::ReadOnly | Self::GenErr => *self,
+
+            // Value errors -> BadValue
+            Self::WrongType | Self::WrongLength | Self::WrongEncoding
+            | Self::WrongValue | Self::InconsistentValue => Self::BadValue,
+
+            // Access/creation errors -> NoSuchName
+            Self::NoAccess | Self::NotWritable | Self::NoCreation
+            | Self::InconsistentName | Self::AuthorizationError => Self::NoSuchName,
+
+            // Resource/commit errors -> GenErr
+            Self::ResourceUnavailable | Self::CommitFailed | Self::UndoFailed => Self::GenErr,
+
+            Self::Unknown(_) => Self::GenErr,
+        }
+    }
+
     /// Return the canonical SMI name for this status code.
     ///
     /// For `Unknown` variants, returns `None`; callers should format the
@@ -352,6 +376,37 @@ mod tests {
         let reason = WalkAbortReason::NonIncreasing;
         let err: &dyn std::error::Error = &reason;
         assert_eq!(err.to_string(), "non-increasing OID");
+    }
+
+    #[test]
+    fn error_status_to_v1_mapping() {
+        // RFC 2576 Section 4.3 mappings
+        // V1 statuses (0-5) pass through unchanged
+        assert_eq!(ErrorStatus::NoError.to_v1(), ErrorStatus::NoError);
+        assert_eq!(ErrorStatus::TooBig.to_v1(), ErrorStatus::TooBig);
+        assert_eq!(ErrorStatus::NoSuchName.to_v1(), ErrorStatus::NoSuchName);
+        assert_eq!(ErrorStatus::BadValue.to_v1(), ErrorStatus::BadValue);
+        assert_eq!(ErrorStatus::ReadOnly.to_v1(), ErrorStatus::ReadOnly);
+        assert_eq!(ErrorStatus::GenErr.to_v1(), ErrorStatus::GenErr);
+
+        // WrongValue/WrongType/WrongLength/WrongEncoding/InconsistentValue -> BadValue
+        assert_eq!(ErrorStatus::WrongValue.to_v1(), ErrorStatus::BadValue);
+        assert_eq!(ErrorStatus::WrongType.to_v1(), ErrorStatus::BadValue);
+        assert_eq!(ErrorStatus::WrongLength.to_v1(), ErrorStatus::BadValue);
+        assert_eq!(ErrorStatus::WrongEncoding.to_v1(), ErrorStatus::BadValue);
+        assert_eq!(ErrorStatus::InconsistentValue.to_v1(), ErrorStatus::BadValue);
+
+        // NoAccess/NotWritable/NoCreation/InconsistentName/AuthorizationError -> NoSuchName
+        assert_eq!(ErrorStatus::NoAccess.to_v1(), ErrorStatus::NoSuchName);
+        assert_eq!(ErrorStatus::NotWritable.to_v1(), ErrorStatus::NoSuchName);
+        assert_eq!(ErrorStatus::NoCreation.to_v1(), ErrorStatus::NoSuchName);
+        assert_eq!(ErrorStatus::InconsistentName.to_v1(), ErrorStatus::NoSuchName);
+        assert_eq!(ErrorStatus::AuthorizationError.to_v1(), ErrorStatus::NoSuchName);
+
+        // ResourceUnavailable/CommitFailed/UndoFailed -> GenErr
+        assert_eq!(ErrorStatus::ResourceUnavailable.to_v1(), ErrorStatus::GenErr);
+        assert_eq!(ErrorStatus::CommitFailed.to_v1(), ErrorStatus::GenErr);
+        assert_eq!(ErrorStatus::UndoFailed.to_v1(), ErrorStatus::GenErr);
     }
 
     #[test]
