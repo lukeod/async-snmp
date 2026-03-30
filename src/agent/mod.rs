@@ -165,6 +165,7 @@ pub struct AgentBuilder {
     usm_users: HashMap<Bytes, UsmConfig>,
     handlers: Vec<RegisteredHandler>,
     engine_id: Option<Vec<u8>>,
+    engine_boots: u32,
     max_message_size: usize,
     max_concurrent_requests: Option<usize>,
     recv_buffer_size: Option<usize>,
@@ -189,6 +190,7 @@ impl AgentBuilder {
             usm_users: HashMap::new(),
             handlers: Vec::new(),
             engine_id: None,
+            engine_boots: 1,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_requests: Some(1000),
             recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
@@ -358,6 +360,35 @@ impl AgentBuilder {
     /// ```
     pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
         self.engine_id = Some(engine_id.into());
+        self
+    }
+
+    /// Set the initial engine boots value.
+    ///
+    /// Per RFC 3414 Section 2.3, snmpEngineBoots must be monotonically
+    /// increasing across restarts. The application is responsible for
+    /// persisting and restoring this value. If not set, defaults to 1.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    ///
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// // Load persisted value (e.g. from file or database)
+    /// let persisted_boots: u32 = 42;
+    ///
+    /// let agent = Agent::builder()
+    ///     .bind("0.0.0.0:1161")
+    ///     .engine_boots(persisted_boots)
+    ///     .community(b"public")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn engine_boots(mut self, boots: u32) -> Self {
+        self.engine_boots = boots;
         self
     }
 
@@ -553,10 +584,10 @@ impl AgentBuilder {
                 usm_users: self.usm_users,
                 handlers: self.handlers,
                 engine_id,
-                engine_boots: AtomicU32::new(1),
+                engine_boots: AtomicU32::new(self.engine_boots),
                 engine_time: AtomicU32::new(0),
                 engine_start: Instant::now(),
-                engine_boots_base: 1,
+                engine_boots_base: self.engine_boots,
                 salt_counter: SaltCounter::new(),
                 max_message_size: self.max_message_size,
                 concurrency_limit,
@@ -678,6 +709,20 @@ impl Agent {
     /// Get the engine ID.
     pub fn engine_id(&self) -> &[u8] {
         &self.inner.engine_id
+    }
+
+    /// Get the current engine boots value.
+    ///
+    /// Useful for persisting across restarts per RFC 3414 Section 2.3.
+    /// The persisted value should be passed to `AgentBuilder::engine_boots()`
+    /// on the next startup.
+    pub fn engine_boots(&self) -> u32 {
+        self.inner.engine_boots.load(Ordering::Relaxed)
+    }
+
+    /// Get the current engine time value.
+    pub fn engine_time(&self) -> u32 {
+        self.inner.engine_time.load(Ordering::Relaxed)
     }
 
     /// Get the cancellation token for this agent.
@@ -2108,5 +2153,32 @@ mod tests {
         let max = crate::v3::MAX_ENGINE_TIME;
         let (boots, _time) = super::compute_engine_boots_time(max - 1, max as u64 * 2);
         assert_eq!(boots, max, "should cap at MAX_ENGINE_TIME, not overflow");
+    }
+
+    #[tokio::test]
+    async fn test_engine_boots_builder() {
+        // engine_boots builder method sets the initial boots value
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .engine_boots(42)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(agent.engine_boots(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_engine_boots_default() {
+        // Default engine_boots is 1
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(agent.engine_boots(), 1);
     }
 }
