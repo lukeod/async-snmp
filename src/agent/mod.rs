@@ -927,7 +927,13 @@ impl Agent {
         match pdu.pdu_type {
             PduType::GetRequest => self.handle_get(ctx, pdu).await,
             PduType::GetNextRequest => self.handle_get_next(ctx, pdu).await,
-            PduType::GetBulkRequest => self.handle_get_bulk(ctx, pdu).await,
+            PduType::GetBulkRequest => {
+                // SNMPv1 does not support GETBULK
+                if ctx.version == Version::V1 {
+                    return Ok(pdu.to_error_response(ErrorStatus::GenErr, 0));
+                }
+                self.handle_get_bulk(ctx, pdu).await
+            }
             PduType::SetRequest => self.handle_set(ctx, pdu).await,
             PduType::InformRequest => self.handle_inform(pdu),
             _ => {
@@ -1720,6 +1726,38 @@ mod tests {
                 .varbinds
                 .iter()
                 .any(|vb| vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v1_getbulk_rejected() {
+        // SNMPv1 does not support GETBULK. Should return GenErr.
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .build()
+            .await
+            .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.version = Version::V1;
+        ctx.security_model = SecurityModel::V1;
+        ctx.pdu_type = PduType::GetBulkRequest;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 10,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(
+            ErrorStatus::from_i32(response.error_status),
+            ErrorStatus::GenErr,
+            "v1 GETBULK should be rejected"
         );
     }
 
