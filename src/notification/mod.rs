@@ -195,7 +195,7 @@ impl NotificationReceiverBuilder {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
-        let socket = bind_udp_socket(bind_addr, None)
+        let socket = bind_udp_socket(bind_addr, None, None)
             .await
             .map_err(|e| Error::Network {
                 target: bind_addr,
@@ -435,7 +435,7 @@ impl NotificationReceiver {
             .parse()
             .map_err(|_| Error::Config(format!("invalid bind address: {}", addr_str).into()))?;
 
-        let socket = bind_udp_socket(bind_addr, None)
+        let socket = bind_udp_socket(bind_addr, None, None)
             .await
             .map_err(|e| Error::Network {
                 target: bind_addr,

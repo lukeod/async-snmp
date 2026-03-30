@@ -232,6 +232,8 @@ impl UdpTransport {
 pub struct UdpTransportBuilder {
     bind_addr: String,
     config: UdpTransportConfig,
+    recv_buffer_size: Option<usize>,
+    send_buffer_size: Option<usize>,
 }
 
 impl UdpTransportBuilder {
@@ -242,6 +244,8 @@ impl UdpTransportBuilder {
         Self {
             bind_addr: "0.0.0.0:0".into(),
             config: UdpTransportConfig::default(),
+            recv_buffer_size: None,
+            send_buffer_size: None,
         }
     }
 
@@ -266,13 +270,30 @@ impl UdpTransportBuilder {
         self
     }
 
+    /// Set the socket receive buffer size (SO_RCVBUF).
+    ///
+    /// Larger buffers prevent packet loss during traffic bursts.
+    /// The kernel may cap this at `net.core.rmem_max`.
+    pub fn recv_buffer_size(mut self, size: usize) -> Self {
+        self.recv_buffer_size = Some(size);
+        self
+    }
+
+    /// Set the socket send buffer size (SO_SNDBUF).
+    ///
+    /// The kernel may cap this at `net.core.wmem_max`.
+    pub fn send_buffer_size(mut self, size: usize) -> Self {
+        self.send_buffer_size = Some(size);
+        self
+    }
+
     /// Build the transport.
     pub async fn build(self) -> Result<UdpTransport> {
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
-        let socket = bind_udp_socket(bind_addr, None)
+        let socket = bind_udp_socket(bind_addr, self.recv_buffer_size, self.send_buffer_size)
             .await
             .map_err(|e| Error::Network {
                 target: bind_addr,
@@ -422,5 +443,26 @@ mod tests {
             .unwrap();
         let handle = transport.handle("127.0.0.1:161".parse().unwrap());
         assert_eq!(handle.max_message_size(), 8192);
+    }
+
+    #[tokio::test]
+    async fn recv_buffer_size_configurable() {
+        // Should not panic or fail - kernel may cap the value
+        let transport = UdpTransport::builder()
+            .recv_buffer_size(2 * 1024 * 1024)
+            .build()
+            .await
+            .unwrap();
+        assert!(transport.local_addr().port() > 0);
+    }
+
+    #[tokio::test]
+    async fn send_buffer_size_configurable() {
+        let transport = UdpTransport::builder()
+            .send_buffer_size(512 * 1024)
+            .build()
+            .await
+            .unwrap();
+        assert!(transport.local_addr().port() > 0);
     }
 }
