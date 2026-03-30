@@ -26,6 +26,7 @@ pub(crate) async fn bind_udp_socket(
     addr: SocketAddr,
     recv_buffer_size: Option<usize>,
     send_buffer_size: Option<usize>,
+    reuse_address: bool,
 ) -> io::Result<UdpSocket> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -41,8 +42,13 @@ pub(crate) async fn bind_udp_socket(
         socket.set_only_v6(false)?;
     }
 
-    // Allow address reuse for quick restarts
-    socket.set_reuse_address(true)?;
+    // SO_REUSEADDR allows another process to bind the same port and steal traffic.
+    // Only enable for client sockets (ephemeral ports) where it helps with quick
+    // restarts. Agent and notification listener sockets should not set this to
+    // prevent port hijacking.
+    if reuse_address {
+        socket.set_reuse_address(true)?;
+    }
 
     // Set buffer sizes if requested (kernel may cap at rmem_max/wmem_max)
     if let Some(size) = recv_buffer_size {
@@ -67,7 +73,7 @@ mod tests {
     #[tokio::test]
     async fn test_bind_udp_socket_ipv4() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let socket = bind_udp_socket(addr, None, None).await.unwrap();
+        let socket = bind_udp_socket(addr, None, None, true).await.unwrap();
         let local = socket.local_addr().unwrap();
         assert!(local.is_ipv4());
         assert_ne!(local.port(), 0);
@@ -76,7 +82,7 @@ mod tests {
     #[tokio::test]
     async fn test_bind_udp_socket_ipv6() {
         let addr: SocketAddr = "[::1]:0".parse().unwrap();
-        let socket = bind_udp_socket(addr, None, None).await.unwrap();
+        let socket = bind_udp_socket(addr, None, None, true).await.unwrap();
         let local = socket.local_addr().unwrap();
         assert!(local.is_ipv6());
         assert_ne!(local.port(), 0);
@@ -85,7 +91,7 @@ mod tests {
     #[tokio::test]
     async fn test_bind_udp_socket_with_buffer_size() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let socket = bind_udp_socket(addr, Some(1024 * 1024), None)
+        let socket = bind_udp_socket(addr, Some(1024 * 1024), None, true)
             .await
             .unwrap();
         let local = socket.local_addr().unwrap();
