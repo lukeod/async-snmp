@@ -563,6 +563,52 @@ impl<T: Transport> Client<T> {
                     // Extract security params before consuming response
                     let response_security_params = response.security_params.clone();
 
+                    // Decode USM params early for security validation and later reuse
+                    let response_usm =
+                        UsmSecurityParams::decode(response_security_params.clone())?;
+
+                    // Validate security level matches what we sent (prevent downgrade attacks)
+                    if response.global_data.msg_flags.security_level != security_level {
+                        tracing::warn!(target: "async_snmp::client", {
+                            peer = %self.peer_addr(),
+                            expected = ?security_level,
+                            actual = ?response.global_data.msg_flags.security_level
+                        }, "security level mismatch in response");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
+                    }
+
+                    // Validate engine ID matches our cached engine state
+                    {
+                        let state = self.inner.engine_state.read().map_err(|_| {
+                            Error::Config("engine_state lock poisoned".into()).boxed()
+                        })?;
+                        if let Some(ref s) = *state
+                            && response_usm.engine_id != s.engine_id
+                        {
+                            tracing::warn!(target: "async_snmp::client", {
+                                peer = %self.peer_addr()
+                            }, "engine ID mismatch in response");
+                            return Err(Error::MalformedResponse {
+                                target: self.peer_addr(),
+                            }
+                            .boxed());
+                        }
+                    }
+
+                    // Validate username matches what we sent
+                    if response_usm.username != security.username {
+                        tracing::warn!(target: "async_snmp::client", {
+                            peer = %self.peer_addr()
+                        }, "username mismatch in response");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
+                    }
+
                     // Extract PDU (with decryption if required)
                     let response_pdu = if security_level.requires_priv() {
                         self.decrypt_response_pdu(response, &response_security_params)?
@@ -587,14 +633,16 @@ impl<T: Transport> Client<T> {
 
                     tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type, snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status, snmp.error_index = response_pdu.error_index }, "received V3 {} response", response_pdu.pdu_type);
 
-                    // Update engine time from successful response
+                    // Update engine time from successful response (reuse already-decoded params)
                     {
-                        let usm_params = UsmSecurityParams::decode(response_security_params)?;
                         let mut state = self.inner.engine_state.write().map_err(|_| {
                             Error::Config("engine_state lock poisoned".into()).boxed()
                         })?;
                         if let Some(ref mut s) = *state {
-                            s.update_time(usm_params.engine_boots, usm_params.engine_time);
+                            s.update_time(
+                                response_usm.engine_boots,
+                                response_usm.engine_time,
+                            );
                         }
                     }
 
