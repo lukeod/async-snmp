@@ -10,8 +10,8 @@ use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Messag
 use crate::notification::DerivedKeys;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
-use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 use crate::v3::auth::authenticate_message;
+use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 use crate::value::Value;
 use crate::varbind::VarBind;
 
@@ -89,9 +89,7 @@ impl Agent {
         // RFC 3414 Section 2.3: refuse authenticated messages when boots latched
         if security_level.requires_auth() && engine_boots == MAX_ENGINE_TIME {
             tracing::warn!(target: "async_snmp::agent", "engine boots at maximum, refusing authenticated response");
-            self.inner
-                .snmp_silent_drops
-                .fetch_add(1, Ordering::Relaxed);
+            self.inner.snmp_silent_drops.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
 
@@ -218,8 +216,8 @@ mod tests {
     use super::*;
     use crate::agent::Agent;
     use crate::oid;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use crate::handler::{BoxFuture, GetNextResult, GetResult, MibHandler};
 
@@ -254,11 +252,7 @@ mod tests {
     }
 
     fn dummy_v3_msg(security_level: SecurityLevel) -> V3Message {
-        let global = MsgGlobalData::new(
-            1,
-            65507,
-            MsgFlags::new(security_level, true),
-        );
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(security_level, true));
         let pdu = Pdu {
             pdu_type: PduType::Response,
             request_id: 1,

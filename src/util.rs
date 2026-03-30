@@ -85,7 +85,9 @@ mod tests {
     #[tokio::test]
     async fn test_bind_udp_socket_with_buffer_size() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let socket = bind_udp_socket(addr, Some(1024 * 1024), None).await.unwrap();
+        let socket = bind_udp_socket(addr, Some(1024 * 1024), None)
+            .await
+            .unwrap();
         let local = socket.local_addr().unwrap();
         assert!(local.is_ipv4());
         assert_ne!(local.port(), 0);

@@ -139,11 +139,12 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use bytes::Bytes;
 
+    use crate::Oid;
     use crate::agent::Agent;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, MibHandler, RequestContext, SecurityModel, SetResult,
@@ -154,7 +155,6 @@ mod tests {
     use crate::value::Value;
     use crate::varbind::VarBind;
     use crate::version::Version;
-    use crate::Oid;
 
     /// Handler that accepts test_set for .99999.1.0 but rejects .99999.2.0,
     /// tracking free_set calls via an atomic counter.

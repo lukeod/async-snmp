@@ -15,15 +15,15 @@ use crate::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
-use crate::v3::{MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
 use crate::v3::auth::{authenticate_message, verify_message};
+use crate::v3::{MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
 use crate::value::Value;
 use crate::varbind::VarBind;
 
-use crate::v3::compute_engine_boots_time;
 use super::types::DerivedKeys;
 use super::varbind::extract_notification_varbinds;
 use super::{Notification, ReceiverInner};
+use crate::v3::compute_engine_boots_time;
 
 impl super::NotificationReceiver {
     /// Handle SNMPv1 message.
@@ -340,7 +340,8 @@ impl super::NotificationReceiver {
             time,
             usm_params.username.clone(),
         );
-        let response_scoped = ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
+        let response_scoped =
+            ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
         let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
 
         self.inner

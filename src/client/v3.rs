@@ -564,8 +564,7 @@ impl<T: Transport> Client<T> {
                     let response_security_params = response.security_params.clone();
 
                     // Decode USM params early for security validation and later reuse
-                    let response_usm =
-                        UsmSecurityParams::decode(response_security_params.clone())?;
+                    let response_usm = UsmSecurityParams::decode(response_security_params.clone())?;
 
                     // Validate security level matches what we sent (prevent downgrade attacks)
                     if response.global_data.msg_flags.security_level != security_level {
@@ -639,10 +638,7 @@ impl<T: Transport> Client<T> {
                             Error::Config("engine_state lock poisoned".into()).boxed()
                         })?;
                         if let Some(ref mut s) = *state {
-                            s.update_time(
-                                response_usm.engine_boots,
-                                response_usm.engine_time,
-                            );
+                            s.update_time(response_usm.engine_boots, response_usm.engine_time);
                         }
                     }
 

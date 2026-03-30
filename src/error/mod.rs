@@ -310,16 +310,26 @@ impl ErrorStatus {
     pub fn to_v1(&self) -> Self {
         match self {
             // V1-native statuses
-            Self::NoError | Self::TooBig | Self::NoSuchName | Self::BadValue
-            | Self::ReadOnly | Self::GenErr => *self,
+            Self::NoError
+            | Self::TooBig
+            | Self::NoSuchName
+            | Self::BadValue
+            | Self::ReadOnly
+            | Self::GenErr => *self,
 
             // Value errors -> BadValue
-            Self::WrongType | Self::WrongLength | Self::WrongEncoding
-            | Self::WrongValue | Self::InconsistentValue => Self::BadValue,
+            Self::WrongType
+            | Self::WrongLength
+            | Self::WrongEncoding
+            | Self::WrongValue
+            | Self::InconsistentValue => Self::BadValue,
 
             // Access/creation errors -> NoSuchName
-            Self::NoAccess | Self::NotWritable | Self::NoCreation
-            | Self::InconsistentName | Self::AuthorizationError => Self::NoSuchName,
+            Self::NoAccess
+            | Self::NotWritable
+            | Self::NoCreation
+            | Self::InconsistentName
+            | Self::AuthorizationError => Self::NoSuchName,
 
             // Resource/commit errors -> GenErr
             Self::ResourceUnavailable | Self::CommitFailed | Self::UndoFailed => Self::GenErr,
@@ -394,17 +404,29 @@ mod tests {
         assert_eq!(ErrorStatus::WrongType.to_v1(), ErrorStatus::BadValue);
         assert_eq!(ErrorStatus::WrongLength.to_v1(), ErrorStatus::BadValue);
         assert_eq!(ErrorStatus::WrongEncoding.to_v1(), ErrorStatus::BadValue);
-        assert_eq!(ErrorStatus::InconsistentValue.to_v1(), ErrorStatus::BadValue);
+        assert_eq!(
+            ErrorStatus::InconsistentValue.to_v1(),
+            ErrorStatus::BadValue
+        );
 
         // NoAccess/NotWritable/NoCreation/InconsistentName/AuthorizationError -> NoSuchName
         assert_eq!(ErrorStatus::NoAccess.to_v1(), ErrorStatus::NoSuchName);
         assert_eq!(ErrorStatus::NotWritable.to_v1(), ErrorStatus::NoSuchName);
         assert_eq!(ErrorStatus::NoCreation.to_v1(), ErrorStatus::NoSuchName);
-        assert_eq!(ErrorStatus::InconsistentName.to_v1(), ErrorStatus::NoSuchName);
-        assert_eq!(ErrorStatus::AuthorizationError.to_v1(), ErrorStatus::NoSuchName);
+        assert_eq!(
+            ErrorStatus::InconsistentName.to_v1(),
+            ErrorStatus::NoSuchName
+        );
+        assert_eq!(
+            ErrorStatus::AuthorizationError.to_v1(),
+            ErrorStatus::NoSuchName
+        );
 
         // ResourceUnavailable/CommitFailed/UndoFailed -> GenErr
-        assert_eq!(ErrorStatus::ResourceUnavailable.to_v1(), ErrorStatus::GenErr);
+        assert_eq!(
+            ErrorStatus::ResourceUnavailable.to_v1(),
+            ErrorStatus::GenErr
+        );
         assert_eq!(ErrorStatus::CommitFailed.to_v1(), ErrorStatus::GenErr);
         assert_eq!(ErrorStatus::UndoFailed.to_v1(), ErrorStatus::GenErr);
     }

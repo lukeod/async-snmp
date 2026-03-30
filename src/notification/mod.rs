@@ -779,12 +779,14 @@ mod tests {
             error_index: 0,
             varbinds: vec![
                 VarBind::new(oids::sys_uptime(), Value::TimeTicks(1000)),
-                VarBind::new(oids::snmp_trap_oid(), Value::ObjectIdentifier(oids::cold_start())),
+                VarBind::new(
+                    oids::snmp_trap_oid(),
+                    Value::ObjectIdentifier(oids::cold_start()),
+                ),
             ],
         };
 
-        let global =
-            MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
 
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
@@ -794,11 +796,7 @@ mod tests {
         )
         .with_auth_placeholder(mac_len);
 
-        let scoped = ScopedPdu::new(
-            Bytes::copy_from_slice(engine_id),
-            Bytes::new(),
-            pdu,
-        );
+        let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), pdu);
         let msg = V3Message::new(global, usm_params.encode(), scoped);
         let mut msg_bytes = msg.encode().to_vec();
 
@@ -837,7 +835,10 @@ mod tests {
         );
 
         let result = receiver.handle_v3(msg, source).await;
-        assert!(result.is_err(), "message with engine_time=5000 should be rejected (outside 150s window)");
+        assert!(
+            result.is_err(),
+            "message with engine_time=5000 should be rejected (outside 150s window)"
+        );
     }
 
     #[tokio::test]
@@ -867,7 +868,10 @@ mod tests {
         );
 
         let result = receiver.handle_v3(msg, source).await;
-        assert!(result.is_err(), "message with wrong engine_boots should be rejected");
+        assert!(
+            result.is_err(),
+            "message with wrong engine_boots should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -968,9 +972,7 @@ mod tests {
 
         // The receiver needs to be running recv() to handle the message.
         // Instead, call handle_v3 directly with the client address as source.
-        let result = receiver
-            .handle_v3(discovery_msg, client_addr)
-            .await;
+        let result = receiver.handle_v3(discovery_msg, client_addr).await;
 
         // Discovery should return Ok(None) - not a notification
         assert!(result.is_ok());
@@ -1027,7 +1029,10 @@ mod tests {
 
         let result = receiver.handle_v3(msg, source).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "engine ID mismatch should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "engine ID mismatch should return None"
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
 use crate::pdu::{Pdu, PduType};
-use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 use crate::v3::auth::verify_message;
+use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;

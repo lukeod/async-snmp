@@ -944,10 +944,11 @@ impl Agent {
     /// atomics is needed.
     fn update_engine_time(&self) {
         let total_secs = self.inner.engine_start.elapsed().as_secs();
-        let (boots, time) =
-            compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+        let (boots, time) = compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
 
-        if boots != self.inner.engine_boots.load(Ordering::Relaxed) && boots > self.inner.engine_boots_base {
+        if boots != self.inner.engine_boots.load(Ordering::Relaxed)
+            && boots > self.inner.engine_boots_base
+        {
             tracing::warn!(
                 target: "async_snmp::agent",
                 engine_boots = boots,
@@ -1249,9 +1250,7 @@ impl Agent {
                         return None;
                     }
                     // RFC 2576 Section 4.1.2.3: skip Counter64 for v1
-                    if ctx.version == Version::V1
-                        && matches!(next_vb.value, Value::Counter64(_))
-                    {
+                    if ctx.version == Version::V1 && matches!(next_vb.value, Value::Counter64(_)) {
                         search_from = next_vb.oid.clone();
                         continue;
                     }
@@ -1870,10 +1869,7 @@ mod tests {
         Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .handler(
-                oid!(1, 3, 6, 1, 4, 1, 99999),
-                Arc::new(Counter64Handler),
-            )
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(Counter64Handler))
             .build()
             .await
             .unwrap()
@@ -1955,8 +1951,8 @@ mod tests {
         let pdu = Pdu {
             pdu_type: PduType::GetBulkRequest,
             request_id: 1,
-            error_status: 0,  // non_repeaters
-            error_index: 10,  // max_repetitions
+            error_status: 0, // non_repeaters
+            error_index: 10, // max_repetitions
             varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
         };
 
@@ -2030,7 +2026,10 @@ mod tests {
             .iter()
             .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
             .count();
-        assert_eq!(data_count, 5, "all 5 OIDs should be returned without msg_max_size limit");
+        assert_eq!(
+            data_count, 5,
+            "all 5 OIDs should be returned without msg_max_size limit"
+        );
     }
 
     #[tokio::test]
@@ -2091,7 +2090,10 @@ mod tests {
         // Exactly at MAX_ENGINE_TIME seconds: boots increments, time resets to 0
         let max = crate::v3::MAX_ENGINE_TIME;
         let (boots, time) = crate::v3::compute_engine_boots_time(1, max as u64);
-        assert_eq!(boots, 2, "boots should increment when elapsed reaches MAX_ENGINE_TIME");
+        assert_eq!(
+            boots, 2,
+            "boots should increment when elapsed reaches MAX_ENGINE_TIME"
+        );
         assert_eq!(time, 0, "time should wrap to 0");
     }
 
