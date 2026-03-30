@@ -76,6 +76,7 @@ impl Agent {
             group_name: None,
             read_view: None,
             write_view: None,
+            msg_max_size: None,
         };
 
         // VACM resolution (if enabled)
@@ -270,6 +271,7 @@ impl Agent {
             group_name: None,
             read_view: None,
             write_view: None,
+            msg_max_size: Some(msg.global_data.msg_max_size as u32),
         };
 
         // VACM resolution (if enabled)

@@ -1069,7 +1069,11 @@ impl Agent {
 
         let mut response_varbinds = Vec::new();
         let mut current_size: usize = RESPONSE_OVERHEAD;
-        let max_size = self.inner.max_message_size;
+        let agent_max = self.inner.max_message_size;
+        let max_size = match ctx.msg_max_size {
+            Some(client_max) => agent_max.min(client_max as usize),
+            None => agent_max,
+        };
 
         // Helper to check if we can add a varbind
         let can_add = |vb: &VarBind, current_size: usize| -> bool {
@@ -1305,6 +1309,7 @@ mod tests {
             group_name: None,
             read_view: None,
             write_view: None,
+            msg_max_size: None,
         }
     }
 
@@ -1864,6 +1869,107 @@ mod tests {
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(response.error_status, 0);
         assert!(matches!(response.varbinds[0].value, Value::Counter64(_)));
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_respects_v3_msg_max_size() {
+        // When msg_max_size is set (V3 request), GETBULK should limit the
+        // response to fit within min(agent_max, client_msg_max_size).
+        // The agent has a large max_message_size, but the client advertises
+        // a small msgMaxSize that can only fit a few varbinds.
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(65507) // agent allows large responses
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .build()
+            .await
+            .unwrap();
+
+        // First, get the full response without msg_max_size limit
+        let mut ctx_unlimited = test_ctx();
+        ctx_unlimited.pdu_type = PduType::GetBulkRequest;
+        ctx_unlimited.msg_max_size = None;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 0,  // non_repeaters
+            error_index: 10,  // max_repetitions
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        let full_response = agent.dispatch_request(&ctx_unlimited, &pdu).await.unwrap();
+        let full_count = full_response
+            .varbinds
+            .iter()
+            .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
+            .count();
+        assert!(
+            full_count >= 3,
+            "expected at least 3 data varbinds without limit, got {}",
+            full_count
+        );
+
+        // Now set a small msg_max_size that limits the response.
+        // RESPONSE_OVERHEAD is 100, and each varbind for OIDs like
+        // .1.3.6.1.4.1.99999.N.0 with Integer value is ~22 bytes.
+        // Set msg_max_size to fit overhead + ~2 varbinds but not all 5.
+        let mut ctx_limited = test_ctx();
+        ctx_limited.pdu_type = PduType::GetBulkRequest;
+        ctx_limited.msg_max_size = Some(150); // overhead(100) + room for ~2 varbinds
+
+        let limited_response = agent.dispatch_request(&ctx_limited, &pdu).await.unwrap();
+        let limited_count = limited_response
+            .varbinds
+            .iter()
+            .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
+            .count();
+
+        assert!(
+            limited_count < full_count,
+            "V3 msg_max_size should limit response: got {} varbinds (unlimited: {})",
+            limited_count,
+            full_count
+        );
+        assert!(
+            limited_count > 0,
+            "should still return at least one varbind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_msg_max_size_none_uses_agent_max() {
+        // Without msg_max_size (v1/v2c), the agent's own max_message_size is used.
+        // With a large agent max, all 5 OIDs should be returned.
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(65507)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .build()
+            .await
+            .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        ctx.msg_max_size = None; // v2c, no client limit
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 10,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let data_count = response
+            .varbinds
+            .iter()
+            .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
+            .count();
+        assert_eq!(data_count, 5, "all 5 OIDs should be returned without msg_max_size limit");
     }
 
     #[tokio::test]

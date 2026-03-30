@@ -114,6 +114,15 @@ pub struct RequestContext {
     ///
     /// The view that controls which OIDs can be written.
     pub write_view: Option<Bytes>,
+
+    /// Client-advertised maximum message size (V3 only).
+    ///
+    /// For SNMPv3 requests, this is the msgMaxSize from the V3 message header,
+    /// indicating the largest message the client can accept. The agent should
+    /// limit response sizes to `min(agent_max, msg_max_size)`.
+    ///
+    /// None for v1/v2c requests (no msgMaxSize field in those versions).
+    pub msg_max_size: Option<u32>,
 }
 
 impl RequestContext {
@@ -133,6 +142,7 @@ impl RequestContext {
             group_name: None,
             read_view: None,
             write_view: None,
+            msg_max_size: None,
         }
     }
 }
