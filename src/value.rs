@@ -1063,9 +1063,17 @@ impl Value {
                 let data = decoder.read_bytes(len)?;
                 Ok(Value::Opaque(data))
             }
+            tag::application::NSAP => {
+                let data = decoder.read_bytes(len)?;
+                Ok(Value::OctetString(data))
+            }
             tag::application::COUNTER64 => {
                 let value = decoder.read_integer64_value(len)?;
                 Ok(Value::Counter64(value))
+            }
+            tag::application::UINTEGER32 => {
+                let value = decoder.read_unsigned32_value(len)?;
+                Ok(Value::Gauge32(value))
             }
             tag::context::NO_SUCH_OBJECT => {
                 if len != 0 {
@@ -1464,14 +1472,14 @@ mod tests {
 
     #[test]
     fn test_unknown_tag_preserved() {
-        // Tag 0x45 is application class but not a standard SNMP type
-        let data = Bytes::from_static(&[0x45, 0x03, 0x01, 0x02, 0x03]);
+        // Tag 0x48 is application class but not a standard SNMP type
+        let data = Bytes::from_static(&[0x48, 0x03, 0x01, 0x02, 0x03]);
         let mut decoder = Decoder::new(data);
         let value = Value::decode(&mut decoder).unwrap();
 
         match value {
             Value::Unknown { tag, ref data } => {
-                assert_eq!(tag, 0x45);
+                assert_eq!(tag, 0x48);
                 assert_eq!(data.as_ref(), &[0x01, 0x02, 0x03]);
             }
             _ => panic!("expected Unknown variant"),
@@ -1479,6 +1487,27 @@ mod tests {
 
         // Roundtrip should preserve
         assert_eq!(roundtrip(value.clone()), value);
+    }
+
+    #[test]
+    fn test_nsap_decodes_as_octet_string() {
+        // Historic NSAP type (0x45) decodes as OctetString
+        let data = Bytes::from_static(&[0x45, 0x03, 0x01, 0x02, 0x03]);
+        let mut decoder = Decoder::new(data);
+        let value = Value::decode(&mut decoder).unwrap();
+        assert_eq!(
+            value,
+            Value::OctetString(Bytes::from_static(&[0x01, 0x02, 0x03]))
+        );
+    }
+
+    #[test]
+    fn test_uinteger32_decodes_as_gauge32() {
+        // Historic UInteger32 type (0x47) decodes as Gauge32
+        let data = Bytes::from_static(&[0x47, 0x01, 0x2a]);
+        let mut decoder = Decoder::new(data);
+        let value = Value::decode(&mut decoder).unwrap();
+        assert_eq!(value, Value::Gauge32(42));
     }
 
     // ========================================================================
