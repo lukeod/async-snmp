@@ -473,7 +473,43 @@ impl<T: Transport> WalkStream<T> {
     }
 }
 
-impl_stream_helpers!(WalkStream<T>);
+impl<T: Transport + 'static> WalkStream<T> {
+    /// Get the next varbind, or None when complete.
+    pub async fn next(&mut self) -> Option<Result<VarBind>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+
+    /// Collect all remaining varbinds.
+    ///
+    /// If the walk completes with no results, a fallback GET is attempted on the
+    /// base OID. This handles scalar OIDs (e.g. `sysDescr.0`) where GETNEXT would
+    /// walk past the value. The GET result is only returned if it contains a real
+    /// value (not `NoSuchObject`, `NoSuchInstance`, or `EndOfMibView`).
+    pub async fn collect(mut self) -> Result<Vec<VarBind>> {
+        let mut results = Vec::new();
+        while let Some(result) = self.next().await {
+            results.push(result?);
+        }
+        if results.is_empty() {
+            let (client, base_oid) = match &self {
+                WalkStream::GetNext(w) => (&w.client, &w.base_oid),
+                WalkStream::GetBulk(bw) => (&bw.client, &bw.base_oid),
+            };
+            match client.get(base_oid).await {
+                Ok(vb)
+                    if !matches!(
+                        vb.value,
+                        Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView
+                    ) =>
+                {
+                    results.push(vb);
+                }
+                _ => {}
+            }
+        }
+        Ok(results)
+    }
+}
 
 impl<T: Transport + 'static> Stream for WalkStream<T> {
     type Item = Result<VarBind>;

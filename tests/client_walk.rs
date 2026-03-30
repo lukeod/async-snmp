@@ -101,6 +101,35 @@ async fn walk_empty_subtree_returns_nothing() {
     assert!(results.is_empty());
 }
 
+/// WALK on a scalar OID falls back to GET when walk yields no results.
+///
+/// Walking sysDescr.0 (a scalar instance) returns empty because GETNEXT moves
+/// past it. The fallback GET retrieves the scalar value.
+#[tokio::test]
+async fn walk_scalar_oid_falls_back_to_get() {
+    let agent = TestAgent::new().await;
+
+    let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
+        .connect()
+        .await
+        .unwrap();
+
+    // sysDescr.0 is a scalar instance OID - walk would normally return empty
+    let results = client
+        .walk(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+    assert_eq!(
+        results[0].value,
+        Value::OctetString("Test SNMP Agent".into())
+    );
+}
+
 /// SNMPv1 WALK on empty subtree returns nothing instead of noSuchName.
 #[tokio::test]
 async fn v1_walk_empty_subtree_returns_nothing() {
