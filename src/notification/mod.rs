@@ -56,6 +56,7 @@ mod varbind;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
@@ -136,6 +137,7 @@ pub mod oids {
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
+    engine_boots: u32,
 }
 
 impl NotificationReceiverBuilder {
@@ -148,6 +150,7 @@ impl NotificationReceiverBuilder {
         Self {
             bind_addr: "0.0.0.0:162".to_string(),
             usm_users: HashMap::new(),
+            engine_boots: 1,
         }
     }
 
@@ -189,6 +192,15 @@ impl NotificationReceiverBuilder {
         self
     }
 
+    /// Set the initial engine boots value.
+    ///
+    /// This should be persisted across restarts and incremented each time
+    /// the receiver starts. Default is 1.
+    pub fn engine_boots(mut self, boots: u32) -> Self {
+        self.engine_boots = boots;
+        self
+    }
+
     /// Build the notification receiver.
     pub async fn build(self) -> Result<NotificationReceiver> {
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
@@ -213,6 +225,8 @@ impl NotificationReceiverBuilder {
                 local_addr,
                 usm_users: self.usm_users,
                 salt_counter: SaltCounter::new(),
+                engine_boots_base: self.engine_boots,
+                engine_start: Instant::now(),
             }),
         })
     }
@@ -400,6 +414,10 @@ struct ReceiverInner {
     usm_users: HashMap<Bytes, UsmConfig>,
     /// Salt counter for privacy operations
     salt_counter: SaltCounter,
+    /// Initial engine boots value at startup, used to compute overflow-adjusted boots.
+    engine_boots_base: u32,
+    /// Time when the receiver was started, used to compute engine time.
+    engine_start: Instant,
 }
 
 impl NotificationReceiver {
@@ -453,6 +471,8 @@ impl NotificationReceiver {
                 local_addr,
                 usm_users: HashMap::new(),
                 salt_counter: SaltCounter::new(),
+                engine_boots_base: 1,
+                engine_start: Instant::now(),
             }),
         })
     }
@@ -653,5 +673,193 @@ mod tests {
             notification.trap_oid().unwrap(),
             oid!(1, 3, 6, 1, 4, 1, 9999, 1, 2, 0, 42)
         );
+    }
+
+    #[test]
+    fn test_compute_engine_boots_time_basic() {
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, 1000);
+        assert_eq!(boots, 1);
+        assert_eq!(time, 1000);
+    }
+
+    #[test]
+    fn test_compute_engine_boots_time_zero_elapsed() {
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, 0);
+        assert_eq!(boots, 1);
+        assert_eq!(time, 0);
+    }
+
+    #[test]
+    fn test_builder_engine_boots_default() {
+        let builder = NotificationReceiverBuilder::new();
+        assert_eq!(builder.engine_boots, 1);
+    }
+
+    #[test]
+    fn test_builder_engine_boots_custom() {
+        let builder = NotificationReceiverBuilder::new().engine_boots(5);
+        assert_eq!(builder.engine_boots, 5);
+    }
+
+    /// Build an authenticated V3 InformRequest message with the given
+    /// engine_boots and engine_time in the USM parameters.
+    fn build_authed_v3_inform(
+        engine_id: &[u8],
+        engine_boots: u32,
+        engine_time: u32,
+        username: &[u8],
+        auth_password: &[u8],
+        auth_protocol: AuthProtocol,
+    ) -> Bytes {
+        use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+        use crate::pdu::{Pdu, PduType};
+        use crate::v3::auth::authenticate_message;
+        use crate::v3::{LocalizedKey, UsmSecurityParams};
+        use crate::value::Value;
+
+        let auth_key =
+            LocalizedKey::from_password(auth_protocol, auth_password, engine_id).unwrap();
+        let mac_len = auth_key.mac_len();
+
+        // Build an InformRequest PDU with sysUpTime.0 and snmpTrapOID.0
+        let pdu = Pdu {
+            pdu_type: PduType::InformRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![
+                VarBind::new(oids::sys_uptime(), Value::TimeTicks(1000)),
+                VarBind::new(oids::snmp_trap_oid(), Value::ObjectIdentifier(oids::cold_start())),
+            ],
+        };
+
+        let global =
+            MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
+
+        let usm_params = UsmSecurityParams::new(
+            Bytes::copy_from_slice(engine_id),
+            engine_boots,
+            engine_time,
+            Bytes::copy_from_slice(username),
+        )
+        .with_auth_placeholder(mac_len);
+
+        let scoped = ScopedPdu::new(
+            Bytes::copy_from_slice(engine_id),
+            Bytes::new(),
+            pdu,
+        );
+        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        let mut msg_bytes = msg.encode().to_vec();
+
+        // Compute and insert HMAC
+        let (auth_offset, auth_len) =
+            UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
+        authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
+
+        Bytes::from(msg_bytes)
+    }
+
+    #[tokio::test]
+    async fn test_v3_inform_outside_time_window_rejected() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let engine_id = b"test-engine";
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        // Engine time far in the future (5000 seconds, well beyond 150-second window)
+        let msg = build_authed_v3_inform(
+            engine_id,
+            1,    // correct boots
+            5000, // way outside time window (receiver started ~0 seconds ago)
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+
+        let result = receiver.handle_v3(msg, source).await;
+        assert!(result.is_err(), "message with engine_time=5000 should be rejected (outside 150s window)");
+    }
+
+    #[tokio::test]
+    async fn test_v3_inform_wrong_boots_rejected() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let engine_id = b"test-engine";
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        // Wrong engine boots (receiver has boots=1)
+        let msg = build_authed_v3_inform(
+            engine_id,
+            2, // wrong boots
+            0, // time is fine
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+
+        let result = receiver.handle_v3(msg, source).await;
+        assert!(result.is_err(), "message with wrong engine_boots should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_v3_inform_within_time_window_accepted() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let engine_id = b"test-engine";
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        // Engine time within the window (receiver started ~0 seconds ago, engine_time=0 is fine)
+        let msg = build_authed_v3_inform(
+            engine_id,
+            1, // correct boots
+            0, // within window
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+
+        let result = receiver.handle_v3(msg, source).await;
+        // Should succeed (or at least not fail due to time window).
+        // The Inform response send will fail since source is fake, but
+        // the time window check itself should pass. The error if any
+        // should be a network error from trying to send the response,
+        // not an Auth error.
+        match result {
+            Ok(Some(_)) => {} // unexpected but ok (socket might succeed on loopback)
+            Err(e) => {
+                let err_str = format!("{}", e);
+                assert!(
+                    !err_str.contains("Auth"),
+                    "should not be an auth error for valid time window, got: {}",
+                    err_str
+                );
+            }
+            Ok(None) => panic!("should not return None for a valid InformRequest"),
+        }
     }
 }

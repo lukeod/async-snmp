@@ -97,7 +97,7 @@ use crate::notification::UsmConfig;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::util::bind_udp_socket;
-use crate::v3::{MAX_ENGINE_TIME, SaltCounter};
+use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -654,21 +654,6 @@ pub(crate) struct AgentInner {
     pub(crate) usm_not_in_time_windows: AtomicU32,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
-}
-
-/// Compute engine boots and time from a base boots value and total elapsed
-/// seconds since engine start.
-///
-/// Per RFC 3414 Section 2.3, each time the elapsed seconds reaches
-/// MAX_ENGINE_TIME (2^31-1), boots increments by one and time wraps to zero.
-/// The boots value is capped at MAX_ENGINE_TIME (the "latched" state per
-/// RFC 3414 Section 2.2.3).
-fn compute_engine_boots_time(boots_base: u32, total_elapsed_secs: u64) -> (u32, u32) {
-    let max = MAX_ENGINE_TIME as u64;
-    let additional_boots = total_elapsed_secs / max;
-    let current_time = (total_elapsed_secs % max) as u32;
-    let boots = (boots_base as u64 + additional_boots).min(max) as u32;
-    (boots, current_time)
 }
 
 /// SNMP Agent.
@@ -2081,14 +2066,14 @@ mod tests {
     #[test]
     fn test_engine_time_no_overflow() {
         // Normal operation: elapsed < MAX_ENGINE_TIME, boots stays at base
-        let (boots, time) = super::compute_engine_boots_time(1, 1000);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, 1000);
         assert_eq!(boots, 1);
         assert_eq!(time, 1000);
     }
 
     #[test]
     fn test_engine_time_zero_elapsed() {
-        let (boots, time) = super::compute_engine_boots_time(1, 0);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, 0);
         assert_eq!(boots, 1);
         assert_eq!(time, 0);
     }
@@ -2096,7 +2081,7 @@ mod tests {
     #[test]
     fn test_engine_time_just_below_max() {
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = super::compute_engine_boots_time(1, max as u64 - 1);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, max as u64 - 1);
         assert_eq!(boots, 1);
         assert_eq!(time, max - 1);
     }
@@ -2105,7 +2090,7 @@ mod tests {
     fn test_engine_time_at_max_wraps() {
         // Exactly at MAX_ENGINE_TIME seconds: boots increments, time resets to 0
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = super::compute_engine_boots_time(1, max as u64);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, max as u64);
         assert_eq!(boots, 2, "boots should increment when elapsed reaches MAX_ENGINE_TIME");
         assert_eq!(time, 0, "time should wrap to 0");
     }
@@ -2114,7 +2099,7 @@ mod tests {
     fn test_engine_time_past_max() {
         // 500 seconds past the first wrap
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = super::compute_engine_boots_time(1, max as u64 + 500);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, max as u64 + 500);
         assert_eq!(boots, 2);
         assert_eq!(time, 500);
     }
@@ -2124,7 +2109,7 @@ mod tests {
         // Three full cycles
         let max = crate::v3::MAX_ENGINE_TIME;
         let elapsed = max as u64 * 3 + 42;
-        let (boots, time) = super::compute_engine_boots_time(1, elapsed);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, elapsed);
         assert_eq!(boots, 4, "base 1 + 3 wraps = 4");
         assert_eq!(time, 42);
     }
@@ -2134,7 +2119,7 @@ mod tests {
         // If enough wraps happen that boots would exceed MAX_ENGINE_TIME, cap it
         let max = crate::v3::MAX_ENGINE_TIME;
         let elapsed = max as u64 * (max as u64); // way more wraps than max allows
-        let (boots, _time) = super::compute_engine_boots_time(1, elapsed);
+        let (boots, _time) = crate::v3::compute_engine_boots_time(1, elapsed);
         assert_eq!(boots, max, "boots should be capped at MAX_ENGINE_TIME");
     }
 
@@ -2142,7 +2127,7 @@ mod tests {
     fn test_engine_time_base_boots_preserved() {
         // A non-1 base boots (e.g. from persistence) is respected
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = super::compute_engine_boots_time(5, max as u64 + 100);
+        let (boots, time) = crate::v3::compute_engine_boots_time(5, max as u64 + 100);
         assert_eq!(boots, 6, "base 5 + 1 wrap = 6");
         assert_eq!(time, 100);
     }
@@ -2151,7 +2136,7 @@ mod tests {
     fn test_engine_time_high_base_boots_capped() {
         // Base boots near MAX_ENGINE_TIME with a wrap should cap
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, _time) = super::compute_engine_boots_time(max - 1, max as u64 * 2);
+        let (boots, _time) = crate::v3::compute_engine_boots_time(max - 1, max as u64 * 2);
         assert_eq!(boots, max, "should cap at MAX_ENGINE_TIME, not overflow");
     }
 

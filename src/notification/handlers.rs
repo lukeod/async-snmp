@@ -14,9 +14,10 @@ use crate::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
-use crate::v3::UsmSecurityParams;
+use crate::v3::{MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
 use crate::v3::auth::{authenticate_message, verify_message};
 
+use crate::v3::compute_engine_boots_time;
 use super::types::DerivedKeys;
 use super::varbind::extract_notification_varbinds;
 use super::{Notification, ReceiverInner};
@@ -147,6 +148,28 @@ impl super::NotificationReceiver {
                         return Err(Error::Auth { target: source }.boxed());
                     }
                     tracing::trace!(target: "async_snmp::notification", { snmp.source = %source }, "V3 authentication verified");
+
+                    // Verify time window (RFC 3414 Section 2.2.3)
+                    let total_secs = self.inner.engine_start.elapsed().as_secs();
+                    let (our_boots, our_time) =
+                        compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+
+                    // When boots is latched at MAX_ENGINE_TIME, reject all authenticated messages
+                    if our_boots == MAX_ENGINE_TIME {
+                        tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated notification");
+                        return Err(Error::Auth { target: source }.boxed());
+                    }
+
+                    if usm_params.engine_boots != our_boots {
+                        tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.our_boots = our_boots }, "V3 notification engine boots mismatch");
+                        return Err(Error::Auth { target: source }.boxed());
+                    }
+
+                    let time_diff = (usm_params.engine_time as i64 - our_time as i64).abs();
+                    if time_diff > TIME_WINDOW as i64 {
+                        tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_time = usm_params.engine_time, snmp.our_time = our_time }, "V3 notification outside time window");
+                        return Err(Error::Auth { target: source }.boxed());
+                    }
                 }
                 _ => {
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received authenticated V3 message but no credentials configured for user");

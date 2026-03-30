@@ -47,6 +47,21 @@ pub const MAX_ENGINE_TIME: u32 = 2147483647;
 /// Default msgMaxSize for UDP transport (65535 - 20 IPv4 - 8 UDP = 65507).
 pub const DEFAULT_MSG_MAX_SIZE: u32 = 65507;
 
+/// Compute engine boots and time from a base boots value and total elapsed
+/// seconds since engine start.
+///
+/// Per RFC 3414 Section 2.3, each time the elapsed seconds reaches
+/// MAX_ENGINE_TIME (2^31-1), boots increments by one and time wraps to zero.
+/// The boots value is capped at MAX_ENGINE_TIME (the "latched" state per
+/// RFC 3414 Section 2.2.3).
+pub fn compute_engine_boots_time(boots_base: u32, total_elapsed_secs: u64) -> (u32, u32) {
+    let max = MAX_ENGINE_TIME as u64;
+    let additional_boots = total_elapsed_secs / max;
+    let current_time = (total_elapsed_secs % max) as u32;
+    let boots = (boots_base as u64 + additional_boots).min(max) as u32;
+    (boots, current_time)
+}
+
 /// USM statistics OIDs used in Report PDUs.
 pub mod report_oids {
     use crate::Oid;
