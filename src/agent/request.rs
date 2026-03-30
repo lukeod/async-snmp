@@ -11,7 +11,7 @@ use crate::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
 use crate::pdu::{Pdu, PduType};
-use crate::v3::UsmSecurityParams;
+use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 use crate::v3::auth::verify_message;
 use crate::value::Value;
 use crate::varbind::VarBind;
@@ -142,6 +142,27 @@ impl Agent {
                 &msg,
                 &usm_params,
                 crate::v3::report_oids::unknown_user_names(),
+                count,
+                source,
+            );
+        }
+
+        // RFC 3414 Section 2.3: when engine boots is latched at maximum,
+        // reject all authenticated inbound messages with notInTimeWindows.
+        // The agent cannot perform timeliness checks in this state.
+        if security_level.requires_auth()
+            && self.inner.engine_boots.load(Ordering::Relaxed) == MAX_ENGINE_TIME
+        {
+            tracing::warn!(target: "async_snmp::agent", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated request");
+            let count = self
+                .inner
+                .usm_not_in_time_windows
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            return self.send_v3_report(
+                &msg,
+                &usm_params,
+                crate::v3::report_oids::not_in_time_windows(),
                 count,
                 source,
             );
