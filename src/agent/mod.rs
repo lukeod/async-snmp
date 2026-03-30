@@ -973,7 +973,15 @@ impl Agent {
             };
 
             let response_value = match result {
-                GetResult::Value(v) => v,
+                GetResult::Value(v) => {
+                    // RFC 2576 Section 4.1.2.3: Counter64 not valid in v1
+                    if ctx.version == Version::V1 && matches!(v, Value::Counter64(_)) {
+                        return Ok(
+                            pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
+                        );
+                    }
+                    v
+                }
                 GetResult::NoSuchObject => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchObject exception
                     if ctx.version == Version::V1 {
@@ -1168,6 +1176,13 @@ impl Agent {
                             "handler returned non-increasing OID in GETNEXT"
                         );
                         return None;
+                    }
+                    // RFC 2576 Section 4.1.2.3: skip Counter64 for v1
+                    if ctx.version == Version::V1
+                        && matches!(next_vb.value, Value::Counter64(_))
+                    {
+                        search_from = next_vb.oid.clone();
+                        continue;
                     }
                     if let Some(ref vacm) = self.inner.vacm {
                         if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
@@ -1706,5 +1721,140 @@ mod tests {
                 .iter()
                 .any(|vb| vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0))
         );
+    }
+
+    /// Handler returning Counter64 at .99999.1.0, Integer at .99999.2.0
+    struct Counter64Handler;
+
+    impl MibHandler for Counter64Handler {
+        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+            Box::pin(async move {
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
+                    return GetResult::Value(Value::Counter64(1_000_000_000_000));
+                }
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
+                    return GetResult::Value(Value::Integer(42));
+                }
+                GetResult::NoSuchObject
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, GetNextResult> {
+            Box::pin(async move {
+                let oid1 = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
+                let oid2 = oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0);
+
+                if oid < &oid1 {
+                    return GetNextResult::Value(VarBind::new(
+                        oid1,
+                        Value::Counter64(1_000_000_000_000),
+                    ));
+                }
+                if oid < &oid2 {
+                    return GetNextResult::Value(VarBind::new(oid2, Value::Integer(42)));
+                }
+                GetNextResult::EndOfMibView
+            })
+        }
+    }
+
+    async fn test_agent_with_counter64() -> Agent {
+        Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999),
+                Arc::new(Counter64Handler),
+            )
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_v1_get_filters_counter64() {
+        // RFC 2576 Section 4.1.2.3: Counter64 not valid in v1 GET responses.
+        // Should return noSuchName for the Counter64 varbind.
+        let agent = test_agent_with_counter64().await;
+
+        let mut ctx = test_ctx();
+        ctx.version = Version::V1;
+        ctx.security_model = SecurityModel::V1;
+        ctx.pdu_type = PduType::GetRequest;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Null,
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(
+            ErrorStatus::from_i32(response.error_status),
+            ErrorStatus::NoSuchName,
+            "v1 GET of Counter64 should return noSuchName"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2c_get_allows_counter64() {
+        // v2c should return Counter64 normally
+        let agent = test_agent_with_counter64().await;
+
+        let ctx = test_ctx(); // v2c by default
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Null,
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, 0);
+        assert!(matches!(response.varbinds[0].value, Value::Counter64(_)));
+    }
+
+    #[tokio::test]
+    async fn test_v1_getnext_skips_counter64() {
+        // RFC 2576 Section 4.1.2.3: Counter64 skipped in v1 GETNEXT.
+        // Walking from .99999 should skip the Counter64 at .99999.1.0
+        // and return the Integer at .99999.2.0.
+        let agent = test_agent_with_counter64().await;
+
+        let mut ctx = test_ctx();
+        ctx.version = Version::V1;
+        ctx.security_model = SecurityModel::V1;
+        ctx.pdu_type = PduType::GetNextRequest;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetNextRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, 0, "should succeed");
+        assert_eq!(
+            response.varbinds[0].oid,
+            oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
+            "should skip Counter64 and return next non-Counter64 OID"
+        );
+        assert!(matches!(response.varbinds[0].value, Value::Integer(42)));
     }
 }
