@@ -56,6 +56,7 @@ mod varbind;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -137,6 +138,7 @@ pub mod oids {
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
+    engine_id: Option<Vec<u8>>,
     engine_boots: u32,
 }
 
@@ -150,6 +152,7 @@ impl NotificationReceiverBuilder {
         Self {
             bind_addr: "0.0.0.0:162".to_string(),
             usm_users: HashMap::new(),
+            engine_id: None,
             engine_boots: 1,
         }
     }
@@ -192,6 +195,15 @@ impl NotificationReceiverBuilder {
         self
     }
 
+    /// Set the engine ID for SNMPv3.
+    ///
+    /// If not set, a default engine ID will be generated based on the
+    /// RFC 3411 format using enterprise number and timestamp.
+    pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
+        self.engine_id = Some(engine_id.into());
+        self
+    }
+
     /// Set the initial engine boots value.
     ///
     /// This should be persisted across restarts and incremented each time
@@ -219,14 +231,26 @@ impl NotificationReceiverBuilder {
             source: e,
         })?;
 
+        let engine_id: Bytes = self.engine_id.map(Bytes::from).unwrap_or_else(|| {
+            let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01];
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            id.extend_from_slice(&timestamp.to_be_bytes());
+            Bytes::from(id)
+        });
+
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {
                 socket,
                 local_addr,
                 usm_users: self.usm_users,
+                engine_id,
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: self.engine_boots,
                 engine_start: Instant::now(),
+                usm_unknown_engine_ids: AtomicU32::new(0),
             }),
         })
     }
@@ -412,12 +436,16 @@ struct ReceiverInner {
     local_addr: SocketAddr,
     /// Configured USM users for V3 authentication
     usm_users: HashMap<Bytes, UsmConfig>,
+    /// Engine ID for V3 discovery responses
+    engine_id: Bytes,
     /// Salt counter for privacy operations
     salt_counter: SaltCounter,
     /// Initial engine boots value at startup, used to compute overflow-adjusted boots.
     engine_boots_base: u32,
     /// Time when the receiver was started, used to compute engine time.
     engine_start: Instant,
+    /// usmStatsUnknownEngineIDs counter
+    usm_unknown_engine_ids: AtomicU32,
 }
 
 impl NotificationReceiver {
@@ -465,14 +493,26 @@ impl NotificationReceiver {
             source: e,
         })?;
 
+        let engine_id: Bytes = {
+            let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01];
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            id.extend_from_slice(&timestamp.to_be_bytes());
+            Bytes::from(id)
+        };
+
         Ok(Self {
             inner: Arc::new(ReceiverInner {
                 socket,
                 local_addr,
                 usm_users: HashMap::new(),
+                engine_id,
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: 1,
                 engine_start: Instant::now(),
+                usm_unknown_engine_ids: AtomicU32::new(0),
             }),
         })
     }
@@ -480,6 +520,16 @@ impl NotificationReceiver {
     /// Get the local address this receiver is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
+    }
+
+    /// Get the engine ID.
+    pub fn engine_id(&self) -> &[u8] {
+        &self.inner.engine_id
+    }
+
+    /// Get the usmStatsUnknownEngineIDs counter value.
+    pub fn usm_unknown_engine_ids(&self) -> u32 {
+        self.inner.usm_unknown_engine_ids.load(Ordering::Relaxed)
     }
 
     /// Receive a notification.
@@ -764,6 +814,7 @@ mod tests {
     async fn test_v3_inform_outside_time_window_rejected() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
+            .engine_id(b"test-engine".to_vec())
             .engine_boots(1)
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
@@ -793,6 +844,7 @@ mod tests {
     async fn test_v3_inform_wrong_boots_rejected() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
+            .engine_id(b"test-engine".to_vec())
             .engine_boots(1)
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
@@ -822,6 +874,7 @@ mod tests {
     async fn test_v3_inform_within_time_window_accepted() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
+            .engine_id(b"test-engine".to_vec())
             .engine_boots(1)
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
@@ -861,5 +914,156 @@ mod tests {
             }
             Ok(None) => panic!("should not return None for a valid InformRequest"),
         }
+    }
+
+    /// Build a V3 discovery request message (empty engine ID, noAuthNoPriv).
+    fn build_v3_discovery_request(msg_id: i32, reportable: bool) -> Bytes {
+        use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+        use crate::pdu::{Pdu, PduType};
+        use crate::v3::UsmSecurityParams;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 0,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![],
+        };
+
+        let global = MsgGlobalData::new(
+            msg_id,
+            65507,
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, reportable),
+        );
+
+        let usm_params = UsmSecurityParams::new(
+            Bytes::new(), // empty engine ID = discovery
+            0,
+            0,
+            Bytes::new(), // empty username
+        );
+
+        let scoped = ScopedPdu::new(Bytes::new(), Bytes::new(), pdu);
+        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        msg.encode()
+    }
+
+    #[tokio::test]
+    async fn test_v3_discovery_gets_response() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"test-discovery-engine".to_vec())
+            .build()
+            .await
+            .unwrap();
+
+        let recv_addr = receiver.local_addr();
+
+        // Bind a separate socket to send discovery and receive the response
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let discovery_msg = build_v3_discovery_request(42, true);
+        client.send_to(&discovery_msg, recv_addr).await.unwrap();
+
+        // The receiver needs to be running recv() to handle the message.
+        // Instead, call handle_v3 directly with the client address as source.
+        let result = receiver
+            .handle_v3(discovery_msg, client_addr)
+            .await;
+
+        // Discovery should return Ok(None) - not a notification
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+
+        // Counter should be incremented
+        assert_eq!(receiver.usm_unknown_engine_ids(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_v3_discovery_non_reportable_ignored() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"test-discovery-engine".to_vec())
+            .build()
+            .await
+            .unwrap();
+
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let discovery_msg = build_v3_discovery_request(42, false);
+
+        let result = receiver.handle_v3(discovery_msg, source).await;
+
+        // Non-reportable discovery should return Ok(None) without incrementing counter
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        assert_eq!(receiver.usm_unknown_engine_ids(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_v3_engine_id_mismatch_ignored() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        // Build a message with a DIFFERENT engine ID
+        let msg = build_authed_v3_inform(
+            b"wrong-engine-id",
+            1,
+            0,
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+
+        let result = receiver.handle_v3(msg, source).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "engine ID mismatch should return None");
+    }
+
+    #[test]
+    fn test_auto_generated_engine_id_non_empty() {
+        let builder = NotificationReceiverBuilder::new();
+        // engine_id field should be None (auto-generate on build)
+        assert!(builder.engine_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_bind_generates_engine_id() {
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        assert!(!receiver.engine_id().is_empty());
+        // RFC 3411 format: starts with 0x80 enterprise indicator
+        assert_eq!(receiver.engine_id()[0], 0x80);
+    }
+
+    #[tokio::test]
+    async fn test_builder_generates_engine_id() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .build()
+            .await
+            .unwrap();
+        assert!(!receiver.engine_id().is_empty());
+        assert_eq!(receiver.engine_id()[0], 0x80);
+    }
+
+    #[tokio::test]
+    async fn test_builder_custom_engine_id() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"custom-engine".to_vec())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(receiver.engine_id(), b"custom-engine");
     }
 }

@@ -4,6 +4,7 @@
 //! notification messages.
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 
@@ -16,6 +17,8 @@ use crate::message::{
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::v3::{MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
 use crate::v3::auth::{authenticate_message, verify_message};
+use crate::value::Value;
+use crate::varbind::VarBind;
 
 use crate::v3::compute_engine_boots_time;
 use super::types::DerivedKeys;
@@ -119,6 +122,18 @@ impl super::NotificationReceiver {
 
         // Decode USM security parameters
         let usm_params = UsmSecurityParams::decode(msg.security_params.clone())?;
+
+        // Check for discovery request (empty engine ID)
+        if usm_params.engine_id.is_empty() {
+            return self.handle_v3_discovery(&msg, &usm_params, source).await;
+        }
+
+        // Verify engine ID matches ours
+        if usm_params.engine_id != self.inner.engine_id {
+            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "engine ID mismatch");
+            return Ok(None);
+        }
+
         let username = usm_params.username.clone();
         let engine_id = usm_params.engine_id.clone();
 
@@ -278,6 +293,67 @@ impl super::NotificationReceiver {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Handle SNMPv3 engine discovery request.
+    ///
+    /// Per RFC 3414 Section 4, responds with a Report PDU containing
+    /// usmStatsUnknownEngineIDs and the receiver's engine ID in USM params.
+    async fn handle_v3_discovery(
+        &self,
+        msg: &V3Message,
+        usm_params: &UsmSecurityParams,
+        source: SocketAddr,
+    ) -> Result<Option<Notification>> {
+        // Only respond if reportable flag is set
+        if !msg.global_data.msg_flags.reportable {
+            return Ok(None);
+        }
+
+        let total_secs = self.inner.engine_start.elapsed().as_secs();
+        let (boots, time) = compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+        let count = self
+            .inner
+            .usm_unknown_engine_ids
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+
+        let report_pdu = Pdu {
+            pdu_type: PduType::Report,
+            request_id: msg.global_data.msg_id,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                crate::v3::report_oids::unknown_engine_ids(),
+                Value::Counter32(count),
+            )],
+        };
+
+        let response_global = MsgGlobalData::new(
+            msg.global_data.msg_id,
+            msg.global_data.msg_max_size,
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+        );
+        let response_usm = UsmSecurityParams::new(
+            self.inner.engine_id.clone(),
+            boots,
+            time,
+            usm_params.username.clone(),
+        );
+        let response_scoped = ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
+        let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
+
+        self.inner
+            .socket
+            .send_to(&response_msg.encode(), source)
+            .await
+            .map_err(|e| Error::Network {
+                target: source,
+                source: e,
+            })?;
+
+        tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent discovery response");
+        Ok(None)
     }
 }
 
