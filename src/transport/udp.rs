@@ -364,6 +364,10 @@ impl Transport for UdpHandle {
         self.inner.local_addr
     }
 
+    fn max_message_size(&self) -> u32 {
+        self.inner.config.max_message_size as u32
+    }
+
     fn is_reliable(&self) -> bool {
         false
     }
@@ -399,5 +403,24 @@ mod tests {
         let handle = transport.handle("[::1]:161".parse().unwrap());
         let expected: SocketAddr = "[::1]:161".parse().unwrap();
         assert_eq!(handle.peer_addr(), expected);
+    }
+
+    #[tokio::test]
+    async fn max_message_size_default() {
+        let transport = UdpTransport::bind("0.0.0.0:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        // Default config is 1472
+        assert_eq!(handle.max_message_size(), 1472);
+    }
+
+    #[tokio::test]
+    async fn max_message_size_custom() {
+        let transport = UdpTransport::builder()
+            .max_message_size(8192)
+            .build()
+            .await
+            .unwrap();
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        assert_eq!(handle.max_message_size(), 8192);
     }
 }
