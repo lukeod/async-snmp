@@ -329,9 +329,9 @@ impl View {
 
     /// Check if an OID is in this view.
     ///
-    /// Per RFC 3415 Section 5, an OID is in the view if:
-    /// - At least one included subtree matches, AND
-    /// - No excluded subtree matches
+    /// Per RFC 3415 Section 5, when multiple subtrees match an OID,
+    /// the longest matching subtree determines inclusion/exclusion.
+    /// At equal lengths, exclude wins.
     ///
     /// # Example
     ///
@@ -348,21 +348,27 @@ impl View {
     /// assert!(!view.contains(&oid!(1, 3, 6, 1, 4, 1)));  // not included
     /// ```
     pub fn contains(&self, oid: &Oid) -> bool {
-        let mut dominated_by_include = false;
-        let mut dominated_by_exclude = false;
+        let mut best_len: Option<usize> = None;
+        let mut best_included = false;
 
         for subtree in &self.subtrees {
             if subtree.matches(oid) {
-                if subtree.included {
-                    dominated_by_include = true;
-                } else {
-                    dominated_by_exclude = true;
+                let len = subtree.oid.len();
+                match best_len {
+                    Some(prev) if len < prev => {}
+                    Some(prev) if len == prev && !subtree.included => {
+                        // Equal length: exclude wins (conservative)
+                        best_included = false;
+                    }
+                    _ => {
+                        best_len = Some(len);
+                        best_included = subtree.included;
+                    }
                 }
             }
         }
 
-        // Included and not excluded
-        dominated_by_include && !dominated_by_exclude
+        best_included
     }
 
     /// Check subtree access status with 3-state result.
@@ -376,8 +382,9 @@ impl View {
     /// - [`ViewCheckResult::Excluded`]: OID and all descendants are not accessible
     /// - [`ViewCheckResult::Ambiguous`]: Mixed permissions, check each OID individually
     pub fn check_subtree(&self, oid: &Oid) -> ViewCheckResult {
-        let mut has_covering_include = false;
-        let mut has_covering_exclude = false;
+        // Find the longest covering match (RFC 3415 longest-match semantics)
+        let mut best_covering_len: Option<usize> = None;
+        let mut best_covering_included = false;
         let mut has_child_include = false;
         let mut has_child_exclude = false;
 
@@ -385,10 +392,16 @@ impl View {
 
         for subtree in &self.subtrees {
             if subtree.matches(oid) {
-                if subtree.included {
-                    has_covering_include = true;
-                } else {
-                    has_covering_exclude = true;
+                let len = subtree.oid.len();
+                match best_covering_len {
+                    Some(prev) if len < prev => {}
+                    Some(prev) if len == prev && !subtree.included => {
+                        best_covering_included = false;
+                    }
+                    _ => {
+                        best_covering_len = Some(len);
+                        best_covering_included = subtree.included;
+                    }
                 }
             }
 
@@ -404,15 +417,20 @@ impl View {
             }
         }
 
-        if has_covering_exclude {
-            return ViewCheckResult::Excluded;
-        }
-
-        if has_covering_include {
-            if has_child_exclude {
-                return ViewCheckResult::Ambiguous;
+        match (best_covering_len.is_some(), best_covering_included) {
+            (true, false) => {
+                if has_child_include {
+                    return ViewCheckResult::Ambiguous;
+                }
+                return ViewCheckResult::Excluded;
             }
-            return ViewCheckResult::Included;
+            (true, true) => {
+                if has_child_exclude {
+                    return ViewCheckResult::Ambiguous;
+                }
+                return ViewCheckResult::Included;
+            }
+            _ => {}
         }
 
         if has_child_include {
@@ -946,6 +964,49 @@ mod tests {
         // Excluded OID
         assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 7)));
         assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 7, 0)));
+    }
+
+    #[test]
+    fn test_view_longest_match_wins() {
+        // RFC 3415 Section 5: when multiple subtrees match, longest match wins.
+        // include(1.3.6.1) + exclude(1.3.6.1.2) + include(1.3.6.1.2.1)
+        // For OID 1.3.6.1.2.1.1.0, all three match. Longest is include(1.3.6.1.2.1),
+        // so the OID should be accessible.
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1))
+            .exclude(oid!(1, 3, 6, 1, 2))
+            .include(oid!(1, 3, 6, 1, 2, 1));
+
+        // Longest match is include(1.3.6.1.2.1), so this should be included
+        assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
+
+        // OID under the exclude but not re-included
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 3, 1, 0)));
+
+        // OID only under the top-level include, not under exclude
+        assert!(view.contains(&oid!(1, 3, 6, 1, 4, 1, 0)));
+    }
+
+    #[test]
+    fn test_view_longest_match_exclude_wins() {
+        // When longest match is an exclude, OID should be excluded
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1))
+            .exclude(oid!(1, 3, 6, 1, 2, 1));
+
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
+        assert!(view.contains(&oid!(1, 3, 6, 1, 4, 1, 0)));
+    }
+
+    #[test]
+    fn test_view_equal_length_exclude_wins() {
+        // When include and exclude have equal match length, exclude should win
+        // (conservative interpretation: deny beats allow at same specificity)
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1))
+            .exclude(oid!(1, 3, 6, 1, 2, 1));
+
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
     }
 
     #[test]
