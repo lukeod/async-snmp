@@ -792,10 +792,10 @@ mod tests {
 
     #[test]
     fn test_parse_rejects_empty_components() {
-        assert!(Oid::parse("1.3.6.").is_err());  // Trailing dot
-        assert!(Oid::parse("1..3.6").is_err());   // Double dot
-        assert!(Oid::parse("..1.3").is_err());     // Double leading dot
-        assert!(Oid::parse("...").is_err());       // All dots
+        assert!(Oid::parse("1.3.6.").is_err()); // Trailing dot
+        assert!(Oid::parse("1..3.6").is_err()); // Double dot
+        assert!(Oid::parse("..1.3").is_err()); // Double leading dot
+        assert!(Oid::parse("...").is_err()); // All dots
     }
 
     #[test]

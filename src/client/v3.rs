@@ -4,17 +4,16 @@
 //! and V3 message building/handling.
 
 use crate::ber::Decoder;
-use crate::error::internal::{AuthErrorKind, CryptoErrorKind, DecodeErrorKind, EncodeErrorKind};
+use crate::error::internal::{AuthErrorKind, CryptoErrorKind, DecodeErrorKind};
 use crate::error::{Error, ErrorStatus, Result};
 use crate::format::hex;
-use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+use crate::message::{ScopedPdu, V3Message};
 use crate::pdu::{Pdu, PduType};
 use crate::transport::Transport;
 use crate::v3::{
-    UsmSecurityParams,
-    auth::{authenticate_message, verify_message},
-    is_decryption_error_report, is_not_in_time_window_report, is_unknown_engine_id_report,
-    is_unknown_user_name_report, is_unsupported_sec_level_report, is_wrong_digest_report,
+    UsmSecurityParams, auth::verify_message, compute_engine_boots_time, is_decryption_error_report,
+    is_not_in_time_window_report, is_unknown_engine_id_report, is_unknown_user_name_report,
+    is_unsupported_sec_level_report, is_wrong_digest_report,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -188,20 +187,21 @@ impl<T: Transport> Client<T> {
     /// The `msg_id` parameter is separate from `pdu.request_id` per RFC 3412
     /// Section 6.2: retransmissions SHOULD use a new msgID for each attempt.
     pub(super) fn build_v3_message(&self, pdu: &Pdu, msg_id: i32) -> Result<Vec<u8>> {
-        let security = self.inner.config.v3_security.as_ref().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::NoSecurityConfig }, "V3 security not configured");
-            Error::Config("V3 security not configured".into()).boxed()
-        })?;
+        let security = self
+            .inner
+            .config
+            .v3_security
+            .as_ref()
+            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         let engine_state = self
             .inner
             .engine_state
             .read()
             .map_err(|_| Error::Config("engine_state lock poisoned".into()).boxed())?;
-        let engine_state = engine_state.as_ref().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::EngineNotDiscovered }, "engine not discovered");
-            Error::Config("engine not discovered".into()).boxed()
-        })?;
+        let engine_state = engine_state
+            .as_ref()
+            .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?;
 
         let derived = self
             .inner
@@ -209,131 +209,18 @@ impl<T: Transport> Client<T> {
             .read()
             .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
 
-        let security_level = security.security_level();
-
-        // Build scoped PDU
-        let scoped_pdu = ScopedPdu::new(
-            engine_state.engine_id.clone(),
-            security.context_name.clone(),
-            pdu.clone(),
-        );
-
-        // Get current engine time estimate
-        let engine_boots = engine_state.engine_boots;
-        let engine_time = engine_state.estimated_time();
-
-        // Handle encryption if needed
-        let (msg_data, priv_params) = if security_level.requires_priv() {
-            tracing::trace!(target: "async_snmp::client", "encrypting scoped PDU");
-
-            let derived_ref = derived.as_ref().ok_or_else(|| {
-                tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::KeysNotDerived }, "keys not derived");
-                Error::Config("keys not derived".into()).boxed()
-            })?;
-            let priv_key = derived_ref
-                .priv_key
-                .as_ref()
-                .ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::NoPrivKey }, "privacy key not available");
-                    Error::Config("privacy key not available".into()).boxed()
-                })?;
-
-            // Encode scoped PDU
-            let scoped_pdu_bytes = scoped_pdu.encode_to_bytes();
-
-            // Encrypt
-            let (ciphertext, salt) = priv_key
-                .encrypt(
-                    &scoped_pdu_bytes,
-                    engine_boots,
-                    engine_time,
-                    Some(&self.inner.salt_counter),
-                )
-                .map_err(|e| {
-                    tracing::warn!(target: "async_snmp::crypto", { peer = %self.peer_addr(), error = %e }, "encryption failed");
-                    Error::Auth {
-                        target: self.peer_addr(),
-                    }
-                    .boxed()
-                })?;
-
-            tracing::trace!(target: "async_snmp::client", { plaintext_len = scoped_pdu_bytes.len(), ciphertext_len = ciphertext.len() }, "encrypted scoped PDU");
-
-            (crate::message::V3MessageData::Encrypted(ciphertext), salt)
-        } else {
-            (
-                crate::message::V3MessageData::Plaintext(scoped_pdu),
-                Bytes::new(),
-            )
-        };
-
-        // Resolve auth key up front if authentication is required.
-        // This avoids a redundant lookup later and makes the error visible
-        // before we bother encoding the message.
-        let auth_key = if security_level.requires_auth() {
-            Some(
-                derived
-                    .as_ref()
-                    .and_then(|d| d.auth_key.as_ref())
-                    .ok_or_else(|| {
-                        tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::MissingAuthKey }, "auth key not available for encoding");
-                        Error::Config("auth key not available".into()).boxed()
-                    })?,
-            )
-        } else {
-            None
-        };
-
-        // Build USM security parameters
-        let mut usm_params = UsmSecurityParams::new(
-            engine_state.engine_id.clone(),
-            engine_boots,
-            engine_time,
-            security.username.clone(),
-        );
-
-        if let Some(key) = &auth_key {
-            usm_params = usm_params.with_auth_placeholder(key.mac_len());
-        }
-
-        if security_level.requires_priv() {
-            usm_params = usm_params.with_priv_params(priv_params);
-        }
-
-        let usm_encoded = usm_params.encode();
-
-        // Build global data
-        let msg_flags = MsgFlags::new(security_level, true); // reportable=true for requests
-        let global_data = MsgGlobalData::new(msg_id, engine_state.msg_max_size as i32, msg_flags);
-
-        // Build complete message
-        let msg = match msg_data {
-            crate::message::V3MessageData::Plaintext(scoped_pdu) => {
-                V3Message::new(global_data, usm_encoded, scoped_pdu)
-            }
-            crate::message::V3MessageData::Encrypted(ciphertext) => {
-                V3Message::new_encrypted(global_data, usm_encoded, ciphertext)
-            }
-        };
-
-        let mut encoded = msg.encode().to_vec();
-
-        // Apply authentication if needed
-        if let Some(key) = &auth_key {
-            tracing::trace!(target: "async_snmp::client", "applying HMAC authentication");
-
-            // Find auth params position and apply HMAC
-            if let Some((offset, len)) = UsmSecurityParams::find_auth_params_offset(&encoded) {
-                authenticate_message(key, &mut encoded, offset, len)
-                    .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-                tracing::trace!(target: "async_snmp::client", { auth_params_offset = offset, auth_params_len = len }, "applied HMAC authentication");
-            } else {
-                tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params position");
-                return Err(Error::Config("could not find auth params position".into()).boxed());
-            }
-        }
-
-        Ok(encoded)
+        crate::v3::encode::encode_v3_message(
+            pdu,
+            msg_id,
+            &engine_state.engine_id,
+            engine_state.engine_boots,
+            engine_state.estimated_time(),
+            security,
+            derived.as_ref(),
+            &self.inner.salt_counter,
+            true, // reportable=true for requests
+            engine_state.msg_max_size,
+        )
     }
 
     /// Verify HMAC authentication on a V3 response message.
@@ -447,10 +334,12 @@ impl<T: Transport> Client<T> {
         // Ensure engine is discovered first
         self.ensure_engine_discovered().await?;
 
-        let security = self.inner.config.v3_security.as_ref().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::client", { kind = %EncodeErrorKind::NoSecurityConfig }, "V3 security not configured");
-            Error::Config("V3 security not configured".into()).boxed()
-        })?;
+        let security = self
+            .inner
+            .config
+            .v3_security
+            .as_ref()
+            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
         let security_level = security.security_level();
 
         let mut last_error: Option<Box<Error>> = None;
@@ -683,6 +572,86 @@ impl<T: Transport> Client<T> {
             }
             .boxed()
         }))
+    }
+
+    /// Ensure keys are derived against the local engine ID for V3 trap sending.
+    pub(super) fn ensure_local_keys_derived(&self) -> Result<()> {
+        // Fast path: already derived.
+        {
+            let keys =
+                self.inner.local_derived_keys.read().map_err(|_| {
+                    Error::Config("local_derived_keys lock poisoned".into()).boxed()
+                })?;
+            if keys.is_some() {
+                return Ok(());
+            }
+        }
+
+        let local_engine_id = self.inner.config.local_engine_id.as_ref().ok_or_else(|| {
+            Error::Config("local_engine_id required for V3 trap sending".into()).boxed()
+        })?;
+
+        let security = self
+            .inner
+            .config
+            .v3_security
+            .as_ref()
+            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+
+        let keys = security
+            .derive_keys(local_engine_id)
+            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+
+        let mut derived = self
+            .inner
+            .local_derived_keys
+            .write()
+            .map_err(|_| Error::Config("local_derived_keys lock poisoned".into()).boxed())?;
+        *derived = Some(keys);
+
+        Ok(())
+    }
+
+    /// Build and encode a V3 trap message using local engine ID.
+    ///
+    /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
+    /// trap PDUs. Uses local_engine_id, local boots/time, and sets
+    /// reportable=false (no Report PDU expected for traps).
+    pub(super) fn build_v3_trap_message(&self, pdu: &Pdu, msg_id: i32) -> Result<Vec<u8>> {
+        let security = self
+            .inner
+            .config
+            .v3_security
+            .as_ref()
+            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+
+        let local_engine_id = self.inner.config.local_engine_id.as_ref().ok_or_else(|| {
+            Error::Config("local_engine_id required for V3 trap sending".into()).boxed()
+        })?;
+
+        let derived = self
+            .inner
+            .local_derived_keys
+            .read()
+            .map_err(|_| Error::Config("local_derived_keys lock poisoned".into()).boxed())?;
+
+        // Compute local engine boots/time
+        let elapsed_secs = self.inner.local_engine_start.elapsed().as_secs();
+        let (engine_boots, engine_time) =
+            compute_engine_boots_time(self.inner.config.local_engine_boots, elapsed_secs);
+
+        crate::v3::encode::encode_v3_message(
+            pdu,
+            msg_id,
+            local_engine_id,
+            engine_boots,
+            engine_time,
+            security,
+            derived.as_ref(),
+            &self.inner.salt_counter,
+            false, // reportable=false for traps
+            crate::v3::DEFAULT_MSG_MAX_SIZE,
+        )
     }
 }
 

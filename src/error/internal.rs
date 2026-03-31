@@ -210,16 +210,6 @@ impl std::fmt::Display for DecodeErrorKind {
 /// BER encode error kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EncodeErrorKind {
-    /// V3 security not configured.
-    NoSecurityConfig,
-    /// Engine not discovered.
-    EngineNotDiscovered,
-    /// Keys not derived.
-    KeysNotDerived,
-    /// Auth key not available for encoding.
-    MissingAuthKey,
-    /// Privacy key not available.
-    NoPrivKey,
     /// Could not locate auth params position in encoded message.
     MissingAuthParams,
 }
@@ -227,11 +217,6 @@ pub(crate) enum EncodeErrorKind {
 impl std::fmt::Display for EncodeErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoSecurityConfig => write!(f, "V3 security config not set"),
-            Self::EngineNotDiscovered => write!(f, "engine not discovered"),
-            Self::KeysNotDerived => write!(f, "keys not derived"),
-            Self::MissingAuthKey => write!(f, "auth key not available for encoding"),
-            Self::NoPrivKey => write!(f, "privacy key not available"),
             Self::MissingAuthParams => {
                 write!(f, "could not find auth params position in encoded message")
             }

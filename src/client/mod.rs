@@ -47,7 +47,7 @@ use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
-use crate::pdu::{GetBulkPdu, Pdu};
+use crate::pdu::{GetBulkPdu, Pdu, TrapV1Pdu};
 use crate::transport::Transport;
 use crate::transport::UdpHandle;
 use crate::v3::{EngineCache, EngineState, SaltCounter};
@@ -140,6 +140,10 @@ struct ClientInner<T: Transport> {
     engine_cache: Option<Arc<EngineCache>>,
     /// Serializes concurrent discovery attempts so only one runs at a time.
     discovery_lock: AsyncMutex<()>,
+    /// Local engine start time for computing engine time in V3 traps.
+    local_engine_start: Instant,
+    /// Keys derived against local_engine_id for V3 trap sending.
+    local_derived_keys: RwLock<Option<DerivedKeys>>,
 }
 
 /// Client configuration.
@@ -167,6 +171,13 @@ pub struct ClientConfig {
     pub max_walk_results: Option<usize>,
     /// Max-repetitions for GETBULK operations (default: 25)
     pub max_repetitions: u32,
+    /// Local engine ID for V3 trap sending (default: None).
+    ///
+    /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
+    /// trap PDUs. This engine ID is used to localize keys for outbound V3 traps.
+    pub local_engine_id: Option<Bytes>,
+    /// Local engine boots base value for V3 trap sending (default: 1).
+    pub local_engine_boots: u32,
 }
 
 impl Default for ClientConfig {
@@ -185,6 +196,8 @@ impl Default for ClientConfig {
             oid_ordering: OidOrdering::Strict,
             max_walk_results: None,
             max_repetitions: DEFAULT_MAX_REPETITIONS,
+            local_engine_id: None,
+            local_engine_boots: 1,
         }
     }
 }
@@ -206,6 +219,8 @@ impl<T: Transport> Client<T> {
                 salt_counter: SaltCounter::new(),
                 engine_cache: None,
                 discovery_lock: AsyncMutex::new(()),
+                local_engine_start: Instant::now(),
+                local_derived_keys: RwLock::new(None),
             }),
         }
     }
@@ -225,6 +240,8 @@ impl<T: Transport> Client<T> {
                 salt_counter: SaltCounter::new(),
                 engine_cache: Some(engine_cache),
                 discovery_lock: AsyncMutex::new(()),
+                local_engine_start: Instant::now(),
+                local_derived_keys: RwLock::new(None),
             }),
         }
     }
@@ -659,6 +676,144 @@ impl<T: Transport> Client<T> {
             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response has fewer varbinds than requested");
         }
         Ok(response.varbinds)
+    }
+
+    /// Send a trap (fire-and-forget).
+    ///
+    /// For V1 clients: constructs a TrapV1 PDU. The `trap_oid` is reverse-mapped
+    /// to v1 generic_trap/specific_trap/enterprise fields per RFC 3584 Section 3.2.
+    /// The agent_addr is set from the transport's local IPv4 address, or `[0,0,0,0]`
+    /// if the local address is IPv6. Use [`send_v1_trap`](Self::send_v1_trap) for
+    /// explicit control over v1 fields.
+    ///
+    /// For V2c/V3 clients: constructs a TrapV2 PDU with the mandatory sysUpTime.0
+    /// and snmpTrapOID.0 prefix.
+    ///
+    /// For V3: uses the local engine ID (set via `ClientBuilder::local_engine_id`).
+    ///
+    /// # Arguments
+    ///
+    /// * `trap_oid` - The trap OID (snmpTrapOID.0 value)
+    /// * `uptime` - sysUpTime.0 value in hundredths of seconds
+    /// * `varbinds` - Additional variable bindings (appended after the prefix)
+    #[instrument(skip(self, varbinds), err, fields(snmp.target = %self.peer_addr(), snmp.trap_oid = %trap_oid))]
+    pub async fn send_trap(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> Result<()> {
+        if self.inner.config.version == Version::V1 {
+            // Build a v2-style PDU and convert to v1.
+            // Per RFC 3584 Section 3, use the local IPv4 address as agent_addr.
+            let local_ip = match self.inner.transport.local_addr().ip() {
+                std::net::IpAddr::V4(v4) => v4.octets(),
+                std::net::IpAddr::V6(_) => [0, 0, 0, 0],
+            };
+            // request_id is unused in the v1 wire format, use 0 to avoid
+            // wasting a slot in the request_id sequence.
+            let pdu = Pdu::trap_v2(0, uptime, trap_oid, varbinds);
+            let trap = pdu.to_v1_trap(local_ip).ok_or_else(|| {
+                Error::Config("cannot convert trap to v1 (Counter64 varbind?)".into()).boxed()
+            })?;
+            return self.send_v1_trap(trap).await;
+        }
+
+        let request_id = self.next_request_id();
+        let pdu = Pdu::trap_v2(request_id, uptime, trap_oid, varbinds);
+
+        if self.is_v3() {
+            self.ensure_local_keys_derived()?;
+            let msg_id = self.next_request_id();
+            let data = self.build_v3_trap_message(&pdu, msg_id)?;
+            tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.varbind_count = pdu.varbinds.len(), snmp.bytes = data.len() }, "sending V3 trap");
+            self.inner.transport.send(&data).await?;
+        } else {
+            let message = CommunityMessage::new(
+                self.inner.config.version,
+                self.inner.config.community.clone(),
+                pdu,
+            );
+            let data = message.encode();
+            tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.bytes = data.len() }, "sending v2c trap");
+            self.inner.transport.send(&data).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Send an SNMPv1 trap with explicit v1 PDU fields.
+    ///
+    /// This is a lower-level method that accepts a pre-built [`TrapV1Pdu`],
+    /// giving full control over enterprise OID, agent_addr, generic_trap,
+    /// specific_trap, and time_stamp fields.
+    ///
+    /// The client must be configured for V1 (`Auth::v1()`). Returns an error
+    /// if the client version is not V1.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use async_snmp::{Auth, Client, TrapV1Pdu, GenericTrap, oid};
+    /// # async fn example() -> async_snmp::Result<()> {
+    /// let client = Client::builder("192.168.1.100:162", Auth::v1("public"))
+    ///     .connect().await?;
+    ///
+    /// let trap = TrapV1Pdu::new(
+    ///     oid!(1, 3, 6, 1, 4, 1, 9999),  // enterprise
+    ///     [192, 168, 1, 1],               // agent address
+    ///     GenericTrap::ColdStart,
+    ///     0,
+    ///     12345,                          // uptime in centiseconds
+    ///     vec![],
+    /// );
+    /// client.send_v1_trap(trap).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self, trap), err, fields(snmp.target = %self.peer_addr(), snmp.generic_trap = %trap.generic_trap))]
+    pub async fn send_v1_trap(&self, trap: TrapV1Pdu) -> Result<()> {
+        if self.inner.config.version != Version::V1 {
+            return Err(Error::Config("send_v1_trap requires a V1 client".into()).boxed());
+        }
+
+        let message = CommunityMessage::v1_trap(self.inner.config.community.clone(), trap);
+        let data = message.encode();
+        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
+        self.inner.transport.send(&data).await?;
+
+        Ok(())
+    }
+
+    /// Send a v2c/v3 inform and wait for acknowledgement.
+    ///
+    /// Constructs an InformRequest PDU with the mandatory sysUpTime.0 and
+    /// snmpTrapOID.0 prefix, sends it to the target, and waits for a Response
+    /// PDU. Uses the same retry and timeout logic as other request types.
+    ///
+    /// For V3: uses engine discovery against the receiver (same as GET/SET).
+    /// V1 is not supported and returns an error.
+    ///
+    /// # Arguments
+    ///
+    /// * `trap_oid` - The trap OID (snmpTrapOID.0 value)
+    /// * `uptime` - sysUpTime.0 value in hundredths of seconds
+    /// * `varbinds` - Additional variable bindings (appended after the prefix)
+    #[instrument(skip(self, varbinds), err, fields(snmp.target = %self.peer_addr(), snmp.trap_oid = %trap_oid))]
+    pub async fn send_inform(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> Result<()> {
+        if self.inner.config.version == Version::V1 {
+            return Err(Error::Config("v1 inform sending not supported".into()).boxed());
+        }
+
+        let request_id = self.next_request_id();
+        let pdu = Pdu::inform_request(request_id, uptime, trap_oid, varbinds);
+        let _response = self.send_request(pdu).await?;
+        Ok(())
     }
 
     /// GETBULK request (SNMPv2c/v3 only).

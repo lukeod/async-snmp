@@ -293,12 +293,17 @@ impl UdpTransportBuilder {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
-        let socket = bind_udp_socket(bind_addr, self.recv_buffer_size, self.send_buffer_size, true)
-            .await
-            .map_err(|e| Error::Network {
-                target: bind_addr,
-                source: e,
-            })?;
+        let socket = bind_udp_socket(
+            bind_addr,
+            self.recv_buffer_size,
+            self.send_buffer_size,
+            true,
+        )
+        .await
+        .map_err(|e| Error::Network {
+            target: bind_addr,
+            source: e,
+        })?;
 
         let local_addr = socket.local_addr().map_err(|e| Error::Network {
             target: bind_addr,

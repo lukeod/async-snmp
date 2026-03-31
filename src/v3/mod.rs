@@ -16,6 +16,7 @@
 
 pub mod auth;
 mod crypto;
+pub(crate) mod encode;
 mod engine;
 mod privacy;
 mod usm;

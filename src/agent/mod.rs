@@ -65,6 +65,7 @@
 //! }
 //! ```
 
+mod notification;
 mod request;
 mod response;
 mod set_handler;
@@ -76,7 +77,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use subtle::ConstantTimeEq;
@@ -171,6 +172,9 @@ pub struct AgentBuilder {
     recv_buffer_size: Option<usize>,
     vacm: Option<VacmConfig>,
     cancel: Option<CancellationToken>,
+    trap_sinks: Vec<(String, crate::client::Auth)>,
+    inform_timeout: Duration,
+    inform_retry: crate::client::Retry,
 }
 
 impl AgentBuilder {
@@ -196,6 +200,9 @@ impl AgentBuilder {
             recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
             vacm: None,
             cancel: None,
+            trap_sinks: Vec::new(),
+            inform_timeout: Duration::from_secs(5),
+            inform_retry: crate::client::Retry::default(),
         }
     }
 
@@ -527,6 +534,56 @@ impl AgentBuilder {
         self
     }
 
+    /// Add a trap/inform destination.
+    ///
+    /// The agent will send notifications to all configured trap sinks when
+    /// [`Agent::send_trap()`] or [`Agent::send_inform()`] is called.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::agent::Agent;
+    /// use async_snmp::{Auth, AuthProtocol, PrivProtocol};
+    ///
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// let agent = Agent::builder()
+    ///     .bind("0.0.0.0:1161")
+    ///     .community(b"public")
+    ///     .trap_sink("192.168.1.100:162", Auth::v2c("public"))
+    ///     .trap_sink("10.0.0.1:162", Auth::usm("trapuser")
+    ///         .auth(AuthProtocol::Sha256, "authpass")
+    ///         .privacy(PrivProtocol::Aes128, "privpass"))
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn trap_sink(
+        mut self,
+        dest: impl Into<String>,
+        auth: impl Into<crate::client::Auth>,
+    ) -> Self {
+        self.trap_sinks.push((dest.into(), auth.into()));
+        self
+    }
+
+    /// Set the timeout for inform requests sent to trap sinks.
+    ///
+    /// Default is 5 seconds. Only affects `send_inform`, not `send_trap`.
+    pub fn inform_timeout(mut self, timeout: Duration) -> Self {
+        self.inform_timeout = timeout;
+        self
+    }
+
+    /// Set the retry policy for inform requests sent to trap sinks.
+    ///
+    /// Default is `Retry::default()` (3 retries with 1-second delay).
+    /// Only affects `send_inform`, not `send_trap`.
+    pub fn inform_retry(mut self, retry: crate::client::Retry) -> Self {
+        self.inform_retry = retry;
+        self
+    }
+
     /// Build the agent.
     pub async fn build(mut self) -> Result<Agent> {
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
@@ -575,6 +632,20 @@ impl AgentBuilder {
             .max_concurrent_requests
             .map(|n| Arc::new(Semaphore::new(n)));
 
+        // Resolve trap sink addresses
+        let mut trap_sinks = Vec::with_capacity(self.trap_sinks.len());
+        for (dest_str, auth) in self.trap_sinks {
+            let dest: SocketAddr = dest_str.parse().map_err(|_| {
+                Error::Config(format!("invalid trap sink address: {}", dest_str).into())
+            })?;
+            trap_sinks.push(notification::TrapSink::new(
+                dest,
+                auth,
+                self.inform_timeout,
+                self.inform_retry.clone(),
+            ));
+        }
+
         Ok(Agent {
             inner: Arc::new(AgentInner {
                 socket: Arc::new(socket),
@@ -600,6 +671,7 @@ impl AgentBuilder {
                 usm_wrong_digests: AtomicU32::new(0),
                 usm_not_in_time_windows: AtomicU32::new(0),
                 cancel,
+                trap_sinks,
             }),
         })
     }
@@ -654,6 +726,8 @@ pub(crate) struct AgentInner {
     pub(crate) usm_not_in_time_windows: AtomicU32,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
+    /// Configured trap/inform destinations.
+    pub(crate) trap_sinks: Vec<notification::TrapSink>,
 }
 
 /// SNMP Agent.

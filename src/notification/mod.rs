@@ -96,6 +96,11 @@ pub mod oids {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 3, 0)
     }
 
+    /// snmpTrapAddress.0 - agent address from v1 trap (RFC 3584 Section 3)
+    pub fn snmp_trap_address() -> crate::Oid {
+        oid!(1, 3, 6, 1, 6, 3, 18, 1, 3, 0)
+    }
+
     /// Standard trap OID prefix (snmpTraps)
     pub fn snmp_traps() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5)

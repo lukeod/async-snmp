@@ -147,6 +147,8 @@ pub struct ClientBuilder {
     oid_ordering: OidOrdering,
     max_walk_results: Option<usize>,
     engine_cache: Option<Arc<EngineCache>>,
+    local_engine_id: Option<Vec<u8>>,
+    local_engine_boots: u32,
 }
 
 impl ClientBuilder {
@@ -191,6 +193,8 @@ impl ClientBuilder {
             oid_ordering: OidOrdering::Strict,
             max_walk_results: None,
             engine_cache: None,
+            local_engine_id: None,
+            local_engine_boots: 1,
         }
     }
 
@@ -374,6 +378,36 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the local engine ID for V3 trap sending.
+    ///
+    /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
+    /// trap PDUs. This engine ID is used to localize keys for outbound V3 traps.
+    /// Required when sending V3 traps; not needed for V3 informs (which use
+    /// engine discovery against the receiver).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::{Auth, AuthProtocol, ClientBuilder};
+    ///
+    /// let builder = ClientBuilder::new(("192.168.1.1", 162),
+    ///     Auth::usm("trapuser").auth(AuthProtocol::Sha256, "password"))
+    ///     .local_engine_id(b"my-engine-id".to_vec());
+    /// ```
+    pub fn local_engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
+        self.local_engine_id = Some(engine_id.into());
+        self
+    }
+
+    /// Set the local engine boots value for V3 trap sending (default: 1).
+    ///
+    /// This is the base boots counter. Engine time is computed from the
+    /// elapsed time since the client was created.
+    pub fn local_engine_boots(mut self, boots: u32) -> Self {
+        self.local_engine_boots = boots;
+        self
+    }
+
     /// Set shared engine cache (V3 only, for polling many targets).
     ///
     /// Allows multiple clients to share discovered engine state, reducing
@@ -507,6 +541,11 @@ impl ClientBuilder {
                     oid_ordering: self.oid_ordering,
                     max_walk_results: self.max_walk_results,
                     max_repetitions: self.max_repetitions,
+                    local_engine_id: self
+                        .local_engine_id
+                        .as_ref()
+                        .map(|id| Bytes::copy_from_slice(id)),
+                    local_engine_boots: self.local_engine_boots,
                 }
             }
             Auth::Usm(usm) => {
@@ -544,6 +583,11 @@ impl ClientBuilder {
                     oid_ordering: self.oid_ordering,
                     max_walk_results: self.max_walk_results,
                     max_repetitions: self.max_repetitions,
+                    local_engine_id: self
+                        .local_engine_id
+                        .as_ref()
+                        .map(|id| Bytes::copy_from_slice(id)),
+                    local_engine_boots: self.local_engine_boots,
                 }
             }
         }

@@ -128,9 +128,11 @@ impl super::NotificationReceiver {
             return self.handle_v3_discovery(&msg, &usm_params, source).await;
         }
 
-        // Verify engine ID matches ours
+        // Verify engine ID matches ours. For V3 traps the sender is the
+        // authoritative engine, so the receiver must be configured with the
+        // sender's engine ID to accept the message.
         if usm_params.engine_id != self.inner.engine_id {
-            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "engine ID mismatch");
+            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_engine_id = ?usm_params.engine_id.as_ref(), snmp.our_engine_id = ?self.inner.engine_id.as_ref() }, "engine ID mismatch, configure receiver with sender's engine ID for V3 traps");
             return Ok(None);
         }
 
