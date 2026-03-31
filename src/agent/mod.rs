@@ -65,6 +65,7 @@
 //! }
 //! ```
 
+mod builtins;
 mod notification;
 mod request;
 mod response;
@@ -73,7 +74,7 @@ pub mod vacm;
 
 pub use vacm::{SecurityModel, VacmBuilder, VacmConfig, View, ViewCheckResult, ViewSubtree};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -95,6 +96,7 @@ use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::handler::{GetNextResult, GetResult, MibHandler, RequestContext};
 use crate::notification::UsmConfig;
+use crate::oid;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::util::bind_udp_socket;
@@ -109,6 +111,31 @@ const DEFAULT_MAX_MESSAGE_SIZE: usize = 1472;
 /// Overhead for SNMP message encoding (approximate conservative estimate).
 /// This accounts for version, community/USM, PDU headers, etc.
 const RESPONSE_OVERHEAD: usize = 100;
+
+/// Built-in MIB handler groups that the agent registers automatically.
+///
+/// By default, the agent registers handlers for standard SNMP MIB objects
+/// (engine parameters, USM statistics, MPD statistics). Use
+/// [`AgentBuilder::without_builtin_handler`] to disable specific groups
+/// or [`AgentBuilder::without_builtin_handlers`] to disable all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinMib {
+    /// snmpEngine scalars (1.3.6.1.6.3.10.2.1).
+    ///
+    /// Provides snmpEngineID, snmpEngineBoots, snmpEngineTime,
+    /// and snmpEngineMaxMessageSize.
+    SnmpEngine,
+    /// USM statistics (1.3.6.1.6.3.15.1.1).
+    ///
+    /// Provides the six usmStats counters (unsupportedSecLevels,
+    /// notInTimeWindows, unknownUserNames, unknownEngineIDs,
+    /// wrongDigests, decryptionErrors).
+    UsmStats,
+    /// MPD statistics (1.3.6.1.6.3.11.2.1).
+    ///
+    /// Provides snmpUnknownSecurityModels and snmpInvalidMsgs.
+    MpdStats,
+}
 
 /// Registered handler with its OID prefix.
 pub(crate) struct RegisteredHandler {
@@ -175,6 +202,7 @@ pub struct AgentBuilder {
     trap_sinks: Vec<(String, crate::client::Auth)>,
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
+    disabled_builtins: HashSet<BuiltinMib>,
 }
 
 impl AgentBuilder {
@@ -203,6 +231,7 @@ impl AgentBuilder {
             trap_sinks: Vec::new(),
             inform_timeout: Duration::from_secs(5),
             inform_retry: crate::client::Retry::default(),
+            disabled_builtins: HashSet::new(),
         }
     }
 
@@ -584,6 +613,28 @@ impl AgentBuilder {
         self
     }
 
+    /// Disable a specific built-in MIB handler group.
+    ///
+    /// By default, the agent registers handlers for snmpEngine, USM stats,
+    /// and MPD stats. Call this to prevent registration of a specific group,
+    /// e.g., if you want to provide your own handler for those OIDs.
+    pub fn without_builtin_handler(mut self, mib: BuiltinMib) -> Self {
+        self.disabled_builtins.insert(mib);
+        self
+    }
+
+    /// Disable all built-in MIB handlers.
+    ///
+    /// The agent will not register any internal handlers for snmpEngine,
+    /// USM stats, or MPD stats. You can still query the counter values
+    /// via accessor methods like [`Agent::usm_unknown_engine_ids()`].
+    pub fn without_builtin_handlers(mut self) -> Self {
+        self.disabled_builtins.insert(BuiltinMib::SnmpEngine);
+        self.disabled_builtins.insert(BuiltinMib::UsmStats);
+        self.disabled_builtins.insert(BuiltinMib::MpdStats);
+        self
+    }
+
     /// Build the agent.
     pub async fn build(mut self) -> Result<Agent> {
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
@@ -621,10 +672,6 @@ impl AgentBuilder {
             Bytes::from(id)
         });
 
-        // Sort handlers by prefix length (longest first) for matching
-        self.handlers
-            .sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
-
         let cancel = self.cancel.unwrap_or_default();
 
         // Create concurrency limiter if configured
@@ -646,6 +693,54 @@ impl AgentBuilder {
             ));
         }
 
+        let state = Arc::new(AgentState {
+            engine_id,
+            engine_boots: AtomicU32::new(self.engine_boots),
+            engine_time: AtomicU32::new(0),
+            engine_start: Instant::now(),
+            engine_boots_base: self.engine_boots,
+            max_message_size: self.max_message_size,
+            snmp_invalid_msgs: AtomicU32::new(0),
+            snmp_unknown_security_models: AtomicU32::new(0),
+            snmp_silent_drops: AtomicU32::new(0),
+            usm_unknown_engine_ids: AtomicU32::new(0),
+            usm_unknown_usernames: AtomicU32::new(0),
+            usm_wrong_digests: AtomicU32::new(0),
+            usm_not_in_time_windows: AtomicU32::new(0),
+            usm_unsupported_sec_levels: AtomicU32::new(0),
+            usm_decryption_errors: AtomicU32::new(0),
+        });
+
+        // Register built-in handlers for any not disabled
+        if !self.disabled_builtins.contains(&BuiltinMib::SnmpEngine) {
+            self.handlers.push(RegisteredHandler {
+                prefix: oid!(1, 3, 6, 1, 6, 3, 10, 2, 1),
+                handler: Arc::new(builtins::SnmpEngineHandler {
+                    state: Arc::clone(&state),
+                }),
+            });
+        }
+        if !self.disabled_builtins.contains(&BuiltinMib::UsmStats) {
+            self.handlers.push(RegisteredHandler {
+                prefix: oid!(1, 3, 6, 1, 6, 3, 15, 1, 1),
+                handler: Arc::new(builtins::UsmStatsHandler {
+                    state: Arc::clone(&state),
+                }),
+            });
+        }
+        if !self.disabled_builtins.contains(&BuiltinMib::MpdStats) {
+            self.handlers.push(RegisteredHandler {
+                prefix: oid!(1, 3, 6, 1, 6, 3, 11, 2, 1),
+                handler: Arc::new(builtins::MpdStatsHandler {
+                    state: Arc::clone(&state),
+                }),
+            });
+        }
+
+        // Sort handlers by prefix length (longest first) for matching
+        self.handlers
+            .sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+
         Ok(Agent {
             inner: Arc::new(AgentInner {
                 socket: Arc::new(socket),
@@ -654,22 +749,10 @@ impl AgentBuilder {
                 communities: self.communities,
                 usm_users: self.usm_users,
                 handlers: self.handlers,
-                engine_id,
-                engine_boots: AtomicU32::new(self.engine_boots),
-                engine_time: AtomicU32::new(0),
-                engine_start: Instant::now(),
-                engine_boots_base: self.engine_boots,
+                state,
                 salt_counter: SaltCounter::new(),
-                max_message_size: self.max_message_size,
                 concurrency_limit,
                 vacm: self.vacm,
-                snmp_invalid_msgs: AtomicU32::new(0),
-                snmp_unknown_security_models: AtomicU32::new(0),
-                snmp_silent_drops: AtomicU32::new(0),
-                usm_unknown_engine_ids: AtomicU32::new(0),
-                usm_unknown_usernames: AtomicU32::new(0),
-                usm_wrong_digests: AtomicU32::new(0),
-                usm_not_in_time_windows: AtomicU32::new(0),
                 cancel,
                 trap_sinks,
             }),
@@ -683,24 +766,15 @@ impl Default for AgentBuilder {
     }
 }
 
-/// Inner state shared across agent clones.
-pub(crate) struct AgentInner {
-    pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) socket_state: UdpSocketState,
-    pub(crate) local_addr: SocketAddr,
-    pub(crate) communities: Vec<Vec<u8>>,
-    pub(crate) usm_users: HashMap<Bytes, UsmConfig>,
-    pub(crate) handlers: Vec<RegisteredHandler>,
+/// Engine state and counters shared across agent clones and (future) built-in handlers.
+pub(crate) struct AgentState {
     pub(crate) engine_id: Bytes,
     pub(crate) engine_boots: AtomicU32,
     pub(crate) engine_time: AtomicU32,
     pub(crate) engine_start: Instant,
     /// Initial engine_boots value at startup, used to compute overflow-adjusted boots.
     pub(crate) engine_boots_base: u32,
-    pub(crate) salt_counter: SaltCounter,
     pub(crate) max_message_size: usize,
-    pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
-    pub(crate) vacm: Option<VacmConfig>,
     // RFC 3412 statistics counters
     /// snmpInvalidMsgs (1.3.6.1.6.3.11.2.1.2) - messages with invalid msgFlags
     /// (e.g., privacy without authentication)
@@ -724,6 +798,26 @@ pub(crate) struct AgentInner {
     /// usmStatsNotInTimeWindows (1.3.6.1.6.3.15.1.1.2) - messages outside
     /// the time window
     pub(crate) usm_not_in_time_windows: AtomicU32,
+    /// usmStatsUnsupportedSecLevels (1.3.6.1.6.3.15.1.1.1) - messages where
+    /// the user does not support the requested security level
+    pub(crate) usm_unsupported_sec_levels: AtomicU32,
+    /// usmStatsDecryptionErrors (1.3.6.1.6.3.15.1.1.6) - messages where
+    /// decryption failed
+    pub(crate) usm_decryption_errors: AtomicU32,
+}
+
+/// Inner state shared across agent clones.
+pub(crate) struct AgentInner {
+    pub(crate) socket: Arc<UdpSocket>,
+    pub(crate) socket_state: UdpSocketState,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) communities: Vec<Vec<u8>>,
+    pub(crate) usm_users: HashMap<Bytes, UsmConfig>,
+    pub(crate) handlers: Vec<RegisteredHandler>,
+    pub(crate) state: Arc<AgentState>,
+    pub(crate) salt_counter: SaltCounter,
+    pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
+    pub(crate) vacm: Option<VacmConfig>,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
     /// Configured trap/inform destinations.
@@ -767,7 +861,7 @@ impl Agent {
 
     /// Get the engine ID.
     pub fn engine_id(&self) -> &[u8] {
-        &self.inner.engine_id
+        &self.inner.state.engine_id
     }
 
     /// Get the current engine boots value.
@@ -776,12 +870,12 @@ impl Agent {
     /// The persisted value should be passed to `AgentBuilder::engine_boots()`
     /// on the next startup.
     pub fn engine_boots(&self) -> u32 {
-        self.inner.engine_boots.load(Ordering::Relaxed)
+        self.inner.state.engine_boots.load(Ordering::Relaxed)
     }
 
     /// Get the current engine time value.
     pub fn engine_time(&self) -> u32 {
-        self.inner.engine_time.load(Ordering::Relaxed)
+        self.inner.state.engine_time.load(Ordering::Relaxed)
     }
 
     /// Get the cancellation token for this agent.
@@ -798,7 +892,7 @@ impl Agent {
     ///
     /// OID: 1.3.6.1.6.3.11.2.1.2
     pub fn snmp_invalid_msgs(&self) -> u32 {
-        self.inner.snmp_invalid_msgs.load(Ordering::Relaxed)
+        self.inner.state.snmp_invalid_msgs.load(Ordering::Relaxed)
     }
 
     /// Get the snmpUnknownSecurityModels counter value.
@@ -809,6 +903,7 @@ impl Agent {
     /// OID: 1.3.6.1.6.3.11.2.1.1
     pub fn snmp_unknown_security_models(&self) -> u32 {
         self.inner
+            .state
             .snmp_unknown_security_models
             .load(Ordering::Relaxed)
     }
@@ -822,7 +917,7 @@ impl Agent {
     ///
     /// OID: 1.3.6.1.6.3.11.2.1.3
     pub fn snmp_silent_drops(&self) -> u32 {
-        self.inner.snmp_silent_drops.load(Ordering::Relaxed)
+        self.inner.state.snmp_silent_drops.load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsUnknownEngineIDs counter value.
@@ -833,7 +928,10 @@ impl Agent {
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.4
     pub fn usm_unknown_engine_ids(&self) -> u32 {
-        self.inner.usm_unknown_engine_ids.load(Ordering::Relaxed)
+        self.inner
+            .state
+            .usm_unknown_engine_ids
+            .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsUnknownUserNames counter value.
@@ -844,18 +942,20 @@ impl Agent {
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.3
     pub fn usm_unknown_usernames(&self) -> u32 {
-        self.inner.usm_unknown_usernames.load(Ordering::Relaxed)
+        self.inner
+            .state
+            .usm_unknown_usernames
+            .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsWrongDigests counter value.
     ///
-    /// This counter tracks messages with incorrect authentication digests,
-    /// as well as messages where the user has no auth key configured.
-    /// (RFC 3414 Section 3.2 Steps 6 and 7).
+    /// This counter tracks messages with incorrect authentication digests.
+    /// (RFC 3414 Section 3.2 Step 7).
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.5
     pub fn usm_wrong_digests(&self) -> u32 {
-        self.inner.usm_wrong_digests.load(Ordering::Relaxed)
+        self.inner.state.usm_wrong_digests.load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsNotInTimeWindows counter value.
@@ -866,7 +966,48 @@ impl Agent {
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.2
     pub fn usm_not_in_time_windows(&self) -> u32 {
-        self.inner.usm_not_in_time_windows.load(Ordering::Relaxed)
+        self.inner
+            .state
+            .usm_not_in_time_windows
+            .load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsUnsupportedSecLevels counter value.
+    ///
+    /// This counter tracks messages where the user does not support
+    /// the requested security level (e.g., auth required but user
+    /// has no auth key configured). RFC 3414 Section 3.2.
+    ///
+    /// OID: 1.3.6.1.6.3.15.1.1.1
+    pub fn usm_unsupported_sec_levels(&self) -> u32 {
+        self.inner
+            .state
+            .usm_unsupported_sec_levels
+            .load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsDecryptionErrors counter value.
+    ///
+    /// This counter tracks messages where decryption failed (the user
+    /// has a privacy key but the decrypt operation returned an error).
+    /// RFC 3414 Section 3.2.
+    ///
+    /// OID: 1.3.6.1.6.3.15.1.1.6
+    pub fn usm_decryption_errors(&self) -> u32 {
+        self.inner
+            .state
+            .usm_decryption_errors
+            .load(Ordering::Relaxed)
+    }
+
+    /// Returns agent uptime in hundredths of a second (centiseconds).
+    ///
+    /// Use this in your system MIB handler to provide sysUpTime.0
+    /// (1.3.6.1.2.1.1.3.0) as a `Value::TimeTicks` value.
+    pub fn uptime_hundredths(&self) -> u32 {
+        let elapsed = self.inner.state.engine_start.elapsed();
+        let centisecs = elapsed.as_millis() / 10;
+        centisecs.min(u32::MAX as u128) as u32
     }
 
     /// Run the agent, processing requests concurrently.
@@ -905,12 +1046,13 @@ impl Agent {
                     Ok(Some(response_bytes)) => {
                         // RFC 3413 Section 3.2 step 4: if the encoded response
                         // exceeds the max message size, silently drop it.
-                        if response_bytes.len() > agent.inner.max_message_size {
+                        if response_bytes.len() > agent.inner.state.max_message_size {
                             agent
                                 .inner
+                                .state
                                 .snmp_silent_drops
                                 .fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, response_size = response_bytes.len(), max_size = agent.inner.max_message_size }, "response exceeds max message size, silently dropped");
+                            tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, response_size = response_bytes.len(), max_size = agent.inner.state.max_message_size }, "response exceeds max message size, silently dropped");
                         } else if let Err(e) =
                             agent.send_response(&response_bytes, &recv_meta).await
                         {
@@ -1017,11 +1159,12 @@ impl Agent {
     /// the base boots value at startup, so no mutable state beyond the
     /// atomics is needed.
     fn update_engine_time(&self) {
-        let total_secs = self.inner.engine_start.elapsed().as_secs();
-        let (boots, time) = compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+        let total_secs = self.inner.state.engine_start.elapsed().as_secs();
+        let (boots, time) =
+            compute_engine_boots_time(self.inner.state.engine_boots_base, total_secs);
 
-        if boots != self.inner.engine_boots.load(Ordering::Relaxed)
-            && boots > self.inner.engine_boots_base
+        if boots != self.inner.state.engine_boots.load(Ordering::Relaxed)
+            && boots > self.inner.state.engine_boots_base
         {
             tracing::warn!(
                 target: "async_snmp::agent",
@@ -1030,8 +1173,11 @@ impl Agent {
             );
         }
 
-        self.inner.engine_boots.store(boots, Ordering::Relaxed);
-        self.inner.engine_time.store(time, Ordering::Relaxed);
+        self.inner
+            .state
+            .engine_boots
+            .store(boots, Ordering::Relaxed);
+        self.inner.state.engine_time.store(time, Ordering::Relaxed);
     }
 
     /// Validate community string using constant-time comparison.
@@ -1205,7 +1351,7 @@ impl Agent {
 
         let mut response_varbinds = Vec::new();
         let mut current_size: usize = RESPONSE_OVERHEAD;
-        let agent_max = self.inner.max_message_size;
+        let agent_max = self.inner.state.max_message_size;
         let max_size = match ctx.msg_max_size {
             Some(client_max) => agent_max.min(client_max as usize),
             None => agent_max,
@@ -2078,6 +2224,7 @@ mod tests {
             .community(b"public")
             .max_message_size(65507)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .without_builtin_handlers()
             .build()
             .await
             .unwrap();
@@ -2241,5 +2388,151 @@ mod tests {
             .unwrap();
 
         assert_eq!(agent.engine_boots(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_usm_counter_accessors_default_zero() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(agent.usm_unsupported_sec_levels(), 0);
+        assert_eq!(agent.usm_decryption_errors(), 0);
+    }
+
+    #[test]
+    fn test_builtin_mib_without_single() {
+        let builder = AgentBuilder::new().without_builtin_handler(BuiltinMib::UsmStats);
+        assert!(builder.disabled_builtins.contains(&BuiltinMib::UsmStats));
+        assert!(!builder.disabled_builtins.contains(&BuiltinMib::SnmpEngine));
+        assert!(!builder.disabled_builtins.contains(&BuiltinMib::MpdStats));
+    }
+
+    #[test]
+    fn test_builtin_mib_without_all() {
+        let builder = AgentBuilder::new().without_builtin_handlers();
+        assert!(builder.disabled_builtins.contains(&BuiltinMib::SnmpEngine));
+        assert!(builder.disabled_builtins.contains(&BuiltinMib::UsmStats));
+        assert!(builder.disabled_builtins.contains(&BuiltinMib::MpdStats));
+    }
+
+    #[tokio::test]
+    async fn test_uptime_hundredths() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        let uptime = agent.uptime_hundredths();
+        assert!(
+            uptime < 100,
+            "uptime should be less than 1 second, got {}",
+            uptime
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let uptime2 = agent.uptime_hundredths();
+        assert!(uptime2 > uptime, "uptime should increase after delay");
+    }
+
+    #[tokio::test]
+    async fn test_builtin_handlers_registered_by_default() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        let ctx = test_ctx();
+
+        // snmpEngineMaxMessageSize.0 should be queryable
+        let handler = agent
+            .find_handler(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
+            .expect("snmpEngine handler should be registered");
+        let get_result = handler
+            .handler
+            .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
+            .await;
+        assert!(matches!(get_result, GetResult::Value(Value::Integer(_))));
+
+        // usmStatsWrongDigests.0 should be queryable
+        let handler = agent
+            .find_handler(&oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0))
+            .expect("USM stats handler should be registered");
+        let get_result = handler
+            .handler
+            .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0))
+            .await;
+        assert!(matches!(get_result, GetResult::Value(Value::Counter32(0))));
+
+        // snmpUnknownSecurityModels.0 should be queryable
+        let handler = agent
+            .find_handler(&oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
+            .expect("MPD stats handler should be registered");
+        let get_result = handler
+            .handler
+            .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
+            .await;
+        assert!(matches!(get_result, GetResult::Value(Value::Counter32(0))));
+    }
+
+    #[tokio::test]
+    async fn test_builtin_handlers_disabled() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            agent
+                .find_handler(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0))
+                .is_none()
+        );
+        assert!(
+            agent
+                .find_handler(&oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 1, 0))
+                .is_none()
+        );
+        assert!(
+            agent
+                .find_handler(&oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builtin_handler_selective_disable() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handler(BuiltinMib::UsmStats)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            agent
+                .find_handler(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0))
+                .is_some()
+        );
+        assert!(
+            agent
+                .find_handler(&oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 1, 0))
+                .is_none()
+        );
+        assert!(
+            agent
+                .find_handler(&oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
+                .is_some()
+        );
     }
 }

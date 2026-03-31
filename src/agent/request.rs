@@ -106,10 +106,11 @@ impl Agent {
         }
 
         // Verify engine ID matches ours
-        if usm_params.engine_id.as_ref() != self.inner.engine_id.as_ref() {
+        if usm_params.engine_id.as_ref() != self.inner.state.engine_id.as_ref() {
             tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "engine ID mismatch");
             let count = self
                 .inner
+                .state
                 .usm_unknown_engine_ids
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
@@ -125,7 +126,7 @@ impl Agent {
         // Look up user credentials
         let user_config = self.inner.usm_users.get(&usm_params.username);
         let derived_keys = user_config
-            .map(|u| u.derive_keys(&self.inner.engine_id))
+            .map(|u| u.derive_keys(&self.inner.state.engine_id))
             .transpose()
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
@@ -135,6 +136,7 @@ impl Agent {
             tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "unknown user");
             let count = self
                 .inner
+                .state
                 .usm_unknown_usernames
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
@@ -151,11 +153,12 @@ impl Agent {
         // reject all authenticated inbound messages with notInTimeWindows.
         // The agent cannot perform timeliness checks in this state.
         if security_level.requires_auth()
-            && self.inner.engine_boots.load(Ordering::Relaxed) == MAX_ENGINE_TIME
+            && self.inner.state.engine_boots.load(Ordering::Relaxed) == MAX_ENGINE_TIME
         {
             tracing::warn!(target: "async_snmp::agent", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated request");
             let count = self
                 .inner
+                .state
                 .usm_not_in_time_windows
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
@@ -184,8 +187,12 @@ impl Agent {
                         .map_err(|_| Error::Auth { target: source }.boxed())?
                     {
                         tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "authentication failed");
-                        let count =
-                            self.inner.usm_wrong_digests.fetch_add(1, Ordering::Relaxed) + 1;
+                        let count = self
+                            .inner
+                            .state
+                            .usm_wrong_digests
+                            .fetch_add(1, Ordering::Relaxed)
+                            + 1;
                         return self.send_v3_report(
                             &msg,
                             &usm_params,
@@ -196,12 +203,13 @@ impl Agent {
                     }
 
                     // Verify time window (150 seconds)
-                    let our_time = self.inner.engine_time.load(Ordering::Relaxed);
+                    let our_time = self.inner.state.engine_time.load(Ordering::Relaxed);
                     let time_diff = (usm_params.engine_time as i64 - our_time as i64).abs();
                     if time_diff > 150 {
                         tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "message outside time window");
                         let count = self
                             .inner
+                            .state
                             .usm_not_in_time_windows
                             .fetch_add(1, Ordering::Relaxed)
                             + 1;
@@ -215,13 +223,18 @@ impl Agent {
                     }
                 }
                 _ => {
-                    // User exists but has no auth key configured - authentication cannot proceed
-                    tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user has no auth credentials");
-                    let count = self.inner.usm_wrong_digests.fetch_add(1, Ordering::Relaxed) + 1;
+                    // User exists but has no auth key configured - cannot meet requested security level
+                    tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user does not support requested security level");
+                    let count = self
+                        .inner
+                        .state
+                        .usm_unsupported_sec_levels
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
                     return self.send_v3_report(
                         &msg,
                         &usm_params,
-                        crate::v3::report_oids::wrong_digests(),
+                        crate::v3::report_oids::unsupported_sec_levels(),
                         count,
                         source,
                     );
@@ -242,24 +255,49 @@ impl Agent {
                         }
                     };
 
-                    let decrypted = priv_key
-                        .decrypt(
-                            encrypted_data,
-                            usm_params.engine_boots,
-                            usm_params.engine_time,
-                            &usm_params.priv_params,
-                        )
-                        .map_err(|e| {
+                    let decrypted = match priv_key.decrypt(
+                        encrypted_data,
+                        usm_params.engine_boots,
+                        usm_params.engine_time,
+                        &usm_params.priv_params,
+                    ) {
+                        Ok(data) => data,
+                        Err(e) => {
                             tracing::debug!(target: "async_snmp::agent", { source = %source, error = %e }, "decryption failed");
-                            Error::Auth { target: source }.boxed()
-                        })?;
+                            let count = self
+                                .inner
+                                .state
+                                .usm_decryption_errors
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            return self.send_v3_report(
+                                &msg,
+                                &usm_params,
+                                crate::v3::report_oids::decryption_errors(),
+                                count,
+                                source,
+                            );
+                        }
+                    };
 
                     let mut decoder = Decoder::with_target(decrypted, source);
                     ScopedPdu::decode(&mut decoder)?
                 }
                 _ => {
                     tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %CryptoErrorKind::NoPrivKey }, "no privacy key configured for user");
-                    return Err(Error::Auth { target: source }.boxed());
+                    let count = self
+                        .inner
+                        .state
+                        .usm_unsupported_sec_levels
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    return self.send_v3_report(
+                        &msg,
+                        &usm_params,
+                        crate::v3::report_oids::unsupported_sec_levels(),
+                        count,
+                        source,
+                    );
                 }
             }
         } else {
@@ -357,12 +395,13 @@ impl Agent {
             return Ok(None);
         }
 
-        let engine_boots = self.inner.engine_boots.load(Ordering::Relaxed);
-        let engine_time = self.inner.engine_time.load(Ordering::Relaxed);
+        let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
+        let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
 
         // Increment usmStatsUnknownEngineIDs for discovery requests (RFC 3414 Section 3.2 Step 3b)
         let unknown_engine_ids_count = self
             .inner
+            .state
             .usm_unknown_engine_ids
             .fetch_add(1, Ordering::Relaxed)
             + 1;
@@ -386,14 +425,14 @@ impl Agent {
         );
 
         let response_usm = UsmSecurityParams::new(
-            self.inner.engine_id.clone(),
+            self.inner.state.engine_id.clone(),
             engine_boots,
             engine_time,
             Bytes::new(),
         );
 
         let response_scoped =
-            ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
+            ScopedPdu::new(self.inner.state.engine_id.clone(), Bytes::new(), report_pdu);
 
         let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
 

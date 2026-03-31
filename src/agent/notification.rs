@@ -303,20 +303,20 @@ impl super::Agent {
                     Error::Config("V3 security not configured for trap sink".into()).boxed()
                 })?;
 
-                sink.ensure_keys_derived(&self.inner.engine_id)?;
+                sink.ensure_keys_derived(&self.inner.state.engine_id)?;
                 let derived = sink.derived_keys.read().map_err(|_| {
                     Error::Config("trap sink derived_keys lock poisoned".into()).boxed()
                 })?;
 
-                let elapsed_secs = self.inner.engine_start.elapsed().as_secs();
+                let elapsed_secs = self.inner.state.engine_start.elapsed().as_secs();
                 let (engine_boots, engine_time) =
-                    compute_engine_boots_time(self.inner.engine_boots_base, elapsed_secs);
+                    compute_engine_boots_time(self.inner.state.engine_boots_base, elapsed_secs);
 
                 let msg_id = self.next_notification_id();
                 let encoded = crate::v3::encode::encode_v3_message(
                     pdu,
                     msg_id,
-                    &self.inner.engine_id,
+                    &self.inner.state.engine_id,
                     engine_boots,
                     engine_time,
                     security,

@@ -58,6 +58,7 @@ impl TestAgent {
             .community(b"public")
             .cancel(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
+            .without_builtin_handlers()
             .build()
             .await
             .expect("failed to build test agent");

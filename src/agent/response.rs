@@ -40,8 +40,8 @@ impl Agent {
             return Ok(None);
         }
 
-        let engine_boots = self.inner.engine_boots.load(Ordering::Relaxed);
-        let engine_time = self.inner.engine_time.load(Ordering::Relaxed);
+        let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
+        let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
 
         let report_pdu = Pdu {
             pdu_type: PduType::Report,
@@ -58,14 +58,14 @@ impl Agent {
         );
 
         let response_usm = UsmSecurityParams::new(
-            self.inner.engine_id.clone(),
+            self.inner.state.engine_id.clone(),
             engine_boots,
             engine_time,
             incoming_usm.username.clone(),
         );
 
         let response_scoped =
-            ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
+            ScopedPdu::new(self.inner.state.engine_id.clone(), Bytes::new(), report_pdu);
 
         let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
 
@@ -83,13 +83,16 @@ impl Agent {
         derived_keys: Option<&DerivedKeys>,
     ) -> Result<Option<Bytes>> {
         let security_level = incoming.global_data.msg_flags.security_level;
-        let engine_boots = self.inner.engine_boots.load(Ordering::Relaxed);
-        let engine_time = self.inner.engine_time.load(Ordering::Relaxed);
+        let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
+        let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
 
         // RFC 3414 Section 2.3: refuse authenticated messages when boots latched
         if security_level.requires_auth() && engine_boots == MAX_ENGINE_TIME {
             tracing::warn!(target: "async_snmp::agent", "engine boots at maximum, refusing authenticated response");
-            self.inner.snmp_silent_drops.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .state
+                .snmp_silent_drops
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
 
@@ -104,7 +107,7 @@ impl Agent {
         match security_level {
             SecurityLevel::NoAuthNoPriv => {
                 let response_usm = UsmSecurityParams::new(
-                    self.inner.engine_id.clone(),
+                    self.inner.state.engine_id.clone(),
                     engine_boots,
                     engine_time,
                     incoming_usm.username.clone(),
@@ -118,7 +121,7 @@ impl Agent {
                 let (_, auth_key, mac_len) = self.extract_auth_key(derived_keys, local_addr)?;
 
                 let response_usm = UsmSecurityParams::new(
-                    self.inner.engine_id.clone(),
+                    self.inner.state.engine_id.clone(),
                     engine_boots,
                     engine_time,
                     incoming_usm.username.clone(),
@@ -156,7 +159,7 @@ impl Agent {
                     })?;
 
                 let response_usm = UsmSecurityParams::new(
-                    self.inner.engine_id.clone(),
+                    self.inner.state.engine_id.clone(),
                     engine_boots,
                     engine_time,
                     incoming_usm.username.clone(),
@@ -288,6 +291,7 @@ mod tests {
         let agent = test_agent().await;
         agent
             .inner
+            .state
             .engine_boots
             .store(MAX_ENGINE_TIME, Ordering::Relaxed);
 
@@ -310,7 +314,7 @@ mod tests {
             "authenticated response should be dropped when boots is latched"
         );
         assert_eq!(
-            agent.inner.snmp_silent_drops.load(Ordering::Relaxed),
+            agent.inner.state.snmp_silent_drops.load(Ordering::Relaxed),
             1,
             "snmpSilentDrops should be incremented"
         );
@@ -321,6 +325,7 @@ mod tests {
         let agent = test_agent().await;
         agent
             .inner
+            .state
             .engine_boots
             .store(MAX_ENGINE_TIME, Ordering::Relaxed);
 
@@ -349,6 +354,7 @@ mod tests {
         let agent = test_agent().await;
         agent
             .inner
+            .state
             .engine_boots
             .store(MAX_ENGINE_TIME, Ordering::Relaxed);
 
@@ -377,6 +383,7 @@ mod tests {
         let agent = test_agent().await;
         agent
             .inner
+            .state
             .engine_boots
             .store(MAX_ENGINE_TIME, Ordering::Relaxed);
 
@@ -406,6 +413,7 @@ mod tests {
         // Boots just below max - should NOT trigger the latched check
         agent
             .inner
+            .state
             .engine_boots
             .store(MAX_ENGINE_TIME - 1, Ordering::Relaxed);
 
