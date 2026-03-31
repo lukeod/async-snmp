@@ -44,7 +44,7 @@ impl Client<UdpHandle> {
     }
 }
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
 use crate::pdu::{GetBulkPdu, Pdu};
@@ -56,6 +56,7 @@ use crate::varbind::VarBind;
 use crate::version::Version;
 use bytes::Bytes;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -515,48 +516,66 @@ impl<T: Transport> Client<T> {
         }
 
         let max_per_request = self.inner.config.max_oids_per_request;
-
-        // Fast path: single request if within limit
-        if oids.len() <= max_per_request {
-            let request_id = self.next_request_id();
-            let pdu = op(request_id, oids);
-            let response = self.send_request(pdu).await?;
-            if response.varbinds.len() > oids.len() {
-                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has more varbinds than requested");
-                return Err(Error::MalformedResponse {
-                    target: self.peer_addr(),
-                }
-                .boxed());
-            } else if response.varbinds.len() < oids.len() {
-                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has fewer varbinds than requested");
-            }
-            return Ok(response.varbinds);
-        }
-
-        // Batched path: split into chunks
-        let num_batches = oids.len().div_ceil(max_per_request);
-        tracing::debug!(target: "async_snmp::client", { snmp.oid_count = oids.len(), snmp.max_per_request = max_per_request, snmp.batch_count = num_batches, snmp.op = op_name }, "splitting request into batches");
-
         let mut all_results = Vec::with_capacity(oids.len());
 
-        for (batch_idx, chunk) in oids.chunks(max_per_request).enumerate() {
-            tracing::debug!(target: "async_snmp::client", { snmp.batch = batch_idx + 1, snmp.batch_total = num_batches, snmp.batch_oid_count = chunk.len(), snmp.op = op_name }, "sending batch");
-            let request_id = self.next_request_id();
-            let pdu = op(request_id, chunk);
-            let response = self.send_request(pdu).await?;
-            if response.varbinds.len() > chunk.len() {
-                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1, snmp.op = op_name }, "response has more varbinds than requested in batch");
-                return Err(Error::MalformedResponse {
-                    target: self.peer_addr(),
-                }
-                .boxed());
-            } else if response.varbinds.len() < chunk.len() {
-                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = chunk.len(), actual = response.varbinds.len(), snmp.batch = batch_idx + 1, snmp.op = op_name }, "response has fewer varbinds than requested in batch");
-            }
-            all_results.extend(response.varbinds);
+        for chunk in oids.chunks(max_per_request) {
+            self.send_batch_with_bisect(chunk, op_name, op, &mut all_results)
+                .await?;
         }
 
         Ok(all_results)
+    }
+
+    /// Send a batch of OIDs, automatically bisecting on tooBig errors.
+    ///
+    /// If the agent returns tooBig for a batch with more than one OID, the batch
+    /// is split in half and each half is retried. This repeats recursively until
+    /// batches succeed or a single-OID request fails (which is unrecoverable).
+    fn send_batch_with_bisect<'a>(
+        &'a self,
+        oids: &'a [Oid],
+        op_name: &'static str,
+        op: fn(i32, &[Oid]) -> Pdu,
+        results: &'a mut Vec<VarBind>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let request_id = self.next_request_id();
+            let pdu = op(request_id, oids);
+            match self.send_request(pdu).await {
+                Ok(response) => {
+                    if response.varbinds.len() > oids.len() {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has more varbinds than requested");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
+                    } else if response.varbinds.len() < oids.len() {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has fewer varbinds than requested");
+                    }
+                    results.extend(response.varbinds);
+                    Ok(())
+                }
+                Err(e)
+                    if oids.len() > 1
+                        && matches!(
+                            &*e,
+                            Error::Snmp {
+                                status: ErrorStatus::TooBig,
+                                ..
+                            }
+                        ) =>
+                {
+                    let mid = oids.len() / 2;
+                    tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), snmp.batch_size = oids.len(), snmp.split_at = mid, snmp.op = op_name }, "tooBig response, bisecting batch");
+                    self.send_batch_with_bisect(&oids[..mid], op_name, op, results)
+                        .await?;
+                    self.send_batch_with_bisect(&oids[mid..], op_name, op, results)
+                        .await?;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        })
     }
 
     /// SET a single OID.
@@ -1108,6 +1127,166 @@ mod tests {
         let result = client.set_many(&varbinds).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
         assert_eq!(result.unwrap().len(), 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Mock transport that returns tooBig when request exceeds a varbind threshold.
+    // -------------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct TooBigTransport {
+        /// Max varbinds per request before returning tooBig.
+        max_varbinds: usize,
+        pending: Arc<Mutex<VecDeque<(i32, usize)>>>,
+    }
+
+    impl TooBigTransport {
+        fn new(max_varbinds: usize) -> Self {
+            Self {
+                max_varbinds,
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+    }
+
+    impl Transport for TooBigTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            // Decode the message to count varbinds
+            let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let varbind_count = msg.pdu.standard().unwrap().varbinds.len();
+            {
+                let mut q = self.pending.lock().unwrap();
+                q.push_back((request_id, varbind_count));
+            }
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let (request_id, varbind_count) = {
+                let mut q = self.pending.lock().unwrap();
+                q.pop_front().unwrap_or((1, 0))
+            };
+            let max = self.max_varbinds;
+            let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();
+
+            async move {
+                let pdu = if varbind_count > max {
+                    // Return tooBig with empty varbinds (per RFC 3416)
+                    Pdu {
+                        pdu_type: PduType::Response,
+                        request_id,
+                        error_status: ErrorStatus::TooBig.as_i32(),
+                        error_index: 0,
+                        varbinds: vec![],
+                    }
+                } else {
+                    // Echo back one varbind per requested OID
+                    let varbinds: Vec<VarBind> = (0..varbind_count)
+                        .map(|i| {
+                            VarBind::new(
+                                Oid::from_slice(&[1, 3, 6, 1, i as u32]),
+                                crate::value::Value::Integer(i as i32),
+                            )
+                        })
+                        .collect();
+                    Pdu {
+                        pdu_type: PduType::Response,
+                        request_id,
+                        error_status: 0,
+                        error_index: 0,
+                        varbinds,
+                    }
+                };
+
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                Ok((msg.encode(), peer))
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn get_many_bisects_on_too_big() {
+        // Agent can handle at most 3 varbinds per request. We ask for 8.
+        // With max_oids_per_request=10, the initial batch is all 8 OIDs.
+        // That triggers tooBig, so it bisects to 4+4, each of which still
+        // triggers tooBig, then bisects to 2+2+2+2 which all succeed.
+        let transport = TooBigTransport::new(3);
+        let config = ClientConfig {
+            version: Version::V2c,
+            max_oids_per_request: 10,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+
+        let oids: Vec<Oid> = (0..8u32)
+            .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
+            .collect();
+
+        let result = client.get_many(&oids).await.unwrap();
+        assert_eq!(result.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn get_many_single_oid_too_big_is_unrecoverable() {
+        // Agent returns tooBig even for a single OID - can't bisect further.
+        let transport = TooBigTransport::new(0);
+        let config = ClientConfig {
+            version: Version::V2c,
+            max_oids_per_request: 10,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+
+        let oids = [Oid::from_slice(&[1, 3, 6, 1, 1])];
+        let err = client.get_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(
+                &*err,
+                Error::Snmp {
+                    status: ErrorStatus::TooBig,
+                    ..
+                }
+            ),
+            "expected TooBig, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_next_many_bisects_on_too_big() {
+        // Same as get_many test but for GETNEXT.
+        let transport = TooBigTransport::new(3);
+        let config = ClientConfig {
+            version: Version::V2c,
+            max_oids_per_request: 10,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+
+        let oids: Vec<Oid> = (0..8u32)
+            .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
+            .collect();
+
+        let result = client.get_next_many(&oids).await.unwrap();
+        assert_eq!(result.len(), 8);
     }
 
     // Batched path: get_many with more OIDs than max_per_request.
