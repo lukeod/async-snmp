@@ -360,12 +360,11 @@ impl EngineCache {
             }
         }
         // Slow path: write lock to remove the stale entry.
-        if let Ok(mut engines) = self.engines.write() {
-            if let Some(state) = engines.get(target) {
-                if state.synced_at.elapsed() > self.ttl {
-                    engines.remove(target);
-                }
-            }
+        if let Ok(mut engines) = self.engines.write()
+            && let Some(state) = engines.get(target)
+            && state.synced_at.elapsed() > self.ttl
+        {
+            engines.remove(target);
         }
         None
     }
@@ -376,16 +375,15 @@ impl EngineCache {
     /// the oldest `synced_at` time is evicted.
     pub fn insert(&self, target: SocketAddr, state: EngineState) {
         if let Ok(mut engines) = self.engines.write() {
-            if let Some(cap) = self.max_capacity {
-                if !engines.contains_key(&target) && engines.len() >= cap {
-                    if let Some(oldest) = engines
-                        .iter()
-                        .min_by_key(|(_, s)| s.synced_at)
-                        .map(|(k, _)| *k)
-                    {
-                        engines.remove(&oldest);
-                    }
-                }
+            if let Some(cap) = self.max_capacity
+                && !engines.contains_key(&target)
+                && engines.len() >= cap
+                && let Some(oldest) = engines
+                    .iter()
+                    .min_by_key(|(_, s)| s.synced_at)
+                    .map(|(k, _)| *k)
+            {
+                engines.remove(&oldest);
             }
             engines.insert(target, state);
         }
@@ -798,8 +796,8 @@ mod tests {
         cache.insert(addr, state);
         assert!(cache.get(&addr).is_some());
 
-        // Wait for TTL to expire
-        std::thread::sleep(Duration::from_millis(60));
+        // Wait well past TTL to avoid flakiness on slow CI
+        std::thread::sleep(Duration::from_millis(200));
         assert!(
             cache.get(&addr).is_none(),
             "expired entry should return None"
@@ -809,18 +807,18 @@ mod tests {
 
     #[test]
     fn test_engine_cache_ttl_refresh_on_time_update() {
-        let cache = EngineCache::new().with_ttl(Duration::from_millis(80));
+        let cache = EngineCache::new().with_ttl(Duration::from_millis(500));
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
 
         let state = EngineState::new(Bytes::from_static(b"engine1"), 1, 1000);
         cache.insert(addr, state);
 
         // Wait partway, then refresh via update_time
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(cache.update_time(&addr, 1, 1050));
 
         // Wait again - would have expired without the refresh
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
             cache.get(&addr).is_some(),
             "refreshed entry should still be alive"
