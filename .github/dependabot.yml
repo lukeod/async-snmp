@@ -5,6 +5,17 @@ updates:
     schedule:
       interval: weekly
     groups:
+      rustcrypto:
+        patterns:
+          - "digest"
+          - "hmac"
+          - "md-5"
+          - "sha1"
+          - "sha2"
+          - "aes"
+          - "des"
+          - "cbc"
+          - "cfb-mode"
       minor-and-patch:
         patterns:
           - "*"
