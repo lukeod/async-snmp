@@ -65,6 +65,7 @@
 //! address (`::ffff:x.x.x.x`), ensuring cross-platform compatibility with
 //! macOS and BSD (which default to `IPV6_V6ONLY=true`).
 
+pub use super::udp_core::TransportStats;
 use super::udp_core::UdpCore;
 use super::{Transport, extract_request_id};
 use crate::error::{Error, Result};
@@ -179,6 +180,14 @@ impl UdpTransport {
         self.inner.local_addr
     }
 
+    /// Snapshot transport statistics.
+    ///
+    /// Returns cumulative counters for delivered and expired requests.
+    /// Useful for monitoring transport health under load.
+    pub fn stats(&self) -> TransportStats {
+        self.inner.core.stats()
+    }
+
     /// Shutdown the transport, stopping the background receiver.
     ///
     /// Signals the background recv task to stop and waits for it to exit.
@@ -284,8 +293,17 @@ impl UdpTransportBuilder {
 
     /// Set the socket receive buffer size (SO_RCVBUF).
     ///
-    /// Larger buffers prevent packet loss during traffic bursts.
-    /// The kernel may cap this at `net.core.rmem_max`.
+    /// When left unset, the OS default applies (typically 212KB on Linux).
+    /// With a shared transport handling many targets, the default may be
+    /// too small - if responses arrive faster than the recv loop processes
+    /// them, the kernel drops datagrams. A rough guide: estimate peak
+    /// inbound packets/sec, multiply by average response size (~200-500
+    /// bytes for typical SNMP), and size the buffer for at least 500ms of
+    /// burst capacity.
+    ///
+    /// The kernel may cap this at `net.core.rmem_max`. If you see
+    /// unexplained timeouts under load, check for UDP buffer overflows
+    /// with `cat /proc/net/snmp | grep Udp` (the `RcvbufErrors` column).
     pub fn recv_buffer_size(mut self, size: usize) -> Self {
         self.recv_buffer_size = Some(size);
         self

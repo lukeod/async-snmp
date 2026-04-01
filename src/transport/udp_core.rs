@@ -5,6 +5,7 @@
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -20,6 +21,26 @@ const SHARDS: usize = 64;
 /// response wakes only the task waiting for that specific request.
 pub struct UdpCore {
     shards: Box<[Shard; SHARDS]>,
+    stats: CoreStats,
+}
+
+/// Counters for transport health monitoring.
+struct CoreStats {
+    /// Responses successfully matched to a pending request.
+    delivered: AtomicU64,
+    /// Requests that timed out without receiving a response.
+    expired: AtomicU64,
+}
+
+/// Transport-level statistics.
+///
+/// Returned by [`UdpTransport::stats()`](super::UdpTransport::stats).
+#[derive(Debug, Clone, Copy)]
+pub struct TransportStats {
+    /// Responses successfully matched to a pending request.
+    pub delivered: u64,
+    /// Requests that timed out without receiving a response.
+    pub expired: u64,
 }
 
 struct Shard {
@@ -45,6 +66,10 @@ impl UdpCore {
             shards: shards
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("Vec has exactly SHARDS elements")),
+            stats: CoreStats {
+                delivered: AtomicU64::new(0),
+                expired: AtomicU64::new(0),
+            },
         }
     }
 
@@ -79,6 +104,7 @@ impl UdpCore {
             let notify = slot.notify.clone();
             drop(pending);
             notify.notify_one();
+            self.stats.delivered.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         false
@@ -119,6 +145,7 @@ impl UdpCore {
             let now = Instant::now();
             if now >= deadline {
                 self.unregister(request_id);
+                self.stats.expired.fetch_add(1, Ordering::Relaxed);
                 let elapsed = now.saturating_duration_since(deadline - Duration::from_secs(1));
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target, ?elapsed }, "transport timeout");
                 return Err(Error::Timeout {
@@ -137,6 +164,14 @@ impl UdpCore {
                     // Timeout reached, loop will detect and return error
                 }
             }
+        }
+    }
+
+    /// Snapshot current stats.
+    pub fn stats(&self) -> TransportStats {
+        TransportStats {
+            delivered: self.stats.delivered.load(Ordering::Relaxed),
+            expired: self.stats.expired.load(Ordering::Relaxed),
         }
     }
 
