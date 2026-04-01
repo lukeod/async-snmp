@@ -141,7 +141,7 @@ async fn main() -> Result<(), async_snmp::Error> {
 
 ### Scalable Polling (Shared Transport)
 
-For monitoring systems polling thousands of targets, share a single UDP socket across all clients. This provides significant resource efficiency without sacrificing throughput:
+For monitoring systems polling many targets, share a single UDP socket across all clients:
 
 ```rust
 use async_snmp::{Auth, Client, UdpTransport, oid};
@@ -177,19 +177,13 @@ async fn main() -> Result<(), async_snmp::Error> {
 }
 ```
 
-**Benefits of shared transport:**
-- **1 file descriptor** for all targets (vs 1 per target with separate sockets)
-- **Firewall session reuse** between polls to the same target
-- **Lower memory** from shared socket buffers
-- **No per-poll socket creation** overhead
-
-**Scaling guidance:**
+A shared socket uses one file descriptor and one recv loop for all targets, instead of one per target. Repeated polls to the same target reuse the same source port, which avoids creating new firewall/NAT sessions each time.
 
 | Approach | When to use |
 |----------|-------------|
-| Single shared socket | Recommended for most use cases |
-| Multiple shared sockets | Extreme scale (~100,000s+ targets), shard by target |
-| Per-client socket (`.connect()`) | When scrape isolation is required (has FD and syscall overhead) |
+| Shared socket (`build_with()`) | Multiple targets from one process. One FD, one recv loop. Responses are demuxed by request ID. |
+| Multiple shared sockets | High target counts (100k+), sharded by subnet or target group |
+| Per-client socket (`.connect()`) | Default for simple use. Each client gets its own socket and OS buffer. |
 
 ### Using from Synchronous Code
 

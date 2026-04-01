@@ -23,6 +23,18 @@
 //! +------------------+     +------------------+     +------------------+
 //! ```
 //!
+//! # Response Demultiplexing
+//!
+//! A single background task reads all datagrams from the socket. Each incoming
+//! response is matched to its caller by extracting the request ID (or msgID for
+//! SNMPv3) from the packet header and looking up the corresponding pending
+//! request slot. The pending map is sharded (64 shards, keyed by request ID) to
+//! reduce lock contention under high concurrency.
+//!
+//! `connect()` creates a dedicated `UdpTransport` per client. `build_with()`
+//! shares one `UdpTransport` across many clients - the demux logic is the same
+//! in both cases; sharing just avoids duplicating the socket and recv task.
+//!
 //! # Usage
 //!
 //! ```rust,no_run
@@ -35,7 +47,7 @@
 //!     .connect()
 //!     .await?;
 //!
-//! // High-throughput: share transport across clients
+//! // Shared: multiple clients on one socket
 //! let transport = UdpTransport::bind("0.0.0.0:0").await?;
 //! let client1 = Client::builder("192.168.1.1:161", Auth::v2c("public"))
 //!     .build_with(&transport).await?;

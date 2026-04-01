@@ -7,14 +7,11 @@
 //!
 //! # Choosing a Transport
 //!
-//! | Scenario | Recommended Approach |
-//! |----------|---------------------|
-//! | Simple use | [`Client::builder().connect()`](crate::Client::builder) |
-//! | Multiple targets | Share a [`UdpTransport`] via [`build_with()`](crate::ClientBuilder::build_with) |
-//! | Firewall/NAT | [`Client::builder().connect_tcp()`](crate::ClientBuilder::connect_tcp) |
-//!
-//! Most users should use [`Client::builder()`](crate::Client::builder) which creates
-//! the appropriate transport automatically.
+//! | Scenario | Approach |
+//! |----------|---------|
+//! | Single target or few targets | [`Client::builder().connect()`](crate::Client::builder) - each client gets its own socket |
+//! | Many targets from one process | Share a [`UdpTransport`] via [`build_with()`](crate::ClientBuilder::build_with) - one socket, one recv loop |
+//! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::ClientBuilder::connect_tcp) |
 
 mod tcp;
 mod udp;

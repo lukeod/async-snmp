@@ -606,12 +606,11 @@ impl ClientBuilder {
 
     /// Connect via UDP (default).
     ///
-    /// Creates a new UDP socket and connects to the target address. This is the
-    /// recommended connection method for most use cases due to UDP's lower
-    /// overhead compared to TCP.
+    /// Creates a new UDP socket for this client. Each call allocates a
+    /// separate socket and recv loop.
     ///
-    /// For polling many targets, consider using a shared
-    /// [`UdpTransport`](crate::transport::UdpTransport) with [`build_with()`](Self::build_with).
+    /// To share a single socket across multiple clients, use
+    /// [`build_with()`](Self::build_with) instead.
     ///
     /// # Errors
     ///
@@ -648,7 +647,7 @@ impl ClientBuilder {
     /// Build a client using a shared UDP transport.
     ///
     /// Creates a handle for the builder's target address from the given transport.
-    /// This is the recommended way to create multiple clients that share a socket.
+    /// All clients sharing a transport use one socket and one recv loop.
     ///
     /// # Example
     ///
