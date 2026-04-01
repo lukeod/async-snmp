@@ -1,13 +1,15 @@
 //! SNMP Agent (RFC 3413).
 //!
 //! This module provides SNMP agent functionality for responding to
-//! GET, GETNEXT, GETBULK, and SET requests.
+//! GET, GETNEXT, GETBULK, and SET requests, and for sending traps and informs.
 //!
 //! # Features
 //!
 //! - **Async handlers**: All handler methods are async for database queries, network calls, etc.
-//! - **Atomic SET**: Two-phase commit protocol (test/commit/undo) per RFC 3416
+//! - **Atomic SET**: Two-phase commit protocol (test/commit/undo/free) per RFC 3416
 //! - **VACM support**: Optional View-based Access Control Model (RFC 3415)
+//! - **Trap/inform sending**: Send notifications to configured trap sinks via [`Agent::send_trap`] and [`Agent::send_inform`]
+//! - **Built-in MIB handlers**: Automatic read-only handlers for snmpEngine, usmStats, and mpdStats groups (see [`BuiltinMib`])
 //!
 //! # Example
 //!

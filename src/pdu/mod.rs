@@ -612,7 +612,7 @@ impl TrapV1Pdu {
     ///
     /// # Errors
     ///
-    /// Returns an error if the trap OID cannot be computed (see [`v2_trap_oid`]).
+    /// Returns an error if the trap OID cannot be computed (see [`Self::v2_trap_oid`]).
     pub fn to_v2_pdu(&self) -> crate::Result<Pdu> {
         use crate::notification::oids;
         use crate::value::Value;

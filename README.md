@@ -19,7 +19,10 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 - **Full protocol support**: SNMPv1, v2c, and v3 (USM)
 - **Async-first**: Built on Tokio for high-performance async I/O
 - **All operations**: GET, GETNEXT, GETBULK, SET, WALK, BULKWALK
+- **Trap and inform sending**: Agent-based (multi-sink) and client-based notification sending with V1/V2c/V3 support
+- **SNMP agent**: Async handler framework with two-phase SET commit, VACM access control, and built-in MIB handlers for engine/USM/MPD statistics
 - **SNMPv3 security**: MD5/SHA-1/SHA-2 authentication, DES/3DES/AES-128/192/256 privacy, with pluggable crypto backends including a FIPS 140-3 option
+- **Automatic tooBig recovery**: GET/GETNEXT batches are automatically bisected when an agent returns a tooBig error
 - **Multiple transports**: UDP, TCP, and shared UDP for scalable polling
 - **Zero-copy decoding**: Minimal allocations using `bytes` crate
 - **Type-safe**: Compile-time OID validation with `oid!` macro
@@ -34,6 +37,8 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 | WALK / BULKWALK | Y | Y | Y |
 | Receive Traps | Y | Y | Y |
 | Receive Informs | - | Y | Y |
+| Send Traps | Y | Y | Y |
+| Send Informs | - | Y | Y |
 
 ### SNMPv3 Security
 
@@ -219,6 +224,37 @@ fn snmp_get(target: (&str, u16), community: &str) -> Result<VarBind, async_snmp:
 ```
 
 See [examples/lightweight_runtime.rs](examples/lightweight_runtime.rs) and [examples/sync_wrapper.rs](examples/sync_wrapper.rs) for complete examples, including a persistent wrapper struct that reuses the runtime and client across calls.
+
+### Sending Traps and Informs
+
+Traps and informs can be sent from an agent (recommended for devices that also handle requests) or directly from a client (for standalone tools like `snmptrap`):
+
+```rust
+use async_snmp::agent::Agent;
+use async_snmp::{Auth, oid};
+
+#[tokio::main]
+async fn main() -> Result<(), async_snmp::Error> {
+    let agent = Agent::builder()
+        .bind("0.0.0.0:161")
+        .community(b"public")
+        .engine_id(b"my-engine".to_vec())
+        .trap_sink("192.168.1.100:162", Auth::v2c("public"))
+        .build()
+        .await?;
+
+    // Send a coldStart trap to all configured sinks
+    let cold_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    agent.send_trap(&cold_start, 0, vec![]).await?;
+
+    // Send an inform (waits for acknowledgement)
+    agent.send_inform(&cold_start, 0, vec![]).await?;
+
+    Ok(())
+}
+```
+
+Client-based sending is useful for one-shot notifications without running an agent. See [examples/notification_sender.rs](examples/notification_sender.rs) for both approaches with V1, V2c, and V3 examples.
 
 ### Tracing
 

@@ -9,6 +9,9 @@
 //! - Zero-copy BER encoding/decoding
 //! - Type-safe OID and value handling
 //! - Config-driven client construction
+//! - Trap and inform sending (agent-based multi-sink or client-based)
+//! - SNMP agent with async handlers, two-phase SET, VACM, and built-in MIB handlers
+//! - Automatic tooBig recovery (GET/GETNEXT batches bisect on oversized responses)
 //!
 //! ## Quick Start
 //!
