@@ -6,7 +6,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://blog.rust-lang.org/)
 [![License](https://img.shields.io/crates/l/async-snmp.svg)](#license)
 
-Modern, async-first SNMP client library for Rust.
+Async-first SNMP client library for Rust.
 
 ## Note
 
@@ -17,13 +17,13 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 ## Features
 
 - **Full protocol support**: SNMPv1, v2c, and v3 (USM)
-- **Async-first**: Built on Tokio for high-performance async I/O
+- **Async-first**: Built on Tokio
 - **All operations**: GET, GETNEXT, GETBULK, SET, WALK, BULKWALK
 - **Trap and inform sending**: Agent-based (multi-sink) and client-based notification sending with V1/V2c/V3 support
 - **SNMP agent**: Async handler framework with two-phase SET commit, VACM access control, and built-in MIB handlers for engine/USM/MPD statistics
 - **SNMPv3 security**: MD5/SHA-1/SHA-2 authentication, DES/3DES/AES-128/192/256 privacy, with pluggable crypto backends including a FIPS 140-3 option
 - **Automatic tooBig recovery**: GET/GETNEXT batches are automatically bisected when an agent returns a tooBig error
-- **Multiple transports**: UDP, TCP, and shared UDP for scalable polling
+- **Multiple transports**: UDP (per-client or shared), TCP
 - **Zero-copy decoding**: Minimal allocations using `bytes` crate
 - **Type-safe**: Compile-time OID validation with `oid!` macro
 
@@ -139,7 +139,7 @@ async fn main() -> Result<(), async_snmp::Error> {
 }
 ```
 
-### Scalable Polling (Shared Transport)
+### Shared Transport
 
 For monitoring systems polling many targets, share a single UDP socket across all clients:
 

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Trap/inform sending for both Client (`send_trap`, `send_inform`, `send_v1_trap`) and Agent (`send_trap`, `send_inform`); agent supports multiple trap sinks via `AgentBuilder::trap_sink()`
+- Built-in MIB handlers for snmpEngine, usmStats, and mpdStats groups, auto-registered during agent construction; disable selectively with `AgentBuilder::without_builtin_handler()`
+- Auto-bisect for GET/GETNEXT batches on tooBig response; automatically splits and retries without caller intervention
+- Fallback GET on empty walk result to distinguish empty subtree from agent quirks
+- Leading-dot OID notation in `Oid::parse()` (e.g., `.1.3.6.1.2.1`)
+- Engine discovery support in notification receiver for V3 authenticated informs
+- Time window validation for V3 Informs in notification receiver
+- `AgentBuilder::engine_boots()` for persisting engine boots across restarts
+- `free_set` cleanup phase in MibHandler SET protocol, called in reverse order when a later test_set fails
+- Socket buffer size configuration on `UdpTransportBuilder`
+- `UdpTransport::stats()` returning `TransportStats` with delivered/expired request counters
+- Decode historic BER types: NSAP (tag 0x45) as OctetString, UInteger32 (tag 0x47) as Gauge32
 - Pluggable crypto backend via the `CryptoProvider` trait for SNMPv3 USM operations
 - `crypto-rustcrypto` feature (default) backed by RustCrypto crates, supporting all auth and privacy protocols
 - `crypto-fips` feature backed by aws-lc-rs for FIPS 140-3 compliance; rejects MD5, DES, and 3DES at runtime with `CryptoError::UnsupportedAlgorithm`
@@ -18,19 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Trait impls across public types: `TryFrom<i32>` for `Version`/`RowStatus`/`StorageType`, `TryFrom<u8>`/`Into<u8>` for `SecurityLevel`, `From<Vec<u32>>` for `Oid`, `Hash` for `PduType`/`GenericTrap`/`ErrorStatus`/`WalkAbortReason`, `PartialEq`/`Eq` for `UsmSecurityParams` and message types, `AsRef` for `Oid`/`MasterKey`/`LocalizedKey`, `IntoIterator` for `Oid`/`OidTable`, `Copy` for `Backoff`/`DecodeError`, `Debug` for `DerivedKeys`/`VarBindInfo`
 - `ClientBuilder`, `UsmBuilder`, `RetryBuilder`, `TcpTransportBuilder` now derive `Debug`; `RetryBuilder` also derives `Clone`
 - `Auth`, `ClientBuilder`, and `Retry` re-exported from the prelude
-- Examples for sync and lightweight runtime usage
+- Examples for sync/lightweight runtime usage, notification sending, and agent with SET handlers
 
 ### Changed
 
-- **Breaking:** `crypto-rustcrypto` is now an explicit default feature instead of unconditional RustCrypto dependencies. Callers using `default-features = false` must now enable `crypto-rustcrypto` explicitly. The features are mutually exclusive; `--all-features` will not compile.
-- **Breaking:** `MasterKey::from_password()`, `MasterKeys::new()`, `MasterKeys::with_privacy()`, and `LocalizedKey` construction methods now return `Result` to propagate `CryptoError` from the active provider
-- **Breaking:** `Transport` trait no longer requires `Clone`
-- **Breaking:** `Message::pdu()`, `Message::into_pdu()`, and `CommunityMessage::into_pdu()` now return `Option` instead of panicking; removed redundant `try_pdu()`/`try_into_pdu()`
-- `UdpTransport::shutdown()` is now async and awaits the background recv task for clean shutdown confirmation
+- **Breaking:** `crypto-rustcrypto` is now an explicit default feature instead of unconditional RustCrypto dependencies. Callers using `default-features = false` must now enable `crypto-rustcrypto` explicitly. The features are mutually exclusive; `--all-features` will not compile. Add `features = ["crypto-rustcrypto"]` if you were using `default-features = false`.
+- **Breaking:** `MasterKey`, `MasterKeys`, `LocalizedKey`, and `UsmConfig` methods that perform crypto operations now return `CryptoResult` instead of infallible values. Affected: `MasterKey::from_password()`, `MasterKey::localize()`, `MasterKeys::new()`, `MasterKeys::with_privacy()`, `LocalizedKey::from_password()`, `LocalizedKey::from_master_key()`, `LocalizedKey::compute_hmac()`, `LocalizedKey::verify_hmac()`, `UsmConfig::derive_keys()`. Add `.unwrap()` or propagate with `?` at each call site.
+- **Breaking:** `Transport` trait no longer requires `Clone`. Remove `Clone` from trait bounds if you have generic code bounded on `Transport + Clone`.
+- **Breaking:** `Message::pdu()`, `Message::into_pdu()`, and `CommunityMessage::into_pdu()` now return `Option` instead of panicking; removed redundant `try_pdu()`/`try_into_pdu()`. Replace `.pdu()` with `.pdu().unwrap()` or handle the `None` case; replace `.try_pdu()` with `.pdu()`.
+- **Breaking:** `UdpTransport::shutdown()` is now async and awaits the background recv task for clean shutdown confirmation. Add `.await` at call sites.
+- **Breaking:** Built-in MIB handlers (snmpEngine, usmStats, mpdStats) are now auto-registered on every agent. If you had custom handlers for OIDs under `1.3.6.1.6.3.10.2.1`, `1.3.6.1.6.3.15.1.1`, or `1.3.6.1.6.3.11.2.1`, use `AgentBuilder::without_builtin_handler()` to disable the conflicting built-in.
+- UDP transport uses per-request notify instead of per-shard broadcast, reducing spurious wakeups and lock acquisitions
 - Internal BER methods renamed from `ber_encoded_len`/`ber_content_len` to `ber_encoded_size`/`ber_content_size` to match public `encoded_size` convention
 
 ### Fixed
 
+- VACM View longest-match semantics per RFC 3415; previously selected first match instead of longest prefix
+- V3 msgMaxSize not respected in GETBULK response size limiting
+- Walk did not terminate on noSuchObject and noSuchInstance exception values
+- GETBULK requests from v1 clients were not rejected per RFC 3416
+- Counter64 values not filtered from v1 responses per RFC 2576
+- V2c+ SET error statuses not downgraded for v1 requests per RFC 2576
+- V3 security parameters not validated in client response matching
+- `SO_REUSEADDR` enabled on agent and notification listener sockets; now disabled
+- Authenticated messages accepted when engineBoots reached maximum per RFC 3414
+- engineBoots not incremented when engineTime reached MAX_ENGINE_TIME per RFC 3414
 - GETNEXT loop in agent could run forever with buggy handlers; `get_next_accessible_oid()` now checks OID monotonicity
 - Engine time truncation in agent; now uses saturating cast via `.min(u32::MAX as u64)`
 - `getrandom` failure in `random_nonzero_u64()` could panic; now returns `CryptoResult`
