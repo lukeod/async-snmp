@@ -1,12 +1,11 @@
 //! Core infrastructure for UDP response correlation.
 //!
-//! Provides a sharded pending request map with efficient notification
-//! for high-concurrency scenarios.
+//! Provides a sharded pending request map with per-request wakeup.
 
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -14,23 +13,23 @@ use crate::error::{Error, Result};
 
 const SHARDS: usize = 64;
 
-/// Sharded pending request tracking with efficient wakeup.
+/// Sharded pending request tracking with per-request wakeup.
 ///
 /// Uses 64 shards to reduce lock contention under high load.
-/// Each shard has its own mutex and notify, so waiters only
-/// wake when responses arrive for their shard.
+/// Each pending request has its own [`Notify`], so delivering a
+/// response wakes only the task waiting for that specific request.
 pub struct UdpCore {
     shards: Box<[Shard; SHARDS]>,
 }
 
 struct Shard {
     pending: Mutex<HashMap<i32, ResponseSlot>>,
-    notify: Notify,
 }
 
 struct ResponseSlot {
     response: Option<(Bytes, SocketAddr)>,
     deadline: Instant,
+    notify: Arc<Notify>,
 }
 
 impl UdpCore {
@@ -39,7 +38,6 @@ impl UdpCore {
         let shards: Vec<Shard> = (0..SHARDS)
             .map(|_| Shard {
                 pending: Mutex::new(HashMap::new()),
-                notify: Notify::new(),
             })
             .collect();
 
@@ -60,10 +58,10 @@ impl UdpCore {
     /// Creates a slot that will accept the response when it arrives.
     pub fn register(&self, request_id: i32, timeout: Duration) {
         let shard = self.shard(request_id);
-        let deadline = Instant::now() + timeout;
         let slot = ResponseSlot {
             response: None,
-            deadline,
+            deadline: Instant::now() + timeout,
+            notify: Arc::new(Notify::new()),
         };
         shard.pending.lock().unwrap().insert(request_id, slot);
     }
@@ -78,8 +76,9 @@ impl UdpCore {
 
         if let Some(slot) = pending.get_mut(&request_id) {
             slot.response = Some((data, source));
+            let notify = slot.notify.clone();
             drop(pending);
-            shard.notify.notify_waiters();
+            notify.notify_one();
             return true;
         }
         false
@@ -97,16 +96,16 @@ impl UdpCore {
         let shard = self.shard(request_id);
 
         loop {
-            // Check if response already arrived
-            {
+            // Single lock: check for response, or grab notify + deadline for waiting.
+            let (notify, deadline) = {
                 let mut pending = shard.pending.lock().unwrap();
                 if let Some(slot) = pending.get_mut(&request_id) {
                     if let Some(response) = slot.response.take() {
                         pending.remove(&request_id);
                         return Ok(response);
                     }
+                    (slot.notify.clone(), slot.deadline)
                 } else {
-                    // Slot missing - already expired or cancelled
                     tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target, elapsed = ?Duration::ZERO }, "transport timeout (slot missing)");
                     return Err(Error::Timeout {
                         target,
@@ -115,26 +114,8 @@ impl UdpCore {
                     }
                     .boxed());
                 }
-            }
-
-            // Get deadline from slot
-            let deadline = {
-                let pending = shard.pending.lock().unwrap();
-                match pending.get(&request_id) {
-                    Some(slot) => slot.deadline,
-                    None => {
-                        tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target, elapsed = ?Duration::ZERO }, "transport timeout (slot removed)");
-                        return Err(Error::Timeout {
-                            target,
-                            elapsed: Duration::ZERO,
-                            retries: 0,
-                        }
-                        .boxed());
-                    }
-                }
             };
 
-            // Check if past deadline
             let now = Instant::now();
             if now >= deadline {
                 self.unregister(request_id);
@@ -148,10 +129,9 @@ impl UdpCore {
                 .boxed());
             }
 
-            // Wait for notification or timeout
             tokio::select! {
-                _ = shard.notify.notified() => {
-                    // Loop back to check for response
+                _ = notify.notified() => {
+                    // Response delivered, loop back to retrieve it
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                     // Timeout reached, loop will detect and return error
