@@ -397,14 +397,9 @@ mod tests {
 
         let mut current = prefix.clone();
         let mut count = 0;
-        loop {
-            match handler.get_next(&ctx, &current).await {
-                GetNextResult::Value(vb) => {
-                    count += 1;
-                    current = vb.oid;
-                }
-                GetNextResult::EndOfMibView => break,
-            }
+        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await {
+            count += 1;
+            current = vb.oid;
         }
         assert_eq!(count, 4, "should walk through all 4 snmpEngine scalars");
     }
@@ -456,14 +451,9 @@ mod tests {
 
         let mut current = prefix.clone();
         let mut count = 0;
-        loop {
-            match handler.get_next(&ctx, &current).await {
-                GetNextResult::Value(vb) => {
-                    count += 1;
-                    current = vb.oid;
-                }
-                GetNextResult::EndOfMibView => break,
-            }
+        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await {
+            count += 1;
+            current = vb.oid;
         }
         assert_eq!(count, 6, "should walk through all 6 usmStats counters");
     }
@@ -524,14 +514,9 @@ mod tests {
 
         let mut current = prefix.clone();
         let mut count = 0;
-        loop {
-            match handler.get_next(&ctx, &current).await {
-                GetNextResult::Value(vb) => {
-                    count += 1;
-                    current = vb.oid;
-                }
-                GetNextResult::EndOfMibView => break,
-            }
+        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await {
+            count += 1;
+            current = vb.oid;
         }
         assert_eq!(count, 2, "should walk through all 2 mpdStats counters");
     }

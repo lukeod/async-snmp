@@ -70,6 +70,7 @@ impl SyncSnmpClient {
         self.rt.block_on(self.client.get_many(oids))
     }
 
+    #[allow(dead_code)]
     fn set(&self, oid: &async_snmp::Oid, value: Value) -> Result<VarBind, Box<Error>> {
         self.rt.block_on(self.client.set(oid, value))
     }

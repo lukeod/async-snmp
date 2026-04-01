@@ -95,10 +95,10 @@ impl MibHandler for ConfigHandler {
         Box::pin(async move {
             // Find the first OID strictly greater than the requested one.
             for candidate in Self::all_oids() {
-                if &candidate > oid {
-                    if let GetResult::Value(v) = self.get_value(&candidate) {
-                        return GetNextResult::Value(VarBind::new(candidate, v));
-                    }
+                if &candidate > oid
+                    && let GetResult::Value(v) = self.get_value(&candidate)
+                {
+                    return GetNextResult::Value(VarBind::new(candidate, v));
                 }
             }
             GetNextResult::EndOfMibView
@@ -140,19 +140,19 @@ impl MibHandler for ConfigHandler {
         value: &'a Value,
     ) -> BoxFuture<'a, SetResult> {
         Box::pin(async move {
-            if oid.as_ref() == OID_CONFIG_NAME {
-                if let Value::OctetString(bytes) = value {
-                    let s = String::from_utf8_lossy(bytes).to_string();
-                    *self.name.write().unwrap() = s;
-                    self.change_count.fetch_add(1, Ordering::Relaxed);
-                    return SetResult::Ok;
-                }
-            } else if oid.as_ref() == OID_CONFIG_INTERVAL {
-                if let Value::Integer(v) = value {
-                    *self.interval.write().unwrap() = *v;
-                    self.change_count.fetch_add(1, Ordering::Relaxed);
-                    return SetResult::Ok;
-                }
+            if oid.as_ref() == OID_CONFIG_NAME
+                && let Value::OctetString(bytes) = value
+            {
+                let s = String::from_utf8_lossy(bytes).to_string();
+                *self.name.write().unwrap() = s;
+                self.change_count.fetch_add(1, Ordering::Relaxed);
+                return SetResult::Ok;
+            } else if oid.as_ref() == OID_CONFIG_INTERVAL
+                && let Value::Integer(v) = value
+            {
+                *self.interval.write().unwrap() = *v;
+                self.change_count.fetch_add(1, Ordering::Relaxed);
+                return SetResult::Ok;
             }
             SetResult::CommitFailed
         })

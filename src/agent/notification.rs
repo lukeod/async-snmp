@@ -364,7 +364,7 @@ impl super::Agent {
         static COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
         COUNTER
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(if v >= i32::MAX { 1 } else { v + 1 })
+                Some(if v == i32::MAX { 1 } else { v + 1 })
             })
             .unwrap_or(1)
     }

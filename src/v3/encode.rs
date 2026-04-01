@@ -32,6 +32,7 @@ use crate::v3::auth::authenticate_message;
 /// - `salt_counter` - Salt counter for encryption IV generation
 /// - `reportable` - Whether the receiver should send Report PDUs on error
 /// - `msg_max_size` - Maximum message size to advertise
+#[allow(clippy::too_many_arguments)]
 pub fn encode_v3_message(
     pdu: &Pdu,
     msg_id: i32,

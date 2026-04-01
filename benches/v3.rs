@@ -19,11 +19,12 @@ fn bench_key_derivation(c: &mut Criterion) {
     // Key derivation is slow, reduce sample size
     group.sample_size(10);
 
-    let mut protocols: Vec<(&str, AuthProtocol)> = Vec::new();
-    #[cfg(feature = "crypto-rustcrypto")]
-    protocols.push(("MD5", AuthProtocol::Md5));
-    protocols.push(("SHA-1", AuthProtocol::Sha1));
-    protocols.push(("SHA-256", AuthProtocol::Sha256));
+    let protocols: Vec<(&str, AuthProtocol)> = vec![
+        #[cfg(feature = "crypto-rustcrypto")]
+        ("MD5", AuthProtocol::Md5),
+        ("SHA-1", AuthProtocol::Sha1),
+        ("SHA-256", AuthProtocol::Sha256),
+    ];
 
     for (name, protocol) in protocols {
         group.bench_function(BenchmarkId::new("from_password", name), |b| {
@@ -45,12 +46,13 @@ fn bench_hmac(c: &mut Criterion) {
     // Typical SNMP message sizes
     let message_sizes = [64, 128, 256, 512, 1024];
 
-    let mut protocols: Vec<(&str, AuthProtocol)> = Vec::new();
-    #[cfg(feature = "crypto-rustcrypto")]
-    protocols.push(("MD5", AuthProtocol::Md5));
-    protocols.push(("SHA-1", AuthProtocol::Sha1));
-    protocols.push(("SHA-256", AuthProtocol::Sha256));
-    protocols.push(("SHA-512", AuthProtocol::Sha512));
+    let protocols: Vec<(&str, AuthProtocol)> = vec![
+        #[cfg(feature = "crypto-rustcrypto")]
+        ("MD5", AuthProtocol::Md5),
+        ("SHA-1", AuthProtocol::Sha1),
+        ("SHA-256", AuthProtocol::Sha256),
+        ("SHA-512", AuthProtocol::Sha512),
+    ];
 
     // Pre-derive keys (don't include derivation in HMAC benchmark)
     let keys: Vec<_> = protocols
@@ -101,7 +103,8 @@ fn bench_encrypt(c: &mut Criterion) {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
             0x17, 0x18,
         ],
-    );
+    )
+    .unwrap();
 
     let aes128_key = PrivKey::from_bytes(
         PrivProtocol::Aes128,
@@ -109,7 +112,8 @@ fn bench_encrypt(c: &mut Criterion) {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10,
         ],
-    );
+    )
+    .unwrap();
 
     let aes256_key = PrivKey::from_bytes(
         PrivProtocol::Aes256,
@@ -118,7 +122,8 @@ fn bench_encrypt(c: &mut Criterion) {
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
             0x1d, 0x1e, 0x1f, 0x20,
         ],
-    );
+    )
+    .unwrap();
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
@@ -166,7 +171,8 @@ fn bench_decrypt(c: &mut Criterion) {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
             0x17, 0x18,
         ],
-    );
+    )
+    .unwrap();
 
     let aes128_key = PrivKey::from_bytes(
         PrivProtocol::Aes128,
@@ -174,7 +180,8 @@ fn bench_decrypt(c: &mut Criterion) {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10,
         ],
-    );
+    )
+    .unwrap();
 
     let aes256_key = PrivKey::from_bytes(
         PrivProtocol::Aes256,
@@ -183,7 +190,8 @@ fn bench_decrypt(c: &mut Criterion) {
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
             0x1d, 0x1e, 0x1f, 0x20,
         ],
-    );
+    )
+    .unwrap();
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
@@ -262,7 +270,8 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10,
         ],
-    );
+    )
+    .unwrap();
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
