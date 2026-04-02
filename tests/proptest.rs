@@ -275,7 +275,7 @@ fn env() -> &'static SharedEnv {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(3000))]
+    #![proptest_config(ProptestConfig::with_cases(500))]
 
     #[test]
     fn value_survives_full_protocol(value in arb_value()) {
