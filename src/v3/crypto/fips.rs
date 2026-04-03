@@ -108,7 +108,7 @@ impl CryptoProvider for AwsLcFipsProvider {
         protocol: PrivProtocol,
         key: &[u8],
         iv: &[u8],
-        data: &mut [u8],
+        data: &mut Vec<u8>,
     ) -> CryptoResult<()> {
         match protocol {
             PrivProtocol::Des => {

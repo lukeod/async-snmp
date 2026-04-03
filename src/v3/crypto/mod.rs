@@ -148,15 +148,16 @@ pub trait CryptoProvider: Send + Sync + 'static {
 
     /// Encrypt data in place using the specified privacy protocol.
     ///
-    /// The caller is responsible for key extraction, IV construction, and
-    /// padding (for block ciphers). This method performs only the raw cipher
-    /// operation.
+    /// The caller is responsible for key extraction and IV construction.
+    /// For block ciphers (DES, 3DES), the implementation pads unaligned
+    /// plaintext to the next block boundary per RFC 3414 §8.1.1.2,
+    /// extending the Vec as needed.
     fn encrypt(
         &self,
         protocol: PrivProtocol,
         key: &[u8],
         iv: &[u8],
-        data: &mut [u8],
+        data: &mut Vec<u8>,
     ) -> CryptoResult<()>;
 
     /// Compute a bare hash digest using the protocol's hash function.
@@ -168,7 +169,6 @@ pub trait CryptoProvider: Send + Sync + 'static {
     /// Decrypt data in place using the specified privacy protocol.
     ///
     /// The caller is responsible for key extraction and IV reconstruction.
-    /// This method performs only the raw cipher operation.
     fn decrypt(
         &self,
         protocol: PrivProtocol,

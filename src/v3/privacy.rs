@@ -408,11 +408,7 @@ impl PrivKey {
             iv[i] = pre_iv[i] ^ salt[i];
         }
 
-        // Pad plaintext to multiple of 8 bytes
-        let padded_len = plaintext.len().next_multiple_of(8);
-        let mut buffer = vec![0u8; padded_len];
-        buffer[..plaintext.len()].copy_from_slice(plaintext);
-
+        let mut buffer = plaintext.to_vec();
         super::crypto::provider().encrypt(PrivProtocol::Des, key, &iv, &mut buffer)?;
 
         Ok((Bytes::from(buffer), Bytes::copy_from_slice(&salt)))
@@ -471,11 +467,7 @@ impl PrivKey {
             iv[i] = pre_iv[i] ^ salt[i];
         }
 
-        // Pad plaintext to multiple of 8 bytes
-        let padded_len = plaintext.len().next_multiple_of(8);
-        let mut buffer = vec![0u8; padded_len];
-        buffer[..plaintext.len()].copy_from_slice(plaintext);
-
+        let mut buffer = plaintext.to_vec();
         super::crypto::provider().encrypt(PrivProtocol::Des3, key, &iv, &mut buffer)?;
 
         Ok((Bytes::from(buffer), Bytes::copy_from_slice(&salt)))

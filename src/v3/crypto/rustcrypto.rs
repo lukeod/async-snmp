@@ -72,11 +72,20 @@ impl CryptoProvider for RustCryptoProvider {
         protocol: PrivProtocol,
         key: &[u8],
         iv: &[u8],
-        data: &mut [u8],
+        data: &mut Vec<u8>,
     ) -> CryptoResult<()> {
         match protocol {
-            PrivProtocol::Des => encrypt_des_cbc(key, iv, data),
-            PrivProtocol::Des3 => encrypt_des3_cbc(key, iv, data),
+            PrivProtocol::Des | PrivProtocol::Des3 => {
+                // RFC 3414 §8.1.1.2: pad to block boundary (PKCS7)
+                let block = 8;
+                let padded_len = data.len().next_multiple_of(block);
+                let pad_byte = (padded_len - data.len()) as u8;
+                data.resize(padded_len, pad_byte);
+                match protocol {
+                    PrivProtocol::Des => encrypt_des_cbc(key, iv, data),
+                    _ => encrypt_des3_cbc(key, iv, data),
+                }
+            }
             PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
                 encrypt_aes_cfb(key, iv, data)
             }
@@ -311,4 +320,78 @@ fn decrypt_aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 3414 §8.1.1.2: "if [the length] is not [a multiple of 8], the data
+    /// is padded at the end as necessary." The encrypt operation must handle
+    /// unaligned plaintext by padding to the next block boundary.
+    #[test]
+    fn des_encrypt_pads_unaligned_plaintext() {
+        let provider = RustCryptoProvider;
+        let key = b"\x00\x11\x22\x33\x44\x55\x66\x77";
+        let iv = [0u8; 8];
+        let mut data = b"Hello".to_vec(); // 5 bytes, not a multiple of 8
+
+        let result = provider.encrypt(PrivProtocol::Des, key, &iv, &mut data);
+        assert!(
+            result.is_ok(),
+            "DES encrypt must pad unaligned plaintext, got: {:?}",
+            result
+        );
+        assert_eq!(data.len(), 8, "output must be padded to 8-byte boundary");
+    }
+
+    /// Same as DES: 3DES-CBC must pad unaligned plaintext.
+    #[test]
+    fn des3_encrypt_pads_unaligned_plaintext() {
+        let provider = RustCryptoProvider;
+        let key = [0x01u8; 24];
+        let iv = [0u8; 8];
+        let mut data = b"Hello".to_vec(); // 5 bytes
+
+        let result = provider.encrypt(PrivProtocol::Des3, &key, &iv, &mut data);
+        assert!(
+            result.is_ok(),
+            "3DES encrypt must pad unaligned plaintext, got: {:?}",
+            result
+        );
+        assert_eq!(data.len(), 8, "output must be padded to 8-byte boundary");
+    }
+
+    /// DES roundtrip: unaligned plaintext should encrypt and decrypt correctly.
+    #[test]
+    fn des_roundtrip_unaligned() {
+        let provider = RustCryptoProvider;
+        let key = b"\x00\x11\x22\x33\x44\x55\x66\x77";
+        let iv = [0u8; 8];
+        let plaintext = b"Hello";
+        let mut data = plaintext.to_vec();
+
+        provider
+            .encrypt(PrivProtocol::Des, key, &iv, &mut data)
+            .unwrap();
+        assert_eq!(data.len(), 8);
+
+        provider
+            .decrypt(PrivProtocol::Des, key, &iv, &mut data)
+            .unwrap();
+        assert_eq!(&data[..plaintext.len()], plaintext);
+    }
+
+    /// Already-aligned DES plaintext should still work (no regression).
+    #[test]
+    fn des_encrypt_aligned_unchanged() {
+        let provider = RustCryptoProvider;
+        let key = b"\x00\x11\x22\x33\x44\x55\x66\x77";
+        let iv = [0u8; 8];
+        let mut data = vec![0x41u8; 8]; // already 8 bytes
+
+        let result = provider.encrypt(PrivProtocol::Des, key, &iv, &mut data);
+        assert!(result.is_ok());
+        assert_eq!(data.len(), 8);
+    }
 }
