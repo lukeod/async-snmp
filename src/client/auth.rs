@@ -25,7 +25,7 @@
 use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol};
 
 /// SNMP version for community-based authentication.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommunityVersion {
     /// SNMPv1
     V1,
@@ -35,7 +35,7 @@ pub enum CommunityVersion {
 }
 
 /// Authentication configuration for SNMP clients.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Auth {
     /// Community string authentication (SNMPv1 or v2c).
     Community {
@@ -133,7 +133,7 @@ impl Auth {
 }
 
 /// SNMPv3 USM authentication parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UsmAuth {
     /// SNMPv3 username
     pub username: String,

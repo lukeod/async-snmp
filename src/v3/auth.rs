@@ -79,7 +79,7 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// let key1 = master.localize(engine1_id).unwrap();
 /// let key2 = master.localize(engine2_id).unwrap();
 /// ```
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MasterKey {
     key: Vec<u8>,
     #[zeroize(skip)]
@@ -446,7 +446,7 @@ pub fn verify_message(
 ///
 /// // Use with multiple clients - localization is cheap (~1μs per engine)
 /// ```
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MasterKeys {
     /// Master key for authentication (and base for privacy key derivation)
     auth_master: MasterKey,

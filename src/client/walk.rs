@@ -73,7 +73,7 @@ pub enum WalkMode {
 /// - [`AllowNonIncreasing`](Self::AllowNonIncreasing): Tolerates out-of-order
 ///   OIDs but tracks all seen OIDs to detect cycles. Returns
 ///   [`Error::WalkAborted`](crate::Error::WalkAborted) if the same OID appears twice.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OidOrdering {
     /// Require strictly increasing OIDs (default).
     ///
