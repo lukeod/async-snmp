@@ -63,7 +63,7 @@
 //! By default, handlers are read-only (returning [`SetResult::NotWritable`]).
 //! See [`MibHandler`] documentation for implementation details.
 //!
-//! # Using OidTable for GETNEXT
+//! # Using `OidTable` for GETNEXT
 //!
 //! For handlers with static or slowly-changing data, [`OidTable`] simplifies
 //! GETNEXT implementation by maintaining OIDs in sorted order:
@@ -123,10 +123,10 @@ pub enum SecurityModel {
     ///
     /// Use this when the same mapping should apply regardless of SNMP version.
     Any = 0,
-    /// SNMPv1.
+    /// `SNMPv1`.
     V1 = 1,
-    /// SNMPv2c.
+    /// `SNMPv2c`.
     V2c = 2,
-    /// SNMPv3 User-based Security Model.
+    /// `SNMPv3` User-based Security Model.
     Usm = 3,
 }

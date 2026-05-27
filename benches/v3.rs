@@ -1,7 +1,7 @@
-//! SNMPv3 security benchmarks.
+//! `SNMPv3` security benchmarks.
 //!
 //! Tests the performance of V3 crypto operations which are on the hot path
-//! for all SNMPv3 communications.
+//! for all `SNMPv3` communications.
 
 use async_snmp::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -30,7 +30,7 @@ fn bench_key_derivation(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("from_password", name), |b| {
             b.iter(|| {
                 black_box(LocalizedKey::from_password(protocol, PASSWORD, ENGINE_ID).unwrap())
-            })
+            });
         });
     }
 
@@ -68,7 +68,7 @@ fn bench_hmac(c: &mut Criterion) {
 
             group.throughput(Throughput::Bytes(size as u64));
             group.bench_with_input(
-                BenchmarkId::new(format!("compute_{}", name), size),
+                BenchmarkId::new(format!("compute_{name}"), size),
                 &data,
                 |b, data| b.iter(|| black_box(key.compute_hmac(data).unwrap())),
             );
@@ -82,7 +82,7 @@ fn bench_hmac(c: &mut Criterion) {
     let mac = key_sha256.compute_hmac(&data).unwrap();
 
     group.bench_function("verify_SHA-256_256bytes", |b| {
-        b.iter(|| black_box(key_sha256.verify_hmac(&data, &mac).unwrap()))
+        b.iter(|| black_box(key_sha256.verify_hmac(&data, &mac).unwrap()));
     });
 
     group.finish();
@@ -138,20 +138,20 @@ fn bench_encrypt(c: &mut Criterion) {
         {
             let key = des_key.clone();
             group.bench_with_input(BenchmarkId::new("DES", size), &data, |b, data| {
-                b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
+                b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()));
             });
         }
 
         // AES-128
         let key = aes128_key.clone();
         group.bench_with_input(BenchmarkId::new("AES-128", size), &data, |b, data| {
-            b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
+            b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()));
         });
 
         // AES-256
         let key = aes256_key.clone();
         group.bench_with_input(BenchmarkId::new("AES-256", size), &data, |b, data| {
-            b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()))
+            b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()));
         });
     }
 
@@ -213,7 +213,7 @@ fn bench_decrypt(c: &mut Criterion) {
                 |b, (ct, pp)| {
                     b.iter(|| {
                         black_box(des_key.decrypt(ct, engine_boots, engine_time, pp).unwrap())
-                    })
+                    });
                 },
             );
         }
@@ -232,7 +232,7 @@ fn bench_decrypt(c: &mut Criterion) {
                             .decrypt(ct, engine_boots, engine_time, pp)
                             .unwrap(),
                     )
-                })
+                });
             },
         );
 
@@ -250,7 +250,7 @@ fn bench_decrypt(c: &mut Criterion) {
                             .decrypt(ct, engine_boots, engine_time, pp)
                             .unwrap(),
                     )
-                })
+                });
             },
         );
     }
@@ -290,7 +290,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
                 .unwrap();
             let _hmac = auth_key.compute_hmac(&full_message).unwrap();
             black_box(encrypted)
-        })
+        });
     });
 
     // Incoming: verify HMAC, then decrypt
@@ -307,7 +307,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
                 .decrypt(&ciphertext, engine_boots, engine_time, &priv_params)
                 .unwrap();
             black_box(decrypted)
-        })
+        });
     });
 
     group.finish();

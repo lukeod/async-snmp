@@ -1,7 +1,7 @@
 //! Varbind extraction and validation for SNMP notifications.
 //!
 //! Per RFC 3416, notification PDUs have a specific varbind structure:
-//! - First varbind: sysUpTime.0 (1.3.6.1.2.1.1.3.0) with TimeTicks value
+//! - First varbind: sysUpTime.0 (1.3.6.1.2.1.1.3.0) with `TimeTicks` value
 //! - Second varbind: snmpTrapOID.0 (1.3.6.1.6.3.1.1.4.1.0) with OID value
 //! - Remaining varbinds: notification-specific data
 
@@ -17,7 +17,7 @@ use super::oids;
 /// Extract uptime, trap OID, and additional varbinds from a notification PDU.
 ///
 /// Per RFC 3416, the first two varbinds are always:
-/// 1. sysUpTime.0 (1.3.6.1.2.1.1.3.0) - TimeTicks
+/// 1. sysUpTime.0 (1.3.6.1.2.1.1.3.0) - `TimeTicks`
 /// 2. snmpTrapOID.0 (1.3.6.1.6.3.1.1.4.1.0) - OID of the trap
 pub(crate) fn extract_notification_varbinds(pdu: &Pdu) -> Result<(u32, Oid, Vec<VarBind>)> {
     extract_notification_varbinds_impl(pdu, false)
@@ -75,10 +75,11 @@ fn extract_notification_varbinds_impl(pdu: &Pdu, strict: bool) -> Result<(u32, O
 /// Validate notification varbinds strictly per RFC 3416.
 ///
 /// Returns `true` if the first two varbinds have the correct OIDs:
-/// - First: sysUpTime.0 (1.3.6.1.2.1.1.3.0) with TimeTicks value
+/// - First: sysUpTime.0 (1.3.6.1.2.1.1.3.0) with `TimeTicks` value
 /// - Second: snmpTrapOID.0 (1.3.6.1.6.3.1.1.4.1.0) with OID value
 ///
 /// This is useful for validating incoming notifications before processing.
+#[must_use] 
 pub fn validate_notification_varbinds(pdu: &Pdu) -> bool {
     if pdu.varbinds.len() < 2 {
         return false;

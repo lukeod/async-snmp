@@ -9,10 +9,10 @@ use crate::format::hex;
 use crate::oid::Oid;
 use bytes::Bytes;
 
-/// RFC 2579 RowStatus textual convention.
+/// RFC 2579 `RowStatus` textual convention.
 ///
 /// Used by SNMP tables to control row creation, modification, and deletion.
-/// The state machine for RowStatus is defined in RFC 2579 Section 7.1.
+/// The state machine for `RowStatus` is defined in RFC 2579 Section 7.1.
 ///
 /// # State Transitions
 ///
@@ -74,6 +74,7 @@ impl RowStatus {
     /// Create from raw SNMP integer value.
     ///
     /// Returns `None` for values outside the valid range (1-6).
+    #[must_use]
     pub fn from_i32(value: i32) -> Option<Self> {
         Self::try_from(value).ok()
     }
@@ -98,7 +99,7 @@ impl std::fmt::Display for RowStatus {
     }
 }
 
-/// RFC 2579 StorageType textual convention.
+/// RFC 2579 `StorageType` textual convention.
 ///
 /// Describes how an SNMP row's data is stored and persisted.
 ///
@@ -158,6 +159,7 @@ impl StorageType {
     /// Create from raw SNMP integer value.
     ///
     /// Returns `None` for values outside the valid range (1-5).
+    #[must_use]
     pub fn from_i32(value: i32) -> Option<Self> {
         Self::try_from(value).ok()
     }
@@ -183,7 +185,7 @@ impl std::fmt::Display for StorageType {
 
 /// SNMP value.
 ///
-/// Represents all SNMP data types including SMIv2 types and exception values.
+/// Represents all SNMP data types including `SMIv2` types and exception values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Value {
@@ -192,7 +194,7 @@ pub enum Value {
 
     /// OCTET STRING (arbitrary bytes).
     ///
-    /// Per RFC 2578 (SMIv2), OCTET STRING values have a maximum size of 65535 octets.
+    /// Per RFC 2578 (`SMIv2`), OCTET STRING values have a maximum size of 65535 octets.
     /// This limit is **not enforced** during decoding to maintain permissive parsing
     /// behavior. Applications that require strict compliance should validate size
     /// after decoding.
@@ -204,7 +206,7 @@ pub enum Value {
     /// OBJECT IDENTIFIER
     ObjectIdentifier(Oid),
 
-    /// IpAddress (4 bytes, big-endian)
+    /// `IpAddress` (4 bytes, big-endian)
     IpAddress([u8; 4]),
 
     /// Counter32 (unsigned 32-bit, wrapping)
@@ -213,7 +215,7 @@ pub enum Value {
     /// Gauge32 / Unsigned32 (unsigned 32-bit, non-wrapping)
     Gauge32(u32),
 
-    /// TimeTicks (hundredths of seconds since epoch)
+    /// `TimeTicks` (hundredths of seconds since epoch)
     TimeTicks(u32),
 
     /// Opaque (legacy, arbitrary bytes)
@@ -221,12 +223,12 @@ pub enum Value {
 
     /// Counter64 (unsigned 64-bit, wrapping).
     ///
-    /// **SNMPv2c/v3 only.** Counter64 was introduced in SNMPv2 (RFC 2578) and is
-    /// not supported in SNMPv1. When sending Counter64 values to an SNMPv1 agent,
+    /// **SNMPv2c/v3 only.** Counter64 was introduced in `SNMPv2` (RFC 2578) and is
+    /// not supported in `SNMPv1`. When sending Counter64 values to an `SNMPv1` agent,
     /// the value will be silently ignored or cause an error depending on the agent
     /// implementation.
     ///
-    /// If your application needs to support SNMPv1, avoid using Counter64 or
+    /// If your application needs to support `SNMPv1`, avoid using Counter64 or
     /// fall back to Counter32 (with potential overflow for high-bandwidth counters).
     Counter64(u64),
 
@@ -379,7 +381,7 @@ impl Value {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Value::Counter64(v) => Some(*v),
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(*v as u64),
+            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(u64::from(*v)),
             Value::Integer(v) if *v >= 0 => Some(*v as u64),
             _ => None,
         }
@@ -501,10 +503,11 @@ impl Value {
     /// assert_eq!(Value::Counter64(10_000_000_000).as_f64(), Some(10_000_000_000.0));
     /// assert_eq!(Value::Null.as_f64(), None);
     /// ```
+    #[expect(clippy::cast_precision_loss, reason = "we intentionally bend over backwards to make an f64 available even for 64-bit ints")]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            Value::Integer(v) => Some(*v as f64),
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(*v as f64),
+            Value::Integer(v) => Some(f64::from(*v)),
+            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(f64::from(*v)),
             Value::Counter64(v) => Some(*v as f64),
             _ => None,
         }
@@ -533,6 +536,7 @@ impl Value {
     /// let wrapped = Value::Counter64(large).as_f64_wrapped().unwrap();
     /// assert!(wrapped < large as f64); // Wrapped to smaller value
     /// ```
+    #[expect(clippy::cast_precision_loss, reason = "we intentionally bend over backwards to make an f64 available even for 64-bit ints")]
     pub fn as_f64_wrapped(&self) -> Option<f64> {
         const MANTISSA_LIMIT: u64 = 1 << 53;
         match self {
@@ -569,13 +573,13 @@ impl Value {
     /// assert_eq!(Value::Null.as_decimal(2), None);
     /// ```
     pub fn as_decimal(&self, places: u8) -> Option<f64> {
-        let divisor = 10f64.powi(places as i32);
+        let divisor = 10f64.powi(i32::from(places));
         self.as_f64().map(|v| v / divisor)
     }
 
-    /// TimeTicks as Duration (hundredths of seconds).
+    /// `TimeTicks` as Duration (hundredths of seconds).
     ///
-    /// TimeTicks represents time in hundredths of a second. This method
+    /// `TimeTicks` represents time in hundredths of a second. This method
     /// converts to `std::time::Duration` for idiomatic Rust time handling.
     ///
     /// Common use: sysUpTime, interface last-change timestamps.
@@ -595,7 +599,7 @@ impl Value {
     /// ```
     pub fn as_duration(&self) -> Option<std::time::Duration> {
         match self {
-            Value::TimeTicks(v) => Some(std::time::Duration::from_millis(*v as u64 * 10)),
+            Value::TimeTicks(v) => Some(std::time::Duration::from_millis(u64::from(*v) * 10)),
             _ => None,
         }
     }
@@ -678,10 +682,10 @@ impl Value {
         }
     }
 
-    /// Extract Counter64 from Opaque value (net-snmp extension for SNMPv1).
+    /// Extract Counter64 from Opaque value (net-snmp extension for `SNMPv1`).
     ///
-    /// SNMPv1 doesn't support Counter64 natively. net-snmp encodes 64-bit
-    /// counters inside Opaque for SNMPv1 compatibility using extension tag
+    /// `SNMPv1` doesn't support Counter64 natively. net-snmp encodes 64-bit
+    /// counters inside Opaque for `SNMPv1` compatibility using extension tag
     /// (0x9f) + counter64 type (0x76) + length + big-endian bytes.
     ///
     /// # Examples
@@ -737,7 +741,7 @@ impl Value {
                 let is_negative = bytes[0] & 0x80 != 0;
                 let mut value: i64 = if is_negative { -1 } else { 0 };
                 for &byte in bytes {
-                    value = (value << 8) | (byte as i64);
+                    value = (value << 8) | i64::from(byte);
                 }
                 Some(value)
             }
@@ -782,7 +786,7 @@ impl Value {
                 let bytes = &data[3..3 + len];
                 let mut value: u64 = 0;
                 for &byte in bytes {
-                    value = (value << 8) | (byte as u64);
+                    value = (value << 8) | u64::from(byte);
                 }
                 Some(value)
             }
@@ -790,9 +794,9 @@ impl Value {
         }
     }
 
-    /// Extract RFC 2579 TruthValue as bool.
+    /// Extract RFC 2579 `TruthValue` as bool.
     ///
-    /// TruthValue is an INTEGER with: true(1), false(2).
+    /// `TruthValue` is an INTEGER with: true(1), false(2).
     /// Returns `None` for non-Integer values or values outside {1, 2}.
     ///
     /// # Examples
@@ -816,7 +820,7 @@ impl Value {
         }
     }
 
-    /// Extract RFC 2579 RowStatus.
+    /// Extract RFC 2579 `RowStatus`.
     ///
     /// Returns `None` for non-Integer values or values outside {1-6}.
     ///
@@ -840,7 +844,7 @@ impl Value {
         }
     }
 
-    /// Extract RFC 2579 StorageType.
+    /// Extract RFC 2579 `StorageType`.
     ///
     /// Returns `None` for non-Integer values or values outside {1-5}.
     ///
@@ -883,36 +887,27 @@ impl Value {
                 let content_len = integer_content_len(*v);
                 1 + length_encoded_len(content_len) + content_len
             }
-            Value::OctetString(data) => {
+            Value::OctetString(data) | Value::Opaque(data) | Value::Unknown { data, .. } => {
                 let content_len = data.len();
                 1 + length_encoded_len(content_len) + content_len
             }
-            Value::Null => 2, // tag + length(0)
+            Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => 2, // tag + length(0)
             Value::ObjectIdentifier(oid) => oid.ber_encoded_size(),
             Value::IpAddress(_) => 6, // tag + length(4) + 4 bytes
             Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => {
                 let content_len = unsigned32_content_len(*v);
                 1 + length_encoded_len(content_len) + content_len
             }
-            Value::Opaque(data) => {
-                let content_len = data.len();
-                1 + length_encoded_len(content_len) + content_len
-            }
             Value::Counter64(v) => {
                 let content_len = unsigned64_content_len(*v);
-                1 + length_encoded_len(content_len) + content_len
-            }
-            Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => 2, // tag + length(0)
-            Value::Unknown { data, .. } => {
-                let content_len = data.len();
                 1 + length_encoded_len(content_len) + content_len
             }
         }
     }
 
-    /// Format an OctetString, Opaque, or Integer value using RFC 2579 DISPLAY-HINT.
+    /// Format an `OctetString`, Opaque, or Integer value using RFC 2579 DISPLAY-HINT.
     ///
-    /// For OctetString and Opaque, uses the OCTET STRING hint format (e.g., "1x:").
+    /// For `OctetString` and Opaque, uses the OCTET STRING hint format (e.g., "1x:").
     /// For Integer, uses the INTEGER hint format (e.g., "d-2" for decimal places).
     ///
     /// Returns `None` for other value types or invalid hint syntax.
@@ -1114,27 +1109,27 @@ impl Value {
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Integer(v) => write!(f, "{}", v),
+            Value::Integer(v) => write!(f, "{v}"),
             Value::OctetString(data) => {
                 // Try to display as string if it's valid UTF-8
                 if let Ok(s) = std::str::from_utf8(data) {
-                    write!(f, "{}", s)
+                    write!(f, "{s}")
                 } else {
                     write!(f, "0x{}", hex::encode(data))
                 }
             }
             Value::Null => write!(f, "NULL"),
-            Value::ObjectIdentifier(oid) => write!(f, "{}", oid),
+            Value::ObjectIdentifier(oid) => write!(f, "{oid}"),
             Value::IpAddress(addr) => {
                 write!(f, "{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3])
             }
-            Value::Counter32(v) => write!(f, "{}", v),
-            Value::Gauge32(v) => write!(f, "{}", v),
+            Value::Counter32(v) => write!(f, "{v}"),
+            Value::Gauge32(v) => write!(f, "{v}"),
             Value::TimeTicks(v) => {
                 write!(f, "{}", crate::format::format_timeticks(*v))
             }
             Value::Opaque(data) => write!(f, "Opaque(0x{})", hex::encode(data)),
-            Value::Counter64(v) => write!(f, "{}", v),
+            Value::Counter64(v) => write!(f, "{v}"),
             Value::NoSuchObject => write!(f, "noSuchObject"),
             Value::NoSuchInstance => write!(f, "noSuchInstance"),
             Value::EndOfMibView => write!(f, "endOfMibView"),
@@ -1241,7 +1236,7 @@ impl From<u64> for Value {
 
 /// Converts a 4-byte array into [`Value::IpAddress`].
 ///
-/// The bytes are interpreted as a big-endian IPv4 address, matching the IpAddress
+/// The bytes are interpreted as a big-endian IPv4 address, matching the `IpAddress`
 /// SNMP type (RFC 2578 Section 7.1.5). Use this when you already have an address
 /// in `[u8; 4]` form (e.g., from `Ipv4Addr::octets()`).
 impl From<[u8; 4]> for Value {
@@ -1273,8 +1268,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(&*err, crate::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error, got: {:?}",
-            err
+            "expected MalformedResponse error, got: {err:?}"
         );
     }
 
@@ -1294,7 +1288,7 @@ mod tests {
     // Value Type Encoding/Decoding Tests
     // ========================================================================
 
-    fn roundtrip(value: Value) -> Value {
+    fn roundtrip(value: &Value) -> Value {
         let mut buf = EncodeBuf::new();
         value.encode(&mut buf);
         let data = buf.finish();
@@ -1305,169 +1299,169 @@ mod tests {
     #[test]
     fn test_integer_positive() {
         let value = Value::Integer(42);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_integer_negative() {
         let value = Value::Integer(-42);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_integer_zero() {
         let value = Value::Integer(0);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_integer_min() {
         let value = Value::Integer(i32::MIN);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_integer_max() {
         let value = Value::Integer(i32::MAX);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_octet_string_ascii() {
         let value = Value::OctetString(Bytes::from_static(b"hello world"));
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_octet_string_binary() {
         let value = Value::OctetString(Bytes::from_static(&[0x00, 0xFF, 0x80, 0x7F]));
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_octet_string_empty() {
         let value = Value::OctetString(Bytes::new());
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_null() {
         let value = Value::Null;
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_object_identifier() {
         let value = Value::ObjectIdentifier(crate::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_ip_address() {
         let value = Value::IpAddress([192, 168, 1, 1]);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_ip_address_zero() {
         let value = Value::IpAddress([0, 0, 0, 0]);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_ip_address_broadcast() {
         let value = Value::IpAddress([255, 255, 255, 255]);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_counter32() {
-        let value = Value::Counter32(999999);
-        assert_eq!(roundtrip(value.clone()), value);
+        let value = Value::Counter32(999_999);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_counter32_zero() {
         let value = Value::Counter32(0);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_counter32_max() {
         let value = Value::Counter32(u32::MAX);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_gauge32() {
-        let value = Value::Gauge32(1000000000);
-        assert_eq!(roundtrip(value.clone()), value);
+        let value = Value::Gauge32(1_000_000_000);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_gauge32_max() {
         let value = Value::Gauge32(u32::MAX);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_timeticks() {
-        let value = Value::TimeTicks(123456);
-        assert_eq!(roundtrip(value.clone()), value);
+        let value = Value::TimeTicks(123_456);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_timeticks_max() {
         let value = Value::TimeTicks(u32::MAX);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_opaque() {
         let value = Value::Opaque(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]));
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_opaque_empty() {
         let value = Value::Opaque(Bytes::new());
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_counter64() {
-        let value = Value::Counter64(123456789012345);
-        assert_eq!(roundtrip(value.clone()), value);
+        let value = Value::Counter64(123_456_789_012_345);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_counter64_zero() {
         let value = Value::Counter64(0);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_counter64_max() {
         let value = Value::Counter64(u64::MAX);
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_no_such_object() {
         let value = Value::NoSuchObject;
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_no_such_instance() {
         let value = Value::NoSuchInstance;
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
     fn test_end_of_mib_view() {
         let value = Value::EndOfMibView;
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
@@ -1486,7 +1480,7 @@ mod tests {
         }
 
         // Roundtrip should preserve
-        assert_eq!(roundtrip(value.clone()), value);
+        assert_eq!(roundtrip(&value), value);
     }
 
     #[test]
@@ -1610,14 +1604,14 @@ mod tests {
     #[test]
     fn test_display_octet_string_utf8() {
         let v = Value::OctetString(Bytes::from_static(b"hello"));
-        assert_eq!(format!("{}", v), "hello");
+        assert_eq!(format!("{v}"), "hello");
     }
 
     #[test]
     fn test_display_octet_string_binary() {
         // Use bytes that are not valid UTF-8 (0xFF is never valid in UTF-8)
         let v = Value::OctetString(Bytes::from_static(&[0xFF, 0xFE]));
-        assert_eq!(format!("{}", v), "0xfffe");
+        assert_eq!(format!("{v}"), "0xfffe");
     }
 
     #[test]
@@ -1628,7 +1622,7 @@ mod tests {
     #[test]
     fn test_display_ip_address() {
         let v = Value::IpAddress([192, 168, 1, 1]);
-        assert_eq!(format!("{}", v), "192.168.1.1");
+        assert_eq!(format!("{v}"), "192.168.1.1");
     }
 
     #[test]
@@ -1644,19 +1638,19 @@ mod tests {
     #[test]
     fn test_display_timeticks() {
         // 123456 hundredths = 1234.56 seconds = 20m 34.56s
-        let v = Value::TimeTicks(123456);
-        assert_eq!(format!("{}", v), "00:20:34.56");
+        let v = Value::TimeTicks(123_456);
+        assert_eq!(format!("{v}"), "00:20:34.56");
     }
 
     #[test]
     fn test_display_opaque() {
         let v = Value::Opaque(Bytes::from_static(&[0xBE, 0xEF]));
-        assert_eq!(format!("{}", v), "Opaque(0xbeef)");
+        assert_eq!(format!("{v}"), "Opaque(0xbeef)");
     }
 
     #[test]
     fn test_display_counter64() {
-        assert_eq!(format!("{}", Value::Counter64(12345678)), "12345678");
+        assert_eq!(format!("{}", Value::Counter64(1234_5678)), "12345678");
     }
 
     #[test]
@@ -1672,7 +1666,7 @@ mod tests {
             tag: 0x99,
             data: Bytes::from_static(&[0x01, 0x02]),
         };
-        assert_eq!(format!("{}", v), "Unknown(tag=0x99, data=0x0102)");
+        assert_eq!(format!("{v}"), "Unknown(tag=0x99, data=0x0102)");
     }
 
     // ========================================================================
@@ -1726,8 +1720,8 @@ mod tests {
 
     #[test]
     fn test_from_u64() {
-        let v: Value = 12345678901234u64.into();
-        assert_eq!(v, Value::Counter64(12345678901234));
+        let v: Value = 12_345_678_901_234_u64.into();
+        assert_eq!(v, Value::Counter64(12_345_678_901_234));
     }
 
     #[test]
@@ -1845,7 +1839,7 @@ mod tests {
         );
         // 360000 ticks = 3600 seconds = 1 hour
         assert_eq!(
-            Value::TimeTicks(360000).as_duration(),
+            Value::TimeTicks(360_000).as_duration(),
             Some(Duration::from_secs(3600))
         );
         // 1 tick = 10 milliseconds
@@ -1906,7 +1900,7 @@ mod tests {
             0x9f, 0x76, 0x08, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
         ]);
         let value = Value::Opaque(data);
-        assert_eq!(value.as_opaque_counter64(), Some(0x0123456789ABCDEF));
+        assert_eq!(value.as_opaque_counter64(), Some(0x0123_4567_89AB_CDEF));
 
         // Shorter encoding (e.g., small value)
         let small = Bytes::from_static(&[0x9f, 0x76, 0x01, 0x42]);
@@ -1947,7 +1941,7 @@ mod tests {
             0x9f, 0x7b, 0x08, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
         ]);
         let value = Value::Opaque(data);
-        assert_eq!(value.as_opaque_u64(), Some(0x0123456789ABCDEF));
+        assert_eq!(value.as_opaque_u64(), Some(0x0123_4567_89AB_CDEF));
 
         // u64::MAX
         let max = Bytes::from_static(&[

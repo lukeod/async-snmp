@@ -1,4 +1,4 @@
-//! MibHandler trait and related types.
+//! `MibHandler` trait and related types.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -284,13 +284,13 @@ pub trait MibHandler: Send + Sync + 'static {
         Box::pin(async { SetResult::Ok })
     }
 
-    /// Free resources allocated during test_set (cleanup on test failure).
+    /// Free resources allocated during `test_set` (cleanup on test failure).
     ///
-    /// Called for varbinds whose test_set succeeded when a later varbind's
-    /// test_set fails. This allows handlers to release any resources
+    /// Called for varbinds whose `test_set` succeeded when a later varbind's
+    /// `test_set` fails. This allows handlers to release any resources
     /// (locks, temporary allocations) acquired during the test phase.
     ///
-    /// Called in reverse order, matching the undo_set convention.
+    /// Called in reverse order, matching the `undo_set` convention.
     ///
     /// Default implementation does nothing.
     fn free_set<'a>(

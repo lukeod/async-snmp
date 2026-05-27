@@ -1,10 +1,10 @@
 use super::{CryptoError, CryptoProvider, CryptoResult};
 use crate::v3::{AuthProtocol, PrivProtocol};
 
-/// Default crypto provider backed by the RustCrypto crate ecosystem.
+/// Default crypto provider backed by the `RustCrypto` crate ecosystem.
 ///
 /// This is a stateless unit struct that dispatches to the appropriate
-/// RustCrypto implementations based on the protocol enum values.
+/// `RustCrypto` implementations based on the protocol enum values.
 pub struct RustCryptoProvider;
 
 // --- Dispatch macro for auth protocol -> concrete hash type ---
@@ -339,8 +339,7 @@ mod tests {
         let result = provider.encrypt(PrivProtocol::Des, key, &iv, &mut data);
         assert!(
             result.is_ok(),
-            "DES encrypt must pad unaligned plaintext, got: {:?}",
-            result
+            "DES encrypt must pad unaligned plaintext, got: {result:?}"
         );
         assert_eq!(data.len(), 8, "output must be padded to 8-byte boundary");
     }
@@ -356,8 +355,7 @@ mod tests {
         let result = provider.encrypt(PrivProtocol::Des3, &key, &iv, &mut data);
         assert!(
             result.is_ok(),
-            "3DES encrypt must pad unaligned plaintext, got: {:?}",
-            result
+            "3DES encrypt must pad unaligned plaintext, got: {result:?}"
         );
         assert_eq!(data.len(), 8, "output must be padded to 8-byte boundary");
     }

@@ -78,6 +78,7 @@ impl Default for Retry {
 
 impl Retry {
     /// No retries - request is sent once and fails on timeout.
+    #[must_use]
     pub fn none() -> Self {
         Self {
             max_attempts: 0,
@@ -91,6 +92,7 @@ impl Retry {
     ///
     /// * `attempts` - Maximum number of retry attempts
     /// * `delay` - Fixed delay before each retry
+    #[must_use]
     pub fn fixed(attempts: u32, delay: Duration) -> Self {
         Self {
             max_attempts: attempts,
@@ -117,6 +119,7 @@ impl Retry {
     ///     .jitter(0.25)
     ///     .build();
     /// ```
+    #[must_use]
     pub fn exponential(attempts: u32) -> RetryBuilder {
         RetryBuilder {
             max_attempts: attempts,
@@ -127,6 +130,7 @@ impl Retry {
     /// Compute the delay before the next retry attempt.
     ///
     /// Returns `Duration::ZERO` for `Backoff::None`.
+    #[must_use]
     pub fn compute_delay(&self, attempt: u32) -> Duration {
         match &self.backoff {
             Backoff::None => Duration::ZERO,
@@ -173,12 +177,14 @@ impl Default for RetryBuilder {
 
 impl RetryBuilder {
     /// Set the initial delay before the first retry (default: 1 second).
+    #[must_use]
     pub fn initial_delay(mut self, delay: Duration) -> Self {
         self.initial = delay;
         self
     }
 
     /// Set the maximum delay cap (default: 5 seconds).
+    #[must_use]
     pub fn max_delay(mut self, delay: Duration) -> Self {
         self.max = delay;
         self
@@ -190,12 +196,14 @@ impl RetryBuilder {
     /// experience timeouts simultaneously.
     ///
     /// The value is clamped to [0.0, 1.0].
+    #[must_use]
     pub fn jitter(mut self, jitter: f64) -> Self {
         self.jitter = jitter.clamp(0.0, 1.0);
         self
     }
 
     /// Build the [`Retry`] configuration.
+    #[must_use]
     pub fn build(self) -> Retry {
         Retry {
             max_attempts: self.max_attempts,
@@ -222,13 +230,14 @@ static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Uses a multiplicative hash of an atomic counter to generate pseudo-random
 /// values. This is sufficient for retry desynchronization without requiring
 /// true randomness.
+#[allow(clippy::cast_precision_loss, reason = "u64->f64 cast is intentional part of hash-like algorithm")]
 fn jitter_factor(jitter: f64) -> f64 {
     if jitter <= 0.0 {
         return 1.0;
     }
     // Multiplicative hash of counter (Knuth's method)
     let counter = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let hash = counter.wrapping_mul(0x5851f42d4c957f2d);
+    let hash = counter.wrapping_mul(0x5851_f42d_4c95_7f2d);
     // Convert to [0, 1) range using upper bits (better distribution)
     let random = (hash >> 11) as f64 / ((1u64 << 53) as f64);
     // Return factor in [1-jitter, 1+jitter]
@@ -367,7 +376,7 @@ mod tests {
         for _ in 0..10 {
             let delay = retry.compute_delay(0);
             let millis = delay.as_millis();
-            assert!((75..=125).contains(&millis), "delay was {}ms", millis);
+            assert!((75..=125).contains(&millis), "delay was {millis}ms");
         }
     }
 
@@ -376,7 +385,7 @@ mod tests {
         // Test that jitter_factor produces values in expected range
         for _ in 0..100 {
             let factor = jitter_factor(0.5);
-            assert!((0.5..=1.5).contains(&factor), "factor was {}", factor);
+            assert!((0.5..=1.5).contains(&factor), "factor was {factor}");
         }
     }
 

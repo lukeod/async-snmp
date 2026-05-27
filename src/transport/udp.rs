@@ -27,7 +27,7 @@
 //!
 //! A single background task reads all datagrams from the socket. Each incoming
 //! response is matched to its caller by extracting the request ID (or msgID for
-//! SNMPv3) from the packet header and looking up the corresponding pending
+//! `SNMPv3`) from the packet header and looking up the corresponding pending
 //! request slot. The pending map is sharded (64 shards, keyed by request ID) to
 //! reduce lock contention under high concurrency.
 //!
@@ -89,7 +89,7 @@ const UDP_RECV_BUFFER_SIZE: usize = 65535;
 pub struct UdpTransportConfig {
     /// Maximum message size for sending (default: 1472, fits Ethernet MTU).
     ///
-    /// This affects the advertised msgMaxSize in SNMPv3 requests. The receive
+    /// This affects the advertised msgMaxSize in `SNMPv3` requests. The receive
     /// buffer is always sized to accept the maximum UDP datagram (65535 bytes).
     pub max_message_size: usize,
     /// Log warning when response source differs from target (default: true)
@@ -142,6 +142,7 @@ impl UdpTransport {
     }
 
     /// Create a builder for custom configuration.
+    #[must_use]
     pub fn builder() -> UdpTransportBuilder {
         UdpTransportBuilder::new()
     }
@@ -153,6 +154,7 @@ impl UdpTransport {
     /// When the transport is bound to an IPv6 socket and the target is IPv4,
     /// the target is automatically mapped to an IPv4-mapped IPv6 address
     /// (`::ffff:x.x.x.x`) for cross-platform dual-stack compatibility.
+    #[must_use]
     pub fn handle(&self, target: SocketAddr) -> UdpHandle {
         let target = self.map_to_socket_family(target);
         UdpHandle {
@@ -176,6 +178,7 @@ impl UdpTransport {
     }
 
     /// Get the local bind address.
+    #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
     }
@@ -184,6 +187,7 @@ impl UdpTransport {
     ///
     /// Returns cumulative counters for delivered and expired requests.
     /// Useful for monitoring transport health under load.
+    #[must_use]
     pub fn stats(&self) -> TransportStats {
         self.inner.core.stats()
     }
@@ -210,7 +214,7 @@ impl UdpTransport {
                 tokio::select! {
                     biased;
 
-                    _ = task_inner.shutdown.cancelled() => {
+                    () = task_inner.shutdown.cancelled() => {
                         tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %task_inner.local_addr }, "UDP transport shutdown");
                         break;
                     }
@@ -261,6 +265,7 @@ impl UdpTransportBuilder {
     /// Create a new builder with default settings.
     ///
     /// Default bind address is `0.0.0.0:0` (IPv4).
+    #[must_use]
     pub fn new() -> Self {
         Self {
             bind_addr: "0.0.0.0:0".into(),
@@ -271,6 +276,7 @@ impl UdpTransportBuilder {
     }
 
     /// Set the local bind address.
+    #[must_use]
     pub fn bind(mut self, addr: impl AsRef<str>) -> Self {
         self.bind_addr = addr.as_ref().to_string();
         self
@@ -278,20 +284,22 @@ impl UdpTransportBuilder {
 
     /// Set maximum message size for sending (default: 1472 bytes).
     ///
-    /// This affects the advertised msgMaxSize in SNMPv3 requests. The receive
+    /// This affects the advertised msgMaxSize in `SNMPv3` requests. The receive
     /// buffer is always sized to accept any valid UDP datagram (65535 bytes).
+    #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.config.max_message_size = size;
         self
     }
 
     /// Configure warning on source address mismatch (default: true).
+    #[must_use]
     pub fn warn_on_source_mismatch(mut self, warn: bool) -> Self {
         self.config.warn_on_source_mismatch = warn;
         self
     }
 
-    /// Set the socket receive buffer size (SO_RCVBUF).
+    /// Set the socket receive buffer size (`SO_RCVBUF`).
     ///
     /// When left unset, the OS default applies (typically 212KB on Linux).
     /// With a shared transport handling many targets, the default may be
@@ -304,14 +312,16 @@ impl UdpTransportBuilder {
     /// The kernel may cap this at `net.core.rmem_max`. If you see
     /// unexplained timeouts under load, check for UDP buffer overflows
     /// with `cat /proc/net/snmp | grep Udp` (the `RcvbufErrors` column).
+    #[must_use]
     pub fn recv_buffer_size(mut self, size: usize) -> Self {
         self.recv_buffer_size = Some(size);
         self
     }
 
-    /// Set the socket send buffer size (SO_SNDBUF).
+    /// Set the socket send buffer size (`SO_SNDBUF`).
     ///
     /// The kernel may cap this at `net.core.wmem_max`.
+    #[must_use]
     pub fn send_buffer_size(mut self, size: usize) -> Self {
         self.send_buffer_size = Some(size);
         self
@@ -366,7 +376,7 @@ impl Default for UdpTransportBuilder {
 /// Handle to a UDP transport for a specific target.
 ///
 /// Implements [`Transport`] and can be used with [`Client`](crate::Client).
-/// Cheap to clone (Arc + SocketAddr).
+/// Cheap to clone (Arc + `SocketAddr`).
 #[derive(Clone)]
 pub struct UdpHandle {
     inner: Arc<UdpTransportInner>,

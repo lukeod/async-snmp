@@ -82,7 +82,7 @@ async fn zero_retries_single_attempt() {
     assert!(elapsed < Duration::from_millis(200));
 }
 
-/// TCP transport doesn't retry (is_reliable = true).
+/// TCP transport doesn't retry (`is_reliable` = true).
 #[tokio::test]
 async fn tcp_no_retry() {
     // This test requires TCP support in TestAgent.

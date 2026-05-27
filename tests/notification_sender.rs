@@ -108,7 +108,7 @@ async fn v2c_trap_send_receive() {
             assert_eq!(varbinds.len(), 1);
             assert_eq!(varbinds[0].value.as_str(), Some("test agent"));
         }
-        other => panic!("expected TrapV2c, got {:?}", other),
+        other => panic!("expected TrapV2c, got {other:?}"),
     }
 }
 
@@ -154,7 +154,7 @@ async fn v2c_inform_send_receive() {
             assert_eq!(received_oid, trap_oid);
             assert_eq!(varbinds.len(), 0);
         }
-        other => panic!("expected InformV2c, got {:?}", other),
+        other => panic!("expected InformV2c, got {other:?}"),
     }
 }
 
@@ -209,7 +209,7 @@ async fn v3_trap_send_receive() {
             assert_eq!(uptime, 99);
             assert_eq!(received_oid, trap_oid);
         }
-        other => panic!("expected TrapV3, got {:?}", other),
+        other => panic!("expected TrapV3, got {other:?}"),
     }
 }
 
@@ -264,7 +264,7 @@ async fn v3_inform_send_receive() {
             assert_eq!(uptime, 7777);
             assert_eq!(received_oid, trap_oid);
         }
-        other => panic!("expected InformV3, got {:?}", other),
+        other => panic!("expected InformV3, got {other:?}"),
     }
 }
 
@@ -303,7 +303,7 @@ async fn v1_trap_send_receive() {
             assert_eq!(trap.generic_trap, GenericTrap::LinkDown);
             assert_eq!(trap.time_stamp, 5000);
         }
-        other => panic!("expected TrapV1, got {:?}", other),
+        other => panic!("expected TrapV1, got {other:?}"),
     }
 }
 
@@ -347,7 +347,7 @@ async fn v1_trap_send_v1_trap_explicit() {
             assert_eq!(trap.time_stamp, 99999);
             assert_eq!(trap.varbinds.len(), 1);
         }
-        other => panic!("expected TrapV1, got {:?}", other),
+        other => panic!("expected TrapV1, got {other:?}"),
     }
 }
 
@@ -453,7 +453,7 @@ async fn agent_v2c_trap_to_sink() {
             assert_eq!(uptime, 500);
             assert_eq!(received_oid, trap_oid);
         }
-        other => panic!("expected TrapV2c, got {:?}", other),
+        other => panic!("expected TrapV2c, got {other:?}"),
     }
 }
 
@@ -491,7 +491,7 @@ async fn agent_v2c_inform_to_sink() {
             assert_eq!(uptime, 1000);
             assert_eq!(received_oid, trap_oid);
         }
-        other => panic!("expected InformV2c, got {:?}", other),
+        other => panic!("expected InformV2c, got {other:?}"),
     }
 }
 
@@ -545,7 +545,7 @@ async fn agent_v3_trap_to_sink() {
             assert_eq!(uptime, 9999);
             assert_eq!(received_oid, trap_oid);
         }
-        other => panic!("expected TrapV3, got {:?}", other),
+        other => panic!("expected TrapV3, got {other:?}"),
     }
 }
 
@@ -586,13 +586,13 @@ async fn agent_multiple_sinks() {
         Notification::TrapV2c { community, .. } => {
             assert_eq!(community.as_ref(), b"public");
         }
-        other => panic!("expected TrapV2c, got {:?}", other),
+        other => panic!("expected TrapV2c, got {other:?}"),
     }
     match n2 {
         Notification::TrapV2c { community, .. } => {
             assert_eq!(community.as_ref(), b"trap-community");
         }
-        other => panic!("expected TrapV2c, got {:?}", other),
+        other => panic!("expected TrapV2c, got {other:?}"),
     }
 }
 
@@ -625,7 +625,7 @@ async fn agent_v1_trap_to_sink() {
             assert_eq!(trap.generic_trap, GenericTrap::WarmStart);
             assert_eq!(trap.time_stamp, 1000);
         }
-        other => panic!("expected TrapV1, got {:?}", other),
+        other => panic!("expected TrapV1, got {other:?}"),
     }
 }
 
@@ -666,7 +666,7 @@ async fn agent_mixed_v1_v2c_sinks() {
             assert_eq!(trap.generic_trap, GenericTrap::LinkUp);
             assert_eq!(trap.time_stamp, 777);
         }
-        other => panic!("expected TrapV1, got {:?}", other),
+        other => panic!("expected TrapV1, got {other:?}"),
     }
 
     // V2c sink gets a TrapV2c
@@ -681,7 +681,7 @@ async fn agent_mixed_v1_v2c_sinks() {
             assert_eq!(uptime, 777);
             assert_eq!(received_oid, trap_oid);
         }
-        other => panic!("expected TrapV2c, got {:?}", other),
+        other => panic!("expected TrapV2c, got {other:?}"),
     }
 }
 

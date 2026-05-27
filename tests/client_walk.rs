@@ -1,5 +1,5 @@
 #![cfg(feature = "agent")]
-//! WALK and BULKWALK operation tests using TestAgent.
+//! WALK and BULKWALK operation tests using `TestAgent`.
 
 mod common;
 
@@ -30,7 +30,7 @@ async fn walk_iterates_subtree() {
     assert_eq!(results[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
 }
 
-/// SNMPv1 WALK iterates through subtree and stops cleanly on noSuchName.
+/// `SNMPv1` WALK iterates through subtree and stops cleanly on noSuchName.
 #[tokio::test]
 async fn v1_walk_iterates_subtree() {
     let agent = TestAgent::new().await;
@@ -130,7 +130,7 @@ async fn walk_scalar_oid_falls_back_to_get() {
     );
 }
 
-/// SNMPv1 WALK on empty subtree returns nothing instead of noSuchName.
+/// `SNMPv1` WALK on empty subtree returns nothing instead of noSuchName.
 #[tokio::test]
 async fn v1_walk_empty_subtree_returns_nothing() {
     let agent = TestAgent::new().await;
@@ -177,7 +177,7 @@ async fn bulkwalk_iterates_subtree() {
     }
 }
 
-/// BULKWALK respects max_repetitions.
+/// BULKWALK respects `max_repetitions`.
 #[tokio::test]
 async fn bulkwalk_respects_max_repetitions() {
     let data = fixtures::combined([fixtures::system_mib(), fixtures::interface_table(5)]);

@@ -61,9 +61,9 @@ impl fmt::Display for Target {
             Target::Address(addr) => f.write_str(addr),
             Target::HostPort(host, port) => {
                 if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
-                    write!(f, "[{}]:{}", host, port)
+                    write!(f, "[{host}]:{port}")
                 } else {
-                    write!(f, "{}:{}", host, port)
+                    write!(f, "{host}:{port}")
                 }
             }
         }
@@ -212,6 +212,7 @@ impl ClientBuilder {
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .timeout(Duration::from_secs(10));
     /// ```
+    #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -247,6 +248,7 @@ impl ClientBuilder {
     ///         .max_delay(Duration::from_secs(5))
     ///         .jitter(0.25));
     /// ```
+    #[must_use]
     pub fn retry(mut self, retry: impl Into<Retry>) -> Self {
         self.retry = retry.into();
         self
@@ -272,6 +274,7 @@ impl ClientBuilder {
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_oids_per_request(50);
     /// ```
+    #[must_use]
     pub fn max_oids_per_request(mut self, max: usize) -> Self {
         self.max_oids_per_request = max;
         self
@@ -304,6 +307,7 @@ impl ClientBuilder {
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_repetitions(50);
     /// ```
+    #[must_use]
     pub fn max_repetitions(mut self, max: u32) -> Self {
         self.max_repetitions = max;
         self
@@ -328,6 +332,7 @@ impl ClientBuilder {
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .walk_mode(WalkMode::GetBulk);
     /// ```
+    #[must_use]
     pub fn walk_mode(mut self, mode: WalkMode) -> Self {
         self.walk_mode = mode;
         self
@@ -354,6 +359,7 @@ impl ClientBuilder {
     ///     .oid_ordering(OidOrdering::AllowNonIncreasing)
     ///     .max_walk_results(10_000);
     /// ```
+    #[must_use]
     pub fn oid_ordering(mut self, ordering: OidOrdering) -> Self {
         self.oid_ordering = ordering;
         self
@@ -373,6 +379,7 @@ impl ClientBuilder {
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_walk_results(10_000);
     /// ```
+    #[must_use]
     pub fn max_walk_results(mut self, limit: usize) -> Self {
         self.max_walk_results = Some(limit);
         self
@@ -394,6 +401,7 @@ impl ClientBuilder {
     ///     Auth::usm("trapuser").auth(AuthProtocol::Sha256, "password"))
     ///     .local_engine_id(b"my-engine-id".to_vec());
     /// ```
+    #[must_use]
     pub fn local_engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
         self.local_engine_id = Some(engine_id.into());
         self
@@ -403,6 +411,7 @@ impl ClientBuilder {
     ///
     /// This is the base boots counter. Engine time is computed from the
     /// elapsed time since the client was created.
+    #[must_use]
     pub fn local_engine_boots(mut self, boots: u32) -> Self {
         self.local_engine_boots = boots;
         self
@@ -412,7 +421,7 @@ impl ClientBuilder {
     ///
     /// Allows multiple clients to share discovered engine state, reducing
     /// the number of discovery requests. This is particularly useful when
-    /// polling many devices with SNMPv3.
+    /// polling many devices with `SNMPv3`.
     ///
     /// # Example
     ///
@@ -432,6 +441,7 @@ impl ClientBuilder {
     ///     Auth::usm("admin").auth(AuthProtocol::Sha256, "password"))
     ///     .engine_cache(cache.clone());
     /// ```
+    #[must_use]
     pub fn engine_cache(mut self, cache: Arc<EngineCache>) -> Self {
         self.engine_cache = Some(cache);
         self
@@ -486,7 +496,7 @@ impl ClientBuilder {
         Ok(())
     }
 
-    /// Resolve target address to SocketAddr, defaulting to port 161.
+    /// Resolve target address to `SocketAddr`, defaulting to port 161.
     ///
     /// Accepts IPv4 (`192.168.1.1`, `192.168.1.1:162`), IPv6 (`::1`,
     /// `[::1]:162`), hostnames (`switch.local`, `switch.local:162`), and
@@ -522,7 +532,7 @@ impl ClientBuilder {
         })
     }
 
-    /// Build ClientConfig from the builder settings.
+    /// Build `ClientConfig` from the builder settings.
     fn build_config(&self) -> ClientConfig {
         match &self.auth {
             Auth::Community { version, community } => {

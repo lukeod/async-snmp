@@ -42,7 +42,7 @@ use crate::oid::Oid;
 /// target address cannot be determined (e.g., parsing failures before
 /// the source address is known).
 pub(crate) const UNKNOWN_TARGET: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0);
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 // Pattern for converting detailed internal errors to simplified public errors:
 //
@@ -160,6 +160,7 @@ pub enum Error {
 
 impl Error {
     /// Box this error (convenience for constructing boxed errors).
+    #[must_use] 
     pub fn boxed(self) -> Box<Self> {
         Box::new(self)
     }
@@ -173,7 +174,7 @@ impl Error {
 ///
 /// # Error Categories
 ///
-/// ## SNMPv1 Errors (0-5)
+/// ## `SNMPv1` Errors (0-5)
 ///
 /// - `NoError` - Operation succeeded
 /// - `TooBig` - Response too large for transport
@@ -210,7 +211,7 @@ pub enum ErrorStatus {
     NoError,
     /// Response message would be too large for transport (status = 1).
     TooBig,
-    /// Requested OID not found (status = 2). SNMPv1 only; v2c+ uses exception values.
+    /// Requested OID not found (status = 2). `SNMPv1` only; v2c+ uses exception values.
     NoSuchName,
     /// Invalid value provided in SET request (status = 3).
     BadValue,
@@ -279,6 +280,7 @@ impl ErrorStatus {
     }
 
     /// Convert to raw status code.
+    #[must_use] 
     pub fn as_i32(&self) -> i32 {
         match self {
             Self::NoError => 0,
@@ -307,6 +309,7 @@ impl ErrorStatus {
     /// Map a v2c+ error status to its v1 equivalent per RFC 2576 Section 4.3.
     ///
     /// V1-native statuses (0-5) pass through unchanged.
+    #[must_use] 
     pub fn to_v1(&self) -> Self {
         match self {
             // V1-native statuses
@@ -342,6 +345,7 @@ impl ErrorStatus {
     ///
     /// For `Unknown` variants, returns `None`; callers should format the
     /// numeric code directly in that case.
+    #[must_use] 
     pub fn as_str(&self) -> Option<&'static str> {
         match self {
             Self::NoError => Some("noError"),

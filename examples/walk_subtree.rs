@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => {
-                println!("  Walk error: {}", e);
+                println!("  Walk error: {e}");
                 break;
             }
         }
@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("String values found:");
     for (oid, value) in &strings {
-        println!("  {}: {}", oid, value);
+        println!("  {oid}: {value}");
     }
 
     // =========================================================================
@@ -174,10 +174,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for handle in handles {
         match handle.await? {
             Ok((subtree, count)) => {
-                println!("  {} - {} OIDs", subtree, count);
+                println!("  {subtree} - {count} OIDs");
             }
             Err(e) => {
-                println!("  Walk failed: {}", e);
+                println!("  Walk failed: {e}");
             }
         }
     }
@@ -247,27 +247,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    {
+        // You can also use the format module directly for more control
+        use async_snmp::format::{display_hint, hex};
 
-    // You can also use the format module directly for more control
-    use async_snmp::format::{display_hint, hex};
+        println!("\nDirect format module usage:");
 
-    println!("\nDirect format module usage:");
+        // Format bytes as a MAC address
+        let mac_bytes = [0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
+        println!("  MAC (1x:): {}", display_hint::apply("1x:", &mac_bytes));
 
-    // Format bytes as a MAC address
-    let mac_bytes = [0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
-    println!("  MAC (1x:): {}", display_hint::apply("1x:", &mac_bytes));
+        // Format bytes as an IPv4 address
+        let ip_bytes = [192, 168, 1, 1];
+        println!("  IPv4 (1d.): {}", display_hint::apply("1d.", &ip_bytes));
 
-    // Format bytes as an IPv4 address
-    let ip_bytes = [192, 168, 1, 1];
-    println!("  IPv4 (1d.): {}", display_hint::apply("1d.", &ip_bytes));
+        // Hex encoding for binary data (useful for engine IDs, etc.)
+        let engine_id = [0x80, 0x00, 0x1f, 0x88, 0x04];
+        println!("  Engine ID (hex): {}", hex::encode(&engine_id));
 
-    // Hex encoding for binary data (useful for engine IDs, etc.)
-    let engine_id = [0x80, 0x00, 0x1f, 0x88, 0x04];
-    println!("  Engine ID (hex): {}", hex::encode(&engine_id));
+        // Lazy hex formatting for logging (avoids allocation if log level disabled)
+        println!("  Lazy hex: {}", hex::Bytes(&engine_id));
 
-    // Lazy hex formatting for logging (avoids allocation if log level disabled)
-    println!("  Lazy hex: {}", hex::Bytes(&engine_id));
-
-    println!("\nExample complete!");
+        println!("\nExample complete!");
+    }
     Ok(())
 }

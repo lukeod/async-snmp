@@ -19,7 +19,7 @@
 //!   docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
 
 use async_snmp::{
-    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, Retry, TcpTransport, Transport, oid,
+    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, Retry, TcpTransport, Transport, VarBind, oid
 };
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("sysDescr: {:?}", vb.value);
         }
         Err(e) => {
-            println!("GET failed: {}", e);
+            println!("GET failed: {e}");
         }
     }
 
@@ -85,11 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
                 Ok(vb) => println!("sysName: {:?}", vb.value),
-                Err(e) => println!("GET failed: {}", e),
+                Err(e) => println!("GET failed: {e}"),
             }
         }
         Err(e) => {
-            println!("TCP connection failed: {}", e);
+            println!("TCP connection failed: {e}");
         }
     }
 
@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            println!("Connection failed: {}", e);
+            println!("Connection failed: {e}");
         }
     }
 
@@ -144,12 +144,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("SNMPv3 TCP client connected");
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
-                Ok(vb) => println!("sysDescr: {:?}", vb.value),
-                Err(e) => println!("GET failed: {}", e),
+                Ok(VarBind { oid: _, value }) => println!("sysDescr: {value:?}"),
+                Err(e) => println!("GET failed: {e}"),
             }
         }
         Err(e) => {
-            println!("SNMPv3 TCP connection failed: {}", e);
+            println!("SNMPv3 TCP connection failed: {e}");
         }
     }
 
@@ -183,15 +183,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Demonstrate both clients work the same way
     if let Ok(client) = udp_client {
         match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-            Ok(vb) => println!("\nUDP sysUpTime: {:?}", vb.value),
-            Err(e) => println!("\nUDP error: {}", e),
+            Ok(VarBind { oid: _, value }) => println!("\nUDP sysUpTime: {value:?}"),
+            Err(e) => println!("\nUDP error: {e}"),
         }
     }
 
     if let Ok(client) = tcp_client {
         match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-            Ok(vb) => println!("TCP sysUpTime: {:?}", vb.value),
-            Err(e) => println!("TCP error: {}", e),
+            Ok(VarBind { oid: _, value }) => println!("TCP sysUpTime: {value:?}"),
+            Err(e) => println!("TCP error: {e}"),
         }
     }
 

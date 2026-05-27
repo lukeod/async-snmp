@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Extract string value if present
             if let Some(s) = varbind.value.as_str() {
-                println!("As string: {}", s);
+                println!("As string: {s}");
             }
         }
         Err(e) => {
@@ -160,11 +160,10 @@ fn handle_error(operation: &str, error: &Error) {
             status, index, oid, ..
         } => {
             println!(
-                "{} failed: SNMP error {:?} at index {}",
-                operation, status, index
+                "{operation} failed: SNMP error {status:?} at index {index}"
             );
             if let Some(oid) = oid {
-                println!("  Problematic OID: {}", oid);
+                println!("  Problematic OID: {oid}");
             }
 
             // Provide specific guidance based on error type
@@ -190,21 +189,20 @@ fn handle_error(operation: &str, error: &Error) {
             ..
         } => {
             println!(
-                "{} failed: Timeout after {:?} ({} retries)",
-                operation, elapsed, retries
+                "{operation} failed: Timeout after {elapsed:?} ({retries} retries)"
             );
-            println!("  -> Check if agent at {} is reachable", target);
+            println!("  -> Check if agent at {target} is reachable");
         }
 
         // Network errors
         Error::Network { target, source, .. } => {
-            println!("{} failed: Network error - {}", operation, source);
-            println!("  -> Target: {}", target);
+            println!("{operation} failed: Network error - {source}");
+            println!("  -> Target: {target}");
         }
 
         // Other errors
         _ => {
-            println!("{} failed: {}", operation, error);
+            println!("{operation} failed: {error}");
         }
     }
 }

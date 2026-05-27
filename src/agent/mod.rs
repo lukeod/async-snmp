@@ -217,6 +217,7 @@ impl AgentBuilder {
     /// - Receive buffer size: 4MB (requested from kernel)
     /// - No communities or USM users (all requests rejected)
     /// - No handlers registered
+    #[must_use]
     pub fn new() -> Self {
         Self {
             bind_addr: "0.0.0.0:161".to_string(),
@@ -274,6 +275,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -299,6 +301,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn community(mut self, community: &[u8]) -> Self {
         self.communities.push(community.to_vec());
         self
@@ -321,6 +324,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn communities<I, C>(mut self, communities: I) -> Self
     where
         I: IntoIterator<Item = C>,
@@ -332,7 +336,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Add a USM user for SNMPv3 authentication.
+    /// Add a USM user for `SNMPv3` authentication.
     ///
     /// Configure authentication and privacy settings using the closure.
     /// Multiple users can be added with different security levels.
@@ -366,6 +370,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
     where
         F: FnOnce(UsmConfig) -> UsmConfig,
@@ -376,7 +381,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the engine ID for SNMPv3.
+    /// Set the engine ID for `SNMPv3`.
     ///
     /// If not set, a default engine ID will be generated based on the
     /// RFC 3411 format using enterprise number and timestamp.
@@ -396,6 +401,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
         self.engine_id = Some(engine_id.into());
         self
@@ -425,6 +431,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn engine_boots(mut self, boots: u32) -> Self {
         self.engine_boots = boots;
         self
@@ -435,8 +442,9 @@ impl AgentBuilder {
     /// Default is 1472 octets (fits Ethernet MTU minus IP/UDP headers).
     /// GETBULK responses will be truncated to fit within this limit.
     ///
-    /// For SNMPv3 requests, the agent uses the minimum of this value
+    /// For `SNMPv3` requests, the agent uses the minimum of this value
     /// and the msgMaxSize from the request.
+    #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
@@ -449,6 +457,7 @@ impl AgentBuilder {
     ///
     /// This controls memory usage under high load while still allowing
     /// parallel request processing.
+    #[must_use]
     pub fn max_concurrent_requests(mut self, limit: Option<usize>) -> Self {
         self.max_concurrent_requests = limit;
         self
@@ -460,6 +469,7 @@ impl AgentBuilder {
     /// A larger buffer prevents packet loss during request bursts.
     ///
     /// Set to `None` to use the kernel default.
+    #[must_use]
     pub fn recv_buffer_size(mut self, size: Option<usize>) -> Self {
         self.recv_buffer_size = size;
         self
@@ -505,6 +515,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn handler(mut self, prefix: Oid, handler: Arc<dyn MibHandler>) -> Self {
         self.handlers.push(RegisteredHandler { prefix, handler });
         self
@@ -548,6 +559,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn vacm<F>(mut self, configure: F) -> Self
     where
         F: FnOnce(VacmBuilder) -> VacmBuilder,
@@ -560,6 +572,7 @@ impl AgentBuilder {
     /// Set a cancellation token for graceful shutdown.
     ///
     /// If not set, the agent creates its own token accessible via `Agent::cancel()`.
+    #[must_use]
     pub fn cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -589,6 +602,7 @@ impl AgentBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn trap_sink(
         mut self,
         dest: impl Into<String>,
@@ -601,6 +615,7 @@ impl AgentBuilder {
     /// Set the timeout for inform requests sent to trap sinks.
     ///
     /// Default is 5 seconds. Only affects `send_inform`, not `send_trap`.
+    #[must_use]
     pub fn inform_timeout(mut self, timeout: Duration) -> Self {
         self.inform_timeout = timeout;
         self
@@ -610,6 +625,7 @@ impl AgentBuilder {
     ///
     /// Default is `Retry::default()` (3 retries with 1-second delay).
     /// Only affects `send_inform`, not `send_trap`.
+    #[must_use]
     pub fn inform_retry(mut self, retry: crate::client::Retry) -> Self {
         self.inform_retry = retry;
         self
@@ -620,6 +636,7 @@ impl AgentBuilder {
     /// By default, the agent registers handlers for snmpEngine, USM stats,
     /// and MPD stats. Call this to prevent registration of a specific group,
     /// e.g., if you want to provide your own handler for those OIDs.
+    #[must_use]
     pub fn without_builtin_handler(mut self, mib: BuiltinMib) -> Self {
         self.disabled_builtins.insert(mib);
         self
@@ -630,6 +647,7 @@ impl AgentBuilder {
     /// The agent will not register any internal handlers for snmpEngine,
     /// USM stats, or MPD stats. You can still query the counter values
     /// via accessor methods like [`Agent::usm_unknown_engine_ids()`].
+    #[must_use]
     pub fn without_builtin_handlers(mut self) -> Self {
         self.disabled_builtins.insert(BuiltinMib::SnmpEngine);
         self.disabled_builtins.insert(BuiltinMib::UsmStats);
@@ -662,7 +680,7 @@ impl AgentBuilder {
             })?;
 
         // Generate default engine ID if not provided
-        let engine_id: Bytes = self.engine_id.map(Bytes::from).unwrap_or_else(|| {
+        let engine_id: Bytes = self.engine_id.map_or_else(|| {
             // RFC 3411 format: enterprise number + format + local identifier
             // Use a simple format: 0x80 (local) + timestamp + random
             let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01]; // Enterprise format indicator
@@ -672,7 +690,7 @@ impl AgentBuilder {
                 .as_secs();
             id.extend_from_slice(&timestamp.to_be_bytes());
             Bytes::from(id)
-        });
+        }, Bytes::from);
 
         let cancel = self.cancel.unwrap_or_default();
 
@@ -685,7 +703,7 @@ impl AgentBuilder {
         let mut trap_sinks = Vec::with_capacity(self.trap_sinks.len());
         for (dest_str, auth) in self.trap_sinks {
             let dest: SocketAddr = dest_str.parse().map_err(|_| {
-                Error::Config(format!("invalid trap sink address: {}", dest_str).into())
+                Error::Config(format!("invalid trap sink address: {dest_str}").into())
             })?;
             trap_sinks.push(notification::TrapSink::new(
                 dest,
@@ -741,7 +759,7 @@ impl AgentBuilder {
 
         // Sort handlers by prefix length (longest first) for matching
         self.handlers
-            .sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+            .sort_by_key(|h| std::cmp::Reverse(h.prefix.len()));
 
         Ok(Agent {
             inner: Arc::new(AgentInner {
@@ -774,7 +792,7 @@ pub(crate) struct AgentState {
     pub(crate) engine_boots: AtomicU32,
     pub(crate) engine_time: AtomicU32,
     pub(crate) engine_start: Instant,
-    /// Initial engine_boots value at startup, used to compute overflow-adjusted boots.
+    /// Initial `engine_boots` value at startup, used to compute overflow-adjusted boots.
     pub(crate) engine_boots_base: u32,
     pub(crate) max_message_size: usize,
     // RFC 3412 statistics counters
@@ -852,16 +870,19 @@ pub struct Agent {
 
 impl Agent {
     /// Create a builder for configuring the agent.
+    #[must_use]
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
     }
 
     /// Get the local address the agent is bound to.
+    #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
     }
 
     /// Get the engine ID.
+    #[must_use]
     pub fn engine_id(&self) -> &[u8] {
         &self.inner.state.engine_id
     }
@@ -871,11 +892,13 @@ impl Agent {
     /// Useful for persisting across restarts per RFC 3414 Section 2.3.
     /// The persisted value should be passed to `AgentBuilder::engine_boots()`
     /// on the next startup.
+    #[must_use]
     pub fn engine_boots(&self) -> u32 {
         self.inner.state.engine_boots.load(Ordering::Relaxed)
     }
 
     /// Get the current engine time value.
+    #[must_use]
     pub fn engine_time(&self) -> u32 {
         self.inner.state.engine_time.load(Ordering::Relaxed)
     }
@@ -883,6 +906,7 @@ impl Agent {
     /// Get the cancellation token for this agent.
     ///
     /// Call `token.cancel()` to initiate graceful shutdown.
+    #[must_use]
     pub fn cancel(&self) -> CancellationToken {
         self.inner.cancel.clone()
     }
@@ -893,6 +917,7 @@ impl Agent {
     /// privacy-without-authentication (RFC 3412 Section 7.2 Step 5d).
     ///
     /// OID: 1.3.6.1.6.3.11.2.1.2
+    #[must_use]
     pub fn snmp_invalid_msgs(&self) -> u32 {
         self.inner.state.snmp_invalid_msgs.load(Ordering::Relaxed)
     }
@@ -903,6 +928,7 @@ impl Agent {
     /// (RFC 3412 Section 7.2 Step 2).
     ///
     /// OID: 1.3.6.1.6.3.11.2.1.1
+    #[must_use]
     pub fn snmp_unknown_security_models(&self) -> u32 {
         self.inner
             .state
@@ -912,12 +938,13 @@ impl Agent {
 
     /// Get the snmpSilentDrops counter value.
     ///
-    /// This counter tracks confirmed-class PDUs (GetRequest, GetNextRequest,
-    /// GetBulkRequest, SetRequest, InformRequest) that were silently dropped
+    /// This counter tracks confirmed-class PDUs (`GetRequest`, `GetNextRequest`,
+    /// `GetBulkRequest`, `SetRequest`, `InformRequest`) that were silently dropped
     /// because even an empty Response-PDU would exceed the maximum message
     /// size constraint (RFC 3412 Section 7.1).
     ///
     /// OID: 1.3.6.1.6.3.11.2.1.3
+    #[must_use]
     pub fn snmp_silent_drops(&self) -> u32 {
         self.inner.state.snmp_silent_drops.load(Ordering::Relaxed)
     }
@@ -929,6 +956,7 @@ impl Agent {
     /// does not match the local engine (RFC 3414 Section 3.2 Step 3).
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.4
+    #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
         self.inner
             .state
@@ -943,6 +971,7 @@ impl Agent {
     /// user database (RFC 3414 Section 3.2 Step 1).
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.3
+    #[must_use]
     pub fn usm_unknown_usernames(&self) -> u32 {
         self.inner
             .state
@@ -956,6 +985,7 @@ impl Agent {
     /// (RFC 3414 Section 3.2 Step 7).
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.5
+    #[must_use]
     pub fn usm_wrong_digests(&self) -> u32 {
         self.inner.state.usm_wrong_digests.load(Ordering::Relaxed)
     }
@@ -967,6 +997,7 @@ impl Agent {
     /// more than 150 seconds (RFC 3414 Section 3.2 Step 8).
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.2
+    #[must_use]
     pub fn usm_not_in_time_windows(&self) -> u32 {
         self.inner
             .state
@@ -981,6 +1012,7 @@ impl Agent {
     /// has no auth key configured). RFC 3414 Section 3.2.
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.1
+    #[must_use]
     pub fn usm_unsupported_sec_levels(&self) -> u32 {
         self.inner
             .state
@@ -995,6 +1027,7 @@ impl Agent {
     /// RFC 3414 Section 3.2.
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.6
+    #[must_use]
     pub fn usm_decryption_errors(&self) -> u32 {
         self.inner
             .state
@@ -1006,10 +1039,11 @@ impl Agent {
     ///
     /// Use this in your system MIB handler to provide sysUpTime.0
     /// (1.3.6.1.2.1.1.3.0) as a `Value::TimeTicks` value.
+    #[must_use]
     pub fn uptime_hundredths(&self) -> u32 {
         let elapsed = self.inner.state.engine_start.elapsed();
         let centisecs = elapsed.as_millis() / 10;
-        centisecs.min(u32::MAX as u128) as u32
+        centisecs.min(u128::from(u32::MAX)) as u32
     }
 
     /// Run the agent, processing requests concurrently.
@@ -1026,7 +1060,7 @@ impl Agent {
                 result = self.recv_packet(&mut buf) => {
                     result?
                 }
-                _ = self.inner.cancel.cancelled() => {
+                () = self.inner.cancel.cancelled() => {
                     tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
                     return Ok(());
                 }
@@ -1093,8 +1127,8 @@ impl Agent {
 
             match result {
                 Ok(n) if n > 0 => return Ok(meta[0]),
-                Ok(_) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Ok(_) => {/* fall thru to next `loop {}` iteration */},
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {/* fall thru to next `loop {}` iteration */},
                 Err(e) => {
                     return Err(Error::Network {
                         target: self.inner.local_addr,
@@ -1125,7 +1159,7 @@ impl Agent {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {/* fall thru to next `loop {}` iteration */},
                 Err(e) => return Err(e),
             }
         }
@@ -1155,7 +1189,7 @@ impl Agent {
 
     /// Update engine boots and time based on elapsed time since start.
     ///
-    /// Per RFC 3414 Section 2.3, when snmpEngineTime reaches MAX_ENGINE_TIME
+    /// Per RFC 3414 Section 2.3, when snmpEngineTime reaches `MAX_ENGINE_TIME`
     /// (2^31-1), snmpEngineBoots is incremented and snmpEngineTime resets to
     /// zero. The boots/time pair is derived from total elapsed seconds and
     /// the base boots value at startup, so no mutable state beyond the
@@ -1227,11 +1261,13 @@ impl Agent {
         }
     }
 
-    /// Handle InformRequest PDU.
+    /// Handle `InformRequest` PDU.
     ///
-    /// Per RFC 3416 Section 4.2.7, an InformRequest is a confirmed-class PDU
+    /// Per RFC 3416 Section 4.2.7, an `InformRequest` is a confirmed-class PDU
     /// that the receiver acknowledges by returning a Response with the same
     /// request-id and varbind list.
+    #[allow(clippy::unnecessary_wraps, reason = "TODO store received informs, which may be a fallible operation")]
+    #[allow(clippy::unused_self, reason = "TODO store received informs, which may require self")]
     fn handle_inform(&self, pdu: &Pdu) -> Result<Pdu> {
         // Simply acknowledge by returning the same varbinds in a Response
         Ok(pdu.to_response())
@@ -1249,11 +1285,10 @@ impl Agent {
                 // v1: noSuchName, v2c/v3: noAccess or NoSuchObject
                 if ctx.version == Version::V1 {
                     return Ok(pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32));
-                } else {
-                    // For GET, return NoSuchObject for inaccessible OIDs per RFC 3415
-                    response_varbinds.push(VarBind::new(vb.oid.clone(), Value::NoSuchObject));
-                    continue;
                 }
+                // For GET, return NoSuchObject for inaccessible OIDs per RFC 3415
+                response_varbinds.push(VarBind::new(vb.oid.clone(), Value::NoSuchObject));
+                continue;
             }
 
             let result = if let Some(handler) = self.find_handler(&vb.oid) {
@@ -1278,9 +1313,8 @@ impl Agent {
                         return Ok(
                             pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
                         );
-                    } else {
-                        Value::NoSuchObject
                     }
+                    Value::NoSuchObject
                 }
                 GetResult::NoSuchInstance => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchInstance exception
@@ -1288,9 +1322,8 @@ impl Agent {
                         return Ok(
                             pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
                         );
-                    } else {
-                        Value::NoSuchInstance
                     }
+                    Value::NoSuchInstance
                 }
             };
 
@@ -1316,20 +1349,16 @@ impl Agent {
             // continuing the walk until an accessible OID is found.
             let next = self.get_next_accessible_oid(ctx, &vb.oid).await;
 
-            match next {
-                Some(next_vb) => {
-                    response_varbinds.push(next_vb);
+            if let Some(next_vb) = next {
+                response_varbinds.push(next_vb);
+            } else {
+                // v1 returns noSuchName, v2c/v3 returns endOfMibView
+                if ctx.version == Version::V1 {
+                    return Ok(
+                        pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
+                    );
                 }
-                None => {
-                    // v1 returns noSuchName, v2c/v3 returns endOfMibView
-                    if ctx.version == Version::V1 {
-                        return Ok(
-                            pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
-                        );
-                    } else {
-                        response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
-                    }
-                }
+                response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
             }
         }
 
@@ -1348,8 +1377,8 @@ impl Agent {
     /// size limit, we return fewer variable bindings rather than all of them.
     async fn handle_get_bulk(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
         // For GETBULK, error_status is non_repeaters and error_index is max_repetitions
-        let non_repeaters = pdu.error_status.max(0) as usize;
-        let max_repetitions = pdu.error_index.max(0) as usize;
+        let non_repeaters = pdu.error_status.try_into().unwrap_or(0);
+        let max_repetitions = pdu.error_index.max(0);
 
         let mut response_varbinds = Vec::new();
         let mut current_size: usize = RESPONSE_OVERHEAD;
@@ -1400,16 +1429,13 @@ impl Agent {
                     } else {
                         let next = self.get_next_accessible_oid(ctx, oid).await;
 
-                        match next {
-                            Some(next_vb) => {
-                                *oid = next_vb.oid.clone();
-                                row_complete = false;
-                                next_vb
-                            }
-                            None => {
-                                all_done[i] = true;
-                                VarBind::new(oid.clone(), Value::EndOfMibView)
-                            }
+                        if let Some(next_vb) = next {
+                            *oid = next_vb.oid.clone();
+                            row_complete = false;
+                            next_vb
+                        } else {
+                            all_done[i] = true;
+                            VarBind::new(oid.clone(), Value::EndOfMibView)
                         }
                     };
 
@@ -1479,9 +1505,8 @@ impl Agent {
                     if let Some(ref vacm) = self.inner.vacm {
                         if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
                             return candidate;
-                        } else {
-                            search_from = next_vb.oid.clone();
                         }
+                        search_from = next_vb.oid.clone();
                     } else {
                         return candidate;
                     }
@@ -1640,20 +1665,20 @@ mod tests {
     #[test]
     fn test_mib_handler_handles() {
         let handler = TestHandler;
-        let prefix = oid!(1, 3, 6, 1, 4, 1, 99999);
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 99_999);
 
         // OID within prefix
-        assert!(handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)));
+        assert!(handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99_999, 1, 0)));
 
         // Exact prefix match
-        assert!(handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99999)));
+        assert!(handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99_999)));
 
         // OID before prefix - should NOT be handled (GET/SET routing must not claim
         // OIDs outside the registered subtree)
-        assert!(!handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99998)));
+        assert!(!handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 99_998)));
 
         // OID after prefix (not handled)
-        assert!(!handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 100000)));
+        assert!(!handler.handles(&prefix, &oid!(1, 3, 6, 1, 4, 1, 100_000)));
     }
 
     #[tokio::test]
@@ -1709,9 +1734,9 @@ mod tests {
     impl MibHandler for FiveOidHandler {
         fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
             Box::pin(async move {
-                for i in 1u32..=5 {
-                    if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, i, 0) {
-                        return GetResult::Value(Value::Integer(i as i32));
+                for i in 1u16..=5 {
+                    if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, i.into(), 0) {
+                        return GetResult::Value(Value::Integer(i.into()));
                     }
                 }
                 GetResult::NoSuchObject
@@ -1791,13 +1816,11 @@ mod tests {
         // Both accessible OIDs must appear - the walk must not stop at the first one
         assert!(
             returned_oids.contains(&&oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0)),
-            "expected .99999.2.0 in response, got: {:?}",
-            returned_oids
+            "expected .99999.2.0 in response, got: {returned_oids:?}"
         );
         assert!(
             returned_oids.contains(&&oid!(1, 3, 6, 1, 4, 1, 99999, 4, 0)),
-            "expected .99999.4.0 in response (walk must continue past denied OIDs), got: {:?}",
-            returned_oids
+            "expected .99999.4.0 in response (walk must continue past denied OIDs), got: {returned_oids:?}"
         );
 
         // Denied OIDs must not appear
@@ -1808,8 +1831,7 @@ mod tests {
         ] {
             assert!(
                 !returned_oids.contains(&oid),
-                "GETBULK returned OID outside read view: {:?}",
-                oid
+                "GETBULK returned OID outside read view: {oid:?}"
             );
         }
     }
@@ -1894,7 +1916,7 @@ mod tests {
         }
     }
 
-    /// Build an agent with ThreeOidHandler and a VACM view that includes
+    /// Build an agent with `ThreeOidHandler` and a VACM view that includes
     /// .99999.1 and .99999.3 but excludes .99999.2.
     async fn test_agent_with_gap_vacm() -> Agent {
         Agent::builder()
@@ -2186,8 +2208,7 @@ mod tests {
             .count();
         assert!(
             full_count >= 3,
-            "expected at least 3 data varbinds without limit, got {}",
-            full_count
+            "expected at least 3 data varbinds without limit, got {full_count}"
         );
 
         // Now set a small msg_max_size that limits the response.
@@ -2207,9 +2228,7 @@ mod tests {
 
         assert!(
             limited_count < full_count,
-            "V3 msg_max_size should limit response: got {} varbinds (unlimited: {})",
-            limited_count,
-            full_count
+            "V3 msg_max_size should limit response: got {limited_count} varbinds (unlimited: {full_count})"
         );
         assert!(
             limited_count > 0,
@@ -2303,7 +2322,7 @@ mod tests {
     #[test]
     fn test_engine_time_just_below_max() {
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = crate::v3::compute_engine_boots_time(1, max as u64 - 1);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, u64::from(max) - 1);
         assert_eq!(boots, 1);
         assert_eq!(time, max - 1);
     }
@@ -2312,7 +2331,7 @@ mod tests {
     fn test_engine_time_at_max_wraps() {
         // Exactly at MAX_ENGINE_TIME seconds: boots increments, time resets to 0
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = crate::v3::compute_engine_boots_time(1, max as u64);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, u64::from(max));
         assert_eq!(
             boots, 2,
             "boots should increment when elapsed reaches MAX_ENGINE_TIME"
@@ -2324,7 +2343,7 @@ mod tests {
     fn test_engine_time_past_max() {
         // 500 seconds past the first wrap
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = crate::v3::compute_engine_boots_time(1, max as u64 + 500);
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, u64::from(max) + 500);
         assert_eq!(boots, 2);
         assert_eq!(time, 500);
     }
@@ -2333,7 +2352,7 @@ mod tests {
     fn test_engine_time_multiple_wraps() {
         // Three full cycles
         let max = crate::v3::MAX_ENGINE_TIME;
-        let elapsed = max as u64 * 3 + 42;
+        let elapsed = u64::from(max) * 3 + 42;
         let (boots, time) = crate::v3::compute_engine_boots_time(1, elapsed);
         assert_eq!(boots, 4, "base 1 + 3 wraps = 4");
         assert_eq!(time, 42);
@@ -2343,7 +2362,7 @@ mod tests {
     fn test_engine_time_boots_capped_at_max() {
         // If enough wraps happen that boots would exceed MAX_ENGINE_TIME, cap it
         let max = crate::v3::MAX_ENGINE_TIME;
-        let elapsed = max as u64 * (max as u64); // way more wraps than max allows
+        let elapsed = u64::from(max) * u64::from(max); // way more wraps than max allows
         let (boots, _time) = crate::v3::compute_engine_boots_time(1, elapsed);
         assert_eq!(boots, max, "boots should be capped at MAX_ENGINE_TIME");
     }
@@ -2352,7 +2371,7 @@ mod tests {
     fn test_engine_time_base_boots_preserved() {
         // A non-1 base boots (e.g. from persistence) is respected
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = crate::v3::compute_engine_boots_time(5, max as u64 + 100);
+        let (boots, time) = crate::v3::compute_engine_boots_time(5, u64::from(max) + 100);
         assert_eq!(boots, 6, "base 5 + 1 wrap = 6");
         assert_eq!(time, 100);
     }
@@ -2361,7 +2380,7 @@ mod tests {
     fn test_engine_time_high_base_boots_capped() {
         // Base boots near MAX_ENGINE_TIME with a wrap should cap
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, _time) = crate::v3::compute_engine_boots_time(max - 1, max as u64 * 2);
+        let (boots, _time) = crate::v3::compute_engine_boots_time(max - 1, u64::from(max) * 2);
         assert_eq!(boots, max, "should cap at MAX_ENGINE_TIME, not overflow");
     }
 
@@ -2433,8 +2452,7 @@ mod tests {
         let uptime = agent.uptime_hundredths();
         assert!(
             uptime < 100,
-            "uptime should be less than 1 second, got {}",
-            uptime
+            "uptime should be less than 1 second, got {uptime}"
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

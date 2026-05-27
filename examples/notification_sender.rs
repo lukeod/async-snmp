@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
     let recv_addr = receiver.local_addr();
-    println!("Receiver listening on {}\n", recv_addr);
+    println!("Receiver listening on {recv_addr}\n");
 
     // Spawn receiver loop (expects 5 notifications total)
     let recv_handle = tokio::spawn(async move {
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Ok((notification, source))) => {
                     print_notification(&notification, source);
                 }
-                Ok(Err(e)) => eprintln!("Receive error: {}", e),
+                Ok(Err(e)) => eprintln!("Receive error: {e}"),
                 Err(_) => eprintln!("Timeout waiting for notification"),
             }
         }
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .connect()
     .await?;
     let link_up = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 4);
-    v3_client.send_trap(&link_up, 100000, vec![]).await?;
+    v3_client.send_trap(&link_up, 100_000, vec![]).await?;
     println!("Sent v3 trap (linkUp, authNoPriv)\n");
 
     // V3 inform via client (uses engine discovery)
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let auth_failure = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 5);
     v3_priv_client
-        .send_inform(&auth_failure, 200000, vec![])
+        .send_inform(&auth_failure, 200_000, vec![])
         .await?;
     println!("Sent v3 inform (authenticationFailure, authPriv) - acknowledged\n");
 

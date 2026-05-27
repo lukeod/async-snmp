@@ -57,6 +57,7 @@ impl UsmSecurityParams {
     }
 
     /// Create empty security parameters for discovery.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             engine_id: Bytes::new(),
@@ -69,12 +70,14 @@ impl UsmSecurityParams {
     }
 
     /// Set authentication parameters.
+    #[must_use]
     pub fn with_auth_params(mut self, auth_params: impl Into<Bytes>) -> Self {
         self.auth_params = auth_params.into();
         self
     }
 
     /// Set privacy parameters.
+    #[must_use]
     pub fn with_priv_params(mut self, priv_params: impl Into<Bytes>) -> Self {
         self.priv_params = priv_params.into();
         self
@@ -85,6 +88,7 @@ impl UsmSecurityParams {
     /// For authenticated messages, the auth params field is filled with zeros
     /// during encoding, then the HMAC is computed over the entire message,
     /// and finally the zeros are replaced with the actual HMAC.
+    #[must_use]
     pub fn with_auth_placeholder(mut self, mac_len: usize) -> Self {
         self.auth_params = Bytes::from(vec![0u8; mac_len]);
         self
@@ -157,10 +161,11 @@ impl UsmSecurityParams {
         })
     }
 
-    /// Get the position of auth_params within the encoded message.
+    /// Get the position of `auth_params` within the encoded message.
     ///
     /// This is needed for HMAC computation: we need to know where to
     /// replace the placeholder zeros with the actual HMAC.
+    #[must_use]
     pub fn find_auth_params_offset(encoded_msg: &[u8]) -> Option<(usize, usize)> {
         // Navigate the BER structure to find auth_params location
         // Message structure:

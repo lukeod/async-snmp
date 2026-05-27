@@ -61,6 +61,7 @@ use crate::format::hex;
 /// // Empty data returns empty string
 /// assert_eq!(display_hint::apply("1d", &[]), "");
 /// ```
+#[must_use] 
 pub fn apply(hint: &str, data: &[u8]) -> String {
     if hint.is_empty() || data.is_empty() {
         return hex::encode(data);
@@ -162,7 +163,7 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                 b'd' => {
                     // Big-endian unsigned integer
                     let val = chunk.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-                    let _ = write!(result, "{}", val);
+                    let _ = write!(result, "{val}");
                 }
                 b'x' => {
                     // Hex encoding - zero-padded per byte
@@ -171,7 +172,7 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                 b'o' => {
                     // Big-endian octal
                     let val = chunk.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-                    let _ = write!(result, "{:o}", val);
+                    let _ = write!(result, "{val:o}");
                 }
                 b'a' => {
                     // ASCII - write bytes directly (single-byte characters)
@@ -242,16 +243,17 @@ fn is_digit(c: u8) -> bool {
 /// assert_eq!(display_hint::apply_integer("d-2", -500), Some("-5.00".to_string()));
 /// assert_eq!(display_hint::apply_integer("d-1", 255), Some("25.5".to_string()));
 /// ```
+#[must_use] 
 pub fn apply_integer(hint: &str, value: i32) -> Option<String> {
     match hint {
-        "x" => Some(format!("{:x}", value)),
-        "o" => Some(format!("{:o}", value)),
-        "b" => Some(format!("{:b}", value)),
-        "d" => Some(format!("{}", value)),
+        "x" => Some(format!("{value:x}")),
+        "o" => Some(format!("{value:o}")),
+        "b" => Some(format!("{value:b}")),
+        "d" => Some(format!("{value}")),
         hint if hint.starts_with("d-") => {
             let places: usize = hint[2..].parse().ok()?;
             if places == 0 {
-                return Some(format!("{}", value));
+                return Some(format!("{value}"));
             }
             Some(format_with_decimal_point(value, places))
         }
@@ -277,11 +279,11 @@ fn format_with_decimal_point(value: i32, places: usize) -> String {
         // e.g., 1234 with places=2 -> "12.34"
         let split_point = abs_str.len() - places;
         let (integer_part, decimal_part) = abs_str.split_at(split_point);
-        format!("{}.{}", integer_part, decimal_part)
+        format!("{integer_part}.{decimal_part}")
     };
 
     if is_negative {
-        format!("-{}", result)
+        format!("-{result}")
     } else {
         result
     }

@@ -1,7 +1,7 @@
 //! Authentication configuration types for the SNMP client.
 //!
 //! This module provides the [`Auth`] enum for specifying authentication
-//! configuration, supporting SNMPv1/v2c community strings and SNMPv3 USM.
+//! configuration, supporting SNMPv1/v2c community strings and `SNMPv3` USM.
 //!
 //! # Master Key Caching
 //!
@@ -27,9 +27,9 @@ use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol};
 /// SNMP version for community-based authentication.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommunityVersion {
-    /// SNMPv1
+    /// `SNMPv1`
     V1,
-    /// SNMPv2c
+    /// `SNMPv2c`
     #[default]
     V2c,
 }
@@ -37,14 +37,14 @@ pub enum CommunityVersion {
 /// Authentication configuration for SNMP clients.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Auth {
-    /// Community string authentication (SNMPv1 or v2c).
+    /// Community string authentication (`SNMPv1` or v2c).
     Community {
         /// SNMP version (V1 or V2c)
         version: CommunityVersion,
         /// Community string
         community: String,
     },
-    /// User-based Security Model (SNMPv3).
+    /// User-based Security Model (`SNMPv3`).
     Usm(UsmAuth),
 }
 
@@ -56,9 +56,9 @@ impl Default for Auth {
 }
 
 impl Auth {
-    /// SNMPv1 community authentication.
+    /// `SNMPv1` community authentication.
     ///
-    /// Creates authentication configuration for SNMPv1, which only supports
+    /// Creates authentication configuration for `SNMPv1`, which only supports
     /// community string authentication without encryption.
     ///
     /// # Example
@@ -76,11 +76,11 @@ impl Auth {
         }
     }
 
-    /// SNMPv2c community authentication.
+    /// `SNMPv2c` community authentication.
     ///
-    /// Creates authentication configuration for SNMPv2c, which supports
+    /// Creates authentication configuration for `SNMPv2c`, which supports
     /// community string authentication without encryption but adds GETBULK
-    /// and improved error handling over SNMPv1.
+    /// and improved error handling over `SNMPv1`.
     ///
     /// # Example
     ///
@@ -100,10 +100,10 @@ impl Auth {
         }
     }
 
-    /// Start building SNMPv3 USM authentication.
+    /// Start building `SNMPv3` USM authentication.
     ///
     /// Returns a builder that allows configuring authentication and privacy
-    /// protocols. SNMPv3 supports three security levels:
+    /// protocols. `SNMPv3` supports three security levels:
     /// - noAuthNoPriv: username only (no security)
     /// - authNoPriv: username with authentication (integrity)
     /// - authPriv: username with authentication and encryption (confidentiality)
@@ -132,10 +132,10 @@ impl Auth {
     }
 }
 
-/// SNMPv3 USM authentication parameters.
+/// `SNMPv3` USM authentication parameters.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UsmAuth {
-    /// SNMPv3 username
+    /// `SNMPv3` username
     pub username: String,
     /// Authentication protocol (None for noAuthNoPriv)
     pub auth_protocol: Option<AuthProtocol>,
@@ -145,7 +145,7 @@ pub struct UsmAuth {
     pub priv_protocol: Option<PrivProtocol>,
     /// Privacy password
     pub priv_password: Option<String>,
-    /// SNMPv3 context name for VACM context selection.
+    /// `SNMPv3` context name for VACM context selection.
     /// Most deployments use empty string (default).
     pub context_name: Option<String>,
     /// Pre-computed master keys for caching.
@@ -153,7 +153,7 @@ pub struct UsmAuth {
     pub master_keys: Option<MasterKeys>,
 }
 
-/// Builder for SNMPv3 USM authentication.
+/// Builder for `SNMPv3` USM authentication.
 #[derive(Debug)]
 pub struct UsmBuilder {
     username: String,
@@ -207,6 +207,7 @@ impl UsmBuilder {
     ///     .auth(AuthProtocol::Sha256, "mypassword")
     ///     .into();
     /// ```
+    #[must_use]
     pub fn auth(mut self, protocol: AuthProtocol, password: impl Into<String>) -> Self {
         self.auth = Some((protocol, password.into()));
         self
@@ -233,6 +234,7 @@ impl UsmBuilder {
     ///     .privacy(PrivProtocol::Aes128, "privpassword")
     ///     .into();
     /// ```
+    #[must_use]
     pub fn privacy(mut self, protocol: PrivProtocol, password: impl Into<String>) -> Self {
         self.privacy = Some((protocol, password.into()));
         self
@@ -262,12 +264,13 @@ impl UsmBuilder {
     ///     .with_master_keys(master_keys)
     ///     .into();
     /// ```
+    #[must_use]
     pub fn with_master_keys(mut self, master_keys: MasterKeys) -> Self {
         self.master_keys = Some(master_keys);
         self
     }
 
-    /// Set the SNMPv3 context name for VACM context selection.
+    /// Set the `SNMPv3` context name for VACM context selection.
     ///
     /// The context name allows selecting different MIB views on the same agent.
     /// Most deployments use empty string (default).
@@ -282,6 +285,7 @@ impl UsmBuilder {
     ///     .context_name("vlan100")
     ///     .into();
     /// ```
+    #[must_use]
     pub fn context_name(mut self, name: impl Into<String>) -> Self {
         self.context_name = Some(name.into());
         self
@@ -295,13 +299,13 @@ impl From<UsmBuilder> for Auth {
             auth_protocol: b
                 .master_keys
                 .as_ref()
-                .map(|m| m.auth_protocol())
+                .map(super::super::v3::auth::MasterKeys::auth_protocol)
                 .or(b.auth.as_ref().map(|(p, _)| *p)),
             auth_password: b.auth.map(|(_, pw)| pw),
             priv_protocol: b
                 .master_keys
                 .as_ref()
-                .and_then(|m| m.priv_protocol())
+                .and_then(super::super::v3::auth::MasterKeys::priv_protocol)
                 .or(b.privacy.as_ref().map(|(p, _)| *p)),
             priv_password: b.privacy.map(|(_, pw)| pw),
             context_name: b.context_name,
@@ -322,7 +326,7 @@ mod tests {
                 assert_eq!(version, CommunityVersion::V2c);
                 assert_eq!(community, "public");
             }
-            _ => panic!("expected Community variant"),
+            Auth::Usm(_) => panic!("expected Community variant"),
         }
     }
 
@@ -334,7 +338,7 @@ mod tests {
                 assert_eq!(version, CommunityVersion::V1);
                 assert_eq!(community, "private");
             }
-            _ => panic!("expected Community variant"),
+            Auth::Usm(_) => panic!("expected Community variant"),
         }
     }
 
@@ -346,7 +350,7 @@ mod tests {
                 assert_eq!(version, CommunityVersion::V2c);
                 assert_eq!(community, "secret");
             }
-            _ => panic!("expected Community variant"),
+            Auth::Usm(_) => panic!("expected Community variant"),
         }
     }
 
@@ -368,7 +372,7 @@ mod tests {
                 assert!(usm.priv_password.is_none());
                 assert!(usm.context_name.is_none());
             }
-            _ => panic!("expected Usm variant"),
+            Auth::Community { .. } => panic!("expected Usm variant"),
         }
     }
 
@@ -385,7 +389,7 @@ mod tests {
                 assert!(usm.priv_protocol.is_none());
                 assert!(usm.priv_password.is_none());
             }
-            _ => panic!("expected Usm variant"),
+            Auth::Community { .. } => panic!("expected Usm variant"),
         }
     }
 
@@ -403,7 +407,7 @@ mod tests {
                 assert_eq!(usm.priv_protocol, Some(PrivProtocol::Aes128));
                 assert_eq!(usm.priv_password, Some("privpass".to_string()));
             }
-            _ => panic!("expected Usm variant"),
+            Auth::Community { .. } => panic!("expected Usm variant"),
         }
     }
 
@@ -418,7 +422,7 @@ mod tests {
                 assert_eq!(usm.username, "admin");
                 assert_eq!(usm.context_name, Some("vlan100".to_string()));
             }
-            _ => panic!("expected Usm variant"),
+            Auth::Community { .. } => panic!("expected Usm variant"),
         }
     }
 
@@ -440,7 +444,7 @@ mod tests {
                 assert_eq!(usm.priv_password, Some("priv".to_string()));
                 assert_eq!(usm.context_name, Some("ctx".to_string()));
             }
-            _ => panic!("expected Usm variant"),
+            Auth::Community { .. } => panic!("expected Usm variant"),
         }
     }
 }

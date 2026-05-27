@@ -1,9 +1,9 @@
 //! SNMP Notification Receiver (RFC 3413).
 //!
 //! This module provides functionality for receiving SNMP notifications:
-//! - TrapV1 (SNMPv1 format, different PDU structure)
-//! - TrapV2/SNMPv2-Trap (SNMPv2c/v3 format)
-//! - InformRequest (confirmed notification, requires response)
+//! - `TrapV1` (SNMP v1 format, different PDU structure)
+//! - `TrapV2`/`SNMPv2-Trap` (SNMP v2c/v3 format)
+//! - `InformRequest` (confirmed notification, requires response)
 //!
 //! # Example
 //!
@@ -30,7 +30,7 @@
 //!
 //! # V3 Authenticated Informs
 //!
-//! To receive and respond to authenticated V3 InformRequests, configure USM credentials:
+//! To receive and respond to authenticated V3 `InformRequests`, configure USM credentials:
 //!
 //! ```rust,no_run
 //! use async_snmp::notification::NotificationReceiver;
@@ -82,56 +82,67 @@ pub mod oids {
     use crate::oid;
 
     /// sysUpTime.0 - first varbind in v2c/v3 notifications
+    #[must_use]
     pub fn sys_uptime() -> crate::Oid {
         oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)
     }
 
     /// snmpTrapOID.0 - second varbind in v2c/v3 notifications (contains trap type)
+    #[must_use]
     pub fn snmp_trap_oid() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0)
     }
 
     /// snmpTrapEnterprise.0 - optional, enterprise OID for enterprise-specific traps
+    #[must_use]
     pub fn snmp_trap_enterprise() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 3, 0)
     }
 
     /// snmpTrapAddress.0 - agent address from v1 trap (RFC 3584 Section 3)
+    #[must_use]
     pub fn snmp_trap_address() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 18, 1, 3, 0)
     }
 
     /// Standard trap OID prefix (snmpTraps)
+    #[must_use]
     pub fn snmp_traps() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5)
     }
 
     /// coldStart trap OID (snmpTraps.1)
+    #[must_use]
     pub fn cold_start() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1)
     }
 
     /// warmStart trap OID (snmpTraps.2)
+    #[must_use]
     pub fn warm_start() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2)
     }
 
     /// linkDown trap OID (snmpTraps.3)
+    #[must_use]
     pub fn link_down() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3)
     }
 
     /// linkUp trap OID (snmpTraps.4)
+    #[must_use]
     pub fn link_up() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 4)
     }
 
     /// authenticationFailure trap OID (snmpTraps.5)
+    #[must_use]
     pub fn auth_failure() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 5)
     }
 
     /// egpNeighborLoss trap OID (snmpTraps.6)
+    #[must_use]
     pub fn egp_neighbor_loss() -> crate::Oid {
         oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 6)
     }
@@ -153,6 +164,7 @@ impl NotificationReceiverBuilder {
     /// Defaults:
     /// - Bind address: `0.0.0.0:162` (UDP, standard SNMP trap port)
     /// - No USM users (v3 notifications rejected until users are added)
+    #[must_use]
     pub fn new() -> Self {
         Self {
             bind_addr: "0.0.0.0:162".to_string(),
@@ -165,6 +177,7 @@ impl NotificationReceiverBuilder {
     /// Set the UDP bind address.
     ///
     /// Default is `0.0.0.0:162` (UDP, standard SNMP trap port).
+    #[must_use]
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -190,6 +203,7 @@ impl NotificationReceiverBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
     where
         F: FnOnce(UsmConfig) -> UsmConfig,
@@ -200,10 +214,11 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Set the engine ID for SNMPv3.
+    /// Set the engine ID for `SNMPv3`.
     ///
     /// If not set, a default engine ID will be generated based on the
     /// RFC 3411 format using enterprise number and timestamp.
+    #[must_use]
     pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
         self.engine_id = Some(engine_id.into());
         self
@@ -213,6 +228,7 @@ impl NotificationReceiverBuilder {
     ///
     /// This should be persisted across restarts and incremented each time
     /// the receiver starts. Default is 1.
+    #[must_use]
     pub fn engine_boots(mut self, boots: u32) -> Self {
         self.engine_boots = boots;
         self
@@ -236,7 +252,7 @@ impl NotificationReceiverBuilder {
             source: e,
         })?;
 
-        let engine_id: Bytes = self.engine_id.map(Bytes::from).unwrap_or_else(|| {
+        let engine_id: Bytes = self.engine_id.map_or_else(|| {
             let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01];
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -244,7 +260,7 @@ impl NotificationReceiverBuilder {
                 .as_secs();
             id.extend_from_slice(&timestamp.to_be_bytes());
             Bytes::from(id)
-        });
+        }, Bytes::from);
 
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {
@@ -270,12 +286,12 @@ impl Default for NotificationReceiverBuilder {
 /// Received SNMP notification.
 ///
 /// This enum represents all types of SNMP notifications that can be received:
-/// - SNMPv1 Trap (different PDU structure)
+/// - `SNMPv1` Trap (different PDU structure)
 /// - SNMPv2c/v3 Trap (standard PDU with sysUpTime.0 and snmpTrapOID.0)
-/// - InformRequest (confirmed notification, response will be sent automatically)
+/// - `InformRequest` (confirmed notification, response will be sent automatically)
 #[derive(Debug, Clone)]
 pub enum Notification {
-    /// SNMPv1 Trap with unique PDU structure.
+    /// `SNMPv1` Trap with unique PDU structure.
     TrapV1 {
         /// Community string used for authentication
         community: Bytes,
@@ -283,7 +299,7 @@ pub enum Notification {
         trap: TrapV1Pdu,
     },
 
-    /// SNMPv2c Trap (unconfirmed notification).
+    /// `SNMPv2c` Trap (unconfirmed notification).
     TrapV2c {
         /// Community string used for authentication
         community: Bytes,
@@ -297,7 +313,7 @@ pub enum Notification {
         request_id: i32,
     },
 
-    /// SNMPv3 Trap (unconfirmed notification).
+    /// `SNMPv3` Trap (unconfirmed notification).
     TrapV3 {
         /// Username from USM
         username: Bytes,
@@ -315,7 +331,7 @@ pub enum Notification {
         request_id: i32,
     },
 
-    /// InformRequest (confirmed notification) - v2c.
+    /// `InformRequest` (confirmed notification) - v2c.
     ///
     /// A response is automatically sent when this notification is received.
     InformV2c {
@@ -331,7 +347,7 @@ pub enum Notification {
         request_id: i32,
     },
 
-    /// InformRequest (confirmed notification) - v3.
+    /// `InformRequest` (confirmed notification) - v3.
     ///
     /// A response is automatically sent when this notification is received.
     InformV3 {
@@ -355,7 +371,7 @@ pub enum Notification {
 impl Notification {
     /// Get the trap/notification OID.
     ///
-    /// For TrapV1, this is derived from enterprise + generic/specific trap.
+    /// For `TrapV1`, this is derived from enterprise + generic/specific trap.
     /// For v2c/v3, this is the snmpTrapOID.0 value.
     pub fn trap_oid(&self) -> Result<Oid> {
         match self {
@@ -367,7 +383,7 @@ impl Notification {
         }
     }
 
-    /// Get the uptime value (sysUpTime.0 or time_stamp for v1).
+    /// Get the uptime value (sysUpTime.0 or `time_stamp` for v1).
     pub fn uptime(&self) -> u32 {
         match self {
             Notification::TrapV1 { trap, .. } => trap.time_stamp,
@@ -389,7 +405,7 @@ impl Notification {
         }
     }
 
-    /// Check if this is a confirmed notification (InformRequest).
+    /// Check if this is a confirmed notification (`InformRequest`).
     pub fn is_confirmed(&self) -> bool {
         matches!(
             self,
@@ -410,7 +426,7 @@ impl Notification {
 /// SNMP Notification Receiver.
 ///
 /// Listens for incoming SNMP notifications (traps and informs) on a UDP socket.
-/// For InformRequest notifications, automatically sends a Response-PDU.
+/// For `InformRequest` notifications, automatically sends a Response-PDU.
 ///
 /// # V3 Authentication
 ///
@@ -457,6 +473,7 @@ impl NotificationReceiver {
     /// Create a builder for configuring the notification receiver.
     ///
     /// Use this to configure USM credentials for V3 authentication.
+    #[must_use]
     pub fn builder() -> NotificationReceiverBuilder {
         NotificationReceiverBuilder::new()
     }
@@ -484,7 +501,7 @@ impl NotificationReceiver {
         let addr_str = addr.as_ref();
         let bind_addr: SocketAddr = addr_str
             .parse()
-            .map_err(|_| Error::Config(format!("invalid bind address: {}", addr_str).into()))?;
+            .map_err(|_| Error::Config(format!("invalid bind address: {addr_str}").into()))?;
 
         let socket = bind_udp_socket(bind_addr, None, None, false)
             .await
@@ -523,23 +540,26 @@ impl NotificationReceiver {
     }
 
     /// Get the local address this receiver is bound to.
+    #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
     }
 
     /// Get the engine ID.
+    #[must_use]
     pub fn engine_id(&self) -> &[u8] {
         &self.inner.engine_id
     }
 
     /// Get the usmStatsUnknownEngineIDs counter value.
+    #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
         self.inner.usm_unknown_engine_ids.load(Ordering::Relaxed)
     }
 
     /// Receive a notification.
     ///
-    /// This method blocks until a notification is received. For InformRequest
+    /// This method blocks until a notification is received. For `InformRequest`
     /// notifications, a Response-PDU is automatically sent back to the sender.
     ///
     /// Returns the notification and the source address.
@@ -562,11 +582,10 @@ impl NotificationReceiver {
 
             match self.parse_and_respond(data, source).await {
                 Ok(Some(notification)) => return Ok((notification, source)),
-                Ok(None) => continue, // Not a notification PDU, ignore
+                Ok(None) => {}, // Not a notification PDU, ignore
                 Err(e) => {
                     // Log parsing error but continue receiving
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to parse notification");
-                    continue;
                 }
             }
         }
@@ -756,8 +775,8 @@ mod tests {
         assert_eq!(builder.engine_boots, 5);
     }
 
-    /// Build an authenticated V3 InformRequest message with the given
-    /// engine_boots and engine_time in the USM parameters.
+    /// Build an authenticated V3 `InformRequest` message with the given
+    /// `engine_boots` and `engine_time` in the USM parameters.
     fn build_authed_v3_inform(
         engine_id: &[u8],
         engine_boots: u32,
@@ -914,11 +933,10 @@ mod tests {
         match result {
             Ok(Some(_)) => {} // unexpected but ok (socket might succeed on loopback)
             Err(e) => {
-                let err_str = format!("{}", e);
+                let err_str = format!("{e}");
                 assert!(
                     !err_str.contains("Auth"),
-                    "should not be an auth error for valid time window, got: {}",
-                    err_str
+                    "should not be an auth error for valid time window, got: {err_str}"
                 );
             }
             Ok(None) => panic!("should not return None for a valid InformRequest"),

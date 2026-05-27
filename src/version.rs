@@ -5,12 +5,12 @@
 #[non_exhaustive]
 #[derive(Default)]
 pub enum Version {
-    /// SNMPv1 (RFC 1157)
+    /// `SNMPv1` (RFC 1157)
     V1,
-    /// SNMPv2c (RFC 1901)
+    /// `SNMPv2c` (RFC 1901)
     #[default]
     V2c,
-    /// SNMPv3 (RFC 3411-3418)
+    /// `SNMPv3` (RFC 3411-3418)
     V3,
 }
 
@@ -26,6 +26,7 @@ impl Version {
     /// assert_eq!(Version::V2c.as_i32(), 1);
     /// assert_eq!(Version::V3.as_i32(), 3);
     /// ```
+    #[must_use] 
     pub const fn as_i32(self) -> i32 {
         match self {
             Version::V1 => 0,
@@ -46,6 +47,7 @@ impl Version {
     /// assert_eq!(Version::from_i32(3), Some(Version::V3));
     /// assert_eq!(Version::from_i32(2), None); // Invalid version
     /// ```
+    #[must_use] 
     pub const fn from_i32(value: i32) -> Option<Self> {
         match value {
             0 => Some(Version::V1),

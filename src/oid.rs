@@ -17,7 +17,7 @@ pub const MAX_OID_LEN: usize = 128;
 
 /// Object Identifier.
 ///
-/// Stored as a sequence of arc values (u32). Uses SmallVec to avoid
+/// Stored as a sequence of arc values (u32). Uses `SmallVec` to avoid
 /// heap allocation for OIDs with 16 or fewer arcs.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Oid {
@@ -26,6 +26,7 @@ pub struct Oid {
 
 impl Oid {
     /// Create an empty OID.
+    #[must_use] 
     pub fn empty() -> Self {
         Self {
             arcs: SmallVec::new(),
@@ -74,6 +75,7 @@ impl Oid {
     /// let empty = Oid::from_slice(&[]);
     /// assert!(empty.is_empty());
     /// ```
+    #[must_use] 
     pub fn from_slice(arcs: &[u32]) -> Self {
         Self {
             arcs: SmallVec::from_slice(arcs),
@@ -117,12 +119,12 @@ impl Oid {
 
         for part in s.split('.') {
             if part.is_empty() {
-                return Err(Error::InvalidOid(format!("'{}': empty arc", s).into()).boxed());
+                return Err(Error::InvalidOid(format!("'{s}': empty arc").into()).boxed());
             }
 
             let arc: u32 = part
                 .parse()
-                .map_err(|_| Error::InvalidOid(format!("'{}': invalid arc", s).into()).boxed())?;
+                .map_err(|_| Error::InvalidOid(format!("'{s}': invalid arc").into()).boxed())?;
 
             arcs.push(arc);
         }
@@ -131,16 +133,19 @@ impl Oid {
     }
 
     /// Get the arc values.
+    #[must_use] 
     pub fn arcs(&self) -> &[u32] {
         &self.arcs
     }
 
     /// Get the number of arcs.
+    #[must_use] 
     pub fn len(&self) -> usize {
         self.arcs.len()
     }
 
     /// Check if the OID is empty.
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         self.arcs.is_empty()
     }
@@ -171,6 +176,7 @@ impl Oid {
     /// // Every OID starts with the empty OID
     /// assert!(sys_descr.starts_with(&Oid::empty()));
     /// ```
+    #[must_use] 
     pub fn starts_with(&self, other: &Oid) -> bool {
         self.arcs.len() >= other.arcs.len() && self.arcs[..other.arcs.len()] == other.arcs[..]
     }
@@ -195,6 +201,7 @@ impl Oid {
     /// // Empty OID has no parent
     /// assert!(Oid::empty().parent().is_none());
     /// ```
+    #[must_use] 
     pub fn parent(&self) -> Option<Oid> {
         if self.arcs.is_empty() {
             None
@@ -222,6 +229,7 @@ impl Oid {
     /// let sys_descr_instance = sys_descr.child(0);
     /// assert_eq!(sys_descr_instance.to_string(), "1.3.6.1.2.1.1.1.0");
     /// ```
+    #[must_use] 
     pub fn child(&self, arc: u32) -> Oid {
         let mut arcs = self.arcs.clone();
         arcs.push(arc);
@@ -259,6 +267,7 @@ impl Oid {
     /// let any = oid!(1, 2, 3);
     /// assert_eq!(any.strip_prefix(&Oid::empty()).unwrap(), any);
     /// ```
+    #[must_use] 
     pub fn strip_prefix(&self, prefix: &Oid) -> Option<Oid> {
         if self.starts_with(prefix) {
             Some(Oid::from_slice(&self.arcs[prefix.len()..]))
@@ -294,6 +303,7 @@ impl Oid {
     /// // Too large returns None
     /// assert!(oid.suffix(100).is_none());
     /// ```
+    #[must_use] 
     pub fn suffix(&self, n: usize) -> Option<&[u32]> {
         if n <= self.arcs.len() {
             Some(&self.arcs[self.arcs.len() - n..])
@@ -339,7 +349,7 @@ impl Oid {
         // arc1 must be 0, 1, or 2
         if arc1 > 2 {
             return Err(Error::InvalidOid(
-                format!("first arc must be 0, 1, or 2, got {}", arc1).into(),
+                format!("first arc must be 0, 1, or 2, got {arc1}").into(),
             )
             .boxed());
         }
@@ -352,8 +362,7 @@ impl Oid {
             if arc1 < 2 && arc2 >= 40 {
                 return Err(Error::InvalidOid(
                     format!(
-                        "second arc must be <= 39 when first arc is {}, got {}",
-                        arc1, arc2
+                        "second arc must be <= 39 when first arc is {arc1}, got {arc2}"
                     )
                     .into(),
                 )
@@ -376,7 +385,7 @@ impl Oid {
     /// Validate that the OID doesn't exceed the maximum arc count.
     ///
     /// SNMP implementations commonly limit OIDs to 128 subidentifiers. This check
-    /// provides protection against DoS attacks from maliciously long OIDs.
+    /// provides protection against `DoS` attacks from maliciously long OIDs.
     ///
     /// # Examples
     ///
@@ -416,7 +425,7 @@ impl Oid {
 
     /// Encode to BER format, returning bytes in a stack-allocated buffer.
     ///
-    /// Uses SmallVec to avoid heap allocation for OIDs with up to ~20 arcs.
+    /// Uses `SmallVec` to avoid heap allocation for OIDs with up to ~20 arcs.
     /// This is the optimized version used internally by encoding routines.
     ///
     /// OID encoding (X.690 Section 8.19):
@@ -457,6 +466,7 @@ impl Oid {
     ///
     /// This method does not validate arc constraints. Use [`to_ber_checked()`](Self::to_ber_checked)
     /// for validation, or call [`validate()`](Self::validate) first.
+    #[must_use] 
     pub fn to_ber(&self) -> Vec<u8> {
         self.to_ber_smallvec().to_vec()
     }
@@ -558,7 +568,7 @@ fn first_subidentifier(arcs: &SmallVec<[u32; 16]>) -> u32 {
     }
 }
 
-/// Encode a subidentifier in base-128 variable length into a SmallVec.
+/// Encode a subidentifier in base-128 variable length into a `SmallVec`.
 #[inline]
 fn encode_subidentifier_smallvec(bytes: &mut SmallVec<[u8; 64]>, value: u32) {
     if value == 0 {
@@ -584,7 +594,7 @@ fn encode_subidentifier_smallvec(bytes: &mut SmallVec<[u8; 64]>, value: u32) {
     }
 }
 
-/// Decode a subidentifier, returning (value, bytes_consumed).
+/// Decode a subidentifier, returning (value, `bytes_consumed`).
 fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
     let mut value: u32 = 0;
     let mut i = 0;
@@ -610,7 +620,7 @@ fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
             .boxed());
         }
 
-        value = (value << 7) | ((byte & 0x7F) as u32);
+        value = (value << 7) | u32::from(byte & 0x7F);
 
         if byte & 0x80 == 0 {
             // Last byte
@@ -623,7 +633,7 @@ fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
 
 impl fmt::Debug for Oid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Oid({})", self)
+        write!(f, "Oid({self})")
     }
 }
 
@@ -634,7 +644,7 @@ impl fmt::Display for Oid {
             if !first {
                 write!(f, ".")?;
             }
-            write!(f, "{}", arc)?;
+            write!(f, "{arc}")?;
             first = false;
         }
         Ok(())
@@ -1094,8 +1104,7 @@ mod tests {
         let oid = Oid::from_slice(&[2, max_valid_arc2]);
         assert!(
             oid.validate().is_ok(),
-            "arc2={} with arc1=2 should be valid (max that fits)",
-            max_valid_arc2
+            "arc2={max_valid_arc2} with arc1=2 should be valid (max that fits)"
         );
 
         // One more than max should fail validation
@@ -1103,8 +1112,7 @@ mod tests {
         let oid = Oid::from_slice(&[2, overflow_arc2]);
         assert!(
             oid.validate().is_err(),
-            "arc2={} with arc1=2 should be invalid (would overflow first subidentifier)",
-            overflow_arc2
+            "arc2={overflow_arc2} with arc1=2 should be invalid (would overflow first subidentifier)"
         );
 
         // Also test arc2 = u32::MAX should definitely fail

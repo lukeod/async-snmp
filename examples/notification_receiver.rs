@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     handle_notification(&notification, source);
                 }
                 Err(e) => {
-                    eprintln!("Error receiving notification: {}", e);
+                    eprintln!("Error receiving notification: {e}");
                 }
             }
         }
@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::select! {
         _ = handle => {}
-        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
             println!("\nDemo timeout reached");
         }
     }
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// This demonstrates extracting useful information from different notification types.
 fn handle_notification(notification: &Notification, source: SocketAddr) {
-    println!("=== Notification from {} ===", source);
+    println!("=== Notification from {source} ===");
 
     // Common fields available on all notification types
     println!("  Version: {:?}", notification.version());
@@ -121,12 +121,12 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
     let trap_oid = match notification.trap_oid() {
         Ok(oid) => oid,
         Err(err) => {
-            println!("  Trap OID: <invalid: {}>", err);
+            println!("  Trap OID: <invalid: {err}>");
             return;
         }
     };
 
-    println!("  Trap OID: {}", trap_oid);
+    println!("  Trap OID: {trap_oid}");
     println!("  Uptime: {} centiseconds", notification.uptime());
 
     // Identify well-known trap types
@@ -143,7 +143,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
     } else {
         "enterprise-specific"
     };
-    println!("  Trap Type: {}", trap_name);
+    println!("  Trap Type: {trap_name}");
 
     // Version-specific handling
     match notification {
@@ -163,7 +163,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
         } => {
             println!("  Type: SNMPv2c Trap");
             println!("  Community: {}", String::from_utf8_lossy(community));
-            println!("  Request ID: {}", request_id);
+            println!("  Request ID: {request_id}");
         }
 
         Notification::TrapV3 {
@@ -177,7 +177,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             println!("  Username: {}", String::from_utf8_lossy(username));
             println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
             println!("  Context Name: {}", String::from_utf8_lossy(context_name));
-            println!("  Request ID: {}", request_id);
+            println!("  Request ID: {request_id}");
         }
 
         Notification::InformV2c {
@@ -187,7 +187,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
         } => {
             println!("  Type: SNMPv2c Inform (response sent automatically)");
             println!("  Community: {}", String::from_utf8_lossy(community));
-            println!("  Request ID: {}", request_id);
+            println!("  Request ID: {request_id}");
         }
 
         Notification::InformV3 {
@@ -201,7 +201,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             println!("  Username: {}", String::from_utf8_lossy(username));
             println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
             println!("  Context Name: {}", String::from_utf8_lossy(context_name));
-            println!("  Request ID: {}", request_id);
+            println!("  Request ID: {request_id}");
         }
     }
 

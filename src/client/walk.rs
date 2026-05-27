@@ -5,7 +5,7 @@
 // which triggers this lint but is the standard pattern for storing futures.
 #![allow(clippy::type_complexity)]
 
-/// Implement `next()` and `collect()` for a Stream type that implements poll_next.
+/// Implement `next()` and `collect()` for a Stream type that implements `poll_next`.
 macro_rules! impl_stream_helpers {
     ($type:ident < $($gen:tt),+ >) => {
         impl<$($gen),+> $type<$($gen),+>
@@ -85,7 +85,7 @@ pub enum OidOrdering {
     /// Allow non-increasing OIDs, with cycle detection.
     ///
     /// Some buggy agents return OIDs out of order. This mode tracks all seen
-    /// OIDs in a HashSet to detect cycles, terminating with an error if the
+    /// OIDs in a `HashSet` to detect cycles, terminating with an error if the
     /// same OID is returned twice.
     ///
     /// **Warning**: This uses O(n) memory where n = number of walk results.

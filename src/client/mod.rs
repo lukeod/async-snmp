@@ -87,7 +87,7 @@ pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Err
         Error::Snmp {
             target,
             status,
-            index: pdu.error_index.max(0) as u32,
+            index: pdu.error_index.try_into().unwrap_or(0),
             oid,
         }
         .boxed(),
@@ -142,7 +142,7 @@ struct ClientInner<T: Transport> {
     discovery_lock: AsyncMutex<()>,
     /// Local engine start time for computing engine time in V3 traps.
     local_engine_start: Instant,
-    /// Keys derived against local_engine_id for V3 trap sending.
+    /// Keys derived against `local_engine_id` for V3 trap sending.
     local_derived_keys: RwLock<Option<DerivedKeys>>,
 }
 
@@ -161,7 +161,7 @@ pub struct ClientConfig {
     pub retry: Retry,
     /// Maximum OIDs per request (default: 10)
     pub max_oids_per_request: usize,
-    /// SNMPv3 security configuration (default: None)
+    /// `SNMPv3` security configuration (default: None)
     pub v3_security: Option<UsmConfig>,
     /// Walk operation mode (default: Auto)
     pub walk_mode: WalkMode,
@@ -181,7 +181,7 @@ pub struct ClientConfig {
 }
 
 impl Default for ClientConfig {
-    /// Returns configuration for SNMPv2c with community "public".
+    /// Returns configuration for `SNMPv2c` with community "public".
     ///
     /// See field documentation for all default values.
     fn default() -> Self {
@@ -250,6 +250,7 @@ impl<T: Transport> Client<T> {
     ///
     /// Returns the remote address that this client sends requests to.
     /// Named to match [`std::net::TcpStream::peer_addr()`].
+    #[must_use]
     pub fn peer_addr(&self) -> SocketAddr {
         self.inner.transport.peer_addr()
     }
@@ -320,15 +321,12 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
-                    let response_pdu = match response.into_pdu() {
-                        Some(p) => p,
-                        None => {
-                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "received TrapV1 in response to request");
-                            return Err(Error::MalformedResponse {
-                                target: self.peer_addr(),
-                            }
-                            .boxed());
+                    let Some(response_pdu) = response.into_pdu() else {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "received TrapV1 in response to request");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
                         }
+                        .boxed());
                     };
 
                     // Validate request ID
@@ -360,7 +358,7 @@ impl<T: Transport> Client<T> {
                             tokio::time::sleep(delay).await;
                         }
                     }
-                    continue;
+                    // fall thru to next loop iteration
                 }
                 Err(e) => {
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
@@ -680,13 +678,13 @@ impl<T: Transport> Client<T> {
 
     /// Send a trap (fire-and-forget).
     ///
-    /// For V1 clients: constructs a TrapV1 PDU. The `trap_oid` is reverse-mapped
-    /// to v1 generic_trap/specific_trap/enterprise fields per RFC 3584 Section 3.2.
-    /// The agent_addr is set from the transport's local IPv4 address, or `[0,0,0,0]`
+    /// For V1 clients: constructs a `TrapV1` PDU. The `trap_oid` is reverse-mapped
+    /// to v1 `generic_trap/specific_trap/enterprise` fields per RFC 3584 Section 3.2.
+    /// The `agent_addr` is set from the transport's local IPv4 address, or `[0,0,0,0]`
     /// if the local address is IPv6. Use [`send_v1_trap`](Self::send_v1_trap) for
     /// explicit control over v1 fields.
     ///
-    /// For V2c/V3 clients: constructs a TrapV2 PDU with the mandatory sysUpTime.0
+    /// For V2c/V3 clients: constructs a `TrapV2` PDU with the mandatory sysUpTime.0
     /// and snmpTrapOID.0 prefix.
     ///
     /// For V3: uses the local engine ID (set via `ClientBuilder::local_engine_id`).
@@ -742,11 +740,11 @@ impl<T: Transport> Client<T> {
         Ok(())
     }
 
-    /// Send an SNMPv1 trap with explicit v1 PDU fields.
+    /// Send an `SNMPv1` trap with explicit v1 PDU fields.
     ///
     /// This is a lower-level method that accepts a pre-built [`TrapV1Pdu`],
-    /// giving full control over enterprise OID, agent_addr, generic_trap,
-    /// specific_trap, and time_stamp fields.
+    /// giving full control over enterprise OID, `agent_addr`, `generic_trap`,
+    /// `specific_trap`, and `time_stamp` fields.
     ///
     /// The client must be configured for V1 (`Auth::v1()`). Returns an error
     /// if the client version is not V1.
@@ -787,7 +785,7 @@ impl<T: Transport> Client<T> {
 
     /// Send a v2c/v3 inform and wait for acknowledgement.
     ///
-    /// Constructs an InformRequest PDU with the mandatory sysUpTime.0 and
+    /// Constructs an `InformRequest` PDU with the mandatory sysUpTime.0 and
     /// snmpTrapOID.0 prefix, sends it to the target, and waits for a Response
     /// PDU. Uses the same retry and timeout logic as other request types.
     ///
@@ -1031,7 +1029,7 @@ mod tests {
     struct TruncatingTransport {
         /// Number of varbinds to include in each response.
         response_varbind_count: usize,
-        /// Captured (request_id) values from sent requests, stored for building
+        /// Captured (`request_id`) values from sent requests, stored for building
         /// responses.
         pending: Arc<Mutex<VecDeque<i32>>>,
     }

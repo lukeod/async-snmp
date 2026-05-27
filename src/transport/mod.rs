@@ -49,9 +49,9 @@ static REQUEST_ID_COUNTER: LazyLock<AtomicI32> = LazyLock::new(|| {
 
 /// Allocate a globally unique request ID.
 ///
-/// Returns a positive non-zero i32 (range 1..=2147483647) that is unique
+/// Returns a positive non-zero i32 (range 1..=2,147,483,647) that is unique
 /// within this process. Per RFC 1157/3412, request-id/msgID is defined as
-/// INTEGER (0..2147483647), and some implementations may not handle negative
+/// INTEGER (0..2,147,483,647), and some implementations may not handle negative
 /// values correctly.
 ///
 /// The counter is seeded with random bytes to minimize collision risk across
@@ -59,7 +59,7 @@ static REQUEST_ID_COUNTER: LazyLock<AtomicI32> = LazyLock::new(|| {
 pub fn alloc_request_id() -> i32 {
     loop {
         let id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let id = id & 0x7FFFFFFF;
+        let id = id & 0x7FFF_FFFF;
         if id != 0 {
             return id;
         }
@@ -135,13 +135,13 @@ pub trait AgentTransport: Send + Sync {
 // Request ID Extraction (shared between transports)
 // ============================================================================
 
-/// Extract request_id (or msgID for V3) from an SNMP response.
+/// Extract `request_id` (or msgID for V3) from an SNMP response.
 ///
 /// SNMP message structure differs by version:
 ///
 /// V1/V2c:
 /// - SEQUENCE { INTEGER version, OCTET STRING community, PDU }
-/// - PDU contains request_id as first INTEGER
+/// - PDU contains `request_id` as first INTEGER
 ///
 /// V3:
 /// - SEQUENCE { INTEGER version(3), SEQUENCE msgGlobalData { INTEGER msgID, ... }, ... }
@@ -174,12 +174,12 @@ pub(crate) fn extract_request_id(data: &[u8]) -> Option<i32> {
         return None;
     }
     let version = if version_len == 1 {
-        data[pos] as i32
+        i32::from(data[pos])
     } else {
         // Multi-byte version (unusual but handle it)
         let mut v: i32 = 0;
         for i in 0..version_len {
-            v = (v << 8) | (data[pos + i] as i32);
+            v = (v << 8) | i32::from(data[pos + i]);
         }
         v
     };
@@ -230,10 +230,10 @@ fn extract_v3_msg_id(data: &[u8], mut pos: usize) -> Option<i32> {
     }
 
     // Decode msgID (signed integer, big-endian)
-    decode_ber_signed_integer(&data[pos..pos + id_len])
+    Some(decode_ber_signed_integer(&data[pos..pos + id_len]))
 }
 
-/// Extract request_id from V1/V2c message starting at community position.
+/// Extract `request_id` from V1/V2c message starting at community position.
 fn extract_v1v2c_request_id(data: &[u8], mut pos: usize) -> Option<i32> {
     // Community (OCTET STRING)
     if pos >= data.len() || data[pos] != 0x04 {
@@ -273,23 +273,23 @@ fn extract_v1v2c_request_id(data: &[u8], mut pos: usize) -> Option<i32> {
     }
 
     // Decode request_id (signed integer, big-endian)
-    decode_ber_signed_integer(&data[pos..pos + id_len])
+    Some(decode_ber_signed_integer(&data[pos..pos + id_len]))
 }
 
 /// Decode a BER-encoded signed integer.
-fn decode_ber_signed_integer(bytes: &[u8]) -> Option<i32> {
+fn decode_ber_signed_integer(bytes: &[u8]) -> i32 {
     if bytes.is_empty() {
-        return Some(0);
+        return 0;
     }
 
     // Sign extend for negative numbers
     let mut value: i32 = if bytes[0] & 0x80 != 0 { -1 } else { 0 };
 
     for &byte in bytes {
-        value = (value << 8) | (byte as i32);
+        value = (value << 8) | i32::from(byte);
     }
 
-    Some(value)
+    value
 }
 
 #[cfg(test)]
@@ -297,12 +297,12 @@ mod request_id_tests {
     use super::*;
     use std::sync::atomic::AtomicI32;
 
-    /// RFC 1157 and RFC 3412 define request-id/msgID as INTEGER (0..2147483647).
+    /// RFC 1157 and RFC 3412 define request-id/msgID as INTEGER (0..2_147_483_647).
     #[test]
     fn request_id_is_always_positive() {
         for _ in 0..10_000 {
             let id = alloc_request_id();
-            assert!(id > 0, "request ID must be positive, got {}", id);
+            assert!(id > 0, "request ID must be positive, got {id}");
         }
     }
 
@@ -315,7 +315,7 @@ mod request_id_tests {
         }
     }
 
-    /// Validates wrap-around: counter going from i32::MAX to negative must
+    /// Validates wrap-around: counter going from `i32::MAX` to negative must
     /// still produce positive values via 31-bit masking (RFC 3412 range).
     #[test]
     fn request_id_wrap_around_stays_positive() {
@@ -324,7 +324,7 @@ mod request_id_tests {
         let alloc_test_id = || -> i32 {
             loop {
                 let id = counter.fetch_add(1, Ordering::Relaxed);
-                let id = id & 0x7FFFFFFF;
+                let id = id & 0x7FFF_FFFF;
                 if id != 0 {
                     return id;
                 }
@@ -335,9 +335,7 @@ mod request_id_tests {
             let id = alloc_test_id();
             assert!(
                 id > 0,
-                "request ID must be positive after wrap, iteration {}, got {}",
-                i,
-                id
+                "request ID must be positive after wrap, iteration {i}, got {id}"
             );
         }
     }
@@ -349,7 +347,7 @@ mod request_id_tests {
         let mut seen = HashSet::new();
         for _ in 0..10_000 {
             let id = alloc_request_id();
-            assert!(seen.insert(id), "request ID {} was allocated twice", id);
+            assert!(seen.insert(id), "request ID {id} was allocated twice");
         }
     }
 }

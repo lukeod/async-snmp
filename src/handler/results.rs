@@ -71,11 +71,11 @@ pub enum SetResult {
     /// Value has wrong ASN.1 type for this OID.
     ///
     /// Use when the provided value type doesn't match the expected type
-    /// (e.g., OctetString provided for an Integer object).
+    /// (e.g., `OctetString` provided for an Integer object).
     WrongType,
     /// Value has wrong length for this OID.
     ///
-    /// Use when the value length violates constraints (e.g., DisplayString
+    /// Use when the value length violates constraints (e.g., `DisplayString`
     /// longer than 255 characters).
     WrongLength,
     /// Value encoding is incorrect.
@@ -102,11 +102,13 @@ pub enum SetResult {
 
 impl SetResult {
     /// Check if this result indicates success.
+    #[must_use] 
     pub fn is_ok(&self) -> bool {
         matches!(self, SetResult::Ok)
     }
 
-    /// Convert to an ErrorStatus code.
+    /// Convert to an `ErrorStatus` code.
+    #[must_use] 
     pub fn to_error_status(&self) -> ErrorStatus {
         match self {
             SetResult::Ok => ErrorStatus::NoError,
@@ -141,6 +143,7 @@ pub struct Response {
 
 impl Response {
     /// Create a successful response with the given varbinds.
+    #[must_use] 
     pub fn success(varbinds: Vec<VarBind>) -> Self {
         Self {
             varbinds,
@@ -150,6 +153,7 @@ impl Response {
     }
 
     /// Create an error response.
+    #[must_use] 
     pub fn error(error_status: ErrorStatus, error_index: i32, varbinds: Vec<VarBind>) -> Self {
         Self {
             varbinds,
@@ -169,10 +173,10 @@ impl Response {
 ///
 /// # Version Differences
 ///
-/// - **SNMPv1**: Both exception types result in a `noSuchName` error response
+/// - **`SNMPv1`**: Both exception types result in a `noSuchName` error response
 /// - **SNMPv2c/v3**: Returns the appropriate exception value in the response varbind
 ///
-/// # Choosing NoSuchObject vs NoSuchInstance
+/// # Choosing `NoSuchObject` vs `NoSuchInstance`
 ///
 /// | Situation | Variant |
 /// |-----------|---------|
@@ -281,7 +285,7 @@ impl From<Option<Value>> for GetResult {
 ///
 /// # Version Differences
 ///
-/// - **SNMPv1**: `EndOfMibView` results in a `noSuchName` error response
+/// - **`SNMPv1`**: `EndOfMibView` results in a `noSuchName` error response
 /// - **SNMPv2c/v3**: Returns the `endOfMibView` exception value in the response
 ///
 /// # Lexicographic Ordering

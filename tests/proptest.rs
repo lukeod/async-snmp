@@ -1,7 +1,7 @@
 #![cfg(feature = "agent")]
 //! Property-based tests for async-snmp.
 //!
-//! High-level tests exercise the full protocol stack with a shared TestAgent
+//! High-level tests exercise the full protocol stack with a shared `TestAgent`
 //! per test function (avoids socket exhaustion). Low-level tests validate BER
 //! codec round-trips in isolation.
 
@@ -97,7 +97,7 @@ fn arb_oid() -> impl Strategy<Value = Oid> {
 }
 
 /// Strategy for generating valid OIDs under the test subtree (1.3.6.1.99).
-/// These OIDs are guaranteed to be handled by the TestAgent.
+/// These OIDs are guaranteed to be handled by the `TestAgent`.
 fn arb_test_oid() -> impl Strategy<Value = Oid> {
     prop::collection::vec(any::<u32>(), 1..=10).prop_map(|rest| {
         let mut arcs = vec![1, 3, 6, 1, 99];
@@ -106,7 +106,7 @@ fn arb_test_oid() -> impl Strategy<Value = Oid> {
     })
 }
 
-/// Strategy for generating arbitrary byte data (for OctetString, Opaque).
+/// Strategy for generating arbitrary byte data (for `OctetString`, Opaque).
 fn arb_bytes() -> impl Strategy<Value = Bytes> {
     prop::collection::vec(any::<u8>(), 0..=256).prop_map(Bytes::from)
 }
@@ -168,17 +168,17 @@ fn arb_value_with_exceptions() -> impl Strategy<Value = Value> {
     ]
 }
 
-/// Strategy for generating VarBinds.
+/// Strategy for generating `VarBinds`.
 fn arb_varbind() -> impl Strategy<Value = VarBind> {
     (arb_oid(), arb_value_with_exceptions()).prop_map(|(oid, value)| VarBind::new(oid, value))
 }
 
-/// Strategy for generating a vector of VarBinds.
+/// Strategy for generating a vector of `VarBinds`.
 fn arb_varbinds() -> impl Strategy<Value = Vec<VarBind>> {
     prop::collection::vec(arb_varbind(), 0..=10)
 }
 
-/// Strategy for generating PDU types (excluding TrapV1 which has different structure).
+/// Strategy for generating PDU types (excluding `TrapV1` which has different structure).
 fn arb_pdu_type() -> impl Strategy<Value = PduType> {
     prop_oneof![
         Just(PduType::GetRequest),
@@ -195,8 +195,8 @@ fn arb_pdu_type() -> impl Strategy<Value = PduType> {
 /// Strategy for generating generic PDUs.
 ///
 /// Generates valid PDUs that pass RFC 3416 validation:
-/// - For non-GETBULK PDUs, error_index must be 0 or in range 1..=varbinds.len()
-/// - error_index must be non-negative
+/// - For non-GETBULK PDUs, `error_index` must be 0 or in range `1..=varbinds.len()`
+/// - `error_index` must be non-negative
 fn arb_pdu() -> impl Strategy<Value = Pdu> {
     (arb_pdu_type(), any::<i32>(), any::<i32>(), arb_varbinds())
         .prop_flat_map(|(pdu_type, request_id, error_status, varbinds)| {
@@ -240,7 +240,7 @@ fn arb_getbulk_pdu() -> impl Strategy<Value = GetBulkPdu> {
     )
 }
 
-/// Strategy for generating TrapV1 PDUs.
+/// Strategy for generating `TrapV1` PDUs.
 fn arb_trap_v1_pdu() -> impl Strategy<Value = TrapV1Pdu> {
     (
         arb_oid(),
@@ -612,8 +612,7 @@ fn oid_single_arc_encoding_behavior() {
         let expected = Oid::from_slice(&[arc1, 0]);
         assert_eq!(
             decoded, expected,
-            "single arc {} should decode to [{}, 0]",
-            arc1, arc1
+            "single arc {arc1} should decode to [{arc1}, 0]"
         );
     }
 }
@@ -629,7 +628,7 @@ fn oid_two_arc_roundtrip() {
             let oid = Oid::from_slice(&[arc1, arc2]);
             let encoded = oid.to_ber();
             let decoded = Oid::from_ber(&encoded).unwrap();
-            assert_eq!(oid, decoded, "arc1={}, arc2={} failed", arc1, arc2);
+            assert_eq!(oid, decoded, "arc1={arc1}, arc2={arc2} failed");
         }
     }
 }
@@ -669,7 +668,7 @@ fn integer_boundary_values() {
 
         let mut decoder = Decoder::new(bytes);
         let decoded = decoder.read_integer().unwrap();
-        assert_eq!(value, decoded, "integer {} failed", value);
+        assert_eq!(value, decoded, "integer {value} failed");
     }
 }
 
@@ -684,7 +683,7 @@ fn unsigned32_boundary_values() {
 
         let mut decoder = Decoder::new(bytes);
         let decoded = decoder.read_unsigned32(tag::application::GAUGE32).unwrap();
-        assert_eq!(value, decoded, "unsigned32 {} failed", value);
+        assert_eq!(value, decoded, "unsigned32 {value} failed");
     }
 }
 
@@ -692,14 +691,14 @@ fn unsigned32_boundary_values() {
 fn counter64_boundary_values() {
     use async_snmp::ber::tag;
 
-    for value in [0u64, 1, 127, 128, 255, 256, u32::MAX as u64, u64::MAX] {
+    for value in [0u64, 1, 127, 128, 255, 256, u32::MAX.into(), u64::MAX] {
         let mut buf = EncodeBuf::new();
         buf.push_integer64(value);
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
         let decoded = decoder.read_integer64(tag::application::COUNTER64).unwrap();
-        assert_eq!(value, decoded, "counter64 {} failed", value);
+        assert_eq!(value, decoded, "counter64 {value} failed");
     }
 }
 
@@ -736,7 +735,7 @@ fn value_all_variants_roundtrip() {
 
         let mut decoder = Decoder::new(bytes);
         let decoded = Value::decode(&mut decoder).unwrap();
-        assert_eq!(value, decoded, "value {:?} failed", value);
+        assert_eq!(value, decoded, "value {value:?} failed");
     }
 }
 
@@ -744,7 +743,7 @@ fn value_all_variants_roundtrip() {
 // BER Decoder Malformed Input Tests
 // =============================================================================
 
-/// Tests for truncated data - decoder should return TruncatedData error
+/// Tests for truncated data - decoder should return `TruncatedData` error
 mod truncated_data {
     use super::*;
 
@@ -1008,7 +1007,7 @@ mod integer_overflow {
         let mut decoder = Decoder::new(Bytes::from_static(&[
             0x02, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05,
         ]));
-        assert_eq!(decoder.read_integer().unwrap(), 0x02030405_i32);
+        assert_eq!(decoder.read_integer().unwrap(), 0x02_03_04_05_i32);
     }
 
     #[test]
@@ -1039,7 +1038,7 @@ mod integer_overflow {
 
     #[test]
     fn integer_min_value() {
-        // i32::MIN = -2147483648 = 0x80000000
+        // i32::MIN = -2_147_483_648 = 0x80000000
         // Encoded as: 02 04 80 00 00 00
         let mut decoder = Decoder::new(Bytes::from_static(&[0x02, 0x04, 0x80, 0x00, 0x00, 0x00]));
         let result = decoder.read_integer().unwrap();
@@ -1048,7 +1047,7 @@ mod integer_overflow {
 
     #[test]
     fn integer_max_value() {
-        // i32::MAX = 2147483647 = 0x7FFFFFFF
+        // i32::MAX = 2_147_483_647 = 0x7FFFFFFF
         // Encoded as: 02 04 7F FF FF FF
         let mut decoder = Decoder::new(Bytes::from_static(&[0x02, 0x04, 0x7F, 0xFF, 0xFF, 0xFF]));
         let result = decoder.read_integer().unwrap();
@@ -1183,8 +1182,7 @@ mod request_id_mismatch {
 
             assert_eq!(
                 decoded.request_id, request_id,
-                "request_id {} failed",
-                request_id
+                "request_id {request_id} failed"
             );
         }
     }
@@ -1240,7 +1238,7 @@ fn unknown_value_tag_preserved() {
             assert_eq!(tag, 0x99);
             assert_eq!(&data[..], &[0x01, 0x02, 0x03]);
         }
-        _ => panic!("expected Value::Unknown, got {:?}", result),
+        _ => panic!("expected Value::Unknown, got {result:?}"),
     }
 }
 

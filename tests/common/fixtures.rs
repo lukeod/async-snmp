@@ -28,7 +28,7 @@ pub fn system_mib() -> BTreeMap<Oid, Value> {
         oid!(1, 3, 6, 1, 2, 1, 1, 2, 0),
         Value::ObjectIdentifier(oid!(1, 3, 6, 1, 4, 1, 99999)),
     );
-    data.insert(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::TimeTicks(123456));
+    data.insert(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::TimeTicks(123_456));
     data.insert(
         oid!(1, 3, 6, 1, 2, 1, 1, 4, 0),
         Value::OctetString("admin@test.local".into()),

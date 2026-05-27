@@ -57,7 +57,7 @@ fn main() {
     );
     println!(
         "Large counter (direct): {:?}",
-        large_counter.as_f64().map(|v| format!("{:.0}", v))
+        large_counter.as_f64().map(|v| format!("{v:.0}"))
     );
     println!(
         "Large counter (wrapped): {:?}",
@@ -112,11 +112,11 @@ fn main() {
     println!("\n--- TimeTicks to Duration ---");
 
     // sysUpTime: 360000 ticks = 3600 seconds = 1 hour
-    let sys_uptime = Value::TimeTicks(360000);
+    let sys_uptime = Value::TimeTicks(360_000);
     if let Some(duration) = sys_uptime.as_duration() {
         println!(
             "sysUpTime ticks: {}, duration: {:?} ({} hours)",
-            360000,
+            360_000,
             duration,
             duration.as_secs() / 3600
         );
@@ -192,9 +192,9 @@ fn main() {
     let create_and_wait: Value = RowStatus::CreateAndWait.into();
     let destroy: Value = RowStatus::Destroy.into();
 
-    println!("  CreateAndGo -> {:?}", create_and_go);
-    println!("  CreateAndWait -> {:?}", create_and_wait);
-    println!("  Destroy -> {:?}", destroy);
+    println!("  CreateAndGo -> {create_and_go:?}");
+    println!("  CreateAndWait -> {create_and_wait:?}");
+    println!("  Destroy -> {destroy:?}");
 
     // Display trait for logging
     println!("\nRowStatus Display representations:");
@@ -206,7 +206,7 @@ fn main() {
         RowStatus::CreateAndWait,
         RowStatus::Destroy,
     ] {
-        println!("  {:?} displays as \"{}\"", status, status);
+        println!("  {status:?} displays as \"{status}\"");
     }
 
     // --- as_storage_type(): Row persistence configuration ---
@@ -218,7 +218,7 @@ fn main() {
     for i in 1..=5 {
         let value = Value::Integer(i);
         if let Some(storage) = value.as_storage_type() {
-            println!("  {}({}): \"{}\"", storage, i, storage);
+            println!("  {storage}({i}): \"{storage}\"");
         }
     }
 
@@ -226,8 +226,8 @@ fn main() {
     println!("\nCreating StorageType values:");
     let volatile: Value = StorageType::Volatile.into();
     let non_volatile: Value = StorageType::NonVolatile.into();
-    println!("  Volatile -> {:?}", volatile);
-    println!("  NonVolatile -> {:?}", non_volatile);
+    println!("  Volatile -> {volatile:?}");
+    println!("  NonVolatile -> {non_volatile:?}");
 
     // =========================================================================
     // Section 3: Opaque Sub-type Extraction (net-snmp Extensions)
@@ -248,7 +248,7 @@ fn main() {
     let pi_float = Value::Opaque(pi_float_data);
 
     if let Some(value) = pi_float.as_opaque_float() {
-        println!("Opaque float (pi): {:.6}", value);
+        println!("Opaque float (pi): {value:.6}");
         println!(
             "  Difference from f32::PI: {:.10}",
             (value - std::f32::consts::PI).abs()
@@ -283,7 +283,7 @@ fn main() {
     let pi_double = Value::Opaque(pi_double_data);
 
     if let Some(value) = pi_double.as_opaque_double() {
-        println!("Opaque double (pi): {:.15}", value);
+        println!("Opaque double (pi): {value:.15}");
         println!(
             "  Difference from f64::PI: {:.20}",
             (value - std::f64::consts::PI).abs()
@@ -326,21 +326,24 @@ fn main() {
 
     // Extract the column and index from a walked OID
     if let Some(suffix) = if_descr_5.strip_prefix(&if_entry) {
-        println!("ifEntry OID: {}", if_entry);
-        println!("Walked OID:  {}", if_descr_5);
-        println!(
-            "Suffix:      {} (column={}, index={})",
-            suffix,
-            suffix.arcs()[0],
-            suffix.arcs()[1]
-        );
+        println!("ifEntry OID: {if_entry}");
+        println!("Walked OID:  {if_descr_5}");
+        if let [column, index, ..] = suffix.arcs() {
+            println!("Suffix:      {suffix} (column={column}, index={index})");
+        } else {
+            println!("Suffix:      {suffix} (unexpected format)");
+        }
     }
 
     // Extract just the index from a column OID
     if let Some(index) = if_descr_5.strip_prefix(&if_descr) {
-        println!("\nColumn OID:  {}", if_descr);
-        println!("Walked OID:  {}", if_descr_5);
-        println!("Index:       {} (interface #{})", index, index.arcs()[0]);
+        println!("\nColumn OID:  {if_descr}");
+        println!("Walked OID:  {if_descr_5}");
+        if let Some(if_number) = index.arcs().first() {
+            println!("Index:       {index} (interface #{if_number})");
+        } else {
+            println!("Index:       {index} (unexpected format)");
+        }
     }
 
     // --- Composite indexes (multi-component) ---
@@ -353,14 +356,14 @@ fn main() {
     let ip_net_to_media_entry = oid!(1, 3, 6, 1, 2, 1, 4, 22, 1, 2, 1, 192, 168, 1, 100);
 
     if let Some(index) = ip_net_to_media_entry.strip_prefix(&ip_net_to_media_phys) {
-        let arcs = index.arcs();
         println!("ipNetToMediaPhysAddress composite index:");
-        println!("  Full index OID: {}", index);
-        println!("  ifIndex: {}", arcs[0]);
-        println!(
-            "  IP Address: {}.{}.{}.{}",
-            arcs[1], arcs[2], arcs[3], arcs[4]
-        );
+        println!("  Full index OID: {index}");
+        if let [if_index, a, b, c, d] = index.arcs() {
+            println!("  ifIndex: {if_index}");
+            println!("  IP Address: {a}.{b}.{c}.{d}");
+        } else {
+            println!("  (unexpected format)");
+        }
     }
 
     // --- suffix(): Get last N arcs ---
@@ -372,16 +375,19 @@ fn main() {
 
     // Get the 5-arc composite index (ifIndex + 4-byte IP)
     if let Some(index) = walked_oid.suffix(5) {
-        println!("Last 5 arcs of {}: {:?}", walked_oid, index);
-        println!(
-            "  Parsed: ifIndex={}, IP={}.{}.{}.{}",
-            index[0], index[1], index[2], index[3], index[4]
-        );
+        println!("Last 5 arcs of {walked_oid}: {index:?}");
+        if let [if_index, a, b, c, d] = index {
+            println!("  Parsed: ifIndex={if_index}, IP={a}.{b}.{c}.{d}");
+        } else {
+            // TODO const-generic suffix method so that the compiler knows this
+            //      branch should be impossible
+            println!("  (cosmic ray or typo)");
+        }
     }
 
     // Get just the last arc (useful for simple integer indexes)
     if let Some(last) = walked_oid.suffix(1) {
-        println!("Last arc: {:?}", last);
+        println!("Last arc: {last:?}");
     }
 
     // suffix(0) returns empty slice

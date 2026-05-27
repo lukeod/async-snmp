@@ -89,7 +89,7 @@ use tokio::time::timeout;
 /// Maximum SNMP message size for TCP (per RFC 3430).
 ///
 /// This is the protocol-level maximum used for msgMaxSize advertisement.
-const MAX_TCP_MESSAGE_SIZE: usize = 0x7fffffff;
+const MAX_TCP_MESSAGE_SIZE: usize = 0x7FFF_FFFF;
 
 /// Default allocation limit for incoming TCP messages.
 ///
@@ -103,7 +103,7 @@ const DEFAULT_MAX_ALLOCATION_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Configuration options for [`TcpTransport`].
 ///
-/// For advanced TCP socket configuration (TCP_NODELAY, keepalive, buffer sizes,
+/// For advanced TCP socket configuration (`TCP_NODELAY`, keepalive, buffer sizes,
 /// etc.), use [`TcpTransport::from_socket()`] with a pre-configured `TcpSocket`.
 #[derive(Debug, Clone)]
 pub struct TcpOptions {
@@ -126,7 +126,7 @@ impl Default for TcpOptions {
 
 /// Builder for [`TcpTransport`].
 ///
-/// For advanced TCP socket configuration (TCP_NODELAY, keepalive, buffer sizes,
+/// For advanced TCP socket configuration (`TCP_NODELAY`, keepalive, buffer sizes,
 /// etc.), use [`TcpTransport::from_socket()`] with a pre-configured `TcpSocket`.
 ///
 /// # Example
@@ -152,6 +152,7 @@ pub struct TcpTransportBuilder {
 
 impl TcpTransportBuilder {
     /// Create a new builder with default settings.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             timeout: None,
@@ -160,6 +161,7 @@ impl TcpTransportBuilder {
     }
 
     /// Set connection timeout.
+    #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -171,6 +173,7 @@ impl TcpTransportBuilder {
     /// any buffers, preventing denial-of-service attacks.
     ///
     /// Default: 10MB.
+    #[must_use]
     pub fn max_allocation_size(mut self, size: usize) -> Self {
         self.options.max_allocation_size = size;
         self
@@ -267,10 +270,10 @@ pub struct TcpTransport {
 struct TcpTransportInner {
     /// The TCP stream, wrapped in Arc for owned guard pattern
     stream: Arc<Mutex<TcpStream>>,
-    /// Holds the stream lock between send() and recv() to serialize operations.
-    /// Uses tokio::sync::Mutex so the guard is dropped on task cancellation.
+    /// Holds the stream lock between `send()` and `recv()` to serialize operations.
+    /// Uses `tokio::sync::Mutex` so the guard is dropped on task cancellation.
     active_guard: Mutex<Option<OwnedMutexGuard<TcpStream>>>,
-    /// Timeout for current request in milliseconds (set by register_request)
+    /// Timeout for current request in milliseconds (set by `register_request`)
     current_timeout_ms: AtomicU64,
     target: SocketAddr,
     local_addr: SocketAddr,
@@ -314,6 +317,7 @@ impl TcpTransport {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn builder() -> TcpTransportBuilder {
         TcpTransportBuilder::new()
     }
@@ -489,37 +493,41 @@ async fn read_ber_message(
         .await
         .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
-    let (content_len, len_bytes) = if first_len_byte[0] < 0x80 {
-        // Short form: length is directly in this byte
-        (first_len_byte[0] as usize, vec![first_len_byte[0]])
-    } else if first_len_byte[0] == 0x80 {
-        // Indefinite length - not supported
-        tracing::debug!(target: "async_snmp::transport::tcp", { %target }, "indefinite length encoding not supported");
-        return Err(Error::MalformedResponse { target }.boxed());
-    } else {
-        // Long form: first byte indicates number of following length bytes
-        let num_len_bytes = (first_len_byte[0] & 0x7F) as usize;
-        if num_len_bytes > 4 {
-            tracing::debug!(target: "async_snmp::transport::tcp", { octets = num_len_bytes, %target }, "length encoding too long");
+    let (content_len, len_bytes) = match first_len_byte[0].cmp(&0x80) {
+        std::cmp::Ordering::Less => {
+            // Short form: length is directly in this byte
+            (first_len_byte[0] as usize, vec![first_len_byte[0]])
+        }
+        std::cmp::Ordering::Equal => {
+            // Indefinite length - not supported
+            tracing::debug!(target: "async_snmp::transport::tcp", { %target }, "indefinite length encoding not supported");
             return Err(Error::MalformedResponse { target }.boxed());
         }
+        std::cmp::Ordering::Greater => {
+            // Long form: first byte indicates number of following length bytes
+            let num_len_bytes = (first_len_byte[0] & 0x7F) as usize;
+            if num_len_bytes > 4 {
+                tracing::debug!(target: "async_snmp::transport::tcp", { octets = num_len_bytes, %target }, "length encoding too long");
+                return Err(Error::MalformedResponse { target }.boxed());
+            }
 
-        let mut len_bytes_buf = vec![0u8; num_len_bytes];
-        stream
-            .read_exact(&mut len_bytes_buf)
-            .await
-            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+            let mut len_bytes_buf = vec![0u8; num_len_bytes];
+            stream
+                .read_exact(&mut len_bytes_buf)
+                .await
+                .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
-        let mut length: usize = 0;
-        for &b in &len_bytes_buf {
-            length = (length << 8) | (b as usize);
+            let mut length: usize = 0;
+            for &b in &len_bytes_buf {
+                length = (length << 8) | (b as usize);
+            }
+
+            // Build the complete length encoding for reconstruction
+            let mut all_len_bytes = vec![first_len_byte[0]];
+            all_len_bytes.extend_from_slice(&len_bytes_buf);
+
+            (length, all_len_bytes)
         }
-
-        // Build the complete length encoding for reconstruction
-        let mut all_len_bytes = vec![first_len_byte[0]];
-        all_len_bytes.extend_from_slice(&len_bytes_buf);
-
-        (length, all_len_bytes)
     };
 
     // Reject excessively large claimed sizes before allocating.
@@ -656,7 +664,7 @@ mod tests {
         assert!(transport.is_reliable());
     }
 
-    /// Test concurrent requests through a single TcpTransport.
+    /// Test concurrent requests through a single `TcpTransport`.
     ///
     /// TCP serializes request-response pairs via locking. Multiple concurrent
     /// callers queue up and execute one at a time. All should succeed.
@@ -726,7 +734,7 @@ mod tests {
 
         let success_count = results
             .iter()
-            .filter(|r| r.as_ref().map(|r| r.is_ok()).unwrap_or(false))
+            .filter(|r| r.as_ref().is_ok_and(std::result::Result::is_ok))
             .count();
 
         assert_eq!(
@@ -737,7 +745,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// Build a minimal SNMP v2c request with a specific request_id.
+    /// Build a minimal SNMP v2c request with a specific `request_id`.
     fn build_request_with_id(request_id: i32) -> Vec<u8> {
         let id_bytes = request_id.to_be_bytes();
         vec![
@@ -775,7 +783,7 @@ mod tests {
         ]
     }
 
-    /// Build a minimal SNMP v2c response with a specific request_id.
+    /// Build a minimal SNMP v2c response with a specific `request_id`.
     fn build_response_with_id(request_id: i32) -> Vec<u8> {
         let id_bytes = request_id.to_be_bytes();
         vec![
@@ -861,14 +869,13 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got: {:?}",
-            err
+            "Expected MalformedResponse error, got: {err:?}"
         );
 
         server.await.unwrap();
     }
 
-    /// Test that a custom max_allocation_size via builder is respected.
+    /// Test that a custom `max_allocation_size` via builder is respected.
     #[tokio::test]
     async fn test_tcp_builder_custom_allocation_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -913,8 +920,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got: {:?}",
-            err
+            "Expected MalformedResponse error, got: {err:?}"
         );
 
         server.await.unwrap();

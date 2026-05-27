@@ -22,12 +22,12 @@ use std::sync::atomic::Ordering;
 use super::Agent;
 
 impl Agent {
-    /// Handle SNMPv1 request.
+    /// Handle `SNMPv1` request.
     pub(super) async fn handle_v1(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
         self.handle_community(data, source, Version::V1).await
     }
 
-    /// Handle SNMPv2c request.
+    /// Handle `SNMPv2c` request.
     pub(super) async fn handle_v2c(
         &self,
         data: Bytes,
@@ -36,7 +36,7 @@ impl Agent {
         self.handle_community(data, source, Version::V2c).await
     }
 
-    /// Handle an SNMPv1 or SNMPv2c community-based request.
+    /// Handle an `SNMPv1` or `SNMPv2c` community-based request.
     async fn handle_community(
         &self,
         data: Bytes,
@@ -92,7 +92,7 @@ impl Agent {
         Ok(Some(response_msg.encode()))
     }
 
-    /// Handle SNMPv3 request.
+    /// Handle `SNMPv3` request.
     pub(super) async fn handle_v3(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
         let msg = V3Message::decode(data.clone())?;
         let security_level = msg.global_data.msg_flags.security_level;
@@ -102,7 +102,7 @@ impl Agent {
 
         // Check if this is a discovery request (empty engine ID)
         if usm_params.engine_id.is_empty() {
-            return self.handle_v3_discovery(&msg, source);
+            return Ok(self.handle_v3_discovery(&msg, source));
         }
 
         // Verify engine ID matches ours
@@ -204,7 +204,7 @@ impl Agent {
 
                     // Verify time window (150 seconds)
                     let our_time = self.inner.state.engine_time.load(Ordering::Relaxed);
-                    let time_diff = (usm_params.engine_time as i64 - our_time as i64).abs();
+                    let time_diff = (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
                     if time_diff > 150 {
                         tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "message outside time window");
                         let count = self
@@ -300,14 +300,9 @@ impl Agent {
                     );
                 }
             }
-        } else {
-            match msg.scoped_pdu() {
-                Some(sp) => sp.clone(),
-                None => {
-                    tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::UnexpectedEncryption }, "unexpected encrypted scoped PDU");
-                    return Err(Error::MalformedResponse { target: source }.boxed());
-                }
-            }
+        } else if let Some(sp) = msg.scoped_pdu() { sp.clone() } else {
+            tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::UnexpectedEncryption }, "unexpected encrypted scoped PDU");
+            return Err(Error::MalformedResponse { target: source }.boxed());
         };
 
         let pdu = &scoped_pdu.pdu;
@@ -376,7 +371,7 @@ impl Agent {
         }
     }
 
-    /// Handle SNMPv3 discovery request.
+    /// Handle `SNMPv3` discovery request.
     ///
     /// Per RFC 3412 Section 7.1 Step 3, Report PDUs may only be sent if:
     /// - The PDU is from the Confirmed Class, OR
@@ -388,11 +383,11 @@ impl Agent {
         &self,
         incoming: &V3Message,
         _source: SocketAddr,
-    ) -> Result<Option<Bytes>> {
+    ) -> std::option::Option<bytes::Bytes> {
         // Check reportableFlag before sending Report (RFC 3412 Section 7.1 Step 3)
         if !incoming.global_data.msg_flags.reportable {
             tracing::debug!(target: "async_snmp::agent", "discovery request has reportable=false, not sending report");
-            return Ok(None);
+            return None;
         }
 
         let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
@@ -436,13 +431,13 @@ impl Agent {
 
         let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
 
-        Ok(Some(response_msg.encode()))
+        Some(response_msg.encode())
     }
 }
 
 /// Check if a PDU type is a request that should be handled.
 ///
-/// InformRequest is a confirmed-class PDU (RFC 3416) that requires a Response.
+/// `InformRequest` is a confirmed-class PDU (RFC 3416) that requires a Response.
 /// While Informs are typically handled by notification receivers, agents should
 /// also respond to them per RFC 3413 Section 4.
 pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {

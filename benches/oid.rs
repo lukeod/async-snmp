@@ -1,4 +1,4 @@
-//! OID benchmarks focused on SmallVec optimization evaluation.
+//! OID benchmarks focused on `SmallVec` optimization evaluation.
 //!
 //! The Oid type uses `SmallVec<[u32; 16]>` to avoid heap allocation for
 //! OIDs with 16 or fewer arcs. This benchmark suite evaluates whether
@@ -13,32 +13,32 @@ fn generate_oid(len: usize) -> Oid {
     // Start with a valid prefix and extend
     let mut arcs = vec![1u32, 3, 6, 1, 4, 1];
     for i in 0..(len.saturating_sub(6)) {
-        arcs.push((i % 256) as u32);
+        arcs.push((i & 0xFF) as u32);
     }
     Oid::new(arcs)
 }
 
-/// Benchmark OID creation from slice (SmallVec allocation test)
+/// Benchmark OID creation from slice (`SmallVec` allocation test)
 fn bench_oid_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("oid_creation");
 
     // Test lengths below, at, and above the SmallVec threshold of 16
-    let lengths = [4, 8, 12, 16, 20, 24, 32, 64];
+    let lengths = [4u16, 8, 12, 16, 20, 24, 32, 64];
 
     for len in lengths {
         let arcs: Vec<u32> = (0..len)
-            .map(|i| if i == 0 { 1 } else { i as u32 })
+            .map(|i| if i == 0 { 1 } else { i.into() })
             .collect();
 
         group.bench_with_input(BenchmarkId::new("from_slice", len), &arcs, |b, arcs| {
-            b.iter(|| black_box(Oid::from_slice(arcs)))
+            b.iter(|| black_box(Oid::from_slice(arcs)));
         });
     }
 
     group.finish();
 }
 
-/// Benchmark OID cloning (measures SmallVec clone cost)
+/// Benchmark OID cloning (measures `SmallVec` clone cost)
 fn bench_oid_clone(c: &mut Criterion) {
     let mut group = c.benchmark_group("oid_clone");
 
@@ -47,7 +47,7 @@ fn bench_oid_clone(c: &mut Criterion) {
         let oid = generate_oid(len);
 
         group.bench_with_input(BenchmarkId::new("clone", len), &oid, |b, oid| {
-            b.iter(|| black_box(oid.clone()))
+            b.iter(|| black_box(oid.clone()));
         });
     }
 
@@ -63,7 +63,7 @@ fn bench_oid_child(c: &mut Criterion) {
         let oid = generate_oid(len);
 
         group.bench_with_input(BenchmarkId::new("child", len), &oid, |b, oid| {
-            b.iter(|| black_box(oid.child(42)))
+            b.iter(|| black_box(oid.child(42)));
         });
     }
 
@@ -78,7 +78,7 @@ fn bench_oid_parent(c: &mut Criterion) {
         let oid = generate_oid(len);
 
         group.bench_with_input(BenchmarkId::new("parent", len), &oid, |b, oid| {
-            b.iter(|| black_box(oid.parent()))
+            b.iter(|| black_box(oid.parent()));
         });
     }
 
@@ -147,7 +147,7 @@ fn bench_oid_ber_encode(c: &mut Criterion) {
         let oid = generate_oid(len);
 
         group.bench_with_input(BenchmarkId::new("to_ber", len), &oid, |b, oid| {
-            b.iter(|| black_box(oid.to_ber()))
+            b.iter(|| black_box(oid.to_ber()));
         });
     }
 
@@ -163,7 +163,7 @@ fn bench_oid_ber_decode(c: &mut Criterion) {
         let encoded = oid.to_ber();
 
         group.bench_with_input(BenchmarkId::new("from_ber", len), &encoded, |b, data| {
-            b.iter(|| black_box(Oid::from_ber(data).unwrap()))
+            b.iter(|| black_box(Oid::from_ber(data).unwrap()));
         });
     }
 
@@ -179,7 +179,7 @@ fn bench_oid_parse(c: &mut Criterion) {
         let oid_str = oid.to_string();
 
         group.bench_with_input(BenchmarkId::new("parse", len), &oid_str, |b, s| {
-            b.iter(|| black_box(Oid::parse(s).unwrap()))
+            b.iter(|| black_box(Oid::parse(s).unwrap()));
         });
     }
 
@@ -194,7 +194,7 @@ fn bench_oid_display(c: &mut Criterion) {
         let oid = generate_oid(len);
 
         group.bench_with_input(BenchmarkId::new("to_string", len), &oid, |b, oid| {
-            b.iter(|| black_box(oid.to_string()))
+            b.iter(|| black_box(oid.to_string()));
         });
     }
 
@@ -213,7 +213,7 @@ fn bench_real_world_patterns(c: &mut Criterion) {
     // Walk iteration pattern: check if OID is within subtree
     group.bench_function("walk_check_subtree", |b| {
         let current = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 42]);
-        b.iter(|| black_box(current.starts_with(&if_table)))
+        b.iter(|| black_box(current.starts_with(&if_table)));
     });
 
     // GETBULK response processing: decode multiple OIDs
@@ -226,7 +226,7 @@ fn bench_real_world_patterns(c: &mut Criterion) {
             for encoded in &encoded_oids {
                 black_box(Oid::from_ber(encoded).unwrap());
             }
-        })
+        });
     });
 
     // Table index extraction pattern
@@ -239,20 +239,20 @@ fn bench_real_world_patterns(c: &mut Criterion) {
             } else {
                 None
             }
-        })
+        });
     });
 
     // Hash map lookup simulation (common for caching)
     use std::collections::HashMap;
     let mut oid_map: HashMap<Oid, i32> = HashMap::new();
-    for i in 0..100 {
-        let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, i]);
-        oid_map.insert(oid, i as i32);
+    for i in 0u16..100 {
+        let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, i.into()]);
+        oid_map.insert(oid, i.into());
     }
     let lookup_oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 50]);
 
     group.bench_function("hashmap_lookup", |b| {
-        b.iter(|| black_box(oid_map.get(&lookup_oid)))
+        b.iter(|| black_box(oid_map.get(&lookup_oid)));
     });
 
     // OID sorting (used in walk result ordering)
@@ -268,13 +268,13 @@ fn bench_real_world_patterns(c: &mut Criterion) {
                 black_box(oids)
             },
             criterion::BatchSize::SmallInput,
-        )
+        );
     });
 
     group.finish();
 }
 
-/// Specific test for SmallVec threshold behavior
+/// Specific test for `SmallVec` threshold behavior
 fn bench_smallvec_threshold(c: &mut Criterion) {
     let mut group = c.benchmark_group("smallvec_threshold");
 
@@ -295,11 +295,11 @@ fn bench_smallvec_threshold(c: &mut Criterion) {
     let oid_16_base = generate_oid(16);
 
     group.bench_function("child_15_to_16_arcs", |b| {
-        b.iter(|| black_box(oid_15_base.child(42)))
+        b.iter(|| black_box(oid_15_base.child(42)));
     });
 
     group.bench_function("child_16_to_17_arcs", |b| {
-        b.iter(|| black_box(oid_16_base.child(42)))
+        b.iter(|| black_box(oid_16_base.child(42)));
     });
 
     group.finish();

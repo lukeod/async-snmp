@@ -122,7 +122,7 @@ impl<T: Transport> Client<T> {
                             tokio::time::sleep(delay).await;
                         }
                     }
-                    continue;
+                    // fall thru to next loop iteration
                 }
                 Err(e) => return Err(e),
             }
@@ -323,7 +323,7 @@ impl<T: Transport> Client<T> {
         fields(
             snmp.target = %self.peer_addr(),
             snmp.request_id = pdu.request_id,
-            snmp.security_level = ?self.inner.config.v3_security.as_ref().map(|s| s.security_level()),
+            snmp.security_level = ?self.inner.config.v3_security.as_ref().map(crate::UsmConfig::security_level),
             snmp.attempt = tracing::field::Empty,
             snmp.elapsed_ms = tracing::field::Empty,
         )
@@ -551,7 +551,7 @@ impl<T: Transport> Client<T> {
                             tokio::time::sleep(delay).await;
                         }
                     }
-                    continue;
+                    // fall thru to next loop iteration
                 }
                 Err(e) => {
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
@@ -615,7 +615,7 @@ impl<T: Transport> Client<T> {
     /// Build and encode a V3 trap message using local engine ID.
     ///
     /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
-    /// trap PDUs. Uses local_engine_id, local boots/time, and sets
+    /// trap PDUs. Uses `local_engine_id`, local boots/time, and sets
     /// reportable=false (no Report PDU expected for traps).
     pub(super) fn build_v3_trap_message(&self, pdu: &Pdu, msg_id: i32) -> Result<Vec<u8>> {
         let security = self

@@ -15,6 +15,7 @@ const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
 /// assert_eq!(encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
 /// assert_eq!(encode(&[0x00, 0xff]), "00ff");
 /// ```
+#[must_use] 
 pub fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     write_to(&mut out, bytes);
@@ -73,7 +74,7 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 /// assert!(decode_relaxed("a").is_err()); // one hex digit is odd-length
 /// ```
 pub fn decode_relaxed(s: &str) -> Result<Vec<u8>, DecodeError> {
-    let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let clean: String = s.chars().filter(char::is_ascii_hexdigit).collect();
     decode(&clean)
 }
 
@@ -91,6 +92,7 @@ pub fn decode_relaxed(s: &str) -> Result<Vec<u8>, DecodeError> {
 /// assert!(!is_printable(&[0x00, 0x01]));
 /// assert!(!is_printable(&[0x80, 0x81]));
 /// ```
+#[must_use] 
 pub fn is_printable(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return true;
@@ -151,21 +153,21 @@ mod tests {
     fn test_bytes_display() {
         let data = [0xde, 0xad, 0xbe, 0xef];
         let hex = Bytes(&data);
-        assert_eq!(format!("{}", hex), "deadbeef");
+        assert_eq!(format!("{hex}"), "deadbeef");
     }
 
     #[test]
     fn test_bytes_debug() {
         let data = [0x00, 0xff, 0x42];
         let hex = Bytes(&data);
-        assert_eq!(format!("{:?}", hex), "00ff42");
+        assert_eq!(format!("{hex:?}"), "00ff42");
     }
 
     #[test]
     fn test_bytes_empty() {
         let data: [u8; 0] = [];
         let hex = Bytes(&data);
-        assert_eq!(format!("{}", hex), "");
+        assert_eq!(format!("{hex}"), "");
     }
 
     #[test]
