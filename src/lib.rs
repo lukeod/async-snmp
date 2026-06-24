@@ -4,7 +4,7 @@
 //!
 //! ## Features
 //!
-//! - Full SNMPv1, v2c, and v3 support
+//! - Full `SNMPv1`, v2c, and v3 support
 //! - Async-first API built on Tokio
 //! - Zero-copy BER encoding/decoding
 //! - Type-safe OID and value handling
@@ -34,7 +34,7 @@
 //! }
 //! ```
 //!
-//! ## SNMPv3 Example
+//! ## `SNMPv3` Example
 //!
 //! ```rust,no_run
 //! use async_snmp::{Auth, Client, oid, v3::{AuthProtocol, PrivProtocol}};
@@ -170,9 +170,9 @@
 //! }
 //! ```
 //!
-//! ## High-Throughput SNMPv3 Polling
+//! ## High-Throughput `SNMPv3` Polling
 //!
-//! SNMPv3 has two expensive per-connection operations:
+//! `SNMPv3` has two expensive per-connection operations:
 //! - **Password derivation**: ~850μs to derive keys from passwords (SHA-256)
 //! - **Engine discovery**: Round-trip to learn the agent's engine ID and time
 //!
@@ -302,15 +302,15 @@
 //! | `snmp.request_id` | SNMP request identifier |
 //! | `snmp.retries` | Current retry attempt number |
 //! | `snmp.elapsed_ms` | Request duration in milliseconds |
-//! | `snmp.pdu_type` | PDU type (Get, GetNext, etc.) |
+//! | `snmp.pdu_type` | PDU type (Get, `GetNext`, etc.) |
 //! | `snmp.varbind_count` | Number of varbinds in request/response |
 //! | `snmp.error_status` | SNMP error status from response |
 //! | `snmp.error_index` | Index of problematic varbind |
 //! | `snmp.non_repeaters` | GETBULK non-repeaters parameter |
 //! | `snmp.max_repetitions` | GETBULK max-repetitions parameter |
-//! | `snmp.username` | SNMPv3 USM username |
-//! | `snmp.security_level` | SNMPv3 security level |
-//! | `snmp.engine_id` | SNMPv3 engine identifier (hex) |
+//! | `snmp.username` | `SNMPv3` USM username |
+//! | `snmp.security_level` | `SNMPv3` security level |
+//! | `snmp.engine_id` | `SNMPv3` engine identifier (hex) |
 //! | `snmp.local_addr` | Local bind address |
 //!
 //! ### Filtering by Target
@@ -323,7 +323,7 @@
 //! | `async_snmp::client` | Client operations, requests, retries |
 //! | `async_snmp::agent` | Agent request/response handling |
 //! | `async_snmp::ber` | BER encoding/decoding |
-//! | `async_snmp::v3` | SNMPv3 message processing |
+//! | `async_snmp::v3` | `SNMPv3` message processing |
 //! | `async_snmp::transport` | UDP/TCP transport layer |
 //! | `async_snmp::notification` | Trap/inform receiver |
 //!

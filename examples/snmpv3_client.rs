@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match client_auth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
         Ok(result) => println!("sysName: {:?}\n", result.value),
-        Err(e) => println!("Error: {}\n", e),
+        Err(e) => println!("Error: {e}\n"),
     }
 
     // =========================================================================
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match client_noauth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
         Ok(result) => println!("sysUpTime: {:?}\n", result.value),
-        Err(e) => println!("Error: {}\n", e),
+        Err(e) => println!("Error: {e}\n"),
     }
 
     // =========================================================================

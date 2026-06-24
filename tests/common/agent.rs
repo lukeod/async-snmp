@@ -70,7 +70,7 @@ impl TestAgent {
             if let Err(e) = agent.run().await {
                 // Only log if not cancelled
                 if !e.to_string().contains("cancelled") {
-                    eprintln!("TestAgent error: {}", e);
+                    eprintln!("TestAgent error: {e}");
                 }
             }
         });
@@ -187,7 +187,7 @@ impl V3User {
     }
 }
 
-/// Builder for TestAgent with V3 configuration.
+/// Builder for `TestAgent` with V3 configuration.
 pub struct TestAgentBuilder {
     data: BTreeMap<Oid, Value>,
     communities: Vec<Vec<u8>>,

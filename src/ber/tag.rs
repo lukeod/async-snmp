@@ -49,12 +49,12 @@ pub mod application {
     /// Opaque type for arbitrary ASN.1 data (tag 0x44).
     pub const OPAQUE: u8 = 0x44;
     /// NSAP address type (tag 0x45). Historic, defined in early SMI drafts but
-    /// never standardized. Decodes as OctetString.
+    /// never standardized. Decodes as `OctetString`.
     pub const NSAP: u8 = 0x45;
     /// 64-bit counter type (tag 0x46).
     pub const COUNTER64: u8 = 0x46;
     /// Unsigned 32-bit integer type (tag 0x47). Historic, defined in RFC 1442
-    /// (SNMPv2 party-based, obsoleted by RFC 1902). Decodes as Gauge32.
+    /// (`SNMPv2` party-based, obsoleted by RFC 1902). Decodes as Gauge32.
     pub const UINTEGER32: u8 = 0x47;
 }
 
@@ -81,7 +81,7 @@ pub mod pdu {
     pub const RESPONSE: u8 = CONTEXT_SPECIFIC | CONSTRUCTED | 0x02;
     /// SET request PDU tag (0xA3).
     pub const SET_REQUEST: u8 = CONTEXT_SPECIFIC | CONSTRUCTED | 0x03;
-    /// SNMPv1 trap PDU tag (0xA4).
+    /// `SNMPv1` trap PDU tag (0xA4).
     pub const TRAP_V1: u8 = CONTEXT_SPECIFIC | CONSTRUCTED | 0x04;
     /// GET-BULK request PDU tag (0xA5).
     pub const GET_BULK_REQUEST: u8 = CONTEXT_SPECIFIC | CONSTRUCTED | 0x05;

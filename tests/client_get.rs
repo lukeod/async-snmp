@@ -1,5 +1,5 @@
 #![cfg(feature = "agent")]
-//! GET and SET operation tests using TestAgent.
+//! GET and SET operation tests using `TestAgent`.
 
 mod common;
 
@@ -23,7 +23,7 @@ async fn get_returns_value() {
     assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
 }
 
-/// GET on missing OID returns NoSuchInstance.
+/// GET on missing OID returns `NoSuchInstance`.
 #[tokio::test]
 async fn get_missing_oid_returns_no_such_instance() {
     let agent = TestAgent::new().await;
@@ -140,10 +140,10 @@ async fn set_many_modifies_values() {
     }
 }
 
-/// set_many returns an error when varbind count exceeds max_oids_per_request.
+/// `set_many` returns an error when varbind count exceeds `max_oids_per_request`.
 ///
 /// SET must be atomic (RFC 3416). Splitting across PDUs would break that
-/// guarantee, so set_many refuses to batch and returns Error::Config instead.
+/// guarantee, so `set_many` refuses to batch and returns `Error::Config` instead.
 #[tokio::test]
 async fn set_many_rejects_oversized_request() {
     let agent = TestAgent::new().await;
@@ -210,7 +210,7 @@ async fn getnext_returns_next_oid() {
     assert_eq!(result.oid, oid!(1, 3, 6, 1, 2, 1, 1, 2, 0));
 }
 
-/// GETNEXT past end of MIB returns EndOfMibView.
+/// GETNEXT past end of MIB returns `EndOfMibView`.
 #[tokio::test]
 async fn getnext_past_end_returns_end_of_mib_view() {
     let agent = TestAgent::new().await;

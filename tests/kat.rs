@@ -789,7 +789,7 @@ fn test_fips_rejects_3des_encrypt() {
 /// Golden value: SHA-2 key localization for "maplesyrup".
 ///
 /// No RFC test vectors exist for SHA-2 localization, but these values were
-/// computed independently under both the RustCrypto and aws-lc-rs providers
+/// computed independently under both the `RustCrypto` and aws-lc-rs providers
 /// and verified to match. Any provider must produce these exact outputs.
 #[test]
 fn test_golden_sha2_key_localization() {

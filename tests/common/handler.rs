@@ -1,4 +1,4 @@
-//! BTreeMap-backed MibHandler for testing.
+//! BTreeMap-backed `MibHandler` for testing.
 //!
 //! Stores OID->Value mappings with correct lexicographic ordering
 //! for GETNEXT operations.
@@ -10,10 +10,10 @@ use async_snmp::{Oid, Value, VarBind};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-/// A simple MibHandler backed by an in-memory BTreeMap.
+/// A simple `MibHandler` backed by an in-memory `BTreeMap`.
 ///
 /// Thread-safe for concurrent access. Supports GET, GETNEXT, and SET.
-/// The BTreeMap provides correct lexicographic ordering for GETNEXT.
+/// The `BTreeMap` provides correct lexicographic ordering for GETNEXT.
 pub struct TestHandler {
     data: Arc<RwLock<BTreeMap<Oid, Value>>>,
 }
@@ -84,8 +84,7 @@ impl MibHandler for TestHandler {
         let result = data
             .range(oid..)
             .find(|(k, _)| *k > oid)
-            .map(|(k, v)| GetNextResult::Value(VarBind::new(k.clone(), v.clone())))
-            .unwrap_or(GetNextResult::EndOfMibView);
+            .map_or(GetNextResult::EndOfMibView, |(k, v)| GetNextResult::Value(VarBind::new(k.clone(), v.clone())));
 
         Box::pin(async move { result })
     }
@@ -194,7 +193,7 @@ mod tests {
                 assert_eq!(vb.oid, oid!(1, 3, 6, 2));
                 assert_eq!(vb.value, Value::Integer(2));
             }
-            _ => panic!("expected Value, got {:?}", result),
+            GetNextResult::EndOfMibView => panic!("expected Value, got {result:?}"),
         }
     }
 

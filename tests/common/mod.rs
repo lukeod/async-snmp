@@ -1,6 +1,6 @@
 //! Shared test infrastructure for async-snmp.
 //!
-//! Provides TestAgent (in-process SNMP agent), fixtures, and utilities.
+//! Provides `TestAgent` (in-process SNMP agent), fixtures, and utilities.
 
 // Allow dead code and unused imports since not all test files use all utilities
 #![allow(dead_code)]

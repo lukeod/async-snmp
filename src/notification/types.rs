@@ -1,6 +1,6 @@
-//! USM configuration types for SNMPv3 authentication.
+//! USM configuration types for `SNMPv3` authentication.
 //!
-//! These types store authentication and privacy settings for SNMPv3 operations,
+//! These types store authentication and privacy settings for `SNMPv3` operations,
 //! used by both the client and notification receiver.
 
 use bytes::Bytes;
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::message::SecurityLevel;
 use crate::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol};
 
-/// USM user credentials for SNMPv3 authentication.
+/// USM user credentials for `SNMPv3` authentication.
 ///
 /// Stores the credentials needed for authenticated and/or encrypted communication.
 /// Keys are derived when the engine ID is discovered.
@@ -27,7 +27,7 @@ pub struct UsmConfig {
     pub auth: Option<(AuthProtocol, Vec<u8>)>,
     /// Privacy protocol and password
     pub privacy: Option<(PrivProtocol, Vec<u8>)>,
-    /// SNMPv3 context name for VACM context selection.
+    /// `SNMPv3` context name for VACM context selection.
     pub context_name: Bytes,
     /// Pre-computed master keys for efficient key derivation
     pub master_keys: Option<crate::v3::MasterKeys>,
@@ -46,18 +46,21 @@ impl UsmConfig {
     }
 
     /// Add authentication (authNoPriv or authPriv).
+    #[must_use]
     pub fn auth(mut self, protocol: AuthProtocol, password: impl AsRef<[u8]>) -> Self {
         self.auth = Some((protocol, password.as_ref().to_vec()));
         self
     }
 
     /// Add privacy/encryption (authPriv).
+    #[must_use]
     pub fn privacy(mut self, protocol: PrivProtocol, password: impl AsRef<[u8]>) -> Self {
         self.privacy = Some((protocol, password.as_ref().to_vec()));
         self
     }
 
-    /// Set the SNMPv3 context name for scoped PDUs.
+    /// Set the `SNMPv3` context name for scoped PDUs.
+    #[must_use]
     pub fn context_name(mut self, context_name: impl Into<Bytes>) -> Self {
         self.context_name = context_name.into();
         self
@@ -68,6 +71,7 @@ impl UsmConfig {
     /// When set, passwords are ignored and keys are derived from the cached
     /// master keys. This avoids the expensive ~850us password expansion for
     /// each engine.
+    #[must_use]
     pub fn with_master_keys(mut self, master_keys: crate::v3::MasterKeys) -> Self {
         self.master_keys = Some(master_keys);
         self

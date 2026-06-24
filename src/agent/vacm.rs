@@ -7,7 +7,7 @@
 //! # Overview
 //!
 //! VACM (View-based Access Control Model) is the standard access control mechanism
-//! for SNMPv3, though it can also be used with SNMPv1/v2c. It answers the question:
+//! for `SNMPv3`, though it can also be used with SNMPv1/v2c. It answers the question:
 //! "Can this user perform this operation on this OID?"
 //!
 //! # Architecture
@@ -158,7 +158,7 @@
 //! # Access Denied Behavior
 //!
 //! When VACM denies access:
-//! - **SNMPv1**: Returns `noSuchName` error
+//! - **`SNMPv1`**: Returns `noSuchName` error
 //! - **SNMPv2c/v3 GET**: Returns `noAccess` error or `NoSuchObject` per RFC 3416
 //! - **SNMPv2c/v3 SET**: Returns `noAccess` error
 
@@ -227,6 +227,7 @@ impl View {
     ///
     /// An empty view contains no OIDs. Add subtrees with [`include()`](View::include)
     /// or [`exclude()`](View::exclude).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -249,6 +250,7 @@ impl View {
     /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
     /// assert!(view.contains(&oid!(1, 3, 6, 1, 4, 1, 99999, 1)));
     /// ```
+    #[must_use]
     pub fn include(mut self, oid: Oid) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -279,6 +281,7 @@ impl View {
     /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1)));   // ifDescr.1
     /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 100))); // ifDescr.100
     /// ```
+    #[must_use]
     pub fn include_masked(mut self, oid: Oid, mask: Vec<u8>) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -306,6 +309,7 @@ impl View {
     /// assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)));  // sysDescr
     /// assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 6, 0))); // sysLocation
     /// ```
+    #[must_use]
     pub fn exclude(mut self, oid: Oid) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -318,6 +322,7 @@ impl View {
     /// Add an excluded subtree with a wildcard mask.
     ///
     /// See [`include_masked()`](View::include_masked) for mask usage.
+    #[must_use]
     pub fn exclude_masked(mut self, oid: Oid, mask: Vec<u8>) -> Self {
         self.subtrees.push(ViewSubtree {
             oid,
@@ -347,6 +352,7 @@ impl View {
     /// assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 25, 1, 0)));
     /// assert!(!view.contains(&oid!(1, 3, 6, 1, 4, 1)));  // not included
     /// ```
+    #[must_use]
     pub fn contains(&self, oid: &Oid) -> bool {
         let mut best_len: Option<usize> = None;
         let mut best_included = false;
@@ -381,6 +387,7 @@ impl View {
     /// - [`ViewCheckResult::Included`]: OID and all descendants are accessible
     /// - [`ViewCheckResult::Excluded`]: OID and all descendants are not accessible
     /// - [`ViewCheckResult::Ambiguous`]: Mixed permissions, check each OID individually
+    #[must_use]
     pub fn check_subtree(&self, oid: &Oid) -> ViewCheckResult {
         // Find the longest covering match (RFC 3415 longest-match semantics)
         let mut best_covering_len: Option<usize> = None;
@@ -462,6 +469,7 @@ pub struct ViewSubtree {
 
 impl ViewSubtree {
     /// Check if an OID matches this subtree (with mask).
+    #[must_use]
     pub fn matches(&self, oid: &Oid) -> bool {
         let subtree_arcs = self.oid.arcs();
         let oid_arcs = oid.arcs();
@@ -563,8 +571,9 @@ impl AccessEntryBuilder {
 
     /// Set the context prefix for matching.
     ///
-    /// Context is an SNMPv3 concept that allows partitioning MIB views.
+    /// Context is an `SNMPv3` concept that allows partitioning MIB views.
     /// Most deployments use an empty context (the default).
+    #[must_use]
     pub fn context_prefix(mut self, prefix: impl Into<Bytes>) -> Self {
         self.context_prefix = prefix.into();
         self
@@ -573,6 +582,7 @@ impl AccessEntryBuilder {
     /// Set the security model this entry applies to.
     ///
     /// Default is [`SecurityModel::Any`] which matches all models.
+    #[must_use]
     pub fn security_model(mut self, model: SecurityModel) -> Self {
         self.security_model = model;
         self
@@ -599,6 +609,7 @@ impl AccessEntryBuilder {
     ///     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
     ///     .build();
     /// ```
+    #[must_use]
     pub fn security_level(mut self, level: SecurityLevel) -> Self {
         self.security_level = level;
         self
@@ -609,6 +620,7 @@ impl AccessEntryBuilder {
     /// When enabled, the context prefix is matched against the start of
     /// the request context name rather than requiring an exact match.
     /// The default is exact matching.
+    #[must_use]
     pub fn context_match_prefix(mut self) -> Self {
         self.context_match = ContextMatch::Prefix;
         self
@@ -618,6 +630,7 @@ impl AccessEntryBuilder {
     ///
     /// The view must be defined with [`VacmBuilder::view()`].
     /// If not set, read operations are denied.
+    #[must_use]
     pub fn read_view(mut self, view: impl Into<Bytes>) -> Self {
         self.read_view = view.into();
         self
@@ -627,6 +640,7 @@ impl AccessEntryBuilder {
     ///
     /// The view must be defined with [`VacmBuilder::view()`].
     /// If not set, write (SET) operations are denied.
+    #[must_use]
     pub fn write_view(mut self, view: impl Into<Bytes>) -> Self {
         self.write_view = view.into();
         self
@@ -636,6 +650,7 @@ impl AccessEntryBuilder {
     ///
     /// Used for trap/inform generation (not access control).
     /// The view must be defined with [`VacmBuilder::view()`].
+    #[must_use]
     pub fn notify_view(mut self, view: impl Into<Bytes>) -> Self {
         self.notify_view = view.into();
         self
@@ -669,6 +684,7 @@ pub struct VacmConfig {
 
 impl VacmConfig {
     /// Create a new empty VACM configuration.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -695,6 +711,7 @@ impl VacmConfig {
     }
 
     /// Resolve group name for a request.
+    #[must_use]
     pub fn get_group(&self, model: SecurityModel, name: &[u8]) -> Option<&Bytes> {
         // Try exact model match first, then fall back to Any.
         // Iterate to avoid allocating a Bytes for the lookup key.
@@ -719,6 +736,7 @@ impl VacmConfig {
     /// 2. Prefer exact contextMatch over prefix
     /// 3. Prefer longer contextPrefix
     /// 4. Prefer higher securityLevel
+    #[must_use]
     pub fn get_access(
         &self,
         group: &[u8],
@@ -736,12 +754,8 @@ impl VacmConfig {
             })
             .max_by_key(|e| {
                 // RFC 3415 Section 4 preference order (tuple comparison is lexicographic)
-                let model_score: u8 = if e.security_model == model { 1 } else { 0 };
-                let match_score: u8 = if e.context_match == ContextMatch::Exact {
-                    1
-                } else {
-                    0
-                };
+                let model_score: u8 = u8::from(e.security_model == model);
+                let match_score: u8 = u8::from(e.context_match == ContextMatch::Exact);
                 let prefix_len = e.context_prefix.len();
                 let level_score = e.security_level as u8;
                 (model_score, match_score, prefix_len, level_score)
@@ -757,6 +771,7 @@ impl VacmConfig {
     }
 
     /// Check if OID access is permitted.
+    #[must_use]
     pub fn check_access(&self, view_name: Option<&Bytes>, oid: &Oid) -> bool {
         let Some(view_name) = view_name else {
             return false;
@@ -819,6 +834,7 @@ pub struct VacmBuilder {
 
 impl VacmBuilder {
     /// Create a new VACM builder.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             config: VacmConfig::new(),
@@ -829,7 +845,7 @@ impl VacmBuilder {
     ///
     /// The security name is:
     /// - For SNMPv1/v2c: the community string
-    /// - For SNMPv3: the USM username
+    /// - For `SNMPv3`: the USM username
     ///
     /// Multiple security names can map to the same group.
     ///
@@ -846,6 +862,7 @@ impl VacmBuilder {
     ///     .group("admin", SecurityModel::Usm, "admin_group")
     ///     .build();
     /// ```
+    #[must_use]
     pub fn group(
         mut self,
         security_name: impl Into<Bytes>,
@@ -880,6 +897,7 @@ impl VacmBuilder {
     ///     .view("system_view", |v| v.include(oid!(1, 3, 6, 1, 2, 1, 1)))
     ///     .build();
     /// ```
+    #[must_use]
     pub fn access<F>(mut self, group_name: impl Into<Bytes>, configure: F) -> Self
     where
         F: FnOnce(AccessEntryBuilder) -> AccessEntryBuilder,
@@ -909,6 +927,7 @@ impl VacmBuilder {
     ///         .exclude(oid!(1, 3, 6, 1, 4, 1, 99999)))  // exclude our enterprise
     ///     .build();
     /// ```
+    #[must_use]
     pub fn view<F>(mut self, name: impl Into<Bytes>, configure: F) -> Self
     where
         F: FnOnce(View) -> View,
@@ -919,6 +938,7 @@ impl VacmBuilder {
     }
 
     /// Build the VACM configuration.
+    #[must_use]
     pub fn build(self) -> VacmConfig {
         self.config
     }
@@ -1863,15 +1883,13 @@ mod tests {
                 ViewCheckResult::Included => {
                     assert!(
                         contains_result,
-                        "check_subtree=Included but contains=false for {:?}",
-                        oid
+                        "check_subtree=Included but contains=false for {oid:?}"
                     );
                 }
                 ViewCheckResult::Excluded => {
                     assert!(
                         !contains_result,
-                        "check_subtree=Excluded but contains=true for {:?}",
-                        oid
+                        "check_subtree=Excluded but contains=true for {oid:?}"
                     );
                 }
                 ViewCheckResult::Ambiguous => {

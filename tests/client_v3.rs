@@ -1,5 +1,5 @@
 #![cfg(feature = "agent")]
-//! SNMPv3 security tests using TestAgent.
+//! `SNMPv3` security tests using `TestAgent`.
 
 mod common;
 
@@ -169,8 +169,7 @@ async fn v3_wrong_password_fails() {
 
     assert!(
         matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
-        "expected Auth error, got {:?}",
-        result
+        "expected Auth error, got {result:?}"
     );
 }
 
@@ -203,8 +202,7 @@ async fn v3_unknown_user_auth_fails() {
 
     assert!(
         matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
-        "expected Auth error, got {:?}",
-        result
+        "expected Auth error, got {result:?}"
     );
 }
 
@@ -232,8 +230,7 @@ async fn v3_unknown_user_no_auth_fails() {
 
     assert!(
         matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
-        "expected Auth error for unknown noAuthNoPriv user, got {:?}",
-        result
+        "expected Auth error for unknown noAuthNoPriv user, got {result:?}"
     );
 }
 
@@ -324,7 +321,7 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     );
     let counter1 = match vb1.value {
         Value::Counter32(v) => v,
-        ref v => panic!("expected Counter32, got {:?}", v),
+        ref v => panic!("expected Counter32, got {v:?}"),
     };
     assert_eq!(counter1, 1, "first Report should carry counter value 1");
 
@@ -351,7 +348,7 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     );
     let counter2 = match vb2.value {
         Value::Counter32(v) => v,
-        ref v => panic!("expected Counter32, got {:?}", v),
+        ref v => panic!("expected Counter32, got {v:?}"),
     };
     assert_eq!(counter2, 2, "second Report should carry counter value 2");
 
@@ -395,7 +392,7 @@ async fn report_pdu_counter_matches_agent_counter_unknown_user() {
 
     let counter = match vb.value {
         Value::Counter32(v) => v,
-        ref v => panic!("expected Counter32, got {:?}", v),
+        ref v => panic!("expected Counter32, got {v:?}"),
     };
     assert_eq!(counter, 1, "Report PDU counter should be 1, not 0");
 

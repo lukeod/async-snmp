@@ -4,7 +4,7 @@
 //! `SEQUENCE { version INTEGER, community OCTET STRING, pdu PDU }`
 //!
 //! The only difference is the version number (0 for v1, 1 for v2c).
-//! SNMPv1 Trap PDUs (tag 0xA4) have a distinct wire format from standard PDUs
+//! `SNMPv1` Trap PDUs (tag 0xA4) have a distinct wire format from standard PDUs
 //! and are represented by the `CommunityPdu::TrapV1` variant.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
@@ -16,18 +16,19 @@ use bytes::Bytes;
 
 /// PDU carried inside a community (v1/v2c) message.
 ///
-/// SNMPv1 Trap PDUs have a different wire layout from all other PDU types,
+/// `SNMPv1` Trap PDUs have a different wire layout from all other PDU types,
 /// so they are decoded into a distinct variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommunityPdu {
-    /// Standard PDU (Get, GetNext, Response, Set, GetBulk, Inform, TrapV2, Report).
+    /// Standard PDU (Get, `GetNext`, Response, Set, `GetBulk`, Inform, `TrapV2`, Report).
     Standard(Pdu),
-    /// SNMPv1 Trap PDU (distinct wire format, only valid in V1 messages).
+    /// `SNMPv1` Trap PDU (distinct wire format, only valid in V1 messages).
     TrapV1(TrapV1Pdu),
 }
 
 impl CommunityPdu {
-    /// Return a reference to the standard PDU, or `None` if this is a TrapV1.
+    /// Return a reference to the standard PDU, or `None` if this is a `TrapV1`.
+    #[must_use] 
     pub fn standard(&self) -> Option<&Pdu> {
         match self {
             Self::Standard(p) => Some(p),
@@ -35,7 +36,8 @@ impl CommunityPdu {
         }
     }
 
-    /// Return a reference to the TrapV1 PDU, or `None` if this is a standard PDU.
+    /// Return a reference to the `TrapV1` PDU, or `None` if this is a standard PDU.
+    #[must_use] 
     pub fn trap_v1(&self) -> Option<&TrapV1Pdu> {
         match self {
             Self::TrapV1(t) => Some(t),
@@ -44,6 +46,7 @@ impl CommunityPdu {
     }
 
     /// Return the PDU type.
+    #[must_use] 
     pub fn pdu_type(&self) -> PduType {
         match self {
             Self::Standard(p) => p.pdu_type,
@@ -74,10 +77,10 @@ impl From<TrapV1Pdu> for CommunityPdu {
 
 /// Community-based SNMP message (v1/v2c).
 ///
-/// This unified type handles both SNMPv1 and SNMPv2c messages,
+/// This unified type handles both `SNMPv1` and `SNMPv2c` messages,
 /// which share identical structure but differ in version number.
 /// The `pdu` field is a `CommunityPdu` that can hold either a standard
-/// PDU or a TrapV1 PDU.
+/// PDU or a `TrapV1` PDU.
 #[derive(Debug, Clone)]
 pub struct CommunityMessage {
     /// SNMP version (V1 or V2c)
@@ -92,12 +95,11 @@ impl CommunityMessage {
     /// Create a new community message with a standard PDU.
     ///
     /// # Panics
-    /// Panics if version is V3 (use V3Message instead).
+    /// Panics if version is V3 (use `V3Message` instead).
     pub fn new(version: Version, community: impl Into<Bytes>, pdu: Pdu) -> Self {
         assert!(
             matches!(version, Version::V1 | Version::V2c),
-            "CommunityMessage only supports V1/V2c, not {:?}",
-            version
+            "CommunityMessage only supports V1/V2c, not {version:?}"
         );
         Self {
             version,
@@ -116,7 +118,7 @@ impl CommunityMessage {
         Self::new(Version::V1, community, pdu)
     }
 
-    /// Create a V1 message carrying a TrapV1 PDU.
+    /// Create a V1 message carrying a `TrapV1` PDU.
     pub fn v1_trap(community: impl Into<Bytes>, trap: TrapV1Pdu) -> Self {
         Self {
             version: Version::V1,
@@ -198,7 +200,7 @@ impl CommunityMessage {
 
     /// Consume and return the standard PDU.
     ///
-    /// Returns `None` if the PDU is a TrapV1.
+    /// Returns `None` if the PDU is a `TrapV1`.
     pub fn into_pdu(self) -> Option<Pdu> {
         match self.pdu {
             CommunityPdu::Standard(p) => Some(p),
@@ -213,7 +215,7 @@ impl CommunityMessage {
 
     /// Encode a GETBULK request message (v2c/v3 only).
     ///
-    /// GETBULK is not supported in SNMPv1.
+    /// GETBULK is not supported in `SNMPv1`.
     pub fn encode_bulk(version: Version, community: impl Into<Bytes>, pdu: &GetBulkPdu) -> Bytes {
         debug_assert!(version != Version::V1, "GETBULK not supported in SNMPv1");
 

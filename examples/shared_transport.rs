@@ -17,7 +17,7 @@
 //!   docker run -d -p 11161:161/udp async-snmp-test:latest
 
 use async_snmp::transport::UdpTransport;
-use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, Retry, oid};
+use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, Retry, VarBind, oid};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,8 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some((oid, result)) = futures.next().await {
         match result {
-            Ok(vb) => println!("  {}: {:?}", oid, vb.value),
-            Err(e) => println!("  {}: {}", oid, e),
+            Ok(VarBind { oid: _, value, }) => println!("  {oid}: {value:?}"),
+            Err(e) => println!("  {oid}: {e}"),
         }
     }
 
@@ -138,8 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
         match client.get(oid).await {
-            Ok(vb) => println!("  {}: {:?}", oid, vb.value),
-            Err(e) => println!("  {}: {}", oid, e),
+            Ok(VarBind { oid: _, value, }) => println!("  {oid}: {value:?}"),
+            Err(e) => println!("  {oid}: {e}"),
         }
     }
 
@@ -185,14 +185,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => match *e {
                 async_snmp::Error::Timeout { .. } => {
                     timeout += 1;
-                    println!("  {}: timeout", addr);
+                    println!("  {addr}: timeout");
                 }
-                _ => println!("  {}: {}", addr, e),
+                _ => println!("  {addr}: {e}"),
             },
         }
     }
 
-    println!("\nResults: {} success, {} timeout", success, timeout);
+    println!("\nResults: {success} success, {timeout} timeout");
 
     println!("\nExample complete!");
     Ok(())

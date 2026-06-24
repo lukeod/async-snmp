@@ -33,7 +33,7 @@ fn bench_oid_encode(c: &mut Criterion) {
 
     for (name, oid) in common_oids() {
         group.bench_with_input(BenchmarkId::new("to_ber", name), &oid, |b, oid| {
-            b.iter(|| black_box(oid.to_ber()))
+            b.iter(|| black_box(oid.to_ber()));
         });
     }
 
@@ -47,7 +47,7 @@ fn bench_oid_decode(c: &mut Criterion) {
     for (name, oid) in common_oids() {
         let encoded = oid.to_ber();
         group.bench_with_input(BenchmarkId::new("from_ber", name), &encoded, |b, data| {
-            b.iter(|| black_box(Oid::from_ber(data).unwrap()))
+            b.iter(|| black_box(Oid::from_ber(data).unwrap()));
         });
     }
 
@@ -66,7 +66,7 @@ fn bench_oid_parse(c: &mut Criterion) {
 
     for (name, s) in oid_strings {
         group.bench_with_input(BenchmarkId::new("parse", name), s, |b, s| {
-            b.iter(|| black_box(Oid::parse(s).unwrap()))
+            b.iter(|| black_box(Oid::parse(s).unwrap()));
         });
     }
 
@@ -114,7 +114,7 @@ fn bench_value_encode(c: &mut Criterion) {
                 let mut buf = EncodeBuf::new();
                 value.encode(&mut buf);
                 black_box(buf.finish())
-            })
+            });
         });
     }
 
@@ -156,14 +156,14 @@ fn bench_value_decode(c: &mut Criterion) {
             b.iter(|| {
                 let mut decoder = Decoder::new(data.clone());
                 black_box(Value::decode(&mut decoder).unwrap())
-            })
+            });
         });
     }
 
     group.finish();
 }
 
-/// Benchmark VarBind encoding
+/// Benchmark `VarBind` encoding
 fn bench_varbind_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("varbind_encode");
 
@@ -199,14 +199,14 @@ fn bench_varbind_encode(c: &mut Criterion) {
                 let mut buf = EncodeBuf::new();
                 vb.encode(&mut buf);
                 black_box(buf.finish())
-            })
+            });
         });
     }
 
     group.finish();
 }
 
-/// Benchmark VarBind decoding
+/// Benchmark `VarBind` decoding
 fn bench_varbind_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("varbind_decode");
 
@@ -245,14 +245,14 @@ fn bench_varbind_decode(c: &mut Criterion) {
             b.iter(|| {
                 let mut decoder = Decoder::new(data.clone());
                 black_box(VarBind::decode(&mut decoder).unwrap())
-            })
+            });
         });
     }
 
     group.finish();
 }
 
-/// Benchmark EncodeBuf operations
+/// Benchmark `EncodeBuf` operations
 fn bench_encode_buf(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_buf");
 
@@ -260,11 +260,11 @@ fn bench_encode_buf(c: &mut Criterion) {
     group.bench_function("new_default", |b| b.iter(|| black_box(EncodeBuf::new())));
 
     group.bench_function("new_with_capacity_512", |b| {
-        b.iter(|| black_box(EncodeBuf::with_capacity(512)))
+        b.iter(|| black_box(EncodeBuf::with_capacity(512)));
     });
 
     group.bench_function("new_with_capacity_1024", |b| {
-        b.iter(|| black_box(EncodeBuf::with_capacity(1024)))
+        b.iter(|| black_box(EncodeBuf::with_capacity(1024)));
     });
 
     // Measure encoding a typical SNMP response (multiple varbinds)
@@ -275,7 +275,7 @@ fn bench_encode_buf(c: &mut Criterion) {
         ),
         VarBind::new(
             Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 3, 0]),
-            Value::TimeTicks(123456789),
+            Value::TimeTicks(123_456_789),
         ),
         VarBind::new(
             Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 5, 0]),
@@ -290,7 +290,7 @@ fn bench_encode_buf(c: &mut Criterion) {
                 vb.encode(&mut buf);
             }
             black_box(buf.finish())
-        })
+        });
     });
 
     // Measure encoding 10 varbinds (typical GETBULK response)
@@ -298,7 +298,7 @@ fn bench_encode_buf(c: &mut Criterion) {
         .map(|i| {
             VarBind::new(
                 Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, i]),
-                Value::OctetString(Bytes::from(format!("eth{}", i))),
+                Value::OctetString(Bytes::from(format!("eth{i}"))),
             )
         })
         .collect();
@@ -310,7 +310,7 @@ fn bench_encode_buf(c: &mut Criterion) {
                 vb.encode(&mut buf);
             }
             black_box(buf.finish())
-        })
+        });
     });
 
     group.finish();
@@ -338,7 +338,7 @@ fn bench_integer_encode(c: &mut Criterion) {
                 let mut buf = EncodeBuf::new();
                 buf.push_integer(v);
                 black_box(buf.finish())
-            })
+            });
         });
     }
 
@@ -363,7 +363,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
         ),
         VarBind::new(
             Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 3, 0]),
-            Value::TimeTicks(123456789),
+            Value::TimeTicks(123_456_789),
         ),
         VarBind::new(
             Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 5, 0]),
@@ -384,7 +384,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
         b.iter(|| {
             let data = encoded.clone();
             black_box(CommunityMessage::decode(data).unwrap())
-        })
+        });
     });
 
     // Larger message (10 varbinds, simulating GETBULK)
@@ -392,7 +392,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
         .map(|i| {
             VarBind::new(
                 Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2, i]),
-                Value::OctetString(Bytes::from(format!("GigabitEthernet0/{}", i))),
+                Value::OctetString(Bytes::from(format!("GigabitEthernet0/{i}"))),
             )
         })
         .collect();
@@ -409,7 +409,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
         b.iter(|| {
             let data = encoded_large.clone();
             black_box(CommunityMessage::decode(data).unwrap())
-        })
+        });
     });
 
     group.finish();

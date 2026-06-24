@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match oneshot_get(target, "public") {
         Ok(vb) => println!("sysDescr: {:?}", vb.value),
-        Err(e) => println!("Error: {}", e),
+        Err(e) => println!("Error: {e}"),
     }
 
     // =========================================================================

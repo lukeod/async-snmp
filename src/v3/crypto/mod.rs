@@ -1,11 +1,11 @@
-//! Pluggable cryptographic provider for SNMPv3 security operations.
+//! Pluggable cryptographic provider for `SNMPv3` security operations.
 //!
 //! This module defines the [`CryptoProvider`] trait that captures the primitive
 //! cryptographic operations needed by the USM layer, and provides two built-in
 //! implementations:
 //!
 //! - [`RustCryptoProvider`] (feature `crypto-rustcrypto`, **default**) - backed by
-//!   the RustCrypto crate ecosystem. Supports all auth and privacy protocols.
+//!   the `RustCrypto` crate ecosystem. Supports all auth and privacy protocols.
 //! - [`AwsLcFipsProvider`] (feature `crypto-fips`) - backed by aws-lc-rs for
 //!   FIPS 140-3 compliance. Rejects MD5, DES, and 3DES as non-FIPS algorithms.
 //!
@@ -39,7 +39,7 @@ impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedAlgorithm(name) => {
-                write!(f, "unsupported algorithm: {}", name)
+                write!(f, "unsupported algorithm: {name}")
             }
             Self::InvalidKeyLength => write!(f, "invalid key length"),
             Self::CipherError => write!(f, "cipher operation failed"),
@@ -73,7 +73,7 @@ mod fips;
 #[cfg(feature = "crypto-fips")]
 pub use fips::AwsLcFipsProvider;
 
-/// Trait defining the cryptographic primitives needed by the SNMPv3 USM layer.
+/// Trait defining the cryptographic primitives needed by the `SNMPv3` USM layer.
 ///
 /// This trait captures the six core operations that vary between crypto backends:
 /// hashing, password-to-key derivation, key localization, HMAC computation, and
@@ -92,7 +92,7 @@ pub use fips::AwsLcFipsProvider;
 /// # Security Requirements
 ///
 /// Implementations must uphold the following properties for correct and secure
-/// SNMPv3 operation:
+/// `SNMPv3` operation:
 ///
 /// - **Constant-time HMAC comparison.** The caller (`verify_message`) performs
 ///   the constant-time comparison, but `compute_hmac` must not short-circuit

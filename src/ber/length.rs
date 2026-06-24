@@ -10,12 +10,12 @@ use std::net::SocketAddr;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 
-/// Maximum length we'll accept (to prevent DoS).
+/// Maximum length we'll accept (to prevent `DoS`).
 ///
 /// 2MB is far larger than any realistic SNMP message (typical messages are
 /// hundreds of bytes to a few KB). This provides a sanity check at the BER
 /// decode layer while still being generous enough for any legitimate use case.
-pub const MAX_LENGTH: usize = 0x200000; // 2MB
+pub const MAX_LENGTH: usize = 0x20_0000; // 2MB
 
 /// Returns the number of bytes needed to encode a length value in BER.
 ///
@@ -28,7 +28,7 @@ pub(crate) const fn length_encoded_len(len: usize) -> usize {
         2
     } else if len <= 0xFFFF {
         3
-    } else if len <= 0xFFFFFF {
+    } else if len <= 0xFF_FFFF {
         4
     } else {
         5
@@ -49,9 +49,9 @@ pub(crate) const fn base128_len(value: u32) -> usize {
         1
     } else if value < 0x4000 {
         2
-    } else if value < 0x200000 {
+    } else if value < 0x20_0000 {
         3
-    } else if value < 0x10000000 {
+    } else if value < 0x1000_0000 {
         4
     } else {
         5
@@ -121,6 +121,7 @@ pub(crate) const fn unsigned64_content_len(value: u64) -> usize {
 /// Encode a length value into the buffer (returns bytes in reverse order for prepending)
 ///
 /// Uses short form for lengths <= 127, long form otherwise.
+#[must_use]
 pub fn encode_length(len: usize) -> ([u8; 5], usize) {
     let mut buf = [0u8; 5];
 
@@ -139,7 +140,7 @@ pub fn encode_length(len: usize) -> ([u8; 5], usize) {
         buf[1] = (len >> 8) as u8;
         buf[2] = 0x82;
         (buf, 3)
-    } else if len <= 0xFFFFFF {
+    } else if len <= 0xFF_FFFF {
         // Long form, 3 bytes
         buf[0] = len as u8;
         buf[1] = (len >> 8) as u8;
@@ -193,7 +194,7 @@ pub(crate) fn parse_ber_length(data: &[u8]) -> Option<(usize, usize)> {
     Some((len, 1 + num_octets))
 }
 
-/// Decode a length from bytes, returning (length, bytes_consumed)
+/// Decode a length from bytes, returning (length, `bytes_consumed`)
 ///
 /// The `base_offset` parameter is used to report error offsets correctly
 /// when this is called from within a decoder. The `target` parameter provides
@@ -343,12 +344,12 @@ mod tests {
         assert_eq!(base128_len(0), 1);
         assert_eq!(base128_len(127), 1);
         assert_eq!(base128_len(128), 2);
-        assert_eq!(base128_len(16383), 2);
-        assert_eq!(base128_len(16384), 3);
-        assert_eq!(base128_len(2097151), 3);
-        assert_eq!(base128_len(2097152), 4);
-        assert_eq!(base128_len(268435455), 4);
-        assert_eq!(base128_len(268435456), 5);
+        assert_eq!(base128_len(16_383), 2);
+        assert_eq!(base128_len(16_384), 3);
+        assert_eq!(base128_len(2_097_151), 3);
+        assert_eq!(base128_len(2_097_152), 4);
+        assert_eq!(base128_len(268_435_455), 4);
+        assert_eq!(base128_len(268_435_456), 5);
         assert_eq!(base128_len(u32::MAX), 5);
     }
 
@@ -444,8 +445,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got {:?}",
-            err
+            "Expected MalformedResponse error, got {err:?}"
         );
     }
 

@@ -30,7 +30,7 @@ pub(crate) struct TrapSink {
     pub(crate) version: Version,
     pub(crate) community: Bytes,
     pub(crate) v3_security: Option<UsmConfig>,
-    /// Keys derived against the agent's engine_id for V3 trap sending.
+    /// Keys derived against the agent's `engine_id` for V3 trap sending.
     /// Lazily populated on first use.
     pub(crate) derived_keys: RwLock<Option<DerivedKeys>>,
     /// Inform request timeout and retry policy.
@@ -82,7 +82,7 @@ impl TrapSink {
         }
     }
 
-    /// Ensure keys are derived against the given engine_id for V3 trap sending.
+    /// Ensure keys are derived against the given `engine_id` for V3 trap sending.
     fn ensure_keys_derived(&self, engine_id: &[u8]) -> Result<()> {
         {
             let keys = self.derived_keys.read().map_err(|_| {
@@ -150,7 +150,7 @@ impl TrapSink {
     }
 }
 
-/// Convert UsmAuth (builder-level) to UsmConfig (runtime-level).
+/// Convert `UsmAuth` (builder-level) to `UsmConfig` (runtime-level).
 fn resolve_usm_config(usm: &UsmAuth) -> UsmConfig {
     let mut security = UsmConfig::new(Bytes::copy_from_slice(usm.username.as_bytes()));
     if let Some(context_name) = &usm.context_name {
@@ -174,7 +174,7 @@ fn resolve_usm_config(usm: &UsmAuth) -> UsmConfig {
 impl super::Agent {
     /// Send a trap to all configured trap sinks.
     ///
-    /// Constructs a TrapV2 PDU with the mandatory sysUpTime.0 and snmpTrapOID.0
+    /// Constructs a `TrapV2` PDU with the mandatory sysUpTime.0 and snmpTrapOID.0
     /// prefix and sends it to each destination. Fire-and-forget: no response
     /// expected.
     ///
@@ -223,7 +223,7 @@ impl super::Agent {
 
     /// Send an inform to all configured trap sinks.
     ///
-    /// Constructs an InformRequest PDU and sends it to each destination,
+    /// Constructs an `InformRequest` PDU and sends it to each destination,
     /// waiting for acknowledgement from each. Reuses a cached client per
     /// sink for the request/response exchange.
     ///

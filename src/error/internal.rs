@@ -3,7 +3,7 @@
 //! These types are not part of the public API. They are used internally
 //! to provide detailed diagnostic information via tracing.
 
-/// Authentication error kinds (SNMPv3).
+/// Authentication error kinds (`SNMPv3`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthErrorKind {
     /// No credentials configured for this operation.
@@ -102,9 +102,9 @@ pub(crate) enum DecodeErrorKind {
     InsufficientData { needed: usize, available: usize },
     /// Invalid OID in notification varbinds.
     InvalidOid,
-    /// Negative non_repeaters in GETBULK PDU.
+    /// Negative `non_repeaters` in GETBULK PDU.
     NegativeNonRepeaters { value: i32 },
-    /// Negative max_repetitions in GETBULK PDU.
+    /// Negative `max_repetitions` in GETBULK PDU.
     NegativeMaxRepetitions { value: i32 },
     /// OID exceeds maximum arc count during decode.
     OidTooLong { count: usize, max: usize },
@@ -122,42 +122,40 @@ impl std::fmt::Display for DecodeErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnexpectedTag { expected, actual } => {
-                write!(f, "expected tag 0x{:02X}, got 0x{:02X}", expected, actual)
+                write!(f, "expected tag 0x{expected:02X}, got 0x{actual:02X}")
             }
             Self::TruncatedData => write!(f, "unexpected end of data"),
             Self::InvalidLength => write!(f, "invalid length encoding"),
             Self::IndefiniteLength => write!(f, "indefinite length encoding not supported"),
             Self::IntegerOverflow => write!(f, "integer overflow"),
             Self::ZeroLengthInteger => write!(f, "zero-length integer"),
-            Self::UnknownVersion(v) => write!(f, "unknown SNMP version: {}", v),
-            Self::UnknownPduType(t) => write!(f, "unknown PDU type: 0x{:02X}", t),
+            Self::UnknownVersion(v) => write!(f, "unknown SNMP version: {v}"),
+            Self::UnknownPduType(t) => write!(f, "unknown PDU type: 0x{t:02X}"),
             Self::ConstructedOctetString => {
                 write!(f, "constructed OCTET STRING (0x24) not supported")
             }
             Self::MissingPdu => write!(f, "missing PDU in message"),
             Self::InvalidMsgFlags => write!(f, "invalid msgFlags: privacy without authentication"),
-            Self::UnknownSecurityModel(m) => write!(f, "unknown security model: {}", m),
+            Self::UnknownSecurityModel(m) => write!(f, "unknown security model: {m}"),
             Self::MsgMaxSizeTooSmall { value, minimum } => {
-                write!(f, "msgMaxSize {} below RFC 3412 minimum {}", value, minimum)
+                write!(f, "msgMaxSize {value} below RFC 3412 minimum {minimum}")
             }
             Self::MsgMaxSizeTooLarge { value } => {
-                write!(f, "msgMaxSize {} above RFC 3412 maximum 2147483647", value)
+                write!(f, "msgMaxSize {value} above RFC 3412 maximum 2147483647")
             }
             Self::InvalidMsgId { value } => {
-                write!(f, "msgID {} outside RFC 3412 range 0..2147483647", value)
+                write!(f, "msgID {value} outside RFC 3412 range 0..2147483647")
             }
             Self::InvalidEngineBoots { value } => {
                 write!(
                     f,
-                    "msgAuthoritativeEngineBoots {} outside RFC 3414 range 0..2147483647",
-                    value
+                    "msgAuthoritativeEngineBoots {value} outside RFC 3414 range 0..2147483647"
                 )
             }
             Self::InvalidEngineTime { value } => {
                 write!(
                     f,
-                    "msgAuthoritativeEngineTime {} outside RFC 3414 range 0..2147483647",
-                    value
+                    "msgAuthoritativeEngineTime {value} outside RFC 3414 range 0..2147483647"
                 )
             }
             Self::InvalidNull => write!(f, "NULL with non-zero length"),
@@ -165,37 +163,37 @@ impl std::fmt::Display for DecodeErrorKind {
             #[cfg(feature = "agent")]
             Self::ExpectedEncryption => write!(f, "expected encrypted scoped PDU"),
             Self::InvalidIpAddressLength { length } => {
-                write!(f, "IP address must be 4 bytes, got {}", length)
+                write!(f, "IP address must be 4 bytes, got {length}")
             }
             Self::LengthTooLong { octets } => {
-                write!(f, "length encoding too long ({} octets)", octets)
+                write!(f, "length encoding too long ({octets} octets)")
             }
             Self::LengthExceedsMax { length, max } => {
-                write!(f, "length {} exceeds maximum {}", length, max)
+                write!(f, "length {length} exceeds maximum {max}")
             }
             Self::Integer64TooLong { length } => {
-                write!(f, "integer64 too long: {} bytes", length)
+                write!(f, "integer64 too long: {length} bytes")
             }
             Self::EmptyResponse => write!(f, "empty response"),
             Self::TlvOverflow => write!(f, "TLV extends past end of data"),
             Self::InsufficientData { needed, available } => {
-                write!(f, "need {} bytes but only {} remaining", needed, available)
+                write!(f, "need {needed} bytes but only {available} remaining")
             }
             Self::InvalidOid => write!(f, "invalid OID in notification varbinds"),
             Self::NegativeNonRepeaters { value } => {
-                write!(f, "negative non_repeaters: {}", value)
+                write!(f, "negative non_repeaters: {value}")
             }
             Self::NegativeMaxRepetitions { value } => {
-                write!(f, "negative max_repetitions: {}", value)
+                write!(f, "negative max_repetitions: {value}")
             }
             Self::OidTooLong { count, max } => {
-                write!(f, "OID has {} arcs, exceeds maximum {}", count, max)
+                write!(f, "OID has {count} arcs, exceeds maximum {max}")
             }
             Self::IntegerTooLong { length } => {
-                write!(f, "integer encoding too long: {} bytes (max 8)", length)
+                write!(f, "integer encoding too long: {length} bytes (max 8)")
             }
             Self::Unsigned32TooLong { length } => {
-                write!(f, "unsigned32 encoding too long: {} bytes (max 9)", length)
+                write!(f, "unsigned32 encoding too long: {length} bytes (max 9)")
             }
             Self::Integer64MissingLeadingZero => {
                 write!(f, "9-octet integer64 missing required leading zero byte")

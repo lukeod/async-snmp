@@ -1,6 +1,6 @@
-//! Variable binding (VarBind) type.
+//! Variable binding (`VarBind`) type.
 //!
-//! A VarBind pairs an OID with a value.
+//! A `VarBind` pairs an OID with a value.
 
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::Result;
@@ -17,12 +17,13 @@ pub struct VarBind {
 }
 
 impl VarBind {
-    /// Create a new VarBind.
+    /// Create a new `VarBind`.
     pub fn new(oid: Oid, value: Value) -> Self {
         Self { oid, value }
     }
 
-    /// Create a VarBind with a NULL value (for GET requests).
+    /// Create a `VarBind` with a NULL value (for GET requests).
+    #[must_use]
     pub fn null(oid: Oid) -> Self {
         Self {
             oid,
@@ -38,7 +39,7 @@ impl VarBind {
         });
     }
 
-    /// Returns the exact encoded size of this VarBind in bytes.
+    /// Returns the exact encoded size of this `VarBind` in bytes.
     ///
     /// Computes the size arithmetically without allocating.
     /// Useful for response size estimation in GETBULK processing.
@@ -69,9 +70,9 @@ impl std::fmt::Display for VarBind {
     }
 }
 
-/// Encodes a list of VarBinds to BER format.
+/// Encodes a list of `VarBind`s to BER format.
 ///
-/// Writes the VarBinds as a SEQUENCE of SEQUENCE elements, where each inner
+/// Writes the `VarBind`s as a SEQUENCE of SEQUENCE elements, where each inner
 /// SEQUENCE contains an OID and its associated value.
 pub fn encode_varbind_list(buf: &mut EncodeBuf, varbinds: &[VarBind]) {
     buf.push_sequence(|buf| {
@@ -82,9 +83,9 @@ pub fn encode_varbind_list(buf: &mut EncodeBuf, varbinds: &[VarBind]) {
     });
 }
 
-/// Decodes a BER-encoded VarBind list into a vector of VarBinds.
+/// Decodes a BER-encoded `VarBind` list into a vector of `VarBind`s.
 ///
-/// Expects a SEQUENCE containing zero or more VarBind SEQUENCE elements.
+/// Expects a SEQUENCE containing zero or more `VarBind` SEQUENCE elements.
 pub fn decode_varbind_list(decoder: &mut Decoder) -> Result<Vec<VarBind>> {
     let mut seq = decoder.read_sequence()?;
 
@@ -102,7 +103,7 @@ pub fn decode_varbind_list(decoder: &mut Decoder) -> Result<Vec<VarBind>> {
 
 /// Encodes OIDs with NULL values for GET requests.
 ///
-/// Creates a VarBind list where each OID is paired with a NULL value,
+/// Creates a `VarBind` list where each OID is paired with a NULL value,
 /// as required by SNMP GET, GETNEXT, and GETBULK request PDUs.
 pub fn encode_null_varbinds(buf: &mut EncodeBuf, oids: &[Oid]) {
     buf.push_sequence(|buf| {
@@ -283,7 +284,7 @@ mod tests {
                 Value::OctetString(Bytes::from_static(b"Linux router")),
             ),
             VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 99, 0), Value::NoSuchObject),
-            VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::TimeTicks(123456)),
+            VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::TimeTicks(123_456)),
             VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 100, 0), Value::NoSuchInstance),
         ];
 
@@ -396,7 +397,7 @@ mod tests {
     #[test]
     fn test_varbind_display() {
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Integer(42));
-        let display = format!("{}", vb);
+        let display = format!("{vb}");
         assert!(display.contains("1.3.6.1.2.1.1.1.0"));
         assert!(display.contains("42"));
     }
@@ -404,7 +405,7 @@ mod tests {
     #[test]
     fn test_varbind_display_exception() {
         let vb = VarBind::new(oid!(1, 3, 6, 1), Value::NoSuchObject);
-        let display = format!("{}", vb);
+        let display = format!("{vb}");
         assert!(display.contains("noSuchObject"));
     }
 
@@ -423,7 +424,7 @@ mod tests {
     // VarBind::encoded_size() Tests
     // ========================================================================
 
-    /// Helper to verify encoded_size() matches actual encoding length
+    /// Helper to verify `encoded_size()` matches actual encoding length
     fn verify_encoded_size(vb: &VarBind) {
         let mut buf = EncodeBuf::new();
         vb.encode(&mut buf);
@@ -431,8 +432,7 @@ mod tests {
         let computed = vb.encoded_size();
         assert_eq!(
             computed, actual,
-            "encoded_size mismatch for {:?}: computed={}, actual={}",
-            vb, computed, actual
+            "encoded_size mismatch for {vb:?}: computed={computed}, actual={actual}"
         );
     }
 

@@ -1,20 +1,20 @@
 #![cfg(feature = "agent")]
-//! Request batching tests using TestAgent.
+//! Request batching tests using `TestAgent`.
 
 mod common;
 
 use async_snmp::{Auth, Client, Oid, Value, oid};
 use common::{TestAgent, fixtures};
 
-/// GET_MANY with more OIDs than max_oids_per_request batches automatically.
+/// `GET_MANY` with more OIDs than `max_oids_per_request` batches automatically.
 #[tokio::test]
 async fn get_many_batches_large_requests() {
     // Create agent with many OIDs
     let mut data = fixtures::system_mib();
-    for i in 0..50 {
+    for i in 0u16..50 {
         data.insert(
-            oid!(1, 3, 6, 1, 4, 1, 99999, 1, i as u32),
-            Value::Integer(i),
+            oid!(1, 3, 6, 1, 4, 1, 99999, 1, i.into()),
+            Value::Integer(i.into()),
         );
     }
     let agent = TestAgent::with_data(data).await;

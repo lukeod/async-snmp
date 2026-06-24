@@ -1,6 +1,6 @@
 //! Protocol version-specific notification handlers.
 //!
-//! This module contains the internal handlers for processing SNMPv1, v2c, and v3
+//! This module contains the internal handlers for processing `SNMPv1`, v2c, and v3
 //! notification messages.
 
 use std::net::SocketAddr;
@@ -26,7 +26,7 @@ use super::{Notification, ReceiverInner};
 use crate::v3::compute_engine_boots_time;
 
 impl super::NotificationReceiver {
-    /// Handle SNMPv1 message.
+    /// Handle `SNMPv1` message.
     pub(super) async fn handle_v1(
         &self,
         data: Bytes,
@@ -54,7 +54,7 @@ impl super::NotificationReceiver {
         }
     }
 
-    /// Handle SNMPv2c message.
+    /// Handle `SNMPv2c` message.
     pub(super) async fn handle_v2c(
         &self,
         data: Bytes,
@@ -63,10 +63,7 @@ impl super::NotificationReceiver {
         let msg = CommunityMessage::decode(data)?;
 
         // V2c messages carry standard PDUs; TrapV1 is only valid in V1 messages.
-        let pdu = match msg.pdu.standard() {
-            Some(p) => p,
-            None => return Ok(None),
-        };
+        let Some(pdu) = msg.pdu.standard() else { return Ok(None) };
 
         match pdu.pdu_type {
             PduType::TrapV2 => {
@@ -111,7 +108,7 @@ impl super::NotificationReceiver {
         }
     }
 
-    /// Handle SNMPv3 message.
+    /// Handle `SNMPv3` message.
     pub(super) async fn handle_v3(
         &self,
         data: Bytes,
@@ -182,8 +179,8 @@ impl super::NotificationReceiver {
                         return Err(Error::Auth { target: source }.boxed());
                     }
 
-                    let time_diff = (usm_params.engine_time as i64 - our_time as i64).abs();
-                    if time_diff > TIME_WINDOW as i64 {
+                    let time_diff = (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
+                    if time_diff > i64::from(TIME_WINDOW) {
                         tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_time = usm_params.engine_time, snmp.our_time = our_time }, "V3 notification outside time window");
                         return Err(Error::Auth { target: source }.boxed());
                     }
@@ -228,14 +225,9 @@ impl super::NotificationReceiver {
                     return Ok(None);
                 }
             }
-        } else {
-            match msg.scoped_pdu() {
-                Some(sp) => sp.clone(),
-                None => {
-                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "unexpected encrypted V3 message");
-                    return Ok(None);
-                }
-            }
+        } else if let Some(sp) = msg.scoped_pdu() { sp.clone() } else {
+            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "unexpected encrypted V3 message");
+            return Ok(None);
         };
 
         let context_engine_id = scoped_pdu.context_engine_id.clone();
@@ -297,7 +289,7 @@ impl super::NotificationReceiver {
         }
     }
 
-    /// Handle SNMPv3 engine discovery request.
+    /// Handle `SNMPv3` engine discovery request.
     ///
     /// Per RFC 3414 Section 4, responds with a Report PDU containing
     /// usmStatsUnknownEngineIDs and the receiver's engine ID in USM params.

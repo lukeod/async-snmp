@@ -26,6 +26,7 @@ impl Agent {
     ///
     /// When this function is called, we haven't successfully decoded the PDU
     /// (due to auth/decryption errors), so we must check reportableFlag.
+    /// TODO why does this appear to be only used by `test_boots_latched_allows_report`?
     pub(super) fn send_v3_report(
         &self,
         incoming: &V3Message,

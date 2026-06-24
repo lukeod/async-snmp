@@ -1,4 +1,4 @@
-//! SNMPv3 security module.
+//! `SNMPv3` security module.
 //!
 //! This module implements the User-based Security Model (USM) as defined
 //! in RFC 3414 and RFC 7860, including:
@@ -88,7 +88,7 @@ impl std::fmt::Display for ParseProtocolError {
 impl std::error::Error for ParseProtocolError {}
 
 /// Authentication protocol identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AuthProtocol {
     /// HMAC-MD5-96 (RFC 3414)
     Md5,
@@ -141,6 +141,7 @@ impl AuthProtocol {
     ///
     /// This is also the key length produced by the key localization algorithm,
     /// which is used for privacy key derivation.
+    #[must_use] 
     pub fn digest_len(self) -> usize {
         match self {
             Self::Md5 => 16,
@@ -153,6 +154,7 @@ impl AuthProtocol {
     }
 
     /// Get the truncated MAC length for authentication parameters.
+    #[must_use] 
     pub fn mac_len(self) -> usize {
         match self {
             Self::Md5 | Self::Sha1 => 12, // HMAC-96
@@ -165,7 +167,7 @@ impl AuthProtocol {
 }
 
 /// Privacy protocol identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrivProtocol {
     /// DES-CBC (RFC 3414).
     ///
@@ -217,6 +219,7 @@ impl std::str::FromStr for PrivProtocol {
 
 impl PrivProtocol {
     /// Get the key length in bytes.
+    #[must_use] 
     pub fn key_len(self) -> usize {
         match self {
             Self::Des => 16,  // 8 key + 8 pre-IV
@@ -228,6 +231,7 @@ impl PrivProtocol {
     }
 
     /// Get the IV/salt length in bytes.
+    #[must_use] 
     pub fn salt_len(self) -> usize {
         8 // All protocols use 8-byte salt
     }

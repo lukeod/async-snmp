@@ -44,8 +44,7 @@ fn bench_get_single(c: &mut Criterion) {
 
     if !is_container_available(&rt) {
         eprintln!(
-            "Skipping client benchmarks: test container not available at {}",
-            TARGET
+            "Skipping client benchmarks: test container not available at {TARGET}"
         );
         eprintln!(
             "Start with: docker run -d --name async-snmp-test-manual -p 11161:161/udp async-snmp-test:latest"
@@ -75,7 +74,7 @@ fn bench_get_single(c: &mut Criterion) {
     for (name, oid) in oids {
         group.bench_with_input(BenchmarkId::new("single", name), &oid, |b, oid| {
             b.to_async(&rt)
-                .iter(|| async { black_box(client.get(oid).await.unwrap()) })
+                .iter(|| async { black_box(client.get(oid).await.unwrap()) });
         });
     }
 
@@ -128,7 +127,7 @@ fn bench_get_many(c: &mut Criterion) {
         group.throughput(Throughput::Elements(*count as u64));
         group.bench_with_input(BenchmarkId::new("batch", count), oids, |b, oids| {
             b.to_async(&rt)
-                .iter(|| async { black_box(client.get_many(oids).await.unwrap()) })
+                .iter(|| async { black_box(client.get_many(oids).await.unwrap()) });
         });
     }
 
@@ -158,7 +157,7 @@ fn bench_get_next(c: &mut Criterion) {
 
     group.bench_function("single", |b| {
         b.to_async(&rt)
-            .iter(|| async { black_box(client.get_next(&oid).await.unwrap()) })
+            .iter(|| async { black_box(client.get_next(&oid).await.unwrap()) });
     });
 
     group.finish();
@@ -185,8 +184,8 @@ fn bench_get_bulk(c: &mut Criterion) {
 
     let system_oid = oid!(1, 3, 6, 1, 2, 1, 1);
 
-    for max_reps in [5, 10, 25] {
-        group.throughput(Throughput::Elements(max_reps as u64));
+    for max_reps in [5u16, 10, 25] {
+        group.throughput(Throughput::Elements(max_reps.into()));
         group.bench_with_input(
             BenchmarkId::new("max_repetitions", max_reps),
             &max_reps,
@@ -194,11 +193,11 @@ fn bench_get_bulk(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| async {
                     black_box(
                         client
-                            .get_bulk(std::slice::from_ref(&system_oid), 0, max_reps)
+                            .get_bulk(std::slice::from_ref(&system_oid), 0, max_reps.into())
                             .await
                             .unwrap(),
                     )
-                })
+                });
             },
         );
     }
@@ -236,7 +235,7 @@ fn bench_walk(c: &mut Criterion) {
                 .await
                 .unwrap();
             black_box(results)
-        })
+        });
     });
 
     group.bench_function("system_bulk", |b| {
@@ -247,7 +246,7 @@ fn bench_walk(c: &mut Criterion) {
                 .await
                 .unwrap();
             black_box(results)
-        })
+        });
     });
 
     group.bench_function("system_auto", |b| {
@@ -259,7 +258,7 @@ fn bench_walk(c: &mut Criterion) {
                 .await
                 .unwrap();
             black_box(results)
-        })
+        });
     });
 
     group.finish();
@@ -284,7 +283,7 @@ fn bench_client_construction(c: &mut Criterion) {
                 .await
                 .unwrap();
             black_box(client)
-        })
+        });
     });
 
     group.finish();
@@ -307,7 +306,7 @@ fn bench_request_overhead(c: &mut Criterion) {
             let pdu = Pdu::get_request(12345, &oids);
             let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu);
             black_box(msg.encode())
-        })
+        });
     });
 
     // Measure response decoding (no network)
@@ -326,7 +325,7 @@ fn bench_request_overhead(c: &mut Criterion) {
         b.iter(|| {
             let data = encoded.clone();
             black_box(CommunityMessage::decode(data).unwrap())
-        })
+        });
     });
 
     group.finish();
@@ -365,7 +364,7 @@ fn bench_concurrent(c: &mut Criterion) {
             for client in &clients {
                 black_box(client.get(&oid).await.unwrap());
             }
-        })
+        });
     });
 
     // Benchmark concurrent requests
@@ -377,7 +376,7 @@ fn bench_concurrent(c: &mut Criterion) {
             for result in results {
                 black_box(result.unwrap());
             }
-        })
+        });
     });
 
     group.finish();

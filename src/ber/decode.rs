@@ -38,6 +38,7 @@ impl Decoder {
     }
 
     /// Create a decoder from a byte slice (copies the data).
+    #[must_use]
     pub fn from_slice(data: &[u8]) -> Self {
         Self::new(Bytes::copy_from_slice(data))
     }
@@ -47,7 +48,7 @@ impl Decoder {
         self.target.unwrap_or(UNKNOWN_TARGET)
     }
 
-    /// Return a boxed MalformedResponse error for the current target.
+    /// Return a boxed `MalformedResponse` error for the current target.
     fn malformed(&self) -> Box<crate::error::Error> {
         Error::MalformedResponse {
             target: self.target(),
@@ -171,8 +172,8 @@ impl Decoder {
         let is_negative = bytes[0] & 0x80 != 0;
         let mut value: i64 = if is_negative { -1 } else { 0 };
 
-        for &byte in bytes.iter() {
-            value = (value << 8) | (byte as i64);
+        for &byte in &bytes {
+            value = (value << 8) | i64::from(byte);
         }
 
         Ok(value as i32)
@@ -206,8 +207,8 @@ impl Decoder {
 
         let mut value: u64 = 0;
 
-        for &byte in bytes.iter() {
-            value = (value << 8) | (byte as u64);
+        for &byte in &bytes {
+            value = (value << 8) | u64::from(byte);
         }
 
         Ok(value)
@@ -242,8 +243,8 @@ impl Decoder {
         // to stay compatible with devices that send oversized but otherwise valid encodings.
         let mut value: u64 = 0;
 
-        for &byte in bytes.iter() {
-            value = (value << 8) | (byte as u64);
+        for &byte in &bytes {
+            value = (value << 8) | u64::from(byte);
         }
 
         Ok(value as u32)
@@ -416,12 +417,12 @@ mod tests {
         // 5-8 byte integers are accepted and truncated to i32, matching net-snmp CHECK_OVERFLOW_S.
         // 5 bytes: 0x0102030405 -> truncated to 0x02030405
         let mut dec = Decoder::from_slice(&[0x02, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05]);
-        assert_eq!(dec.read_integer().unwrap(), 0x02030405_i32);
+        assert_eq!(dec.read_integer().unwrap(), 0x02_03_04_05_i32);
 
         // 8 bytes: last 4 bytes kept
         let mut dec =
             Decoder::from_slice(&[0x02, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-        assert_eq!(dec.read_integer().unwrap(), 0x05060708_i32);
+        assert_eq!(dec.read_integer().unwrap(), 0x05_06_07_08_i32);
 
         // 9 bytes is rejected (exceeds net-snmp's sizeof(long)=8 limit)
         let mut dec = Decoder::from_slice(&[
@@ -438,7 +439,7 @@ mod tests {
         // 6-9 byte unsigned32 values are accepted and truncated to u32, matching net-snmp CHECK_OVERFLOW_U.
         // 6 bytes: 0x010203040506 -> truncated to 0x03040506
         let mut dec = Decoder::from_slice(&[0x42, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
-        assert_eq!(dec.read_unsigned32(0x42).unwrap(), 0x03040506_u32);
+        assert_eq!(dec.read_unsigned32(0x42).unwrap(), 0x03_04_05_06_u32);
 
         // 9 bytes with leading zero: accepted, value fits in u32
         let mut dec = Decoder::from_slice(&[
@@ -522,8 +523,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error, got {:?}",
-            err
+            "expected MalformedResponse error, got {err:?}"
         );
     }
 
@@ -537,8 +537,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error, got {:?}",
-            err
+            "expected MalformedResponse error, got {err:?}"
         );
     }
 
@@ -552,8 +551,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error for multi-byte tag, got {:?}",
-            err
+            "expected MalformedResponse error for multi-byte tag, got {err:?}"
         );
 
         // 0x3F: constructed form with tag bits all set - also multi-byte

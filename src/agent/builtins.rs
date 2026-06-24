@@ -323,7 +323,7 @@ mod tests {
             GetResult::Value(Value::OctetString(v)) => {
                 assert_eq!(v.as_ref(), &[0x80, 0x00, 0x01, 0x02, 0x03]);
             }
-            other => panic!("expected OctetString, got {:?}", other),
+            other => panic!("expected OctetString, got {other:?}"),
         }
     }
 
@@ -432,11 +432,10 @@ mod tests {
                 GetResult::Value(Value::Counter32(v)) => {
                     assert_eq!(
                         v, *expected_val,
-                        "column {} expected {}, got {}",
-                        col, expected_val, v
+                        "column {col} expected {expected_val}, got {v}"
                     );
                 }
-                other => panic!("column {}: expected Counter32, got {:?}", col, other),
+                other => panic!("column {col}: expected Counter32, got {other:?}"),
             }
         }
     }
@@ -482,11 +481,10 @@ mod tests {
                 GetResult::Value(Value::Counter32(v)) => {
                     assert_eq!(
                         v, *expected_val,
-                        "column {} expected {}, got {}",
-                        col, expected_val, v
+                        "column {col} expected {expected_val}, got {v}"
                     );
                 }
-                other => panic!("column {}: expected Counter32, got {:?}", col, other),
+                other => panic!("column {col}: expected Counter32, got {other:?}"),
             }
         }
     }

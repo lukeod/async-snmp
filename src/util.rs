@@ -14,9 +14,9 @@ use tokio::net::UdpSocket;
 /// # Arguments
 ///
 /// * `addr` - The socket address to bind to. Should match the target address family.
-/// * `recv_buffer_size` - Optional receive buffer size (SO_RCVBUF). The kernel may cap
+/// * `recv_buffer_size` - Optional receive buffer size (`SO_RCVBUF`). The kernel may cap
 ///   this at `net.core.rmem_max`. Larger buffers prevent packet loss during bursts.
-/// * `send_buffer_size` - Optional send buffer size (SO_SNDBUF). The kernel may cap
+/// * `send_buffer_size` - Optional send buffer size (`SO_SNDBUF`). The kernel may cap
 ///   this at `net.core.wmem_max`.
 ///
 /// # Returns

@@ -28,16 +28,16 @@ use bytes::Bytes;
 /// regardless of version. Use [`Message::decode`] to parse incoming data.
 #[derive(Debug)]
 pub enum Message {
-    /// SNMPv1 or SNMPv2c message with community string
+    /// `SNMPv1` or `SNMPv2c` message with community string
     Community(CommunityMessage),
-    /// SNMPv3 message with USM security
+    /// `SNMPv3` message with USM security
     V3(V3Message),
 }
 
 impl Message {
     /// Get a reference to the PDU.
     ///
-    /// Returns `None` for encrypted V3 messages or SNMPv1 Trap messages.
+    /// Returns `None` for encrypted V3 messages or `SNMPv1` Trap messages.
     pub fn pdu(&self) -> Option<&Pdu> {
         match self {
             Message::Community(m) => m.pdu.standard(),
@@ -47,7 +47,7 @@ impl Message {
 
     /// Consume and return the PDU.
     ///
-    /// Returns `None` for encrypted V3 messages or SNMPv1 Trap messages.
+    /// Returns `None` for encrypted V3 messages or `SNMPv1` Trap messages.
     pub fn into_pdu(self) -> Option<Pdu> {
         match self {
             Message::Community(m) => match m.pdu {

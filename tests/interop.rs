@@ -587,7 +587,7 @@ async fn tcp_transport_get() {
             assert_eq!(vb.oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
             assert!(matches!(vb.value, Value::OctetString(_)));
         }
-        Err(e) => panic!("TCP GET failed: {}", e),
+        Err(e) => panic!("TCP GET failed: {e}"),
     }
 }
 
@@ -700,7 +700,7 @@ async fn set_writable_oid() {
             async_snmp::Error::Snmp { .. } => {
                 // NotWritable is acceptable if agent doesn't allow writes
             }
-            _ => panic!("SET failed unexpectedly: {}", e),
+            _ => panic!("SET failed unexpectedly: {e}"),
         },
     }
 }

@@ -16,17 +16,17 @@
 
 /// MAC address: "1x:" - each byte as hex separated by colons.
 ///
-/// Used by SNMPv2-TC::MacAddress and many physical address fields.
+/// Used by `SNMPv2-TC::MacAddress` and many physical address fields.
 pub const MAC_ADDRESS: &str = "1x:";
 
 /// Display string (UTF-8): "255a" - up to 255 ASCII/UTF-8 characters.
 ///
-/// Used by SNMPv2-TC::DisplayString, SNMPv2-MIB::sysDescr, etc.
+/// Used by `SNMPv2-TC::DisplayString`, `SNMPv2-MIB::sysDescr`, etc.
 pub const DISPLAY_STRING: &str = "255a";
 
 /// Date and time: "2d-1d-1d,1d:1d:1d.1d,1a1d:1d".
 ///
-/// Used by SNMPv2-TC::DateAndTime (8 or 11 bytes).
+/// Used by `SNMPv2-TC::DateAndTime` (8 or 11 bytes).
 /// Format: YYYY-MM-DD,HH:MM:SS.d,+/-HH:MM
 pub const DATE_AND_TIME: &str = "2d-1d-1d,1d:1d:1d.1d,1a1d:1d";
 

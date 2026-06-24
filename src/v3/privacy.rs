@@ -1,4 +1,4 @@
-//! Privacy (encryption) protocols for SNMPv3 (RFC 3414, RFC 3826).
+//! Privacy (encryption) protocols for `SNMPv3` (RFC 3414, RFC 3826).
 //!
 //! This module implements:
 //! - DES-CBC privacy (RFC 3414 Section 8)
@@ -51,18 +51,16 @@ impl std::fmt::Display for PrivacyError {
             Self::InvalidPrivParamsLength { expected, actual } => {
                 write!(
                     f,
-                    "invalid privParameters length: expected {}, got {}",
-                    expected, actual
+                    "invalid privParameters length: expected {expected}, got {actual}"
                 )
             }
             Self::InvalidCiphertextLength { length, block_size } => {
                 write!(
                     f,
-                    "ciphertext length {} not multiple of block size {}",
-                    length, block_size
+                    "ciphertext length {length} not multiple of block size {block_size}"
                 )
             }
-            Self::Crypto(e) => write!(f, "{}", e),
+            Self::Crypto(e) => write!(f, "{e}"),
         }
     }
 }
@@ -113,7 +111,7 @@ pub struct PrivKey {
     #[zeroize(skip)]
     protocol: PrivProtocol,
     /// Salt counter for generating unique IVs.
-    /// Uses interior mutability so encrypt() can take &self.
+    /// Uses interior mutability so `encrypt()` can take &self.
     #[zeroize(skip)]
     salt_counter: AtomicU64,
 }
@@ -124,7 +122,9 @@ pub struct SaltCounter(AtomicU64);
 impl SaltCounter {
     /// Create a new salt counter initialized from cryptographic randomness.
     ///
+    /// # Panics
     /// Panics if the OS random source is unavailable.
+    #[must_use]
     pub fn new() -> Self {
         Self(AtomicU64::new(
             random_nonzero_u64().expect("OS random source unavailable"),
@@ -134,6 +134,7 @@ impl SaltCounter {
     /// Create a salt counter initialized to a specific value.
     ///
     /// This is primarily for testing purposes.
+    #[must_use]
     pub fn from_value(value: u64) -> Self {
         Self(AtomicU64::new(value))
     }
@@ -143,7 +144,7 @@ impl SaltCounter {
     /// This method never returns zero. Per net-snmp behavior, zero is skipped
     /// on wraparound to avoid potential IV reuse issues.
     ///
-    /// Uses the post-increment value as the salt and a single compare_exchange
+    /// Uses the post-increment value as the salt and a single `compare_exchange`
     /// to skip zero atomically, avoiding the two-fetch_add race that could
     /// cause IV reuse under concurrent access.
     pub fn next(&self) -> u64 {
@@ -309,7 +310,7 @@ impl PrivKey {
     /// Encrypt data and return (ciphertext, privParameters).
     ///
     /// # Arguments
-    /// * `plaintext` - The data to encrypt (typically the serialized ScopedPDU)
+    /// * `plaintext` - The data to encrypt (typically the serialized `ScopedPDU`)
     /// * `engine_boots` - The authoritative engine's boot count
     /// * `engine_time` - The authoritative engine's time
     /// * `salt_counter` - Optional shared salt counter; if None, uses internal counter
@@ -324,7 +325,7 @@ impl PrivKey {
         engine_time: u32,
         salt_counter: Option<&SaltCounter>,
     ) -> PrivacyResult<(Bytes, Bytes)> {
-        let salt = salt_counter.map(|c| c.next()).unwrap_or_else(|| {
+        let salt = salt_counter.map_or_else(|| {
             // Fetch the current value, then increment. Skip zero.
             let val = self.salt_counter.fetch_add(1, Ordering::Relaxed);
             if val != 0 {
@@ -332,7 +333,7 @@ impl PrivKey {
             }
             // Counter was zero (initial or wrapped). Fetch the next value.
             self.salt_counter.fetch_add(1, Ordering::Relaxed)
-        });
+        }, SaltCounter::next);
 
         match self.protocol {
             PrivProtocol::Des => self.encrypt_des(plaintext, engine_boots, salt),
@@ -567,6 +568,7 @@ impl std::fmt::Debug for PrivKey {
         f.debug_struct("PrivKey")
             .field("protocol", &self.protocol)
             .field("key", &"[REDACTED]")
+            .field("salt_counter", &"[REDACTED]")
             .finish()
     }
 }
@@ -726,7 +728,7 @@ mod tests {
         assert_eq!(s3, s2.wrapping_add(1));
     }
 
-    /// Test that SaltCounter never returns zero.
+    /// Test that `SaltCounter` never returns zero.
     ///
     /// Per net-snmp behavior (snmpusm.c:1319-1320), zero salt values should be
     /// skipped to avoid potential IV reuse issues on wraparound.
@@ -752,9 +754,9 @@ mod tests {
         assert_eq!(s3, 2);
     }
 
-    /// Test that PrivKey's internal salt counter never produces zero.
+    /// Test that `PrivKey`'s internal salt counter never produces zero.
     ///
-    /// When using the internal counter (not a shared SaltCounter), the salt
+    /// When using the internal counter (not a shared `SaltCounter`), the salt
     /// should also skip zero on wraparound.
     #[test]
     fn test_priv_key_internal_salt_skips_zero() {
@@ -1143,7 +1145,7 @@ mod tests {
         assert_eq!(&correct_decrypted[..plaintext.len()], plaintext);
     }
 
-    /// Test that SaltCounter never emits duplicate salts under concurrent access.
+    /// Test that `SaltCounter` never emits duplicate salts under concurrent access.
     ///
     /// This is a regression test for the two-fetch_add race where two threads
     /// could both return 1 after a wraparound left the counter at 0.
@@ -1178,9 +1180,9 @@ mod tests {
         }
     }
 
-    /// Test that a cloned PrivKey starts with an independent salt counter.
+    /// Test that a cloned `PrivKey` starts with an independent salt counter.
     ///
-    /// This is a regression test for derive(Clone) copying the salt_counter
+    /// This is a regression test for derive(Clone) copying the `salt_counter`
     /// field, which caused clones to emit identical salts for their first encryptions.
     #[test]
     fn test_priv_key_clone_independent_salts() {

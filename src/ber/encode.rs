@@ -17,11 +17,13 @@ pub struct EncodeBuf {
 
 impl EncodeBuf {
     /// Create a new encode buffer with default capacity.
+    #[must_use] 
     pub fn new() -> Self {
         Self::with_capacity(512)
     }
 
     /// Create a new encode buffer with specified capacity.
+    #[must_use] 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             buf: Vec::with_capacity(capacity),
@@ -53,11 +55,13 @@ impl EncodeBuf {
     }
 
     /// Get the current length of encoded data.
+    #[must_use] 
     pub fn len(&self) -> usize {
         self.buf.len()
     }
 
     /// Check if buffer is empty.
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
@@ -142,12 +146,14 @@ impl EncodeBuf {
     /// Finalize and return the encoded bytes.
     ///
     /// The buffer is reversed to produce the correct order.
+    #[must_use] 
     pub fn finish(mut self) -> Bytes {
         self.buf.reverse();
         Bytes::from(self.buf)
     }
 
     /// Finalize and return as `Vec<u8>`.
+    #[must_use] 
     pub fn finish_vec(mut self) -> Vec<u8> {
         self.buf.reverse();
         self.buf

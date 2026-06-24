@@ -156,8 +156,8 @@ mod tests {
     use crate::varbind::VarBind;
     use crate::version::Version;
 
-    /// Handler that accepts test_set for .99999.1.0 but rejects .99999.2.0,
-    /// tracking free_set calls via an atomic counter.
+    /// Handler that accepts `test_set` for .99999.1.0 but rejects .99999.2.0,
+    /// tracking `free_set` calls via an atomic counter.
     struct FreeSetTracker {
         free_count: Arc<AtomicU32>,
     }

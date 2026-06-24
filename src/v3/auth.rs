@@ -7,7 +7,7 @@
 //!
 //! # Two-Level Key Derivation
 //!
-//! SNMPv3 key derivation is a two-step process:
+//! `SNMPv3` key derivation is a two-step process:
 //!
 //! 1. **Password to Master Key** (~850μs for SHA-256): Expand password to 1MB
 //!    by repetition and hash it. This produces a protocol-specific master key.
@@ -79,7 +79,7 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// let key1 = master.localize(engine1_id).unwrap();
 /// let key2 = master.localize(engine2_id).unwrap();
 /// ```
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MasterKey {
     key: Vec<u8>,
     #[zeroize(skip)]
@@ -152,11 +152,13 @@ impl MasterKey {
     }
 
     /// Get the protocol this key is for.
+    #[must_use]
     pub fn protocol(&self) -> AuthProtocol {
         self.protocol
     }
 
     /// Get the raw key bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.key
     }
@@ -200,7 +202,7 @@ impl LocalizedKey {
     /// This implements the key localization algorithm from RFC 3414 Section A.2:
     /// 1. Expand password to 1MB by repetition
     /// 2. Hash the expansion to get the master key
-    /// 3. Hash (master_key || engine_id || master_key) to get the localized key
+    /// 3. Hash (`master_key` || `engine_id` || `master_key`) to get the localized key
     ///
     /// # Performance Note
     ///
@@ -256,16 +258,19 @@ impl LocalizedKey {
     }
 
     /// Get the protocol this key is for.
+    #[must_use]
     pub fn protocol(&self) -> AuthProtocol {
         self.protocol
     }
 
     /// Get the raw key bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.key
     }
 
     /// Get the MAC length for this key's protocol.
+    #[must_use]
     pub fn mac_len(&self) -> usize {
         self.protocol.mac_len()
     }
@@ -409,13 +414,15 @@ pub fn verify_message(
 
     // Compute HMAC over the message with zeros in the auth position,
     // feeding three slices to avoid copying the entire message.
-    const MAX_MAC_LEN: usize = 48; // SHA-512
-    let zeros = [0u8; MAX_MAC_LEN];
-    let computed = compute_hmac_slices(
-        key.protocol,
-        key.as_bytes(),
-        &[&message[..auth_offset], &zeros[..auth_len], &message[end..]],
-    )?;
+    let computed = {
+        const MAX_MAC_LEN: usize = 48; // SHA-512
+        let zeros: [u8; MAX_MAC_LEN] = [0u8; MAX_MAC_LEN];
+        compute_hmac_slices(
+            key.protocol,
+            key.as_bytes(),
+            &[&message[..auth_offset], &zeros[..auth_len], &message[end..]],
+        )?
+    };
 
     // Constant-time comparison
     if computed.len() != received_mac.len() {
@@ -428,7 +435,7 @@ pub fn verify_message(
     Ok(result == 0)
 }
 
-/// Pre-computed master keys for SNMPv3 authentication and privacy.
+/// Pre-computed master keys for `SNMPv3` authentication and privacy.
 ///
 /// This struct caches the expensive password-to-key derivation results for
 /// both authentication and privacy passwords. When polling many engines with
@@ -446,12 +453,12 @@ pub fn verify_message(
 ///
 /// // Use with multiple clients - localization is cheap (~1μs per engine)
 /// ```
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MasterKeys {
     /// Master key for authentication (and base for privacy key derivation)
     auth_master: MasterKey,
     /// Optional separate master key for privacy password
-    /// If None, the auth_master is used for privacy (common case: same password)
+    /// If None, the `auth_master` is used for privacy (common case: same password)
     #[zeroize(skip)]
     priv_protocol: Option<super::PrivProtocol>,
     priv_master: Option<MasterKey>,
@@ -484,6 +491,7 @@ impl MasterKeys {
     ///
     /// This is the common case where auth and priv passwords are identical.
     /// The same master key is reused, avoiding duplicate derivation.
+    #[must_use]
     pub fn with_privacy_same_password(mut self, priv_protocol: super::PrivProtocol) -> Self {
         self.priv_protocol = Some(priv_protocol);
         // priv_master stays None - we'll use auth_master for priv key derivation
@@ -515,6 +523,7 @@ impl MasterKeys {
     }
 
     /// Get the authentication master key.
+    #[must_use]
     pub fn auth_master(&self) -> &MasterKey {
         &self.auth_master
     }
@@ -523,6 +532,7 @@ impl MasterKeys {
     ///
     /// Returns the separate priv master key if set, otherwise returns the
     /// auth master key (for same-password case).
+    #[must_use]
     pub fn priv_master(&self) -> Option<&MasterKey> {
         if self.priv_protocol.is_some() {
             Some(self.priv_master.as_ref().unwrap_or(&self.auth_master))
@@ -532,18 +542,20 @@ impl MasterKeys {
     }
 
     /// Get the configured privacy protocol.
+    #[must_use]
     pub fn priv_protocol(&self) -> Option<super::PrivProtocol> {
         self.priv_protocol
     }
 
     /// Get the authentication protocol.
+    #[must_use]
     pub fn auth_protocol(&self) -> AuthProtocol {
         self.auth_master.protocol()
     }
 
     /// Derive localized keys for a specific engine ID.
     ///
-    /// Returns (auth_key, priv_key) where priv_key is None if no privacy
+    /// Returns (`auth_key`, `priv_key`) where `priv_key` is None if no privacy
     /// was configured.
     ///
     /// Key extension is automatically applied when needed based on the auth/priv
@@ -605,7 +617,7 @@ impl std::fmt::Debug for MasterKeys {
 /// Kul' = Kul || H(Kul) || H(Kul || H(Kul)) || ...
 /// ```
 ///
-/// Where H() is the hash function of the authentication protocol.
+/// Where `H()` is the hash function of the authentication protocol.
 pub(crate) fn extend_key(
     protocol: AuthProtocol,
     key: &[u8],

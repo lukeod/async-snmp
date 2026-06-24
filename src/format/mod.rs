@@ -40,7 +40,7 @@ pub mod display_hint;
 pub mod hex;
 pub mod hints;
 
-/// Format TimeTicks (centiseconds) as a human-readable duration string.
+/// Format `TimeTicks` (centiseconds) as a human-readable duration string.
 ///
 /// Output format: `Xd HH:MM:SS.CC` (with days) or `HH:MM:SS.CC` (without).
 ///
@@ -53,6 +53,7 @@ pub mod hints;
 /// assert_eq!(format_timeticks(360000), "01:00:00.00");
 /// assert_eq!(format_timeticks(0), "00:00:00.00");
 /// ```
+#[must_use]
 pub fn format_timeticks(centiseconds: u32) -> String {
     let total_seconds = centiseconds / 100;
     let cs = centiseconds % 100;
@@ -64,19 +65,19 @@ pub fn format_timeticks(centiseconds: u32) -> String {
 
     if days > 0 {
         format!(
-            "{}d {:02}:{:02}:{:02}.{:02}",
-            days, hours, minutes, seconds, cs
+            "{days}d {hours:02}:{minutes:02}:{seconds:02}.{cs:02}"
         )
     } else {
-        format!("{:02}:{:02}:{:02}.{:02}", hours, minutes, seconds, cs)
+        format!("{hours:02}:{minutes:02}:{seconds:02}.{cs:02}")
     }
 }
 
 /// Format bytes as space-separated uppercase hex (e.g., "0A 1B 2C").
+#[must_use]
 pub fn format_hex_display(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|b| format!("{:02X}", b))
+        .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -87,8 +88,8 @@ mod tests {
 
     #[test]
     fn test_format_timeticks() {
-        assert_eq!(format_timeticks(12345678), "1d 10:17:36.78");
-        assert_eq!(format_timeticks(360000), "01:00:00.00");
+        assert_eq!(format_timeticks(1234_5678), "1d 10:17:36.78");
+        assert_eq!(format_timeticks(360_000), "01:00:00.00");
         assert_eq!(format_timeticks(0), "00:00:00.00");
     }
 

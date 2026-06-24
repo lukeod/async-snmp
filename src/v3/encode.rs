@@ -23,7 +23,7 @@ use crate::v3::auth::authenticate_message;
 /// # Parameters
 ///
 /// - `pdu` - The PDU to encode
-/// - `msg_id` - Message ID (separate from pdu.request_id per RFC 3412 Section 6.2)
+/// - `msg_id` - Message ID (separate from `pdu.request_id` per RFC 3412 Section 6.2)
 /// - `engine_id` - Authoritative engine ID (sender's for traps, receiver's for requests)
 /// - `engine_boots` - Current engine boots value
 /// - `engine_time` - Current engine time value

@@ -71,9 +71,9 @@ pub struct RequestContext {
 
     /// Security model used for this request.
     ///
-    /// - `V1` for SNMPv1 community-based
-    /// - `V2c` for SNMPv2c community-based
-    /// - `Usm` for SNMPv3 User-based Security Model
+    /// - `V1` for `SNMPv1` community-based
+    /// - `V2c` for `SNMPv2c` community-based
+    /// - `Usm` for `SNMPv3` User-based Security Model
     pub security_model: SecurityModel,
 
     /// Security name (community string or USM username).
@@ -82,14 +82,14 @@ pub struct RequestContext {
     /// For v3: the USM username
     pub security_name: Bytes,
 
-    /// Security level (v3 only, NoAuthNoPriv for v1/v2c).
+    /// Security level (v3 only, `NoAuthNoPriv` for v1/v2c).
     ///
     /// Indicates whether authentication and/or privacy were used.
     pub security_level: SecurityLevel,
 
     /// Context name (v3 only, empty for v1/v2c).
     ///
-    /// SNMPv3 contexts allow partitioning MIB views.
+    /// `SNMPv3` contexts allow partitioning MIB views.
     pub context_name: Bytes,
 
     /// Request ID from the PDU.
@@ -97,7 +97,7 @@ pub struct RequestContext {
     /// Useful for correlating requests with responses in logs.
     pub request_id: i32,
 
-    /// PDU type (GetRequest, GetNextRequest, SetRequest, etc.).
+    /// PDU type (`GetRequest`, `GetNextRequest`, `SetRequest`, etc.).
     pub pdu_type: PduType,
 
     /// Resolved group name (if VACM enabled).
@@ -117,7 +117,7 @@ pub struct RequestContext {
 
     /// Client-advertised maximum message size (V3 only).
     ///
-    /// For SNMPv3 requests, this is the msgMaxSize from the V3 message header,
+    /// For `SNMPv3` requests, this is the msgMaxSize from the V3 message header,
     /// indicating the largest message the client can accept. The agent should
     /// limit response sizes to `min(agent_max, msg_max_size)`.
     ///
@@ -127,6 +127,7 @@ pub struct RequestContext {
 
 impl RequestContext {
     /// Create a minimal context for unit testing.
+    #[must_use] 
     pub fn test_context() -> Self {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

@@ -1,4 +1,4 @@
-//! SNMPv3 message format (RFC 3412).
+//! `SNMPv3` message format (RFC 3412).
 //!
 //! V3 messages have a more complex structure than v1/v2c:
 //! ```text
@@ -16,8 +16,8 @@
 //! ```
 //!
 //! The msgData field is either:
-//! - A plaintext ScopedPDU (SEQUENCE) for noAuthNoPriv/authNoPriv
-//! - An encrypted OCTET STRING for authPriv (decrypts to ScopedPDU)
+//! - A plaintext `ScopedPDU` (SEQUENCE) for noAuthNoPriv/authNoPriv
+//! - An encrypted OCTET STRING for authPriv (decrypts to `ScopedPDU`)
 
 use bytes::Bytes;
 
@@ -26,7 +26,7 @@ use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::pdu::Pdu;
 
-/// SNMPv3 security model identifiers.
+/// `SNMPv3` security model identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum SecurityModel {
@@ -36,6 +36,7 @@ pub enum SecurityModel {
 
 impl SecurityModel {
     /// Create from raw value.
+    #[must_use] 
     pub fn from_i32(value: i32) -> Option<Self> {
         match value {
             3 => Some(Self::Usm),
@@ -44,12 +45,13 @@ impl SecurityModel {
     }
 
     /// Get the raw value.
+    #[must_use] 
     pub fn as_i32(self) -> i32 {
         self as i32
     }
 }
 
-/// SNMPv3 security level.
+/// `SNMPv3` security level.
 ///
 /// The variants are ordered from least secure to most secure,
 /// supporting VACM-style level comparisons (e.g., `actual >= required`).
@@ -65,6 +67,7 @@ pub enum SecurityLevel {
 
 impl SecurityLevel {
     /// Decode from msgFlags byte.
+    #[must_use] 
     pub fn from_flags(flags: u8) -> Option<Self> {
         let auth = flags & 0x01 != 0;
         let priv_ = flags & 0x02 != 0;
@@ -78,6 +81,7 @@ impl SecurityLevel {
     }
 
     /// Encode to msgFlags byte (without reportable flag).
+    #[must_use] 
     pub fn to_flags(self) -> u8 {
         match self {
             Self::NoAuthNoPriv => 0x00,
@@ -87,11 +91,13 @@ impl SecurityLevel {
     }
 
     /// Check if authentication is required.
+    #[must_use] 
     pub fn requires_auth(self) -> bool {
         matches!(self, Self::AuthNoPriv | Self::AuthPriv)
     }
 
     /// Check if privacy (encryption) is required.
+    #[must_use] 
     pub fn requires_priv(self) -> bool {
         matches!(self, Self::AuthPriv)
     }
@@ -122,6 +128,7 @@ pub struct MsgFlags {
 
 impl MsgFlags {
     /// Create new message flags.
+    #[must_use] 
     pub fn new(security_level: SecurityLevel, reportable: bool) -> Self {
         Self {
             security_level,
@@ -146,6 +153,7 @@ impl MsgFlags {
     }
 
     /// Encode to byte.
+    #[must_use] 
     pub fn to_byte(self) -> u8 {
         let mut flags = self.security_level.to_flags();
         if self.reportable {
@@ -170,6 +178,7 @@ pub struct MsgGlobalData {
 
 impl MsgGlobalData {
     /// Create new global data.
+    #[must_use] 
     pub fn new(msg_id: i32, msg_max_size: i32, msg_flags: MsgFlags) -> Self {
         Self {
             msg_id,
@@ -193,8 +202,8 @@ impl MsgGlobalData {
     /// Decode from decoder.
     ///
     /// Validates that:
-    /// - `msgID` is in range 0..2147483647 (RFC 3412 HeaderData)
-    /// - `msgMaxSize` is in range 484..2147483647 (RFC 3412 HeaderData)
+    /// - `msgID` is in range 0..2147483647 (RFC 3412 `HeaderData`)
+    /// - `msgMaxSize` is in range 484..2147483647 (RFC 3412 `HeaderData`)
     /// - `msgSecurityModel` is a known value (currently only USM=3)
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
         const MSG_MAX_SIZE_MINIMUM: i32 = 484;
@@ -287,6 +296,7 @@ impl ScopedPdu {
     }
 
     /// Create with empty context (most common case).
+    #[must_use] 
     pub fn with_empty_context(pdu: Pdu) -> Self {
         Self {
             context_engine_id: Bytes::new(),
@@ -327,14 +337,14 @@ impl ScopedPdu {
     }
 }
 
-/// SNMPv3 message.
+/// `SNMPv3` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V3Message {
     /// Global data (header)
     pub global_data: MsgGlobalData,
     /// Security parameters (opaque, USM-encoded)
     pub security_params: Bytes,
-    /// Message data - either plaintext ScopedPdu or encrypted bytes
+    /// Message data - either plaintext `ScopedPdu` or encrypted bytes
     pub data: V3MessageData,
 }
 
@@ -490,6 +500,7 @@ impl V3Message {
     ///
     /// This is sent to discover the engine ID and time of a remote SNMP engine.
     /// Uses empty security parameters and no authentication.
+    #[must_use] 
     pub fn discovery_request(msg_id: i32) -> Self {
         let global_data = MsgGlobalData::new(
             msg_id,

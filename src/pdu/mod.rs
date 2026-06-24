@@ -20,7 +20,7 @@ pub enum PduType {
     Response = 0xA2,
     /// SET request - modify OID values.
     SetRequest = 0xA3,
-    /// SNMPv1 trap - unsolicited notification from an agent.
+    /// `SNMPv1` trap - unsolicited notification from an agent.
     TrapV1 = 0xA4,
     /// GET-BULK request - efficient bulk retrieval of table data.
     GetBulkRequest = 0xA5,
@@ -28,12 +28,13 @@ pub enum PduType {
     InformRequest = 0xA6,
     /// SNMPv2c/v3 trap - unsolicited notification from an agent.
     TrapV2 = 0xA7,
-    /// Report - used in SNMPv3 for engine discovery and error reporting.
+    /// Report - used in `SNMPv3` for engine discovery and error reporting.
     Report = 0xA8,
 }
 
 impl PduType {
     /// Create from tag byte.
+    #[must_use]
     pub fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0xA0 => Some(Self::GetRequest),
@@ -50,6 +51,7 @@ impl PduType {
     }
 
     /// Get the tag byte.
+    #[must_use]
     pub fn tag(self) -> u8 {
         self as u8
     }
@@ -88,6 +90,7 @@ pub struct Pdu {
 
 impl Pdu {
     /// Create a new GET request PDU.
+    #[must_use]
     pub fn get_request(request_id: i32, oids: &[Oid]) -> Self {
         Self {
             pdu_type: PduType::GetRequest,
@@ -99,6 +102,7 @@ impl Pdu {
     }
 
     /// Create a new GETNEXT request PDU.
+    #[must_use]
     pub fn get_next_request(request_id: i32, oids: &[Oid]) -> Self {
         Self {
             pdu_type: PduType::GetNextRequest,
@@ -110,6 +114,7 @@ impl Pdu {
     }
 
     /// Create a new SET request PDU.
+    #[must_use]
     pub fn set_request(request_id: i32, varbinds: Vec<VarBind>) -> Self {
         Self {
             pdu_type: PduType::SetRequest,
@@ -123,10 +128,11 @@ impl Pdu {
     /// Create a SNMPv2c/v3 Trap PDU.
     ///
     /// Prepends the mandatory varbind prefix per RFC 3416 Section 4.2.6:
-    /// 1. sysUpTime.0 (1.3.6.1.2.1.1.3.0) with TimeTicks value
+    /// 1. sysUpTime.0 (1.3.6.1.2.1.1.3.0) with `TimeTicks` value
     /// 2. snmpTrapOID.0 (1.3.6.1.6.3.1.1.4.1.0) with the trap OID
     ///
     /// Caller-provided varbinds are appended after the prefix.
+    #[must_use]
     pub fn trap_v2(request_id: i32, uptime: u32, trap_oid: &Oid, varbinds: Vec<VarBind>) -> Self {
         let mut all_varbinds = Vec::with_capacity(2 + varbinds.len());
         all_varbinds.push(VarBind::new(
@@ -147,10 +153,11 @@ impl Pdu {
         }
     }
 
-    /// Create an InformRequest PDU.
+    /// Create an `InformRequest` PDU.
     ///
     /// Same varbind structure as `trap_v2` (sysUpTime.0 + snmpTrapOID.0 prefix),
-    /// but uses InformRequest PDU type which expects a Response from the receiver.
+    /// but uses `InformRequest` PDU type which expects a Response from the receiver.
+    #[must_use]
     pub fn inform_request(
         request_id: i32,
         uptime: u32,
@@ -178,7 +185,8 @@ impl Pdu {
 
     /// Create a GETBULK request PDU.
     ///
-    /// Note: For GETBULK, error_status holds non_repeaters and error_index holds max_repetitions.
+    /// Note: For GETBULK, `error_status` holds `non_repeaters` and `error_index` holds `max_repetitions`.
+    #[must_use]
     pub fn get_bulk(
         request_id: i32,
         non_repeaters: i32,
@@ -240,19 +248,22 @@ impl Pdu {
     }
 
     /// Check if this is an error response.
+    #[must_use]
     pub fn is_error(&self) -> bool {
         self.pdu_type == PduType::Response && self.error_status != 0
     }
 
     /// Get the error status as an enum.
+    #[must_use]
     pub fn error_status_enum(&self) -> ErrorStatus {
         ErrorStatus::from_i32(self.error_status)
     }
 
     /// Create a Response PDU from this PDU (for Inform handling).
     ///
-    /// The response copies the request_id and variable bindings,
-    /// sets error_status and error_index to 0, and changes the PDU type to Response.
+    /// The response copies the `request_id` and variable bindings,
+    /// sets `error_status` and `error_index` to 0, and changes the PDU type to Response.
+    #[must_use]
     pub fn to_response(&self) -> Self {
         Self {
             pdu_type: PduType::Response,
@@ -264,6 +275,7 @@ impl Pdu {
     }
 
     /// Create a Response PDU with specific error status.
+    #[must_use]
     pub fn to_error_response(&self, error_status: ErrorStatus, error_index: i32) -> Self {
         Self {
             pdu_type: PduType::Response,
@@ -274,26 +286,27 @@ impl Pdu {
         }
     }
 
-    /// Convert a v2 notification PDU to a v1 TrapV1Pdu (RFC 3584 Section 3.2).
+    /// Convert a v2 notification PDU to a v1 `TrapV1Pdu` (RFC 3584 Section 3.2).
     ///
     /// Extracts the v1 fields from the standard v2 notification varbind layout:
-    /// - sysUpTime.0 (first varbind) -> time_stamp
-    /// - snmpTrapOID.0 (second varbind) -> generic_trap, specific_trap, enterprise
-    /// - snmpTrapAddress.0 varbind (if present) -> agent_addr
+    /// - sysUpTime.0 (first varbind) -> `time_stamp`
+    /// - snmpTrapOID.0 (second varbind) -> `generic_trap`, `specific_trap`, enterprise
+    /// - snmpTrapAddress.0 varbind (if present) -> `agent_addr`
     /// - snmpTrapEnterprise.0 varbind (if present) -> enterprise (for standard traps)
     ///
     /// Per RFC 3584 Section 3.2: if any varbind is Counter64, the trap cannot be
     /// represented in v1 and `None` is returned.
     ///
-    /// The `default_addr` parameter provides the agent_addr when no
+    /// The `default_addr` parameter provides the `agent_addr` when no
     /// snmpTrapAddress.0 varbind is present (typically the local IP address,
     /// or `[0,0,0,0]` if unknown).
     ///
     /// Returns `None` if:
     /// - The PDU has fewer than 2 varbinds
-    /// - The first varbind is not TimeTicks
+    /// - The first varbind is not `TimeTicks`
     /// - The second varbind is not an OID
     /// - Any varbind contains a Counter64 value
+    #[must_use]
     pub fn to_v1_trap(&self, default_addr: [u8; 4]) -> Option<TrapV1Pdu> {
         use crate::notification::oids;
         use crate::value::Value;
@@ -316,10 +329,7 @@ impl Pdu {
             _ => return None,
         };
 
-        let trap_oid = match &self.varbinds[1].value {
-            Value::ObjectIdentifier(oid) => oid,
-            _ => return None,
-        };
+        let Value::ObjectIdentifier(trap_oid) = &self.varbinds[1].value else { return None };
 
         // Check for Counter64 in any varbind (RFC 3584 Section 3.2, rule 6)
         for vb in &self.varbinds {
@@ -401,6 +411,7 @@ impl Pdu {
     }
 
     /// Check if this is a notification PDU (Trap or Inform).
+    #[must_use]
     pub fn is_notification(&self) -> bool {
         matches!(
             self.pdu_type,
@@ -409,6 +420,7 @@ impl Pdu {
     }
 
     /// Check if this is a confirmed-class PDU (requires response).
+    #[must_use]
     pub fn is_confirmed(&self) -> bool {
         matches!(
             self.pdu_type,
@@ -421,7 +433,7 @@ impl Pdu {
     }
 }
 
-/// SNMPv1 generic trap types (RFC 1157 Section 4.1.6).
+/// `SNMPv1` generic trap types (RFC 1157 Section 4.1.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenericTrap {
     /// coldStart(0) - agent is reinitializing, config may change
@@ -436,7 +448,7 @@ pub enum GenericTrap {
     AuthenticationFailure,
     /// egpNeighborLoss(5) - EGP peer marked down
     EgpNeighborLoss,
-    /// enterpriseSpecific(6) - vendor-specific trap, see specific_trap field
+    /// enterpriseSpecific(6) - vendor-specific trap, see `specific_trap` field
     EnterpriseSpecific,
     /// An unrecognized generic trap value received on the wire.
     Unknown(i32),
@@ -459,6 +471,7 @@ impl std::fmt::Display for GenericTrap {
 
 impl GenericTrap {
     /// Create from integer value.
+    #[must_use]
     pub fn from_i32(v: i32) -> Self {
         match v {
             0 => Self::ColdStart,
@@ -473,6 +486,7 @@ impl GenericTrap {
     }
 
     /// Get the integer value.
+    #[must_use]
     pub fn as_i32(self) -> i32 {
         match self {
             Self::ColdStart => 0,
@@ -487,10 +501,10 @@ impl GenericTrap {
     }
 }
 
-/// SNMPv1 Trap PDU (RFC 1157 Section 4.1.6).
+/// `SNMPv1` Trap PDU (RFC 1157 Section 4.1.6).
 ///
 /// This PDU type has a completely different structure from other PDUs.
-/// It is only used in SNMPv1 and is replaced by SNMPv2-Trap in v2c/v3.
+/// It is only used in `SNMPv1` and is replaced by SNMPv2-Trap in v2c/v3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrapV1Pdu {
     /// Enterprise OID (sysObjectID of the entity generating the trap)
@@ -499,7 +513,7 @@ pub struct TrapV1Pdu {
     pub agent_addr: [u8; 4],
     /// Generic trap type
     pub generic_trap: GenericTrap,
-    /// Specific trap code (meaningful when generic_trap is enterpriseSpecific)
+    /// Specific trap code (meaningful when `generic_trap` is enterpriseSpecific)
     pub specific_trap: i32,
     /// Time since the network entity was last (re)initialized (in hundredths of seconds)
     pub time_stamp: u32,
@@ -508,7 +522,8 @@ pub struct TrapV1Pdu {
 }
 
 impl TrapV1Pdu {
-    /// Create a new SNMPv1 Trap PDU.
+    /// Create a new `SNMPv1` Trap PDU.
+    #[must_use]
     pub fn new(
         enterprise: Oid,
         agent_addr: [u8; 4],
@@ -528,19 +543,20 @@ impl TrapV1Pdu {
     }
 
     /// Check if this is an enterprise-specific trap.
+    #[must_use]
     pub fn is_enterprise_specific(&self) -> bool {
         self.generic_trap == GenericTrap::EnterpriseSpecific
     }
 
-    /// Convert to SNMPv2 trap OID (RFC 3584 Section 3).
+    /// Convert to `SNMPv2` trap OID (RFC 3584 Section 3).
     ///
-    /// RFC 3584 defines how to translate SNMPv1 trap information to SNMPv2
+    /// RFC 3584 defines how to translate `SNMPv1` trap information to `SNMPv2`
     /// snmpTrapOID.0 format:
     ///
     /// - For generic traps 0-5 (coldStart through egpNeighborLoss):
     ///   The trap OID is `snmpTraps.{generic_trap + 1}` (1.3.6.1.6.3.1.1.5.{1-6})
     ///
-    /// - For enterprise-specific traps (generic_trap = 6):
+    /// - For enterprise-specific traps (`generic_trap` = 6):
     ///   The trap OID is `enterprise.0.specific_trap`
     ///
     /// # Errors
@@ -608,7 +624,7 @@ impl TrapV1Pdu {
     /// (snmpTrapAddress.0, snmpTrapCommunity.0, snmpTrapEnterprise.0) are only
     /// appended when a proxy forwards a received trap.
     ///
-    /// The request_id is set to 0; callers should assign their own.
+    /// The `request_id` is set to 0; callers should assign their own.
     ///
     /// # Errors
     ///
@@ -740,6 +756,7 @@ pub struct GetBulkPdu {
 
 impl GetBulkPdu {
     /// Create a new GETBULK request.
+    #[must_use]
     pub fn new(request_id: i32, non_repeaters: i32, max_repetitions: i32, oids: &[Oid]) -> Self {
         Self {
             request_id,
@@ -804,7 +821,7 @@ mod tests {
 
     /// Test helper for encoding PDUs with arbitrary field values.
     ///
-    /// Unlike `Pdu`, this allows encoding invalid values (negative error_index,
+    /// Unlike `Pdu`, this allows encoding invalid values (negative `error_index`,
     /// out-of-bounds indices, etc.) for testing decoder validation.
     struct RawPdu {
         pdu_type: u8,
@@ -919,7 +936,7 @@ mod tests {
             [192, 168, 1, 1],             // agent address
             GenericTrap::LinkDown,
             0,
-            12345678, // time stamp
+            1234_5678, // time stamp
             vec![VarBind::new(
                 oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1),
                 Value::Integer(1),
@@ -937,7 +954,7 @@ mod tests {
         assert_eq!(decoded.agent_addr, [192, 168, 1, 1]);
         assert_eq!(decoded.generic_trap, GenericTrap::LinkDown);
         assert_eq!(decoded.specific_trap, 0);
-        assert_eq!(decoded.time_stamp, 12345678);
+        assert_eq!(decoded.time_stamp, 1234_5678);
         assert_eq!(decoded.varbinds.len(), 1);
     }
 
@@ -997,8 +1014,7 @@ mod tests {
             assert_eq!(
                 trap.v2_trap_oid().unwrap(),
                 expected_oid,
-                "Failed for {:?}",
-                generic_trap
+                "Failed for {generic_trap:?}"
             );
         }
     }
@@ -1173,8 +1189,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(&*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got {:?}",
-            err
+            "expected MalformedResponse, got {err:?}"
         );
     }
 
@@ -1190,8 +1205,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(&*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got {:?}",
-            err
+            "expected MalformedResponse, got {err:?}"
         );
     }
 
@@ -1566,8 +1580,7 @@ mod tests {
             let v1 = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
             assert_eq!(
                 v1.generic_trap, expected_generic,
-                "Failed for {:?}",
-                trap_oid
+                "Failed for {trap_oid:?}"
             );
             assert_eq!(v1.specific_trap, 0);
         }
