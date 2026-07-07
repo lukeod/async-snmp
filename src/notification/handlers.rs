@@ -312,24 +312,12 @@ impl super::NotificationReceiver {
                             timely
                         };
                         if !timely {
-                            let count = self.bump_not_in_time_windows();
-                            // The report goes out under the receiver's engine
-                            // ID, so it must be authenticated with the user's
-                            // key localized to that engine ID, not the remote
-                            // sender's.
-                            let report_key = user_config
-                                .derive_keys(&self.inner.engine_id)
-                                .ok()
-                                .and_then(|k| k.auth_key);
-                            self.send_usm_report(
-                                &msg,
-                                &usm_params,
-                                crate::v3::report_oids::not_in_time_windows(),
-                                count,
-                                report_key.as_ref(),
-                                source,
-                            )
-                            .await;
+                            // RFC 3414 Section 3.2 Step 7b: for a remote
+                            // authoritative engine this is a bare error
+                            // indication. usmStatsNotInTimeWindows and the
+                            // notInTimeWindows Report apply only to the
+                            // authoritative case (Step 7a); net-snmp counts
+                            // the local-reference branch only.
                             return Err(Error::Auth { target: source }.boxed());
                         }
                     }

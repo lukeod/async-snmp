@@ -1613,10 +1613,13 @@ mod tests {
         assert_eq!(receiver.usm_not_in_time_windows(), 1);
     }
 
-    /// RFC 3414 Section 3.2 Step 7b: a stale trap from a known remote engine
-    /// increments usmStatsNotInTimeWindows.
+    /// RFC 3414 Section 3.2 Step 7b: when the sender is the authoritative
+    /// engine, a timeliness failure is a bare error indication.
+    /// usmStatsNotInTimeWindows and its Report belong to the authoritative
+    /// case (Step 7a) only, matching net-snmp's
+    /// usm_check_and_update_timeliness.
     #[tokio::test]
-    async fn test_v3_trap_remote_stale_increments_not_in_time_windows() {
+    async fn test_v3_trap_remote_stale_not_counted() {
         let receiver = remote_trap_receiver().await;
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
@@ -1625,7 +1628,63 @@ mod tests {
 
         let stale = build_authed_v3_trap(b"remote-sender-engine", 7, 5_000);
         assert!(receiver.handle_v3(stale, source).await.is_err());
-        assert_eq!(receiver.usm_not_in_time_windows(), 1);
+        assert_eq!(receiver.usm_not_in_time_windows(), 0);
+    }
+
+    /// A stale inform under a remote sender's engine ID (Step 7b) gets no
+    /// notInTimeWindows Report even though its reportableFlag is set: the
+    /// receiver is not authoritative for that engine's clock.
+    #[tokio::test]
+    async fn test_v3_inform_remote_stale_gets_no_report() {
+        let receiver = remote_trap_receiver().await;
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let fresh = build_v3_notification(
+            crate::pdu::PduType::InformRequest,
+            b"remote-sender-engine",
+            7,
+            10_000,
+            b"trapuser",
+            Some((b"authpass12345678", AuthProtocol::Sha1)),
+        );
+        assert!(receiver
+            .handle_v3(fresh, client_addr)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Drain the inform acknowledgement.
+        let mut buf = vec![0u8; 4096];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected the inform response")
+        .unwrap();
+
+        let stale = build_v3_notification(
+            crate::pdu::PduType::InformRequest,
+            b"remote-sender-engine",
+            7,
+            5_000,
+            b"trapuser",
+            Some((b"authpass12345678", AuthProtocol::Sha1)),
+        );
+        assert!(receiver.handle_v3(stale, client_addr).await.is_err());
+        assert_eq!(receiver.usm_not_in_time_windows(), 0);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "no Report may be sent for a Step 7b timeliness failure"
+        );
     }
 
     /// Build an authPriv V3 trap for the given username, HMAC'd with the
