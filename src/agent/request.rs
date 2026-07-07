@@ -550,8 +550,63 @@ mod tests {
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let result = agent.handle_v3(msg, source).await.unwrap();
-        assert!(result.is_some());
+        let report = result.expect("a reportable authPriv request must produce a Report");
         assert_eq!(agent.usm_unsupported_sec_levels(), 1);
         assert_eq!(agent.usm_wrong_digests(), 0);
+
+        // Pin the emitted report varbind to usmStatsUnsupportedSecLevels and
+        // Counter32(1): the counter increment and the report OID are separate
+        // arguments, so the counter assertions above would still pass if the
+        // OID were swapped for a sibling (e.g. wrongDigests).
+        let decoded = V3Message::decode(report).unwrap();
+        let pdu = decoded.pdu().expect("report carries a PDU");
+        assert_eq!(pdu.pdu_type, PduType::Report);
+        let vb = &pdu.varbinds[0];
+        assert_eq!(vb.oid, crate::v3::report_oids::unsupported_sec_levels());
+        assert_eq!(vb.value, Value::Counter32(1));
+    }
+
+    /// RFC 3414 Section 3.2 orders Step 5 before Step 7: even when engine boots
+    /// is latched at maximum (the Section 2.3 rejection that otherwise returns
+    /// usmStatsNotInTimeWindows), an authPriv request for a user without a
+    /// privacy key is still reported as usmStatsUnsupportedSecLevels. Pins the
+    /// Step-5-before-latched-boots ordering, which the boots-normal test above
+    /// does not exercise.
+    #[tokio::test]
+    async fn test_v3_authpriv_for_auth_only_user_reported_before_latched_boots() {
+        use crate::v3::AuthProtocol;
+
+        let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("trapuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+        // Latch engine boots so the Section 2.3 notInTimeWindows rejection
+        // would fire first if Step 5 did not precede it.
+        agent
+            .inner
+            .state
+            .engine_boots
+            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+
+        let msg = build_authpriv_bad_hmac(&engine_id, b"trapuser", b"wrong-password-1234");
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let report = agent
+            .handle_v3(msg, source)
+            .await
+            .unwrap()
+            .expect("a reportable request must produce a Report");
+        assert_eq!(agent.usm_unsupported_sec_levels(), 1);
+        assert_eq!(agent.usm_not_in_time_windows(), 0);
+
+        let decoded = V3Message::decode(report).unwrap();
+        let vb = &decoded.pdu().unwrap().varbinds[0];
+        assert_eq!(vb.oid, crate::v3::report_oids::unsupported_sec_levels());
     }
 }
