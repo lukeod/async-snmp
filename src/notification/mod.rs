@@ -283,6 +283,11 @@ impl NotificationReceiverBuilder {
                 engine_boots_base: self.engine_boots,
                 engine_start: Instant::now(),
                 usm_unknown_engine_ids: AtomicU32::new(0),
+                usm_unknown_usernames: AtomicU32::new(0),
+                usm_wrong_digests: AtomicU32::new(0),
+                usm_not_in_time_windows: AtomicU32::new(0),
+                usm_unsupported_sec_levels: AtomicU32::new(0),
+                usm_decryption_errors: AtomicU32::new(0),
                 remote_engines: Mutex::new(HashMap::new()),
             }),
         })
@@ -503,6 +508,16 @@ struct ReceiverInner {
     engine_start: Instant,
     /// usmStatsUnknownEngineIDs counter
     usm_unknown_engine_ids: AtomicU32,
+    /// usmStatsUnknownUserNames counter
+    usm_unknown_usernames: AtomicU32,
+    /// usmStatsWrongDigests counter
+    usm_wrong_digests: AtomicU32,
+    /// usmStatsNotInTimeWindows counter
+    usm_not_in_time_windows: AtomicU32,
+    /// usmStatsUnsupportedSecLevels counter
+    usm_unsupported_sec_levels: AtomicU32,
+    /// usmStatsDecryptionErrors counter
+    usm_decryption_errors: AtomicU32,
     /// Timeliness state for remote authoritative engines (trap senders),
     /// keyed by engine ID (RFC 3414 Section 2.3). Seeded from the first
     /// authenticated message from each engine, so only holders of configured
@@ -578,6 +593,11 @@ impl NotificationReceiver {
                 engine_boots_base: 1,
                 engine_start: Instant::now(),
                 usm_unknown_engine_ids: AtomicU32::new(0),
+                usm_unknown_usernames: AtomicU32::new(0),
+                usm_wrong_digests: AtomicU32::new(0),
+                usm_not_in_time_windows: AtomicU32::new(0),
+                usm_unsupported_sec_levels: AtomicU32::new(0),
+                usm_decryption_errors: AtomicU32::new(0),
                 remote_engines: Mutex::new(HashMap::new()),
             }),
         })
@@ -599,6 +619,38 @@ impl NotificationReceiver {
     #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
         self.inner.usm_unknown_engine_ids.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsUnknownUserNames counter value.
+    #[must_use]
+    pub fn usm_unknown_usernames(&self) -> u32 {
+        self.inner.usm_unknown_usernames.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsWrongDigests counter value.
+    #[must_use]
+    pub fn usm_wrong_digests(&self) -> u32 {
+        self.inner.usm_wrong_digests.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsNotInTimeWindows counter value.
+    #[must_use]
+    pub fn usm_not_in_time_windows(&self) -> u32 {
+        self.inner.usm_not_in_time_windows.load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsUnsupportedSecLevels counter value.
+    #[must_use]
+    pub fn usm_unsupported_sec_levels(&self) -> u32 {
+        self.inner
+            .usm_unsupported_sec_levels
+            .load(Ordering::Relaxed)
+    }
+
+    /// Get the usmStatsDecryptionErrors counter value.
+    #[must_use]
+    pub fn usm_decryption_errors(&self) -> u32 {
+        self.inner.usm_decryption_errors.load(Ordering::Relaxed)
     }
 
     /// Receive a notification.
@@ -901,7 +953,10 @@ mod tests {
         } else {
             SecurityLevel::NoAuthNoPriv
         };
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(level, false));
+        // Informs are Confirmed Class and are sent with the reportableFlag
+        // set; traps are Unconfirmed Class and are not (RFC 3412 Section 6.4).
+        let reportable = pdu_type == crate::pdu::PduType::InformRequest;
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(level, reportable));
 
         let mut usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
@@ -1434,5 +1489,340 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receiver.engine_id(), b"custom-engine");
+    }
+
+    #[tokio::test]
+    async fn test_usm_counter_accessors_default_zero() {
+        let receiver = remote_trap_receiver().await;
+        assert_eq!(receiver.usm_unknown_engine_ids(), 0);
+        assert_eq!(receiver.usm_unknown_usernames(), 0);
+        assert_eq!(receiver.usm_wrong_digests(), 0);
+        assert_eq!(receiver.usm_not_in_time_windows(), 0);
+        assert_eq!(receiver.usm_unsupported_sec_levels(), 0);
+        assert_eq!(receiver.usm_decryption_errors(), 0);
+    }
+
+    /// RFC 3414 Section 3.2 Step 6: a failed HMAC increments
+    /// usmStatsWrongDigests.
+    #[tokio::test]
+    async fn test_v3_trap_wrong_digest_increments_counter() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_v3_notification(
+            crate::pdu::PduType::TrapV2,
+            b"remote-sender-engine",
+            7,
+            123_456,
+            b"trapuser",
+            Some((b"wrong-password-1234", AuthProtocol::Sha1)),
+        );
+        assert!(receiver.handle_v3(msg, source).await.is_err());
+        assert_eq!(receiver.usm_wrong_digests(), 1);
+    }
+
+    /// RFC 3414 Section 3.2 Step 4: an authenticated message for a user not
+    /// in the local configuration increments usmStatsUnknownUserNames.
+    #[tokio::test]
+    async fn test_v3_trap_unknown_user_increments_counter() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_v3_notification(
+            crate::pdu::PduType::TrapV2,
+            b"remote-sender-engine",
+            7,
+            123_456,
+            b"nosuchuser",
+            Some((b"authpass12345678", AuthProtocol::Sha1)),
+        );
+        let result = receiver.handle_v3(msg, source).await.unwrap();
+        assert!(result.is_none(), "unknown user must not be delivered");
+        assert_eq!(receiver.usm_unknown_usernames(), 1);
+        assert_eq!(receiver.usm_wrong_digests(), 0);
+    }
+
+    /// RFC 3414 Section 3.2 Step 5: an authenticated message for a user
+    /// configured without an auth key increments
+    /// usmStatsUnsupportedSecLevels.
+    #[tokio::test]
+    async fn test_v3_trap_user_without_auth_key_increments_counter() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .usm_user("plainuser", |u| u)
+            .build()
+            .await
+            .unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_v3_notification(
+            crate::pdu::PduType::TrapV2,
+            b"remote-sender-engine",
+            7,
+            123_456,
+            b"plainuser",
+            Some((b"authpass12345678", AuthProtocol::Sha1)),
+        );
+        let result = receiver.handle_v3(msg, source).await.unwrap();
+        assert!(result.is_none());
+        assert_eq!(receiver.usm_unsupported_sec_levels(), 1);
+        assert_eq!(receiver.usm_unknown_usernames(), 0);
+    }
+
+    /// RFC 3414 Section 3.2 Step 7a: an inform under the receiver's engine ID
+    /// outside the time window increments usmStatsNotInTimeWindows.
+    #[tokio::test]
+    async fn test_v3_inform_time_window_failure_increments_counter() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"test-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_authed_v3_inform(
+            b"test-engine",
+            1,
+            5000,
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+        assert!(receiver.handle_v3(msg, source).await.is_err());
+        assert_eq!(receiver.usm_not_in_time_windows(), 1);
+    }
+
+    /// RFC 3414 Section 3.2 Step 7b: a stale trap from a known remote engine
+    /// increments usmStatsNotInTimeWindows.
+    #[tokio::test]
+    async fn test_v3_trap_remote_stale_increments_not_in_time_windows() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let fresh = build_authed_v3_trap(b"remote-sender-engine", 7, 10_000);
+        assert!(receiver.handle_v3(fresh, source).await.unwrap().is_some());
+
+        let stale = build_authed_v3_trap(b"remote-sender-engine", 7, 5_000);
+        assert!(receiver.handle_v3(stale, source).await.is_err());
+        assert_eq!(receiver.usm_not_in_time_windows(), 1);
+    }
+
+    /// Build an authPriv V3 trap with a valid HMAC but undecryptable privacy
+    /// parameters (wrong salt length), for the given user credentials.
+    fn build_v3_trap_bad_ciphertext(engine_id: &[u8]) -> Bytes {
+        use crate::message::{MsgFlags, MsgGlobalData, V3Message};
+        use crate::v3::auth::authenticate_message;
+        use crate::v3::{LocalizedKey, UsmSecurityParams};
+
+        let auth_key =
+            LocalizedKey::from_password(AuthProtocol::Sha1, b"authpass12345678", engine_id)
+                .unwrap();
+
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthPriv, false));
+        let usm_params = UsmSecurityParams::new(
+            Bytes::copy_from_slice(engine_id),
+            7,
+            123_456,
+            Bytes::from_static(b"privuser"),
+        )
+        .with_auth_placeholder(auth_key.mac_len())
+        .with_priv_params(Bytes::from_static(b"bad"));
+
+        let msg = V3Message::new_encrypted(
+            global,
+            usm_params.encode(),
+            Bytes::from_static(b"not-a-valid-ciphertext"),
+        );
+        let mut msg_bytes = msg.encode().to_vec();
+        let (auth_offset, auth_len) =
+            UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
+        authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
+        Bytes::from(msg_bytes)
+    }
+
+    /// RFC 3414 Section 3.2 Step 8: a decryption failure increments
+    /// usmStatsDecryptionErrors.
+    #[tokio::test]
+    async fn test_v3_decryption_error_increments_counter() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .usm_user("privuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+                    .privacy(crate::v3::PrivProtocol::Aes128, b"privpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_v3_trap_bad_ciphertext(b"remote-sender-engine");
+        assert!(receiver.handle_v3(msg, source).await.is_err());
+        assert_eq!(receiver.usm_decryption_errors(), 1);
+    }
+
+    /// A USM-failed inform (Confirmed Class, reportableFlag set) gets a
+    /// Report back (RFC 3412 Section 7.1 Step 3). The notInTimeWindows
+    /// report carries the receiver's engine ID/boots/time for time
+    /// resynchronization and is authenticated at authNoPriv
+    /// (RFC 3414 Section 3.2 Step 7).
+    #[tokio::test]
+    async fn test_v3_failed_inform_gets_authenticated_time_window_report() {
+        use crate::message::V3Message;
+        use crate::v3::auth::verify_message;
+        use crate::v3::{LocalizedKey, UsmSecurityParams};
+
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"test-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let msg = build_authed_v3_inform(
+            b"test-engine",
+            1,
+            5000, // outside the 150s window
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+        assert!(receiver.handle_v3(msg, client_addr).await.is_err());
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected a Report in response to the failed inform")
+        .unwrap();
+        let report_bytes = Bytes::copy_from_slice(&buf[..len]);
+
+        let report = V3Message::decode(report_bytes.clone()).unwrap();
+        assert_eq!(
+            report.global_data.msg_flags.security_level,
+            SecurityLevel::AuthNoPriv,
+            "notInTimeWindows report must be authenticated (authNoPriv)"
+        );
+        assert!(!report.global_data.msg_flags.reportable);
+
+        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        assert_eq!(report_usm.engine_id.as_ref(), b"test-engine");
+
+        // The HMAC must verify with the user's key localized to the
+        // receiver's engine ID.
+        let key =
+            LocalizedKey::from_password(AuthProtocol::Sha1, b"authpass12345678", b"test-engine")
+                .unwrap();
+        let (auth_offset, auth_len) =
+            UsmSecurityParams::find_auth_params_offset(&report_bytes).unwrap();
+        assert!(verify_message(&key, &report_bytes, auth_offset, auth_len).unwrap());
+
+        let scoped = report.scoped_pdu().expect("report should be plaintext");
+        assert_eq!(scoped.pdu.pdu_type, crate::pdu::PduType::Report);
+        assert_eq!(
+            scoped.pdu.varbinds[0].oid,
+            crate::v3::report_oids::not_in_time_windows()
+        );
+    }
+
+    /// A USM-failed inform for an unknown user gets an unauthenticated
+    /// Report (no key exists to authenticate it with).
+    #[tokio::test]
+    async fn test_v3_failed_inform_unknown_user_gets_noauth_report() {
+        use crate::message::V3Message;
+        use crate::v3::UsmSecurityParams;
+
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"test-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let msg = build_authed_v3_inform(
+            b"test-engine",
+            1,
+            0,
+            b"nosuchuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+        let result = receiver.handle_v3(msg, client_addr).await.unwrap();
+        assert!(result.is_none());
+        assert_eq!(receiver.usm_unknown_usernames(), 1);
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected a Report in response to the failed inform")
+        .unwrap();
+
+        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        assert_eq!(
+            report.global_data.msg_flags.security_level,
+            SecurityLevel::NoAuthNoPriv
+        );
+        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        assert_eq!(report_usm.engine_id.as_ref(), b"test-engine");
+        let scoped = report.scoped_pdu().expect("report should be plaintext");
+        assert_eq!(scoped.pdu.pdu_type, crate::pdu::PduType::Report);
+        assert_eq!(
+            scoped.pdu.varbinds[0].oid,
+            crate::v3::report_oids::unknown_user_names()
+        );
+    }
+
+    /// A USM-failed trap must NOT get a Report: traps are Unconfirmed Class
+    /// and carry reportableFlag=0 (RFC 3412 Sections 6.4 and 7.1 Step 3).
+    #[tokio::test]
+    async fn test_v3_failed_trap_gets_no_report() {
+        let receiver = remote_trap_receiver().await;
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let msg = build_v3_notification(
+            crate::pdu::PduType::TrapV2,
+            b"remote-sender-engine",
+            7,
+            123_456,
+            b"trapuser",
+            Some((b"wrong-password-1234", AuthProtocol::Sha1)),
+        );
+        assert!(receiver.handle_v3(msg, client_addr).await.is_err());
+        assert_eq!(receiver.usm_wrong_digests(), 1);
+
+        let mut buf = vec![0u8; 4096];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.recv_from(&mut buf),
+        )
+        .await;
+        assert!(result.is_err(), "no Report may be sent for a failed trap");
     }
 }

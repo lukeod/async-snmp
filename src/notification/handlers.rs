@@ -14,9 +14,10 @@ use crate::error::{Error, Result};
 use crate::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
+use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::v3::auth::{authenticate_message, verify_message};
-use crate::v3::{EngineState, MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
+use crate::v3::{EngineState, LocalizedKey, MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
 use crate::value::Value;
 use crate::varbind::VarBind;
 
@@ -153,6 +154,17 @@ impl super::NotificationReceiver {
                         .map_err(|_| Error::Auth { target: source }.boxed())?
                     {
                         tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "V3 authentication failed");
+                        let count =
+                            self.inner.usm_wrong_digests.fetch_add(1, Ordering::Relaxed) + 1;
+                        self.send_usm_report(
+                            &msg,
+                            &usm_params,
+                            crate::v3::report_oids::wrong_digests(),
+                            count,
+                            None,
+                            source,
+                        )
+                        .await;
                         return Err(Error::Auth { target: source }.boxed());
                     }
                     tracing::trace!(target: "async_snmp::notification", { snmp.source = %source }, "V3 authentication verified");
@@ -166,14 +178,36 @@ impl super::NotificationReceiver {
                         let (our_boots, our_time) =
                             compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
 
-                        // When boots is latched at MAX_ENGINE_TIME, reject all authenticated messages
+                        // When boots is latched at MAX_ENGINE_TIME, reject all authenticated messages.
+                        // The report is unauthenticated: a latched engine must not
+                        // authenticate further messages (RFC 3414 Section 2.3).
                         if our_boots == MAX_ENGINE_TIME {
                             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated notification");
+                            let count = self.bump_not_in_time_windows();
+                            self.send_usm_report(
+                                &msg,
+                                &usm_params,
+                                crate::v3::report_oids::not_in_time_windows(),
+                                count,
+                                None,
+                                source,
+                            )
+                            .await;
                             return Err(Error::Auth { target: source }.boxed());
                         }
 
                         if usm_params.engine_boots != our_boots {
                             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.our_boots = our_boots }, "V3 notification engine boots mismatch");
+                            let count = self.bump_not_in_time_windows();
+                            self.send_usm_report(
+                                &msg,
+                                &usm_params,
+                                crate::v3::report_oids::not_in_time_windows(),
+                                count,
+                                keys.auth_key.as_ref(),
+                                source,
+                            )
+                            .await;
                             return Err(Error::Auth { target: source }.boxed());
                         }
 
@@ -181,6 +215,16 @@ impl super::NotificationReceiver {
                             (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
                         if time_diff > i64::from(TIME_WINDOW) {
                             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_time = usm_params.engine_time, snmp.our_time = our_time }, "V3 notification outside time window");
+                            let count = self.bump_not_in_time_windows();
+                            self.send_usm_report(
+                                &msg,
+                                &usm_params,
+                                crate::v3::report_oids::not_in_time_windows(),
+                                count,
+                                keys.auth_key.as_ref(),
+                                source,
+                            )
+                            .await;
                             return Err(Error::Auth { target: source }.boxed());
                         }
                     } else {
@@ -192,42 +236,82 @@ impl super::NotificationReceiver {
                         // Copy the engine ID out of the received datagram so a
                         // stored entry does not pin the whole packet buffer.
                         let engine_key = Bytes::copy_from_slice(&engine_id);
-                        let mut engines = self
-                            .inner
-                            .remote_engines
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        // Bound the table: a peer holding one credential can
-                        // authenticate under arbitrarily many fabricated engine
-                        // IDs, so evict the least-recently-updated engine when
-                        // full before seeding a new one.
-                        if !engines.contains_key(&engine_key)
-                            && engines.len() >= super::MAX_REMOTE_ENGINES
-                            && let Some(oldest) = engines
-                                .iter()
-                                .min_by_key(|(_, s)| s.synced_at)
-                                .map(|(k, _)| k.clone())
-                        {
-                            engines.remove(&oldest);
-                        }
-                        let state = engines.entry(engine_key).or_insert_with_key(|k| {
-                            EngineState::new(
-                                k.clone(),
+                        // Scoped so the lock is released before any await.
+                        let timely = {
+                            let mut engines = self
+                                .inner
+                                .remote_engines
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            // Bound the table: a peer holding one credential can
+                            // authenticate under arbitrarily many fabricated engine
+                            // IDs, so evict the least-recently-updated engine when
+                            // full before seeding a new one.
+                            if !engines.contains_key(&engine_key)
+                                && engines.len() >= super::MAX_REMOTE_ENGINES
+                                && let Some(oldest) = engines
+                                    .iter()
+                                    .min_by_key(|(_, s)| s.synced_at)
+                                    .map(|(k, _)| k.clone())
+                            {
+                                engines.remove(&oldest);
+                            }
+                            let state = engines.entry(engine_key).or_insert_with_key(|k| {
+                                EngineState::new(
+                                    k.clone(),
+                                    usm_params.engine_boots,
+                                    usm_params.engine_time,
+                                )
+                            });
+                            let timely = state.check_and_update_timeliness(
                                 usm_params.engine_boots,
                                 usm_params.engine_time,
+                            );
+                            if !timely {
+                                tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = state.engine_boots, snmp.our_time = state.estimated_time() }, "V3 notification outside time window");
+                            }
+                            timely
+                        };
+                        if !timely {
+                            let count = self.bump_not_in_time_windows();
+                            // The report goes out under the receiver's engine
+                            // ID, so it must be authenticated with the user's
+                            // key localized to that engine ID, not the remote
+                            // sender's.
+                            let report_key = user_config
+                                .and_then(|u| u.derive_keys(&self.inner.engine_id).ok())
+                                .and_then(|k| k.auth_key);
+                            self.send_usm_report(
+                                &msg,
+                                &usm_params,
+                                crate::v3::report_oids::not_in_time_windows(),
+                                count,
+                                report_key.as_ref(),
+                                source,
                             )
-                        });
-                        if !state.check_and_update_timeliness(
-                            usm_params.engine_boots,
-                            usm_params.engine_time,
-                        ) {
-                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = state.engine_boots, snmp.our_time = state.estimated_time() }, "V3 notification outside time window");
+                            .await;
                             return Err(Error::Auth { target: source }.boxed());
                         }
                     }
                 }
                 _ => {
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received authenticated V3 message but no credentials configured for user");
+                    // RFC 3414 Section 3.2: Step 4 (unknown user) vs Step 5
+                    // (user exists but cannot meet the requested level).
+                    let (counter, report_oid) = if user_config.is_none() {
+                        (
+                            &self.inner.usm_unknown_usernames,
+                            crate::v3::report_oids::unknown_user_names(),
+                        )
+                    } else {
+                        (
+                            &self.inner.usm_unsupported_sec_levels,
+                            crate::v3::report_oids::unsupported_sec_levels(),
+                        )
+                    };
+                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.send_usm_report(&msg, &usm_params, report_oid, count, None, source)
+                        .await;
                     return Ok(None);
                 }
             }
@@ -246,23 +330,53 @@ impl super::NotificationReceiver {
                         }
                     };
 
-                    let decrypted = priv_key
-                        .decrypt(
-                            encrypted_data,
-                            usm_params.engine_boots,
-                            usm_params.engine_time,
-                            &usm_params.priv_params,
-                        )
-                        .map_err(|e| {
+                    let decrypted = priv_key.decrypt(
+                        encrypted_data,
+                        usm_params.engine_boots,
+                        usm_params.engine_time,
+                        &usm_params.priv_params,
+                    );
+                    let decrypted = match decrypted {
+                        Ok(data) => data,
+                        Err(e) => {
                             tracing::debug!(target: "async_snmp::notification", { source = %source, error = %e }, "decryption failed");
-                            Error::Auth { target: source }.boxed()
-                        })?;
+                            let count = self
+                                .inner
+                                .usm_decryption_errors
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            self.send_usm_report(
+                                &msg,
+                                &usm_params,
+                                crate::v3::report_oids::decryption_errors(),
+                                count,
+                                None,
+                                source,
+                            )
+                            .await;
+                            return Err(Error::Auth { target: source }.boxed());
+                        }
+                    };
 
                     let mut decoder = Decoder::with_target(decrypted, source);
                     ScopedPdu::decode(&mut decoder)?
                 }
                 _ => {
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received encrypted V3 message but no privacy key configured for user");
+                    let count = self
+                        .inner
+                        .usm_unsupported_sec_levels
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    self.send_usm_report(
+                        &msg,
+                        &usm_params,
+                        crate::v3::report_oids::unsupported_sec_levels(),
+                        count,
+                        None,
+                        source,
+                    )
+                    .await;
                     return Ok(None);
                 }
             }
@@ -394,6 +508,96 @@ impl super::NotificationReceiver {
 
         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent discovery response");
         Ok(None)
+    }
+
+    fn bump_not_in_time_windows(&self) -> u32 {
+        self.inner
+            .usm_not_in_time_windows
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    /// Send a Report PDU for a USM processing failure, best-effort.
+    ///
+    /// Per RFC 3412 Section 7.1 Step 3 a Report may only be sent when the PDU
+    /// is Confirmed Class or, when the PDU class cannot be determined (the
+    /// case here: the message failed USM processing), when the reportableFlag
+    /// is set. Informs are sent with the flag set and traps without, so this
+    /// answers USM-failed informs while staying silent for traps.
+    ///
+    /// With `auth_key` (localized to the receiver's engine ID) the report is
+    /// sent authenticated at authNoPriv, as RFC 3414 Section 3.2 Step 7
+    /// requires for notInTimeWindows reports so the sender can trust the
+    /// boots/time for resynchronization. Otherwise it is sent noAuthNoPriv.
+    ///
+    /// Send failures are logged and swallowed: the caller is already on a
+    /// failure path and the report is advisory.
+    async fn send_usm_report(
+        &self,
+        msg: &V3Message,
+        usm_params: &UsmSecurityParams,
+        report_oid: Oid,
+        count: u32,
+        auth_key: Option<&LocalizedKey>,
+        source: SocketAddr,
+    ) {
+        if !msg.global_data.msg_flags.reportable {
+            return;
+        }
+
+        let total_secs = self.inner.engine_start.elapsed().as_secs();
+        let (boots, time) = compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+
+        let report_pdu = Pdu {
+            pdu_type: PduType::Report,
+            request_id: msg.global_data.msg_id,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(report_oid, Value::Counter32(count))],
+        };
+
+        let security_level = if auth_key.is_some() {
+            SecurityLevel::AuthNoPriv
+        } else {
+            SecurityLevel::NoAuthNoPriv
+        };
+        let response_global = MsgGlobalData::new(
+            msg.global_data.msg_id,
+            msg.global_data.msg_max_size,
+            MsgFlags::new(security_level, false),
+        );
+        let mut response_usm = UsmSecurityParams::new(
+            self.inner.engine_id.clone(),
+            boots,
+            time,
+            usm_params.username.clone(),
+        );
+        if let Some(key) = auth_key {
+            response_usm = response_usm.with_auth_placeholder(key.mac_len());
+        }
+        let response_scoped =
+            ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
+        let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
+        let mut response_bytes = response_msg.encode().to_vec();
+
+        if let Some(key) = auth_key {
+            let Some((auth_offset, auth_len)) =
+                UsmSecurityParams::find_auth_params_offset(&response_bytes)
+            else {
+                tracing::debug!(target: "async_snmp::notification", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in USM report");
+                return;
+            };
+            if let Err(e) = authenticate_message(key, &mut response_bytes, auth_offset, auth_len) {
+                tracing::debug!(target: "async_snmp::notification", { error = %e }, "failed to authenticate USM report");
+                return;
+            }
+        }
+
+        if let Err(e) = self.inner.socket.send_to(&response_bytes, source).await {
+            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to send USM report");
+        } else {
+            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent USM report");
+        }
     }
 }
 
