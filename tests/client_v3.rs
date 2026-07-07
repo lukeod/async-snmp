@@ -129,6 +129,147 @@ async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
     );
 }
 
+/// A client whose cached engineBoots is AHEAD of the agent's cannot resync:
+/// the authenticated notInTimeWindows Report carries a lower boots value, and
+/// `EngineState::update_time` never moves boots backwards (RFC 3414
+/// Section 2.3). Each retry resends the same stale boots, so the client
+/// exhausts its attempts and surfaces an auth error, with the agent counting
+/// one rejection per attempt.
+#[tokio::test]
+async fn v3_engine_boots_ahead_of_agent_exhausts_retries() {
+    use async_snmp::v3::{EngineCache, EngineState};
+    use std::sync::Arc;
+
+    let agent = TestAgentBuilder::new()
+        .usm_user(V3User::auth_only(
+            b"authuser".to_vec(),
+            AuthProtocol::Sha256,
+            AUTH_PASS.as_bytes().to_vec(),
+        ))
+        .build()
+        .await;
+
+    let cache = Arc::new(EngineCache::new());
+    let client = Client::builder(
+        agent.addr().to_string(),
+        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+    )
+    .engine_cache(cache.clone())
+    .connect()
+    .await
+    .unwrap();
+
+    // Discover and authenticate normally, seeding the shared cache.
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(agent.agent().usm_not_in_time_windows(), 0);
+
+    // Raise the cached boots value above the agent's; time stays within the
+    // window. The Report's lower boots cannot resync the client.
+    let good = cache.get(&agent.addr()).expect("cache seeded");
+    cache.insert(
+        agent.addr(),
+        EngineState::new(
+            good.engine_id.clone(),
+            good.engine_boots + 1,
+            good.estimated_time(),
+        ),
+    );
+
+    let client2 = Client::builder(
+        agent.addr().to_string(),
+        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+    )
+    .engine_cache(cache.clone())
+    .retry(Retry::fixed(2, Duration::ZERO))
+    .connect()
+    .await
+    .unwrap();
+
+    let err = client2
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .expect_err("boots ahead of the agent must not succeed");
+    assert!(matches!(*err, Error::Auth { .. }), "got {err:?}");
+
+    // max_attempts = 2 means 3 transmissions, each rejected and counted.
+    assert_eq!(
+        agent.agent().usm_not_in_time_windows(),
+        3,
+        "agent must count one rejection per attempt"
+    );
+
+    // The client must not have regressed its cached boots to the Report's
+    // lower value.
+    let cached = cache.get(&agent.addr()).expect("cache entry present");
+    assert_eq!(cached.engine_boots, good.engine_boots + 1);
+}
+
+/// Same resync scenario as above but over an authPriv session: the agent's
+/// Step 7a Report is plaintext at authNoPriv (RFC 3414 Section 3.2 Step 7a),
+/// and the client must still verify it, resync, and succeed on retry with
+/// re-encrypted boots/time.
+#[tokio::test]
+async fn v3_wrong_engine_boots_resync_auth_priv() {
+    use async_snmp::v3::{EngineCache, EngineState};
+    use std::sync::Arc;
+
+    let agent = TestAgentBuilder::new()
+        .usm_user(V3User::auth_priv(
+            b"authprivuser".to_vec(),
+            AuthProtocol::Sha256,
+            AUTH_PASS.as_bytes().to_vec(),
+            PrivProtocol::Aes128,
+            PRIV_PASS.as_bytes().to_vec(),
+        ))
+        .build()
+        .await;
+
+    let cache = Arc::new(EngineCache::new());
+    let client = Client::builder(
+        agent.addr().to_string(),
+        Auth::usm("authprivuser")
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+    )
+    .engine_cache(cache.clone())
+    .connect()
+    .await
+    .unwrap();
+
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(agent.agent().usm_not_in_time_windows(), 0);
+
+    let good = cache.get(&agent.addr()).expect("cache seeded");
+    assert!(good.engine_boots > 0, "agent boots must be nonzero");
+    cache.insert(
+        agent.addr(),
+        EngineState::new(
+            good.engine_id.clone(),
+            good.engine_boots - 1,
+            good.estimated_time(),
+        ),
+    );
+
+    let client2 = Client::builder(
+        agent.addr().to_string(),
+        Auth::usm("authprivuser")
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+    )
+    .engine_cache(cache)
+    .connect()
+    .await
+    .unwrap();
+
+    let result = client2
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .expect("authPriv client must resync from the authNoPriv Report and retry");
+    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+
+    assert_eq!(agent.agent().usm_not_in_time_windows(), 1);
+}
+
 /// V3 authPriv with SHA-256 and AES-128.
 #[tokio::test]
 async fn v3_auth_priv_sha256_aes128() {
