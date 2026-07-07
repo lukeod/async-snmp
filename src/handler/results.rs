@@ -102,13 +102,13 @@ pub enum SetResult {
 
 impl SetResult {
     /// Check if this result indicates success.
-    #[must_use] 
+    #[must_use]
     pub fn is_ok(&self) -> bool {
         matches!(self, SetResult::Ok)
     }
 
     /// Convert to an `ErrorStatus` code.
-    #[must_use] 
+    #[must_use]
     pub fn to_error_status(&self) -> ErrorStatus {
         match self {
             SetResult::Ok => ErrorStatus::NoError,
@@ -143,7 +143,7 @@ pub struct Response {
 
 impl Response {
     /// Create a successful response with the given varbinds.
-    #[must_use] 
+    #[must_use]
     pub fn success(varbinds: Vec<VarBind>) -> Self {
         Self {
             varbinds,
@@ -153,7 +153,7 @@ impl Response {
     }
 
     /// Create an error response.
-    #[must_use] 
+    #[must_use]
     pub fn error(error_status: ErrorStatus, error_index: i32, varbinds: Vec<VarBind>) -> Self {
         Self {
             varbinds,

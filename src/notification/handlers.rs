@@ -63,7 +63,9 @@ impl super::NotificationReceiver {
         let msg = CommunityMessage::decode(data)?;
 
         // V2c messages carry standard PDUs; TrapV1 is only valid in V1 messages.
-        let Some(pdu) = msg.pdu.standard() else { return Ok(None) };
+        let Some(pdu) = msg.pdu.standard() else {
+            return Ok(None);
+        };
 
         match pdu.pdu_type {
             PduType::TrapV2 => {
@@ -225,7 +227,9 @@ impl super::NotificationReceiver {
                     return Ok(None);
                 }
             }
-        } else if let Some(sp) = msg.scoped_pdu() { sp.clone() } else {
+        } else if let Some(sp) = msg.scoped_pdu() {
+            sp.clone()
+        } else {
             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "unexpected encrypted V3 message");
             return Ok(None);
         };

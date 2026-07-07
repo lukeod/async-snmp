@@ -329,7 +329,9 @@ impl Pdu {
             _ => return None,
         };
 
-        let Value::ObjectIdentifier(trap_oid) = &self.varbinds[1].value else { return None };
+        let Value::ObjectIdentifier(trap_oid) = &self.varbinds[1].value else {
+            return None;
+        };
 
         // Check for Counter64 in any varbind (RFC 3584 Section 3.2, rule 6)
         for vb in &self.varbinds {
@@ -1578,10 +1580,7 @@ mod tests {
         for (trap_oid, expected_generic) in traps {
             let pdu = Pdu::trap_v2(1, 100, &trap_oid, vec![]);
             let v1 = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
-            assert_eq!(
-                v1.generic_trap, expected_generic,
-                "Failed for {trap_oid:?}"
-            );
+            assert_eq!(v1.generic_trap, expected_generic, "Failed for {trap_oid:?}");
             assert_eq!(v1.specific_trap, 0);
         }
     }

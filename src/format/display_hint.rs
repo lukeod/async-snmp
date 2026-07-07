@@ -61,7 +61,7 @@ use crate::format::hex;
 /// // Empty data returns empty string
 /// assert_eq!(display_hint::apply("1d", &[]), "");
 /// ```
-#[must_use] 
+#[must_use]
 pub fn apply(hint: &str, data: &[u8]) -> String {
     if hint.is_empty() || data.is_empty() {
         return hex::encode(data);
@@ -243,7 +243,7 @@ fn is_digit(c: u8) -> bool {
 /// assert_eq!(display_hint::apply_integer("d-2", -500), Some("-5.00".to_string()));
 /// assert_eq!(display_hint::apply_integer("d-1", 255), Some("25.5".to_string()));
 /// ```
-#[must_use] 
+#[must_use]
 pub fn apply_integer(hint: &str, value: i32) -> Option<String> {
     match hint {
         "x" => Some(format!("{value:x}")),

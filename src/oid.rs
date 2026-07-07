@@ -26,7 +26,7 @@ pub struct Oid {
 
 impl Oid {
     /// Create an empty OID.
-    #[must_use] 
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             arcs: SmallVec::new(),
@@ -75,7 +75,7 @@ impl Oid {
     /// let empty = Oid::from_slice(&[]);
     /// assert!(empty.is_empty());
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn from_slice(arcs: &[u32]) -> Self {
         Self {
             arcs: SmallVec::from_slice(arcs),
@@ -133,19 +133,19 @@ impl Oid {
     }
 
     /// Get the arc values.
-    #[must_use] 
+    #[must_use]
     pub fn arcs(&self) -> &[u32] {
         &self.arcs
     }
 
     /// Get the number of arcs.
-    #[must_use] 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.arcs.len()
     }
 
     /// Check if the OID is empty.
-    #[must_use] 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.arcs.is_empty()
     }
@@ -176,7 +176,7 @@ impl Oid {
     /// // Every OID starts with the empty OID
     /// assert!(sys_descr.starts_with(&Oid::empty()));
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn starts_with(&self, other: &Oid) -> bool {
         self.arcs.len() >= other.arcs.len() && self.arcs[..other.arcs.len()] == other.arcs[..]
     }
@@ -201,7 +201,7 @@ impl Oid {
     /// // Empty OID has no parent
     /// assert!(Oid::empty().parent().is_none());
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn parent(&self) -> Option<Oid> {
         if self.arcs.is_empty() {
             None
@@ -229,7 +229,7 @@ impl Oid {
     /// let sys_descr_instance = sys_descr.child(0);
     /// assert_eq!(sys_descr_instance.to_string(), "1.3.6.1.2.1.1.1.0");
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn child(&self, arc: u32) -> Oid {
         let mut arcs = self.arcs.clone();
         arcs.push(arc);
@@ -267,7 +267,7 @@ impl Oid {
     /// let any = oid!(1, 2, 3);
     /// assert_eq!(any.strip_prefix(&Oid::empty()).unwrap(), any);
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn strip_prefix(&self, prefix: &Oid) -> Option<Oid> {
         if self.starts_with(prefix) {
             Some(Oid::from_slice(&self.arcs[prefix.len()..]))
@@ -303,7 +303,7 @@ impl Oid {
     /// // Too large returns None
     /// assert!(oid.suffix(100).is_none());
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn suffix(&self, n: usize) -> Option<&[u32]> {
         if n <= self.arcs.len() {
             Some(&self.arcs[self.arcs.len() - n..])
@@ -361,10 +361,7 @@ impl Oid {
             // arc2 must be <= 39 when arc1 < 2
             if arc1 < 2 && arc2 >= 40 {
                 return Err(Error::InvalidOid(
-                    format!(
-                        "second arc must be <= 39 when first arc is {arc1}, got {arc2}"
-                    )
-                    .into(),
+                    format!("second arc must be <= 39 when first arc is {arc1}, got {arc2}").into(),
                 )
                 .boxed());
             }
@@ -466,7 +463,7 @@ impl Oid {
     ///
     /// This method does not validate arc constraints. Use [`to_ber_checked()`](Self::to_ber_checked)
     /// for validation, or call [`validate()`](Self::validate) first.
-    #[must_use] 
+    #[must_use]
     pub fn to_ber(&self) -> Vec<u8> {
         self.to_ber_smallvec().to_vec()
     }

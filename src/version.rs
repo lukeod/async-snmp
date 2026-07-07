@@ -26,7 +26,7 @@ impl Version {
     /// assert_eq!(Version::V2c.as_i32(), 1);
     /// assert_eq!(Version::V3.as_i32(), 3);
     /// ```
-    #[must_use] 
+    #[must_use]
     pub const fn as_i32(self) -> i32 {
         match self {
             Version::V1 => 0,
@@ -47,7 +47,7 @@ impl Version {
     /// assert_eq!(Version::from_i32(3), Some(Version::V3));
     /// assert_eq!(Version::from_i32(2), None); // Invalid version
     /// ```
-    #[must_use] 
+    #[must_use]
     pub const fn from_i32(value: i32) -> Option<Self> {
         match value {
             0 => Some(Version::V1),

@@ -36,7 +36,7 @@ pub enum SecurityModel {
 
 impl SecurityModel {
     /// Create from raw value.
-    #[must_use] 
+    #[must_use]
     pub fn from_i32(value: i32) -> Option<Self> {
         match value {
             3 => Some(Self::Usm),
@@ -45,7 +45,7 @@ impl SecurityModel {
     }
 
     /// Get the raw value.
-    #[must_use] 
+    #[must_use]
     pub fn as_i32(self) -> i32 {
         self as i32
     }
@@ -67,7 +67,7 @@ pub enum SecurityLevel {
 
 impl SecurityLevel {
     /// Decode from msgFlags byte.
-    #[must_use] 
+    #[must_use]
     pub fn from_flags(flags: u8) -> Option<Self> {
         let auth = flags & 0x01 != 0;
         let priv_ = flags & 0x02 != 0;
@@ -81,7 +81,7 @@ impl SecurityLevel {
     }
 
     /// Encode to msgFlags byte (without reportable flag).
-    #[must_use] 
+    #[must_use]
     pub fn to_flags(self) -> u8 {
         match self {
             Self::NoAuthNoPriv => 0x00,
@@ -91,13 +91,13 @@ impl SecurityLevel {
     }
 
     /// Check if authentication is required.
-    #[must_use] 
+    #[must_use]
     pub fn requires_auth(self) -> bool {
         matches!(self, Self::AuthNoPriv | Self::AuthPriv)
     }
 
     /// Check if privacy (encryption) is required.
-    #[must_use] 
+    #[must_use]
     pub fn requires_priv(self) -> bool {
         matches!(self, Self::AuthPriv)
     }
@@ -128,7 +128,7 @@ pub struct MsgFlags {
 
 impl MsgFlags {
     /// Create new message flags.
-    #[must_use] 
+    #[must_use]
     pub fn new(security_level: SecurityLevel, reportable: bool) -> Self {
         Self {
             security_level,
@@ -153,7 +153,7 @@ impl MsgFlags {
     }
 
     /// Encode to byte.
-    #[must_use] 
+    #[must_use]
     pub fn to_byte(self) -> u8 {
         let mut flags = self.security_level.to_flags();
         if self.reportable {
@@ -178,7 +178,7 @@ pub struct MsgGlobalData {
 
 impl MsgGlobalData {
     /// Create new global data.
-    #[must_use] 
+    #[must_use]
     pub fn new(msg_id: i32, msg_max_size: i32, msg_flags: MsgFlags) -> Self {
         Self {
             msg_id,
@@ -296,7 +296,7 @@ impl ScopedPdu {
     }
 
     /// Create with empty context (most common case).
-    #[must_use] 
+    #[must_use]
     pub fn with_empty_context(pdu: Pdu) -> Self {
         Self {
             context_engine_id: Bytes::new(),
@@ -500,7 +500,7 @@ impl V3Message {
     ///
     /// This is sent to discover the engine ID and time of a remote SNMP engine.
     /// Uses empty security parameters and no authentication.
-    #[must_use] 
+    #[must_use]
     pub fn discovery_request(msg_id: i32) -> Self {
         let global_data = MsgGlobalData::new(
             msg_id,

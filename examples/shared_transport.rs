@@ -17,7 +17,9 @@
 //!   docker run -d -p 11161:161/udp async-snmp-test:latest
 
 use async_snmp::transport::UdpTransport;
-use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, Retry, VarBind, oid};
+use async_snmp::{
+    Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, Retry, VarBind, oid,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some((oid, result)) = futures.next().await {
         match result {
-            Ok(VarBind { oid: _, value, }) => println!("  {oid}: {value:?}"),
+            Ok(VarBind { oid: _, value }) => println!("  {oid}: {value:?}"),
             Err(e) => println!("  {oid}: {e}"),
         }
     }
@@ -138,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
         match client.get(oid).await {
-            Ok(VarBind { oid: _, value, }) => println!("  {oid}: {value:?}"),
+            Ok(VarBind { oid: _, value }) => println!("  {oid}: {value:?}"),
             Err(e) => println!("  {oid}: {e}"),
         }
     }

@@ -159,9 +159,7 @@ fn handle_error(operation: &str, error: &Error) {
         Error::Snmp {
             status, index, oid, ..
         } => {
-            println!(
-                "{operation} failed: SNMP error {status:?} at index {index}"
-            );
+            println!("{operation} failed: SNMP error {status:?} at index {index}");
             if let Some(oid) = oid {
                 println!("  Problematic OID: {oid}");
             }
@@ -188,9 +186,7 @@ fn handle_error(operation: &str, error: &Error) {
             retries,
             ..
         } => {
-            println!(
-                "{operation} failed: Timeout after {elapsed:?} ({retries} retries)"
-            );
+            println!("{operation} failed: Timeout after {elapsed:?} ({retries} retries)");
             println!("  -> Check if agent at {target} is reachable");
         }
 

@@ -252,15 +252,18 @@ impl NotificationReceiverBuilder {
             source: e,
         })?;
 
-        let engine_id: Bytes = self.engine_id.map_or_else(|| {
-            let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01];
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            id.extend_from_slice(&timestamp.to_be_bytes());
-            Bytes::from(id)
-        }, Bytes::from);
+        let engine_id: Bytes = self.engine_id.map_or_else(
+            || {
+                let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01];
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                id.extend_from_slice(&timestamp.to_be_bytes());
+                Bytes::from(id)
+            },
+            Bytes::from,
+        );
 
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {
@@ -582,7 +585,7 @@ impl NotificationReceiver {
 
             match self.parse_and_respond(data, source).await {
                 Ok(Some(notification)) => return Ok((notification, source)),
-                Ok(None) => {}, // Not a notification PDU, ignore
+                Ok(None) => {} // Not a notification PDU, ignore
                 Err(e) => {
                     // Log parsing error but continue receiving
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to parse notification");

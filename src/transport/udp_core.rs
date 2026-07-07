@@ -146,7 +146,9 @@ impl UdpCore {
             if now >= deadline {
                 self.unregister(request_id);
                 self.stats.expired.fetch_add(1, Ordering::Relaxed);
-                let elapsed = now.saturating_duration_since(deadline.checked_sub(Duration::from_secs(1)).unwrap());
+                let elapsed = now.saturating_duration_since(
+                    deadline.checked_sub(Duration::from_secs(1)).unwrap(),
+                );
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target, ?elapsed }, "transport timeout");
                 return Err(Error::Timeout {
                     target,

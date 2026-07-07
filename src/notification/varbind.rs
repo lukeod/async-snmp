@@ -79,7 +79,7 @@ fn extract_notification_varbinds_impl(pdu: &Pdu, strict: bool) -> Result<(u32, O
 /// - Second: snmpTrapOID.0 (1.3.6.1.6.3.1.1.4.1.0) with OID value
 ///
 /// This is useful for validating incoming notifications before processing.
-#[must_use] 
+#[must_use]
 pub fn validate_notification_varbinds(pdu: &Pdu) -> bool {
     if pdu.varbinds.len() < 2 {
         return false;

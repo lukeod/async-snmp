@@ -19,7 +19,8 @@
 //!   docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
 
 use async_snmp::{
-    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, Retry, TcpTransport, Transport, VarBind, oid
+    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, Retry, TcpTransport, Transport,
+    VarBind, oid,
 };
 use std::net::SocketAddr;
 use std::time::Duration;

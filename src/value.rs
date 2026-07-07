@@ -503,7 +503,10 @@ impl Value {
     /// assert_eq!(Value::Counter64(10_000_000_000).as_f64(), Some(10_000_000_000.0));
     /// assert_eq!(Value::Null.as_f64(), None);
     /// ```
-    #[expect(clippy::cast_precision_loss, reason = "we intentionally bend over backwards to make an f64 available even for 64-bit ints")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "we intentionally bend over backwards to make an f64 available even for 64-bit ints"
+    )]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Integer(v) => Some(f64::from(*v)),
@@ -536,7 +539,10 @@ impl Value {
     /// let wrapped = Value::Counter64(large).as_f64_wrapped().unwrap();
     /// assert!(wrapped < large as f64); // Wrapped to smaller value
     /// ```
-    #[expect(clippy::cast_precision_loss, reason = "we intentionally bend over backwards to make an f64 available even for 64-bit ints")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "we intentionally bend over backwards to make an f64 available even for 64-bit ints"
+    )]
     pub fn as_f64_wrapped(&self) -> Option<f64> {
         const MANTISSA_LIMIT: u64 = 1 << 53;
         match self {

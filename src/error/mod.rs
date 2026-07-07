@@ -160,7 +160,7 @@ pub enum Error {
 
 impl Error {
     /// Box this error (convenience for constructing boxed errors).
-    #[must_use] 
+    #[must_use]
     pub fn boxed(self) -> Box<Self> {
         Box::new(self)
     }
@@ -280,7 +280,7 @@ impl ErrorStatus {
     }
 
     /// Convert to raw status code.
-    #[must_use] 
+    #[must_use]
     pub fn as_i32(&self) -> i32 {
         match self {
             Self::NoError => 0,
@@ -309,7 +309,7 @@ impl ErrorStatus {
     /// Map a v2c+ error status to its v1 equivalent per RFC 2576 Section 4.3.
     ///
     /// V1-native statuses (0-5) pass through unchanged.
-    #[must_use] 
+    #[must_use]
     pub fn to_v1(&self) -> Self {
         match self {
             // V1-native statuses
@@ -345,7 +345,7 @@ impl ErrorStatus {
     ///
     /// For `Unknown` variants, returns `None`; callers should format the
     /// numeric code directly in that case.
-    #[must_use] 
+    #[must_use]
     pub fn as_str(&self) -> Option<&'static str> {
         match self {
             Self::NoError => Some("noError"),

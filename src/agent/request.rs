@@ -300,7 +300,9 @@ impl Agent {
                     );
                 }
             }
-        } else if let Some(sp) = msg.scoped_pdu() { sp.clone() } else {
+        } else if let Some(sp) = msg.scoped_pdu() {
+            sp.clone()
+        } else {
             tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::UnexpectedEncryption }, "unexpected encrypted scoped PDU");
             return Err(Error::MalformedResponse { target: source }.boxed());
         };

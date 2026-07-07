@@ -28,7 +28,7 @@ pub enum CommunityPdu {
 
 impl CommunityPdu {
     /// Return a reference to the standard PDU, or `None` if this is a `TrapV1`.
-    #[must_use] 
+    #[must_use]
     pub fn standard(&self) -> Option<&Pdu> {
         match self {
             Self::Standard(p) => Some(p),
@@ -37,7 +37,7 @@ impl CommunityPdu {
     }
 
     /// Return a reference to the `TrapV1` PDU, or `None` if this is a standard PDU.
-    #[must_use] 
+    #[must_use]
     pub fn trap_v1(&self) -> Option<&TrapV1Pdu> {
         match self {
             Self::TrapV1(t) => Some(t),
@@ -46,7 +46,7 @@ impl CommunityPdu {
     }
 
     /// Return the PDU type.
-    #[must_use] 
+    #[must_use]
     pub fn pdu_type(&self) -> PduType {
         match self {
             Self::Standard(p) => p.pdu_type,

@@ -127,7 +127,7 @@ pub struct RequestContext {
 
 impl RequestContext {
     /// Create a minimal context for unit testing.
-    #[must_use] 
+    #[must_use]
     pub fn test_context() -> Self {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

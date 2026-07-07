@@ -325,15 +325,18 @@ impl PrivKey {
         engine_time: u32,
         salt_counter: Option<&SaltCounter>,
     ) -> PrivacyResult<(Bytes, Bytes)> {
-        let salt = salt_counter.map_or_else(|| {
-            // Fetch the current value, then increment. Skip zero.
-            let val = self.salt_counter.fetch_add(1, Ordering::Relaxed);
-            if val != 0 {
-                return val;
-            }
-            // Counter was zero (initial or wrapped). Fetch the next value.
-            self.salt_counter.fetch_add(1, Ordering::Relaxed)
-        }, SaltCounter::next);
+        let salt = salt_counter.map_or_else(
+            || {
+                // Fetch the current value, then increment. Skip zero.
+                let val = self.salt_counter.fetch_add(1, Ordering::Relaxed);
+                if val != 0 {
+                    return val;
+                }
+                // Counter was zero (initial or wrapped). Fetch the next value.
+                self.salt_counter.fetch_add(1, Ordering::Relaxed)
+            },
+            SaltCounter::next,
+        );
 
         match self.protocol {
             PrivProtocol::Des => self.encrypt_des(plaintext, engine_boots, salt),

@@ -43,9 +43,7 @@ fn bench_get_single(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
     if !is_container_available(&rt) {
-        eprintln!(
-            "Skipping client benchmarks: test container not available at {TARGET}"
-        );
+        eprintln!("Skipping client benchmarks: test container not available at {TARGET}");
         eprintln!(
             "Start with: docker run -d --name async-snmp-test-manual -p 11161:161/udp async-snmp-test:latest"
         );

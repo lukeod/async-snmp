@@ -230,7 +230,10 @@ static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Uses a multiplicative hash of an atomic counter to generate pseudo-random
 /// values. This is sufficient for retry desynchronization without requiring
 /// true randomness.
-#[allow(clippy::cast_precision_loss, reason = "u64->f64 cast is intentional part of hash-like algorithm")]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "u64->f64 cast is intentional part of hash-like algorithm"
+)]
 fn jitter_factor(jitter: f64) -> f64 {
     if jitter <= 0.0 {
         return 1.0;

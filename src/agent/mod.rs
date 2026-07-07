@@ -680,17 +680,20 @@ impl AgentBuilder {
             })?;
 
         // Generate default engine ID if not provided
-        let engine_id: Bytes = self.engine_id.map_or_else(|| {
-            // RFC 3411 format: enterprise number + format + local identifier
-            // Use a simple format: 0x80 (local) + timestamp + random
-            let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01]; // Enterprise format indicator
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            id.extend_from_slice(&timestamp.to_be_bytes());
-            Bytes::from(id)
-        }, Bytes::from);
+        let engine_id: Bytes = self.engine_id.map_or_else(
+            || {
+                // RFC 3411 format: enterprise number + format + local identifier
+                // Use a simple format: 0x80 (local) + timestamp + random
+                let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01]; // Enterprise format indicator
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                id.extend_from_slice(&timestamp.to_be_bytes());
+                Bytes::from(id)
+            },
+            Bytes::from,
+        );
 
         let cancel = self.cancel.unwrap_or_default();
 
@@ -1127,8 +1130,9 @@ impl Agent {
 
             match result {
                 Ok(n) if n > 0 => return Ok(meta[0]),
-                Ok(_) => {/* fall thru to next `loop {}` iteration */},
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {/* fall thru to next `loop {}` iteration */},
+                Ok(_) => { /* fall thru to next `loop {}` iteration */ }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { /* fall thru to next `loop {}` iteration */
+                }
                 Err(e) => {
                     return Err(Error::Network {
                         target: self.inner.local_addr,
@@ -1159,7 +1163,8 @@ impl Agent {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {/* fall thru to next `loop {}` iteration */},
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { /* fall thru to next `loop {}` iteration */
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1266,8 +1271,14 @@ impl Agent {
     /// Per RFC 3416 Section 4.2.7, an `InformRequest` is a confirmed-class PDU
     /// that the receiver acknowledges by returning a Response with the same
     /// request-id and varbind list.
-    #[allow(clippy::unnecessary_wraps, reason = "TODO store received informs, which may be a fallible operation")]
-    #[allow(clippy::unused_self, reason = "TODO store received informs, which may require self")]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "TODO store received informs, which may be a fallible operation"
+    )]
+    #[allow(
+        clippy::unused_self,
+        reason = "TODO store received informs, which may require self"
+    )]
     fn handle_inform(&self, pdu: &Pdu) -> Result<Pdu> {
         // Simply acknowledge by returning the same varbinds in a Response
         Ok(pdu.to_response())
@@ -1354,9 +1365,7 @@ impl Agent {
             } else {
                 // v1 returns noSuchName, v2c/v3 returns endOfMibView
                 if ctx.version == Version::V1 {
-                    return Ok(
-                        pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
-                    );
+                    return Ok(pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32));
                 }
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
             }

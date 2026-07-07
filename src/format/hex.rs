@@ -15,7 +15,7 @@ const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
 /// assert_eq!(encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
 /// assert_eq!(encode(&[0x00, 0xff]), "00ff");
 /// ```
-#[must_use] 
+#[must_use]
 pub fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     write_to(&mut out, bytes);
@@ -92,7 +92,7 @@ pub fn decode_relaxed(s: &str) -> Result<Vec<u8>, DecodeError> {
 /// assert!(!is_printable(&[0x00, 0x01]));
 /// assert!(!is_printable(&[0x80, 0x81]));
 /// ```
-#[must_use] 
+#[must_use]
 pub fn is_printable(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return true;

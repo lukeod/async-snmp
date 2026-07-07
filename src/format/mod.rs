@@ -64,9 +64,7 @@ pub fn format_timeticks(centiseconds: u32) -> String {
     let seconds = total_seconds % 60;
 
     if days > 0 {
-        format!(
-            "{days}d {hours:02}:{minutes:02}:{seconds:02}.{cs:02}"
-        )
+        format!("{days}d {hours:02}:{minutes:02}:{seconds:02}.{cs:02}")
     } else {
         format!("{hours:02}:{minutes:02}:{seconds:02}.{cs:02}")
     }

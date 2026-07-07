@@ -72,9 +72,7 @@ fn main() {
     ];
 
     for (num_containers, concurrency) in configs {
-        println!(
-            "\n--- {num_containers} containers, {concurrency} concurrent requests each ---\n"
-        );
+        println!("\n--- {num_containers} containers, {concurrency} concurrent requests each ---\n");
 
         rt.block_on(async {
             run_comparison(num_containers, concurrency).await;
@@ -100,9 +98,7 @@ async fn run_comparison(num_containers: usize, concurrency_per_target: usize) {
     let non_shared_result = benchmark_non_shared(&targets, concurrency_per_target).await;
 
     let non_shared_fds = count_fds();
-    println!(
-        "  FDs during test: {non_shared_fds} (baseline: {baseline_fds})"
-    );
+    println!("  FDs during test: {non_shared_fds} (baseline: {baseline_fds})");
 
     // Drop clients, wait a moment for cleanup
     drop(non_shared_result.clients);
@@ -116,9 +112,7 @@ async fn run_comparison(num_containers: usize, concurrency_per_target: usize) {
     let shared_result = benchmark_shared(&targets, concurrency_per_target).await;
 
     let shared_fds = count_fds();
-    println!(
-        "  FDs during test: {shared_fds} (baseline: {baseline_fds})"
-    );
+    println!("  FDs during test: {shared_fds} (baseline: {baseline_fds})");
 
     // Print comparison
     println!("\n[Comparison]");
@@ -159,7 +153,7 @@ struct BenchmarkStats {
 }
 
 impl BenchmarkStats {
-    #[allow(clippy::cast_precision_loss, reason="approximation is fine here")]
+    #[allow(clippy::cast_precision_loss, reason = "approximation is fine here")]
     fn requests_per_sec(&self) -> f64 {
         self.successful_requests as f64 / self.duration_secs
     }
@@ -232,7 +226,7 @@ async fn benchmark_shared(
     BenchmarkResult { stats, clients }
 }
 
-#[allow(clippy::cast_precision_loss, reason="approximation is fine here")]
+#[allow(clippy::cast_precision_loss, reason = "approximation is fine here")]
 fn print_stats(stats: &BenchmarkStats) {
     println!("  Throughput: {:.0} req/s", stats.requests_per_sec());
     println!(
@@ -342,16 +336,13 @@ async fn run_benchmark<T: async_snmp::Transport + 'static>(
     }
 }
 
-
-#[allow(clippy::cast_precision_loss, reason="approximation is fine here")]
+#[allow(clippy::cast_precision_loss, reason = "approximation is fine here")]
 fn print_comparison(per_client: &BenchmarkStats, shared: &BenchmarkStats) {
     let throughput_ratio = shared.requests_per_sec() / per_client.requests_per_sec().max(0.001);
     let p50_ratio = per_client.p50_us as f64 / shared.p50_us.max(1) as f64;
     let p99_ratio = per_client.p99_us as f64 / shared.p99_us.max(1) as f64;
 
-    println!(
-        "  Throughput: shared is {throughput_ratio:.2}x vs per-client"
-    );
+    println!("  Throughput: shared is {throughput_ratio:.2}x vs per-client");
     println!(
         "  p50 Latency: shared is {:.2}x {} than per-client",
         if p50_ratio > 1.0 {
@@ -419,8 +410,7 @@ fn image_exists(image: &str) -> bool {
 fn count_fds() -> usize {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_dir("/proc/self/fd")
-            .map_or(0, std::iter::Iterator::count)
+        std::fs::read_dir("/proc/self/fd").map_or(0, std::iter::Iterator::count)
     }
     #[cfg(not(target_os = "linux"))]
     {

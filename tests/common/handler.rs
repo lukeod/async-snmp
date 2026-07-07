@@ -84,7 +84,9 @@ impl MibHandler for TestHandler {
         let result = data
             .range(oid..)
             .find(|(k, _)| *k > oid)
-            .map_or(GetNextResult::EndOfMibView, |(k, v)| GetNextResult::Value(VarBind::new(k.clone(), v.clone())));
+            .map_or(GetNextResult::EndOfMibView, |(k, v)| {
+                GetNextResult::Value(VarBind::new(k.clone(), v.clone()))
+            });
 
         Box::pin(async move { result })
     }

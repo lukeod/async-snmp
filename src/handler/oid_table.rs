@@ -54,7 +54,7 @@ pub struct OidTable<V> {
 
 impl<V> OidTable<V> {
     /// Create a new empty OID table.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -62,7 +62,7 @@ impl<V> OidTable<V> {
     }
 
     /// Create an OID table with pre-allocated capacity.
-    #[must_use] 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
@@ -90,7 +90,7 @@ impl<V> OidTable<V> {
     }
 
     /// Get the value for an exact OID match.
-    #[must_use] 
+    #[must_use]
     pub fn get(&self, oid: &Oid) -> Option<&V> {
         match self.entries.binary_search_by(|(o, _)| o.cmp(oid)) {
             Ok(idx) => Some(&self.entries[idx].1),
@@ -101,7 +101,7 @@ impl<V> OidTable<V> {
     /// Get the lexicographically next OID and value after the given OID.
     ///
     /// Returns `None` if there are no OIDs greater than the given one.
-    #[must_use] 
+    #[must_use]
     pub fn get_next(&self, oid: &Oid) -> Option<(&Oid, &V)> {
         match self.entries.binary_search_by(|(o, _)| o.cmp(oid)) {
             Ok(idx) => {
@@ -116,13 +116,13 @@ impl<V> OidTable<V> {
     }
 
     /// Get the number of entries in the table.
-    #[must_use] 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Check if the table is empty.
-    #[must_use] 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

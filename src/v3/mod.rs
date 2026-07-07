@@ -141,7 +141,7 @@ impl AuthProtocol {
     ///
     /// This is also the key length produced by the key localization algorithm,
     /// which is used for privacy key derivation.
-    #[must_use] 
+    #[must_use]
     pub fn digest_len(self) -> usize {
         match self {
             Self::Md5 => 16,
@@ -154,7 +154,7 @@ impl AuthProtocol {
     }
 
     /// Get the truncated MAC length for authentication parameters.
-    #[must_use] 
+    #[must_use]
     pub fn mac_len(self) -> usize {
         match self {
             Self::Md5 | Self::Sha1 => 12, // HMAC-96
@@ -219,7 +219,7 @@ impl std::str::FromStr for PrivProtocol {
 
 impl PrivProtocol {
     /// Get the key length in bytes.
-    #[must_use] 
+    #[must_use]
     pub fn key_len(self) -> usize {
         match self {
             Self::Des => 16,  // 8 key + 8 pre-IV
@@ -231,7 +231,7 @@ impl PrivProtocol {
     }
 
     /// Get the IV/salt length in bytes.
-    #[must_use] 
+    #[must_use]
     pub fn salt_len(self) -> usize {
         8 // All protocols use 8-byte salt
     }
