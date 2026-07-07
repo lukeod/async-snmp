@@ -217,9 +217,10 @@ impl super::NotificationReceiver {
                         let (our_boots, our_time) =
                             compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
 
-                        // When boots is latched at MAX_ENGINE_TIME, reject all authenticated messages.
-                        // The report is unauthenticated: a latched engine must not
-                        // authenticate further messages (RFC 3414 Section 2.3).
+                        // When boots is latched at MAX_ENGINE_TIME, reject all
+                        // authenticated messages. Like the other Time Window
+                        // failures, the report must be authenticated at
+                        // authNoPriv (RFC 3414 Section 3.2 Step 7a).
                         if our_boots == MAX_ENGINE_TIME {
                             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated notification");
                             let count = self.bump_not_in_time_windows();
@@ -228,7 +229,7 @@ impl super::NotificationReceiver {
                                 &usm_params,
                                 crate::v3::report_oids::not_in_time_windows(),
                                 count,
-                                None,
+                                Some(auth_key),
                                 source,
                             )
                             .await;

@@ -1839,6 +1839,71 @@ mod tests {
         );
     }
 
+    /// RFC 3414 Section 3.2 Step 7a lists latched engine boots as a Time
+    /// Window failure and mandates the report be authenticated at
+    /// authNoPriv, like the other notInTimeWindows reports.
+    #[tokio::test]
+    async fn test_v3_latched_boots_report_is_authenticated() {
+        use crate::message::V3Message;
+        use crate::v3::MAX_ENGINE_TIME;
+        use crate::v3::auth::verify_message;
+        use crate::v3::{LocalizedKey, UsmSecurityParams};
+
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"test-engine".to_vec())
+            .engine_boots(MAX_ENGINE_TIME)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let msg = build_authed_v3_inform(
+            b"test-engine",
+            MAX_ENGINE_TIME,
+            0,
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+        assert!(receiver.handle_v3(msg, client_addr).await.is_err());
+        assert_eq!(receiver.usm_not_in_time_windows(), 1);
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected a Report in response to the failed inform")
+        .unwrap();
+        let report_bytes = Bytes::copy_from_slice(&buf[..len]);
+
+        let report = V3Message::decode(report_bytes.clone()).unwrap();
+        assert_eq!(
+            report.global_data.msg_flags.security_level,
+            SecurityLevel::AuthNoPriv,
+            "notInTimeWindows report must be authenticated (authNoPriv)"
+        );
+        let key =
+            LocalizedKey::from_password(AuthProtocol::Sha1, b"authpass12345678", b"test-engine")
+                .unwrap();
+        let (auth_offset, auth_len) =
+            UsmSecurityParams::find_auth_params_offset(&report_bytes).unwrap();
+        assert!(verify_message(&key, &report_bytes, auth_offset, auth_len).unwrap());
+
+        let scoped = report.scoped_pdu().expect("report should be plaintext");
+        assert_eq!(
+            scoped.pdu.varbinds[0].oid,
+            crate::v3::report_oids::not_in_time_windows()
+        );
+    }
+
     /// A USM-failed inform for an unknown user gets an unauthenticated
     /// Report (no key exists to authenticate it with).
     #[tokio::test]
