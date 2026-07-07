@@ -7,6 +7,9 @@
 //!
 //! # Example
 //!
+//! Receive v1/v2c notifications. A receiver constructed with `bind` has no
+//! USM user table, so v3 notifications are rejected; see below for v3.
+//!
 //! ```rust,no_run
 //! use async_snmp::notification::{NotificationReceiver, Notification};
 //! use std::net::SocketAddr;
@@ -28,9 +31,11 @@
 //! }
 //! ```
 //!
-//! # V3 Authenticated Informs
+//! # V3 Notifications
 //!
-//! To receive and respond to authenticated V3 `InformRequests`, configure USM credentials:
+//! To receive V3 traps and `InformRequests`, configure USM credentials via
+//! the builder. Only notifications from registered usernames are accepted,
+//! at any security level including noAuthNoPriv:
 //!
 //! ```rust,no_run
 //! use async_snmp::notification::NotificationReceiver;
@@ -539,7 +544,13 @@ impl NotificationReceiver {
     /// Bind to a local address.
     ///
     /// The standard SNMP notification port is 162.
-    /// For V3 authentication support, use `NotificationReceiver::builder()` instead.
+    ///
+    /// A receiver constructed this way handles v1 and v2c notifications
+    /// only: it has no USM user table, so every v3 notification (including
+    /// noAuthNoPriv) is rejected with `usmStatsUnknownUserNames` (RFC 3414
+    /// Section 3.2 Step 4). To receive v3 notifications, use
+    /// [`NotificationReceiver::builder()`] and register users with
+    /// `usm_user`.
     ///
     /// # Example
     ///
