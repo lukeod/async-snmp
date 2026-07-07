@@ -225,6 +225,37 @@ impl EngineState {
         }
     }
 
+    /// Timeliness check for messages from a remote authoritative engine
+    /// (RFC 3414 Section 3.2 Step 7b, non-authoritative role).
+    ///
+    /// First updates the local notion of the remote engine's boots/time if
+    /// the message is newer (see [`update_time`](Self::update_time)), then
+    /// evaluates the asymmetric time window: the message is outside the
+    /// window only if the local boots notion is latched at the maximum,
+    /// the message's boots value is older than the local notion, or the
+    /// message's time is more than 150 seconds behind the local notion.
+    ///
+    /// The caller must verify the message is authentic before calling this,
+    /// since it mutates the timeliness state.
+    ///
+    /// Returns true if the message is within the time window.
+    pub fn check_and_update_timeliness(&mut self, msg_boots: u32, msg_time: u32) -> bool {
+        self.update_time(msg_boots, msg_time);
+
+        if self.engine_boots == MAX_ENGINE_TIME {
+            return false;
+        }
+        if msg_boots < self.engine_boots {
+            return false;
+        }
+        if msg_boots == self.engine_boots
+            && msg_time < self.estimated_time().saturating_sub(TIME_WINDOW)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Check if a message time is within the time window.
     ///
     /// Per RFC 3414 Section 2.2.3, a message is outside the window if:
@@ -771,6 +802,67 @@ mod tests {
         // Boots too low (replay from previous boot cycle)
         assert!(!state.is_in_time_window(99, 1000));
         assert!(!state.is_in_time_window(0, 1000));
+    }
+
+    /// Non-authoritative timeliness (RFC 3414 Section 3.2 Step 7b): a message
+    /// with time within the window is accepted without updating the LCD.
+    #[test]
+    fn test_check_and_update_timeliness_within_window_accepted() {
+        let mut state = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
+
+        // Older time but within 150s of our notion: accepted, latest unchanged
+        assert!(state.check_and_update_timeliness(3, 900));
+        assert_eq!(state.latest_received_engine_time, 1000);
+
+        // Exactly at the boundary (1000 - 150 = 850): accepted
+        assert!(state.check_and_update_timeliness(3, 850));
+    }
+
+    #[test]
+    fn test_check_and_update_timeliness_newer_time_updates_lcd() {
+        let mut state = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
+
+        assert!(state.check_and_update_timeliness(3, 1200));
+        assert_eq!(state.latest_received_engine_time, 1200);
+        assert_eq!(state.engine_time, 1200);
+    }
+
+    #[test]
+    fn test_check_and_update_timeliness_stale_time_rejected() {
+        let mut state = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
+
+        // 500 < 1000 - 150: replayed/stale message
+        assert!(!state.check_and_update_timeliness(3, 500));
+        // Just past the boundary
+        assert!(!state.check_and_update_timeliness(3, 849));
+    }
+
+    #[test]
+    fn test_check_and_update_timeliness_old_boots_rejected() {
+        let mut state = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
+
+        assert!(!state.check_and_update_timeliness(2, 5000));
+        assert_eq!(state.engine_boots, 3, "old boot cycle must not update LCD");
+    }
+
+    #[test]
+    fn test_check_and_update_timeliness_reboot_accepted() {
+        let mut state = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
+
+        // Sender rebooted: higher boots with low time is accepted and updates LCD
+        assert!(state.check_and_update_timeliness(4, 10));
+        assert_eq!(state.engine_boots, 4);
+        assert_eq!(state.latest_received_engine_time, 10);
+
+        // Messages from the previous boot cycle are now rejected
+        assert!(!state.check_and_update_timeliness(3, 99999));
+    }
+
+    #[test]
+    fn test_check_and_update_timeliness_latched_boots_rejected() {
+        let mut state = EngineState::new(Bytes::from_static(b"engine"), MAX_ENGINE_TIME, 1000);
+
+        assert!(!state.check_and_update_timeliness(MAX_ENGINE_TIME, 1000));
     }
 
     #[test]

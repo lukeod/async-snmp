@@ -55,8 +55,8 @@ mod varbind;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -69,13 +69,20 @@ use crate::error::{Error, Result};
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 use crate::util::bind_udp_socket;
-use crate::v3::SaltCounter;
+use crate::v3::{EngineState, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
 // Re-exports
 pub use types::{DerivedKeys, UsmConfig};
 pub use varbind::validate_notification_varbinds;
+
+/// Maximum number of distinct remote authoritative engines whose timeliness
+/// state is retained for trap senders. A peer holding one USM credential can
+/// authenticate under arbitrarily many fabricated engine IDs (keys are
+/// localized per engine ID), so the table is bounded and the
+/// least-recently-updated engine is evicted when full.
+const MAX_REMOTE_ENGINES: usize = 8192;
 
 /// Well-known OIDs for notification varbinds.
 pub mod oids {
@@ -275,6 +282,7 @@ impl NotificationReceiverBuilder {
                 engine_boots_base: self.engine_boots,
                 engine_start: Instant::now(),
                 usm_unknown_engine_ids: AtomicU32::new(0),
+                remote_engines: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -470,6 +478,13 @@ struct ReceiverInner {
     engine_start: Instant,
     /// usmStatsUnknownEngineIDs counter
     usm_unknown_engine_ids: AtomicU32,
+    /// Timeliness state for remote authoritative engines (trap senders),
+    /// keyed by engine ID (RFC 3414 Section 2.3). Seeded from the first
+    /// authenticated message from each engine, so only holders of configured
+    /// credentials can add entries. Bounded to `MAX_REMOTE_ENGINES` with
+    /// least-recently-updated eviction so a credential holder cannot grow it
+    /// without limit by fabricating engine IDs.
+    remote_engines: Mutex<HashMap<Bytes, EngineState>>,
 }
 
 impl NotificationReceiver {
@@ -538,6 +553,7 @@ impl NotificationReceiver {
                 engine_boots_base: 1,
                 engine_start: Instant::now(),
                 usm_unknown_engine_ids: AtomicU32::new(0),
+                remote_engines: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -778,9 +794,10 @@ mod tests {
         assert_eq!(builder.engine_boots, 5);
     }
 
-    /// Build an authenticated V3 `InformRequest` message with the given
-    /// `engine_boots` and `engine_time` in the USM parameters.
-    fn build_authed_v3_inform(
+    /// Build an authenticated V3 notification message of the given PDU type
+    /// with the given `engine_boots` and `engine_time` in the USM parameters.
+    fn build_authed_v3_notification(
+        pdu_type: crate::pdu::PduType,
         engine_id: &[u8],
         engine_boots: u32,
         engine_time: u32,
@@ -789,7 +806,7 @@ mod tests {
         auth_protocol: AuthProtocol,
     ) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
-        use crate::pdu::{Pdu, PduType};
+        use crate::pdu::Pdu;
         use crate::v3::auth::authenticate_message;
         use crate::v3::{LocalizedKey, UsmSecurityParams};
         use crate::value::Value;
@@ -798,9 +815,9 @@ mod tests {
             LocalizedKey::from_password(auth_protocol, auth_password, engine_id).unwrap();
         let mac_len = auth_key.mac_len();
 
-        // Build an InformRequest PDU with sysUpTime.0 and snmpTrapOID.0
+        // Build a notification PDU with sysUpTime.0 and snmpTrapOID.0
         let pdu = Pdu {
-            pdu_type: PduType::InformRequest,
+            pdu_type,
             request_id: 1,
             error_status: 0,
             error_index: 0,
@@ -833,6 +850,216 @@ mod tests {
         authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
 
         Bytes::from(msg_bytes)
+    }
+
+    /// Build an authenticated V3 `InformRequest` message with the given
+    /// `engine_boots` and `engine_time` in the USM parameters.
+    fn build_authed_v3_inform(
+        engine_id: &[u8],
+        engine_boots: u32,
+        engine_time: u32,
+        username: &[u8],
+        auth_password: &[u8],
+        auth_protocol: AuthProtocol,
+    ) -> Bytes {
+        build_authed_v3_notification(
+            crate::pdu::PduType::InformRequest,
+            engine_id,
+            engine_boots,
+            engine_time,
+            username,
+            auth_password,
+            auth_protocol,
+        )
+    }
+
+    /// Build an authenticated V3 `SNMPv2-Trap` message with the given
+    /// `engine_boots` and `engine_time` in the USM parameters.
+    fn build_authed_v3_trap(engine_id: &[u8], engine_boots: u32, engine_time: u32) -> Bytes {
+        build_authed_v3_notification(
+            crate::pdu::PduType::TrapV2,
+            engine_id,
+            engine_boots,
+            engine_time,
+            b"trapuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        )
+    }
+
+    /// Build a receiver with its own engine ID and a `trapuser` configured,
+    /// for tests exercising traps sent under a remote sender's engine ID.
+    async fn remote_trap_receiver() -> NotificationReceiver {
+        NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("trapuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// For traps the SENDER is the authoritative engine (RFC 3414 Section
+    /// 1.5.1): a real remote agent sends under its own engine ID with its
+    /// own boots/time. The receiver must accept it without being configured
+    /// with the sender's engine ID or clock.
+    #[tokio::test]
+    async fn test_v3_trap_from_remote_sender_engine_accepted() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        // Sender's own engine ID, arbitrary boots and time
+        let msg = build_authed_v3_trap(b"remote-sender-engine", 7, 123_456);
+
+        let result = receiver.handle_v3(msg, source).await.unwrap();
+        match result {
+            Some(Notification::TrapV3 { username, .. }) => {
+                assert_eq!(username.as_ref(), b"trapuser");
+            }
+            other => panic!("expected TrapV3, got {other:?}"),
+        }
+    }
+
+    /// Each remote engine gets independent timeliness state: traps from
+    /// multiple senders with unrelated boots/time are all accepted.
+    #[tokio::test]
+    async fn test_v3_traps_from_multiple_remote_engines_accepted() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg_a = build_authed_v3_trap(b"sender-engine-a", 7, 123_456);
+        let msg_b = build_authed_v3_trap(b"sender-engine-b", 2, 42);
+
+        assert!(
+            receiver.handle_v3(msg_a, source).await.unwrap().is_some(),
+            "trap from first remote engine should be accepted"
+        );
+        assert!(
+            receiver.handle_v3(msg_b, source).await.unwrap().is_some(),
+            "trap from second remote engine should be accepted"
+        );
+    }
+
+    /// The remote-engine table is bounded: once `MAX_REMOTE_ENGINES` entries
+    /// exist, an authenticated trap under a new engine ID evicts an old entry
+    /// rather than growing the map, so a credential holder cannot exhaust
+    /// memory by fabricating engine IDs.
+    #[tokio::test]
+    async fn test_v3_remote_engines_table_bounded() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        // Pre-fill the table to capacity with cheap dummy entries.
+        {
+            let mut engines = receiver.inner.remote_engines.lock().unwrap();
+            for i in 0..MAX_REMOTE_ENGINES {
+                let id = Bytes::from(format!("dummy-engine-{i}"));
+                engines.insert(id.clone(), EngineState::new(id, 1, 1));
+            }
+            assert_eq!(engines.len(), MAX_REMOTE_ENGINES);
+        }
+
+        // An authenticated trap under a not-yet-seen engine ID is accepted.
+        let msg = build_authed_v3_trap(b"fresh-remote-engine", 7, 123_456);
+        assert!(receiver.handle_v3(msg, source).await.unwrap().is_some());
+
+        // The table stayed at capacity (an old entry was evicted) and the new
+        // engine is now tracked.
+        let engines = receiver.inner.remote_engines.lock().unwrap();
+        assert_eq!(engines.len(), MAX_REMOTE_ENGINES);
+        assert!(engines.contains_key(&Bytes::from_static(b"fresh-remote-engine")));
+    }
+
+    /// A replayed (stale) trap from a known remote engine is rejected:
+    /// its engine time is more than 150 seconds behind the local notion
+    /// established by an earlier authentic message (RFC 3414 Section 3.2
+    /// Step 7b).
+    #[tokio::test]
+    async fn test_v3_trap_remote_engine_stale_time_rejected() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let fresh = build_authed_v3_trap(b"remote-sender-engine", 7, 10_000);
+        assert!(receiver.handle_v3(fresh, source).await.unwrap().is_some());
+
+        // Same boots, time far behind the notion just established
+        let stale = build_authed_v3_trap(b"remote-sender-engine", 7, 5_000);
+        assert!(
+            receiver.handle_v3(stale, source).await.is_err(),
+            "stale engine time should be rejected as outside the time window"
+        );
+    }
+
+    /// A trap claiming an older boot cycle than previously seen is rejected.
+    #[tokio::test]
+    async fn test_v3_trap_remote_engine_old_boots_rejected() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let fresh = build_authed_v3_trap(b"remote-sender-engine", 7, 10_000);
+        assert!(receiver.handle_v3(fresh, source).await.unwrap().is_some());
+
+        let old_boots = build_authed_v3_trap(b"remote-sender-engine", 6, 99_999);
+        assert!(
+            receiver.handle_v3(old_boots, source).await.is_err(),
+            "older boot cycle should be rejected"
+        );
+    }
+
+    /// A sender reboot (higher boots, low time) is tolerated and updates
+    /// the local notion; the previous boot cycle is then rejected.
+    #[tokio::test]
+    async fn test_v3_trap_remote_engine_reboot_accepted() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let before = build_authed_v3_trap(b"remote-sender-engine", 7, 10_000);
+        assert!(receiver.handle_v3(before, source).await.unwrap().is_some());
+
+        let after_reboot = build_authed_v3_trap(b"remote-sender-engine", 8, 5);
+        assert!(
+            receiver
+                .handle_v3(after_reboot, source)
+                .await
+                .unwrap()
+                .is_some(),
+            "trap after sender reboot should be accepted"
+        );
+
+        let from_old_cycle = build_authed_v3_trap(b"remote-sender-engine", 7, 20_000);
+        assert!(
+            receiver.handle_v3(from_old_cycle, source).await.is_err(),
+            "trap from superseded boot cycle should be rejected"
+        );
+    }
+
+    /// A trap with a bad HMAC from an unknown remote engine must not seed
+    /// timeliness state or be accepted.
+    #[tokio::test]
+    async fn test_v3_trap_remote_engine_bad_auth_rejected() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_authed_v3_notification(
+            crate::pdu::PduType::TrapV2,
+            b"remote-sender-engine",
+            7,
+            123_456,
+            b"trapuser",
+            b"wrong-password-1234",
+            AuthProtocol::Sha1,
+        );
+        assert!(
+            receiver.handle_v3(msg, source).await.is_err(),
+            "trap with wrong auth key should be rejected"
+        );
+
+        // A correctly authenticated trap still works afterwards
+        let good = build_authed_v3_trap(b"remote-sender-engine", 7, 123_456);
+        assert!(receiver.handle_v3(good, source).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1028,8 +1255,13 @@ mod tests {
         assert_eq!(receiver.usm_unknown_engine_ids(), 0);
     }
 
+    /// A message under an engine ID other than the receiver's own is treated
+    /// as coming from a remote authoritative engine (RFC 3414 Section 3.2
+    /// Step 7b): authentication uses keys localized to that engine ID and
+    /// timeliness uses per-engine state, so it is accepted rather than
+    /// requiring the receiver to be configured with the sender's engine ID.
     #[tokio::test]
-    async fn test_v3_engine_id_mismatch_ignored() {
+    async fn test_v3_inform_under_remote_engine_id_accepted() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"my-receiver-engine".to_vec())
@@ -1045,7 +1277,7 @@ mod tests {
 
         // Build a message with a DIFFERENT engine ID
         let msg = build_authed_v3_inform(
-            b"wrong-engine-id",
+            b"remote-engine-id",
             1,
             0,
             b"informuser",
@@ -1053,11 +1285,10 @@ mod tests {
             AuthProtocol::Sha1,
         );
 
-        let result = receiver.handle_v3(msg, source).await;
-        assert!(result.is_ok());
+        let result = receiver.handle_v3(msg, source).await.unwrap();
         assert!(
-            result.unwrap().is_none(),
-            "engine ID mismatch should return None"
+            matches!(result, Some(Notification::InformV3 { .. })),
+            "authenticated inform under a remote engine ID should be accepted, got {result:?}"
         );
     }
 

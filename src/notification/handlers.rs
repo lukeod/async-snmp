@@ -16,7 +16,7 @@ use crate::message::{
 };
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::v3::auth::{authenticate_message, verify_message};
-use crate::v3::{MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
+use crate::v3::{EngineState, MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
 use crate::value::Value;
 use crate::varbind::VarBind;
 
@@ -127,14 +127,6 @@ impl super::NotificationReceiver {
             return self.handle_v3_discovery(&msg, &usm_params, source).await;
         }
 
-        // Verify engine ID matches ours. For V3 traps the sender is the
-        // authoritative engine, so the receiver must be configured with the
-        // sender's engine ID to accept the message.
-        if usm_params.engine_id != self.inner.engine_id {
-            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_engine_id = ?usm_params.engine_id.as_ref(), snmp.our_engine_id = ?self.inner.engine_id.as_ref() }, "engine ID mismatch, configure receiver with sender's engine ID for V3 traps");
-            return Ok(None);
-        }
-
         let username = usm_params.username.clone();
         let engine_id = usm_params.engine_id.clone();
 
@@ -165,26 +157,73 @@ impl super::NotificationReceiver {
                     }
                     tracing::trace!(target: "async_snmp::notification", { snmp.source = %source }, "V3 authentication verified");
 
-                    // Verify time window (RFC 3414 Section 2.2.3)
-                    let total_secs = self.inner.engine_start.elapsed().as_secs();
-                    let (our_boots, our_time) =
-                        compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+                    // Verify time window (RFC 3414 Section 3.2 Step 7)
+                    if engine_id == self.inner.engine_id {
+                        // We are the authoritative engine for this message
+                        // (informs sent under our engine ID): Step 7a,
+                        // checked against our own boots/time.
+                        let total_secs = self.inner.engine_start.elapsed().as_secs();
+                        let (our_boots, our_time) =
+                            compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
 
-                    // When boots is latched at MAX_ENGINE_TIME, reject all authenticated messages
-                    if our_boots == MAX_ENGINE_TIME {
-                        tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated notification");
-                        return Err(Error::Auth { target: source }.boxed());
-                    }
+                        // When boots is latched at MAX_ENGINE_TIME, reject all authenticated messages
+                        if our_boots == MAX_ENGINE_TIME {
+                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated notification");
+                            return Err(Error::Auth { target: source }.boxed());
+                        }
 
-                    if usm_params.engine_boots != our_boots {
-                        tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.our_boots = our_boots }, "V3 notification engine boots mismatch");
-                        return Err(Error::Auth { target: source }.boxed());
-                    }
+                        if usm_params.engine_boots != our_boots {
+                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.our_boots = our_boots }, "V3 notification engine boots mismatch");
+                            return Err(Error::Auth { target: source }.boxed());
+                        }
 
-                    let time_diff = (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
-                    if time_diff > i64::from(TIME_WINDOW) {
-                        tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_time = usm_params.engine_time, snmp.our_time = our_time }, "V3 notification outside time window");
-                        return Err(Error::Auth { target: source }.boxed());
+                        let time_diff =
+                            (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
+                        if time_diff > i64::from(TIME_WINDOW) {
+                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_time = usm_params.engine_time, snmp.our_time = our_time }, "V3 notification outside time window");
+                            return Err(Error::Auth { target: source }.boxed());
+                        }
+                    } else {
+                        // The sender is the authoritative engine (traps sent
+                        // under the sender's engine ID): Step 7b, checked
+                        // against per-engine state seeded from the first
+                        // authenticated message.
+                        //
+                        // Copy the engine ID out of the received datagram so a
+                        // stored entry does not pin the whole packet buffer.
+                        let engine_key = Bytes::copy_from_slice(&engine_id);
+                        let mut engines = self
+                            .inner
+                            .remote_engines
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // Bound the table: a peer holding one credential can
+                        // authenticate under arbitrarily many fabricated engine
+                        // IDs, so evict the least-recently-updated engine when
+                        // full before seeding a new one.
+                        if !engines.contains_key(&engine_key)
+                            && engines.len() >= super::MAX_REMOTE_ENGINES
+                            && let Some(oldest) = engines
+                                .iter()
+                                .min_by_key(|(_, s)| s.synced_at)
+                                .map(|(k, _)| k.clone())
+                        {
+                            engines.remove(&oldest);
+                        }
+                        let state = engines.entry(engine_key).or_insert_with_key(|k| {
+                            EngineState::new(
+                                k.clone(),
+                                usm_params.engine_boots,
+                                usm_params.engine_time,
+                            )
+                        });
+                        if !state.check_and_update_timeliness(
+                            usm_params.engine_boots,
+                            usm_params.engine_time,
+                        ) {
+                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = state.engine_boots, snmp.our_time = state.estimated_time() }, "V3 notification outside time window");
+                            return Err(Error::Auth { target: source }.boxed());
+                        }
                     }
                 }
                 _ => {
