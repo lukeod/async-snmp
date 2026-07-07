@@ -1064,15 +1064,15 @@ mod tests {
         }
     }
 
-    /// A noAuthNoPriv V3 trap is delivered (no per-user minimum is enforced
-    /// here) but must be distinguishable from an authenticated one via its
-    /// security level, whatever username it claims.
+    /// A noAuthNoPriv V3 trap from a configured user is delivered (no
+    /// per-user minimum is enforced here) but must be distinguishable from
+    /// an authenticated one via its security level.
     #[tokio::test]
     async fn test_v3_noauth_trap_carries_security_level() {
         let receiver = remote_trap_receiver().await;
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let msg = build_noauth_v3_trap(b"remote-sender-engine", b"anyuser");
+        let msg = build_noauth_v3_trap(b"remote-sender-engine", b"trapuser");
         match receiver.handle_v3(msg, source).await.unwrap() {
             Some(Notification::TrapV3 {
                 security_level,
@@ -1080,10 +1080,25 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(security_level, SecurityLevel::NoAuthNoPriv);
-                assert_eq!(username.as_ref(), b"anyuser");
+                assert_eq!(username.as_ref(), b"trapuser");
             }
             other => panic!("expected TrapV3, got {other:?}"),
         }
+    }
+
+    /// RFC 3414 Section 3.2 Step 4 is unconditional: the user must exist in
+    /// the local configuration regardless of security level, so a
+    /// noAuthNoPriv message from an unknown user is dropped and counted,
+    /// not delivered.
+    #[tokio::test]
+    async fn test_v3_noauth_trap_unknown_user_rejected_and_counted() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_noauth_v3_trap(b"remote-sender-engine", b"nosuchuser");
+        let result = receiver.handle_v3(msg, source).await.unwrap();
+        assert!(result.is_none(), "unknown user must not be delivered");
+        assert_eq!(receiver.usm_unknown_usernames(), 1);
     }
 
     /// Each remote engine gets independent timeliness state: traps from

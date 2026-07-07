@@ -131,19 +131,35 @@ impl super::NotificationReceiver {
         let username = usm_params.username.clone();
         let engine_id = usm_params.engine_id.clone();
 
-        // Look up user credentials if we have them configured
-        let user_config = self.inner.usm_users.get(&username);
+        // RFC 3414 Section 3.2 Step 4: the user must exist in the local
+        // configuration regardless of security level.
+        let Some(user_config) = self.inner.usm_users.get(&username) else {
+            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "V3 message for unknown user");
+            let count = self
+                .inner
+                .usm_unknown_usernames
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            self.send_usm_report(
+                &msg,
+                &usm_params,
+                crate::v3::report_oids::unknown_user_names(),
+                count,
+                None,
+                source,
+            )
+            .await;
+            return Ok(None);
+        };
         let derived_keys = user_config
-            .map(|u| u.derive_keys(&engine_id))
-            .transpose()
+            .derive_keys(&engine_id)
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
         // Verify authentication if required
         if security_level == SecurityLevel::AuthNoPriv || security_level == SecurityLevel::AuthPriv
         {
-            match &derived_keys {
-                Some(keys) if keys.auth_key.is_some() => {
-                    let auth_key = keys.auth_key.as_ref().unwrap();
+            match derived_keys.auth_key.as_ref() {
+                Some(auth_key) => {
                     let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data)
                         .ok_or_else(|| {
                             tracing::debug!(target: "async_snmp::notification", { source = %source, kind = %AuthErrorKind::AuthParamsNotFound }, "could not find auth params in notification");
@@ -204,7 +220,7 @@ impl super::NotificationReceiver {
                                 &usm_params,
                                 crate::v3::report_oids::not_in_time_windows(),
                                 count,
-                                keys.auth_key.as_ref(),
+                                Some(auth_key),
                                 source,
                             )
                             .await;
@@ -221,7 +237,7 @@ impl super::NotificationReceiver {
                                 &usm_params,
                                 crate::v3::report_oids::not_in_time_windows(),
                                 count,
-                                keys.auth_key.as_ref(),
+                                Some(auth_key),
                                 source,
                             )
                             .await;
@@ -279,7 +295,8 @@ impl super::NotificationReceiver {
                             // key localized to that engine ID, not the remote
                             // sender's.
                             let report_key = user_config
-                                .and_then(|u| u.derive_keys(&self.inner.engine_id).ok())
+                                .derive_keys(&self.inner.engine_id)
+                                .ok()
                                 .and_then(|k| k.auth_key);
                             self.send_usm_report(
                                 &msg,
@@ -294,24 +311,24 @@ impl super::NotificationReceiver {
                         }
                     }
                 }
-                _ => {
-                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received authenticated V3 message but no credentials configured for user");
-                    // RFC 3414 Section 3.2: Step 4 (unknown user) vs Step 5
-                    // (user exists but cannot meet the requested level).
-                    let (counter, report_oid) = if user_config.is_none() {
-                        (
-                            &self.inner.usm_unknown_usernames,
-                            crate::v3::report_oids::unknown_user_names(),
-                        )
-                    } else {
-                        (
-                            &self.inner.usm_unsupported_sec_levels,
-                            crate::v3::report_oids::unsupported_sec_levels(),
-                        )
-                    };
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    self.send_usm_report(&msg, &usm_params, report_oid, count, None, source)
-                        .await;
+                None => {
+                    // RFC 3414 Section 3.2 Step 5: the user exists but cannot
+                    // meet the requested security level.
+                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received authenticated V3 message but user has no auth key");
+                    let count = self
+                        .inner
+                        .usm_unsupported_sec_levels
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    self.send_usm_report(
+                        &msg,
+                        &usm_params,
+                        crate::v3::report_oids::unsupported_sec_levels(),
+                        count,
+                        None,
+                        source,
+                    )
+                    .await;
                     return Ok(None);
                 }
             }
@@ -319,9 +336,8 @@ impl super::NotificationReceiver {
 
         // Decrypt if needed
         let scoped_pdu = if security_level == SecurityLevel::AuthPriv {
-            match &derived_keys {
-                Some(keys) if keys.priv_key.is_some() => {
-                    let priv_key = keys.priv_key.as_ref().unwrap();
+            match derived_keys.priv_key.as_ref() {
+                Some(priv_key) => {
                     let encrypted_data = match &msg.data {
                         V3MessageData::Encrypted(data) => data,
                         V3MessageData::Plaintext(_) => {
@@ -361,7 +377,7 @@ impl super::NotificationReceiver {
                     let mut decoder = Decoder::with_target(decrypted, source);
                     ScopedPdu::decode(&mut decoder)?
                 }
-                _ => {
+                None => {
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received encrypted V3 message but no privacy key configured for user");
                     let count = self
                         .inner
@@ -419,7 +435,7 @@ impl super::NotificationReceiver {
                     response_pdu,
                     context_engine_id.clone(),
                     context_name.clone(),
-                    derived_keys.as_ref(),
+                    Some(&derived_keys),
                 )?;
 
                 self.inner
