@@ -1426,10 +1426,12 @@ mod tests {
 
         let result = receiver.handle_v3(discovery_msg, source).await;
 
-        // Non-reportable discovery should return Ok(None) without incrementing counter
+        // A non-reportable message with an unknown (empty) engine ID gets no
+        // response, but the counter tracks the occurrence like every other
+        // usmStats counter.
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-        assert_eq!(receiver.usm_unknown_engine_ids(), 0);
+        assert_eq!(receiver.usm_unknown_engine_ids(), 1);
     }
 
     /// A message under an engine ID other than the receiver's own is treated
@@ -1649,11 +1651,13 @@ mod tests {
             b"trapuser",
             Some((b"authpass12345678", AuthProtocol::Sha1)),
         );
-        assert!(receiver
-            .handle_v3(fresh, client_addr)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            receiver
+                .handle_v3(fresh, client_addr)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // Drain the inform acknowledgement.
         let mut buf = vec![0u8; 4096];

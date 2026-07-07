@@ -4,7 +4,7 @@
 //! notification messages.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
@@ -25,6 +25,42 @@ use super::types::DerivedKeys;
 use super::varbind::extract_notification_varbinds;
 use super::{Notification, ReceiverInner};
 use crate::v3::compute_engine_boots_time;
+
+/// A USM processing failure, binding the usmStats counter to the report OID
+/// sent for it (RFC 3414 Section 3.2) so the pair cannot be mismatched.
+#[derive(Clone, Copy)]
+enum UsmFailure {
+    UnknownEngineIds,
+    UnknownUserNames,
+    WrongDigests,
+    NotInTimeWindows,
+    UnsupportedSecLevels,
+    DecryptionErrors,
+}
+
+impl UsmFailure {
+    fn counter(self, inner: &ReceiverInner) -> &AtomicU32 {
+        match self {
+            Self::UnknownEngineIds => &inner.usm_unknown_engine_ids,
+            Self::UnknownUserNames => &inner.usm_unknown_usernames,
+            Self::WrongDigests => &inner.usm_wrong_digests,
+            Self::NotInTimeWindows => &inner.usm_not_in_time_windows,
+            Self::UnsupportedSecLevels => &inner.usm_unsupported_sec_levels,
+            Self::DecryptionErrors => &inner.usm_decryption_errors,
+        }
+    }
+
+    fn report_oid(self) -> Oid {
+        match self {
+            Self::UnknownEngineIds => crate::v3::report_oids::unknown_engine_ids(),
+            Self::UnknownUserNames => crate::v3::report_oids::unknown_user_names(),
+            Self::WrongDigests => crate::v3::report_oids::wrong_digests(),
+            Self::NotInTimeWindows => crate::v3::report_oids::not_in_time_windows(),
+            Self::UnsupportedSecLevels => crate::v3::report_oids::unsupported_sec_levels(),
+            Self::DecryptionErrors => crate::v3::report_oids::decryption_errors(),
+        }
+    }
+}
 
 impl super::NotificationReceiver {
     /// Handle `SNMPv1` message.
@@ -135,16 +171,10 @@ impl super::NotificationReceiver {
         // configuration regardless of security level.
         let Some(user_config) = self.inner.usm_users.get(&username) else {
             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "V3 message for unknown user");
-            let count = self
-                .inner
-                .usm_unknown_usernames
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
             self.send_usm_report(
                 &msg,
                 &usm_params,
-                crate::v3::report_oids::unknown_user_names(),
-                count,
+                UsmFailure::UnknownUserNames,
                 None,
                 source,
             )
@@ -161,16 +191,10 @@ impl super::NotificationReceiver {
         // which also dispatches before any digest is verified.
         if security_level == SecurityLevel::AuthPriv && derived_keys.priv_key.is_none() {
             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received encrypted V3 message but no privacy key configured for user");
-            let count = self
-                .inner
-                .usm_unsupported_sec_levels
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
             self.send_usm_report(
                 &msg,
                 &usm_params,
-                crate::v3::report_oids::unsupported_sec_levels(),
-                count,
+                UsmFailure::UnsupportedSecLevels,
                 None,
                 source,
             )
@@ -193,13 +217,10 @@ impl super::NotificationReceiver {
                         .map_err(|_| Error::Auth { target: source }.boxed())?
                     {
                         tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "V3 authentication failed");
-                        let count =
-                            self.inner.usm_wrong_digests.fetch_add(1, Ordering::Relaxed) + 1;
                         self.send_usm_report(
                             &msg,
                             &usm_params,
-                            crate::v3::report_oids::wrong_digests(),
-                            count,
+                            UsmFailure::WrongDigests,
                             None,
                             source,
                         )
@@ -223,12 +244,10 @@ impl super::NotificationReceiver {
                         // authNoPriv (RFC 3414 Section 3.2 Step 7a).
                         if our_boots == MAX_ENGINE_TIME {
                             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated notification");
-                            let count = self.bump_not_in_time_windows();
                             self.send_usm_report(
                                 &msg,
                                 &usm_params,
-                                crate::v3::report_oids::not_in_time_windows(),
-                                count,
+                                UsmFailure::NotInTimeWindows,
                                 Some(auth_key),
                                 source,
                             )
@@ -238,12 +257,10 @@ impl super::NotificationReceiver {
 
                         if usm_params.engine_boots != our_boots {
                             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.our_boots = our_boots }, "V3 notification engine boots mismatch");
-                            let count = self.bump_not_in_time_windows();
                             self.send_usm_report(
                                 &msg,
                                 &usm_params,
-                                crate::v3::report_oids::not_in_time_windows(),
-                                count,
+                                UsmFailure::NotInTimeWindows,
                                 Some(auth_key),
                                 source,
                             )
@@ -255,12 +272,10 @@ impl super::NotificationReceiver {
                             (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
                         if time_diff > i64::from(TIME_WINDOW) {
                             tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_time = usm_params.engine_time, snmp.our_time = our_time }, "V3 notification outside time window");
-                            let count = self.bump_not_in_time_windows();
                             self.send_usm_report(
                                 &msg,
                                 &usm_params,
-                                crate::v3::report_oids::not_in_time_windows(),
-                                count,
+                                UsmFailure::NotInTimeWindows,
                                 Some(auth_key),
                                 source,
                             )
@@ -327,16 +342,10 @@ impl super::NotificationReceiver {
                     // RFC 3414 Section 3.2 Step 5: the user exists but cannot
                     // meet the requested security level.
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received authenticated V3 message but user has no auth key");
-                    let count = self
-                        .inner
-                        .usm_unsupported_sec_levels
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1;
                     self.send_usm_report(
                         &msg,
                         &usm_params,
-                        crate::v3::report_oids::unsupported_sec_levels(),
-                        count,
+                        UsmFailure::UnsupportedSecLevels,
                         None,
                         source,
                     )
@@ -371,16 +380,10 @@ impl super::NotificationReceiver {
                 Ok(data) => data,
                 Err(e) => {
                     tracing::debug!(target: "async_snmp::notification", { source = %source, error = %e }, "decryption failed");
-                    let count = self
-                        .inner
-                        .usm_decryption_errors
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1;
                     self.send_usm_report(
                         &msg,
                         &usm_params,
-                        crate::v3::report_oids::decryption_errors(),
-                        count,
+                        UsmFailure::DecryptionErrors,
                         None,
                         source,
                     )
@@ -469,72 +472,19 @@ impl super::NotificationReceiver {
         usm_params: &UsmSecurityParams,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        // Only respond if reportable flag is set
-        if !msg.global_data.msg_flags.reportable {
-            return Ok(None);
-        }
-
-        let total_secs = self.inner.engine_start.elapsed().as_secs();
-        let (boots, time) = compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
-        let count = self
-            .inner
-            .usm_unknown_engine_ids
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-
-        let report_pdu = Pdu {
-            pdu_type: PduType::Report,
-            request_id: msg.global_data.msg_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
-                crate::v3::report_oids::unknown_engine_ids(),
-                Value::Counter32(count),
-            )],
-        };
-
-        let response_global = MsgGlobalData::new(
-            msg.global_data.msg_id,
-            msg.global_data.msg_max_size,
-            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
-        );
-        let response_usm = UsmSecurityParams::new(
-            self.inner.engine_id.clone(),
-            boots,
-            time,
-            usm_params.username.clone(),
-        );
-        let response_scoped =
-            ScopedPdu::new(self.inner.engine_id.clone(), Bytes::new(), report_pdu);
-        let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
-
-        self.inner
-            .socket
-            .send_to(&response_msg.encode(), source)
-            .await
-            .map_err(|e| Error::Network {
-                target: source,
-                source: e,
-            })?;
-
-        tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent discovery response");
+        self.send_usm_report(msg, usm_params, UsmFailure::UnknownEngineIds, None, source)
+            .await;
         Ok(None)
     }
 
-    fn bump_not_in_time_windows(&self) -> u32 {
-        self.inner
-            .usm_not_in_time_windows
-            .fetch_add(1, Ordering::Relaxed)
-            + 1
-    }
-
-    /// Send a Report PDU for a USM processing failure, best-effort.
+    /// Count a USM processing failure and send its Report PDU, best-effort.
     ///
-    /// Per RFC 3412 Section 7.1 Step 3 a Report may only be sent when the PDU
-    /// is Confirmed Class or, when the PDU class cannot be determined (the
-    /// case here: the message failed USM processing), when the reportableFlag
-    /// is set. Informs are sent with the flag set and traps without, so this
-    /// answers USM-failed informs while staying silent for traps.
+    /// The failure's usmStats counter is always incremented. Per RFC 3412
+    /// Section 7.1 Step 3 a Report may only be sent when the PDU is Confirmed
+    /// Class or, when the PDU class cannot be determined (the case here: the
+    /// message failed USM processing), when the reportableFlag is set.
+    /// Informs are sent with the flag set and traps without, so this answers
+    /// USM-failed informs while staying silent for traps.
     ///
     /// With `auth_key` (localized to the receiver's engine ID) the report is
     /// sent authenticated at authNoPriv, as RFC 3414 Section 3.2 Step 7
@@ -547,14 +497,15 @@ impl super::NotificationReceiver {
         &self,
         msg: &V3Message,
         usm_params: &UsmSecurityParams,
-        report_oid: Oid,
-        count: u32,
+        failure: UsmFailure,
         auth_key: Option<&LocalizedKey>,
         source: SocketAddr,
     ) {
+        let count = failure.counter(&self.inner).fetch_add(1, Ordering::Relaxed) + 1;
         if !msg.global_data.msg_flags.reportable {
             return;
         }
+        let report_oid = failure.report_oid();
 
         let total_secs = self.inner.engine_start.elapsed().as_secs();
         let (boots, time) = compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
@@ -591,17 +542,10 @@ impl super::NotificationReceiver {
         let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
         let mut response_bytes = response_msg.encode().to_vec();
 
-        if let Some(key) = auth_key {
-            let Some((auth_offset, auth_len)) =
-                UsmSecurityParams::find_auth_params_offset(&response_bytes)
-            else {
-                tracing::debug!(target: "async_snmp::notification", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in USM report");
-                return;
-            };
-            if let Err(e) = authenticate_message(key, &mut response_bytes, auth_offset, auth_len) {
-                tracing::debug!(target: "async_snmp::notification", { error = %e }, "failed to authenticate USM report");
-                return;
-            }
+        if let Some(key) = auth_key
+            && sign_v3_message(key, &mut response_bytes, self.inner.local_addr).is_err()
+        {
+            return;
         }
 
         if let Err(e) = self.inner.socket.send_to(&response_bytes, source).await {
@@ -610,6 +554,26 @@ impl super::NotificationReceiver {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent USM report");
         }
     }
+}
+
+/// Fill in the HMAC of an encoded V3 message built with an auth placeholder.
+///
+/// Failures are logged at debug level; `local_addr` is only used as the
+/// error's target address.
+fn sign_v3_message(
+    auth_key: &LocalizedKey,
+    message: &mut [u8],
+    local_addr: SocketAddr,
+) -> Result<()> {
+    let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(message)
+        .ok_or_else(|| {
+            tracing::debug!(target: "async_snmp::notification", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in outgoing V3 message");
+            Error::MalformedResponse { target: local_addr }.boxed()
+        })?;
+    authenticate_message(auth_key, message, auth_offset, auth_len).map_err(|e| {
+        tracing::debug!(target: "async_snmp::notification", { error = %e }, "failed to authenticate outgoing V3 message");
+        Error::Config(e.to_string().into()).boxed()
+    })
 }
 
 /// Build a V3 response message with appropriate security.
@@ -671,16 +635,7 @@ fn build_v3_response(
                 V3Message::new(response_global, response_usm.encode(), response_scoped);
 
             let mut response_bytes = response_msg.encode().to_vec();
-
-            // Find and fill in the authentication parameters
-            let (auth_offset, auth_len) =
-                UsmSecurityParams::find_auth_params_offset(&response_bytes).ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::notification", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in notification response");
-                    Error::MalformedResponse { target: local_addr }.boxed()
-                })?;
-
-            authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len)
-                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+            sign_v3_message(auth_key, &mut response_bytes, local_addr)?;
 
             Ok(Bytes::from(response_bytes))
         }
@@ -728,16 +683,7 @@ fn build_v3_response(
                 V3Message::new_encrypted(response_global, response_usm.encode(), encrypted);
 
             let mut response_bytes = response_msg.encode().to_vec();
-
-            // Find and fill in the authentication parameters
-            let (auth_offset, auth_len) =
-                UsmSecurityParams::find_auth_params_offset(&response_bytes).ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::notification", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in notification response");
-                    Error::MalformedResponse { target: local_addr }.boxed()
-                })?;
-
-            authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len)
-                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+            sign_v3_message(auth_key, &mut response_bytes, local_addr)?;
 
             Ok(Bytes::from(response_bytes))
         }
