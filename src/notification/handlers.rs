@@ -155,6 +155,29 @@ impl super::NotificationReceiver {
             .derive_keys(&engine_id)
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
+        // RFC 3414 Section 3.2 Step 5: the user must support the requested
+        // security level, checked before authentication (Step 6). The
+        // missing-auth-key half of Step 5 is handled by the match below,
+        // which also dispatches before any digest is verified.
+        if security_level == SecurityLevel::AuthPriv && derived_keys.priv_key.is_none() {
+            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received encrypted V3 message but no privacy key configured for user");
+            let count = self
+                .inner
+                .usm_unsupported_sec_levels
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            self.send_usm_report(
+                &msg,
+                &usm_params,
+                crate::v3::report_oids::unsupported_sec_levels(),
+                count,
+                None,
+                source,
+            )
+            .await;
+            return Ok(None);
+        }
+
         // Verify authentication if required
         if security_level == SecurityLevel::AuthNoPriv || security_level == SecurityLevel::AuthPriv
         {
@@ -336,66 +359,49 @@ impl super::NotificationReceiver {
 
         // Decrypt if needed
         let scoped_pdu = if security_level == SecurityLevel::AuthPriv {
-            match derived_keys.priv_key.as_ref() {
-                Some(priv_key) => {
-                    let encrypted_data = match &msg.data {
-                        V3MessageData::Encrypted(data) => data,
-                        V3MessageData::Plaintext(_) => {
-                            tracing::debug!(target: "async_snmp::notification", { source = %source, kind = %DecodeErrorKind::UnexpectedEncryption }, "expected encrypted scoped PDU in notification");
-                            return Err(Error::MalformedResponse { target: source }.boxed());
-                        }
-                    };
-
-                    let decrypted = priv_key.decrypt(
-                        encrypted_data,
-                        usm_params.engine_boots,
-                        usm_params.engine_time,
-                        &usm_params.priv_params,
-                    );
-                    let decrypted = match decrypted {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::debug!(target: "async_snmp::notification", { source = %source, error = %e }, "decryption failed");
-                            let count = self
-                                .inner
-                                .usm_decryption_errors
-                                .fetch_add(1, Ordering::Relaxed)
-                                + 1;
-                            self.send_usm_report(
-                                &msg,
-                                &usm_params,
-                                crate::v3::report_oids::decryption_errors(),
-                                count,
-                                None,
-                                source,
-                            )
-                            .await;
-                            return Err(Error::Auth { target: source }.boxed());
-                        }
-                    };
-
-                    let mut decoder = Decoder::with_target(decrypted, source);
-                    ScopedPdu::decode(&mut decoder)?
+            // Presence checked at Step 5 above.
+            let priv_key = derived_keys
+                .priv_key
+                .as_ref()
+                .expect("authPriv without a privacy key is rejected at Step 5");
+            let encrypted_data = match &msg.data {
+                V3MessageData::Encrypted(data) => data,
+                V3MessageData::Plaintext(_) => {
+                    tracing::debug!(target: "async_snmp::notification", { source = %source, kind = %DecodeErrorKind::UnexpectedEncryption }, "expected encrypted scoped PDU in notification");
+                    return Err(Error::MalformedResponse { target: source }.boxed());
                 }
-                None => {
-                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&username) }, "received encrypted V3 message but no privacy key configured for user");
+            };
+
+            let decrypted = priv_key.decrypt(
+                encrypted_data,
+                usm_params.engine_boots,
+                usm_params.engine_time,
+                &usm_params.priv_params,
+            );
+            let decrypted = match decrypted {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::debug!(target: "async_snmp::notification", { source = %source, error = %e }, "decryption failed");
                     let count = self
                         .inner
-                        .usm_unsupported_sec_levels
+                        .usm_decryption_errors
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
                     self.send_usm_report(
                         &msg,
                         &usm_params,
-                        crate::v3::report_oids::unsupported_sec_levels(),
+                        crate::v3::report_oids::decryption_errors(),
                         count,
                         None,
                         source,
                     )
                     .await;
-                    return Ok(None);
+                    return Err(Error::Auth { target: source }.boxed());
                 }
-            }
+            };
+
+            let mut decoder = Decoder::with_target(decrypted, source);
+            ScopedPdu::decode(&mut decoder)?
         } else if let Some(sp) = msg.scoped_pdu() {
             sp.clone()
         } else {

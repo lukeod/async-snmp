@@ -1628,23 +1628,27 @@ mod tests {
         assert_eq!(receiver.usm_not_in_time_windows(), 1);
     }
 
-    /// Build an authPriv V3 trap with a valid HMAC but undecryptable privacy
-    /// parameters (wrong salt length), for the given user credentials.
-    fn build_v3_trap_bad_ciphertext(engine_id: &[u8]) -> Bytes {
+    /// Build an authPriv V3 trap for the given username, HMAC'd with the
+    /// given password, with undecryptable privacy parameters (wrong salt
+    /// length) and garbage ciphertext.
+    fn build_v3_trap_bad_ciphertext(
+        engine_id: &[u8],
+        username: &[u8],
+        auth_password: &[u8],
+    ) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, V3Message};
         use crate::v3::auth::authenticate_message;
         use crate::v3::{LocalizedKey, UsmSecurityParams};
 
         let auth_key =
-            LocalizedKey::from_password(AuthProtocol::Sha1, b"authpass12345678", engine_id)
-                .unwrap();
+            LocalizedKey::from_password(AuthProtocol::Sha1, auth_password, engine_id).unwrap();
 
         let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthPriv, false));
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             7,
             123_456,
-            Bytes::from_static(b"privuser"),
+            Bytes::copy_from_slice(username),
         )
         .with_auth_placeholder(auth_key.mac_len())
         .with_priv_params(Bytes::from_static(b"bad"));
@@ -1677,9 +1681,30 @@ mod tests {
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let msg = build_v3_trap_bad_ciphertext(b"remote-sender-engine");
+        let msg =
+            build_v3_trap_bad_ciphertext(b"remote-sender-engine", b"privuser", b"authpass12345678");
         assert!(receiver.handle_v3(msg, source).await.is_err());
         assert_eq!(receiver.usm_decryption_errors(), 1);
+    }
+
+    /// RFC 3414 Section 3.2 Step 5 precedes Step 6: an authPriv message for
+    /// a user configured without privacy increments
+    /// usmStatsUnsupportedSecLevels even when its HMAC is invalid, not
+    /// usmStatsWrongDigests.
+    #[tokio::test]
+    async fn test_v3_authpriv_for_auth_only_user_counts_unsupported_sec_level() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_v3_trap_bad_ciphertext(
+            b"remote-sender-engine",
+            b"trapuser",
+            b"wrong-password-1234",
+        );
+        let result = receiver.handle_v3(msg, source).await.unwrap();
+        assert!(result.is_none());
+        assert_eq!(receiver.usm_unsupported_sec_levels(), 1);
+        assert_eq!(receiver.usm_wrong_digests(), 0);
     }
 
     /// A USM-failed inform (Confirmed Class, reportableFlag set) gets a
