@@ -263,22 +263,35 @@ impl EngineState {
     /// - Message boots differs from local boots, OR
     /// - |`message_time` - `local_time`| > 150 seconds
     pub fn is_in_time_window(&self, msg_boots: u32, msg_time: u32) -> bool {
-        // Check for latched boots (max value)
-        if self.engine_boots == 2_147_483_647 {
-            return false;
-        }
-
-        // Boots must match
-        if msg_boots != self.engine_boots {
-            return false;
-        }
-
-        // Time must be within window
-        let local_time = self.estimated_time();
-        let diff = msg_time.abs_diff(local_time);
-
-        diff <= TIME_WINDOW
+        in_authoritative_time_window(
+            self.engine_boots,
+            self.estimated_time(),
+            msg_boots,
+            msg_time,
+        )
     }
+}
+
+/// Time window check when the local engine's boots/time are the reference
+/// (RFC 3414 Section 2.2.3, applied by Section 3.2 Step 7a in the
+/// authoritative role).
+///
+/// The message is in the window only if local boots is not latched at
+/// [`MAX_ENGINE_TIME`], the message boots equals local boots, and the message
+/// time is within [`TIME_WINDOW`] seconds of local time (symmetric).
+///
+/// For messages from a remote authoritative engine (Step 7b), use
+/// [`EngineState::check_and_update_timeliness`] instead: that check is
+/// asymmetric and self-updating.
+pub fn in_authoritative_time_window(
+    local_boots: u32,
+    local_time: u32,
+    msg_boots: u32,
+    msg_time: u32,
+) -> bool {
+    local_boots != MAX_ENGINE_TIME
+        && msg_boots == local_boots
+        && msg_time.abs_diff(local_time) <= TIME_WINDOW
 }
 
 /// Default TTL for engine cache entries (5 minutes).

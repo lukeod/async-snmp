@@ -17,7 +17,7 @@ use crate::message::{
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::v3::auth::{authenticate_message, verify_message};
-use crate::v3::{EngineState, LocalizedKey, MAX_ENGINE_TIME, TIME_WINDOW, UsmSecurityParams};
+use crate::v3::{EngineState, LocalizedKey, UsmSecurityParams, in_authoritative_time_window};
 use crate::value::Value;
 use crate::varbind::VarBind;
 
@@ -238,40 +238,17 @@ impl super::NotificationReceiver {
                         let (our_boots, our_time) =
                             compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
 
-                        // When boots is latched at MAX_ENGINE_TIME, reject all
-                        // authenticated messages. Like the other Time Window
-                        // failures, the report must be authenticated at
-                        // authNoPriv (RFC 3414 Section 3.2 Step 7a).
-                        if our_boots == MAX_ENGINE_TIME {
-                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated notification");
-                            self.send_usm_report(
-                                &msg,
-                                &usm_params,
-                                UsmFailure::NotInTimeWindows,
-                                Some(auth_key),
-                                source,
-                            )
-                            .await;
-                            return Err(Error::Auth { target: source }.boxed());
-                        }
-
-                        if usm_params.engine_boots != our_boots {
-                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.our_boots = our_boots }, "V3 notification engine boots mismatch");
-                            self.send_usm_report(
-                                &msg,
-                                &usm_params,
-                                UsmFailure::NotInTimeWindows,
-                                Some(auth_key),
-                                source,
-                            )
-                            .await;
-                            return Err(Error::Auth { target: source }.boxed());
-                        }
-
-                        let time_diff =
-                            (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
-                        if time_diff > i64::from(TIME_WINDOW) {
-                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_time = usm_params.engine_time, snmp.our_time = our_time }, "V3 notification outside time window");
+                        // Covers latched boots, boots mismatch, and time drift.
+                        // Like the other Time Window failures, the report must
+                        // be authenticated at authNoPriv (RFC 3414 Section 3.2
+                        // Step 7a).
+                        if !in_authoritative_time_window(
+                            our_boots,
+                            our_time,
+                            usm_params.engine_boots,
+                            usm_params.engine_time,
+                        ) {
+                            tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = our_boots, snmp.our_time = our_time }, "V3 notification outside time window");
                             self.send_usm_report(
                                 &msg,
                                 &usm_params,
