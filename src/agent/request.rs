@@ -4,7 +4,7 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::ber::Decoder;
-use crate::error::internal::{CryptoErrorKind, DecodeErrorKind};
+use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
 use crate::handler::{RequestContext, SecurityModel};
 use crate::message::{
@@ -151,6 +151,31 @@ impl Agent {
             );
         }
 
+        // RFC 3414 Section 3.2 Step 5: the user must support the requested
+        // security level, checked before authentication (Step 6) and
+        // timeliness (Step 7). An authPriv request for a user without a
+        // privacy key is rejected here regardless of its HMAC or boots. The
+        // missing-auth-key half of Step 5 is handled by the match below.
+        if security_level == SecurityLevel::AuthPriv
+            && derived_keys.as_ref().is_some_and(|k| k.priv_key.is_none())
+        {
+            tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user does not support requested privacy level");
+            let count = self
+                .inner
+                .state
+                .usm_unsupported_sec_levels
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            return self.send_v3_report(
+                &msg,
+                &usm_params,
+                crate::v3::report_oids::unsupported_sec_levels(),
+                count,
+                None,
+                source,
+            );
+        }
+
         // RFC 3414 Section 2.3: when engine boots is latched at maximum,
         // reject all authenticated inbound messages with notInTimeWindows.
         // The agent cannot perform timeliness checks in this state.
@@ -261,64 +286,47 @@ impl Agent {
 
         // Decrypt if needed
         let scoped_pdu = if security_level == SecurityLevel::AuthPriv {
-            match &derived_keys {
-                Some(keys) if keys.priv_key.is_some() => {
-                    let priv_key = keys.priv_key.as_ref().unwrap();
-                    let encrypted_data = match &msg.data {
-                        V3MessageData::Encrypted(data) => data,
-                        V3MessageData::Plaintext(_) => {
-                            tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::ExpectedEncryption }, "expected encrypted scoped PDU");
-                            return Err(Error::MalformedResponse { target: source }.boxed());
-                        }
-                    };
-
-                    let decrypted = match priv_key.decrypt(
-                        encrypted_data,
-                        usm_params.engine_boots,
-                        usm_params.engine_time,
-                        &usm_params.priv_params,
-                    ) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::debug!(target: "async_snmp::agent", { source = %source, error = %e }, "decryption failed");
-                            let count = self
-                                .inner
-                                .state
-                                .usm_decryption_errors
-                                .fetch_add(1, Ordering::Relaxed)
-                                + 1;
-                            return self.send_v3_report(
-                                &msg,
-                                &usm_params,
-                                crate::v3::report_oids::decryption_errors(),
-                                count,
-                                None,
-                                source,
-                            );
-                        }
-                    };
-
-                    let mut decoder = Decoder::with_target(decrypted, source);
-                    ScopedPdu::decode(&mut decoder)?
+            // Privacy key presence was checked at Step 5 above.
+            let priv_key = derived_keys
+                .as_ref()
+                .and_then(|keys| keys.priv_key.as_ref())
+                .expect("authPriv without a privacy key is rejected at Step 5");
+            let encrypted_data = match &msg.data {
+                V3MessageData::Encrypted(data) => data,
+                V3MessageData::Plaintext(_) => {
+                    tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::ExpectedEncryption }, "expected encrypted scoped PDU");
+                    return Err(Error::MalformedResponse { target: source }.boxed());
                 }
-                _ => {
-                    tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %CryptoErrorKind::NoPrivKey }, "no privacy key configured for user");
+            };
+
+            let decrypted = match priv_key.decrypt(
+                encrypted_data,
+                usm_params.engine_boots,
+                usm_params.engine_time,
+                &usm_params.priv_params,
+            ) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::debug!(target: "async_snmp::agent", { source = %source, error = %e }, "decryption failed");
                     let count = self
                         .inner
                         .state
-                        .usm_unsupported_sec_levels
+                        .usm_decryption_errors
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
                     return self.send_v3_report(
                         &msg,
                         &usm_params,
-                        crate::v3::report_oids::unsupported_sec_levels(),
+                        crate::v3::report_oids::decryption_errors(),
                         count,
                         None,
                         source,
                     );
                 }
-            }
+            };
+
+            let mut decoder = Decoder::with_target(decrypted, source);
+            ScopedPdu::decode(&mut decoder)?
         } else if let Some(sp) = msg.scoped_pdu() {
             sp.clone()
         } else {
@@ -485,5 +493,65 @@ mod tests {
         assert!(is_request_pdu(PduType::InformRequest));
         assert!(!is_request_pdu(PduType::Response));
         assert!(!is_request_pdu(PduType::TrapV2));
+    }
+
+    /// Build an authPriv V3 message for `username` whose HMAC is computed with
+    /// `auth_password` (pass a wrong password to force a digest mismatch). The
+    /// ciphertext is deliberately invalid; callers exercising Step 5 never
+    /// reach decryption.
+    fn build_authpriv_bad_hmac(engine_id: &[u8], username: &[u8], auth_password: &[u8]) -> Bytes {
+        use crate::v3::auth::authenticate_message;
+        use crate::v3::{AuthProtocol, LocalizedKey};
+
+        let auth_key =
+            LocalizedKey::from_password(AuthProtocol::Sha1, auth_password, engine_id).unwrap();
+
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthPriv, true));
+        let usm_params = UsmSecurityParams::new(
+            Bytes::copy_from_slice(engine_id),
+            7,
+            123_456,
+            Bytes::copy_from_slice(username),
+        )
+        .with_auth_placeholder(auth_key.mac_len())
+        .with_priv_params(Bytes::from_static(b"bad"));
+
+        let msg = V3Message::new_encrypted(
+            global,
+            usm_params.encode(),
+            Bytes::from_static(b"not-a-valid-ciphertext"),
+        );
+        let mut msg_bytes = msg.encode().to_vec();
+        let (auth_offset, auth_len) =
+            UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
+        authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
+        Bytes::from(msg_bytes)
+    }
+
+    /// RFC 3414 Section 3.2 Step 5 precedes Step 6: an authPriv request for a
+    /// user configured without privacy increments usmStatsUnsupportedSecLevels
+    /// even when its HMAC is invalid, not usmStatsWrongDigests.
+    #[tokio::test]
+    async fn test_v3_authpriv_for_auth_only_user_counts_unsupported_sec_level() {
+        use crate::v3::AuthProtocol;
+
+        let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("trapuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let msg = build_authpriv_bad_hmac(&engine_id, b"trapuser", b"wrong-password-1234");
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let result = agent.handle_v3(msg, source).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(agent.usm_unsupported_sec_levels(), 1);
+        assert_eq!(agent.usm_wrong_digests(), 0);
     }
 }
