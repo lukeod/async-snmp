@@ -65,6 +65,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
+use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tracing::instrument;
 
@@ -89,6 +90,26 @@ pub use varbind::validate_notification_varbinds;
 /// localized per engine ID), so the table is bounded and the
 /// least-recently-updated engine is evicted when full.
 const MAX_REMOTE_ENGINES: usize = 8192;
+
+/// Decide whether a v1/v2c notification carrying `community` is accepted.
+///
+/// An empty `configured` list accepts any community (filtering is opt-in).
+/// Otherwise the community must equal one of the configured strings. The
+/// comparison runs against every configured entry without early-out and uses
+/// constant-time equality (mirroring `Agent::validate_community`) so a timing
+/// side channel cannot be used to recover a valid community byte by byte.
+pub(super) fn community_allowed(configured: &[Vec<u8>], community: &[u8]) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+    let mut valid = false;
+    for candidate in configured {
+        if candidate.len() == community.len() && bool::from(candidate.as_slice().ct_eq(community)) {
+            valid = true;
+        }
+    }
+    valid
+}
 
 /// Well-known OIDs for notification varbinds.
 pub mod oids {
@@ -167,6 +188,7 @@ pub mod oids {
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
+    communities: Vec<Vec<u8>>,
     engine_id: Option<Vec<u8>>,
     engine_boots: u32,
 }
@@ -182,6 +204,7 @@ impl NotificationReceiverBuilder {
         Self {
             bind_addr: "0.0.0.0:162".to_string(),
             usm_users: HashMap::new(),
+            communities: Vec::new(),
             engine_id: None,
             engine_boots: 1,
         }
@@ -224,6 +247,70 @@ impl NotificationReceiverBuilder {
         let username_bytes: Bytes = username.into();
         let config = configure(UsmConfig::new(username_bytes.clone()));
         self.usm_users.insert(username_bytes, config);
+        self
+    }
+
+    /// Restrict accepted v1/v2c notifications to the given community string.
+    ///
+    /// Community filtering is opt-in. With no community configured the
+    /// receiver accepts v1/v2c notifications under any community and surfaces
+    /// the community on the returned [`Notification`] for caller-side policy.
+    /// Once one or more communities are configured, a v1/v2c notification
+    /// whose community matches none of them is dropped and never returned
+    /// from [`NotificationReceiver::recv`]; a dropped inform is not
+    /// acknowledged. Comparison is constant-time. This does not affect v3,
+    /// which is gated by USM.
+    ///
+    /// Call multiple times to accept several communities.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::notification::NotificationReceiver;
+    ///
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// let receiver = NotificationReceiver::builder()
+    ///     .bind("0.0.0.0:162")
+    ///     .community(b"public")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn community(mut self, community: &[u8]) -> Self {
+        self.communities.push(community.to_vec());
+        self
+    }
+
+    /// Restrict accepted v1/v2c notifications to any of the given communities.
+    ///
+    /// Convenience for calling [`Self::community`] once per entry. See that
+    /// method for the filtering semantics.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::notification::NotificationReceiver;
+    ///
+    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// let receiver = NotificationReceiver::builder()
+    ///     .bind("0.0.0.0:162")
+    ///     .communities(["public", "monitor"])
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn communities<I, C>(mut self, communities: I) -> Self
+    where
+        I: IntoIterator<Item = C>,
+        C: AsRef<[u8]>,
+    {
+        for c in communities {
+            self.communities.push(c.as_ref().to_vec());
+        }
         self
     }
 
@@ -283,6 +370,7 @@ impl NotificationReceiverBuilder {
                 socket,
                 local_addr,
                 usm_users: self.usm_users,
+                communities: self.communities,
                 engine_id,
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: self.engine_boots,
@@ -503,6 +591,10 @@ struct ReceiverInner {
     local_addr: SocketAddr,
     /// Configured USM users for V3 authentication
     usm_users: HashMap<Bytes, UsmConfig>,
+    /// Accepted v1/v2c community strings. Empty means accept any community
+    /// (community filtering is opt-in); otherwise a v1/v2c notification whose
+    /// community matches none of these is dropped.
+    communities: Vec<Vec<u8>>,
     /// Engine ID for V3 discovery responses
     engine_id: Bytes,
     /// Salt counter for privacy operations
@@ -599,6 +691,7 @@ impl NotificationReceiver {
                 socket,
                 local_addr,
                 usm_users: HashMap::new(),
+                communities: Vec::new(),
                 engine_id,
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: 1,
@@ -2028,5 +2121,181 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "no Report may be sent for a failed trap");
+    }
+
+    #[test]
+    fn test_community_allowed() {
+        // Empty allowlist accepts any community (opt-in filtering).
+        assert!(community_allowed(&[], b"public"));
+        assert!(community_allowed(&[], b""));
+
+        let configured = vec![b"public".to_vec(), b"monitor".to_vec()];
+        assert!(community_allowed(&configured, b"public"));
+        assert!(community_allowed(&configured, b"monitor"));
+        // Non-matching, prefix, and length-mismatch are all rejected.
+        assert!(!community_allowed(&configured, b"private"));
+        assert!(!community_allowed(&configured, b"pub"));
+        assert!(!community_allowed(&configured, b"publicx"));
+        assert!(!community_allowed(&configured, b""));
+    }
+
+    fn build_v2c_trap(community: &[u8]) -> Bytes {
+        use crate::message::CommunityMessage;
+        use crate::pdu::Pdu;
+        let pdu = Pdu::trap_v2(1, 100, &oids::cold_start(), vec![]);
+        CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu).encode()
+    }
+
+    fn build_v2c_inform(community: &[u8]) -> Bytes {
+        use crate::message::CommunityMessage;
+        use crate::pdu::Pdu;
+        let pdu = Pdu::inform_request(1, 100, &oids::cold_start(), vec![]);
+        CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu).encode()
+    }
+
+    fn build_v1_trap(community: &[u8]) -> Bytes {
+        use crate::message::CommunityMessage;
+        use crate::pdu::GenericTrap;
+        let trap = TrapV1Pdu::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999),
+            [192, 168, 1, 1],
+            GenericTrap::ColdStart,
+            0,
+            12345,
+            vec![],
+        );
+        CommunityMessage::v1_trap(Bytes::copy_from_slice(community), trap).encode()
+    }
+
+    #[tokio::test]
+    async fn test_v2c_trap_matching_community_accepted() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let result = receiver
+            .handle_v2c(build_v2c_trap(b"public"), source)
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(Notification::TrapV2c { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_v2c_trap_wrong_community_dropped() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let result = receiver
+            .handle_v2c(build_v2c_trap(b"private"), source)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_v2c_trap_no_allowlist_accepts_any_community() {
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let result = receiver
+            .handle_v2c(build_v2c_trap(b"anything"), source)
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(Notification::TrapV2c { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_v1_trap_wrong_community_dropped() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        assert!(
+            receiver
+                .handle_v1(build_v1_trap(b"private"), source)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            receiver
+                .handle_v1(build_v1_trap(b"public"), source)
+                .await
+                .unwrap(),
+            Some(Notification::TrapV1 { .. })
+        ));
+    }
+
+    /// An inform rejected by the community filter is dropped before the ack is
+    /// built, so no Response datagram is sent to the source.
+    #[tokio::test]
+    async fn test_v2c_inform_wrong_community_dropped_without_ack() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let result = receiver
+            .handle_v2c(build_v2c_inform(b"private"), client_addr)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        let mut buf = vec![0u8; 4096];
+        let recv = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.recv_from(&mut buf),
+        )
+        .await;
+        assert!(recv.is_err(), "a filtered inform must not be acknowledged");
+    }
+
+    /// A matching inform is still acknowledged (the filter does not suppress
+    /// valid acks).
+    #[tokio::test]
+    async fn test_v2c_inform_matching_community_acked() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let result = receiver
+            .handle_v2c(build_v2c_inform(b"public"), client_addr)
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(Notification::InformV2c { .. })));
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("a matching inform must be acknowledged")
+        .unwrap();
+        assert!(len > 0);
     }
 }

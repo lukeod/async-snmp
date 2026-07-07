@@ -76,6 +76,11 @@ impl super::NotificationReceiver {
         let _version = seq.read_integer()?;
         let community = seq.read_octet_string()?;
 
+        if !super::community_allowed(&self.inner.communities, &community) {
+            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v1 notification with unaccepted community");
+            return Ok(None);
+        }
+
         // Peek at PDU tag
         let pdu_tag = seq.peek_tag().ok_or_else(|| {
             tracing::debug!(target: "async_snmp::notification", { source = %source, kind = %DecodeErrorKind::TruncatedData }, "truncated notification data");
@@ -98,6 +103,11 @@ impl super::NotificationReceiver {
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
         let msg = CommunityMessage::decode(data)?;
+
+        if !super::community_allowed(&self.inner.communities, &msg.community) {
+            tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v2c notification with unaccepted community");
+            return Ok(None);
+        }
 
         // V2c messages carry standard PDUs; TrapV1 is only valid in V1 messages.
         let Some(pdu) = msg.pdu.standard() else {
