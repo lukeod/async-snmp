@@ -76,7 +76,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// Maximum UDP datagram size for receiving.
 ///
@@ -115,22 +115,16 @@ pub struct UdpTransport {
 }
 
 struct UdpTransportInner {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
-    core: UdpCore,
+    core: Arc<UdpCore>,
     config: UdpTransportConfig,
     shutdown: CancellationToken,
+    // Cancels the recv task when the last transport/handle reference drops.
+    // The task itself must hold no strong reference to this struct, or the
+    // guard would never fire.
+    _shutdown_guard: DropGuard,
     recv_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for UdpTransport {
-    fn drop(&mut self) {
-        // Cancel the background receiver task when the last UdpTransport handle is dropped.
-        // Arc::get_mut succeeds only when this is the last reference.
-        if Arc::get_mut(&mut self.inner).is_some() {
-            self.inner.shutdown.cancel();
-        }
-    }
 }
 
 impl UdpTransport {
@@ -196,6 +190,9 @@ impl UdpTransport {
     ///
     /// Signals the background recv task to stop and waits for it to exit.
     /// Pending requests will fail with timeout errors.
+    ///
+    /// Calling this is optional: the recv task is also cancelled when the
+    /// last `UdpTransport` clone and [`UdpHandle`] are dropped.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         let handle = self.inner.recv_task.lock().await.take();
@@ -205,7 +202,14 @@ impl UdpTransport {
     }
 
     fn start_recv_loop(inner: &Arc<UdpTransportInner>) {
-        let task_inner = inner.clone();
+        // The task captures only the pieces it needs, never the inner Arc:
+        // Drop-based cancellation relies on the DropGuard firing when the
+        // last transport/handle reference drops, which can only happen if
+        // the task keeps no strong reference to the inner state.
+        let socket = inner.socket.clone();
+        let core = inner.core.clone();
+        let shutdown = inner.shutdown.clone();
+        let local_addr = inner.local_addr;
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
@@ -214,29 +218,29 @@ impl UdpTransport {
                 tokio::select! {
                     biased;
 
-                    () = task_inner.shutdown.cancelled() => {
-                        tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %task_inner.local_addr }, "UDP transport shutdown");
+                    () = shutdown.cancelled() => {
+                        tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %local_addr }, "UDP transport shutdown");
                         break;
                     }
 
                     _ = cleanup_interval.tick() => {
-                        task_inner.core.cleanup_expired();
+                        core.cleanup_expired();
                     }
 
-                    result = task_inner.socket.recv_from(&mut buf) => {
+                    result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((len, source)) => {
                                 let data = Bytes::copy_from_slice(&buf[..len]);
 
                                 if let Some(request_id) = extract_request_id(&data) {
-                                    if !task_inner.core.deliver(request_id, data, source) {
+                                    if !core.deliver(request_id, data, source) {
                                         tracing::debug!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.source = %source }, "response for unknown request");
                                     }
                                 } else {
                                     tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, snmp.bytes = len }, "malformed response (no request_id)");
                                 }
                             }
-                            Err(_) if task_inner.shutdown.is_cancelled() => break,
+                            Err(_) if shutdown.is_cancelled() => break,
                             Err(e) => {
                                 tracing::error!(target: "async_snmp::transport", { error = %e }, "UDP recv error");
                             }
@@ -352,12 +356,14 @@ impl UdpTransportBuilder {
 
         tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %local_addr }, "UDP transport bound");
 
+        let shutdown = CancellationToken::new();
         let inner = Arc::new(UdpTransportInner {
-            socket,
+            socket: Arc::new(socket),
             local_addr,
-            core: UdpCore::new(),
+            core: Arc::new(UdpCore::new()),
             config: self.config,
-            shutdown: CancellationToken::new(),
+            _shutdown_guard: shutdown.clone().drop_guard(),
+            shutdown,
             recv_task: tokio::sync::Mutex::new(None),
         });
 
@@ -499,6 +505,27 @@ mod tests {
             .await
             .unwrap();
         assert!(transport.local_addr().port() > 0);
+    }
+
+    #[tokio::test]
+    async fn drop_without_shutdown_stops_recv_task() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let task = transport
+            .inner
+            .recv_task
+            .try_lock()
+            .unwrap()
+            .take()
+            .expect("recv task running");
+        let weak = Arc::downgrade(&transport.inner);
+
+        drop(transport);
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("recv task did not exit after drop")
+            .unwrap();
+        assert_eq!(weak.strong_count(), 0, "transport state leaked after drop");
     }
 
     #[tokio::test]
