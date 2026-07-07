@@ -1384,6 +1384,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_v3_discovery_gets_response() {
+        use crate::message::V3Message;
+        use crate::v3::UsmSecurityParams;
+        use crate::value::Value;
+
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"test-discovery-engine".to_vec())
@@ -1391,17 +1395,12 @@ mod tests {
             .await
             .unwrap();
 
-        let recv_addr = receiver.local_addr();
-
-        // Bind a separate socket to send discovery and receive the response
+        // Bind a separate socket to receive the Report; handle_v3 is called
+        // directly with this socket's address as source.
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client.local_addr().unwrap();
 
         let discovery_msg = build_v3_discovery_request(42, true);
-        client.send_to(&discovery_msg, recv_addr).await.unwrap();
-
-        // The receiver needs to be running recv() to handle the message.
-        // Instead, call handle_v3 directly with the client address as source.
         let result = receiver.handle_v3(discovery_msg, client_addr).await;
 
         // Discovery should return Ok(None) - not a notification
@@ -1410,6 +1409,32 @@ mod tests {
 
         // Counter should be incremented
         assert_eq!(receiver.usm_unknown_engine_ids(), 1);
+
+        // The Report must carry usmStatsUnknownEngineIDs with the counter
+        // value and the receiver's engine ID (RFC 3414 Section 4).
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected a discovery Report")
+        .unwrap();
+
+        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        assert_eq!(
+            report.global_data.msg_flags.security_level,
+            SecurityLevel::NoAuthNoPriv
+        );
+        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        assert_eq!(report_usm.engine_id.as_ref(), b"test-discovery-engine");
+        let scoped = report.scoped_pdu().expect("report should be plaintext");
+        assert_eq!(scoped.pdu.pdu_type, crate::pdu::PduType::Report);
+        assert_eq!(
+            scoped.pdu.varbinds[0].oid,
+            crate::v3::report_oids::unknown_engine_ids()
+        );
+        assert_eq!(scoped.pdu.varbinds[0].value, Value::Counter32(1));
     }
 
     #[tokio::test]
