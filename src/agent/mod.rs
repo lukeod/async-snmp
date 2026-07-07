@@ -995,9 +995,10 @@ impl Agent {
 
     /// Get the usmStatsNotInTimeWindows counter value.
     ///
-    /// This counter tracks messages that fall outside the time window.
-    /// Incremented when the message time differs from the local time by
-    /// more than 150 seconds (RFC 3414 Section 3.2 Step 8).
+    /// This counter tracks authenticated messages that fail the time window
+    /// check (RFC 3414 Section 3.2 Step 7a): engine boots mismatch, boots
+    /// latched at the maximum, or message time differing from the local time
+    /// by more than 150 seconds.
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.2
     #[must_use]

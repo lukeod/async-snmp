@@ -119,6 +119,7 @@ impl Agent {
                 &usm_params,
                 crate::v3::report_oids::unknown_engine_ids(),
                 count,
+                None,
                 source,
             );
         }
@@ -145,6 +146,7 @@ impl Agent {
                 &usm_params,
                 crate::v3::report_oids::unknown_user_names(),
                 count,
+                None,
                 source,
             );
         }
@@ -162,11 +164,14 @@ impl Agent {
                 .usm_not_in_time_windows
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
+            // Unlike the Step 7a rejection below, the message's HMAC has not
+            // been verified at this point, so the report is not authenticated.
             return self.send_v3_report(
                 &msg,
                 &usm_params,
                 crate::v3::report_oids::not_in_time_windows(),
                 count,
+                None,
                 source,
             );
         }
@@ -198,6 +203,7 @@ impl Agent {
                             &usm_params,
                             crate::v3::report_oids::wrong_digests(),
                             count,
+                            None,
                             source,
                         );
                     }
@@ -219,11 +225,15 @@ impl Agent {
                             .usm_not_in_time_windows
                             .fetch_add(1, Ordering::Relaxed)
                             + 1;
+                        // RFC 3414 Section 3.2 Step 7a: the report must be
+                        // authenticated at authNoPriv so the sender can trust
+                        // the boots/time for resynchronization.
                         return self.send_v3_report(
                             &msg,
                             &usm_params,
                             crate::v3::report_oids::not_in_time_windows(),
                             count,
+                            Some(auth_key),
                             source,
                         );
                     }
@@ -242,6 +252,7 @@ impl Agent {
                         &usm_params,
                         crate::v3::report_oids::unsupported_sec_levels(),
                         count,
+                        None,
                         source,
                     );
                 }
@@ -281,6 +292,7 @@ impl Agent {
                                 &usm_params,
                                 crate::v3::report_oids::decryption_errors(),
                                 count,
+                                None,
                                 source,
                             );
                         }
@@ -302,6 +314,7 @@ impl Agent {
                         &usm_params,
                         crate::v3::report_oids::unsupported_sec_levels(),
                         count,
+                        None,
                         source,
                     );
                 }

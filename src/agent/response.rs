@@ -26,13 +26,18 @@ impl Agent {
     ///
     /// When this function is called, we haven't successfully decoded the PDU
     /// (due to auth/decryption errors), so we must check reportableFlag.
-    /// TODO why does this appear to be only used by `test_boots_latched_allows_report`?
+    ///
+    /// With `auth_key` the report is sent authenticated at authNoPriv, as
+    /// RFC 3414 Section 3.2 Step 7a requires for notInTimeWindows reports so
+    /// the sender can trust the boots/time for resynchronization. Otherwise
+    /// it is sent noAuthNoPriv.
     pub(super) fn send_v3_report(
         &self,
         incoming: &V3Message,
         incoming_usm: &UsmSecurityParams,
         report_oid: Oid,
         counter_value: u32,
+        auth_key: Option<&crate::v3::LocalizedKey>,
         _source: SocketAddr,
     ) -> Result<Option<Bytes>> {
         // Check reportableFlag before sending Report (RFC 3412 Section 7.1 Step 3)
@@ -52,25 +57,40 @@ impl Agent {
             varbinds: vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
         };
 
+        let security_level = if auth_key.is_some() {
+            SecurityLevel::AuthNoPriv
+        } else {
+            SecurityLevel::NoAuthNoPriv
+        };
         let response_global = MsgGlobalData::new(
             incoming.global_data.msg_id,
             incoming.global_data.msg_max_size,
-            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+            MsgFlags::new(security_level, false),
         );
 
-        let response_usm = UsmSecurityParams::new(
+        let mut response_usm = UsmSecurityParams::new(
             self.inner.state.engine_id.clone(),
             engine_boots,
             engine_time,
             incoming_usm.username.clone(),
         );
+        if let Some(key) = auth_key {
+            response_usm = response_usm.with_auth_placeholder(key.mac_len());
+        }
 
         let response_scoped =
             ScopedPdu::new(self.inner.state.engine_id.clone(), Bytes::new(), report_pdu);
 
         let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
 
-        Ok(Some(response_msg.encode()))
+        match auth_key {
+            Some(key) => {
+                let response_bytes =
+                    self.sign_response(response_msg.encode().to_vec(), key, self.inner.local_addr)?;
+                Ok(Some(Bytes::from(response_bytes)))
+            }
+            None => Ok(Some(response_msg.encode())),
+        }
     }
 
     /// Build a V3 response message with appropriate security.
@@ -388,7 +408,7 @@ mod tests {
             .engine_boots
             .store(MAX_ENGINE_TIME, Ordering::Relaxed);
 
-        // Reports are always noAuthNoPriv, so they should still work
+        // Unauthenticated reports are noAuthNoPriv, so they should still work
         let msg = dummy_v3_msg(SecurityLevel::AuthNoPriv);
         let usm = dummy_usm();
 
@@ -398,6 +418,7 @@ mod tests {
                 &usm,
                 crate::v3::report_oids::not_in_time_windows(),
                 1,
+                None,
                 "127.0.0.1:12345".parse().unwrap(),
             )
             .unwrap();

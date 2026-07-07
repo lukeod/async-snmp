@@ -60,8 +60,8 @@ async fn v3_auth_sha256() {
 
 /// A request carrying the wrong msgAuthoritativeEngineBoots is rejected with
 /// a notInTimeWindows Report (RFC 3414 Section 3.2 Step 7a: boots must match,
-/// not just time). The client surfaces this as an auth error (the agent's
-/// Report is unauthenticated, so the client will not resync from it); the
+/// not just time). The Report is authenticated at authNoPriv, so the client
+/// resyncs its engine state from it and the retried request succeeds; the
 /// agent counter records the rejection.
 #[tokio::test]
 async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
@@ -91,15 +91,18 @@ async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
     client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(agent.agent().usm_not_in_time_windows(), 0);
 
-    // Corrupt the cached boots value; time stays within the window. A second
-    // client sharing the cache adopts the corrupted state (the first client
-    // keeps its own per-connection copy).
+    // Lower the cached boots value, modeling cached state that predates an
+    // agent reboot; time stays within the window. A second client sharing
+    // the cache adopts the stale state (the first client keeps its own
+    // per-connection copy). Resync via update_time only moves boots forward
+    // (RFC 3414 Section 2.3), so the stale side must be below the agent.
     let good = cache.get(&agent.addr()).expect("cache seeded");
+    assert!(good.engine_boots > 0, "agent boots must be nonzero");
     cache.insert(
         agent.addr(),
         EngineState::new(
             good.engine_id.clone(),
-            good.engine_boots + 1,
+            good.engine_boots - 1,
             good.estimated_time(),
         ),
     );
@@ -113,11 +116,11 @@ async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
     .await
     .unwrap();
 
-    let err = client2
+    let result = client2
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
-        .expect_err("request with wrong engineBoots must not succeed");
-    assert!(matches!(*err, Error::Auth { .. }), "got {err:?}");
+        .expect("client must resync from the authenticated Report and retry");
+    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
 
     assert_eq!(
         agent.agent().usm_not_in_time_windows(),
