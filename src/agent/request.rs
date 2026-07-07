@@ -202,10 +202,16 @@ impl Agent {
                         );
                     }
 
-                    // Verify time window (150 seconds)
+                    // Verify time window (RFC 3414 Section 3.2 Step 7a):
+                    // boots must match and time must be within 150 seconds.
+                    let our_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
                     let our_time = self.inner.state.engine_time.load(Ordering::Relaxed);
-                    let time_diff = (i64::from(usm_params.engine_time) - i64::from(our_time)).abs();
-                    if time_diff > 150 {
+                    if !crate::v3::in_authoritative_time_window(
+                        our_boots,
+                        our_time,
+                        usm_params.engine_boots,
+                        usm_params.engine_time,
+                    ) {
                         tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "message outside time window");
                         let count = self
                             .inner

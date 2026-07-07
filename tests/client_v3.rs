@@ -58,6 +58,74 @@ async fn v3_auth_sha256() {
     assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
 }
 
+/// A request carrying the wrong msgAuthoritativeEngineBoots is rejected with
+/// a notInTimeWindows Report (RFC 3414 Section 3.2 Step 7a: boots must match,
+/// not just time). The client surfaces this as an auth error (the agent's
+/// Report is unauthenticated, so the client will not resync from it); the
+/// agent counter records the rejection.
+#[tokio::test]
+async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
+    use async_snmp::v3::{EngineCache, EngineState};
+    use std::sync::Arc;
+
+    let agent = TestAgentBuilder::new()
+        .usm_user(V3User::auth_only(
+            b"authuser".to_vec(),
+            AuthProtocol::Sha256,
+            AUTH_PASS.as_bytes().to_vec(),
+        ))
+        .build()
+        .await;
+
+    let cache = Arc::new(EngineCache::new());
+    let client = Client::builder(
+        agent.addr().to_string(),
+        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+    )
+    .engine_cache(cache.clone())
+    .connect()
+    .await
+    .unwrap();
+
+    // Discover and authenticate normally, seeding the shared cache.
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(agent.agent().usm_not_in_time_windows(), 0);
+
+    // Corrupt the cached boots value; time stays within the window. A second
+    // client sharing the cache adopts the corrupted state (the first client
+    // keeps its own per-connection copy).
+    let good = cache.get(&agent.addr()).expect("cache seeded");
+    cache.insert(
+        agent.addr(),
+        EngineState::new(
+            good.engine_id.clone(),
+            good.engine_boots + 1,
+            good.estimated_time(),
+        ),
+    );
+
+    let client2 = Client::builder(
+        agent.addr().to_string(),
+        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+    )
+    .engine_cache(cache)
+    .connect()
+    .await
+    .unwrap();
+
+    let err = client2
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .expect_err("request with wrong engineBoots must not succeed");
+    assert!(matches!(*err, Error::Auth { .. }), "got {err:?}");
+
+    assert_eq!(
+        agent.agent().usm_not_in_time_windows(),
+        1,
+        "agent must reject mismatched engineBoots with notInTimeWindows"
+    );
+}
+
 /// V3 authPriv with SHA-256 and AES-128.
 #[tokio::test]
 async fn v3_auth_priv_sha256_aes128() {
