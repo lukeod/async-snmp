@@ -66,6 +66,7 @@ use tracing::instrument;
 use crate::ber::Decoder;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
+use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 use crate::util::bind_udp_socket;
@@ -332,6 +333,10 @@ pub enum Notification {
         context_engine_id: Bytes,
         /// Context name
         context_name: Bytes,
+        /// Security level the message was received at. A `NoAuthNoPriv`
+        /// notification is unauthenticated: its username is an unverified
+        /// claim. Callers requiring authentication must check this.
+        security_level: SecurityLevel,
         /// sysUpTime.0 value
         uptime: u32,
         /// snmpTrapOID.0 value
@@ -368,6 +373,10 @@ pub enum Notification {
         context_engine_id: Bytes,
         /// Context name
         context_name: Bytes,
+        /// Security level the message was received at. A `NoAuthNoPriv`
+        /// notification is unauthenticated: its username is an unverified
+        /// claim. Callers requiring authentication must check this.
+        security_level: SecurityLevel,
         /// sysUpTime.0 value
         uptime: u32,
         /// snmpTrapOID.0 value
@@ -413,6 +422,22 @@ impl Notification {
             | Notification::TrapV3 { varbinds, .. }
             | Notification::InformV2c { varbinds, .. }
             | Notification::InformV3 { varbinds, .. } => varbinds,
+        }
+    }
+
+    /// Get the security level the notification was received at.
+    ///
+    /// Returns `None` for v1/v2c notifications (community-based, no USM
+    /// security level). For v3 notifications, `NoAuthNoPriv` means the
+    /// message was not authenticated and its username is an unverified
+    /// claim.
+    pub fn security_level(&self) -> Option<SecurityLevel> {
+        match self {
+            Notification::TrapV1 { .. }
+            | Notification::TrapV2c { .. }
+            | Notification::InformV2c { .. } => None,
+            Notification::TrapV3 { security_level, .. }
+            | Notification::InformV3 { security_level, .. } => Some(*security_level),
         }
     }
 
@@ -734,6 +759,7 @@ mod tests {
             username: Bytes::from_static(b"testuser"),
             context_engine_id: Bytes::from_static(b"engine123"),
             context_name: Bytes::new(),
+            security_level: SecurityLevel::AuthNoPriv,
             uptime: 99999,
             trap_oid: oids::warm_start(),
             varbinds: vec![],
@@ -744,6 +770,45 @@ mod tests {
         assert_eq!(notification.version(), Version::V3);
         assert_eq!(notification.uptime(), 99999);
         assert_eq!(notification.trap_oid().unwrap(), oids::warm_start());
+    }
+
+    #[test]
+    fn test_notification_security_level_accessor() {
+        let trap_v3 = Notification::TrapV3 {
+            username: Bytes::from_static(b"testuser"),
+            context_engine_id: Bytes::from_static(b"engine123"),
+            context_name: Bytes::new(),
+            security_level: SecurityLevel::AuthPriv,
+            uptime: 1,
+            trap_oid: oids::cold_start(),
+            varbinds: vec![],
+            request_id: 1,
+        };
+        assert_eq!(trap_v3.security_level(), Some(SecurityLevel::AuthPriv));
+
+        let inform_v3 = Notification::InformV3 {
+            username: Bytes::from_static(b"testuser"),
+            context_engine_id: Bytes::from_static(b"engine123"),
+            context_name: Bytes::new(),
+            security_level: SecurityLevel::NoAuthNoPriv,
+            uptime: 1,
+            trap_oid: oids::cold_start(),
+            varbinds: vec![],
+            request_id: 1,
+        };
+        assert_eq!(
+            inform_v3.security_level(),
+            Some(SecurityLevel::NoAuthNoPriv)
+        );
+
+        let trap_v2c = Notification::TrapV2c {
+            community: Bytes::from_static(b"public"),
+            uptime: 1,
+            trap_oid: oids::cold_start(),
+            varbinds: vec![],
+            request_id: 1,
+        };
+        assert_eq!(trap_v2c.security_level(), None);
     }
 
     #[test]
@@ -794,16 +859,17 @@ mod tests {
         assert_eq!(builder.engine_boots, 5);
     }
 
-    /// Build an authenticated V3 notification message of the given PDU type
-    /// with the given `engine_boots` and `engine_time` in the USM parameters.
-    fn build_authed_v3_notification(
+    /// Build a V3 notification message of the given PDU type with the given
+    /// `engine_boots` and `engine_time` in the USM parameters. With
+    /// `auth: Some((password, protocol))` the message is AuthNoPriv with a
+    /// valid HMAC; with `None` it is noAuthNoPriv.
+    fn build_v3_notification(
         pdu_type: crate::pdu::PduType,
         engine_id: &[u8],
         engine_boots: u32,
         engine_time: u32,
         username: &[u8],
-        auth_password: &[u8],
-        auth_protocol: AuthProtocol,
+        auth: Option<(&[u8], AuthProtocol)>,
     ) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
         use crate::pdu::Pdu;
@@ -811,9 +877,9 @@ mod tests {
         use crate::v3::{LocalizedKey, UsmSecurityParams};
         use crate::value::Value;
 
-        let auth_key =
-            LocalizedKey::from_password(auth_protocol, auth_password, engine_id).unwrap();
-        let mac_len = auth_key.mac_len();
+        let auth_key = auth.map(|(password, protocol)| {
+            LocalizedKey::from_password(protocol, password, engine_id).unwrap()
+        });
 
         // Build a notification PDU with sysUpTime.0 and snmpTrapOID.0
         let pdu = Pdu {
@@ -830,24 +896,33 @@ mod tests {
             ],
         };
 
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
+        let level = if auth_key.is_some() {
+            SecurityLevel::AuthNoPriv
+        } else {
+            SecurityLevel::NoAuthNoPriv
+        };
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(level, false));
 
-        let usm_params = UsmSecurityParams::new(
+        let mut usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             engine_boots,
             engine_time,
             Bytes::copy_from_slice(username),
-        )
-        .with_auth_placeholder(mac_len);
+        );
+        if let Some(key) = &auth_key {
+            usm_params = usm_params.with_auth_placeholder(key.mac_len());
+        }
 
         let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), pdu);
         let msg = V3Message::new(global, usm_params.encode(), scoped);
         let mut msg_bytes = msg.encode().to_vec();
 
         // Compute and insert HMAC
-        let (auth_offset, auth_len) =
-            UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
-        authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
+        if let Some(key) = &auth_key {
+            let (auth_offset, auth_len) =
+                UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
+            authenticate_message(key, &mut msg_bytes, auth_offset, auth_len).unwrap();
+        }
 
         Bytes::from(msg_bytes)
     }
@@ -862,29 +937,32 @@ mod tests {
         auth_password: &[u8],
         auth_protocol: AuthProtocol,
     ) -> Bytes {
-        build_authed_v3_notification(
+        build_v3_notification(
             crate::pdu::PduType::InformRequest,
             engine_id,
             engine_boots,
             engine_time,
             username,
-            auth_password,
-            auth_protocol,
+            Some((auth_password, auth_protocol)),
         )
     }
 
     /// Build an authenticated V3 `SNMPv2-Trap` message with the given
     /// `engine_boots` and `engine_time` in the USM parameters.
     fn build_authed_v3_trap(engine_id: &[u8], engine_boots: u32, engine_time: u32) -> Bytes {
-        build_authed_v3_notification(
+        build_v3_notification(
             crate::pdu::PduType::TrapV2,
             engine_id,
             engine_boots,
             engine_time,
             b"trapuser",
-            b"authpass12345678",
-            AuthProtocol::Sha1,
+            Some((b"authpass12345678", AuthProtocol::Sha1)),
         )
+    }
+
+    /// Build an unauthenticated (noAuthNoPriv) V3 `SNMPv2-Trap` message.
+    fn build_noauth_v3_trap(engine_id: &[u8], username: &[u8]) -> Bytes {
+        build_v3_notification(crate::pdu::PduType::TrapV2, engine_id, 0, 0, username, None)
     }
 
     /// Build a receiver with its own engine ID and a `trapuser` configured,
@@ -905,7 +983,10 @@ mod tests {
     /// For traps the SENDER is the authoritative engine (RFC 3414 Section
     /// 1.5.1): a real remote agent sends under its own engine ID with its
     /// own boots/time. The receiver must accept it without being configured
-    /// with the sender's engine ID or clock.
+    /// with the sender's engine ID or clock, and the delivered notification
+    /// reports the security level it was received at (RFC 3411 Section
+    /// 3.4.3: securityLevel accompanies every message up to the
+    /// application).
     #[tokio::test]
     async fn test_v3_trap_from_remote_sender_engine_accepted() {
         let receiver = remote_trap_receiver().await;
@@ -916,8 +997,35 @@ mod tests {
 
         let result = receiver.handle_v3(msg, source).await.unwrap();
         match result {
-            Some(Notification::TrapV3 { username, .. }) => {
+            Some(Notification::TrapV3 {
+                username,
+                security_level,
+                ..
+            }) => {
                 assert_eq!(username.as_ref(), b"trapuser");
+                assert_eq!(security_level, SecurityLevel::AuthNoPriv);
+            }
+            other => panic!("expected TrapV3, got {other:?}"),
+        }
+    }
+
+    /// A noAuthNoPriv V3 trap is delivered (no per-user minimum is enforced
+    /// here) but must be distinguishable from an authenticated one via its
+    /// security level, whatever username it claims.
+    #[tokio::test]
+    async fn test_v3_noauth_trap_carries_security_level() {
+        let receiver = remote_trap_receiver().await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let msg = build_noauth_v3_trap(b"remote-sender-engine", b"anyuser");
+        match receiver.handle_v3(msg, source).await.unwrap() {
+            Some(Notification::TrapV3 {
+                security_level,
+                username,
+                ..
+            }) => {
+                assert_eq!(security_level, SecurityLevel::NoAuthNoPriv);
+                assert_eq!(username.as_ref(), b"anyuser");
             }
             other => panic!("expected TrapV3, got {other:?}"),
         }
@@ -1043,14 +1151,13 @@ mod tests {
         let receiver = remote_trap_receiver().await;
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let msg = build_authed_v3_notification(
+        let msg = build_v3_notification(
             crate::pdu::PduType::TrapV2,
             b"remote-sender-engine",
             7,
             123_456,
             b"trapuser",
-            b"wrong-password-1234",
-            AuthProtocol::Sha1,
+            Some((b"wrong-password-1234", AuthProtocol::Sha1)),
         );
         assert!(
             receiver.handle_v3(msg, source).await.is_err(),

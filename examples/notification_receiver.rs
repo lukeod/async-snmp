@@ -170,10 +170,12 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             username,
             context_engine_id,
             context_name,
+            security_level,
             request_id,
             ..
         } => {
             println!("  Type: SNMPv3 Trap");
+            println!("  Security Level: {security_level:?}");
             println!("  Username: {}", String::from_utf8_lossy(username));
             println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
             println!("  Context Name: {}", String::from_utf8_lossy(context_name));
@@ -194,10 +196,12 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             username,
             context_engine_id,
             context_name,
+            security_level,
             request_id,
             ..
         } => {
             println!("  Type: SNMPv3 Inform (response sent automatically)");
+            println!("  Security Level: {security_level:?}");
             println!("  Username: {}", String::from_utf8_lossy(username));
             println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
             println!("  Context Name: {}", String::from_utf8_lossy(context_name));
