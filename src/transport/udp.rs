@@ -189,7 +189,7 @@ impl UdpTransport {
     /// Shutdown the transport, stopping the background receiver.
     ///
     /// Signals the background recv task to stop and waits for it to exit.
-    /// Pending requests will fail with timeout errors.
+    /// Pending requests are woken and fail with timeout errors.
     ///
     /// Calling this is optional: the recv task is also cancelled when the
     /// last `UdpTransport` clone and [`UdpHandle`] are dropped.
@@ -248,6 +248,10 @@ impl UdpTransport {
                     }
                 }
             }
+
+            // Wake pending waiters so they fail now rather than at their
+            // individual deadlines.
+            core.close();
         });
         // Safe: mutex was just created, no contention possible
         *inner
@@ -526,6 +530,25 @@ mod tests {
             .expect("recv task did not exit after drop")
             .unwrap();
         assert_eq!(weak.strong_count(), 0, "transport state leaked after drop");
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_pending_waiters() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        // Target port 9 (discard): no response will ever arrive.
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        handle.register_request(42, Duration::from_secs(30));
+        let waiter = tokio::spawn(async move { handle.recv(42).await });
+        // Let the waiter park on its notify before shutting down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        transport.shutdown().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("pending waiter not woken by shutdown")
+            .unwrap();
+        assert!(result.is_err(), "waiter should fail after shutdown");
     }
 
     #[tokio::test]

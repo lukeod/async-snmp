@@ -5,7 +5,7 @@
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -22,6 +22,8 @@ const SHARDS: usize = 64;
 pub struct UdpCore {
     shards: Box<[Shard; SHARDS]>,
     stats: CoreStats,
+    /// Set when the owning transport shuts down; waiters fail immediately.
+    closed: AtomicBool,
 }
 
 /// Counters for transport health monitoring.
@@ -70,6 +72,28 @@ impl UdpCore {
                 delivered: AtomicU64::new(0),
                 expired: AtomicU64::new(0),
             },
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Mark the core closed and wake all pending waiters.
+    ///
+    /// Called when the transport's recv loop exits. Waiters observe the
+    /// closed flag and fail immediately instead of at their deadlines;
+    /// any already-delivered response is still returned.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        for shard in self.shards.iter() {
+            let notifies: Vec<_> = shard
+                .pending
+                .lock()
+                .unwrap()
+                .values()
+                .map(|slot| slot.notify.clone())
+                .collect();
+            for notify in notifies {
+                notify.notify_one();
+            }
         }
     }
 
@@ -141,6 +165,19 @@ impl UdpCore {
                     .boxed());
                 }
             };
+
+            // Checked after the response lookup so a response delivered
+            // before shutdown is still returned.
+            if self.closed.load(Ordering::Acquire) {
+                self.unregister(request_id);
+                tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target }, "transport shut down");
+                return Err(Error::Timeout {
+                    target,
+                    elapsed: Duration::ZERO,
+                    retries: 0,
+                }
+                .boxed());
+            }
 
             let now = Instant::now();
             if now >= deadline {
