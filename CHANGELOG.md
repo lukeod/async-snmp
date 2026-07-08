@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-08
+
+### Added
+
+- `security_level` field on `Notification::TrapV3` and `Notification::InformV3`, plus a `Notification::security_level()` accessor returning `Option<SecurityLevel>` (`None` for v1/v2c); lets callers distinguish an authenticated notification from a `noAuthNoPriv` one claiming the same username, per RFC 3411 Section 3.4.3
+- Optional community filtering on the notification receiver via `NotificationReceiverBuilder::community()` and `NotificationReceiverBuilder::communities()`; opt-in (empty accepts any and surfaces the community to the caller), constant-time matching, and a filtered inform is dropped without acknowledgement
+- usmStats counter accessors on `NotificationReceiver`: `usm_unknown_usernames()`, `usm_wrong_digests()`, `usm_not_in_time_windows()`, `usm_unsupported_sec_levels()`, and `usm_decryption_errors()` (RFC 3414); v3 inform USM failures now increment the matching counter and, when the reportableFlag is set, return a Report PDU (authenticated at authNoPriv for notInTimeWindows) so senders can resynchronize
+- Per-engine timeliness tracking for authenticated v3 traps in the notification receiver, with the per-engine table bounded to a fixed capacity and least-recently-updated eviction
+- `in_authoritative_time_window()` exported from the `v3` module; shared RFC 3414 Section 2.2.3 / 3.2 Step 7a predicate (local boots not latched, boots match, time within 150s) now backing `EngineState::is_in_time_window()`, the agent, and the notification receiver
+
+### Changed
+
+- **Breaking:** `Notification::TrapV3` and `Notification::InformV3` gained a `security_level: SecurityLevel` field. The `Notification` enum is not `#[non_exhaustive]`, so code that constructs these variants or matches them exhaustively must account for the new field (add `security_level` or use `..`).
+- **Breaking:** `CryptoProvider::encrypt`'s `data` parameter changed from `&mut [u8]` to `&mut Vec<u8>`. Block ciphers (DES, 3DES) now pad unaligned plaintext to the next 8-byte boundary inside the provider (per RFC 3414 Section 8.1.1.2) rather than requiring the caller to pre-pad; the built-in `PrivKey` DES/3DES paths no longer pad before calling the provider. Custom `CryptoProvider` implementations must update the `encrypt` signature. Wire output for the built-in RustCrypto and FIPS providers is unchanged.
+- A notification receiver configured without USM users now drops all v3 notifications at every security level, per RFC 3414 Section 3.2 Step 4; `bind()` and module docs updated to reflect this.
+- Additional trait derives: `Auth`, `UsmAuth`, `MasterKey`, and `MasterKeys` now derive `PartialEq`, `Eq`, `PartialOrd`, `Ord`, and `Hash`; `CommunityVersion`, `OidOrdering`, `AuthProtocol`, and `PrivProtocol` additionally derive `PartialOrd`, `Ord`, and `Hash`.
+- Bumped the RustCrypto dependencies for the `crypto-rustcrypto` backend to the `cipher` 0.5 / `digest` 0.11 generation: `aes` 0.9, `cbc` 0.2, `cfb-mode` 0.9, `des` 0.9, `digest` 0.11, `hmac` 0.13, `md-5` 0.11, `sha1` 0.11, `sha2` 0.11. Provider internals migrated to the new trait/module names; wire output is unchanged.
+
+### Fixed
+
+- Agent evaluated RFC 3414 Section 3.2 Step 5 (security-level support) after authentication (Step 6), timeliness (Step 7), and the boots-latched gate; a request for a user lacking the required auth key (authNoPriv/authPriv) or privacy key (authPriv) now counts `usmStatsUnsupportedSecLevels` regardless of its HMAC, engine boots, or time
+- Agent accepted V3 requests carrying a mismatched `msgAuthoritativeEngineBoots` when the message time was within the window; now rejected with a `notInTimeWindows` Report per RFC 3414 Section 3.2 Step 7a (boots must match, not just time)
+- Agent's `notInTimeWindows` Report is now authenticated at authNoPriv per RFC 3414 Section 3.2 Step 7a, so a client with stale engine state can trust the boots/time and resync from it instead of failing with an auth error
+- Authenticated v3 traps sent under the sender's own authoritative engine ID are now accepted by the notification receiver (previously rejected by an own-engine-ID gate)
+- Notification receiver now checks user existence before the security-level branch, so `noAuthNoPriv` messages from unknown users are counted (`usmStatsUnknownUserNames`) and dropped instead of delivered, per RFC 3414 Section 3.2 Step 4
+- Notification receiver now checks security-level support before digest verification, so an authPriv message for a user without a privacy key counts `usmStatsUnsupportedSecLevels` regardless of its HMAC, per RFC 3414 Section 3.2 (Step 5 before Step 6)
+- Latched engine-boots `notInTimeWindows` Report from the receiver is now authenticated at authNoPriv, per RFC 3414 Section 3.2 Step 7a
+- Notification receiver no longer counts or reports Step 7b timeliness failures for the non-authoritative case; `usmStatsNotInTimeWindows` and its Report are reserved for the authoritative case per RFC 3414
+- USM Report PDU `request-id` is now set to 0 per RFC 3412 Section 7.1 on the agent discovery, agent USM-failure, and notification-receiver report paths, since these reports are emitted before the request's scopedPDU is decoded; previously the message-level msgID was used
+- `UdpTransport` background recv task and socket no longer leak when the last transport reference is dropped without calling `shutdown()`; the previous `Drop`-based cancellation never fired because the recv task held a strong `Arc` to the transport state
+- `UdpTransport::shutdown()` now wakes pending request waiters immediately so they fail without waiting for their individual deadlines, instead of leaving them to time out
+
 ## [0.12.0] - 2026-04-02
 
 ### Added
@@ -351,7 +383,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/async-snmp/async-snmp/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/async-snmp/async-snmp/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/async-snmp/async-snmp/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/async-snmp/async-snmp/compare/v0.9.0...v0.10.0
