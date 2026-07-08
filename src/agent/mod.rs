@@ -1511,7 +1511,18 @@ impl Agent {
 
                     // Check size before adding
                     if !can_add(&next_vb, current_size) {
-                        // Can't fit more, return what we have
+                        // RFC 3416 Section 4.2.3 / net-snmp: if nothing has fit
+                        // yet (common non_repeaters == 0 shape where the first
+                        // repeater varbind is oversized), return tooBig with
+                        // empty varbinds. Mirrors the non-repeater tooBig guard
+                        // above; a bare noError+empty response is
+                        // indistinguishable from end-of-MIB and silently ends a
+                        // manager's walk instead of prompting a retry with a
+                        // smaller max-repetitions.
+                        if response_varbinds.is_empty() {
+                            return Ok(Self::too_big_response(pdu));
+                        }
+                        // Some varbinds already fit: truncate (partial response).
                         break 'outer;
                     }
 
@@ -2453,6 +2464,60 @@ mod tests {
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
         assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert!(
+            response.varbinds.is_empty(),
+            "tooBig Response must have empty varbinds, got {}",
+            response.varbinds.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_too_big_zero_non_repeaters_first_repeater_oversized() {
+        // RFC 3416 Section 4.2.3 / net-snmp: for the common GETBULK shape
+        // non_repeaters == 0, when the FIRST repeater varbind does not fit the
+        // size limit, respond tooBig with empty varbinds (not a bare
+        // noError+empty response, which a manager cannot distinguish from
+        // end-of-MIB). Regression test for the repeater-loop `break 'outer`
+        // path that returned error_status 0 with empty varbinds.
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(65507)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MixedSizeHandler))
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+
+        // The first repeater get_next from .99999.1 returns big1 (200-byte
+        // OctetString). Size the limit above RESPONSE_OVERHEAD (so this is not
+        // the trivial below-overhead case) but below what big1 needs, so big1
+        // is the first varbind and does not fit.
+        let big_vb = VarBind::new(
+            oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+            Value::OctetString(Bytes::from(vec![0xAB; 200])),
+        );
+        let max = RESPONSE_OVERHEAD + big_vb.encoded_size() - 1;
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        ctx.msg_max_size = Some(max as u32);
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 0, // non_repeaters == 0
+            error_index: 5,  // max_repetitions
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        assert_eq!(
+            response.error_status,
+            ErrorStatus::TooBig.as_i32(),
+            "first oversized repeater varbind (non_repeaters == 0) must yield tooBig"
+        );
         assert!(
             response.varbinds.is_empty(),
             "tooBig Response must have empty varbinds, got {}",
