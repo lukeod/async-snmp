@@ -44,7 +44,7 @@ Container integration tests require Docker:
 
 ```bash
 docker build -t async-snmp-test:latest tests/containers/snmpd/
-cargo test --test testcontainers
+cargo test --test interop
 ```
 
 ### Documentation

@@ -20,6 +20,7 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 - **Async-first**: Built on Tokio
 - **All operations**: GET, GETNEXT, GETBULK, SET, WALK, BULKWALK
 - **Trap and inform sending**: Agent-based (multi-sink) and client-based notification sending with V1/V2c/V3 support
+- **Trap and inform receiving**: V1/V2c/V3 notification receiver with optional community filtering and per-notification security-level reporting
 - **SNMP agent**: Async handler framework with two-phase SET commit, VACM access control, and built-in MIB handlers for engine/USM/MPD statistics
 - **SNMPv3 security**: MD5/SHA-1/SHA-2 authentication, DES/3DES/AES-128/192/256 privacy, with pluggable crypto backends including a FIPS 140-3 option
 - **Automatic tooBig recovery**: GET/GETNEXT batches are automatically bisected when an agent returns a tooBig error

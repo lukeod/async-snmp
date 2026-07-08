@@ -42,7 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let receiver = NotificationReceiver::bind("0.0.0.0:1162").await?;
 
     println!("Listening for notifications on {}", receiver.local_addr());
-    println!("This receiver handles v1, v2c, and v3 noAuthNoPriv\n");
+    println!("This receiver handles v1 and v2c only; v3 notifications are rejected");
+    println!("(use NotificationReceiver::builder() with usm_user to accept v3)\n");
 
     // =========================================================================
     // Example 2: Receiver with v3 authentication

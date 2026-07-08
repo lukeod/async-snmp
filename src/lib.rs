@@ -10,6 +10,8 @@
 //! - Type-safe OID and value handling
 //! - Config-driven client construction
 //! - Trap and inform sending (agent-based multi-sink or client-based)
+//! - Trap and inform receiving with optional community filtering and per-notification
+//!   security-level reporting
 //! - SNMP agent with async handlers, two-phase SET, VACM, and built-in MIB handlers
 //! - Automatic tooBig recovery (GET/GETNEXT batches bisect on oversized responses)
 //!
