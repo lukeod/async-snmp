@@ -181,8 +181,46 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                     }
                 }
                 b't' => {
-                    // UTF-8 text - replace invalid sequences with U+FFFD per RFC 2579
-                    result.push_str(&String::from_utf8_lossy(chunk));
+                    // UTF-8 text. Per RFC 2579 3.1 (3), trailing octets which do not form a
+                    // valid UTF-8 encoded character are discarded. Interior invalid sequences
+                    // are unspecified by the RFC; we substitute U+FFFD for those, matching
+                    // `from_utf8_lossy` behavior. Trailing handling is per-chunk.
+                    let mut last_valid_len = result.len();
+                    let mut i = 0;
+                    while i < chunk.len() {
+                        match std::str::from_utf8(&chunk[i..]) {
+                            Ok(valid) => {
+                                result.push_str(valid);
+                                i = chunk.len();
+                                last_valid_len = result.len();
+                            }
+                            Err(e) => {
+                                let vup = e.valid_up_to();
+                                if vup > 0 {
+                                    // SAFETY: chunk[i..i+vup] is valid UTF-8 by valid_up_to()
+                                    result.push_str(
+                                        std::str::from_utf8(&chunk[i..i + vup]).unwrap(),
+                                    );
+                                    i += vup;
+                                    last_valid_len = result.len();
+                                }
+                                match e.error_len() {
+                                    None => {
+                                        // Incomplete sequence at the end -> trailing, stop.
+                                        i = chunk.len();
+                                    }
+                                    Some(len) => {
+                                        // Tentative U+FFFD; trailing ones are trimmed below.
+                                        result.push('\u{FFFD}');
+                                        i += len;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Discard trailing invalid octets: trim tentative U+FFFDs not followed
+                    // by a real character.
+                    result.truncate(last_valid_len);
                 }
                 _ => unreachable!(),
             }
@@ -425,10 +463,32 @@ mod tests {
     }
 
     #[test]
-    fn utf8_invalid_bytes_replaced_with_replacement_char() {
-        // Invalid UTF-8 sequences are replaced with U+FFFD per RFC 2579
+    fn utf8_trailing_invalid_bytes_discarded() {
+        // Trailing invalid octets are discarded per RFC 2579 3.1 (3), not replaced.
         let bytes = &[0xff, 0xfe];
-        assert_eq!(apply("2t", bytes), "\u{fffd}\u{fffd}");
+        assert_eq!(apply("2t", bytes), "");
+    }
+
+    #[test]
+    fn utf8_trailing_truncated_multibyte_discarded() {
+        // \xe2\x82 is a cut-off 3-byte euro sign sequence; discarded, no U+FFFD.
+        assert_eq!(apply("255t", b"abc\xe2\x82"), "abc");
+    }
+
+    #[test]
+    fn utf8_trailing_invalid_byte_discarded() {
+        assert_eq!(apply("255t", b"abc\xff"), "abc");
+    }
+
+    #[test]
+    fn utf8_interior_invalid_retained_as_replacement_char() {
+        // Interior invalid sequences (followed by valid content) keep U+FFFD.
+        assert_eq!(apply("255t", b"a\xffb"), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn utf8_interior_retained_trailing_discarded() {
+        assert_eq!(apply("255t", b"a\xffb\xff"), "a\u{fffd}b");
     }
 
     #[test]
