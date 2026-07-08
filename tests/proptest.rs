@@ -1213,13 +1213,29 @@ mod oid_malformed {
 
     #[test]
     fn oid_very_long_subidentifier() {
-        // Very long subidentifier (many continuation bytes)
-        // This tests that we don't overflow during decoding
-        // 0xFF 0xFF 0xFF 0xFF 0x7F would be a huge number but valid format
+        // Second subidentifier's base-128 continuation bytes decode to a 35-bit
+        // value (> u32::MAX), so the overflow guard in decode_subidentifier must
+        // reject it per the u32 subidentifier cap (X.690 8.19.2).
         let bytes = [0x2B, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
         let result = Oid::from_ber(&bytes);
-        // May succeed or fail depending on overflow handling, but should not panic
-        let _ = result;
+        assert!(
+            result.is_err(),
+            "subidentifier exceeding u32::MAX must be rejected"
+        );
+    }
+
+    #[test]
+    fn oid_max_u32_subidentifier_is_boundary_valid() {
+        // u32::MAX (4294967295) encoded in base-128 is exactly 5 bytes:
+        // 0x8F 0xFF 0xFF 0xFF 0x7F (verified by computation). This is the
+        // largest subidentifier value the overflow guard must still accept,
+        // proving the `> u32::MAX` boundary is precise rather than over-strict.
+        let bytes = [0x2B, 0x8F, 0xFF, 0xFF, 0xFF, 0x7F];
+        let result = Oid::from_ber(&bytes);
+        assert!(result.is_ok(), "u32::MAX subidentifier must decode");
+        let oid = result.unwrap();
+        assert_eq!(oid.arcs(), &[1, 3, u32::MAX]);
+        assert_eq!(oid.to_string(), "1.3.4294967295");
     }
 }
 
