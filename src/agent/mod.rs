@@ -1463,10 +1463,22 @@ impl Agent {
             if !can_add(&next_vb, current_size) {
                 // Can't fit even non-repeaters, return tooBig if we have nothing
                 if response_varbinds.is_empty() {
-                    return Ok(pdu.to_error_response(ErrorStatus::TooBig, 0));
+                    return Ok(Self::too_big_response(pdu));
                 }
-                // Otherwise return what we have
-                break;
+                // RFC 3416 Section 4.2.3: truncation removes variable bindings
+                // from the END of the positional set. All repeaters are
+                // positionally after every non-repeater, so once a non-repeater
+                // is dropped, no later binding may appear. Return the
+                // non-repeater prefix collected so far without running the
+                // repeater loop (falling through would emit repeater varbinds
+                // into the dropped non-repeater's slot).
+                return Ok(Pdu {
+                    pdu_type: PduType::Response,
+                    request_id: pdu.request_id,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds: response_varbinds,
+                });
             }
 
             current_size += next_vb.encoded_size();
@@ -2291,6 +2303,160 @@ mod tests {
         assert!(
             limited_count > 0,
             "should still return at least one varbind"
+        );
+    }
+
+    // Handler with two large non-repeater values under .99999.1.0 and
+    // .99999.2.0, and a small repeater value under .99999.9.0.
+    struct MixedSizeHandler;
+
+    impl MibHandler for MixedSizeHandler {
+        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+            Box::pin(async move {
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)
+                    || oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0)
+                {
+                    return GetResult::Value(Value::OctetString(Bytes::from(vec![0xAB; 200])));
+                }
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 9, 0) {
+                    return GetResult::Value(Value::Integer(7));
+                }
+                GetResult::NoSuchObject
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, GetNextResult> {
+            Box::pin(async move {
+                let big1 = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
+                let big2 = oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0);
+                let small = oid!(1, 3, 6, 1, 4, 1, 99999, 9, 0);
+                if oid < &big1 {
+                    return GetNextResult::Value(VarBind::new(
+                        big1,
+                        Value::OctetString(Bytes::from(vec![0xAB; 200])),
+                    ));
+                }
+                if oid < &big2 {
+                    return GetNextResult::Value(VarBind::new(
+                        big2,
+                        Value::OctetString(Bytes::from(vec![0xAB; 200])),
+                    ));
+                }
+                if oid < &small {
+                    return GetNextResult::Value(VarBind::new(small, Value::Integer(7)));
+                }
+                GetNextResult::EndOfMibView
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_dropped_non_repeater_omits_repeaters() {
+        // RFC 3416 Section 4.2.3: truncation removes variable bindings from the
+        // END of the positional set. Repeaters are positionally after all
+        // non-repeaters, so if a non-repeater does not fit, no repeater binding
+        // may appear in the response. Regression test for the fall-through bug
+        // where a dropped non-repeater let repeater varbinds bleed into its slot.
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(65507)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MixedSizeHandler))
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+
+        // Size the limit so the first (big) non-repeater fits, the second (big)
+        // does not, but a small repeater varbind WOULD fit if it were reached.
+        let big_vb = VarBind::new(
+            oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+            Value::OctetString(Bytes::from(vec![0xAB; 200])),
+        );
+        let small_vb = VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9, 0), Value::Integer(7));
+        let max = RESPONSE_OVERHEAD + big_vb.encoded_size() + small_vb.encoded_size();
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        ctx.msg_max_size = Some(max as u32);
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 2, // non_repeaters
+            error_index: 2,  // max_repetitions
+            varbinds: vec![
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9), Value::Null),
+            ],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        // Only the first non-repeater fit; the response is exactly that prefix.
+        assert_eq!(
+            response.varbinds.len(),
+            1,
+            "expected exactly the non-repeater prefix, got {:?}",
+            response.varbinds.iter().map(|vb| &vb.oid).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            response.varbinds[0].oid,
+            oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)
+        );
+        // The repeater varbind must not have bled into the dropped slot.
+        assert!(
+            !response
+                .varbinds
+                .iter()
+                .any(|vb| vb.oid == oid!(1, 3, 6, 1, 4, 1, 99999, 9, 0)),
+            "repeater varbind leaked into response after a dropped non-repeater"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_too_big_has_empty_varbinds() {
+        // RFC 3416 Section 4.2: a tooBig Response has an empty variable-bindings
+        // field. When not even the first GETBULK varbind fits, respond tooBig.
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(65507)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MixedSizeHandler))
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        // Below RESPONSE_OVERHEAD, so even the first varbind cannot fit.
+        ctx.msg_max_size = Some((RESPONSE_OVERHEAD - 1) as u32);
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 2, // non_repeaters
+            error_index: 2,  // max_repetitions
+            varbinds: vec![
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9), Value::Null),
+            ],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert!(
+            response.varbinds.is_empty(),
+            "tooBig Response must have empty varbinds, got {}",
+            response.varbinds.len()
         );
     }
 
