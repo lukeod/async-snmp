@@ -715,6 +715,72 @@ mod tests {
     }
 
     #[test]
+    fn test_msg_global_data_rejects_zero_length_msg_flags() {
+        // RFC 3412 Section 6.4: msgFlags OCTET STRING (SIZE(1))
+        // SEQUENCE { msg_id, msg_max_size, msgFlags=<empty>, msgSecurityModel=3(Usm) }
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_integer(3); // Usm
+            buf.push_octet_string(&[]); // zero-length msgFlags
+            buf.push_integer(1472); // msg_max_size
+            buf.push_integer(100); // msg_id
+        });
+        let encoded = buf.finish();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = MsgGlobalData::decode(&mut decoder);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
+    }
+
+    #[test]
+    fn test_msg_global_data_rejects_two_byte_msg_flags() {
+        // RFC 3412 Section 6.4: msgFlags OCTET STRING (SIZE(1))
+        // SEQUENCE { msg_id, msg_max_size, msgFlags=<two bytes>, msgSecurityModel=3(Usm) }
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_integer(3); // Usm
+            buf.push_octet_string(&[0x04, 0x00]); // two-byte msgFlags
+            buf.push_integer(1472); // msg_max_size
+            buf.push_integer(100); // msg_id
+        });
+        let encoded = buf.finish();
+
+        let mut decoder = Decoder::new(encoded);
+        let result = MsgGlobalData::decode(&mut decoder);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
+    }
+
+    #[test]
+    fn test_msg_global_data_accepts_one_byte_msg_flags() {
+        // Control: a valid single-byte msgFlags (reportable, noAuthNoPriv) must be accepted
+        // SEQUENCE { msg_id, msg_max_size, msgFlags=[0x04], msgSecurityModel=3(Usm) }
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_integer(3); // Usm
+            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
+            buf.push_integer(1472); // msg_max_size
+            buf.push_integer(100); // msg_id
+        });
+        let encoded = buf.finish();
+
+        let mut decoder = Decoder::new(encoded);
+        let decoded = MsgGlobalData::decode(&mut decoder).unwrap();
+
+        assert_eq!(decoded.msg_flags, MsgFlags::from_byte(0x04).unwrap());
+        assert_eq!(decoded.msg_security_model, SecurityModel::Usm);
+    }
+
+    #[test]
     fn test_msg_global_data_accepts_usm_security_model() {
         // USM (3) should be accepted
         let global =
