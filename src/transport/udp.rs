@@ -560,4 +560,97 @@ mod tests {
             .unwrap();
         assert!(transport.local_addr().port() > 0);
     }
+
+    /// Build a valid v2c response packet carrying `request_id`, for injection
+    /// into `UdpCore::deliver` in the source-mismatch tests below.
+    fn response_packet(request_id: i32) -> Bytes {
+        let pdu = crate::pdu::Pdu::get_request(request_id, &[]).to_response();
+        let msg = crate::message::CommunityMessage::v2c(b"public".as_slice(), pdu);
+        msg.encode()
+    }
+
+    // T9 (RFC 3417 3.1): a response whose datagram source differs from the
+    // handle's target is still delivered by request-id (the recv loop keys
+    // solely on request_id, udp.rs:235-238); `recv`'s source check only warns,
+    // it never rejects. These tests inject directly into `UdpCore::deliver`
+    // (bypassing the real socket) to exercise that exact accept path
+    // deterministically, per the brief's preferred approach.
+
+    #[tokio::test]
+    async fn recv_accepts_mismatched_source_with_warn_enabled() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        let mismatched: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        assert_ne!(target, mismatched);
+
+        // Default config: warn_on_source_mismatch is true.
+        let handle = transport.handle(target);
+        handle.register_request(42, Duration::from_secs(5));
+
+        let packet = response_packet(42);
+        assert!(
+            transport.inner.core.deliver(42, packet.clone(), mismatched),
+            "deliver should find the registered request"
+        );
+
+        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(42))
+            .await
+            .expect("recv timed out")
+            .expect("mismatched-source response must still be accepted");
+
+        assert_eq!(data, packet);
+        assert_eq!(source, mismatched);
+        assert_ne!(source, handle.peer_addr());
+    }
+
+    #[tokio::test]
+    async fn recv_accepts_mismatched_source_with_warn_disabled() {
+        let transport = UdpTransport::builder()
+            .bind("127.0.0.1:0")
+            .warn_on_source_mismatch(false)
+            .build()
+            .await
+            .unwrap();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        let mismatched: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        assert_ne!(target, mismatched);
+
+        let handle = transport.handle(target);
+        handle.register_request(7, Duration::from_secs(5));
+
+        let packet = response_packet(7);
+        assert!(transport.inner.core.deliver(7, packet.clone(), mismatched));
+
+        // Acceptance must not depend on warn_on_source_mismatch: the flag
+        // only controls whether a warning is logged, never rejection.
+        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(7))
+            .await
+            .expect("recv timed out")
+            .expect("mismatched-source response must be accepted regardless of warn flag");
+
+        assert_eq!(data, packet);
+        assert_eq!(source, mismatched);
+        assert_ne!(source, handle.peer_addr());
+    }
+
+    #[tokio::test]
+    async fn recv_matching_source_is_not_a_mismatch() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+
+        let handle = transport.handle(target);
+        handle.register_request(99, Duration::from_secs(5));
+
+        let packet = response_packet(99);
+        assert!(transport.inner.core.deliver(99, packet.clone(), target));
+
+        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(99))
+            .await
+            .expect("recv timed out")
+            .expect("matching-source response must be accepted");
+
+        assert_eq!(data, packet);
+        assert_eq!(source, target);
+        assert_eq!(source, handle.peer_addr());
+    }
 }
