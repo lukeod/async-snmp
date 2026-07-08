@@ -575,4 +575,96 @@ mod tests {
             VarbindOutcome::Yield
         ));
     }
+
+    #[test]
+    fn test_walk_strict_aborts_on_non_increasing_oid() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::Strict);
+
+        let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
+        assert!(matches!(
+            validate_walk_varbind(&vb1, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Yield
+        ));
+
+        // A lower in-subtree OID must abort with NonIncreasing.
+        let vb2 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Integer(2));
+        match validate_walk_varbind(&vb2, &base, &mut tracker, target_addr()) {
+            VarbindOutcome::Abort(e) => match *e {
+                Error::WalkAborted { reason, .. } => {
+                    assert_eq!(reason, WalkAbortReason::NonIncreasing);
+                }
+                other => panic!("expected WalkAborted, got {other:?}"),
+            },
+            _ => panic!("expected Abort outcome"),
+        }
+    }
+
+    #[test]
+    fn test_walk_strict_aborts_on_equal_oid() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::Strict);
+
+        let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
+        assert!(matches!(
+            validate_walk_varbind(&vb1, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Yield
+        ));
+
+        // Same OID again (the `<=` boundary) must also abort with NonIncreasing.
+        let vb2 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
+        match validate_walk_varbind(&vb2, &base, &mut tracker, target_addr()) {
+            VarbindOutcome::Abort(e) => match *e {
+                Error::WalkAborted { reason, .. } => {
+                    assert_eq!(reason, WalkAbortReason::NonIncreasing);
+                }
+                other => panic!("expected WalkAborted, got {other:?}"),
+            },
+            _ => panic!("expected Abort outcome"),
+        }
+    }
+
+    #[test]
+    fn test_walk_relaxed_aborts_on_duplicate_oid_cycle() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::AllowNonIncreasing);
+
+        let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
+        assert!(matches!(
+            validate_walk_varbind(&vb1, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Yield
+        ));
+
+        // Same OID again must abort with Cycle (not NonIncreasing).
+        let vb2 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
+        match validate_walk_varbind(&vb2, &base, &mut tracker, target_addr()) {
+            VarbindOutcome::Abort(e) => match *e {
+                Error::WalkAborted { reason, .. } => {
+                    assert_eq!(reason, WalkAbortReason::Cycle);
+                }
+                other => panic!("expected WalkAborted, got {other:?}"),
+            },
+            _ => panic!("expected Abort outcome"),
+        }
+    }
+
+    #[test]
+    fn test_walk_relaxed_allows_non_increasing_distinct_oid() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::AllowNonIncreasing);
+
+        // Higher OID first.
+        let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::Integer(1));
+        assert!(matches!(
+            validate_walk_varbind(&vb1, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Yield
+        ));
+
+        // Lower, but distinct, in-subtree OID: relaxed mode tolerates this (no abort).
+        let vb2 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Integer(2));
+        assert!(matches!(
+            validate_walk_varbind(&vb2, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Yield
+        ));
+    }
 }
