@@ -152,28 +152,33 @@ impl Agent {
         }
 
         // RFC 3414 Section 3.2 Step 5: the user must support the requested
-        // security level, checked before authentication (Step 6) and
-        // timeliness (Step 7). An authPriv request for a user without a
-        // privacy key is rejected here regardless of its HMAC or boots. The
-        // missing-auth-key half of Step 5 is handled by the match below.
-        if security_level == SecurityLevel::AuthPriv
-            && derived_keys.as_ref().is_some_and(|k| k.priv_key.is_none())
-        {
-            tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user does not support requested privacy level");
-            let count = self
-                .inner
-                .state
-                .usm_unsupported_sec_levels
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            return self.send_v3_report(
-                &msg,
-                &usm_params,
-                crate::v3::report_oids::unsupported_sec_levels(),
-                count,
-                None,
-                source,
-            );
+        // security level, checked before authentication (Step 6), timeliness
+        // (Step 7), and the Section 2.3 boots-latched gate below. A user lacking
+        // the auth key required for authNoPriv/authPriv, or the privacy key
+        // required for authPriv, does not support the level and is rejected here
+        // regardless of the message's HMAC, boots, or time.
+        if security_level.requires_auth() {
+            let supported = derived_keys.as_ref().is_some_and(|k| {
+                k.auth_key.is_some()
+                    && (security_level != SecurityLevel::AuthPriv || k.priv_key.is_some())
+            });
+            if !supported {
+                tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user does not support requested security level");
+                let count = self
+                    .inner
+                    .state
+                    .usm_unsupported_sec_levels
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                return self.send_v3_report(
+                    &msg,
+                    &usm_params,
+                    crate::v3::report_oids::unsupported_sec_levels(),
+                    count,
+                    None,
+                    source,
+                );
+            }
         }
 
         // RFC 3414 Section 2.3: when engine boots is latched at maximum,
@@ -201,86 +206,67 @@ impl Agent {
             );
         }
 
-        // Verify authentication if required
-        if security_level == SecurityLevel::AuthNoPriv || security_level == SecurityLevel::AuthPriv
-        {
-            match &derived_keys {
-                Some(keys) if keys.auth_key.is_some() => {
-                    let auth_key = keys.auth_key.as_ref().unwrap();
-                    let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data)
-                        .ok_or_else(|| {
-                            tracing::debug!(target: "async_snmp::agent", { source = %source }, "could not find auth params in message");
-                            Error::Auth { target: source }.boxed()
-                        })?;
+        // Verify authentication if required (RFC 3414 Section 3.2 Step 6). The
+        // auth key is guaranteed present by the Step 5 check above.
+        if security_level.requires_auth() {
+            let auth_key = derived_keys
+                .as_ref()
+                .and_then(|keys| keys.auth_key.as_ref())
+                .expect("authenticated request without an auth key is rejected at Step 5");
+            let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data)
+                .ok_or_else(|| {
+                    tracing::debug!(target: "async_snmp::agent", { source = %source }, "could not find auth params in message");
+                    Error::Auth { target: source }.boxed()
+                })?;
 
-                    if !verify_message(auth_key, &data, auth_offset, auth_len)
-                        .map_err(|_| Error::Auth { target: source }.boxed())?
-                    {
-                        tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "authentication failed");
-                        let count = self
-                            .inner
-                            .state
-                            .usm_wrong_digests
-                            .fetch_add(1, Ordering::Relaxed)
-                            + 1;
-                        return self.send_v3_report(
-                            &msg,
-                            &usm_params,
-                            crate::v3::report_oids::wrong_digests(),
-                            count,
-                            None,
-                            source,
-                        );
-                    }
+            if !verify_message(auth_key, &data, auth_offset, auth_len)
+                .map_err(|_| Error::Auth { target: source }.boxed())?
+            {
+                tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "authentication failed");
+                let count = self
+                    .inner
+                    .state
+                    .usm_wrong_digests
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                return self.send_v3_report(
+                    &msg,
+                    &usm_params,
+                    crate::v3::report_oids::wrong_digests(),
+                    count,
+                    None,
+                    source,
+                );
+            }
 
-                    // Verify time window (RFC 3414 Section 3.2 Step 7a):
-                    // boots must match and time must be within 150 seconds.
-                    let our_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
-                    let our_time = self.inner.state.engine_time.load(Ordering::Relaxed);
-                    if !crate::v3::in_authoritative_time_window(
-                        our_boots,
-                        our_time,
-                        usm_params.engine_boots,
-                        usm_params.engine_time,
-                    ) {
-                        tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "message outside time window");
-                        let count = self
-                            .inner
-                            .state
-                            .usm_not_in_time_windows
-                            .fetch_add(1, Ordering::Relaxed)
-                            + 1;
-                        // RFC 3414 Section 3.2 Step 7a: the report must be
-                        // authenticated at authNoPriv so the sender can trust
-                        // the boots/time for resynchronization.
-                        return self.send_v3_report(
-                            &msg,
-                            &usm_params,
-                            crate::v3::report_oids::not_in_time_windows(),
-                            count,
-                            Some(auth_key),
-                            source,
-                        );
-                    }
-                }
-                _ => {
-                    // User exists but has no auth key configured - cannot meet requested security level
-                    tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user does not support requested security level");
-                    let count = self
-                        .inner
-                        .state
-                        .usm_unsupported_sec_levels
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1;
-                    return self.send_v3_report(
-                        &msg,
-                        &usm_params,
-                        crate::v3::report_oids::unsupported_sec_levels(),
-                        count,
-                        None,
-                        source,
-                    );
-                }
+            // Verify time window (RFC 3414 Section 3.2 Step 7a):
+            // boots must match and time must be within 150 seconds.
+            let our_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
+            let our_time = self.inner.state.engine_time.load(Ordering::Relaxed);
+            if !crate::v3::in_authoritative_time_window(
+                our_boots,
+                our_time,
+                usm_params.engine_boots,
+                usm_params.engine_time,
+            ) {
+                tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "message outside time window");
+                let count = self
+                    .inner
+                    .state
+                    .usm_not_in_time_windows
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                // RFC 3414 Section 3.2 Step 7a: the report must be
+                // authenticated at authNoPriv so the sender can trust
+                // the boots/time for resynchronization.
+                return self.send_v3_report(
+                    &msg,
+                    &usm_params,
+                    crate::v3::report_oids::not_in_time_windows(),
+                    count,
+                    Some(auth_key),
+                    source,
+                );
             }
         }
 
@@ -529,6 +515,73 @@ mod tests {
             UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
         authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
         Bytes::from(msg_bytes)
+    }
+
+    /// Build an authNoPriv V3 message for `username` with a plaintext scoped PDU
+    /// and an arbitrary auth-parameter placeholder. Callers exercising the
+    /// auth-key-missing half of Step 5 never reach authentication, so the digest
+    /// value is irrelevant.
+    fn build_authnopriv_msg(engine_id: &[u8], username: &[u8]) -> Bytes {
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, true));
+        let usm_params = UsmSecurityParams::new(
+            Bytes::copy_from_slice(engine_id),
+            7,
+            123_456,
+            Bytes::copy_from_slice(username),
+        )
+        .with_auth_params(Bytes::from_static(&[0u8; 12]));
+
+        let scoped = ScopedPdu::new(
+            Bytes::copy_from_slice(engine_id),
+            Bytes::new(),
+            Pdu {
+                pdu_type: PduType::GetRequest,
+                request_id: 99,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![],
+            },
+        );
+        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        msg.encode()
+    }
+
+    /// RFC 3414 Section 3.2 orders Step 5 before Step 7: even when engine boots
+    /// is latched at maximum (the Section 2.3 rejection that otherwise returns
+    /// usmStatsNotInTimeWindows), an authNoPriv request for a user configured
+    /// without an auth key is still reported as usmStatsUnsupportedSecLevels.
+    /// Pins the auth-key-missing half of Step 5 ahead of the latched-boots gate.
+    #[tokio::test]
+    async fn test_v3_authnopriv_for_noauth_user_reported_before_latched_boots() {
+        let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("noauthuser", |u| u)
+            .build()
+            .await
+            .unwrap();
+        agent
+            .inner
+            .state
+            .engine_boots
+            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+
+        let msg = build_authnopriv_msg(&engine_id, b"noauthuser");
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let report = agent
+            .handle_v3(msg, source)
+            .await
+            .unwrap()
+            .expect("a reportable request must produce a Report");
+        assert_eq!(agent.usm_unsupported_sec_levels(), 1);
+        assert_eq!(agent.usm_not_in_time_windows(), 0);
+        assert_eq!(agent.usm_wrong_digests(), 0);
+
+        let decoded = V3Message::decode(report).unwrap();
+        let vb = &decoded.pdu().unwrap().varbinds[0];
+        assert_eq!(vb.oid, crate::v3::report_oids::unsupported_sec_levels());
     }
 
     /// RFC 3414 Section 3.2 Step 5 precedes Step 6: an authPriv request for a
