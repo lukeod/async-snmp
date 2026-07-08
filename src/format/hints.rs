@@ -147,4 +147,67 @@ mod tests {
         let data = Value::OctetString(Bytes::from("café".as_bytes()));
         assert_eq!(data.format_with_hint(UTF8_STRING), Some("café".to_string()));
     }
+
+    #[test]
+    fn test_date_and_time_hint_with_timezone() {
+        // RFC 2579 3.1(7) worked example: Tuesday May 26, 1992 at 1:30:15 PM EDT
+        // (references/rfc2579.txt:1058) -> "1992-5-26,13:30:15.0,-4:0"
+        let dt = Value::OctetString(Bytes::from_static(&[
+            0x07, 0xC8, // year 1992
+            5,    // month
+            26,   // day
+            13,   // hour
+            30,   // minutes
+            15,   // seconds
+            0,    // deci-seconds
+            b'-', // direction from UTC
+            4,    // hours from UTC
+            0,    // minutes from UTC
+        ]));
+        assert_eq!(
+            dt.format_with_hint(DATE_AND_TIME),
+            Some("1992-5-26,13:30:15.0,-4:0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_date_and_time_hint_without_timezone() {
+        // 8-octet form: same date/time, no timezone tail. The trailing
+        // ",1a1d:1d" specs receive no data and are not emitted.
+        let dt = Value::OctetString(Bytes::from_static(&[
+            0x07, 0xC8, // year 1992
+            5,  // month
+            26, // day
+            13, // hour
+            30, // minutes
+            15, // seconds
+            0,  // deci-seconds
+        ]));
+        assert_eq!(
+            dt.format_with_hint(DATE_AND_TIME),
+            Some("1992-5-26,13:30:15.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_date_and_time_hint_positive_offset() {
+        // 11-octet form with a '+' direction (e.g. UTC+10:30), covering the
+        // positive-offset branch of the `1a` direction character.
+        let dt = Value::OctetString(Bytes::from_static(&[
+            0x07, 0xC8, // year 1992
+            5,    // month
+            26,   // day
+            13,   // hour
+            30,   // minutes
+            15,   // seconds
+            0,    // deci-seconds
+            b'+', // direction from UTC
+            10,   // hours from UTC
+            30,   // minutes from UTC
+        ]));
+        assert_eq!(
+            dt.format_with_hint(DATE_AND_TIME),
+            Some("1992-5-26,13:30:15.0,+10:30".to_string())
+        );
+    }
 }
