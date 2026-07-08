@@ -153,6 +153,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use bytes::Bytes;
@@ -467,5 +468,204 @@ mod tests {
 
         assert_eq!(response.error_index, 1);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Handler for exercising the commit-phase rollback path (RFC 3416 §4.2.5):
+    /// `test_set` always accepts, `commit_set` fails for a single designated OID,
+    /// and `undo_set` records every OID it is called with, in call order, so
+    /// tests can assert the rollback happens in reverse commit order. `undo_set`
+    /// itself can also be configured to fail for a designated OID, to exercise
+    /// the `UndoFailed` selection.
+    struct CommitFailHandler {
+        fail_commit_oid: Oid,
+        fail_undo_oid: Option<Oid>,
+        undo_calls: Arc<Mutex<Vec<Oid>>>,
+    }
+
+    impl MibHandler for CommitFailHandler {
+        fn get<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+            Box::pin(async { GetResult::NoSuchObject })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, GetNextResult> {
+            Box::pin(async { GetNextResult::EndOfMibView })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetResult> {
+            Box::pin(async { SetResult::Ok })
+        }
+
+        fn commit_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetResult> {
+            let result = if oid == &self.fail_commit_oid {
+                SetResult::CommitFailed
+            } else {
+                SetResult::Ok
+            };
+            Box::pin(async move { result })
+        }
+
+        fn undo_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetResult> {
+            self.undo_calls.lock().unwrap().push(oid.clone());
+            let result = if self.fail_undo_oid.as_ref() == Some(oid) {
+                SetResult::UndoFailed
+            } else {
+                SetResult::Ok
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    /// Three-varbind SET where the first two `commit_set` calls succeed and the
+    /// third fails: a commit failure with two previously-committed varbinds to
+    /// roll back (in reverse order).
+    fn three_set_varbinds() -> Vec<VarBind> {
+        (1u32..=3)
+            .map(|i| VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, i, 0), Value::Integer(i as i32)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_commit_failure_rolls_back_in_reverse_order() {
+        let undo_calls: Arc<Mutex<Vec<Oid>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CommitFailHandler {
+            fail_commit_oid: oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0),
+            fail_undo_oid: None,
+            undo_calls: undo_calls.clone(),
+        });
+
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .build()
+            .await
+            .unwrap();
+
+        let ctx = test_ctx();
+
+        let pdu = Pdu {
+            pdu_type: PduType::SetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: three_set_varbinds(),
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        // Third varbind's commit_set fails -> CommitFailed, error_index points
+        // at the failing (1-based) varbind.
+        assert_eq!(response.error_status, ErrorStatus::CommitFailed.as_i32());
+        assert_eq!(response.error_index, 3);
+
+        // The first two varbinds were committed; rollback must undo them in
+        // reverse order (varbind 2 then varbind 1).
+        let calls = undo_calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_undo_failure_during_rollback_reports_undo_failed() {
+        let undo_calls: Arc<Mutex<Vec<Oid>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CommitFailHandler {
+            fail_commit_oid: oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0),
+            fail_undo_oid: Some(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)),
+            undo_calls: undo_calls.clone(),
+        });
+
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .build()
+            .await
+            .unwrap();
+
+        let ctx = test_ctx();
+
+        let pdu = Pdu {
+            pdu_type: PduType::SetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: three_set_varbinds(),
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        // The undo for varbind 1 fails during rollback -> UndoFailed takes
+        // precedence over CommitFailed.
+        assert_eq!(response.error_status, ErrorStatus::UndoFailed.as_i32());
+        assert_eq!(response.error_index, 3);
+
+        // Both previously-committed varbinds are still attempted, in reverse
+        // order, even though one of the undos fails.
+        let calls = undo_calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_commits_succeed_no_undo() {
+        let undo_calls: Arc<Mutex<Vec<Oid>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CommitFailHandler {
+            // No OID in the request matches this, so every commit_set succeeds.
+            fail_commit_oid: oid!(1, 3, 6, 1, 4, 1, 99999, 99, 0),
+            fail_undo_oid: None,
+            undo_calls: undo_calls.clone(),
+        });
+
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .build()
+            .await
+            .unwrap();
+
+        let ctx = test_ctx();
+
+        let pdu = Pdu {
+            pdu_type: PduType::SetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: three_set_varbinds(),
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        assert_eq!(response.error_status, 0);
+        assert!(undo_calls.lock().unwrap().is_empty());
     }
 }
