@@ -453,6 +453,28 @@ mod tests {
     }
 
     #[test]
+    fn star_prefix_zero_repeat_count() {
+        // RFC 2579 3.1 (1): the repeat count is read from the data octet; a
+        // count of 0 means zero repetitions. The count byte (0x00) is still
+        // consumed, but no formatted output is produced.
+        assert_eq!(apply("*1x", &[0x00]), "");
+    }
+
+    #[test]
+    fn star_prefix_nonzero_repeat_count_control() {
+        // Control for `star_prefix_zero_repeat_count`: confirms the star path
+        // still formats normally when the repeat count is non-zero.
+        assert_eq!(apply("*1x", &[0x02, 0xaa, 0xbb]), "aabb");
+    }
+
+    #[test]
+    fn star_prefix_zero_repeat_count_non_hex_format() {
+        // Same zero-count behavior with a `d` format char, showing it is
+        // independent of the format character.
+        assert_eq!(apply("*1d", &[0x00]), "");
+    }
+
+    #[test]
     fn trailing_separator_suppressed() {
         assert_eq!(apply("1d.", &[1, 2, 3]), "1.2.3");
     }
