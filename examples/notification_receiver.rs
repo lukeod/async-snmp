@@ -71,7 +71,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Configured users: trapuser (authPriv), readonly (authNoPriv)\n");
 
     // =========================================================================
-    // Example 3: Main receive loop
+    // Example 3: Receiver with community filtering
+    // =========================================================================
+    println!("--- Community-Filtered Receiver ---\n");
+
+    // Community filtering is opt-in. Once one or more communities are
+    // configured, v1/v2c notifications whose community matches none of them
+    // are dropped (a dropped inform is not acknowledged). Comparison is
+    // constant-time. This does not affect v3, which is gated by USM.
+    let filtered_receiver = NotificationReceiver::builder()
+        .bind("0.0.0.0:1164")
+        .communities(["public", "monitor"])
+        .build()
+        .await?;
+
+    println!(
+        "Community-filtered receiver on {} (accepts: public, monitor)\n",
+        filtered_receiver.local_addr()
+    );
+
+    // =========================================================================
+    // Example 4: Main receive loop
     // =========================================================================
     println!("--- Waiting for Notifications ---\n");
     println!("Send test traps with:");

@@ -985,7 +985,7 @@ impl Agent {
     /// Get the usmStatsWrongDigests counter value.
     ///
     /// This counter tracks messages with incorrect authentication digests.
-    /// (RFC 3414 Section 3.2 Step 7).
+    /// (RFC 3414 Section 3.2 Step 6).
     ///
     /// OID: 1.3.6.1.6.3.15.1.1.5
     #[must_use]
