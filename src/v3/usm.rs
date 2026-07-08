@@ -21,6 +21,9 @@ use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 
+/// Maximum length of `msgUserName`, per RFC 3414 Section 2.4 (SIZE(0..32)).
+const MAX_USER_NAME_LEN: usize = 32;
+
 /// USM security parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsmSecurityParams {
@@ -147,7 +150,16 @@ impl UsmSecurityParams {
         }
         let engine_time = raw_time as u32;
 
+        // RFC 3414: msgUserName OCTET STRING (SIZE(0..32))
         let username = seq.read_octet_string()?;
+        if username.len() > MAX_USER_NAME_LEN {
+            tracing::debug!(target: "async_snmp::usm", { offset = seq.offset(), length = username.len(), kind = %DecodeErrorKind::InvalidUserNameLength { length: username.len() } }, "decode error");
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
+
         let auth_params = seq.read_octet_string()?;
         let priv_params = seq.read_octet_string()?;
 
@@ -537,6 +549,50 @@ mod tests {
         // Must not panic - must return None because the claimed extent
         // (auth_start + 64) exceeds the buffer length.
         assert_eq!(UsmSecurityParams::find_auth_params_offset(&encoded), None);
+    }
+
+    #[test]
+    fn test_usm_params_rejects_username_over_32_octets() {
+        use crate::ber::EncodeBuf;
+
+        let long_username = vec![b'x'; 33];
+
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&long_username);
+            buf.push_integer(0);
+            buf.push_integer(0);
+            buf.push_octet_string(&[]);
+        });
+        let encoded = buf.finish();
+
+        let result = UsmSecurityParams::decode(encoded);
+        assert!(result.is_err());
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
+    }
+
+    #[test]
+    fn test_usm_params_accepts_username_exactly_32_octets() {
+        let username = vec![b'u'; 32];
+        let params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, username.clone());
+
+        let encoded = params.encode();
+        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        assert_eq!(decoded.username.as_ref(), username.as_slice());
+    }
+
+    #[test]
+    fn test_usm_params_accepts_short_username() {
+        let params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, b"admin".as_slice());
+
+        let encoded = params.encode();
+        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        assert_eq!(decoded.username.as_ref(), b"admin");
     }
 
     #[test]

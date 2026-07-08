@@ -79,6 +79,8 @@ pub(crate) enum DecodeErrorKind {
     InvalidEngineBoots { value: i32 },
     /// msgAuthoritativeEngineTime outside RFC 3414 range (0..2147483647).
     InvalidEngineTime { value: i32 },
+    /// msgUserName exceeds RFC 3414 maximum length (SIZE(0..32)).
+    InvalidUserNameLength { length: usize },
     /// NULL with non-zero length.
     InvalidNull,
     /// Expected plaintext, got encrypted.
@@ -157,6 +159,9 @@ impl std::fmt::Display for DecodeErrorKind {
                     f,
                     "msgAuthoritativeEngineTime {value} outside RFC 3414 range 0..2147483647"
                 )
+            }
+            Self::InvalidUserNameLength { length } => {
+                write!(f, "msgUserName length {length} exceeds maximum 32")
             }
             Self::InvalidNull => write!(f, "NULL with non-zero length"),
             Self::UnexpectedEncryption => write!(f, "expected plaintext scoped PDU"),
