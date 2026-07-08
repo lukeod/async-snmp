@@ -113,7 +113,7 @@ impl CryptoProvider for RustCryptoProvider {
 
 // --- Auth primitive implementations ---
 
-use digest::core_api::BlockSizeUser;
+use digest::block_api::BlockSizeUser;
 use digest::{Digest, KeyInit, Mac, OutputSizeUser};
 
 fn hash_impl<D>(data: &[u8]) -> Vec<u8>
@@ -181,7 +181,7 @@ where
 // --- Privacy primitive implementations ---
 
 fn encrypt_des_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
     type DesCbc = cbc::Encryptor<des::Des>;
 
     let cipher = DesCbc::new_from_slices(key, iv).map_err(|_| {
@@ -190,7 +190,7 @@ fn encrypt_des_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
     })?;
     let len = data.len();
     cipher
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(data, len)
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(data, len)
         .map_err(|_| {
             tracing::debug!(target: "async_snmp::crypto", "DES encryption failed: cipher error");
             CryptoError::CipherError
@@ -199,7 +199,7 @@ fn encrypt_des_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
 }
 
 fn decrypt_des_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
     type DesCbc = cbc::Decryptor<des::Des>;
 
     let cipher = DesCbc::new_from_slices(key, iv).map_err(|_| {
@@ -207,7 +207,7 @@ fn decrypt_des_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
         CryptoError::InvalidKeyLength
     })?;
     cipher
-        .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(data)
+        .decrypt_padded::<cbc::cipher::block_padding::NoPadding>(data)
         .map_err(|_| {
             tracing::debug!(target: "async_snmp::crypto", "DES decryption failed: cipher error");
             CryptoError::CipherError
@@ -216,7 +216,7 @@ fn decrypt_des_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
 }
 
 fn encrypt_des3_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
     type Des3Cbc = cbc::Encryptor<des::TdesEde3>;
 
     let cipher = Des3Cbc::new_from_slices(key, iv).map_err(|_| {
@@ -225,7 +225,7 @@ fn encrypt_des3_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> 
     })?;
     let len = data.len();
     cipher
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(data, len)
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(data, len)
         .map_err(|_| {
             tracing::debug!(target: "async_snmp::crypto", "3DES encryption failed: cipher error");
             CryptoError::CipherError
@@ -234,7 +234,7 @@ fn encrypt_des3_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> 
 }
 
 fn decrypt_des3_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
     type Des3Cbc = cbc::Decryptor<des::TdesEde3>;
 
     let cipher = Des3Cbc::new_from_slices(key, iv).map_err(|_| {
@@ -242,7 +242,7 @@ fn decrypt_des3_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> 
         CryptoError::InvalidKeyLength
     })?;
     cipher
-        .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(data)
+        .decrypt_padded::<cbc::cipher::block_padding::NoPadding>(data)
         .map_err(|_| {
             tracing::debug!(target: "async_snmp::crypto", "3DES decryption failed: cipher error");
             CryptoError::CipherError
@@ -252,7 +252,7 @@ fn decrypt_des3_cbc(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> 
 
 fn encrypt_aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
     use aes::{Aes128, Aes192, Aes256};
-    use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+    use cfb_mode::cipher::KeyIvInit;
 
     match key.len() {
         16 => {
@@ -289,7 +289,7 @@ fn encrypt_aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
 
 fn decrypt_aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
     use aes::{Aes128, Aes192, Aes256};
-    use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+    use cfb_mode::cipher::KeyIvInit;
 
     match key.len() {
         16 => {
