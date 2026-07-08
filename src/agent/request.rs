@@ -430,10 +430,13 @@ impl Agent {
             .fetch_add(1, Ordering::Relaxed)
             + 1;
 
-        // Build Report PDU with usmStatsUnknownEngineIDs
+        // Build Report PDU with usmStatsUnknownEngineIDs.
+        // RFC 3412 Section 7.1 Step 3c4: request-id is the value extracted from the
+        // original request PDU, or 0 when it cannot be extracted. Discovery requests
+        // carry no decodable scopedPDU here, so the original request-id is unavailable.
         let report_pdu = Pdu {
             pdu_type: PduType::Report,
-            request_id: incoming.global_data.msg_id,
+            request_id: 0,
             error_status: 0,
             error_index: 0,
             varbinds: vec![VarBind::new(

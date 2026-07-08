@@ -497,9 +497,13 @@ impl super::NotificationReceiver {
         let total_secs = self.inner.engine_start.elapsed().as_secs();
         let (boots, time) = compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
 
+        // RFC 3412 Section 7.1 Step 3c4: request-id is the value extracted from the
+        // original request PDU, or 0 when it cannot be extracted. Every USM-failure
+        // path reaches here before the scopedPDU is decoded, so it cannot be extracted.
+        // (msgID, which correlates the Report, is carried separately in the header.)
         let report_pdu = Pdu {
             pdu_type: PduType::Report,
-            request_id: msg.global_data.msg_id,
+            request_id: 0,
             error_status: 0,
             error_index: 0,
             varbinds: vec![VarBind::new(report_oid, Value::Counter32(count))],

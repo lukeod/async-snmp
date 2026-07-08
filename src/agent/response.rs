@@ -49,9 +49,13 @@ impl Agent {
         let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
         let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
 
+        // RFC 3412 Section 7.1 Step 3c4: request-id is the value extracted from the
+        // original request PDU, or 0 when it cannot be extracted. This report is built
+        // before the scopedPDU is decoded, so the original request-id is unavailable.
+        // (msgID, which correlates the Report, is carried separately in the header.)
         let report_pdu = Pdu {
             pdu_type: PduType::Report,
-            request_id: incoming.global_data.msg_id,
+            request_id: 0,
             error_status: 0,
             error_index: 0,
             varbinds: vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
