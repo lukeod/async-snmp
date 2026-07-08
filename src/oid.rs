@@ -462,7 +462,10 @@ impl Oid {
     /// # Validation
     ///
     /// This method does not validate arc constraints. Use [`to_ber_checked()`](Self::to_ber_checked)
-    /// for validation, or call [`validate()`](Self::validate) first.
+    /// for validation, or call [`validate()`](Self::validate) first. If the first two arcs combine
+    /// (`arc1 * 40 + arc2`) to a value exceeding `u32::MAX`, this method saturates that
+    /// subidentifier to `u32::MAX` rather than panicking or wrapping; such an OID is invalid and
+    /// is rejected by `validate()`/`to_ber_checked()`.
     #[must_use]
     pub fn to_ber(&self) -> Vec<u8> {
         self.to_ber_smallvec().to_vec()
@@ -556,12 +559,20 @@ impl Oid {
 ///
 /// Per X.690 Section 8.19: the first two arcs are encoded as `arc1 * 40 + arc2`.
 /// If there is only one arc, it is encoded as `arc1 * 40`.
+///
+/// Uses saturating arithmetic: for every OID that passes [`Oid::validate()`], the
+/// combined value fits in `u32` and no saturation occurs, so this is byte-identical
+/// to unchecked arithmetic on all valid input. An OID with a first subidentifier
+/// that would exceed `u32::MAX` is not representable in this crate's decode model
+/// (see [`decode_subidentifier`]) and is rejected by `validate()`/`to_ber_checked()`;
+/// saturating here only prevents the unchecked [`Oid::to_ber()`] path from panicking
+/// (debug) or wrapping (release) on such an out-of-range OID.
 #[inline]
 fn first_subidentifier(arcs: &SmallVec<[u32; 16]>) -> u32 {
     if arcs.len() >= 2 {
-        arcs[0] * 40 + arcs[1]
+        arcs[0].saturating_mul(40).saturating_add(arcs[1])
     } else {
-        arcs[0] * 40
+        arcs[0].saturating_mul(40)
     }
 }
 
@@ -1240,5 +1251,41 @@ mod tests {
             sum += arc;
         }
         assert_eq!(sum, 10);
+    }
+
+    #[test]
+    fn to_ber_saturates_first_subidentifier_instead_of_overflowing() {
+        // arc1=2, arc2=u32::MAX: arc1*40 + arc2 overflows u32. The unchecked
+        // encode path must saturate rather than panic (debug) or wrap (release).
+        let oid = Oid::from_slice(&[2, u32::MAX]);
+
+        // Checked path still rejects this OID.
+        assert!(oid.validate().is_err());
+        assert!(oid.to_ber_checked().is_err());
+
+        // Unchecked path must not panic and must be deterministic.
+        let bytes1 = oid.to_ber();
+        let bytes2 = oid.to_ber();
+        assert_eq!(bytes1, bytes2);
+        assert!(!bytes1.is_empty());
+
+        // Saturated first subidentifier is u32::MAX, encoded as the sole arc.
+        let expected = {
+            let mut v = SmallVec::<[u8; 64]>::new();
+            encode_subidentifier_smallvec(&mut v, u32::MAX);
+            v.to_vec()
+        };
+        assert_eq!(bytes1, expected);
+
+        // ber_content_size/ber_encoded_size stay self-consistent.
+        assert_eq!(oid.to_ber().len(), oid.ber_content_size());
+    }
+
+    #[test]
+    fn to_ber_unchanged_for_valid_oid() {
+        // Control: a valid OID's encoding is unaffected by the saturating change.
+        let oid = Oid::parse("1.3.6.1.2.1").unwrap();
+        assert!(oid.validate().is_ok());
+        assert_eq!(oid.to_ber(), vec![0x2b, 0x06, 0x01, 0x02, 0x01]);
     }
 }
