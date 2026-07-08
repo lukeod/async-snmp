@@ -875,6 +875,179 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// Test that `read_ber_message` rejects a non-SEQUENCE tag byte.
+    #[tokio::test]
+    async fn test_read_ber_message_rejects_bad_tag() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&[0x31, 0x00]).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+        )
+        .await
+        .expect("read_ber_message should not hang");
+
+        assert!(result.is_err(), "Should reject non-0x30 tag byte");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "Expected MalformedResponse error, got: {err:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// Test that `read_ber_message` rejects the BER indefinite-length form (0x80).
+    #[tokio::test]
+    async fn test_read_ber_message_rejects_indefinite_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&[0x30, 0x80]).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+        )
+        .await
+        .expect("read_ber_message should not hang");
+
+        assert!(result.is_err(), "Should reject indefinite length encoding");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "Expected MalformedResponse error, got: {err:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// Test that `read_ber_message` rejects a long-form length with more than
+    /// the 4-octet cap of trailing length bytes.
+    #[tokio::test]
+    async fn test_read_ber_message_rejects_length_encoding_too_long() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // 0x85 = long form, 5 trailing length octets (> 4-octet cap).
+            socket
+                .write_all(&[0x30, 0x85, 0x00, 0x00, 0x00, 0x00, 0x00])
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+        )
+        .await
+        .expect("read_ber_message should not hang");
+
+        assert!(result.is_err(), "Should reject length encoding over 4 octets");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "Expected MalformedResponse error, got: {err:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// Test that `read_ber_message` reassembles content delivered across
+    /// multiple separate TCP writes (segmented delivery), proving `read_exact`
+    /// correctly spans multiple reads rather than assuming one full message
+    /// arrives in a single `read`.
+    #[tokio::test]
+    async fn test_read_ber_message_reassembles_segmented_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            // Tag + length in the first segment.
+            socket.write_all(&[0x30, 0x04]).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // First half of content.
+            socket.write_all(&[0x01, 0x02]).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Second half of content.
+            socket.write_all(&[0x03, 0x04]).await.unwrap();
+            socket.flush().await.unwrap();
+
+            // Keep the connection open until the client has read everything.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+        )
+        .await
+        .expect("read_ber_message should not hang");
+
+        let bytes = result.expect("segmented message should reassemble successfully");
+        assert_eq!(bytes.as_ref(), &[0x30, 0x04, 0x01, 0x02, 0x03, 0x04]);
+
+        server.await.unwrap();
+    }
+
+    /// Test that a truncated stream (content promised but connection closed
+    /// before it fully arrives) surfaces as a `Network` error from the
+    /// content `read_exact` hitting `UnexpectedEof`.
+    #[tokio::test]
+    async fn test_read_ber_message_truncated_stream_is_network_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            // Claims 5 content octets but only ever sends 2, then drops the
+            // connection.
+            socket.write_all(&[0x30, 0x05]).await.unwrap();
+            socket.write_all(&[0x01, 0x02]).await.unwrap();
+            socket.flush().await.unwrap();
+            drop(socket);
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+        )
+        .await
+        .expect("read_ber_message should not hang");
+
+        assert!(result.is_err(), "Should error on truncated content stream");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(*err, Error::Network { .. }),
+            "Expected Network error, got: {err:?}"
+        );
+
+        server.await.unwrap();
+    }
+
     /// Test that a custom `max_allocation_size` via builder is respected.
     #[tokio::test]
     async fn test_tcp_builder_custom_allocation_limit() {
