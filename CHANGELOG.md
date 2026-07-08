@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Agent silently dropped oversized GET, GETNEXT, and SET responses in the run loop instead of returning the alternate `tooBig` Response that RFC 3416 Sections 4.2.1, 4.2.2, and 4.2.5 require; the GET/GETNEXT/SET handlers now emit a `tooBig` Response (error-status `tooBig`, error-index 0, empty variable-bindings) when the Response would exceed `min(agentMax, msgMaxSize)`, and the run-loop drop is now the final fallback for when even that empty Response will not fit. The SET size check runs up front per Section 4.2.5, before the test/commit phases, so an oversized SET is no longer committed only to have its Response discarded (which a retrying manager would re-apply). GETBULK sizing (Section 4.2.3) is unchanged.
 - VACM MIB-view matching (`View::contains` and `View::check_subtree`) resolved overlapping subtrees of equal length by insertion order, so `exclude` then `include` on the same specificity could grant access that `include` then `exclude` denied. Equal-length matches now follow RFC 3415: the lexicographically greatest matching subtree OID decides, making the outcome independent of the order subtrees were added.
 
 ## [0.13.0] - 2026-07-08

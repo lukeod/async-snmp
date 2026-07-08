@@ -28,7 +28,20 @@ impl Agent {
     ///    order) to release resources, then return the error.
     /// 2. **Commit phase**: Call `commit_set` for each varbind. If any fails,
     ///    call `undo_set` for all previously committed varbinds.
+    ///
+    /// Per RFC 3416 Section 4.2.5 step (1), the size of the Response (which
+    /// echoes the request varbinds) is checked up front: if it would exceed the
+    /// message-size limit the operation terminates immediately with a `tooBig`
+    /// Response, before the test or commit phases run, so an oversized SET is
+    /// never applied.
     pub(super) async fn handle_set(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+        // RFC 3416 Section 4.2.5 step (1): the SET Response echoes the request
+        // varbinds. If that Response would not fit, return tooBig without running
+        // the test or commit phases (prevents a retrying manager re-applying it).
+        if !Self::response_fits(&pdu.varbinds, self.effective_max_size(ctx)) {
+            return Ok(Self::too_big_response(pdu));
+        }
+
         // Track which handlers we need to commit/undo
         struct PendingSet<'a> {
             handler: &'a Arc<dyn MibHandler>,
@@ -146,6 +159,7 @@ mod tests {
 
     use crate::Oid;
     use crate::agent::Agent;
+    use crate::error::ErrorStatus;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, MibHandler, RequestContext, SecurityModel, SetResult,
     };
@@ -299,6 +313,124 @@ mod tests {
 
         assert_eq!(response.error_status, 0);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Handler that always accepts test_set and counts commit_set invocations,
+    /// used to prove the SET size check terminates before the commit phase.
+    struct CommitTracker {
+        commit_count: Arc<AtomicU32>,
+    }
+
+    impl MibHandler for CommitTracker {
+        fn get<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+            Box::pin(async { GetResult::NoSuchObject })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, GetNextResult> {
+            Box::pin(async { GetNextResult::EndOfMibView })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetResult> {
+            Box::pin(async { SetResult::Ok })
+        }
+
+        fn commit_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetResult> {
+            self.commit_count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { SetResult::Ok })
+        }
+    }
+
+    fn five_set_varbinds() -> Vec<VarBind> {
+        (1u32..=5)
+            .map(|i| VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, i, 0), Value::Integer(i as i32)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_set_too_big_returns_toobig_and_skips_commit() {
+        let commit_count = Arc::new(AtomicU32::new(0));
+        let handler = Arc::new(CommitTracker {
+            commit_count: commit_count.clone(),
+        });
+
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(150)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+
+        let ctx = test_ctx();
+
+        // The echoed Response for five varbinds exceeds the 150-byte limit.
+        // RFC 3416 Section 4.2.5 requires returning tooBig before any commit.
+        let pdu = Pdu {
+            pdu_type: PduType::SetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: five_set_varbinds(),
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index, 0);
+        assert!(response.varbinds.is_empty());
+        // The commit phase must never run for an oversized SET.
+        assert_eq!(commit_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_within_limit_commits() {
+        let commit_count = Arc::new(AtomicU32::new(0));
+        let handler = Arc::new(CommitTracker {
+            commit_count: commit_count.clone(),
+        });
+
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(150)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+
+        let ctx = test_ctx();
+
+        // A single-varbind SET fits within the limit and must commit normally.
+        let pdu = Pdu {
+            pdu_type: PduType::SetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Integer(1),
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, 0);
+        assert_eq!(commit_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

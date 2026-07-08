@@ -1085,8 +1085,12 @@ impl Agent {
 
                 match agent.handle_request(data, recv_meta.addr).await {
                     Ok(Some(response_bytes)) => {
-                        // RFC 3413 Section 3.2 step 4: if the encoded response
-                        // exceeds the max message size, silently drop it.
+                        // Per RFC 3416 Section 4.2 the GET/GETNEXT/SET handlers
+                        // already emit a tooBig Response when their result would
+                        // not fit (and GETBULK Section 4.2.3 truncates or emits
+                        // tooBig). This drop is the final fallback for when even
+                        // that empty tooBig Response still exceeds the limit; the
+                        // packet is then silently dropped (snmpSilentDrops).
                         if response_bytes.len() > agent.inner.state.max_message_size {
                             agent
                                 .inner
@@ -1286,6 +1290,41 @@ impl Agent {
         Ok(pdu.to_response())
     }
 
+    /// Effective maximum response message size for a request: the smaller of
+    /// the agent's configured limit and the client's advertised `msgMaxSize`
+    /// (v3). v1/v2c requests carry no `msg_max_size`, so the agent limit applies.
+    fn effective_max_size(&self, ctx: &RequestContext) -> usize {
+        let agent_max = self.inner.state.max_message_size;
+        match ctx.msg_max_size {
+            Some(client_max) => agent_max.min(client_max as usize),
+            None => agent_max,
+        }
+    }
+
+    /// Estimate whether a Response carrying `varbinds` fits within `max_size`,
+    /// using the same estimate as GETBULK: `RESPONSE_OVERHEAD` plus the encoded
+    /// size of each varbind.
+    fn response_fits(varbinds: &[VarBind], max_size: usize) -> bool {
+        let size = RESPONSE_OVERHEAD
+            + varbinds
+                .iter()
+                .map(VarBind::encoded_size)
+                .sum::<usize>();
+        size <= max_size
+    }
+
+    /// Build the `tooBig` Response for `pdu`: error-status `tooBig`, error-index
+    /// zero, and an empty variable-bindings field, per RFC 3416 Section 4.2.
+    pub(super) fn too_big_response(pdu: &Pdu) -> Pdu {
+        Pdu {
+            pdu_type: PduType::Response,
+            request_id: pdu.request_id,
+            error_status: ErrorStatus::TooBig.as_i32(),
+            error_index: 0,
+            varbinds: Vec::new(),
+        }
+    }
+
     /// Handle GET request.
     async fn handle_get(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
         let mut response_varbinds = Vec::with_capacity(pdu.varbinds.len());
@@ -1343,6 +1382,12 @@ impl Agent {
             response_varbinds.push(VarBind::new(vb.oid.clone(), response_value));
         }
 
+        // RFC 3416 Section 4.2.1: if the Response would exceed the message-size
+        // limit, return a tooBig Response with an empty variable-bindings list.
+        if !Self::response_fits(&response_varbinds, self.effective_max_size(ctx)) {
+            return Ok(Self::too_big_response(pdu));
+        }
+
         Ok(Pdu {
             pdu_type: PduType::Response,
             request_id: pdu.request_id,
@@ -1373,6 +1418,12 @@ impl Agent {
             }
         }
 
+        // RFC 3416 Section 4.2.2: if the Response would exceed the message-size
+        // limit, return a tooBig Response with an empty variable-bindings list.
+        if !Self::response_fits(&response_varbinds, self.effective_max_size(ctx)) {
+            return Ok(Self::too_big_response(pdu));
+        }
+
         Ok(Pdu {
             pdu_type: PduType::Response,
             request_id: pdu.request_id,
@@ -1393,11 +1444,7 @@ impl Agent {
 
         let mut response_varbinds = Vec::new();
         let mut current_size: usize = RESPONSE_OVERHEAD;
-        let agent_max = self.inner.state.max_message_size;
-        let max_size = match ctx.msg_max_size {
-            Some(client_max) => agent_max.min(client_max as usize),
-            None => agent_max,
-        };
+        let max_size = self.effective_max_size(ctx);
 
         // Helper to check if we can add a varbind
         let can_add = |vb: &VarBind, current_size: usize| -> bool {
@@ -2565,5 +2612,106 @@ mod tests {
                 .find_handler(&oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
                 .is_some()
         );
+    }
+
+    // Build an agent whose effective response size limit only fits a couple of
+    // varbinds, used to exercise the RFC 3416 tooBig paths for GET/GETNEXT.
+    async fn small_limit_agent() -> Agent {
+        Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(150)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    fn five_varbinds() -> Vec<VarBind> {
+        (1u32..=5)
+            .map(|i| VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, i, 0), Value::Null))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_get_too_big_returns_toobig_response() {
+        let agent = small_limit_agent().await;
+        let ctx = test_ctx();
+
+        // GET for all five OIDs; the response cannot fit within the 150-byte
+        // effective limit, so RFC 3416 Section 4.2.1 requires a tooBig Response.
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: five_varbinds(),
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index, 0);
+        assert!(response.varbinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_within_limit_returns_response() {
+        let agent = small_limit_agent().await;
+        let ctx = test_ctx();
+
+        // A single varbind fits comfortably; the tooBig check must not fire.
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, 0);
+        assert_eq!(response.varbinds.len(), 1);
+        assert!(matches!(response.varbinds[0].value, Value::Integer(1)));
+    }
+
+    #[tokio::test]
+    async fn test_getnext_too_big_returns_toobig_response() {
+        let agent = small_limit_agent().await;
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetNextRequest;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetNextRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: five_varbinds(),
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index, 0);
+        assert!(response.varbinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_getnext_within_limit_returns_response() {
+        let agent = small_limit_agent().await;
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetNextRequest;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetNextRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, 0);
+        assert_eq!(response.varbinds.len(), 1);
+        assert_eq!(response.varbinds[0].oid, oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0));
     }
 }
