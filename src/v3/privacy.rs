@@ -273,12 +273,23 @@ impl PrivKey {
     }
 
     /// Create a privacy key from raw localized key bytes.
+    ///
+    /// `key` must be at least `protocol.key_len()` octets; shorter keys would
+    /// later panic when the encryption/decryption routines slice into them, so
+    /// this returns `Err(CryptoError::InvalidKeyLength)` instead. A key longer
+    /// than `protocol.key_len()` is accepted (per RFC 3826 Section 3.1.2, the
+    /// localized key length is "at least" the required size); the extra
+    /// trailing bytes are simply unused.
     pub fn from_bytes(
         protocol: PrivProtocol,
         key: impl Into<Vec<u8>>,
     ) -> super::crypto::CryptoResult<Self> {
+        let key = key.into();
+        if key.len() < protocol.key_len() {
+            return Err(CryptoError::InvalidKeyLength);
+        }
         Ok(Self {
-            key: key.into(),
+            key,
             protocol,
             salt_counter: Self::init_salt()?,
         })
@@ -717,6 +728,44 @@ mod tests {
 
         let result = priv_key.decrypt(&ciphertext, 0, 0, &priv_params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_bytes_rejects_undersized_key() {
+        // Des requires 16 octets (8 key + 8 pre-IV); 4 is far too short.
+        // Previously this succeeded and a later encrypt() would panic on the slice.
+        let result = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 4]);
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength)));
+    }
+
+    #[test]
+    fn test_from_bytes_accepts_exact_length_key() {
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 16]);
+        assert!(priv_key.is_ok());
+
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; 16]);
+        assert!(priv_key.is_ok());
+    }
+
+    #[test]
+    fn test_from_bytes_accepts_oversized_key() {
+        // RFC 3826 Section 3.1.2 specifies the localized key is ">= " the required
+        // length; downstream slices only ever take a `[..N]` prefix, so extra
+        // trailing bytes are unused but harmless.
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 20]).unwrap();
+        // Encrypting should not panic now that the key is validated as long enough.
+        let _ = priv_key.encrypt(b"data", 0, 0, None);
+    }
+
+    #[test]
+    fn test_from_bytes_key_len_boundary() {
+        let des_len = PrivProtocol::Des.key_len();
+        assert!(PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; des_len - 1]).is_err());
+        assert!(PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; des_len]).is_ok());
+
+        let aes256_len = PrivProtocol::Aes256.key_len();
+        assert!(PrivKey::from_bytes(PrivProtocol::Aes256, vec![0u8; aes256_len - 1]).is_err());
+        assert!(PrivKey::from_bytes(PrivProtocol::Aes256, vec![0u8; aes256_len]).is_ok());
     }
 
     #[test]
