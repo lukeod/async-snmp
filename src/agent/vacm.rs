@@ -334,9 +334,13 @@ impl View {
 
     /// Check if an OID is in this view.
     ///
-    /// Per RFC 3415 Section 5, when multiple subtrees match an OID,
-    /// the longest matching subtree determines inclusion/exclusion.
-    /// At equal lengths, exclude wins.
+    /// Per RFC 3415 Section 5, when multiple subtrees match an OID, the entry
+    /// with the most sub-identifiers determines inclusion/exclusion. When
+    /// several matching entries have the same number of sub-identifiers, the
+    /// one with the lexicographically greatest subtree OID decides, so the
+    /// result does not depend on the order subtrees were added. Identical
+    /// subtree OIDs cannot coexist in a real `vacmViewTreeFamilyTable`; that
+    /// degenerate collision is resolved conservatively (exclude wins).
     ///
     /// # Example
     ///
@@ -354,27 +358,18 @@ impl View {
     /// ```
     #[must_use]
     pub fn contains(&self, oid: &Oid) -> bool {
-        let mut best_len: Option<usize> = None;
-        let mut best_included = false;
+        let mut best: Option<(&[u32], bool)> = None;
 
         for subtree in &self.subtrees {
             if subtree.matches(oid) {
-                let len = subtree.oid.len();
-                match best_len {
-                    Some(prev) if len < prev => {}
-                    Some(prev) if len == prev && !subtree.included => {
-                        // Equal length: exclude wins (conservative)
-                        best_included = false;
-                    }
-                    _ => {
-                        best_len = Some(len);
-                        best_included = subtree.included;
-                    }
+                let arcs = subtree.oid.arcs();
+                if view_match_wins(best, arcs, subtree.included) {
+                    best = Some((arcs, subtree.included));
                 }
             }
         }
 
-        best_included
+        best.is_some_and(|(_, included)| included)
     }
 
     /// Check subtree access status with 3-state result.
@@ -389,30 +384,23 @@ impl View {
     /// - [`ViewCheckResult::Ambiguous`]: Mixed permissions, check each OID individually
     #[must_use]
     pub fn check_subtree(&self, oid: &Oid) -> ViewCheckResult {
-        // Find the longest covering match (RFC 3415 longest-match semantics)
-        let mut best_covering_len: Option<usize> = None;
-        let mut best_covering_included = false;
+        // Find the best covering match (RFC 3415: most sub-identifiers, then
+        // lexicographically greatest subtree OID; see `view_match_wins`).
+        let mut best_covering: Option<(&[u32], bool)> = None;
         let mut has_child_include = false;
         let mut has_child_exclude = false;
 
         let query_arcs = oid.arcs();
 
         for subtree in &self.subtrees {
-            if subtree.matches(oid) {
-                let len = subtree.oid.len();
-                match best_covering_len {
-                    Some(prev) if len < prev => {}
-                    Some(prev) if len == prev && !subtree.included => {
-                        best_covering_included = false;
-                    }
-                    _ => {
-                        best_covering_len = Some(len);
-                        best_covering_included = subtree.included;
-                    }
-                }
+            let subtree_arcs = subtree.oid.arcs();
+
+            if subtree.matches(oid)
+                && view_match_wins(best_covering, subtree_arcs, subtree.included)
+            {
+                best_covering = Some((subtree_arcs, subtree.included));
             }
 
-            let subtree_arcs = subtree.oid.arcs();
             if subtree_arcs.len() > query_arcs.len()
                 && subtree_arcs[..query_arcs.len()] == *query_arcs
             {
@@ -424,27 +412,57 @@ impl View {
             }
         }
 
-        match (best_covering_len.is_some(), best_covering_included) {
-            (true, false) => {
+        match best_covering {
+            Some((_, false)) => {
                 if has_child_include {
-                    return ViewCheckResult::Ambiguous;
+                    ViewCheckResult::Ambiguous
+                } else {
+                    ViewCheckResult::Excluded
                 }
-                return ViewCheckResult::Excluded;
             }
-            (true, true) => {
+            Some((_, true)) => {
                 if has_child_exclude {
-                    return ViewCheckResult::Ambiguous;
+                    ViewCheckResult::Ambiguous
+                } else {
+                    ViewCheckResult::Included
                 }
-                return ViewCheckResult::Included;
             }
-            _ => {}
+            None => {
+                if has_child_include {
+                    ViewCheckResult::Ambiguous
+                } else {
+                    ViewCheckResult::Excluded
+                }
+            }
         }
+    }
+}
 
-        if has_child_include {
-            return ViewCheckResult::Ambiguous;
+/// RFC 3415 tie-break for overlapping MIB-view subtree matches.
+///
+/// Given the current best matching entry (its subtree OID arcs and `included`
+/// flag) and a candidate match, returns whether the candidate should replace
+/// the current best:
+///
+/// - more sub-identifiers wins;
+/// - at equal sub-identifier counts, the lexicographically greater subtree OID
+///   wins (the "lexicographically greatest instance" rule of the
+///   `vacmViewTreeFamilyTable` DESCRIPTION);
+/// - identical subtree OIDs form an index collision that cannot occur in a real
+///   table; it is resolved conservatively by letting an exclude replace an
+///   include so the outcome is independent of insertion order.
+fn view_match_wins(best: Option<(&[u32], bool)>, arcs: &[u32], included: bool) -> bool {
+    match best {
+        None => true,
+        Some((best_arcs, best_included)) => {
+            if arcs.len() != best_arcs.len() {
+                arcs.len() > best_arcs.len()
+            } else if arcs != best_arcs {
+                arcs > best_arcs
+            } else {
+                best_included && !included
+            }
         }
-
-        ViewCheckResult::Excluded
     }
 }
 
@@ -1027,6 +1045,102 @@ mod tests {
             .exclude(oid!(1, 3, 6, 1, 2, 1));
 
         assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 0)));
+    }
+
+    #[test]
+    fn test_view_equal_length_identical_oid_order_independent() {
+        // T4 gap: an include and an exclude on the *same* subtree OID form an
+        // index collision that cannot occur in a real vacmViewTreeFamilyTable.
+        // Both insertion orders must resolve identically (exclude wins).
+        let include_first = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1))
+            .exclude(oid!(1, 3, 6, 1, 2, 1));
+        let exclude_first = View::new()
+            .exclude(oid!(1, 3, 6, 1, 2, 1))
+            .include(oid!(1, 3, 6, 1, 2, 1));
+
+        let query = oid!(1, 3, 6, 1, 2, 1, 1, 0);
+        assert_eq!(
+            include_first.contains(&query),
+            exclude_first.contains(&query),
+            "identical-OID collision must be order-independent"
+        );
+        assert!(
+            !include_first.contains(&query),
+            "identical-OID collision resolves conservatively to excluded"
+        );
+    }
+
+    #[test]
+    fn test_view_equal_length_lexicographic_tie_break() {
+        // Two equal-length masked subtrees that both match the same query OID
+        // via a wildcard on the final arc. Per RFC 3415 the lexicographically
+        // greatest matching subtree OID decides, independent of insertion order.
+        //
+        // Subtree A (include): 1.3.6.1.2.1.5.1, arc 7 wildcarded
+        // Subtree B (exclude): 1.3.6.1.2.1.5.9, arc 7 wildcarded
+        // B is lexicographically greater, so exclude wins -> contains == false.
+        let query = oid!(1, 3, 6, 1, 2, 1, 5, 5);
+        let mask = vec![0xFE]; // arcs 0-6 exact, arc 7 wildcard
+
+        let a_then_b = View::new()
+            .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone())
+            .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone());
+        let b_then_a = View::new()
+            .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone())
+            .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone());
+
+        assert!(
+            !a_then_b.contains(&query),
+            "lexicographically greatest subtree (exclude) must win"
+        );
+        assert_eq!(
+            a_then_b.contains(&query),
+            b_then_a.contains(&query),
+            "lexicographic tie-break must be order-independent"
+        );
+
+        // Swap the include/exclude flags: now the greater subtree is the
+        // include, so inclusion must win in both insertion orders.
+        let a_then_b_inc = View::new()
+            .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone())
+            .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone());
+        let b_then_a_inc = View::new()
+            .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone())
+            .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone());
+
+        assert!(
+            a_then_b_inc.contains(&query),
+            "lexicographically greatest subtree (include) must win"
+        );
+        assert_eq!(
+            a_then_b_inc.contains(&query),
+            b_then_a_inc.contains(&query),
+            "lexicographic tie-break must be order-independent"
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_equal_length_tie_break_order_independent() {
+        // Same equal-length masked scenario as the contains tie-break test, via
+        // check_subtree. The greater subtree OID (exclude) covers the query, so
+        // the result is Excluded regardless of insertion order.
+        let query = oid!(1, 3, 6, 1, 2, 1, 5, 5);
+        let mask = vec![0xFE];
+
+        let a_then_b = View::new()
+            .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone())
+            .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone());
+        let b_then_a = View::new()
+            .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone())
+            .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone());
+
+        assert_eq!(a_then_b.check_subtree(&query), ViewCheckResult::Excluded);
+        assert_eq!(
+            a_then_b.check_subtree(&query),
+            b_then_a.check_subtree(&query),
+            "check_subtree tie-break must be order-independent"
+        );
     }
 
     #[test]

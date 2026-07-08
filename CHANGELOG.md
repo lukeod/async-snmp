@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- VACM MIB-view matching (`View::contains` and `View::check_subtree`) resolved overlapping subtrees of equal length by insertion order, so `exclude` then `include` on the same specificity could grant access that `include` then `exclude` denied. Equal-length matches now follow RFC 3415: the lexicographically greatest matching subtree OID decides, making the outcome independent of the order subtrees were added.
+
 ## [0.13.0] - 2026-07-08
 
 ### Added
