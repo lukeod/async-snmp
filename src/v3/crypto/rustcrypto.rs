@@ -76,7 +76,9 @@ impl CryptoProvider for RustCryptoProvider {
     ) -> CryptoResult<()> {
         match protocol {
             PrivProtocol::Des | PrivProtocol::Des3 => {
-                // RFC 3414 §8.1.1.2: pad to block boundary (PKCS7)
+                // RFC 3414 §8.1.1.2: pad only up to the next 8-byte block boundary;
+                // the pad value is irrelevant and no full block is added when already
+                // aligned (i.e. not PKCS7).
                 let block = 8;
                 let padded_len = data.len().next_multiple_of(block);
                 let pad_byte = (padded_len - data.len()) as u8;
