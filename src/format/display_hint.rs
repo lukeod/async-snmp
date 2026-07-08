@@ -41,6 +41,10 @@ use crate::format::hex;
 /// The last format specification repeats until all data is exhausted (implicit
 /// repetition rule). Trailing separators are suppressed.
 ///
+/// An octet length of zero is permitted (RFC 2579 3.1(2)): a zero-width spec
+/// consumes no data and emits only its literal separator/terminator. A trailing
+/// zero-width spec is not implicitly repeated (loop guard).
+///
 /// # Examples
 ///
 /// ```
@@ -100,10 +104,6 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
             hint_pos += 1;
         }
 
-        if take == 0 {
-            return hex::encode(data);
-        }
-
         // (3) Format character (required)
         if hint_pos >= hint.len() {
             return hex::encode(data);
@@ -149,6 +149,33 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
         } else {
             1
         };
+
+        // Zero-width spec: RFC 2579 3.1(2) permits an octet length of zero. Such
+        // a spec consumes no data bytes (a leading `*` still consumed one byte
+        // above as the repeat count) and emits only its literal separator (once
+        // per repeat) and terminator, mirroring net-snmp snmplib/mib.c:517-545.
+        if take == 0 {
+            let is_last_spec = hint_pos >= hint.len();
+            if has_sep {
+                for r in 0..repeat_count {
+                    // Suppress the trailing separator on the last spec
+                    // (net-snmp: is_last_spec && repeat == 0).
+                    if is_last_spec && r + 1 == repeat_count {
+                        break;
+                    }
+                    result.push(sep as char);
+                }
+            }
+            if has_term && !is_last_spec {
+                result.push(term as char);
+            }
+            if is_last_spec {
+                // Loop guard: a trailing zero-width spec never advances the data
+                // cursor, so it must not be implicitly repeated (infinite loop).
+                break;
+            }
+            continue;
+        }
 
         for r in 0..repeat_count {
             if data_pos >= data.len() {
@@ -546,8 +573,30 @@ mod tests {
     }
 
     #[test]
-    fn zero_take_value() {
-        assert_eq!(apply("0d", &[1, 2, 3]), "010203");
+    fn zero_width_trailing_no_abort_no_loop() {
+        // RFC 2579 3.1(2): octet length may be zero. A trailing zero-width spec
+        // consumes no data and emits no separator/terminator, and must not loop
+        // forever (net-snmp snmplib/mib.c:517-545). Remaining data is ignored.
+        assert_eq!(apply("0d", &[1, 2, 3]), "");
+    }
+
+    #[test]
+    fn zero_width_emits_separator_then_real_spec() {
+        // Zero-width `0d` is not the last spec, so it emits its `.` separator;
+        // `1d` then formats the single byte.
+        assert_eq!(apply("0d.1d", &[5]), ".5");
+    }
+
+    #[test]
+    fn zero_width_star_repeat_suppresses_trailing_separator() {
+        // `*` reads repeat=3 from the data byte; the zero-width spec is last, so
+        // the 3rd (trailing) separator is suppressed -> two commas.
+        assert_eq!(apply("*0d,", &[3]), ",,");
+    }
+
+    #[test]
+    fn zero_width_control_normal_hint_unchanged() {
+        assert_eq!(apply("1d.1d", &[10, 20]), "10.20");
     }
 
     // ========================================================================
