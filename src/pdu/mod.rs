@@ -772,8 +772,13 @@ impl GetBulkPdu {
     pub fn encode(&self, buf: &mut EncodeBuf) {
         buf.push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
             encode_varbind_list(buf, &self.varbinds);
-            buf.push_integer(self.max_repetitions);
-            buf.push_integer(self.non_repeaters);
+            // RFC 3416 Section 4.2.3: non-repeaters and max-repetitions are
+            // INTEGER (0..2147483647). i32::MAX already equals the upper
+            // bound, so only the negative floor needs clamping here; this
+            // matches the agent's own decode-side `.max(0)` leniency for the
+            // GETBULK non-repeaters/max-repetitions fields (src/agent/mod.rs).
+            buf.push_integer(self.max_repetitions.max(0));
+            buf.push_integer(self.non_repeaters.max(0));
             buf.push_integer(self.request_id);
         });
     }
@@ -1223,6 +1228,44 @@ mod tests {
         let pdu = result.unwrap();
         assert_eq!(pdu.non_repeaters, 0);
         assert_eq!(pdu.max_repetitions, 10);
+    }
+
+    #[test]
+    fn test_encode_clamps_negative_non_repeaters_and_max_repetitions() {
+        // RFC 3416 Section 4.2.3: non-repeaters and max-repetitions are
+        // INTEGER (0..2147483647). GetBulkPdu::encode clamps negative values
+        // to 0 before writing, so even a PDU built with negative fields
+        // (e.g. via a raw i32 passed to Client::get_bulk) round-trips through
+        // decode instead of producing a malformed request on the wire.
+        let pdu = GetBulkPdu::new(1, -1, -5, &[oid!(1, 3, 6, 1)]);
+
+        let mut buf = EncodeBuf::new();
+        pdu.encode(&mut buf);
+        let bytes = buf.finish();
+
+        let mut decoder = Decoder::new(bytes);
+        let result = GetBulkPdu::decode(&mut decoder);
+        assert!(
+            result.is_ok(),
+            "encoded negative non_repeaters/max_repetitions should decode after clamping, got {result:?}"
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.non_repeaters, 0);
+        assert_eq!(decoded.max_repetitions, 0);
+    }
+
+    #[test]
+    fn test_encode_leaves_non_negative_non_repeaters_and_max_repetitions_unchanged() {
+        let pdu = GetBulkPdu::new(1, 0, 10, &[oid!(1, 3, 6, 1)]);
+
+        let mut buf = EncodeBuf::new();
+        pdu.encode(&mut buf);
+        let bytes = buf.finish();
+
+        let mut decoder = Decoder::new(bytes);
+        let decoded = GetBulkPdu::decode(&mut decoder).unwrap();
+        assert_eq!(decoded.non_repeaters, 0);
+        assert_eq!(decoded.max_repetitions, 10);
     }
 
     #[test]

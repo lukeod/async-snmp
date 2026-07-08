@@ -70,6 +70,19 @@ pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 // Shared helpers
 // ============================================================================
 
+/// Convert a configured `u32` `max_repetitions` to the `i32` GETBULK wire
+/// field, saturating instead of wrapping.
+///
+/// RFC 3416 Section 4.2.3 specifies `max-repetitions` as `INTEGER
+/// (0..2147483647)`. `ClientBuilder::max_repetitions` takes a `u32`, so a
+/// configured value above `i32::MAX` would wrap to a negative number under a
+/// plain `as i32` cast; this saturates to `i32::MAX` instead, which
+/// `GetBulkPdu::encode`'s own clamp (`.max(0)`) would otherwise silently turn
+/// into `0` (disabling repetitions).
+pub(crate) fn max_repetitions_to_wire(max_repetitions: u32) -> i32 {
+    i32::try_from(max_repetitions).unwrap_or(i32::MAX)
+}
+
 /// Extract an SNMP-level error from a PDU and convert it to an `Error::Snmp`.
 ///
 /// Returns `Some(err)` if the PDU carries an SNMP error status, `None` otherwise.
@@ -897,7 +910,7 @@ impl<T: Transport> Client<T> {
         let ordering = self.inner.config.oid_ordering;
         let max_results = self.inner.config.max_walk_results;
         let walk_mode = self.inner.config.walk_mode;
-        let max_repetitions = self.inner.config.max_repetitions as i32;
+        let max_repetitions = max_repetitions_to_wire(self.inner.config.max_repetitions);
         let version = self.inner.config.version;
 
         WalkStream::new(
@@ -1002,7 +1015,7 @@ impl<T: Transport> Client<T> {
     {
         let ordering = self.inner.config.oid_ordering;
         let max_results = self.inner.config.max_walk_results;
-        let max_repetitions = self.inner.config.max_repetitions as i32;
+        let max_repetitions = max_repetitions_to_wire(self.inner.config.max_repetitions);
         BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
     }
 }
@@ -1019,6 +1032,30 @@ mod tests {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
+
+    // -------------------------------------------------------------------------
+    // max_repetitions_to_wire: saturating u32 -> i32 conversion used by
+    // `walk()` and `bulk_walk_default()` so a configured `max_repetitions`
+    // above `i32::MAX` cannot wrap to a negative GETBULK field (C7).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_max_repetitions_to_wire_saturates_above_i32_max() {
+        // A plain `as i32` cast would wrap this to a negative number.
+        assert_eq!(max_repetitions_to_wire(u32::MAX), i32::MAX);
+        assert_eq!(
+            max_repetitions_to_wire(i32::MAX as u32 + 1),
+            i32::MAX,
+            "one past i32::MAX must saturate, not wrap negative"
+        );
+    }
+
+    #[test]
+    fn test_max_repetitions_to_wire_passes_through_in_range_values() {
+        assert_eq!(max_repetitions_to_wire(0), 0);
+        assert_eq!(max_repetitions_to_wire(25), 25);
+        assert_eq!(max_repetitions_to_wire(i32::MAX as u32), i32::MAX);
+    }
 
     // -------------------------------------------------------------------------
     // Mock transport that returns a response with a configurable number of
