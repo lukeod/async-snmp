@@ -53,6 +53,37 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Mixed Versions on One Port
+//!
+//! A single receiver on one UDP port handles v1, v2c, and v3 concurrently;
+//! each datagram is dispatched by its version field. Community filtering
+//! (v1/v2c) and USM users (v3) are independent and can be configured
+//! together — configuring one does not disable the other:
+//!
+//! ```rust,no_run
+//! use async_snmp::notification::NotificationReceiver;
+//! use async_snmp::{AuthProtocol, PrivProtocol};
+//!
+//! # async fn example() -> Result<(), Box<async_snmp::Error>> {
+//! let receiver = NotificationReceiver::builder()
+//!     .bind("0.0.0.0:162")
+//!     .communities(["public", "monitor"]) // gates v1/v2c
+//!     .usm_user("trapuser", |u| {          // gates v3
+//!         u.auth(AuthProtocol::Sha1, b"authpass123")
+//!          .privacy(PrivProtocol::Aes128, b"privpass123")
+//!     })
+//!     .build()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The two mechanisms confer very different trust (a `public` v2c trap versus
+//! an authPriv v3 trap arrive on the same socket). Each [`Notification`]
+//! variant carries how it was authenticated — the community for v1/v2c, the
+//! username and [`security_level`](Notification::security_level) for v3 — so
+//! branch on the variant when `recv` returns to apply per-version policy.
 
 mod handlers;
 mod types;
@@ -184,7 +215,10 @@ pub mod oids {
 
 /// Builder for `NotificationReceiver`.
 ///
-/// Allows configuration of bind address and USM credentials for V3 support.
+/// Configures the bind address, optional community filtering for v1/v2c, and
+/// USM credentials for v3. Community filtering and USM users are independent
+/// and may be combined; a single receiver then handles all versions on one
+/// port. See the [module docs](crate::notification#mixed-versions-on-one-port).
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
