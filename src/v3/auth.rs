@@ -404,6 +404,13 @@ pub fn verify_message(
     auth_offset: usize,
     auth_len: usize,
 ) -> CryptoResult<bool> {
+    const MAX_MAC_LEN: usize = 48; // SHA-512
+
+    // No supported protocol produces a MAC longer than MAX_MAC_LEN; a larger
+    // auth_len can never verify and would overrun the zeros buffer below.
+    if auth_len > MAX_MAC_LEN {
+        return Ok(false);
+    }
     let end = match auth_offset.checked_add(auth_len) {
         Some(e) if e <= message.len() => e,
         _ => return Ok(false),
@@ -415,7 +422,6 @@ pub fn verify_message(
     // Compute HMAC over the message with zeros in the auth position,
     // feeding three slices to avoid copying the entire message.
     let computed = {
-        const MAX_MAC_LEN: usize = 48; // SHA-512
         let zeros: [u8; MAX_MAC_LEN] = [0u8; MAX_MAC_LEN];
         compute_hmac_slices(
             key.protocol,
@@ -786,6 +792,25 @@ mod tests {
         let mut wrong_mac = mac.clone();
         wrong_mac[0] ^= 0xFF;
         assert!(!key.verify_hmac(data, &wrong_mac).unwrap());
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn test_verify_message_oversized_auth_len() {
+        let key = LocalizedKey::from_bytes(
+            AuthProtocol::Md5,
+            vec![
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
+            ],
+        );
+
+        // auth_len larger than the biggest supported MAC (48 bytes for
+        // SHA-512) but still within the message bounds must be rejected,
+        // not panic on the internal zeros buffer.
+        let message = vec![0u8; 128];
+        let result = verify_message(&key, &message, 10, 49).unwrap();
+        assert!(!result);
     }
 
     #[cfg(feature = "crypto-rustcrypto")]
