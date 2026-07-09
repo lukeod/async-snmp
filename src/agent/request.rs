@@ -3,14 +3,11 @@
 use bytes::Bytes;
 use std::net::SocketAddr;
 
-use crate::ber::Decoder;
-use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::handler::{RequestContext, SecurityModel};
-use crate::message::{CommunityMessage, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
+use crate::message::{CommunityMessage, SecurityLevel};
 use crate::pdu::PduType;
-use crate::v3::auth::verify_message;
-use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
+use crate::v3::process::{MpdCounters, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
 use crate::version::Version;
 
 use std::sync::atomic::Ordering;
@@ -89,232 +86,34 @@ impl Agent {
     }
 
     /// Handle `SNMPv3` request.
+    ///
+    /// USM processing (RFC 3414 Section 3.2) runs in the shared
+    /// [`process_v3_inbound`] core in the authoritative role.
     pub(super) async fn handle_v3(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
-        let msg = V3Message::decode(data.clone())?;
-        let security_level = msg.global_data.msg_flags.security_level;
-
-        // Decode USM parameters
-        let usm_params = UsmSecurityParams::decode(msg.security_params.clone())?;
-
-        // Check if this is a discovery request (empty engine ID)
-        if usm_params.engine_id.is_empty() {
-            return self.handle_v3_discovery(&msg, &usm_params, source);
-        }
-
-        // Verify engine ID matches ours
-        if usm_params.engine_id.as_ref() != self.inner.state.engine_id.as_ref() {
-            tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "engine ID mismatch");
-            let count = self
-                .inner
-                .state
-                .usm_unknown_engine_ids
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            return self.send_v3_report(
-                &msg,
-                &usm_params,
-                crate::v3::report_oids::unknown_engine_ids(),
-                count,
-                None,
-                source,
-            );
-        }
-
-        // Look up user credentials
-        let user_config = self.inner.usm_users.get(&usm_params.username);
-        let derived_keys = user_config
-            .map(|u| u.derive_keys(&self.inner.state.engine_id))
-            .transpose()
-            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-
-        // RFC 3414 section 3.2 step 1: for non-discovery messages (non-empty username),
-        // the user MUST exist in the local user database regardless of security level.
-        if user_config.is_none() {
-            tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "unknown user");
-            let count = self
-                .inner
-                .state
-                .usm_unknown_usernames
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            return self.send_v3_report(
-                &msg,
-                &usm_params,
-                crate::v3::report_oids::unknown_user_names(),
-                count,
-                None,
-                source,
-            );
-        }
-
-        // RFC 3414 Section 3.2 Step 5: the user must support the requested
-        // security level, checked before authentication (Step 6), timeliness
-        // (Step 7), and the Section 2.3 boots-latched gate below. A user lacking
-        // the auth key required for authNoPriv/authPriv, or the privacy key
-        // required for authPriv, does not support the level and is rejected here
-        // regardless of the message's HMAC, boots, or time.
-        if security_level.requires_auth() {
-            let supported = derived_keys.as_ref().is_some_and(|k| {
-                k.auth_key.is_some()
-                    && (security_level != SecurityLevel::AuthPriv || k.priv_key.is_some())
-            });
-            if !supported {
-                tracing::debug!(target: "async_snmp::agent", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user does not support requested security level");
-                let count = self
-                    .inner
-                    .state
-                    .usm_unsupported_sec_levels
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1;
-                return self.send_v3_report(
-                    &msg,
-                    &usm_params,
-                    crate::v3::report_oids::unsupported_sec_levels(),
-                    count,
-                    None,
-                    source,
-                );
-            }
-        }
-
-        // RFC 3414 Section 2.3: when engine boots is latched at maximum,
-        // reject all authenticated inbound messages with notInTimeWindows.
-        // The agent cannot perform timeliness checks in this state.
-        if security_level.requires_auth()
-            && self.inner.state.engine_boots.load(Ordering::Relaxed) == MAX_ENGINE_TIME
-        {
-            tracing::warn!(target: "async_snmp::agent", { snmp.source = %source }, "engine boots at maximum, rejecting authenticated request");
-            let count = self
-                .inner
-                .state
-                .usm_not_in_time_windows
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            // Unlike the Step 7a rejection below, the message's HMAC has not
-            // been verified at this point, so the report is not authenticated.
-            return self.send_v3_report(
-                &msg,
-                &usm_params,
-                crate::v3::report_oids::not_in_time_windows(),
-                count,
-                None,
-                source,
-            );
-        }
-
-        // Verify authentication if required (RFC 3414 Section 3.2 Step 6). The
-        // auth key is guaranteed present by the Step 5 check above.
-        if security_level.requires_auth() {
-            let auth_key = derived_keys
-                .as_ref()
-                .and_then(|keys| keys.auth_key.as_ref())
-                .expect("authenticated request without an auth key is rejected at Step 5");
-            let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data)
-                .ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { source = %source }, "could not find auth params in message");
-                    Error::Auth { target: source }.boxed()
-                })?;
-
-            if !verify_message(auth_key, &data, auth_offset, auth_len)
-                .map_err(|_| Error::Auth { target: source }.boxed())?
-            {
-                tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "authentication failed");
-                let count = self
-                    .inner
-                    .state
-                    .usm_wrong_digests
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1;
-                return self.send_v3_report(
-                    &msg,
-                    &usm_params,
-                    crate::v3::report_oids::wrong_digests(),
-                    count,
-                    None,
-                    source,
-                );
-            }
-
-            // Verify time window (RFC 3414 Section 3.2 Step 7a):
-            // boots must match and time must be within 150 seconds.
-            let our_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
-            let our_time = self.inner.state.engine_time.load(Ordering::Relaxed);
-            if !crate::v3::in_authoritative_time_window(
-                our_boots,
-                our_time,
-                usm_params.engine_boots,
-                usm_params.engine_time,
-            ) {
-                tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "message outside time window");
-                let count = self
-                    .inner
-                    .state
-                    .usm_not_in_time_windows
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1;
-                // RFC 3414 Section 3.2 Step 7a: the report must be
-                // authenticated at authNoPriv so the sender can trust
-                // the boots/time for resynchronization.
-                return self.send_v3_report(
-                    &msg,
-                    &usm_params,
-                    crate::v3::report_oids::not_in_time_windows(),
-                    count,
-                    Some(auth_key),
-                    source,
-                );
-            }
-        }
-
-        // Decrypt if needed
-        let scoped_pdu = if security_level == SecurityLevel::AuthPriv {
-            // Privacy key presence was checked at Step 5 above.
-            let priv_key = derived_keys
-                .as_ref()
-                .and_then(|keys| keys.priv_key.as_ref())
-                .expect("authPriv without a privacy key is rejected at Step 5");
-            let encrypted_data = match &msg.data {
-                V3MessageData::Encrypted(data) => data,
-                V3MessageData::Plaintext(_) => {
-                    tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::ExpectedEncryption }, "expected encrypted scoped PDU");
-                    return Err(Error::MalformedResponse { target: source }.boxed());
-                }
-            };
-
-            let decrypted = match priv_key.decrypt(
-                encrypted_data,
-                usm_params.engine_boots,
-                usm_params.engine_time,
-                &usm_params.priv_params,
-            ) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::debug!(target: "async_snmp::agent", { source = %source, error = %e }, "decryption failed");
-                    let count = self
-                        .inner
-                        .state
-                        .usm_decryption_errors
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1;
-                    return self.send_v3_report(
-                        &msg,
-                        &usm_params,
-                        crate::v3::report_oids::decryption_errors(),
-                        count,
-                        None,
-                        source,
-                    );
-                }
-            };
-
-            let mut decoder = Decoder::with_target(decrypted, source);
-            ScopedPdu::decode(&mut decoder)?
-        } else if let Some(sp) = msg.scoped_pdu() {
-            sp.clone()
-        } else {
-            tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::UnexpectedEncryption }, "unexpected encrypted scoped PDU");
-            return Err(Error::MalformedResponse { target: source }.boxed());
+        let state = &self.inner.state;
+        let usm_ctx = V3LocalContext {
+            engine_id: &state.engine_id,
+            engine_boots: state.engine_boots.load(Ordering::Relaxed),
+            engine_time: state.engine_time.load(Ordering::Relaxed),
+            usm_users: &self.inner.usm_users,
+            stats: &state.usm_stats,
+            mpd: Some(MpdCounters {
+                invalid_msgs: &state.snmp_invalid_msgs,
+                unknown_security_models: &state.snmp_unknown_security_models,
+            }),
+            source,
         };
+
+        let inbound = match process_v3_inbound(data, &usm_ctx, &V3Role::Authoritative)? {
+            V3Inbound::Failed { report, .. } => return Ok(report),
+            // Step 7b does not apply to the authoritative role.
+            V3Inbound::RemoteNotInTimeWindow => return Ok(None),
+            V3Inbound::Message(inbound) => inbound,
+        };
+        let msg = &inbound.msg;
+        let usm_params = &inbound.usm_params;
+        let scoped_pdu = &inbound.scoped_pdu;
+        let security_level = inbound.security_level;
 
         let pdu = &scoped_pdu.pdu;
 
@@ -346,12 +145,12 @@ impl Agent {
 
         // Build response
         self.build_v3_response(
-            &msg,
-            &usm_params,
+            msg,
+            usm_params,
             response_pdu,
             scoped_pdu.context_engine_id.clone(),
             scoped_pdu.context_name.clone(),
-            derived_keys.as_ref(),
+            inbound.derived_keys.as_ref(),
         )
     }
 
@@ -382,32 +181,6 @@ impl Agent {
         }
     }
 
-    /// Handle `SNMPv3` discovery request (RFC 3414 Section 4).
-    ///
-    /// Counts the request as usmStatsUnknownEngineIDs (RFC 3414 Section 3.2
-    /// Step 3b) and answers with the corresponding Report; the reportableFlag
-    /// check (RFC 3412 Section 7.1 Step 3) is applied by `send_v3_report`.
-    pub(super) fn handle_v3_discovery(
-        &self,
-        incoming: &V3Message,
-        incoming_usm: &UsmSecurityParams,
-        source: SocketAddr,
-    ) -> Result<Option<Bytes>> {
-        let count = self
-            .inner
-            .state
-            .usm_unknown_engine_ids
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        self.send_v3_report(
-            incoming,
-            incoming_usm,
-            crate::v3::report_oids::unknown_engine_ids(),
-            count,
-            None,
-            source,
-        )
-    }
 }
 
 /// Check if a PDU type is a request that should be handled.
@@ -429,9 +202,11 @@ pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{MsgFlags, MsgGlobalData};
+    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
     use crate::pdu::Pdu;
+    use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
     use crate::value::Value;
+    use bytes::Bytes;
 
     #[test]
     fn test_is_request_pdu() {

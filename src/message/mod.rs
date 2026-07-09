@@ -14,6 +14,7 @@ pub use community::{CommunityMessage, CommunityPdu};
 pub use v3::{
     MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, SecurityModel, V3Message, V3MessageData,
 };
+pub(crate) use v3::{MpdFailure, classify_mpd_failure};
 
 use crate::ber::Decoder;
 use crate::error::internal::DecodeErrorKind;
@@ -95,6 +96,19 @@ impl Message {
             }
         }
     }
+}
+
+/// Peek at the version integer of an encoded SNMP message without decoding
+/// the rest, for version-based dispatch. `target` is only used as the
+/// error's target address.
+pub(crate) fn peek_version(data: Bytes, target: std::net::SocketAddr) -> Result<Version> {
+    let mut decoder = Decoder::with_target(data, target);
+    let mut seq = decoder.read_sequence()?;
+    let version_num = seq.read_integer()?;
+    Version::from_i32(version_num).ok_or_else(|| {
+        tracing::debug!(target: "async_snmp::ber", { source = %target, kind = %DecodeErrorKind::UnknownVersion(version_num) }, "unknown SNMP version");
+        Error::MalformedResponse { target }.boxed()
+    })
 }
 
 // Convenience conversions

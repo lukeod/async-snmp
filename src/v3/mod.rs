@@ -19,6 +19,7 @@ mod crypto;
 pub(crate) mod encode;
 mod engine;
 mod privacy;
+pub(crate) mod process;
 mod usm;
 
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};

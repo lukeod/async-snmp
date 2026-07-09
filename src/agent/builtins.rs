@@ -121,23 +121,27 @@ impl UsmStatsHandler {
         match col {
             1 => Some(Value::Counter32(
                 self.state
-                    .usm_unsupported_sec_levels
+                    .usm_stats
+                    .unsupported_sec_levels
                     .load(Ordering::Relaxed),
             )),
             2 => Some(Value::Counter32(
-                self.state.usm_not_in_time_windows.load(Ordering::Relaxed),
+                self.state
+                    .usm_stats
+                    .not_in_time_windows
+                    .load(Ordering::Relaxed),
             )),
             3 => Some(Value::Counter32(
-                self.state.usm_unknown_usernames.load(Ordering::Relaxed),
+                self.state.usm_stats.unknown_usernames.load(Ordering::Relaxed),
             )),
             4 => Some(Value::Counter32(
-                self.state.usm_unknown_engine_ids.load(Ordering::Relaxed),
+                self.state.usm_stats.unknown_engine_ids.load(Ordering::Relaxed),
             )),
             5 => Some(Value::Counter32(
-                self.state.usm_wrong_digests.load(Ordering::Relaxed),
+                self.state.usm_stats.wrong_digests.load(Ordering::Relaxed),
             )),
             6 => Some(Value::Counter32(
-                self.state.usm_decryption_errors.load(Ordering::Relaxed),
+                self.state.usm_stats.decryption_errors.load(Ordering::Relaxed),
             )),
             _ => None,
         }
@@ -280,12 +284,16 @@ mod tests {
             snmp_invalid_msgs: AtomicU32::new(10),
             snmp_unknown_security_models: AtomicU32::new(20),
             snmp_silent_drops: AtomicU32::new(30),
-            usm_unknown_engine_ids: AtomicU32::new(40),
-            usm_unknown_usernames: AtomicU32::new(50),
-            usm_wrong_digests: AtomicU32::new(60),
-            usm_not_in_time_windows: AtomicU32::new(70),
-            usm_unsupported_sec_levels: AtomicU32::new(80),
-            usm_decryption_errors: AtomicU32::new(90),
+            usm_stats: {
+                let stats = crate::v3::process::UsmStats::default();
+                stats.unknown_engine_ids.store(40, Ordering::Relaxed);
+                stats.unknown_usernames.store(50, Ordering::Relaxed);
+                stats.wrong_digests.store(60, Ordering::Relaxed);
+                stats.not_in_time_windows.store(70, Ordering::Relaxed);
+                stats.unsupported_sec_levels.store(80, Ordering::Relaxed);
+                stats.decryption_errors.store(90, Ordering::Relaxed);
+                stats
+            },
         })
     }
 

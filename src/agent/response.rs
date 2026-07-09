@@ -1,70 +1,18 @@
 //! V3 response building for the SNMP agent.
 
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
 use crate::error::Result;
 use crate::message::V3Message;
 use crate::notification::DerivedKeys;
-use crate::oid::Oid;
 use crate::pdu::Pdu;
-use crate::v3::encode::{encode_v3_report, encode_v3_response};
+use crate::v3::encode::encode_v3_response;
 use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 
 use super::Agent;
 
 impl Agent {
-    /// Send a V3 Report PDU.
-    ///
-    /// Per RFC 3412 Section 7.1 Step 3, Report PDUs may only be sent if:
-    /// - The PDU is from the Confirmed Class, OR
-    /// - The reportableFlag is set AND the PDU class cannot be determined
-    ///
-    /// When this function is called, we haven't successfully decoded the PDU
-    /// (due to auth/decryption errors), so we must check reportableFlag.
-    ///
-    /// With `auth_key` the report is sent authenticated at authNoPriv, as
-    /// RFC 3414 Section 3.2 Step 7a requires for notInTimeWindows reports so
-    /// the sender can trust the boots/time for resynchronization. Otherwise
-    /// it is sent noAuthNoPriv.
-    pub(super) fn send_v3_report(
-        &self,
-        incoming: &V3Message,
-        incoming_usm: &UsmSecurityParams,
-        report_oid: Oid,
-        counter_value: u32,
-        auth_key: Option<&crate::v3::LocalizedKey>,
-        _source: SocketAddr,
-    ) -> Result<Option<Bytes>> {
-        // Check reportableFlag before sending Report (RFC 3412 Section 7.1 Step 3)
-        if !incoming.global_data.msg_flags.reportable {
-            tracing::debug!(target: "async_snmp::agent", "message has reportable=false, not sending report");
-            return Ok(None);
-        }
-
-        let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
-        let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
-
-        let response_usm = UsmSecurityParams::new(
-            self.inner.state.engine_id.clone(),
-            engine_boots,
-            engine_time,
-            incoming_usm.username.clone(),
-        );
-
-        encode_v3_report(
-            incoming.global_data.msg_id,
-            incoming.global_data.msg_max_size,
-            response_usm,
-            report_oid,
-            counter_value,
-            auth_key,
-            self.inner.local_addr,
-        )
-        .map(Some)
-    }
-
     /// Build a V3 response message with appropriate security.
     pub(super) fn build_v3_response(
         &self,
@@ -118,6 +66,7 @@ mod tests {
     use crate::agent::Agent;
     use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel};
     use crate::oid;
+    use crate::oid::Oid;
     use crate::pdu::PduType;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -275,36 +224,6 @@ mod tests {
         assert!(
             result.is_some(),
             "noAuthNoPriv response should still be sent when boots is latched"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_boots_latched_allows_report() {
-        let agent = test_agent().await;
-        agent
-            .inner
-            .state
-            .engine_boots
-            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
-
-        // Unauthenticated reports are noAuthNoPriv, so they should still work
-        let msg = dummy_v3_msg(SecurityLevel::AuthNoPriv);
-        let usm = dummy_usm();
-
-        let result = agent
-            .send_v3_report(
-                &msg,
-                &usm,
-                crate::v3::report_oids::not_in_time_windows(),
-                1,
-                None,
-                "127.0.0.1:12345".parse().unwrap(),
-            )
-            .unwrap();
-
-        assert!(
-            result.is_some(),
-            "Report PDUs should still be sent when boots is latched"
         );
     }
 

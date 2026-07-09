@@ -93,8 +93,6 @@ use std::io::IoSliceMut;
 
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 
-use crate::ber::Decoder;
-use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::handler::{GetNextResult, GetResult, MibHandler, RequestContext};
 use crate::notification::UsmConfig;
@@ -102,6 +100,7 @@ use crate::oid;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::util::bind_udp_socket;
+use crate::v3::process::UsmStats;
 use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
 use crate::varbind::VarBind;
@@ -726,12 +725,7 @@ impl AgentBuilder {
             snmp_invalid_msgs: AtomicU32::new(0),
             snmp_unknown_security_models: AtomicU32::new(0),
             snmp_silent_drops: AtomicU32::new(0),
-            usm_unknown_engine_ids: AtomicU32::new(0),
-            usm_unknown_usernames: AtomicU32::new(0),
-            usm_wrong_digests: AtomicU32::new(0),
-            usm_not_in_time_windows: AtomicU32::new(0),
-            usm_unsupported_sec_levels: AtomicU32::new(0),
-            usm_decryption_errors: AtomicU32::new(0),
+            usm_stats: UsmStats::default(),
         });
 
         // Register built-in handlers for any not disabled
@@ -808,25 +802,8 @@ pub(crate) struct AgentState {
     /// snmpSilentDrops (1.3.6.1.6.3.11.2.1.3) - confirmed-class PDUs silently
     /// dropped because even an empty response would exceed max message size
     pub(crate) snmp_silent_drops: AtomicU32,
-    // RFC 3414 USM statistics counters
-    /// usmStatsUnknownEngineIDs (1.3.6.1.6.3.15.1.1.4) - messages with
-    /// unknown engine ID
-    pub(crate) usm_unknown_engine_ids: AtomicU32,
-    /// usmStatsUnknownUserNames (1.3.6.1.6.3.15.1.1.3) - messages with
-    /// unknown user name
-    pub(crate) usm_unknown_usernames: AtomicU32,
-    /// usmStatsWrongDigests (1.3.6.1.6.3.15.1.1.5) - messages with incorrect
-    /// authentication digest
-    pub(crate) usm_wrong_digests: AtomicU32,
-    /// usmStatsNotInTimeWindows (1.3.6.1.6.3.15.1.1.2) - messages outside
-    /// the time window
-    pub(crate) usm_not_in_time_windows: AtomicU32,
-    /// usmStatsUnsupportedSecLevels (1.3.6.1.6.3.15.1.1.1) - messages where
-    /// the user does not support the requested security level
-    pub(crate) usm_unsupported_sec_levels: AtomicU32,
-    /// usmStatsDecryptionErrors (1.3.6.1.6.3.15.1.1.6) - messages where
-    /// decryption failed
-    pub(crate) usm_decryption_errors: AtomicU32,
+    /// RFC 3414 usmStats counters
+    pub(crate) usm_stats: UsmStats,
 }
 
 /// Inner state shared across agent clones.
@@ -963,7 +940,8 @@ impl Agent {
     pub fn usm_unknown_engine_ids(&self) -> u32 {
         self.inner
             .state
-            .usm_unknown_engine_ids
+            .usm_stats
+            .unknown_engine_ids
             .load(Ordering::Relaxed)
     }
 
@@ -978,7 +956,8 @@ impl Agent {
     pub fn usm_unknown_usernames(&self) -> u32 {
         self.inner
             .state
-            .usm_unknown_usernames
+            .usm_stats
+            .unknown_usernames
             .load(Ordering::Relaxed)
     }
 
@@ -990,7 +969,7 @@ impl Agent {
     /// OID: 1.3.6.1.6.3.15.1.1.5
     #[must_use]
     pub fn usm_wrong_digests(&self) -> u32 {
-        self.inner.state.usm_wrong_digests.load(Ordering::Relaxed)
+        self.inner.state.usm_stats.wrong_digests.load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsNotInTimeWindows counter value.
@@ -1006,7 +985,8 @@ impl Agent {
     pub fn usm_not_in_time_windows(&self) -> u32 {
         self.inner
             .state
-            .usm_not_in_time_windows
+            .usm_stats
+            .not_in_time_windows
             .load(Ordering::Relaxed)
     }
 
@@ -1021,7 +1001,8 @@ impl Agent {
     pub fn usm_unsupported_sec_levels(&self) -> u32 {
         self.inner
             .state
-            .usm_unsupported_sec_levels
+            .usm_stats
+            .unsupported_sec_levels
             .load(Ordering::Relaxed)
     }
 
@@ -1036,7 +1017,8 @@ impl Agent {
     pub fn usm_decryption_errors(&self) -> u32 {
         self.inner
             .state
-            .usm_decryption_errors
+            .usm_stats
+            .decryption_errors
             .load(Ordering::Relaxed)
     }
 
@@ -1180,18 +1162,7 @@ impl Agent {
     ///
     /// Returns `None` if no response should be sent.
     async fn handle_request(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
-        // Peek at version
-        let mut decoder = Decoder::with_target(data.clone(), source);
-        let mut seq = decoder.read_sequence()?;
-        let version_num = seq.read_integer()?;
-        let version = Version::from_i32(version_num).ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::agent", { source = %source, kind = %DecodeErrorKind::UnknownVersion(version_num) }, "unknown SNMP version");
-            Error::MalformedResponse { target: source }.boxed()
-        })?;
-        drop(seq);
-        drop(decoder);
-
-        match version {
+        match crate::message::peek_version(data.clone(), source)? {
             Version::V1 => self.handle_v1(data, source).await,
             Version::V2c => self.handle_v2c(data, source).await,
             Version::V3 => self.handle_v3(data, source).await,

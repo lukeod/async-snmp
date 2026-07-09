@@ -519,6 +519,41 @@ impl V3Message {
     }
 }
 
+/// RFC 3412 MPD failures that must be counted before the message is
+/// discarded (Sections 7.2.4 and 7.2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MpdFailure {
+    /// Invalid msgFlags (priv without auth) - snmpInvalidMsgs.
+    InvalidMsgFlags,
+    /// Unrecognized msgSecurityModel - snmpUnknownSecurityModels.
+    UnknownSecurityModel,
+}
+
+/// Classify a failed [`V3Message::decode`] as an MPD-countable failure.
+///
+/// Re-parses only the header path so it stays in lockstep with
+/// [`MsgGlobalData::decode`]: the first countable defect wins, and `None`
+/// means the failure was some other malformation.
+pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
+    let mut decoder = Decoder::new(data);
+    let mut seq = decoder.read_sequence().ok()?;
+    if seq.read_integer().ok()? != 3 {
+        return None;
+    }
+    let mut global = seq.read_sequence().ok()?;
+    let _msg_id = global.read_integer().ok()?;
+    let _msg_max_size = global.read_integer().ok()?;
+    let flags_bytes = global.read_octet_string().ok()?;
+    if flags_bytes.len() == 1 && MsgFlags::from_byte(flags_bytes[0]).is_err() {
+        return Some(MpdFailure::InvalidMsgFlags);
+    }
+    let model = global.read_integer().ok()?;
+    if SecurityModel::from_i32(model).is_none() {
+        return Some(MpdFailure::UnknownSecurityModel);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

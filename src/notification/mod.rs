@@ -91,7 +91,7 @@ mod varbind;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -100,13 +100,12 @@ use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tracing::instrument;
 
-use crate::ber::Decoder;
-use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
 use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 use crate::util::bind_udp_socket;
+use crate::v3::process::UsmStats;
 use crate::v3::{EngineState, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -409,12 +408,7 @@ impl NotificationReceiverBuilder {
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: self.engine_boots,
                 engine_start: Instant::now(),
-                usm_unknown_engine_ids: AtomicU32::new(0),
-                usm_unknown_usernames: AtomicU32::new(0),
-                usm_wrong_digests: AtomicU32::new(0),
-                usm_not_in_time_windows: AtomicU32::new(0),
-                usm_unsupported_sec_levels: AtomicU32::new(0),
-                usm_decryption_errors: AtomicU32::new(0),
+                usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(HashMap::new()),
             }),
         })
@@ -637,18 +631,8 @@ struct ReceiverInner {
     engine_boots_base: u32,
     /// Time when the receiver was started, used to compute engine time.
     engine_start: Instant,
-    /// usmStatsUnknownEngineIDs counter
-    usm_unknown_engine_ids: AtomicU32,
-    /// usmStatsUnknownUserNames counter
-    usm_unknown_usernames: AtomicU32,
-    /// usmStatsWrongDigests counter
-    usm_wrong_digests: AtomicU32,
-    /// usmStatsNotInTimeWindows counter
-    usm_not_in_time_windows: AtomicU32,
-    /// usmStatsUnsupportedSecLevels counter
-    usm_unsupported_sec_levels: AtomicU32,
-    /// usmStatsDecryptionErrors counter
-    usm_decryption_errors: AtomicU32,
+    /// RFC 3414 usmStats counters
+    usm_stats: UsmStats,
     /// Timeliness state for remote authoritative engines (trap senders),
     /// keyed by engine ID (RFC 3414 Section 2.3). Seeded from the first
     /// authenticated message from each engine, so only holders of configured
@@ -730,12 +714,7 @@ impl NotificationReceiver {
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: 1,
                 engine_start: Instant::now(),
-                usm_unknown_engine_ids: AtomicU32::new(0),
-                usm_unknown_usernames: AtomicU32::new(0),
-                usm_wrong_digests: AtomicU32::new(0),
-                usm_not_in_time_windows: AtomicU32::new(0),
-                usm_unsupported_sec_levels: AtomicU32::new(0),
-                usm_decryption_errors: AtomicU32::new(0),
+                usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(HashMap::new()),
             }),
         })
@@ -756,39 +735,40 @@ impl NotificationReceiver {
     /// Get the usmStatsUnknownEngineIDs counter value.
     #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
-        self.inner.usm_unknown_engine_ids.load(Ordering::Relaxed)
+        self.inner.usm_stats.unknown_engine_ids.load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsUnknownUserNames counter value.
     #[must_use]
     pub fn usm_unknown_usernames(&self) -> u32 {
-        self.inner.usm_unknown_usernames.load(Ordering::Relaxed)
+        self.inner.usm_stats.unknown_usernames.load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsWrongDigests counter value.
     #[must_use]
     pub fn usm_wrong_digests(&self) -> u32 {
-        self.inner.usm_wrong_digests.load(Ordering::Relaxed)
+        self.inner.usm_stats.wrong_digests.load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsNotInTimeWindows counter value.
     #[must_use]
     pub fn usm_not_in_time_windows(&self) -> u32 {
-        self.inner.usm_not_in_time_windows.load(Ordering::Relaxed)
+        self.inner.usm_stats.not_in_time_windows.load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsUnsupportedSecLevels counter value.
     #[must_use]
     pub fn usm_unsupported_sec_levels(&self) -> u32 {
         self.inner
-            .usm_unsupported_sec_levels
+            .usm_stats
+            .unsupported_sec_levels
             .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsDecryptionErrors counter value.
     #[must_use]
     pub fn usm_decryption_errors(&self) -> u32 {
-        self.inner.usm_decryption_errors.load(Ordering::Relaxed)
+        self.inner.usm_stats.decryption_errors.load(Ordering::Relaxed)
     }
 
     /// Receive a notification.
@@ -833,18 +813,7 @@ impl NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        // First, peek at the version to determine message type
-        let mut decoder = Decoder::with_target(data.clone(), source);
-        let mut seq = decoder.read_sequence()?;
-        let version_num = seq.read_integer()?;
-        let version = Version::from_i32(version_num).ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::notification", { source = %source, kind = %DecodeErrorKind::UnknownVersion(version_num) }, "unknown SNMP version");
-            Error::MalformedResponse { target: source }.boxed()
-        })?;
-        drop(seq);
-        drop(decoder);
-
-        match version {
+        match crate::message::peek_version(data.clone(), source)? {
             Version::V1 => self.handle_v1(data, source).await,
             Version::V2c => self.handle_v2c(data, source).await,
             Version::V3 => self.handle_v3(data, source).await,
