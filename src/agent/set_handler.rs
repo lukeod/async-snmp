@@ -38,7 +38,11 @@ impl Agent {
         // RFC 3416 Section 4.2.5 step (1): the SET Response echoes the request
         // varbinds. If that Response would not fit, return tooBig without running
         // the test or commit phases (prevents a retrying manager re-applying it).
-        if !Self::response_fits(&pdu.varbinds, self.effective_max_size(ctx)) {
+        if !Self::response_fits(
+            &pdu.varbinds,
+            self.response_overhead(ctx),
+            self.effective_max_size(ctx),
+        ) {
             return Ok(Self::too_big_response(pdu));
         }
 

@@ -109,9 +109,21 @@ use crate::version::Version;
 /// Default maximum message size for UDP (RFC 3417 recommendation).
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 1472;
 
-/// Overhead for SNMP message encoding (approximate conservative estimate).
-/// This accounts for version, community/USM, PDU headers, etc.
+/// Base overhead for SNMP message encoding: the v1/v2c community wrapper plus
+/// the fixed BER framing shared by every response (message and PDU sequence
+/// headers, request-id / error-status / error-index integers, and, for v3, the
+/// msgGlobalData, USM, and scopedPDU framing). Variable-length v3 fields and
+/// the auth/priv material are added on top in [`Agent::response_overhead`].
 const RESPONSE_OVERHEAD: usize = 100;
+
+/// Additional v3 overhead when the message is authenticated:
+/// msgAuthenticationParameters carries up to a 48-octet HMAC (SHA-512).
+const V3_AUTH_OVERHEAD: usize = 48;
+
+/// Additional v3 overhead when the message is encrypted: the 8-octet salt in
+/// msgPrivacyParameters, the OCTET STRING wrapper around the encrypted
+/// scopedPDU, and up to a full DES/AES block of CBC padding.
+const V3_PRIV_OVERHEAD: usize = 20;
 
 /// Built-in MIB handler groups that the agent registers automatically.
 ///
@@ -1276,11 +1288,41 @@ impl Agent {
         }
     }
 
+    /// Upper-bound overhead (the non-varbind bytes) of the encoded Response for
+    /// this request, used to budget how many varbinds fit within the size limit.
+    ///
+    /// For v1/v2c the fixed [`RESPONSE_OVERHEAD`] covers the community wrapper.
+    /// The v3 USM/scopedPDU wrapper is materially larger and grows with the
+    /// security level, so the v3 estimate adds the engine ID (carried twice, as
+    /// the authoritative engine ID in the security parameters and the context
+    /// engine ID in the scopedPDU), the user name, the context name, and the
+    /// auth/priv material. The result is deliberately a conservative upper
+    /// bound: a slight over-estimate only trims a varbind or two, whereas an
+    /// under-estimate would let a Response exceed the client's msgMaxSize (sent
+    /// anyway) or the agent limit (silently dropped) instead of returning
+    /// tooBig.
+    fn response_overhead(&self, ctx: &RequestContext) -> usize {
+        if ctx.version != Version::V3 {
+            return RESPONSE_OVERHEAD;
+        }
+        let mut overhead = RESPONSE_OVERHEAD
+            + 2 * self.inner.state.engine_id.len()
+            + ctx.security_name.len()
+            + ctx.context_name.len();
+        if ctx.security_level.requires_auth() {
+            overhead += V3_AUTH_OVERHEAD;
+        }
+        if ctx.security_level.requires_priv() {
+            overhead += V3_PRIV_OVERHEAD;
+        }
+        overhead
+    }
+
     /// Estimate whether a Response carrying `varbinds` fits within `max_size`,
-    /// using the same estimate as GETBULK: `RESPONSE_OVERHEAD` plus the encoded
-    /// size of each varbind.
-    fn response_fits(varbinds: &[VarBind], max_size: usize) -> bool {
-        let size = RESPONSE_OVERHEAD + varbinds.iter().map(VarBind::encoded_size).sum::<usize>();
+    /// using the same estimate as GETBULK: `overhead` (from
+    /// [`Agent::response_overhead`]) plus the encoded size of each varbind.
+    fn response_fits(varbinds: &[VarBind], overhead: usize, max_size: usize) -> bool {
+        let size = overhead + varbinds.iter().map(VarBind::encoded_size).sum::<usize>();
         size <= max_size
     }
 
@@ -1355,7 +1397,11 @@ impl Agent {
 
         // RFC 3416 Section 4.2.1: if the Response would exceed the message-size
         // limit, return a tooBig Response with an empty variable-bindings list.
-        if !Self::response_fits(&response_varbinds, self.effective_max_size(ctx)) {
+        if !Self::response_fits(
+            &response_varbinds,
+            self.response_overhead(ctx),
+            self.effective_max_size(ctx),
+        ) {
             return Ok(Self::too_big_response(pdu));
         }
 
@@ -1391,7 +1437,11 @@ impl Agent {
 
         // RFC 3416 Section 4.2.2: if the Response would exceed the message-size
         // limit, return a tooBig Response with an empty variable-bindings list.
-        if !Self::response_fits(&response_varbinds, self.effective_max_size(ctx)) {
+        if !Self::response_fits(
+            &response_varbinds,
+            self.response_overhead(ctx),
+            self.effective_max_size(ctx),
+        ) {
             return Ok(Self::too_big_response(pdu));
         }
 
@@ -1414,7 +1464,7 @@ impl Agent {
         let max_repetitions = pdu.error_index.max(0);
 
         let mut response_varbinds = Vec::new();
-        let mut current_size: usize = RESPONSE_OVERHEAD;
+        let mut current_size: usize = self.response_overhead(ctx);
         let max_size = self.effective_max_size(ctx);
 
         // Helper to check if we can add a varbind
@@ -2285,6 +2335,117 @@ mod tests {
         assert!(
             limited_count > 0,
             "should still return at least one varbind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_overhead_scales_with_v3_security_level() {
+        // A 17-octet engine ID is carried twice (authoritative + context).
+        let engine_id = vec![0u8; 17];
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .engine_id(engine_id.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // v1/v2c: fixed community-wrapper overhead, unaffected by the security
+        // level field.
+        let v2c = test_ctx();
+        assert_eq!(agent.response_overhead(&v2c), RESPONSE_OVERHEAD);
+
+        let username = Bytes::from_static(b"user");
+        let variable = 2 * engine_id.len() + username.len(); // context name empty
+
+        let mut noauth = test_ctx();
+        noauth.version = Version::V3;
+        noauth.security_level = SecurityLevel::NoAuthNoPriv;
+        noauth.security_name = username.clone();
+        assert_eq!(
+            agent.response_overhead(&noauth),
+            RESPONSE_OVERHEAD + variable
+        );
+
+        let mut authnopriv = noauth.clone();
+        authnopriv.security_level = SecurityLevel::AuthNoPriv;
+        assert_eq!(
+            agent.response_overhead(&authnopriv),
+            RESPONSE_OVERHEAD + variable + V3_AUTH_OVERHEAD
+        );
+
+        let mut authpriv = noauth.clone();
+        authpriv.security_level = SecurityLevel::AuthPriv;
+        assert_eq!(
+            agent.response_overhead(&authpriv),
+            RESPONSE_OVERHEAD + variable + V3_AUTH_OVERHEAD + V3_PRIV_OVERHEAD
+        );
+
+        // Overhead is monotonic in the wrapper cost.
+        assert!(agent.response_overhead(&v2c) < agent.response_overhead(&noauth));
+        assert!(agent.response_overhead(&noauth) < agent.response_overhead(&authnopriv));
+        assert!(agent.response_overhead(&authnopriv) < agent.response_overhead(&authpriv));
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_authpriv_budgets_for_wrapper() {
+        // For the same advertised msgMaxSize, an authPriv v3 request must
+        // reserve more space for the USM/scopedPDU wrapper than a v2c request,
+        // so it fits strictly fewer varbinds. Under the old fixed overhead both
+        // budgeted identically and the authPriv Response could exceed the limit.
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(65507)
+            .engine_id(vec![0u8; 17])
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .build()
+            .await
+            .unwrap();
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: 0, // non_repeaters
+            error_index: 10, // max_repetitions
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        // A limit large enough to expose the difference: v2c fits more varbinds
+        // than authPriv because authPriv's overhead is larger.
+        let limit = 200;
+
+        let mut v2c = test_ctx();
+        v2c.pdu_type = PduType::GetBulkRequest;
+        v2c.msg_max_size = Some(limit);
+        let v2c_count = agent
+            .dispatch_request(&v2c, &pdu)
+            .await
+            .unwrap()
+            .varbinds
+            .iter()
+            .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
+            .count();
+
+        let mut authpriv = test_ctx();
+        authpriv.version = Version::V3;
+        authpriv.security_level = SecurityLevel::AuthPriv;
+        authpriv.security_name = Bytes::from_static(b"user");
+        authpriv.pdu_type = PduType::GetBulkRequest;
+        authpriv.msg_max_size = Some(limit);
+        let authpriv_count = agent
+            .dispatch_request(&authpriv, &pdu)
+            .await
+            .unwrap()
+            .varbinds
+            .iter()
+            .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
+            .count();
+
+        assert!(
+            authpriv_count < v2c_count,
+            "authPriv should budget fewer varbinds than v2c for the same \
+             msgMaxSize: authpriv={authpriv_count}, v2c={v2c_count}"
         );
     }
 
