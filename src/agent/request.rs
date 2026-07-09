@@ -150,7 +150,7 @@ impl Agent {
             response_pdu,
             scoped_pdu.context_engine_id.clone(),
             scoped_pdu.context_name.clone(),
-            inbound.derived_keys.as_ref(),
+            Some(&inbound.derived_keys),
         )
     }
 

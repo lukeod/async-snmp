@@ -147,6 +147,10 @@ impl super::NotificationReceiver {
 
         let inbound = match process_v3_inbound(data, &usm_ctx, &role)? {
             V3Inbound::Failed { failure, report } => {
+                // The shared core logs USM failures at debug; re-surface them
+                // at warn in the receiver role so a misconfigured trap sender
+                // is diagnosable at the default log level.
+                tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.failure = ?failure }, "USM processing failed for inbound message");
                 if let Some(report) = report {
                     if let Err(e) = self.inner.socket.send_to(&report, source).await {
                         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to send USM report");
@@ -208,7 +212,7 @@ impl super::NotificationReceiver {
                     response_pdu,
                     context_engine_id.clone(),
                     context_name.clone(),
-                    inbound.derived_keys.as_ref(),
+                    Some(&inbound.derived_keys),
                 )?;
 
                 self.inner

@@ -129,7 +129,7 @@ pub(crate) struct V3InboundMessage {
     pub(crate) usm_params: UsmSecurityParams,
     pub(crate) scoped_pdu: ScopedPdu,
     pub(crate) security_level: SecurityLevel,
-    pub(crate) derived_keys: Option<DerivedKeys>,
+    pub(crate) derived_keys: DerivedKeys,
 }
 
 /// Outcome of inbound USM processing.
@@ -372,7 +372,7 @@ pub(crate) fn process_v3_inbound(
         usm_params,
         scoped_pdu,
         security_level,
-        derived_keys: Some(derived_keys),
+        derived_keys,
     })))
 }
 

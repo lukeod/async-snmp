@@ -26,6 +26,9 @@ use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::pdu::Pdu;
 
+/// Minimum `msgMaxSize` per RFC 3412 `HeaderData` (INTEGER 484..2147483647).
+const MSG_MAX_SIZE_MINIMUM: i32 = 484;
+
 /// `SNMPv3` security model identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -206,8 +209,6 @@ impl MsgGlobalData {
     /// - `msgMaxSize` is in range 484..2147483647 (RFC 3412 `HeaderData`)
     /// - `msgSecurityModel` is a known value (currently only USM=3)
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
-        const MSG_MAX_SIZE_MINIMUM: i32 = 484;
-
         let mut seq = decoder.read_sequence()?;
 
         let msg_id = seq.read_integer()?;
@@ -541,10 +542,25 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
         return None;
     }
     let mut global = seq.read_sequence().ok()?;
-    let _msg_id = global.read_integer().ok()?;
-    let _msg_max_size = global.read_integer().ok()?;
+    // Mirror `MsgGlobalData::decode`'s fail-fast order so a failure is only
+    // attributed to the field that actually caused decode to reject. A
+    // countable defect at a later field is unreachable once decode would have
+    // stopped at an earlier one (out-of-range msgID/msgMaxSize, wrong-length
+    // msgFlags), and those earlier rejections are ASN.1/header errors rather
+    // than snmpInvalidMsgs/snmpUnknownSecurityModels, so they return None.
+    let msg_id = global.read_integer().ok()?;
+    if msg_id < 0 {
+        return None;
+    }
+    let msg_max_size = global.read_integer().ok()?;
+    if msg_max_size < MSG_MAX_SIZE_MINIMUM {
+        return None;
+    }
     let flags_bytes = global.read_octet_string().ok()?;
-    if flags_bytes.len() == 1 && MsgFlags::from_byte(flags_bytes[0]).is_err() {
+    if flags_bytes.len() != 1 {
+        return None;
+    }
+    if MsgFlags::from_byte(flags_bytes[0]).is_err() {
         return Some(MpdFailure::InvalidMsgFlags);
     }
     let model = global.read_integer().ok()?;
@@ -607,6 +623,52 @@ mod tests {
         let decoded = MsgFlags::from_byte(byte).unwrap();
         assert_eq!(decoded.security_level, SecurityLevel::AuthPriv);
         assert!(decoded.reportable);
+    }
+
+    /// `classify_mpd_failure` must attribute a failure only to the field that
+    /// actually caused `MsgGlobalData::decode` to reject, matching its
+    /// fail-fast order: a message rejected at an earlier field (here a
+    /// negative msgID) must not be blamed on a later unknown security model.
+    #[test]
+    fn classify_mpd_failure_mirrors_decode_fail_fast() {
+        use crate::pdu::Pdu;
+        use crate::v3::UsmSecurityParams;
+
+        // Valid noAuthNoPriv v3 message; single-byte msgID and model keep the
+        // byte patches below length-preserving.
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let usm =
+            UsmSecurityParams::new(Bytes::from_static(b"eid"), 0, 0, Bytes::from_static(b"u"));
+        let scoped = ScopedPdu::new(
+            Bytes::from_static(b"eid"),
+            Bytes::new(),
+            Pdu::get_request(42, &[]),
+        );
+        let base = V3Message::new(global, usm.encode(), scoped).encode();
+
+        let patch = |data: &Bytes, pattern: &[u8], off: usize, val: u8| -> Bytes {
+            let mut b = data.to_vec();
+            let pos = b
+                .windows(pattern.len())
+                .position(|w| w == pattern)
+                .expect("pattern not found");
+            b[pos + off] = val;
+            Bytes::from(b)
+        };
+
+        // Only the security model is unknown -> UnknownSecurityModel.
+        let model_pattern = [0x04, 0x01, 0x04, 0x02, 0x01, 0x03];
+        let unknown_model = patch(&base, &model_pattern, 5, 99);
+        assert_eq!(
+            classify_mpd_failure(unknown_model),
+            Some(MpdFailure::UnknownSecurityModel)
+        );
+
+        // Decode rejects at the negative msgID before reaching the model, so
+        // the unknown model must not be attributed.
+        let neg_id = patch(&base, &[0x02, 0x01, 0x01, 0x02, 0x03], 2, 0x81);
+        let neg_id_unknown_model = patch(&neg_id, &model_pattern, 5, 99);
+        assert_eq!(classify_mpd_failure(neg_id_unknown_model), None);
     }
 
     #[test]
