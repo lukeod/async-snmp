@@ -401,9 +401,9 @@ impl View {
                 best_covering = Some((subtree_arcs, subtree.included));
             }
 
-            if subtree_arcs.len() > query_arcs.len()
-                && subtree_arcs[..query_arcs.len()] == *query_arcs
-            {
+            // A strictly longer subtree whose family (under its mask) covers a
+            // descendant of the query contributes a child include/exclude.
+            if subtree_arcs.len() > query_arcs.len() && subtree.prefix_matches(query_arcs) {
                 if subtree.included {
                     has_child_include = true;
                 } else {
@@ -486,6 +486,27 @@ pub struct ViewSubtree {
 }
 
 impl ViewSubtree {
+    /// Whether arc position `i` requires an exact match.
+    ///
+    /// A mask bit of 1 (or a position past the mask) means the arc must match
+    /// exactly; a bit of 0 is a wildcard. Bit 7 (MSB) of byte 0 is arc 0.
+    fn arc_is_exact(&self, i: usize) -> bool {
+        if i / 8 < self.mask.len() {
+            (self.mask[i / 8] >> (7 - (i % 8))) & 1 == 1
+        } else {
+            true // Default: exact match required
+        }
+    }
+
+    /// Whether the first `arcs.len()` arcs of this subtree match `arcs` under
+    /// the mask. Callers guarantee `self.oid` has at least `arcs.len()` arcs.
+    fn prefix_matches(&self, arcs: &[u32]) -> bool {
+        let subtree_arcs = self.oid.arcs();
+        arcs.iter().enumerate().all(|(i, &arc)| {
+            !self.arc_is_exact(i) || subtree_arcs[i] == arc
+        })
+    }
+
     /// Check if an OID matches this subtree (with mask).
     #[must_use]
     pub fn matches(&self, oid: &Oid) -> bool {
@@ -497,21 +518,8 @@ impl ViewSubtree {
             return false;
         }
 
-        // Check each arc against mask
-        for (i, &subtree_arc) in subtree_arcs.iter().enumerate() {
-            let mask_bit = if i / 8 < self.mask.len() {
-                (self.mask[i / 8] >> (7 - (i % 8))) & 1
-            } else {
-                1 // Default: exact match required
-            };
-
-            if mask_bit == 1 && oid_arcs[i] != subtree_arc {
-                return false;
-            }
-            // mask_bit == 0: wildcard, any value matches
-        }
-
-        true
+        // Every subtree arc must match the OID under the mask.
+        self.prefix_matches(&oid_arcs[..subtree_arcs.len()])
     }
 }
 
@@ -1971,6 +1979,34 @@ mod tests {
         assert_eq!(
             view.check_subtree(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 3)),
             ViewCheckResult::Excluded
+        );
+    }
+
+    #[test]
+    fn test_check_subtree_child_detection_honors_mask() {
+        // vacm-1: a masked EXCLUDE subtree longer than the query, with a
+        // wildcard arc *inside* the query prefix, still covers descendants of
+        // the query. Child detection must apply the mask, otherwise the literal
+        // arc compare misses the exclude and check_subtree over-grants Included.
+        //
+        // Excluded family: 1.3.6.1.2.*.7 (arc 5 wildcarded). This intersects the
+        // included 1.3.6.1.2.1 subtree at e.g. 1.3.6.1.2.1.7, so the query
+        // 1.3.6.1.2.1 has mixed permissions => Ambiguous.
+        let view = View::new()
+            .include(oid!(1, 3, 6, 1, 2, 1))
+            .exclude_masked(
+                oid!(1, 3, 6, 1, 2, 99, 7),
+                vec![0xFA], // arcs 0-4,6 exact; arc 5 wildcard
+            );
+
+        // The excluded family covers a descendant of the query.
+        assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 7)));
+        // A sibling descendant remains included.
+        assert!(view.contains(&oid!(1, 3, 6, 1, 2, 1, 1)));
+
+        assert_eq!(
+            view.check_subtree(&oid!(1, 3, 6, 1, 2, 1)),
+            ViewCheckResult::Ambiguous
         );
     }
 
