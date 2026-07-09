@@ -8,6 +8,21 @@ use crate::error::{Error, ErrorStatus, Result, UNKNOWN_TARGET};
 use crate::oid::Oid;
 use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 
+/// Clamp a GETBULK `non-repeaters`/`max-repetitions` field to the RFC 3416
+/// Section 4.2.3 range `INTEGER (0..2147483647)`.
+///
+/// `i32::MAX` already equals the upper bound, so only the negative floor needs
+/// enforcing. This is the single encode-side choke point shared by both GETBULK
+/// representations: `Pdu::get_bulk` (the SNMPv3 path, which overloads
+/// `error_status`/`error_index`) and `GetBulkPdu::encode` (the community path).
+/// It guarantees neither encoder can emit a negative value on the wire.
+///
+/// Receive-side negative rejection is a separate concern and lives in
+/// `GetBulkPdu::decode`.
+const fn clamp_bulk_field(value: i32) -> i32 {
+    if value < 0 { 0 } else { value }
+}
+
 /// PDU type tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -186,6 +201,8 @@ impl Pdu {
     /// Create a GETBULK request PDU.
     ///
     /// Note: For GETBULK, `error_status` holds `non_repeaters` and `error_index` holds `max_repetitions`.
+    /// Both are clamped via [`clamp_bulk_field`] so this (SNMPv3) encode path cannot emit a negative
+    /// value on the wire.
     #[must_use]
     pub fn get_bulk(
         request_id: i32,
@@ -196,8 +213,8 @@ impl Pdu {
         Self {
             pdu_type: PduType::GetBulkRequest,
             request_id,
-            error_status: non_repeaters,
-            error_index: max_repetitions,
+            error_status: clamp_bulk_field(non_repeaters),
+            error_index: clamp_bulk_field(max_repetitions),
             varbinds,
         }
     }
@@ -772,13 +789,10 @@ impl GetBulkPdu {
     pub fn encode(&self, buf: &mut EncodeBuf) {
         buf.push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
             encode_varbind_list(buf, &self.varbinds);
-            // RFC 3416 Section 4.2.3: non-repeaters and max-repetitions are
-            // INTEGER (0..2147483647). i32::MAX already equals the upper
-            // bound, so only the negative floor needs clamping here; this
-            // matches the agent's own decode-side `.max(0)` leniency for the
-            // GETBULK non-repeaters/max-repetitions fields (src/agent/mod.rs).
-            buf.push_integer(self.max_repetitions.max(0));
-            buf.push_integer(self.non_repeaters.max(0));
+            // Clamp the RFC 3416 (0..2147483647) fields via the shared
+            // choke point so neither GETBULK encode path emits a negative.
+            buf.push_integer(clamp_bulk_field(self.max_repetitions));
+            buf.push_integer(clamp_bulk_field(self.non_repeaters));
             buf.push_integer(self.request_id);
         });
     }
@@ -1266,6 +1280,28 @@ mod tests {
         let decoded = GetBulkPdu::decode(&mut decoder).unwrap();
         assert_eq!(decoded.non_repeaters, 0);
         assert_eq!(decoded.max_repetitions, 10);
+    }
+
+    #[test]
+    fn test_generic_pdu_get_bulk_clamps_negative_fields() {
+        // The SNMPv3 encode path builds a generic Pdu via Pdu::get_bulk (which
+        // overloads error_status/error_index for non_repeaters/max_repetitions)
+        // and serializes it with Pdu::encode, bypassing GetBulkPdu::encode. That
+        // path must apply the same RFC 3416 (0..max-bindings) clamp so a negative
+        // passed to Client::get_bulk on a v3 client never reaches the wire.
+        let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        assert_eq!(pdu.error_status, 0);
+        assert_eq!(pdu.error_index, 0);
+
+        let mut buf = EncodeBuf::new();
+        pdu.encode(&mut buf);
+        let bytes = buf.finish();
+
+        let mut decoder = Decoder::new(bytes);
+        let decoded = GetBulkPdu::decode(&mut decoder)
+            .expect("clamped generic GETBULK encode should decode as valid");
+        assert_eq!(decoded.non_repeaters, 0);
+        assert_eq!(decoded.max_repetitions, 0);
     }
 
     #[test]
