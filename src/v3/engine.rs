@@ -225,6 +225,24 @@ impl EngineState {
         }
     }
 
+    /// Unconditionally set boots/time from an authenticated source,
+    /// allowing the local notion to move backward.
+    ///
+    /// Unlike [`update_time`](Self::update_time), which only moves forward
+    /// for anti-replay, this replaces the boots/time even when the new
+    /// values are lower. It must only be called after the source message's
+    /// authenticity has been verified: per RFC 3414 Section 2.3, an
+    /// authenticated notInTimeWindow Report carries the authoritative
+    /// engine's true boots/time, so trusting it recovers from an agent that
+    /// reset its time without incrementing boots (e.g. a restart that does
+    /// not persist snmpEngineBoots).
+    pub fn resync(&mut self, boots: u32, time: u32) {
+        self.engine_boots = boots;
+        self.engine_time = time;
+        self.synced_at = Instant::now();
+        self.latest_received_engine_time = time;
+    }
+
     /// Timeliness check for messages from a remote authoritative engine
     /// (RFC 3414 Section 3.2 Step 7b, non-authoritative role).
     ///

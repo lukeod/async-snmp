@@ -398,7 +398,29 @@ impl<T: Transport> Client<T> {
                                     Error::Config("engine_state lock poisoned".into()).boxed()
                                 })?;
                                 if let Some(ref mut s) = *state {
-                                    s.update_time(usm_params.engine_boots, usm_params.engine_time);
+                                    if security_level.requires_auth() {
+                                        // The report was authenticated above
+                                        // (verify_response_auth), so per RFC 3414
+                                        // Section 2.3 its boots/time are trustworthy
+                                        // and replace the local notion even when
+                                        // lower. This is the only recovery path when
+                                        // an agent resets its time without bumping
+                                        // boots, leaving our notion permanently ahead.
+                                        s.resync(usm_params.engine_boots, usm_params.engine_time);
+                                        // Propagate the resync so other clients
+                                        // seeded from the shared cache do not
+                                        // repeat the rejected round-trip.
+                                        if let Some(cache) = &self.inner.engine_cache {
+                                            cache.insert(self.peer_addr(), s.clone());
+                                        }
+                                    } else {
+                                        // Unauthenticated report: forward-only so a
+                                        // spoofed report cannot drag the notion back.
+                                        s.update_time(
+                                            usm_params.engine_boots,
+                                            usm_params.engine_time,
+                                        );
+                                    }
                                 }
                             }
                             last_error = Some(
@@ -510,6 +532,17 @@ impl<T: Transport> Client<T> {
                         })?
                     };
 
+                    // RFC 3416 Section 4.2: only a Response-PDU may answer a
+                    // request; reject echoed request-type PDUs (Report PDUs
+                    // were classified above)
+                    if response_pdu.pdu_type != PduType::Response {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), pdu_type = ?response_pdu.pdu_type }, "non-Response PDU in response");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
+                    }
+
                     // Validate request ID
                     if response_pdu.request_id != pdu.request_id {
                         tracing::warn!(target: "async_snmp::client", { expected_request_id = pdu.request_id, actual_request_id = response_pdu.request_id, peer = %self.peer_addr() }, "request ID mismatch in response");
@@ -521,14 +554,50 @@ impl<T: Transport> Client<T> {
 
                     tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type, snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status, snmp.error_index = response_pdu.error_index }, "received V3 {} response", response_pdu.pdu_type);
 
-                    // Update engine time from successful response (reuse already-decoded params)
-                    {
+                    // RFC 3414 Section 3.2 Step 7b: advance the local notion
+                    // of the engine's boots/time and check the response is
+                    // timely (anti-replay). The check only gates
+                    // authenticated exchanges; unauthenticated boots/time
+                    // still update the notion as before.
+                    let timely = {
                         let mut state = self.inner.engine_state.write().map_err(|_| {
                             Error::Config("engine_state lock poisoned".into()).boxed()
                         })?;
-                        if let Some(ref mut s) = *state {
-                            s.update_time(response_usm.engine_boots, response_usm.engine_time);
+                        match *state {
+                            Some(ref mut s) => s.check_and_update_timeliness(
+                                response_usm.engine_boots,
+                                response_usm.engine_time,
+                            ),
+                            None => true,
                         }
+                    };
+                    if security_level.requires_auth() && !timely {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), msg_boots = response_usm.engine_boots, msg_time = response_usm.engine_time }, "response outside time window");
+                        // Clear cached engine state so the next call re-runs
+                        // discovery. update_time is forward-only and discovery
+                        // does not re-run while state exists, so without this a
+                        // notion that has drifted ahead of the agent (e.g. an
+                        // agent restart that reset time without bumping boots)
+                        // would wedge every subsequent authenticated request.
+                        {
+                            let mut state = self.inner.engine_state.write().map_err(|_| {
+                                Error::Config("engine_state lock poisoned".into()).boxed()
+                            })?;
+                            *state = None;
+                        }
+                        {
+                            let mut derived = self.inner.derived_keys.write().map_err(|_| {
+                                Error::Config("derived_keys lock poisoned".into()).boxed()
+                            })?;
+                            *derived = None;
+                        }
+                        if let Some(cache) = &self.inner.engine_cache {
+                            cache.remove(&self.peer_addr());
+                        }
+                        return Err(Error::Auth {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
                     }
 
                     // Check for SNMP error
@@ -923,6 +992,286 @@ mod tests {
         assert!(
             matches!(*result.unwrap_err(), Error::Timeout { .. }),
             "should return Timeout after all retries exhausted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_validation_tests {
+    use super::*;
+    use crate::UsmConfig;
+    use crate::client::ClientConfig;
+    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel};
+    use crate::oid;
+    use crate::v3::auth::authenticate_message;
+    use crate::v3::{AuthProtocol, EngineState, LocalizedKey};
+    use bytes::Bytes;
+    use std::future::ready;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    /// Transport that answers every request with one canned response.
+    #[derive(Clone)]
+    struct CannedTransport {
+        peer: SocketAddr,
+        response: Bytes,
+    }
+
+    impl CannedTransport {
+        fn new(response: Bytes) -> Self {
+            Self {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+                response,
+            }
+        }
+    }
+
+    impl Transport for CannedTransport {
+        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            ready(Ok(()))
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            ready(Ok((self.response.clone(), self.peer)))
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+
+        fn register_request(&self, _request_id: i32, _timeout: Duration) {}
+    }
+
+    const ENGINE_ID: &[u8] = b"engine";
+
+    /// Build a v3 response message under ENGINE_ID for user "user". With
+    /// `auth_password` the message is authNoPriv and HMAC-signed; otherwise
+    /// noAuthNoPriv.
+    fn build_response(
+        pdu_type: PduType,
+        request_id: i32,
+        engine_boots: u32,
+        engine_time: u32,
+        auth_password: Option<&[u8]>,
+    ) -> Bytes {
+        let security_level = if auth_password.is_some() {
+            SecurityLevel::AuthNoPriv
+        } else {
+            SecurityLevel::NoAuthNoPriv
+        };
+        let global = MsgGlobalData::new(99, 65507, MsgFlags::new(security_level, false));
+        let mut usm = UsmSecurityParams::new(
+            Bytes::from_static(ENGINE_ID),
+            engine_boots,
+            engine_time,
+            Bytes::from_static(b"user"),
+        );
+        let auth_key = auth_password.map(|password| {
+            LocalizedKey::from_password(AuthProtocol::Sha1, password, ENGINE_ID).unwrap()
+        });
+        if let Some(key) = &auth_key {
+            usm = usm.with_auth_placeholder(key.mac_len());
+        }
+        let scoped = ScopedPdu::new(
+            Bytes::from_static(ENGINE_ID),
+            Bytes::new(),
+            Pdu {
+                pdu_type,
+                request_id,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![],
+            },
+        );
+        let msg = V3Message::new(global, usm.encode(), scoped);
+        match auth_key {
+            Some(key) => {
+                let mut bytes = msg.encode().to_vec();
+                let (offset, len) =
+                    UsmSecurityParams::find_auth_params_offset(&bytes).unwrap();
+                authenticate_message(&key, &mut bytes, offset, len).unwrap();
+                Bytes::from(bytes)
+            }
+            None => msg.encode(),
+        }
+    }
+
+    /// Build a client over `response` with engine state (and derived keys,
+    /// when authenticated) preset so no discovery round-trip runs.
+    fn canned_client(
+        response: Bytes,
+        engine_boots: u32,
+        engine_time: u32,
+        security: UsmConfig,
+    ) -> Client<CannedTransport> {
+        let config = ClientConfig {
+            version: crate::version::Version::V3,
+            v3_security: Some(security.clone()),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(CannedTransport::new(response), config);
+        {
+            let mut state = client.inner.engine_state.write().unwrap();
+            *state = Some(EngineState::new(
+                Bytes::from_static(ENGINE_ID),
+                engine_boots,
+                engine_time,
+            ));
+        }
+        {
+            let mut derived = client.inner.derived_keys.write().unwrap();
+            *derived = Some(security.derive_keys(ENGINE_ID).unwrap());
+        }
+        client
+    }
+
+    /// Build an authenticated notInTimeWindows Report under ENGINE_ID for
+    /// user "user" with the given boots/time in its USM params.
+    fn build_not_in_time_window_report(
+        engine_boots: u32,
+        engine_time: u32,
+        auth_password: &[u8],
+    ) -> Bytes {
+        use crate::value::Value;
+        use crate::varbind::VarBind;
+
+        let global = MsgGlobalData::new(99, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
+        let key =
+            LocalizedKey::from_password(AuthProtocol::Sha1, auth_password, ENGINE_ID).unwrap();
+        let usm = UsmSecurityParams::new(
+            Bytes::from_static(ENGINE_ID),
+            engine_boots,
+            engine_time,
+            Bytes::from_static(b"user"),
+        )
+        .with_auth_placeholder(key.mac_len());
+        let scoped = ScopedPdu::new(
+            Bytes::from_static(ENGINE_ID),
+            Bytes::new(),
+            Pdu {
+                pdu_type: PduType::Report,
+                request_id: 123,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(
+                    crate::v3::report_oids::not_in_time_windows(),
+                    Value::Counter32(1),
+                )],
+            },
+        );
+        let msg = V3Message::new(global, usm.encode(), scoped);
+        let mut bytes = msg.encode().to_vec();
+        let (offset, len) = UsmSecurityParams::find_auth_params_offset(&bytes).unwrap();
+        authenticate_message(&key, &mut bytes, offset, len).unwrap();
+        Bytes::from(bytes)
+    }
+
+    /// RFC 3414 Section 2.3: an authenticated notInTimeWindows Report whose
+    /// boots/time are behind the local notion resyncs the cached engine
+    /// state backward, recovering from an agent that reset time without
+    /// incrementing boots.
+    #[tokio::test]
+    async fn v3_authenticated_not_in_time_window_report_resyncs_backward() {
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
+        // Local notion is boots=5, time=1000. The report carries the same
+        // boots but a much lower time (agent reset without bumping boots).
+        let response = build_not_in_time_window_report(5, 100, b"authpass12345678");
+        let client = canned_client(response, 5, 1000, security);
+
+        // The report drives a resync then a retry; the canned transport keeps
+        // returning the report, so the call ultimately errors, but the point
+        // is the state moved backward.
+        let _ = client.send_v3_and_recv(pdu).await;
+
+        let state = client.inner.engine_state.read().unwrap();
+        let s = state.as_ref().expect("engine state should still be present");
+        assert_eq!(s.engine_boots, 5);
+        assert_eq!(s.engine_time, 100, "time should resync backward to report");
+        assert_eq!(
+            s.latest_received_engine_time, 100,
+            "latest received time should resync backward"
+        );
+    }
+
+    /// After a stale authenticated response is rejected, the cached engine
+    /// state is cleared so the next call re-runs discovery and recovers.
+    #[tokio::test]
+    async fn v3_stale_authenticated_response_clears_engine_state() {
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
+        // Local notion is time 1000; 500 is beyond the 150-second window.
+        let response =
+            build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));
+        let client = canned_client(response, 1, 1000, security);
+
+        let err = client.send_v3_and_recv(pdu).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::Auth { .. }),
+            "expected Auth error, got: {err}"
+        );
+        assert!(
+            client.inner.engine_state.read().unwrap().is_none(),
+            "engine state should be cleared after stale-response rejection"
+        );
+    }
+
+    /// RFC 3416 Section 4.2: an echoed request-type PDU with a matching
+    /// request-id is not a Response and must be rejected.
+    #[tokio::test]
+    async fn v3_rejects_echoed_request_pdu() {
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
+        let response = build_response(PduType::GetRequest, 123, 1, 1001, None);
+        let client = canned_client(response, 1, 1000, UsmConfig::new("user"));
+
+        let err = client.send_v3_and_recv(pdu).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
+    }
+
+    /// Control for the timeliness test: an authenticated response with a
+    /// fresh engine time passes.
+    #[tokio::test]
+    async fn v3_accepts_timely_authenticated_response() {
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
+        let response =
+            build_response(PduType::Response, 123, 1, 1200, Some(b"authpass12345678"));
+        let client = canned_client(response, 1, 1000, security);
+
+        let result = client.send_v3_and_recv(pdu).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
+    /// RFC 3414 Section 3.2 Step 7b: an authenticated response whose engine
+    /// time is more than 150 seconds behind the local notion is a replay and
+    /// must be rejected.
+    #[tokio::test]
+    async fn v3_rejects_stale_authenticated_response() {
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
+        // Local notion is time 1000; 500 is beyond the 150-second window.
+        let response =
+            build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));
+        let client = canned_client(response, 1, 1000, security);
+
+        let err = client.send_v3_and_recv(pdu).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::Auth { .. }),
+            "expected Auth error, got: {err}"
         );
     }
 }

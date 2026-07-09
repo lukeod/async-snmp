@@ -47,7 +47,7 @@ use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
-use crate::pdu::{GetBulkPdu, Pdu, TrapV1Pdu};
+use crate::pdu::{GetBulkPdu, Pdu, PduType, TrapV1Pdu};
 use crate::transport::Transport;
 use crate::transport::UdpHandle;
 use crate::v3::{EngineCache, EngineState, SaltCounter};
@@ -334,6 +334,15 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
+                    // Warn when the community does not echo the one we sent.
+                    // net-snmp accepts such responses (proxies and some
+                    // agents rewrite the community), so this is not a reject.
+                    if let Message::Community(ref m) = response
+                        && m.community != self.inner.config.community
+                    {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "community mismatch in response");
+                    }
+
                     let Some(response_pdu) = response.into_pdu() else {
                         tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "received TrapV1 in response to request");
                         return Err(Error::MalformedResponse {
@@ -341,6 +350,16 @@ impl<T: Transport> Client<T> {
                         }
                         .boxed());
                     };
+
+                    // RFC 3416 Section 4.2: only a Response-PDU may answer a
+                    // request; reject echoed request-type PDUs
+                    if response_pdu.pdu_type != PduType::Response {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), pdu_type = ?response_pdu.pdu_type }, "non-Response PDU in response");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
+                    }
 
                     // Validate request ID
                     if response_pdu.request_id != request_id {
@@ -1519,6 +1538,136 @@ mod tests {
             .collect();
 
         let err = client.get_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Mock transport returning a response with a configurable PDU type,
+    // community, and message version, for response-validation tests.
+    // -------------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct AdversarialTransport {
+        pdu_type: PduType,
+        community: &'static [u8],
+        respond_as_v1: bool,
+        pending: Arc<Mutex<VecDeque<i32>>>,
+    }
+
+    impl AdversarialTransport {
+        fn new(pdu_type: PduType, community: &'static [u8], respond_as_v1: bool) -> Self {
+            Self {
+                pdu_type,
+                community,
+                respond_as_v1,
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+    }
+
+    impl Transport for AdversarialTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            self.pending.lock().unwrap().push_back(request_id);
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let request_id = self.pending.lock().unwrap().pop_front().unwrap_or(1);
+            let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();
+            let pdu = Pdu {
+                pdu_type: self.pdu_type,
+                request_id,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(
+                    Oid::from_slice(&[1, 3, 6, 1, 1]),
+                    crate::value::Value::Null,
+                )],
+            };
+            let community = Bytes::from_static(self.community);
+            let msg = if self.respond_as_v1 {
+                CommunityMessage::v1(community, pdu)
+            } else {
+                CommunityMessage::v2c(community, pdu)
+            };
+            let encoded = msg.encode();
+            async move { Ok((encoded, peer)) }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    fn adversarial_client(
+        pdu_type: PduType,
+        community: &'static [u8],
+        respond_as_v1: bool,
+    ) -> Client<AdversarialTransport> {
+        let transport = AdversarialTransport::new(pdu_type, community, respond_as_v1);
+        let config = ClientConfig {
+            version: Version::V2c,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        Client::new(transport, config)
+    }
+
+    /// Control: the adversarial transport is otherwise well-formed, so a
+    /// Response PDU with the sent community passes validation.
+    #[tokio::test]
+    async fn response_validation_accepts_well_formed_response() {
+        let client = adversarial_client(PduType::Response, b"public", false);
+        let result = client.get(&Oid::from_slice(&[1, 3, 6, 1, 1])).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
+    /// RFC 3416 Section 4.2: an echoed request-type PDU with a matching
+    /// request-id is not a Response and must be rejected.
+    #[tokio::test]
+    async fn response_validation_rejects_echoed_request_pdu() {
+        let client = adversarial_client(PduType::GetRequest, b"public", false);
+        let err = client
+            .get(&Oid::from_slice(&[1, 3, 6, 1, 1]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
+    }
+
+    /// A response whose community differs from the one sent is rejected.
+    #[tokio::test]
+    async fn response_validation_accepts_community_mismatch() {
+        let client = adversarial_client(PduType::Response, b"other", false);
+        let result = client.get(&Oid::from_slice(&[1, 3, 6, 1, 1])).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
+    /// A v1 response to a v2c request is rejected (version mismatch).
+    #[tokio::test]
+    async fn response_validation_rejects_version_mismatch() {
+        let client = adversarial_client(PduType::Response, b"public", true);
+        let err = client
+            .get(&Oid::from_slice(&[1, 3, 6, 1, 1]))
+            .await
+            .unwrap_err();
         assert!(
             matches!(*err, Error::MalformedResponse { .. }),
             "expected MalformedResponse, got: {err}"

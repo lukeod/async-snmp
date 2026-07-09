@@ -129,14 +129,13 @@ async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
     );
 }
 
-/// A client whose cached engineBoots is AHEAD of the agent's cannot resync:
-/// the authenticated notInTimeWindows Report carries a lower boots value, and
-/// `EngineState::update_time` never moves boots backwards (RFC 3414
-/// Section 2.3). Each retry resends the same stale boots, so the client
-/// exhausts its attempts and surfaces an auth error, with the agent counting
-/// one rejection per attempt.
+/// A client whose cached engineBoots is AHEAD of the agent's resyncs
+/// backward: the agent's Step 7a Report is authenticated, so per RFC 3414
+/// Section 2.3 its lower boots/time replace the cached notion
+/// (`EngineState::resync`) and the retry succeeds. Covers recovery from an
+/// agent that restarts without persisting engineBoots.
 #[tokio::test]
-async fn v3_engine_boots_ahead_of_agent_exhausts_retries() {
+async fn v3_engine_boots_ahead_of_agent_resyncs_backward() {
     use async_snmp::v3::{EngineCache, EngineState};
     use std::sync::Arc;
 
@@ -185,23 +184,21 @@ async fn v3_engine_boots_ahead_of_agent_exhausts_retries() {
     .await
     .unwrap();
 
-    let err = client2
+    client2
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
-        .expect_err("boots ahead of the agent must not succeed");
-    assert!(matches!(*err, Error::Auth { .. }), "got {err:?}");
+        .expect("boots ahead of the agent must recover via authenticated Report resync");
 
-    // max_attempts = 2 means 3 transmissions, each rejected and counted.
+    // One rejection for the first transmission; the resynced retry passes.
     assert_eq!(
         agent.agent().usm_not_in_time_windows(),
-        3,
-        "agent must count one rejection per attempt"
+        1,
+        "agent must count exactly the pre-resync rejection"
     );
 
-    // The client must not have regressed its cached boots to the Report's
-    // lower value.
+    // The cached boots regressed to the agent's true (lower) value.
     let cached = cache.get(&agent.addr()).expect("cache entry present");
-    assert_eq!(cached.engine_boots, good.engine_boots + 1);
+    assert_eq!(cached.engine_boots, good.engine_boots);
 }
 
 /// Same resync scenario as above but over an authPriv session: the agent's
