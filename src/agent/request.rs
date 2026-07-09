@@ -7,14 +7,10 @@ use crate::ber::Decoder;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
 use crate::handler::{RequestContext, SecurityModel};
-use crate::message::{
-    CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
-};
-use crate::pdu::{Pdu, PduType};
+use crate::message::{CommunityMessage, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
+use crate::pdu::PduType;
 use crate::v3::auth::verify_message;
 use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
-use crate::value::Value;
-use crate::varbind::VarBind;
 use crate::version::Version;
 
 use std::sync::atomic::Ordering;
@@ -102,7 +98,7 @@ impl Agent {
 
         // Check if this is a discovery request (empty engine ID)
         if usm_params.engine_id.is_empty() {
-            return Ok(self.handle_v3_discovery(&msg, source));
+            return self.handle_v3_discovery(&msg, &usm_params, source);
         }
 
         // Verify engine ID matches ours
@@ -386,70 +382,31 @@ impl Agent {
         }
     }
 
-    /// Handle `SNMPv3` discovery request.
+    /// Handle `SNMPv3` discovery request (RFC 3414 Section 4).
     ///
-    /// Per RFC 3412 Section 7.1 Step 3, Report PDUs may only be sent if:
-    /// - The PDU is from the Confirmed Class, OR
-    /// - The reportableFlag is set AND the PDU class cannot be determined
-    ///
-    /// For discovery requests, the PDU content cannot be determined (empty engine ID),
-    /// so we check the reportableFlag.
+    /// Counts the request as usmStatsUnknownEngineIDs (RFC 3414 Section 3.2
+    /// Step 3b) and answers with the corresponding Report; the reportableFlag
+    /// check (RFC 3412 Section 7.1 Step 3) is applied by `send_v3_report`.
     pub(super) fn handle_v3_discovery(
         &self,
         incoming: &V3Message,
-        _source: SocketAddr,
-    ) -> std::option::Option<bytes::Bytes> {
-        // Check reportableFlag before sending Report (RFC 3412 Section 7.1 Step 3)
-        if !incoming.global_data.msg_flags.reportable {
-            tracing::debug!(target: "async_snmp::agent", "discovery request has reportable=false, not sending report");
-            return None;
-        }
-
-        let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
-        let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
-
-        // Increment usmStatsUnknownEngineIDs for discovery requests (RFC 3414 Section 3.2 Step 3b)
-        let unknown_engine_ids_count = self
+        incoming_usm: &UsmSecurityParams,
+        source: SocketAddr,
+    ) -> Result<Option<Bytes>> {
+        let count = self
             .inner
             .state
             .usm_unknown_engine_ids
             .fetch_add(1, Ordering::Relaxed)
             + 1;
-
-        // Build Report PDU with usmStatsUnknownEngineIDs.
-        // RFC 3412 Section 7.1 Step 3c4: request-id is the value extracted from the
-        // original request PDU, or 0 when it cannot be extracted. Discovery requests
-        // carry no decodable scopedPDU here, so the original request-id is unavailable.
-        let report_pdu = Pdu {
-            pdu_type: PduType::Report,
-            request_id: 0,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
-                crate::v3::report_oids::unknown_engine_ids(),
-                Value::Counter32(unknown_engine_ids_count),
-            )],
-        };
-
-        let response_global = MsgGlobalData::new(
-            incoming.global_data.msg_id,
-            incoming.global_data.msg_max_size,
-            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
-        );
-
-        let response_usm = UsmSecurityParams::new(
-            self.inner.state.engine_id.clone(),
-            engine_boots,
-            engine_time,
-            Bytes::new(),
-        );
-
-        let response_scoped =
-            ScopedPdu::new(self.inner.state.engine_id.clone(), Bytes::new(), report_pdu);
-
-        let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
-
-        Some(response_msg.encode())
+        self.send_v3_report(
+            incoming,
+            incoming_usm,
+            crate::v3::report_oids::unknown_engine_ids(),
+            count,
+            None,
+            source,
+        )
     }
 }
 
@@ -472,6 +429,9 @@ pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{MsgFlags, MsgGlobalData};
+    use crate::pdu::Pdu;
+    use crate::value::Value;
 
     #[test]
     fn test_is_request_pdu() {

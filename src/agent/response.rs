@@ -4,16 +4,13 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
-use crate::error::internal::{AuthErrorKind, CryptoErrorKind, EncodeErrorKind};
-use crate::error::{Error, Result};
-use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
+use crate::error::Result;
+use crate::message::V3Message;
 use crate::notification::DerivedKeys;
 use crate::oid::Oid;
-use crate::pdu::{Pdu, PduType};
-use crate::v3::auth::authenticate_message;
+use crate::pdu::Pdu;
+use crate::v3::encode::{encode_v3_report, encode_v3_response};
 use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
-use crate::value::Value;
-use crate::varbind::VarBind;
 
 use super::Agent;
 
@@ -49,52 +46,23 @@ impl Agent {
         let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
         let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
 
-        // RFC 3412 Section 7.1 Step 3c4: request-id is the value extracted from the
-        // original request PDU, or 0 when it cannot be extracted. This report is built
-        // before the scopedPDU is decoded, so the original request-id is unavailable.
-        // (msgID, which correlates the Report, is carried separately in the header.)
-        let report_pdu = Pdu {
-            pdu_type: PduType::Report,
-            request_id: 0,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
-        };
-
-        let security_level = if auth_key.is_some() {
-            SecurityLevel::AuthNoPriv
-        } else {
-            SecurityLevel::NoAuthNoPriv
-        };
-        let response_global = MsgGlobalData::new(
-            incoming.global_data.msg_id,
-            incoming.global_data.msg_max_size,
-            MsgFlags::new(security_level, false),
-        );
-
-        let mut response_usm = UsmSecurityParams::new(
+        let response_usm = UsmSecurityParams::new(
             self.inner.state.engine_id.clone(),
             engine_boots,
             engine_time,
             incoming_usm.username.clone(),
         );
-        if let Some(key) = auth_key {
-            response_usm = response_usm.with_auth_placeholder(key.mac_len());
-        }
 
-        let response_scoped =
-            ScopedPdu::new(self.inner.state.engine_id.clone(), Bytes::new(), report_pdu);
-
-        let response_msg = V3Message::new(response_global, response_usm.encode(), response_scoped);
-
-        match auth_key {
-            Some(key) => {
-                let response_bytes =
-                    self.sign_response(response_msg.encode().to_vec(), key, self.inner.local_addr)?;
-                Ok(Some(Bytes::from(response_bytes)))
-            }
-            None => Ok(Some(response_msg.encode())),
-        }
+        encode_v3_report(
+            incoming.global_data.msg_id,
+            incoming.global_data.msg_max_size,
+            response_usm,
+            report_oid,
+            counter_value,
+            auth_key,
+            self.inner.local_addr,
+        )
+        .map(Some)
     }
 
     /// Build a V3 response message with appropriate security.
@@ -121,121 +89,26 @@ impl Agent {
             return Ok(None);
         }
 
-        let response_global = MsgGlobalData::new(
-            incoming.global_data.msg_id,
-            incoming.global_data.msg_max_size,
-            MsgFlags::new(security_level, false),
+        let response_usm = UsmSecurityParams::new(
+            self.inner.state.engine_id.clone(),
+            engine_boots,
+            engine_time,
+            incoming_usm.username.clone(),
         );
 
-        let response_scoped = ScopedPdu::new(context_engine_id, context_name, response_pdu);
-
-        match security_level {
-            SecurityLevel::NoAuthNoPriv => {
-                let response_usm = UsmSecurityParams::new(
-                    self.inner.state.engine_id.clone(),
-                    engine_boots,
-                    engine_time,
-                    incoming_usm.username.clone(),
-                );
-                let response_msg =
-                    V3Message::new(response_global, response_usm.encode(), response_scoped);
-                Ok(Some(response_msg.encode()))
-            }
-            SecurityLevel::AuthNoPriv => {
-                let local_addr = self.inner.local_addr;
-                let (_, auth_key, mac_len) = self.extract_auth_key(derived_keys, local_addr)?;
-
-                let response_usm = UsmSecurityParams::new(
-                    self.inner.state.engine_id.clone(),
-                    engine_boots,
-                    engine_time,
-                    incoming_usm.username.clone(),
-                )
-                .with_auth_placeholder(mac_len);
-
-                let response_msg =
-                    V3Message::new(response_global, response_usm.encode(), response_scoped);
-
-                let response_bytes =
-                    self.sign_response(response_msg.encode().to_vec(), auth_key, local_addr)?;
-
-                Ok(Some(Bytes::from(response_bytes)))
-            }
-            SecurityLevel::AuthPriv => {
-                let local_addr = self.inner.local_addr;
-                let (keys, auth_key, mac_len) = self.extract_auth_key(derived_keys, local_addr)?;
-                let priv_key = keys.priv_key.as_ref().ok_or_else(|| {
-                    tracing::debug!(target: "async_snmp::agent", { kind = %CryptoErrorKind::NoPrivKey }, "no privacy key for response");
-                    Error::Auth { target: local_addr }.boxed()
-                })?;
-
-                // Encrypt the scoped PDU
-                let scoped_pdu_bytes = response_scoped.encode_to_bytes();
-                let (encrypted, priv_params) = priv_key
-                    .encrypt(
-                        &scoped_pdu_bytes,
-                        engine_boots,
-                        engine_time,
-                        Some(&self.inner.salt_counter),
-                    )
-                    .map_err(|e| {
-                        tracing::debug!(target: "async_snmp::agent", { error = %e }, "encryption failed for response");
-                        Error::Auth { target: local_addr }.boxed()
-                    })?;
-
-                let response_usm = UsmSecurityParams::new(
-                    self.inner.state.engine_id.clone(),
-                    engine_boots,
-                    engine_time,
-                    incoming_usm.username.clone(),
-                )
-                .with_auth_placeholder(mac_len)
-                .with_priv_params(priv_params);
-
-                let response_msg =
-                    V3Message::new_encrypted(response_global, response_usm.encode(), encrypted);
-
-                let response_bytes =
-                    self.sign_response(response_msg.encode().to_vec(), auth_key, local_addr)?;
-
-                Ok(Some(Bytes::from(response_bytes)))
-            }
-        }
-    }
-
-    /// Validate `derived_keys` and return the keys along with the auth key and its MAC length.
-    fn extract_auth_key<'a>(
-        &self,
-        derived_keys: Option<&'a DerivedKeys>,
-        local_addr: SocketAddr,
-    ) -> Result<(&'a DerivedKeys, &'a crate::v3::LocalizedKey, usize)> {
-        let keys = derived_keys.ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoCredentials }, "no credentials for response");
-            Error::Auth { target: local_addr }.boxed()
-        })?;
-        let auth_key = keys.auth_key.as_ref().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::agent", { kind = %AuthErrorKind::NoAuthKey }, "no auth key for response");
-            Error::Auth { target: local_addr }.boxed()
-        })?;
-        let mac_len = auth_key.mac_len();
-        Ok((keys, auth_key, mac_len))
-    }
-
-    /// Apply HMAC authentication to an already-encoded response message.
-    fn sign_response(
-        &self,
-        mut response_bytes: Vec<u8>,
-        auth_key: &crate::v3::LocalizedKey,
-        local_addr: SocketAddr,
-    ) -> Result<Vec<u8>> {
-        let (auth_offset, auth_len) =
-            UsmSecurityParams::find_auth_params_offset(&response_bytes).ok_or_else(|| {
-                tracing::debug!(target: "async_snmp::agent", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in response");
-                Error::MalformedResponse { target: local_addr }.boxed()
-            })?;
-        authenticate_message(auth_key, &mut response_bytes, auth_offset, auth_len)
-            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-        Ok(response_bytes)
+        encode_v3_response(
+            response_pdu,
+            incoming.global_data.msg_id,
+            incoming.global_data.msg_max_size,
+            security_level,
+            response_usm,
+            context_engine_id,
+            context_name,
+            derived_keys,
+            &self.inner.salt_counter,
+            self.inner.local_addr,
+        )
+        .map(Some)
     }
 }
 
@@ -243,7 +116,9 @@ impl Agent {
 mod tests {
     use super::*;
     use crate::agent::Agent;
+    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel};
     use crate::oid;
+    use crate::pdu::PduType;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 

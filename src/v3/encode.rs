@@ -3,15 +3,20 @@
 //! Standalone V3 message building used by both the client and agent.
 //! Takes explicit parameters rather than reading from a specific owner's state.
 
+use std::net::SocketAddr;
+
 use bytes::Bytes;
 
+use crate::error::internal::{AuthErrorKind, CryptoErrorKind, EncodeErrorKind};
 use crate::error::{Error, Result};
-use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message, V3MessageData};
+use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use crate::notification::{DerivedKeys, UsmConfig};
-use crate::pdu::Pdu;
-use crate::v3::SaltCounter;
-use crate::v3::UsmSecurityParams;
+use crate::oid::Oid;
+use crate::pdu::{Pdu, PduType};
 use crate::v3::auth::authenticate_message;
+use crate::v3::{LocalizedKey, SaltCounter, UsmSecurityParams};
+use crate::value::Value;
+use crate::varbind::VarBind;
 
 /// Build and encode a V3 message with authentication and/or encryption.
 ///
@@ -131,4 +136,164 @@ pub fn encode_v3_message(
     }
 
     Ok(encoded)
+}
+
+/// Fill in the HMAC of an encoded V3 message built with an auth placeholder.
+///
+/// `target` is only used as the error's target address.
+pub(crate) fn sign_v3_message(
+    auth_key: &LocalizedKey,
+    message: &mut [u8],
+    target: SocketAddr,
+) -> Result<()> {
+    let (auth_offset, auth_len) =
+        UsmSecurityParams::find_auth_params_offset(message).ok_or_else(|| {
+            tracing::debug!(target: "async_snmp::v3", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in outgoing V3 message");
+            Error::MalformedResponse { target }.boxed()
+        })?;
+    authenticate_message(auth_key, message, auth_offset, auth_len).map_err(|e| {
+        tracing::debug!(target: "async_snmp::v3", { error = %e }, "failed to authenticate outgoing V3 message");
+        Error::Config(e.to_string().into()).boxed()
+    })
+}
+
+/// Build and encode a V3 Report message (RFC 3412 Section 7.1 Step 3).
+///
+/// Shared by the agent and the notification receiver. `usm` carries the
+/// responder's engine ID/boots/time and echoes the requester's username;
+/// `msg_id` and `msg_max_size` echo the incoming message header. With
+/// `auth_key` the report is sent authenticated at authNoPriv, as RFC 3414
+/// Section 3.2 Step 7a requires for notInTimeWindows reports so the sender
+/// can trust the boots/time for resynchronization. Otherwise noAuthNoPriv.
+///
+/// The reportableFlag check (whether a report may be sent at all) is the
+/// caller's responsibility.
+pub(crate) fn encode_v3_report(
+    msg_id: i32,
+    msg_max_size: i32,
+    usm: UsmSecurityParams,
+    report_oid: Oid,
+    counter_value: u32,
+    auth_key: Option<&LocalizedKey>,
+    target: SocketAddr,
+) -> Result<Bytes> {
+    // RFC 3412 Section 7.1 Step 3c4: request-id is the value extracted from the
+    // original request PDU, or 0 when it cannot be extracted. Every USM-failure
+    // path reaches here before the scopedPDU is decoded, so it cannot be
+    // extracted. (msgID, which correlates the Report, is carried separately in
+    // the header.)
+    let report_pdu = Pdu {
+        pdu_type: PduType::Report,
+        request_id: 0,
+        error_status: 0,
+        error_index: 0,
+        varbinds: vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
+    };
+
+    let security_level = if auth_key.is_some() {
+        SecurityLevel::AuthNoPriv
+    } else {
+        SecurityLevel::NoAuthNoPriv
+    };
+    let global = MsgGlobalData::new(msg_id, msg_max_size, MsgFlags::new(security_level, false));
+
+    let scoped = ScopedPdu::new(usm.engine_id.clone(), Bytes::new(), report_pdu);
+
+    let usm = match auth_key {
+        Some(key) => usm.with_auth_placeholder(key.mac_len()),
+        None => usm,
+    };
+    let msg = V3Message::new(global, usm.encode(), scoped);
+
+    match auth_key {
+        Some(key) => {
+            let mut bytes = msg.encode().to_vec();
+            sign_v3_message(key, &mut bytes, target)?;
+            Ok(Bytes::from(bytes))
+        }
+        None => Ok(msg.encode()),
+    }
+}
+
+/// Build and encode a V3 Response message at the incoming security level.
+///
+/// Shared by the agent and the notification receiver (Inform acks). `usm`
+/// carries the authoritative engine ID/boots/time the response will claim
+/// and echoes the requester's username; `msg_id`, `msg_max_size`, and
+/// `security_level` echo the incoming message header. Encryption (authPriv)
+/// uses the boots/time already present in `usm`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_v3_response(
+    response_pdu: Pdu,
+    msg_id: i32,
+    msg_max_size: i32,
+    security_level: SecurityLevel,
+    usm: UsmSecurityParams,
+    context_engine_id: Bytes,
+    context_name: Bytes,
+    derived_keys: Option<&DerivedKeys>,
+    salt_counter: &SaltCounter,
+    target: SocketAddr,
+) -> Result<Bytes> {
+    // Same security level as the request, but reportable=false
+    let global = MsgGlobalData::new(msg_id, msg_max_size, MsgFlags::new(security_level, false));
+    let scoped = ScopedPdu::new(context_engine_id, context_name, response_pdu);
+
+    match security_level {
+        SecurityLevel::NoAuthNoPriv => {
+            Ok(V3Message::new(global, usm.encode(), scoped).encode())
+        }
+        SecurityLevel::AuthNoPriv => {
+            let (_, auth_key) = require_auth_key(derived_keys, target)?;
+            let usm = usm.with_auth_placeholder(auth_key.mac_len());
+            let mut bytes = V3Message::new(global, usm.encode(), scoped).encode().to_vec();
+            sign_v3_message(auth_key, &mut bytes, target)?;
+            Ok(Bytes::from(bytes))
+        }
+        SecurityLevel::AuthPriv => {
+            let (keys, auth_key) = require_auth_key(derived_keys, target)?;
+            let priv_key = keys.priv_key.as_ref().ok_or_else(|| {
+                tracing::debug!(target: "async_snmp::v3", { kind = %CryptoErrorKind::NoPrivKey }, "no privacy key for response");
+                Error::Auth { target }.boxed()
+            })?;
+
+            let scoped_pdu_bytes = scoped.encode_to_bytes();
+            let (encrypted, priv_params) = priv_key
+                .encrypt(
+                    &scoped_pdu_bytes,
+                    usm.engine_boots,
+                    usm.engine_time,
+                    Some(salt_counter),
+                )
+                .map_err(|e| {
+                    tracing::debug!(target: "async_snmp::v3", { error = %e }, "encryption failed for response");
+                    Error::Auth { target }.boxed()
+                })?;
+
+            let usm = usm
+                .with_auth_placeholder(auth_key.mac_len())
+                .with_priv_params(priv_params);
+            let mut bytes = V3Message::new_encrypted(global, usm.encode(), encrypted)
+                .encode()
+                .to_vec();
+            sign_v3_message(auth_key, &mut bytes, target)?;
+            Ok(Bytes::from(bytes))
+        }
+    }
+}
+
+/// Validate `derived_keys` and return them along with the auth key.
+fn require_auth_key(
+    derived_keys: Option<&DerivedKeys>,
+    target: SocketAddr,
+) -> Result<(&DerivedKeys, &LocalizedKey)> {
+    let keys = derived_keys.ok_or_else(|| {
+        tracing::debug!(target: "async_snmp::v3", { kind = %AuthErrorKind::NoCredentials }, "no credentials for response");
+        Error::Auth { target }.boxed()
+    })?;
+    let auth_key = keys.auth_key.as_ref().ok_or_else(|| {
+        tracing::debug!(target: "async_snmp::v3", { kind = %AuthErrorKind::NoAuthKey }, "no auth key for response");
+        Error::Auth { target }.boxed()
+    })?;
+    Ok((keys, auth_key))
 }
