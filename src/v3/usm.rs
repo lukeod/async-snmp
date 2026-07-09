@@ -16,7 +16,6 @@
 
 use bytes::Bytes;
 
-use crate::ber::length::parse_ber_length;
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
@@ -177,9 +176,14 @@ impl UsmSecurityParams {
     ///
     /// This is needed for HMAC computation: we need to know where to
     /// replace the placeholder zeros with the actual HMAC.
+    ///
+    /// The walk runs through the central [`Decoder`], so every length field is
+    /// bounds- and `MAX_LENGTH`-checked; any structural mismatch or truncation
+    /// yields `None`.
     #[must_use]
     pub fn find_auth_params_offset(encoded_msg: &[u8]) -> Option<(usize, usize)> {
-        // Navigate the BER structure to find auth_params location
+        use crate::ber::tag::universal::{OCTET_STRING, SEQUENCE};
+
         // Message structure:
         //   SEQUENCE {
         //     INTEGER version
@@ -196,122 +200,30 @@ impl UsmSecurityParams {
         //     }
         //     ...
         //   }
+        //
+        // `expect_tag` consumes tag + length and leaves the cursor at the
+        // content, which for the wrapping constructed/octet-string types is the
+        // next element to walk. Because no sub-decoder is created, the cursor
+        // stays in absolute coordinates over `encoded_msg`.
+        let mut dec = Decoder::from_slice(encoded_msg);
 
-        let mut offset = 0;
+        dec.expect_tag(SEQUENCE).ok()?; // outer SEQUENCE
+        dec.skip_tlv().ok()?; // version INTEGER
+        dec.skip_tlv().ok()?; // msgGlobalData SEQUENCE
+        dec.expect_tag(OCTET_STRING).ok()?; // msgSecurityParameters wrapper
+        dec.expect_tag(SEQUENCE).ok()?; // USM params SEQUENCE
+        dec.skip_tlv().ok()?; // engineID
+        dec.skip_tlv().ok()?; // boots
+        dec.skip_tlv().ok()?; // time
+        dec.skip_tlv().ok()?; // username
 
-        // Outer SEQUENCE
-        if offset >= encoded_msg.len() {
-            return None;
-        }
-        if encoded_msg[offset] != 0x30 {
-            return None;
-        }
-        offset += 1;
-        let (_, len_size) = parse_ber_length(&encoded_msg[offset..])?;
-        offset += len_size;
-        if offset >= encoded_msg.len() {
-            return None;
-        }
-
-        // Version INTEGER
-        if encoded_msg[offset] != 0x02 {
-            return None;
-        }
-        offset += 1;
-        let (ver_len, len_size) = parse_ber_length(&encoded_msg[offset..])?;
-        offset = offset.checked_add(len_size)?.checked_add(ver_len)?;
-        if offset >= encoded_msg.len() {
-            return None;
-        }
-
-        // msgGlobalData SEQUENCE
-        if encoded_msg[offset] != 0x30 {
-            return None;
-        }
-        offset += 1;
-        let (global_len, len_size) = parse_ber_length(&encoded_msg[offset..])?;
-        offset = offset.checked_add(len_size)?.checked_add(global_len)?;
-        if offset >= encoded_msg.len() {
-            return None;
-        }
-
-        // msgSecurityParameters OCTET STRING
-        if encoded_msg[offset] != 0x04 {
-            return None;
-        }
-        offset += 1;
-        let (_, len_size) = parse_ber_length(&encoded_msg[offset..])?;
-        offset = offset.checked_add(len_size)?;
-        if offset >= encoded_msg.len() {
-            return None;
-        }
-
-        // Now we're inside the USM params SEQUENCE
-
-        // USM SEQUENCE tag
-        if encoded_msg[offset] != 0x30 {
-            return None;
-        }
-        offset += 1;
-        let (_, len_size) = parse_ber_length(&encoded_msg[offset..])?;
-        offset = offset.checked_add(len_size)?;
-        if offset >= encoded_msg.len() {
-            return None;
-        }
-
-        // engineID OCTET STRING
-        offset = skip_tlv(encoded_msg, offset)?;
-
-        // boots INTEGER
-        offset = skip_tlv(encoded_msg, offset)?;
-
-        // time INTEGER
-        offset = skip_tlv(encoded_msg, offset)?;
-
-        // username OCTET STRING
-        offset = skip_tlv(encoded_msg, offset)?;
-
-        // authParams OCTET STRING - this is what we're looking for
-        if offset >= encoded_msg.len() {
-            return None;
-        }
-        if encoded_msg[offset] != 0x04 {
-            return None;
-        }
-        offset += 1;
-        let (auth_len, len_size) = parse_ber_length(&encoded_msg[offset..])?;
-        let auth_start = offset.checked_add(len_size)?;
-
-        // Validate the claimed auth range fits within the buffer
-        if auth_start.checked_add(auth_len)? > encoded_msg.len() {
-            return None;
-        }
-
+        // authParams OCTET STRING: record the content offset, then confirm the
+        // claimed extent fits by actually reading it.
+        let auth_len = dec.expect_tag(OCTET_STRING).ok()?;
+        let auth_start = dec.offset();
+        dec.read_bytes(auth_len).ok()?;
         Some((auth_start, auth_len))
     }
-}
-
-/// Skip a TLV, returning the new offset.
-fn skip_tlv(data: &[u8], offset: usize) -> Option<usize> {
-    if offset >= data.len() {
-        return None;
-    }
-
-    // Skip tag
-    let mut pos = offset + 1;
-    if pos >= data.len() {
-        return None;
-    }
-
-    // Parse length
-    let (len, len_size) = parse_ber_length(&data[pos..])?;
-    pos += len_size + len;
-
-    if pos > data.len() {
-        return None;
-    }
-
-    Some(pos)
 }
 
 #[cfg(test)]
