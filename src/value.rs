@@ -215,11 +215,28 @@ pub enum Value {
     /// Gauge32 / Unsigned32 (unsigned 32-bit, non-wrapping)
     Gauge32(u32),
 
+    /// `UInteger32` (unsigned 32-bit, wire tag 0x47).
+    ///
+    /// Historic `SMIv1` type. Semantically identical to Gauge32/Unsigned32 at
+    /// every accessor, but carries a distinct APPLICATION tag (0x47 vs Gauge32's
+    /// 0x42) on the wire. Kept as its own variant so decode -> encode round-trips
+    /// the original tag rather than collapsing to Gauge32.
+    UInteger32(u32),
+
     /// `TimeTicks` (hundredths of seconds since epoch)
     TimeTicks(u32),
 
     /// Opaque (legacy, arbitrary bytes)
     Opaque(Bytes),
+
+    /// NSAP address (wire tag 0x45).
+    ///
+    /// Historic type from early SMI drafts. Semantically identical to
+    /// [`Value::OctetString`] at every byte/str accessor, but carries a distinct
+    /// APPLICATION tag (0x45) on the wire. Kept as its own variant so
+    /// decode -> encode round-trips the original tag rather than collapsing to
+    /// OctetString.
+    Nsap(Bytes),
 
     /// Counter64 (unsigned 64-bit, wrapping).
     ///
@@ -291,7 +308,13 @@ pub enum Value {
     /// ```
     EndOfMibView,
 
-    /// Unknown/unrecognized value type (for forward compatibility)
+    /// Unknown/unrecognized value type (for forward compatibility).
+    ///
+    /// Invariant: `tag` is always a single-byte identifier (`tag & 0x1F != 0x1F`).
+    /// Decode never produces a multi-byte (high-tag-number) form — `read_tag`
+    /// rejects those before this variant is constructed — and `encode` assumes a
+    /// single-byte tag. Hand-constructing an `Unknown` with a multi-byte tag would
+    /// emit a form that cannot be re-decoded.
     Unknown { tag: u8, data: Bytes },
 }
 
@@ -325,7 +348,8 @@ impl Value {
     /// Try to get as u32.
     ///
     /// Returns `Some(u32)` for [`Value::Counter32`], [`Value::Gauge32`],
-    /// [`Value::TimeTicks`], or non-negative [`Value::Integer`]. Returns `None` otherwise.
+    /// [`Value::UInteger32`], [`Value::TimeTicks`], or non-negative
+    /// [`Value::Integer`]. Returns `None` otherwise.
     ///
     /// # Examples
     ///
@@ -348,7 +372,10 @@ impl Value {
     /// ```
     pub fn as_u32(&self) -> Option<u32> {
         match self {
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(*v),
+            Value::Counter32(v)
+            | Value::Gauge32(v)
+            | Value::UInteger32(v)
+            | Value::TimeTicks(v) => Some(*v),
             Value::Integer(v) if *v >= 0 => Some(*v as u32),
             _ => None,
         }
@@ -357,8 +384,9 @@ impl Value {
     /// Try to get as u64.
     ///
     /// Returns `Some(u64)` for [`Value::Counter64`], or any 32-bit unsigned type
-    /// ([`Value::Counter32`], [`Value::Gauge32`], [`Value::TimeTicks`]), or
-    /// non-negative [`Value::Integer`]. Returns `None` otherwise.
+    /// ([`Value::Counter32`], [`Value::Gauge32`], [`Value::UInteger32`],
+    /// [`Value::TimeTicks`]), or non-negative [`Value::Integer`]. Returns `None`
+    /// otherwise.
     ///
     /// # Examples
     ///
@@ -381,7 +409,10 @@ impl Value {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Value::Counter64(v) => Some(*v),
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(u64::from(*v)),
+            Value::Counter32(v)
+            | Value::Gauge32(v)
+            | Value::UInteger32(v)
+            | Value::TimeTicks(v) => Some(u64::from(*v)),
             Value::Integer(v) if *v >= 0 => Some(*v as u64),
             _ => None,
         }
@@ -389,8 +420,8 @@ impl Value {
 
     /// Try to get as bytes.
     ///
-    /// Returns `Some(&[u8])` for [`Value::OctetString`] or [`Value::Opaque`].
-    /// Returns `None` otherwise.
+    /// Returns `Some(&[u8])` for [`Value::OctetString`], [`Value::Opaque`], or
+    /// [`Value::Nsap`]. Returns `None` otherwise.
     ///
     /// # Examples
     ///
@@ -410,15 +441,16 @@ impl Value {
     /// ```
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
-            Value::OctetString(v) | Value::Opaque(v) => Some(v),
+            Value::OctetString(v) | Value::Opaque(v) | Value::Nsap(v) => Some(v),
             _ => None,
         }
     }
 
     /// Try to get as string (UTF-8).
     ///
-    /// Returns `Some(&str)` if the value is an [`Value::OctetString`] or [`Value::Opaque`]
-    /// containing valid UTF-8. Returns `None` for other types or invalid UTF-8.
+    /// Returns `Some(&str)` if the value is an [`Value::OctetString`], [`Value::Opaque`],
+    /// or [`Value::Nsap`] containing valid UTF-8. Returns `None` for other types or
+    /// invalid UTF-8.
     ///
     /// # Examples
     ///
@@ -510,7 +542,10 @@ impl Value {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Integer(v) => Some(f64::from(*v)),
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => Some(f64::from(*v)),
+            Value::Counter32(v)
+            | Value::Gauge32(v)
+            | Value::UInteger32(v)
+            | Value::TimeTicks(v) => Some(f64::from(*v)),
             Value::Counter64(v) => Some(*v as f64),
             _ => None,
         }
@@ -893,14 +928,20 @@ impl Value {
                 let content_len = integer_content_len(*v);
                 1 + length_encoded_len(content_len) + content_len
             }
-            Value::OctetString(data) | Value::Opaque(data) | Value::Unknown { data, .. } => {
+            Value::OctetString(data)
+            | Value::Opaque(data)
+            | Value::Nsap(data)
+            | Value::Unknown { data, .. } => {
                 let content_len = data.len();
                 1 + length_encoded_len(content_len) + content_len
             }
             Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => 2, // tag + length(0)
             Value::ObjectIdentifier(oid) => oid.ber_encoded_size(),
             Value::IpAddress(_) => 6, // tag + length(4) + 4 bytes
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => {
+            Value::Counter32(v)
+            | Value::Gauge32(v)
+            | Value::UInteger32(v)
+            | Value::TimeTicks(v) => {
                 let content_len = unsigned32_content_len(*v);
                 1 + length_encoded_len(content_len) + content_len
             }
@@ -939,8 +980,9 @@ impl Value {
     /// ```
     pub fn format_with_hint(&self, hint: &str) -> Option<String> {
         match self {
-            Value::OctetString(bytes) => Some(crate::format::display_hint::apply(hint, bytes)),
-            Value::Opaque(bytes) => Some(crate::format::display_hint::apply(hint, bytes)),
+            Value::OctetString(bytes) | Value::Opaque(bytes) | Value::Nsap(bytes) => {
+                Some(crate::format::display_hint::apply(hint, bytes))
+            }
             Value::Integer(v) => crate::format::display_hint::apply_integer(hint, *v),
             _ => None,
         }
@@ -956,11 +998,17 @@ impl Value {
             Value::IpAddress(addr) => buf.push_ip_address(*addr),
             Value::Counter32(v) => buf.push_unsigned32(tag::application::COUNTER32, *v),
             Value::Gauge32(v) => buf.push_unsigned32(tag::application::GAUGE32, *v),
+            Value::UInteger32(v) => buf.push_unsigned32(tag::application::UINTEGER32, *v),
             Value::TimeTicks(v) => buf.push_unsigned32(tag::application::TIMETICKS, *v),
             Value::Opaque(data) => {
                 buf.push_bytes(data);
                 buf.push_length(data.len());
                 buf.push_tag(tag::application::OPAQUE);
+            }
+            Value::Nsap(data) => {
+                buf.push_bytes(data);
+                buf.push_length(data.len());
+                buf.push_tag(tag::application::NSAP);
             }
             Value::Counter64(v) => buf.push_integer64(*v),
             Value::NoSuchObject => {
@@ -1066,7 +1114,7 @@ impl Value {
             }
             tag::application::NSAP => {
                 let data = decoder.read_bytes(len)?;
-                Ok(Value::OctetString(data))
+                Ok(Value::Nsap(data))
             }
             tag::application::COUNTER64 => {
                 let value = decoder.read_integer64_value(len)?;
@@ -1074,7 +1122,7 @@ impl Value {
             }
             tag::application::UINTEGER32 => {
                 let value = decoder.read_unsigned32_value(len)?;
-                Ok(Value::Gauge32(value))
+                Ok(Value::UInteger32(value))
             }
             tag::context::NO_SUCH_OBJECT => {
                 if len != 0 {
@@ -1131,10 +1179,13 @@ impl std::fmt::Display for Value {
             }
             Value::Counter32(v) => write!(f, "{v}"),
             Value::Gauge32(v) => write!(f, "{v}"),
+            Value::UInteger32(v) => write!(f, "{v}"),
             Value::TimeTicks(v) => {
                 write!(f, "{}", crate::format::format_timeticks(*v))
             }
             Value::Opaque(data) => write!(f, "Opaque(0x{})", hex::encode(data)),
+            // NSAP addresses are binary; always render hex (matches net-snmp).
+            Value::Nsap(data) => write!(f, "0x{}", hex::encode(data)),
             Value::Counter64(v) => write!(f, "{v}"),
             Value::NoSuchObject => write!(f, "noSuchObject"),
             Value::NoSuchInstance => write!(f, "noSuchInstance"),
@@ -1490,24 +1541,45 @@ mod tests {
     }
 
     #[test]
-    fn test_nsap_decodes_as_octet_string() {
-        // Historic NSAP type (0x45) decodes as OctetString
+    fn test_nsap_decodes_as_nsap() {
+        // Historic NSAP type (0x45) decodes as its own Nsap variant
         let data = Bytes::from_static(&[0x45, 0x03, 0x01, 0x02, 0x03]);
         let mut decoder = Decoder::new(data);
         let value = Value::decode(&mut decoder).unwrap();
-        assert_eq!(
-            value,
-            Value::OctetString(Bytes::from_static(&[0x01, 0x02, 0x03]))
-        );
+        assert_eq!(value, Value::Nsap(Bytes::from_static(&[0x01, 0x02, 0x03])));
     }
 
     #[test]
-    fn test_uinteger32_decodes_as_gauge32() {
-        // Historic UInteger32 type (0x47) decodes as Gauge32
+    fn test_uinteger32_decodes_as_uinteger32() {
+        // Historic UInteger32 type (0x47) decodes as its own UInteger32 variant
         let data = Bytes::from_static(&[0x47, 0x01, 0x2a]);
         let mut decoder = Decoder::new(data);
         let value = Value::decode(&mut decoder).unwrap();
-        assert_eq!(value, Value::Gauge32(42));
+        assert_eq!(value, Value::UInteger32(42));
+    }
+
+    #[test]
+    fn test_nsap_roundtrip_preserves_tag() {
+        // decode -> encode must round-trip the 0x45 tag, not collapse to 0x04
+        let bytes = Bytes::from_static(&[0x45, 0x03, 0x01, 0x02, 0x03]);
+        let mut decoder = Decoder::new(bytes.clone());
+        let value = Value::decode(&mut decoder).unwrap();
+        assert_eq!(value, Value::Nsap(Bytes::from_static(&[0x01, 0x02, 0x03])));
+        let mut buf = EncodeBuf::new();
+        value.encode(&mut buf);
+        assert_eq!(&buf.finish()[..], &bytes[..]);
+    }
+
+    #[test]
+    fn test_uinteger32_roundtrip_preserves_tag() {
+        // decode -> encode must round-trip the 0x47 tag, not collapse to 0x42
+        let bytes = Bytes::from_static(&[0x47, 0x01, 0x2a]);
+        let mut decoder = Decoder::new(bytes.clone());
+        let value = Value::decode(&mut decoder).unwrap();
+        assert_eq!(value, Value::UInteger32(42));
+        let mut buf = EncodeBuf::new();
+        value.encode(&mut buf);
+        assert_eq!(&buf.finish()[..], &bytes[..]);
     }
 
     // ========================================================================
@@ -1652,6 +1724,13 @@ mod tests {
     fn test_display_opaque() {
         let v = Value::Opaque(Bytes::from_static(&[0xBE, 0xEF]));
         assert_eq!(format!("{v}"), "Opaque(0xbeef)");
+    }
+
+    #[test]
+    fn test_display_nsap_always_hex() {
+        // NSAP is binary; printable bytes (AFI 0x39 = '9') must still render hex
+        let v = Value::Nsap(Bytes::from_static(b"90abc"));
+        assert_eq!(format!("{v}"), "0x3930616263");
     }
 
     #[test]

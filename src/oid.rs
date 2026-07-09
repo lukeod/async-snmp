@@ -344,6 +344,20 @@ impl Oid {
             return Ok(());
         }
 
+        // A single-arc OID has no invertible BER encoding: X.690 8.19.4 packs the
+        // first TWO components into one subidentifier (arc1*40 + arc2), so encoding
+        // `[n]` produces subidentifier n*40, which decodes back to `[n, 0]`. This
+        // check only guards the validated paths (`validate()`/`to_ber_checked()`);
+        // the raw encode path (`to_ber()`/`VarBind` encoding) does not validate and
+        // will still emit the non-round-tripping form. Decoding never yields a
+        // single-arc OID (it always pushes two arcs, or zero for empty).
+        if self.arcs.len() == 1 {
+            return Err(Error::InvalidOid(
+                "OID must have at least two arcs to be BER-encodable".into(),
+            )
+            .boxed());
+        }
+
         let arc1 = self.arcs[0];
 
         // arc1 must be 0, 1, or 2
@@ -354,26 +368,24 @@ impl Oid {
             .boxed());
         }
 
-        // Validate arc2 constraints
-        if self.arcs.len() >= 2 {
-            let arc2 = self.arcs[1];
+        // Validate arc2 constraints (at least two arcs exist past this point)
+        let arc2 = self.arcs[1];
 
-            // arc2 must be <= 39 when arc1 < 2
-            if arc1 < 2 && arc2 >= 40 {
-                return Err(Error::InvalidOid(
-                    format!("second arc must be <= 39 when first arc is {arc1}, got {arc2}").into(),
-                )
-                .boxed());
-            }
+        // arc2 must be <= 39 when arc1 < 2
+        if arc1 < 2 && arc2 >= 40 {
+            return Err(Error::InvalidOid(
+                format!("second arc must be <= 39 when first arc is {arc1}, got {arc2}").into(),
+            )
+            .boxed());
+        }
 
-            // Check that first subidentifier (arc1*40 + arc2) won't overflow u32.
-            // Max valid arc2 = u32::MAX - arc1*40
-            let base = arc1 * 40;
-            if arc2 > u32::MAX - base {
-                return Err(
-                    Error::InvalidOid("subidentifier overflow in first two arcs".into()).boxed(),
-                );
-            }
+        // Check that first subidentifier (arc1*40 + arc2) won't overflow u32.
+        // Max valid arc2 = u32::MAX - arc1*40
+        let base = arc1 * 40;
+        if arc2 > u32::MAX - base {
+            return Err(
+                Error::InvalidOid("subidentifier overflow in first two arcs".into()).boxed(),
+            );
         }
 
         Ok(())
@@ -913,6 +925,20 @@ mod tests {
             oid.validate().is_ok(),
             "arc2=999 with arc1=2 should be valid"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_single_arc() {
+        // A single-arc OID has no invertible BER encoding (encode [1] -> subid 40,
+        // decode -> [1, 0]); validate() and to_ber_checked() must reject it.
+        let oid = Oid::from_slice(&[1]);
+        assert!(oid.validate().is_err(), "single-arc OID must be rejected");
+        assert!(
+            oid.to_ber_checked().is_err(),
+            "to_ber_checked must reject single-arc OID"
+        );
+        // parse still accepts it (only validate() is stricter)
+        assert_eq!(Oid::parse("1").unwrap().arcs(), &[1]);
     }
 
     #[test]

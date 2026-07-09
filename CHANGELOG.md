@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Value::UInteger32` (application tag 0x47, RFC 1442's UInteger32) and `Value::Nsap` (application tag 0x45, NsapAddress) variants. Values with these tags previously decoded as `Value::Gauge32` and `Value::OctetString` respectively, which re-encoded under the wrong tag; decode-then-encode now round-trips the original wire tag. `Value` is `#[non_exhaustive]`, so this compiles against existing matches, but code matching `Value::Gauge32`/`Value::OctetString` (or comparing with `==`) no longer sees values carrying these tags — such data now arrives under the new variants. NSAP values always display as hex (matching net-snmp), and the CLI `type` field for them changed from `STRING`/`Hex-STRING` to `Nsap`.
+
+### Changed
+
+- `Oid::validate()` (and therefore `to_ber_checked()`/`validate_all()`) now rejects single-arc OIDs, which have no invertible BER encoding (X.690 8.19.4 packs the first two arcs into one subidentifier, so `[n]` encodes as a value that decodes to `[n, 0]`). The unchecked encode paths are unchanged.
+
 ### Fixed
 
 - Agent silently dropped oversized GET, GETNEXT, and SET responses in the run loop instead of returning the alternate `tooBig` Response that RFC 3416 Sections 4.2.1, 4.2.2, and 4.2.5 require; the GET/GETNEXT/SET handlers now emit a `tooBig` Response (error-status `tooBig`, error-index 0, empty variable-bindings) when the Response would exceed `min(agentMax, msgMaxSize)`, and the run-loop drop is now the final fallback for when even that empty Response will not fit. The SET size check runs up front per Section 4.2.5, before the test/commit phases, so an oversized SET is no longer committed only to have its Response discarded (which a retrying manager would re-apply). GETBULK sizing (Section 4.2.3) is unchanged.

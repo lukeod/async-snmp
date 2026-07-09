@@ -239,6 +239,15 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
             size: None,
         },
 
+        Value::UInteger32(v) => DecodedValue {
+            type_name: "UInteger32".into(),
+            display: v.to_string(),
+            json_value: (*v).into(),
+            formatted: None,
+            raw_hex: None,
+            size: None,
+        },
+
         Value::TimeTicks(v) => {
             let human = format_timeticks(*v);
             DecodedValue {
@@ -256,6 +265,21 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
             let spaced_hex = format_hex_string(bytes);
             DecodedValue {
                 type_name: "Opaque".into(),
+                display: spaced_hex.clone(),
+                json_value: serde_json::Value::String(compact_hex.clone()),
+                formatted: Some(spaced_hex),
+                raw_hex: Some(compact_hex),
+                size: Some(bytes.len()),
+            }
+        }
+
+        // NSAP addresses are binary; always render hex (matches net-snmp).
+        Value::Nsap(bytes) => {
+            let compact_hex = hex::encode(bytes);
+            let spaced_hex = format_hex_string(bytes);
+
+            DecodedValue {
+                type_name: "Nsap".into(),
                 display: spaced_hex.clone(),
                 json_value: serde_json::Value::String(compact_hex.clone()),
                 formatted: Some(spaced_hex),

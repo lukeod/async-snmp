@@ -49,12 +49,12 @@ pub mod application {
     /// Opaque type for arbitrary ASN.1 data (tag 0x44).
     pub const OPAQUE: u8 = 0x44;
     /// NSAP address type (tag 0x45). Historic, defined in early SMI drafts but
-    /// never standardized. Decodes as `OctetString`.
+    /// never standardized. Decodes as `Value::Nsap`.
     pub const NSAP: u8 = 0x45;
     /// 64-bit counter type (tag 0x46).
     pub const COUNTER64: u8 = 0x46;
     /// Unsigned 32-bit integer type (tag 0x47). Historic, defined in RFC 1442
-    /// (`SNMPv2` party-based, obsoleted by RFC 1902). Decodes as Gauge32.
+    /// (`SNMPv2` party-based, obsoleted by RFC 1902). Decodes as `Value::UInteger32`.
     pub const UINTEGER32: u8 = 0x47;
 }
 

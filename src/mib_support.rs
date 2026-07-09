@@ -152,9 +152,19 @@ fn format_object_value(mib: &Mib, object: &mib_rs::Object<'_>, value: &Value) ->
         Value::Counter32(v) => format!("{}", v),
         Value::Counter64(v) => format!("{}", v),
         Value::Gauge32(v) => format!("{}", v),
+        Value::UInteger32(v) => format!("{}", v),
 
         Value::Opaque(bytes) => {
             // Try display hint formatting (same as OctetString)
+            if let Some(formatted) = object.format_octets(bytes, HexCase::Lower) {
+                return formatted;
+            }
+            format_hex(bytes)
+        }
+
+        Value::Nsap(bytes) => {
+            // NSAP addresses are binary; honor an explicit DISPLAY-HINT,
+            // otherwise always render hex (matches net-snmp).
             if let Some(formatted) = object.format_octets(bytes, HexCase::Lower) {
                 return formatted;
             }
