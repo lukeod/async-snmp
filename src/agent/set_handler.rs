@@ -134,12 +134,15 @@ impl Agent {
                 } else {
                     ErrorStatus::CommitFailed
                 };
+                // RFC 3416 4.2.5: commitFailed carries the index of the failed
+                // binding; undoFailed carries error-index zero.
+                let error_index = if undo_failed { 0 } else { (index + 1) as i32 };
                 let status = if ctx.version == Version::V1 {
                     status.to_v1()
                 } else {
                     status
                 };
-                return Ok(pdu.to_error_response(status, (index + 1) as i32));
+                return Ok(pdu.to_error_response(status, error_index));
             }
 
             committed.push(p);
@@ -621,7 +624,9 @@ mod tests {
         // The undo for varbind 1 fails during rollback -> UndoFailed takes
         // precedence over CommitFailed.
         assert_eq!(response.error_status, ErrorStatus::UndoFailed.as_i32());
-        assert_eq!(response.error_index, 3);
+        // RFC 3416 4.2.5: undoFailed carries error-index zero (unlike
+        // commitFailed, which carries the failed binding's index).
+        assert_eq!(response.error_index, 0);
 
         // Both previously-committed varbinds are still attempted, in reverse
         // order, even though one of the undos fails.
