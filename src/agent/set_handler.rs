@@ -66,10 +66,12 @@ impl Agent {
                 for p in pending.iter().rev() {
                     p.handler.free_set(ctx, &p.oid, &p.value).await;
                 }
+                // v2c/v3 report noAccess; v1 downgrades it to noSuchName.
+                let status = ErrorStatus::NoAccess;
                 let status = if ctx.version == Version::V1 {
-                    ErrorStatus::NoSuchName
+                    status.to_v1()
                 } else {
-                    ErrorStatus::NoAccess
+                    status
                 };
                 return Ok(pdu.to_error_response(status, (index + 1) as i32));
             }
@@ -81,11 +83,13 @@ impl Agent {
                 for p in pending.iter().rev() {
                     p.handler.free_set(ctx, &p.oid, &p.value).await;
                 }
-                // No handler for this OID
+                // No handler for this OID: v2c/v3 report notWritable; v1
+                // downgrades it to noSuchName.
+                let status = ErrorStatus::NotWritable;
                 let status = if ctx.version == Version::V1 {
-                    ErrorStatus::NoSuchName
+                    status.to_v1()
                 } else {
-                    ErrorStatus::NotWritable
+                    status
                 };
                 return Ok(pdu.to_error_response(status, (index + 1) as i32));
             }

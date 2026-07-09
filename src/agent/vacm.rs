@@ -502,9 +502,9 @@ impl ViewSubtree {
     /// the mask. Callers guarantee `self.oid` has at least `arcs.len()` arcs.
     fn prefix_matches(&self, arcs: &[u32]) -> bool {
         let subtree_arcs = self.oid.arcs();
-        arcs.iter().enumerate().all(|(i, &arc)| {
-            !self.arc_is_exact(i) || subtree_arcs[i] == arc
-        })
+        arcs.iter()
+            .enumerate()
+            .all(|(i, &arc)| !self.arc_is_exact(i) || subtree_arcs[i] == arc)
     }
 
     /// Check if an OID matches this subtree (with mask).
@@ -1992,12 +1992,10 @@ mod tests {
         // Excluded family: 1.3.6.1.2.*.7 (arc 5 wildcarded). This intersects the
         // included 1.3.6.1.2.1 subtree at e.g. 1.3.6.1.2.1.7, so the query
         // 1.3.6.1.2.1 has mixed permissions => Ambiguous.
-        let view = View::new()
-            .include(oid!(1, 3, 6, 1, 2, 1))
-            .exclude_masked(
-                oid!(1, 3, 6, 1, 2, 99, 7),
-                vec![0xFA], // arcs 0-4,6 exact; arc 5 wildcard
-            );
+        let view = View::new().include(oid!(1, 3, 6, 1, 2, 1)).exclude_masked(
+            oid!(1, 3, 6, 1, 2, 99, 7),
+            vec![0xFA], // arcs 0-4,6 exact; arc 5 wildcard
+        );
 
         // The excluded family covers a descendant of the query.
         assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 7)));

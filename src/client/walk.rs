@@ -38,7 +38,6 @@ use futures_core::Stream;
 use crate::error::{Error, Result, WalkAbortReason};
 use crate::oid::Oid;
 use crate::transport::Transport;
-use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
 
@@ -123,10 +122,7 @@ fn validate_walk_varbind(
     oid_tracker: &mut OidTracker,
     target: std::net::SocketAddr,
 ) -> VarbindOutcome {
-    if matches!(
-        vb.value,
-        Value::EndOfMibView | Value::NoSuchObject | Value::NoSuchInstance
-    ) {
+    if vb.value.is_exception() {
         return VarbindOutcome::Done;
     }
     if !vb.oid.starts_with(base_oid) {
@@ -496,12 +492,7 @@ impl<T: Transport + 'static> WalkStream<T> {
                 WalkStream::GetBulk(bw) => (&bw.client, &bw.base_oid),
             };
             match client.get(base_oid).await {
-                Ok(vb)
-                    if !matches!(
-                        vb.value,
-                        Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView
-                    ) =>
-                {
+                Ok(vb) if !vb.value.is_exception() => {
                     results.push(vb);
                 }
                 _ => {}
@@ -527,6 +518,7 @@ impl<T: Transport + 'static> Stream for WalkStream<T> {
 mod tests {
     use super::*;
     use crate::oid;
+    use crate::value::Value;
 
     fn target_addr() -> std::net::SocketAddr {
         "127.0.0.1:161".parse().unwrap()

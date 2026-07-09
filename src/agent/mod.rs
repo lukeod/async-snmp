@@ -125,6 +125,13 @@ const V3_AUTH_OVERHEAD: usize = 48;
 /// scopedPDU, and up to a full DES/AES block of CBC padding.
 const V3_PRIV_OVERHEAD: usize = 20;
 
+/// RFC 2576 Section 4.1.2.3: SNMPv1 has no Counter64 type, so a Counter64
+/// value cannot be carried in a v1 response varbind. GET responds with
+/// noSuchName; GETNEXT/GETBULK skip the offending varbind.
+fn v1_rejects_counter64(version: Version, value: &Value) -> bool {
+    version == Version::V1 && matches!(value, Value::Counter64(_))
+}
+
 /// Built-in MIB handler groups that the agent registers automatically.
 ///
 /// By default, the agent registers handlers for standard SNMP MIB objects
@@ -1364,8 +1371,7 @@ impl Agent {
 
             let response_value = match result {
                 GetResult::Value(v) => {
-                    // RFC 2576 Section 4.1.2.3: Counter64 not valid in v1
-                    if ctx.version == Version::V1 && matches!(v, Value::Counter64(_)) {
+                    if v1_rejects_counter64(ctx.version, &v) {
                         return Ok(
                             pdu.to_error_response(ErrorStatus::NoSuchName, (index + 1) as i32)
                         );
@@ -1599,8 +1605,7 @@ impl Agent {
                         );
                         return None;
                     }
-                    // RFC 2576 Section 4.1.2.3: skip Counter64 for v1
-                    if ctx.version == Version::V1 && matches!(next_vb.value, Value::Counter64(_)) {
+                    if v1_rejects_counter64(ctx.version, &next_vb.value) {
                         search_from = next_vb.oid.clone();
                         continue;
                     }
