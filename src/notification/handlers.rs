@@ -240,7 +240,6 @@ impl super::NotificationReceiver {
             _ => Ok(None),
         }
     }
-
 }
 
 /// Build a V3 response message with appropriate security.

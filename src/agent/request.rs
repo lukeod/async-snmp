@@ -180,7 +180,6 @@ impl Agent {
             }
         }
     }
-
 }
 
 /// Check if a PDU type is a request that should be handled.

@@ -735,13 +735,19 @@ impl NotificationReceiver {
     /// Get the usmStatsUnknownEngineIDs counter value.
     #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
-        self.inner.usm_stats.unknown_engine_ids.load(Ordering::Relaxed)
+        self.inner
+            .usm_stats
+            .unknown_engine_ids
+            .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsUnknownUserNames counter value.
     #[must_use]
     pub fn usm_unknown_usernames(&self) -> u32 {
-        self.inner.usm_stats.unknown_usernames.load(Ordering::Relaxed)
+        self.inner
+            .usm_stats
+            .unknown_usernames
+            .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsWrongDigests counter value.
@@ -753,7 +759,10 @@ impl NotificationReceiver {
     /// Get the usmStatsNotInTimeWindows counter value.
     #[must_use]
     pub fn usm_not_in_time_windows(&self) -> u32 {
-        self.inner.usm_stats.not_in_time_windows.load(Ordering::Relaxed)
+        self.inner
+            .usm_stats
+            .not_in_time_windows
+            .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsUnsupportedSecLevels counter value.
@@ -768,7 +777,10 @@ impl NotificationReceiver {
     /// Get the usmStatsDecryptionErrors counter value.
     #[must_use]
     pub fn usm_decryption_errors(&self) -> u32 {
-        self.inner.usm_stats.decryption_errors.load(Ordering::Relaxed)
+        self.inner
+            .usm_stats
+            .decryption_errors
+            .load(Ordering::Relaxed)
     }
 
     /// Receive a notification.

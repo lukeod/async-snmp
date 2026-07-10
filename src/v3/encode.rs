@@ -240,13 +240,13 @@ pub(crate) fn encode_v3_response(
     let scoped = ScopedPdu::new(context_engine_id, context_name, response_pdu);
 
     match security_level {
-        SecurityLevel::NoAuthNoPriv => {
-            Ok(V3Message::new(global, usm.encode(), scoped).encode())
-        }
+        SecurityLevel::NoAuthNoPriv => Ok(V3Message::new(global, usm.encode(), scoped).encode()),
         SecurityLevel::AuthNoPriv => {
             let (_, auth_key) = require_auth_key(derived_keys, target)?;
             let usm = usm.with_auth_placeholder(auth_key.mac_len());
-            let mut bytes = V3Message::new(global, usm.encode(), scoped).encode().to_vec();
+            let mut bytes = V3Message::new(global, usm.encode(), scoped)
+                .encode()
+                .to_vec();
             sign_v3_message(auth_key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))
         }

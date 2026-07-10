@@ -957,7 +957,10 @@ mod tests {
         .await
         .expect("read_ber_message should not hang");
 
-        assert!(result.is_err(), "Should reject length encoding over 4 octets");
+        assert!(
+            result.is_err(),
+            "Should reject length encoding over 4 octets"
+        );
         let err = result.unwrap_err();
         assert!(
             matches!(*err, Error::MalformedResponse { .. }),

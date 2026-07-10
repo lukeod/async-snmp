@@ -1098,8 +1098,7 @@ mod response_validation_tests {
         match auth_key {
             Some(key) => {
                 let mut bytes = msg.encode().to_vec();
-                let (offset, len) =
-                    UsmSecurityParams::find_auth_params_offset(&bytes).unwrap();
+                let (offset, len) = UsmSecurityParams::find_auth_params_offset(&bytes).unwrap();
                 authenticate_message(&key, &mut bytes, offset, len).unwrap();
                 Bytes::from(bytes)
             }
@@ -1196,7 +1195,9 @@ mod response_validation_tests {
         let _ = client.send_v3_and_recv(pdu).await;
 
         let state = client.inner.engine_state.read().unwrap();
-        let s = state.as_ref().expect("engine state should still be present");
+        let s = state
+            .as_ref()
+            .expect("engine state should still be present");
         assert_eq!(s.engine_boots, 5);
         assert_eq!(s.engine_time, 100, "time should resync backward to report");
         assert_eq!(
@@ -1212,8 +1213,7 @@ mod response_validation_tests {
         let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         // Local notion is time 1000; 500 is beyond the 150-second window.
-        let response =
-            build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));
+        let response = build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));
         let client = canned_client(response, 1, 1000, security);
 
         let err = client.send_v3_and_recv(pdu).await.unwrap_err();
@@ -1248,8 +1248,7 @@ mod response_validation_tests {
     async fn v3_accepts_timely_authenticated_response() {
         let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
-        let response =
-            build_response(PduType::Response, 123, 1, 1200, Some(b"authpass12345678"));
+        let response = build_response(PduType::Response, 123, 1, 1200, Some(b"authpass12345678"));
         let client = canned_client(response, 1, 1000, security);
 
         let result = client.send_v3_and_recv(pdu).await;
@@ -1264,8 +1263,7 @@ mod response_validation_tests {
         let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         // Local notion is time 1000; 500 is beyond the 150-second window.
-        let response =
-            build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));
+        let response = build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));
         let client = canned_client(response, 1, 1000, security);
 
         let err = client.send_v3_and_recv(pdu).await.unwrap_err();

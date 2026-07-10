@@ -225,9 +225,8 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                                 let vup = e.valid_up_to();
                                 if vup > 0 {
                                     // SAFETY: chunk[i..i+vup] is valid UTF-8 by valid_up_to()
-                                    result.push_str(
-                                        std::str::from_utf8(&chunk[i..i + vup]).unwrap(),
-                                    );
+                                    result
+                                        .push_str(std::str::from_utf8(&chunk[i..i + vup]).unwrap());
                                     i += vup;
                                     last_valid_len = result.len();
                                 }

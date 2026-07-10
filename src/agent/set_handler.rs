@@ -360,7 +360,12 @@ mod tests {
 
     fn five_set_varbinds() -> Vec<VarBind> {
         (1u32..=5)
-            .map(|i| VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, i, 0), Value::Integer(i as i32)))
+            .map(|i| {
+                VarBind::new(
+                    oid!(1, 3, 6, 1, 4, 1, 99999, i, 0),
+                    Value::Integer(i as i32),
+                )
+            })
             .collect()
     }
 
@@ -542,7 +547,12 @@ mod tests {
     /// roll back (in reverse order).
     fn three_set_varbinds() -> Vec<VarBind> {
         (1u32..=3)
-            .map(|i| VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, i, 0), Value::Integer(i as i32)))
+            .map(|i| {
+                VarBind::new(
+                    oid!(1, 3, 6, 1, 4, 1, 99999, i, 0),
+                    Value::Integer(i as i32),
+                )
+            })
             .collect()
     }
 

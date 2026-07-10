@@ -132,16 +132,25 @@ impl UsmStatsHandler {
                     .load(Ordering::Relaxed),
             )),
             3 => Some(Value::Counter32(
-                self.state.usm_stats.unknown_usernames.load(Ordering::Relaxed),
+                self.state
+                    .usm_stats
+                    .unknown_usernames
+                    .load(Ordering::Relaxed),
             )),
             4 => Some(Value::Counter32(
-                self.state.usm_stats.unknown_engine_ids.load(Ordering::Relaxed),
+                self.state
+                    .usm_stats
+                    .unknown_engine_ids
+                    .load(Ordering::Relaxed),
             )),
             5 => Some(Value::Counter32(
                 self.state.usm_stats.wrong_digests.load(Ordering::Relaxed),
             )),
             6 => Some(Value::Counter32(
-                self.state.usm_stats.decryption_errors.load(Ordering::Relaxed),
+                self.state
+                    .usm_stats
+                    .decryption_errors
+                    .load(Ordering::Relaxed),
             )),
             _ => None,
         }

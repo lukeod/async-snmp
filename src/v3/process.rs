@@ -540,7 +540,10 @@ mod tests {
             panic!("unknown user must fail USM processing");
         };
         assert_eq!(failure, UsmFailure::UnknownUserNames);
-        assert!(report.is_none(), "reportable=false must suppress the report");
+        assert!(
+            report.is_none(),
+            "reportable=false must suppress the report"
+        );
         assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 1);
     }
 

@@ -176,12 +176,12 @@ mod tests {
         // ",1a1d:1d" specs receive no data and are not emitted.
         let dt = Value::OctetString(Bytes::from_static(&[
             0x07, 0xC8, // year 1992
-            5,  // month
-            26, // day
-            13, // hour
-            30, // minutes
-            15, // seconds
-            0,  // deci-seconds
+            5,    // month
+            26,   // day
+            13,   // hour
+            30,   // minutes
+            15,   // seconds
+            0,    // deci-seconds
         ]));
         assert_eq!(
             dt.format_with_hint(DATE_AND_TIME),

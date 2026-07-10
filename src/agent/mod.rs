@@ -969,7 +969,11 @@ impl Agent {
     /// OID: 1.3.6.1.6.3.15.1.1.5
     #[must_use]
     pub fn usm_wrong_digests(&self) -> u32 {
-        self.inner.state.usm_stats.wrong_digests.load(Ordering::Relaxed)
+        self.inner
+            .state
+            .usm_stats
+            .wrong_digests
+            .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsNotInTimeWindows counter value.
@@ -1276,11 +1280,7 @@ impl Agent {
     /// using the same estimate as GETBULK: `RESPONSE_OVERHEAD` plus the encoded
     /// size of each varbind.
     fn response_fits(varbinds: &[VarBind], max_size: usize) -> bool {
-        let size = RESPONSE_OVERHEAD
-            + varbinds
-                .iter()
-                .map(VarBind::encoded_size)
-                .sum::<usize>();
+        let size = RESPONSE_OVERHEAD + varbinds.iter().map(VarBind::encoded_size).sum::<usize>();
         size <= max_size
     }
 
@@ -2385,7 +2385,11 @@ mod tests {
             response.varbinds.len(),
             1,
             "expected exactly the non-repeater prefix, got {:?}",
-            response.varbinds.iter().map(|vb| &vb.oid).collect::<Vec<_>>()
+            response
+                .varbinds
+                .iter()
+                .map(|vb| &vb.oid)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             response.varbinds[0].oid,
@@ -2868,7 +2872,10 @@ mod tests {
             request_id: 1,
             error_status: 0,
             error_index: 0,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null)],
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Null,
+            )],
         };
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
@@ -2908,12 +2915,18 @@ mod tests {
             request_id: 1,
             error_status: 0,
             error_index: 0,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null)],
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Null,
+            )],
         };
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(response.error_status, 0);
         assert_eq!(response.varbinds.len(), 1);
-        assert_eq!(response.varbinds[0].oid, oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0));
+        assert_eq!(
+            response.varbinds[0].oid,
+            oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0)
+        );
     }
 }

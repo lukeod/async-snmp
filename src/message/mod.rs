@@ -11,10 +11,10 @@ mod community;
 mod v3;
 
 pub use community::{CommunityMessage, CommunityPdu};
+pub(crate) use v3::{MpdFailure, classify_mpd_failure};
 pub use v3::{
     MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, SecurityModel, V3Message, V3MessageData,
 };
-pub(crate) use v3::{MpdFailure, classify_mpd_failure};
 
 use crate::ber::Decoder;
 use crate::error::internal::DecodeErrorKind;
