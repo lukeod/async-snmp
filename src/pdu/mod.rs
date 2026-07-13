@@ -361,27 +361,23 @@ impl Pdu {
         let snmp_traps_prefix = oids::snmp_traps();
         let (generic_trap, specific_trap, enterprise) = if trap_oid.starts_with(&snmp_traps_prefix)
             && trap_oid.len() == snmp_traps_prefix.len() + 1
+            && (1..=6).contains(&trap_oid.arcs()[trap_oid.len() - 1])
         {
             // Standard trap: snmpTraps.{generic+1}
             let last_arc = trap_oid.arcs()[trap_oid.len() - 1];
-            if last_arc == 0 || last_arc > 6 {
-                // Unknown standard trap number, treat as enterprise-specific
-                (GenericTrap::EnterpriseSpecific, 0, trap_oid.clone())
-            } else {
-                let generic = GenericTrap::from_i32((last_arc - 1) as i32);
-                // For standard traps, enterprise comes from snmpTrapEnterprise.0
-                // varbind if present, otherwise use snmpTraps
-                let enterprise_oid = oids::snmp_trap_enterprise();
-                let ent = self.varbinds[2..]
-                    .iter()
-                    .find(|vb| vb.oid == enterprise_oid)
-                    .and_then(|vb| match &vb.value {
-                        Value::ObjectIdentifier(oid) => Some(oid.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| snmp_traps_prefix.clone());
-                (generic, 0, ent)
-            }
+            let generic = GenericTrap::from_i32((last_arc - 1) as i32);
+            // For standard traps, enterprise comes from snmpTrapEnterprise.0
+            // varbind if present, otherwise use snmpTraps
+            let enterprise_oid = oids::snmp_trap_enterprise();
+            let ent = self.varbinds[2..]
+                .iter()
+                .find(|vb| vb.oid == enterprise_oid)
+                .and_then(|vb| match &vb.value {
+                    Value::ObjectIdentifier(oid) => Some(oid.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| snmp_traps_prefix.clone());
+            (generic, 0, ent)
         } else if trap_oid.len() >= 2 {
             // Enterprise-specific trap. RFC 3584 Section 3.2:
             // - If next-to-last sub-id is zero: enterprise = OID minus last 2 arcs
@@ -1496,6 +1492,22 @@ mod tests {
         // Next-to-last arc is 1 (non-zero), so only last arc stripped
         assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999, 1));
         assert_eq!(trap.time_stamp, 200);
+    }
+
+    #[test]
+    fn test_v2_to_v1_snmp_traps_arc_out_of_range() {
+        // RFC 3584 Section 3.2 rules (1), (3), (4): snmpTraps.x with x=0 or
+        // x>6 is not a standard trap, so enterprise = OID minus last arc
+        // (next-to-last arc 5 is non-zero), generic = 6, specific = last arc.
+        for arc in [0u32, 7, 9] {
+            let pdu = Pdu::trap_v2(1, 100, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, arc), vec![]);
+
+            let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
+
+            assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
+            assert_eq!(trap.specific_trap, i32::try_from(arc).unwrap());
+            assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 6, 3, 1, 1, 5));
+        }
     }
 
     #[test]
