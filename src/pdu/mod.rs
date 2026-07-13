@@ -410,14 +410,10 @@ impl Pdu {
             })
             .unwrap_or(default_addr);
 
-        // Collect remaining varbinds, skipping the sysUpTime/snmpTrapOID prefix
-        // and the conversion-specific varbinds
-        let enterprise_oid = oids::snmp_trap_enterprise();
-        let varbinds: Vec<VarBind> = self.varbinds[2..]
-            .iter()
-            .filter(|vb| vb.oid != trap_address_oid && vb.oid != enterprise_oid)
-            .cloned()
-            .collect();
+        // RFC 3584 Section 3.2 rule (6): the SNMPv1 varbinds are the SNMPv2
+        // varbinds minus only the sysUpTime.0/snmpTrapOID.0 prefix;
+        // snmpTrapAddress.0 and snmpTrapEnterprise.0 are retained.
+        let varbinds: Vec<VarBind> = self.varbinds[2..].to_vec();
 
         Some(TrapV1Pdu {
             enterprise,
@@ -1520,8 +1516,10 @@ mod tests {
 
         let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
         assert_eq!(trap.agent_addr, [192, 168, 1, 1]);
-        // snmpTrapAddress should be stripped from varbinds
-        assert!(trap.varbinds.is_empty());
+        // RFC 3584 Section 3.2 rule (6): only sysUpTime.0 and snmpTrapOID.0
+        // are excluded; snmpTrapAddress.0 is retained in the varbinds
+        assert_eq!(trap.varbinds.len(), 1);
+        assert_eq!(trap.varbinds[0].oid, oids::snmp_trap_address());
     }
 
     #[test]
@@ -1543,8 +1541,10 @@ mod tests {
         let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
         // Standard trap should use the enterprise from snmpTrapEnterprise.0
         assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
-        // snmpTrapEnterprise should be stripped from varbinds
-        assert!(trap.varbinds.is_empty());
+        // RFC 3584 Section 3.2 rule (6): only sysUpTime.0 and snmpTrapOID.0
+        // are excluded; snmpTrapEnterprise.0 is retained in the varbinds
+        assert_eq!(trap.varbinds.len(), 1);
+        assert_eq!(trap.varbinds[0].oid, oids::snmp_trap_enterprise());
     }
 
     #[test]
