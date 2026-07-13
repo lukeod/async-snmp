@@ -201,7 +201,7 @@ impl Pdu {
     /// Create a GETBULK request PDU.
     ///
     /// Note: For GETBULK, `error_status` holds `non_repeaters` and `error_index` holds `max_repetitions`.
-    /// Both are clamped via [`clamp_bulk_field`] so this (SNMPv3) encode path cannot emit a negative
+    /// Both are clamped via `clamp_bulk_field` so this (SNMPv3) encode path cannot emit a negative
     /// value on the wire.
     #[must_use]
     pub fn get_bulk(
