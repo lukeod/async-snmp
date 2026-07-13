@@ -58,6 +58,48 @@ async fn v3_auth_sha256() {
     assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
 }
 
+/// End-to-end authNoPriv roundtrip for a given auth protocol.
+async fn auth_only_roundtrip(protocol: AuthProtocol) {
+    let agent = TestAgentBuilder::new()
+        .usm_user(V3User::auth_only(
+            b"authuser".to_vec(),
+            protocol,
+            AUTH_PASS.as_bytes().to_vec(),
+        ))
+        .build()
+        .await;
+
+    let client = Client::builder(
+        agent.addr().to_string(),
+        Auth::usm("authuser").auth(protocol, AUTH_PASS),
+    )
+    .connect()
+    .await
+    .unwrap();
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+
+    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+}
+
+/// V3 authNoPriv with SHA-224 (RFC 7860).
+#[tokio::test]
+async fn v3_auth_sha224() {
+    auth_only_roundtrip(AuthProtocol::Sha224).await;
+}
+
+/// V3 authNoPriv with SHA-384 (RFC 7860).
+#[tokio::test]
+async fn v3_auth_sha384() {
+    auth_only_roundtrip(AuthProtocol::Sha384).await;
+}
+
+/// V3 authNoPriv with SHA-512 (RFC 7860).
+#[tokio::test]
+async fn v3_auth_sha512() {
+    auth_only_roundtrip(AuthProtocol::Sha512).await;
+}
+
 /// A request carrying the wrong msgAuthoritativeEngineBoots is rejected with
 /// a notInTimeWindows Report (RFC 3414 Section 3.2 Step 7a: boots must match,
 /// not just time). The Report is authenticated at authNoPriv, so the client

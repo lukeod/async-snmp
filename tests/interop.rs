@@ -167,7 +167,10 @@ mod users {
     #[cfg(feature = "crypto-rustcrypto")]
     pub const AUTHMD5_USER: &str = "authmd5_user";
     pub const AUTHSHA1_USER: &str = "authsha1_user";
+    pub const AUTHSHA224_USER: &str = "authsha224_user";
     pub const AUTHSHA256_USER: &str = "authsha256_user";
+    pub const AUTHSHA384_USER: &str = "authsha384_user";
+    pub const AUTHSHA512_USER: &str = "authsha512_user";
     #[cfg(feature = "crypto-rustcrypto")]
     pub const PRIVDES_USER: &str = "privdes_user";
     pub const PRIVAES128_USER: &str = "privaes128_user";
@@ -434,6 +437,39 @@ async fn v3_auth_sha256() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert!(matches!(result.value, Value::OctetString(_)));
+}
+
+/// authNoPriv GET against net-snmp for a given RFC 7860 SHA-2 auth protocol.
+async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
+    let info = get_snmpd_container().await;
+    let target = format!("{}:{}", info.host, info.udp_port);
+
+    let client = Client::builder(&target, Auth::usm(user).auth(protocol, AUTH_PASS))
+        .timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap();
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert!(matches!(result.value, Value::OctetString(_)));
+}
+
+#[tokio::test]
+async fn v3_auth_sha224() {
+    require_container_runtime!();
+    v3_auth_interop(users::AUTHSHA224_USER, AuthProtocol::Sha224).await;
+}
+
+#[tokio::test]
+async fn v3_auth_sha384() {
+    require_container_runtime!();
+    v3_auth_interop(users::AUTHSHA384_USER, AuthProtocol::Sha384).await;
+}
+
+#[tokio::test]
+async fn v3_auth_sha512() {
+    require_container_runtime!();
+    v3_auth_interop(users::AUTHSHA512_USER, AuthProtocol::Sha512).await;
 }
 
 // ============================================================================
