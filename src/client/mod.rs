@@ -328,12 +328,12 @@ impl<T: Transport> Client<T> {
                 .transport
                 .register_request(request_id, self.inner.config.timeout);
 
-            // Send request
+            // Send request and wait for response as a single unit. Combining the
+            // two lets reliable transports (TCP) own their stream lock for the
+            // whole exchange, so a cancelled request cannot leak the lock and
+            // wedge later requests.
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = data.len() }, "sending request");
-            self.inner.transport.send(data).await?;
-
-            // Wait for response (deadline was set by register_request)
-            match self.inner.transport.recv(request_id).await {
+            match self.inner.transport.request(data, request_id).await {
                 Ok((response_data, _source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response");
 

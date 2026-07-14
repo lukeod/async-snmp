@@ -80,6 +80,30 @@ pub trait Transport: Send + Sync {
     /// For TCP transports, uses the timeout parameter.
     fn recv(&self, request_id: i32) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send;
 
+    /// Send request data and wait for the correlated response as a single unit.
+    ///
+    /// The default implementation simply chains [`send`](Self::send) then
+    /// [`recv`](Self::recv). Transports that serialize a request/response pair by
+    /// holding a lock between the two steps (e.g. TCP holding its stream lock)
+    /// must override this so the lock is owned by one future for the whole
+    /// exchange. Otherwise, if the caller's future is dropped between `send` and
+    /// `recv` (for example a `timeout()` wrapping the call), the lock is stashed
+    /// across independent await points and leaks, permanently wedging later
+    /// requests.
+    ///
+    /// Callers should invoke [`register_request`](Self::register_request) before
+    /// this, exactly as they would before a bare `send`/`recv` pair.
+    fn request(
+        &self,
+        data: &[u8],
+        request_id: i32,
+    ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+        async move {
+            self.send(data).await?;
+            self.recv(request_id).await
+        }
+    }
+
     /// The peer address for this transport.
     fn peer_addr(&self) -> SocketAddr;
 

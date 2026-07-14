@@ -106,9 +106,8 @@ impl<T: Transport> Client<T> {
             self.inner
                 .transport
                 .register_request(msg_id, self.inner.config.timeout);
-            self.inner.transport.send(&discovery_data).await?;
 
-            match self.inner.transport.recv(msg_id).await {
+            match self.inner.transport.request(&discovery_data, msg_id).await {
                 Ok(result) => {
                     response_data_opt = Some(result);
                     break 'discovery;
@@ -367,11 +366,9 @@ impl<T: Transport> Client<T> {
                 .transport
                 .register_request(msg_id, self.inner.config.timeout);
 
-            // Send request
-            self.inner.transport.send(&data).await?;
-
-            // Wait for response (deadline was set by register_request)
-            match self.inner.transport.recv(msg_id).await {
+            // Send request and wait for response as a single unit so reliable
+            // transports own their stream lock for the whole exchange.
+            match self.inner.transport.request(&data, msg_id).await {
                 Ok((response_data, _source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received V3 response");
 

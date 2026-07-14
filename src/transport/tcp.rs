@@ -83,7 +83,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 /// Maximum SNMP message size for TCP (per RFC 3430).
@@ -205,7 +205,6 @@ impl TcpTransportBuilder {
         Ok(TcpTransport {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                active_guard: Mutex::new(None),
                 current_timeout_ms: AtomicU64::new(30_000),
                 target,
                 local_addr,
@@ -242,8 +241,11 @@ impl Default for TcpTransportBuilder {
 /// # Serialized Operations
 ///
 /// Request-response pairs are serialized to ensure correct correlation.
-/// The stream lock is held from `send()` until `recv()` completes,
-/// preventing interleaving of concurrent requests.
+/// [`request()`](Transport::request) owns the stream lock for the whole
+/// write-then-read exchange, preventing interleaving of concurrent requests.
+/// Because the lock is held by a single future (not stashed across independent
+/// await points), a dropped or cancelled request releases it instead of leaking
+/// it.
 ///
 /// # Example
 ///
@@ -270,9 +272,6 @@ pub struct TcpTransport {
 struct TcpTransportInner {
     /// The TCP stream, wrapped in Arc for owned guard pattern
     stream: Arc<Mutex<TcpStream>>,
-    /// Holds the stream lock between `send()` and `recv()` to serialize operations.
-    /// Uses `tokio::sync::Mutex` so the guard is dropped on task cancellation.
-    active_guard: Mutex<Option<OwnedMutexGuard<TcpStream>>>,
     /// Timeout for current request in milliseconds (set by `register_request`)
     current_timeout_ms: AtomicU64,
     target: SocketAddr,
@@ -360,7 +359,6 @@ impl TcpTransport {
         Ok(Self {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                active_guard: Mutex::new(None),
                 current_timeout_ms: AtomicU64::new(30_000),
                 target,
                 local_addr,
@@ -372,35 +370,20 @@ impl TcpTransport {
 
 impl Transport for TcpTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
-        // Acquire owned lock and hold it until recv() completes.
-        // This serializes request-response pairs for concurrent callers.
+        // Fire-and-forget write (e.g. traps). The lock is held only for the
+        // duration of this future; it is released on return or cancellation and
+        // is never stashed across independent await points.
         let mut stream = self.inner.stream.clone().lock_owned().await;
         let target = self.inner.target;
-
-        let result = async {
-            stream
-                .write_all(data)
-                .await
-                .map_err(|e| Error::Network { target, source: e }.boxed())?;
-            stream
-                .flush()
-                .await
-                .map_err(|e| Error::Network { target, source: e }.boxed())?;
-            Ok::<_, Box<Error>>(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                // Store the guard to hold the lock until recv()
-                *self.inner.active_guard.lock().await = Some(stream);
-                Ok(())
-            }
-            Err(e) => {
-                // On error, guard is dropped and lock released
-                Err(e)
-            }
-        }
+        stream
+            .write_all(data)
+            .await
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+        Ok(())
     }
 
     fn register_request(&self, _request_id: i32, timeout: Duration) {
@@ -414,15 +397,11 @@ impl Transport for TcpTransport {
             Duration::from_millis(self.inner.current_timeout_ms.load(Ordering::Relaxed));
         let target = self.inner.target;
 
-        // Take the guard that was stored by send().
-        // This ensures we're reading the response for our request.
-        let mut stream =
-            self.inner.active_guard.lock().await.take().ok_or_else(|| {
-                Error::Config("recv() called without prior send()".into()).boxed()
-            })?;
+        // Acquire the stream lock for the duration of this read only. The guard
+        // is a local, so it is released on return or task cancellation.
+        let mut stream = self.inner.stream.clone().lock_owned().await;
 
         // Read a complete BER-encoded message using the framing protocol.
-        // The guard is dropped when this function returns, releasing the lock.
         let max_alloc = self.inner.max_allocation_size;
         let result = timeout(
             recv_timeout,
@@ -432,6 +411,50 @@ impl Transport for TcpTransport {
 
         match result {
             Ok(Ok(data)) => Ok((data, target)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
+                Err(Error::Timeout {
+                    target,
+                    elapsed: recv_timeout,
+                    retries: 0,
+                }
+                .boxed())
+            }
+        }
+    }
+
+    async fn request(&self, data: &[u8], request_id: i32) -> Result<(Bytes, SocketAddr)> {
+        let recv_timeout =
+            Duration::from_millis(self.inner.current_timeout_ms.load(Ordering::Relaxed));
+        let target = self.inner.target;
+        let max_alloc = self.inner.max_allocation_size;
+
+        // Own the stream lock for the whole write+read exchange as a single
+        // unit. The guard is a local held by one future, so it serializes
+        // concurrent callers yet is released on return or cancellation. This
+        // avoids stashing the guard across independent await points, which would
+        // leak the lock (and permanently wedge later requests) if the caller's
+        // future were dropped between the send and the recv.
+        let mut stream = self.inner.stream.clone().lock_owned().await;
+
+        stream
+            .write_all(data)
+            .await
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+
+        let result = timeout(
+            recv_timeout,
+            read_ber_message(&mut stream, target, max_alloc),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(response)) => Ok((response, target)),
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
@@ -719,8 +742,7 @@ mod tests {
                 let request = build_request_with_id(request_id);
 
                 transport.register_request(request_id, Duration::from_secs(5));
-                transport.send(&request).await?;
-                let (response, _) = transport.recv(request_id).await?;
+                let (response, _) = transport.request(&request, request_id).await?;
 
                 // Verify we got a valid response
                 assert_eq!(response[0], 0x30, "Response should be SEQUENCE");
@@ -1098,6 +1120,65 @@ mod tests {
             matches!(*err, Error::MalformedResponse { .. }),
             "Expected MalformedResponse error, got: {err:?}"
         );
+
+        server.await.unwrap();
+    }
+
+    /// Regression test: a dropped/cancelled request must not wedge the transport.
+    ///
+    /// Previously `send()` stashed the stream lock in a field for `recv()` to
+    /// reclaim. If the caller's future was dropped between the two await points
+    /// (e.g. a `timeout()` wrapping the request), the guard leaked and the stream
+    /// lock was never released, deadlocking every later request. `request()` now
+    /// owns the lock as a local for the whole exchange, so cancellation releases
+    /// it and the next request proceeds.
+    #[tokio::test]
+    async fn test_tcp_cancelled_request_does_not_wedge_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            // Read the first request framing, then stall without responding so
+            // the client's request future is cancelled by the outer timeout.
+            let mut hdr = [0u8; 2];
+            socket.read_exact(&mut hdr).await.unwrap();
+            let mut body = vec![0u8; hdr[1] as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Read the second request and answer it.
+            socket.read_exact(&mut hdr).await.unwrap();
+            let mut body2 = vec![0u8; hdr[1] as usize];
+            socket.read_exact(&mut body2).await.unwrap();
+            let response = build_response_with_id(2);
+            socket.write_all(&response).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+
+        // First request: cancelled by the outer timeout before any response.
+        let request = build_request_with_id(1);
+        transport.register_request(1, Duration::from_secs(30));
+        let cancelled = timeout(Duration::from_millis(50), transport.request(&request, 1)).await;
+        assert!(cancelled.is_err(), "outer timeout should elapse (cancel)");
+
+        // The stream lock must be free after the cancelled request.
+        assert!(
+            transport.inner.stream.clone().try_lock_owned().is_ok(),
+            "stream lock leaked after a cancelled request"
+        );
+
+        // The next request must succeed rather than deadlock.
+        let request2 = build_request_with_id(2);
+        transport.register_request(2, Duration::from_secs(5));
+        let result = timeout(Duration::from_secs(5), transport.request(&request2, 2))
+            .await
+            .expect("second request should not hang");
+        let (response, _) = result.expect("second request should succeed");
+        assert_eq!(response[0], 0x30);
 
         server.await.unwrap();
     }
