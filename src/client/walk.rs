@@ -405,6 +405,26 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                             // Continue loop to process buffer
                         }
                         Err(e) => {
+                            // On tooBig, degrade instead of aborting (RFC 3416
+                            // 4.2.3): halve max-repetitions down to a floor of 1
+                            // and retry the same position. Only surface the error
+                            // if it still fails at max-repetitions = 1.
+                            if self.max_repetitions > 1
+                                && matches!(
+                                    &*e,
+                                    Error::Snmp {
+                                        status: crate::error::ErrorStatus::TooBig,
+                                        ..
+                                    }
+                                )
+                            {
+                                let reduced = (self.max_repetitions / 2).max(1);
+                                tracing::debug!(target: "async_snmp::client", { peer = %self.client.peer_addr(), snmp.max_repetitions = self.max_repetitions, snmp.reduced_max_repetitions = reduced }, "tooBig response, reducing max-repetitions and retrying");
+                                self.max_repetitions = reduced;
+                                // Retry the same position with fewer repetitions.
+                                continue;
+                            }
+
                             self.done = true;
                             return Poll::Ready(Some(Err(e)));
                         }
@@ -658,5 +678,164 @@ mod tests {
             validate_walk_varbind(&vb2, &base, &mut tracker, target_addr()),
             VarbindOutcome::Yield
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Mock transport that returns tooBig for GETBULK when max-repetitions
+    // exceeds a threshold, otherwise returns a terminating response. Used to
+    // exercise BulkWalk degradation (RFC 3416 4.2.3): on tooBig the walk halves
+    // max-repetitions and retries the same position instead of aborting.
+    // -------------------------------------------------------------------------
+
+    use crate::client::ClientConfig;
+    use crate::error::ErrorStatus;
+    use crate::message::CommunityMessage;
+    use crate::pdu::{Pdu, PduType};
+    use bytes::Bytes;
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct BulkTooBigTransport {
+        /// Highest max-repetitions the agent will accept; larger requests return tooBig.
+        max_repetitions: i32,
+        /// Records (request_id, max_repetitions) seen by `send`, drained by `recv`.
+        pending: Arc<Mutex<VecDeque<(i32, i32)>>>,
+        /// Total number of tooBig responses emitted.
+        too_big_count: Arc<Mutex<usize>>,
+    }
+
+    impl BulkTooBigTransport {
+        fn new(max_repetitions: i32) -> Self {
+            Self {
+                max_repetitions,
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+                too_big_count: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl Transport for BulkTooBigTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let pdu = msg.pdu.standard().unwrap();
+            // For GETBULK, error_index carries max-repetitions.
+            let max_rep = pdu.error_index;
+            self.pending
+                .lock()
+                .unwrap()
+                .push_back((request_id, max_rep));
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let (request_id, max_rep) = self.pending.lock().unwrap().pop_front().unwrap_or((1, 0));
+            let threshold = self.max_repetitions;
+            let too_big_count = self.too_big_count.clone();
+            let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();
+
+            async move {
+                let pdu = if max_rep > threshold {
+                    *too_big_count.lock().unwrap() += 1;
+                    Pdu {
+                        pdu_type: PduType::Response,
+                        request_id,
+                        error_status: ErrorStatus::TooBig.as_i32(),
+                        error_index: 0,
+                        varbinds: vec![],
+                    }
+                } else {
+                    // One in-subtree value, then EndOfMibView to terminate the walk.
+                    let varbinds = vec![
+                        VarBind::new(oid!(1, 3, 6, 1, 2, 1, 2, 1, 0), Value::Integer(1)),
+                        VarBind::new(oid!(1, 3, 6, 1, 2, 1, 2, 2, 0), Value::EndOfMibView),
+                    ];
+                    Pdu {
+                        pdu_type: PduType::Response,
+                        request_id,
+                        error_status: 0,
+                        error_index: 0,
+                        varbinds,
+                    }
+                };
+
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                Ok((msg.encode(), peer))
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_walk_degrades_max_repetitions_on_too_big() {
+        // Agent accepts at most max-repetitions=4. Starting at 25, the walk must
+        // halve (25 -> 12 -> 6 -> 3) and retry the same position until it fits,
+        // rather than surfacing the tooBig error.
+        let transport = BulkTooBigTransport::new(4);
+        let too_big_count = transport.too_big_count.clone();
+        let config = ClientConfig {
+            version: Version::V2c,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+
+        let results = client
+            .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 25)
+            .collect()
+            .await
+            .unwrap();
+
+        // The reduced request succeeded and yielded the in-subtree varbind.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].oid, oid!(1, 3, 6, 1, 2, 1, 2, 1, 0));
+        // At least one tooBig was observed and recovered from.
+        assert!(*too_big_count.lock().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_walk_too_big_at_min_repetitions_is_unrecoverable() {
+        // Agent returns tooBig even at max-repetitions=1: degradation bottoms out
+        // and the error is surfaced.
+        let transport = BulkTooBigTransport::new(0);
+        let config = ClientConfig {
+            version: Version::V2c,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+
+        let err = client
+            .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 8)
+            .collect()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &*err,
+                Error::Snmp {
+                    status: ErrorStatus::TooBig,
+                    ..
+                }
+            ),
+            "expected TooBig, got: {err}"
+        );
     }
 }
