@@ -687,9 +687,12 @@ impl AgentBuilder {
 
     /// Build the agent.
     pub async fn build(mut self) -> Result<Agent> {
-        // Reject any USM user configured with privacy but no authentication.
-        for config in self.usm_users.values() {
+        // Reject any USM user configured with privacy but no authentication,
+        // and precompute master keys so the expensive password expansion runs
+        // once here instead of on every inbound packet (CPU amplification).
+        for config in self.usm_users.values_mut() {
             config.validate()?;
+            config.precompute_master_keys();
         }
 
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {

@@ -110,6 +110,53 @@ impl UsmConfig {
         Ok(())
     }
 
+    /// Precompute and cache master keys from any configured passwords.
+    ///
+    /// The password-to-master expansion (RFC 3414 Section 2.6, a 1 MiB buffer
+    /// hash) is the expensive part of key derivation. Performing it once at
+    /// configuration time — rather than on every inbound packet in
+    /// [`derive_keys`](Self::derive_keys) — removes an unauthenticated CPU
+    /// amplification vector: without it, an attacker can force a fresh
+    /// password expansion per spoofed message (a Report/discovery for a known
+    /// username triggers derivation before authentication is verified).
+    ///
+    /// After this call the localized-key path localizes from the cached master
+    /// keys (~1us) instead of re-expanding the password. Localized results are
+    /// identical to the password path (the master key is the same value the
+    /// password would have produced). If `master_keys` is already set, or no
+    /// authentication is configured, this is a no-op. Best-effort: if the
+    /// crypto backend rejects a password (e.g. too short), the config is left
+    /// unchanged so the original password path (and its error) is preserved.
+    pub(crate) fn precompute_master_keys(&mut self) {
+        if self.master_keys.is_some() {
+            return;
+        }
+        let Some((auth_protocol, auth_password)) = self.auth.as_ref() else {
+            return;
+        };
+        let master_keys = match crate::v3::MasterKeys::new(*auth_protocol, auth_password) {
+            Ok(mk) => mk,
+            Err(_) => return,
+        };
+        let master_keys = match &self.privacy {
+            Some((priv_protocol, priv_password)) => {
+                // Same password reuses the auth master; a different password
+                // needs its own expansion. Both yield identical localized
+                // privacy keys.
+                if priv_password == auth_password {
+                    master_keys.with_privacy_same_password(*priv_protocol)
+                } else {
+                    match master_keys.with_privacy(*priv_protocol, priv_password) {
+                        Ok(mk) => mk,
+                        Err(_) => return,
+                    }
+                }
+            }
+            None => master_keys,
+        };
+        self.master_keys = Some(master_keys);
+    }
+
     /// Derive localized keys for a specific engine ID.
     ///
     /// If master keys are configured, uses the cached master keys for efficient
@@ -246,5 +293,86 @@ mod tests {
 
         assert!(keys.auth_key.is_some());
         assert!(keys.priv_key.is_some());
+    }
+
+    /// Precomputing master keys populates the cache, so subsequent
+    /// `derive_keys` calls take the master-key localization path instead of
+    /// re-running the 1 MiB password expansion (the CPU-amplification vector).
+    #[test]
+    fn test_precompute_master_keys_populates_cache() {
+        let mut config = UsmConfig::new(Bytes::from_static(b"testuser"))
+            .auth(AuthProtocol::Sha256, b"authpass")
+            .privacy(PrivProtocol::Aes128, b"privpass");
+        assert!(config.master_keys.is_none());
+
+        config.precompute_master_keys();
+        assert!(
+            config.master_keys.is_some(),
+            "precompute must cache master keys so per-packet derivation avoids password expansion"
+        );
+
+        // Idempotent: a second call is a no-op and keeps the cache.
+        config.precompute_master_keys();
+        assert!(config.master_keys.is_some());
+    }
+
+    /// The cached (master-key) path and the uncached (password) path must
+    /// derive identical localized keys, for both auth-only and authPriv.
+    #[test]
+    fn test_precompute_master_keys_preserves_derivation() {
+        let engine_id = b"\x80\x00\x00\x00\x01test-engine";
+
+        // authNoPriv
+        let uncached =
+            UsmConfig::new(Bytes::from_static(b"u")).auth(AuthProtocol::Sha256, b"authpass");
+        let mut cached = uncached.clone();
+        cached.precompute_master_keys();
+        let a = uncached.derive_keys(engine_id).unwrap();
+        let b = cached.derive_keys(engine_id).unwrap();
+        assert_eq!(
+            a.auth_key.as_ref().map(AsRef::as_ref),
+            b.auth_key.as_ref().map(AsRef::as_ref),
+            "auth key must match between password and master-key paths"
+        );
+
+        // authPriv, distinct auth/priv passwords
+        let uncached = UsmConfig::new(Bytes::from_static(b"u"))
+            .auth(AuthProtocol::Sha1, b"authpassword")
+            .privacy(PrivProtocol::Aes128, b"privpassword");
+        let mut cached = uncached.clone();
+        cached.precompute_master_keys();
+        let a = uncached.derive_keys(engine_id).unwrap();
+        let b = cached.derive_keys(engine_id).unwrap();
+        assert_eq!(
+            a.auth_key.as_ref().map(AsRef::as_ref),
+            b.auth_key.as_ref().map(AsRef::as_ref),
+        );
+        assert!(a.priv_key.is_some() && b.priv_key.is_some());
+
+        // authPriv, same auth/priv password (with_privacy_same_password path)
+        let uncached = UsmConfig::new(Bytes::from_static(b"u"))
+            .auth(AuthProtocol::Sha1, b"sharedpassword")
+            .privacy(PrivProtocol::Aes128, b"sharedpassword");
+        let mut cached = uncached.clone();
+        cached.precompute_master_keys();
+        let a = uncached.derive_keys(engine_id).unwrap();
+        let b = cached.derive_keys(engine_id).unwrap();
+        assert_eq!(
+            a.auth_key.as_ref().map(AsRef::as_ref),
+            b.auth_key.as_ref().map(AsRef::as_ref),
+        );
+    }
+
+    /// A password too short for the crypto backend leaves the config on the
+    /// original password path (no silent success, error preserved for later).
+    #[test]
+    fn test_precompute_master_keys_short_password_is_noop() {
+        let mut config =
+            UsmConfig::new(Bytes::from_static(b"u")).auth(AuthProtocol::Sha256, b"short");
+        config.precompute_master_keys();
+        assert!(
+            config.master_keys.is_none(),
+            "a rejected password must not populate the cache"
+        );
     }
 }

@@ -369,10 +369,13 @@ impl NotificationReceiverBuilder {
     }
 
     /// Build the notification receiver.
-    pub async fn build(self) -> Result<NotificationReceiver> {
-        // Reject any USM user configured with privacy but no authentication.
-        for config in self.usm_users.values() {
+    pub async fn build(mut self) -> Result<NotificationReceiver> {
+        // Reject any USM user configured with privacy but no authentication,
+        // and precompute master keys so the expensive password expansion runs
+        // once here instead of on every inbound packet (CPU amplification).
+        for config in self.usm_users.values_mut() {
             config.validate()?;
+            config.precompute_master_keys();
         }
 
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
