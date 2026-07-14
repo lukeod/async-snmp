@@ -215,6 +215,23 @@ impl Default for ClientConfig {
     }
 }
 
+impl ClientConfig {
+    /// Return a copy of this config with invalid values clamped to safe defaults.
+    ///
+    /// [`Client::new`] and [`Client::with_engine_cache`] accept a raw
+    /// [`ClientConfig`], bypassing the [`ClientBuilder`](crate::ClientBuilder)
+    /// validation. This guards against values that would otherwise panic at
+    /// request time, such as `max_oids_per_request == 0` reaching
+    /// [`slice::chunks`], which panics on a chunk size of 0.
+    #[must_use]
+    fn sanitized(mut self) -> Self {
+        if self.max_oids_per_request == 0 {
+            self.max_oids_per_request = DEFAULT_MAX_OIDS_PER_REQUEST;
+        }
+        self
+    }
+}
+
 impl<T: Transport> Client<T> {
     /// Create a new client with the given transport and config.
     ///
@@ -226,7 +243,7 @@ impl<T: Transport> Client<T> {
         Self {
             inner: Arc::new(ClientInner {
                 transport,
-                config,
+                config: config.sanitized(),
                 engine_state: RwLock::new(None),
                 derived_keys: RwLock::new(None),
                 salt_counter: SaltCounter::new(),
@@ -247,7 +264,7 @@ impl<T: Transport> Client<T> {
         Self {
             inner: Arc::new(ClientInner {
                 transport,
-                config,
+                config: config.sanitized(),
                 engine_state: RwLock::new(None),
                 derived_keys: RwLock::new(None),
                 salt_counter: SaltCounter::new(),
@@ -1168,6 +1185,34 @@ mod tests {
             ..Default::default()
         };
         Client::new(transport, config)
+    }
+
+    #[tokio::test]
+    async fn new_clamps_zero_max_oids_per_request() {
+        // Client::new bypasses builder validation; a raw config with
+        // max_oids_per_request == 0 must be clamped so slice::chunks(0) is
+        // never reached (which would panic).
+        let transport = TruncatingTransport::new(3);
+        let config = ClientConfig {
+            version: Version::V2c,
+            max_oids_per_request: 0,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
+        assert_eq!(
+            client.inner.config.max_oids_per_request,
+            DEFAULT_MAX_OIDS_PER_REQUEST
+        );
+
+        let oids = [
+            Oid::from_slice(&[1, 3, 6, 1, 1]),
+            Oid::from_slice(&[1, 3, 6, 1, 2]),
+            Oid::from_slice(&[1, 3, 6, 1, 3]),
+        ];
+        // Must not panic on chunks(0).
+        let result = client.get_many(&oids).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
     }
 
     #[tokio::test]
