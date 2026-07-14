@@ -371,6 +371,10 @@ fn compute_hmac_slices(
 ///
 /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
 /// backend does not support the key's authentication protocol.
+///
+/// Returns [`CryptoError::CipherError`](super::CryptoError::CipherError) if the auth-parameter
+/// offset/length is out of bounds for the message; leaving the message unsigned would be a
+/// silent failure, so an out-of-bounds offset is rejected rather than returning `Ok(())`.
 pub fn authenticate_message(
     key: &LocalizedKey,
     message: &mut [u8],
@@ -379,7 +383,7 @@ pub fn authenticate_message(
 ) -> CryptoResult<()> {
     let end = match auth_offset.checked_add(auth_len) {
         Some(e) if e <= message.len() => e,
-        _ => return Ok(()),
+        _ => return Err(super::CryptoError::CipherError),
     };
 
     // Compute HMAC over the message with zeros in auth params position
@@ -811,6 +815,33 @@ mod tests {
         let message = vec![0u8; 128];
         let result = verify_message(&key, &message, 10, 49).unwrap();
         assert!(!result);
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn test_authenticate_message_oob_offset_errors() {
+        let key = LocalizedKey::from_bytes(
+            AuthProtocol::Md5,
+            vec![
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
+            ],
+        );
+
+        // An auth-parameter offset/length reaching past the message end must be
+        // rejected rather than silently leaving the message unsigned.
+        let mut message = vec![0u8; 32];
+        assert_eq!(
+            authenticate_message(&key, &mut message, 30, 12),
+            Err(super::super::CryptoError::CipherError)
+        );
+
+        // Overflow of offset + len must also be rejected.
+        let mut message = vec![0u8; 32];
+        assert_eq!(
+            authenticate_message(&key, &mut message, usize::MAX, 12),
+            Err(super::super::CryptoError::CipherError)
+        );
     }
 
     #[cfg(feature = "crypto-rustcrypto")]
