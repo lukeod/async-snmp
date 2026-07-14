@@ -144,21 +144,23 @@ impl SaltCounter {
     /// This method never returns zero. Per net-snmp behavior, zero is skipped
     /// on wraparound to avoid potential IV reuse issues.
     ///
-    /// Uses the post-increment value as the salt and a single `compare_exchange`
-    /// to skip zero atomically, avoiding the two-fetch_add race that could
-    /// cause IV reuse under concurrent access.
+    /// Uses the post-increment value as the salt. On wraparound (the single
+    /// thread that observes `old == u64::MAX`), it consumes the next counter
+    /// value via a fresh `fetch_add` rather than returning a fixed constant.
+    /// Returning a constant would duplicate the value produced by whichever
+    /// thread reads `old == 0`, causing IV reuse under concurrent access.
     pub fn next(&self) -> u64 {
-        let old = self.0.fetch_add(1, Ordering::SeqCst);
-        let val = old.wrapping_add(1);
-        if val != 0 {
-            return val;
+        loop {
+            let old = self.0.fetch_add(1, Ordering::SeqCst);
+            let val = old.wrapping_add(1);
+            if val != 0 {
+                return val;
+            }
+            // Counter wrapped to zero (old == u64::MAX). Only one thread observes
+            // this per wrap; loop to take the next distinct counter value instead
+            // of returning a constant that another thread (old == 0) would also
+            // return.
         }
-        // Counter wrapped to zero. Only one thread reaches here (only one fetch_add
-        // returns u64::MAX). Atomically advance from 0 to 1, then return 1.
-        let _ = self
-            .0
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
-        1
     }
 }
 
@@ -804,6 +806,26 @@ mod tests {
         // Subsequent calls should continue normally
         let s3 = counter.next();
         assert_eq!(s3, 2);
+    }
+
+    /// Test that the wraparound path yields distinct, nonzero values.
+    ///
+    /// Regression: the wrap path previously returned a fixed `1`, which could
+    /// duplicate the value produced by whichever thread read the counter as `0`.
+    /// Driving several calls across the wrap boundary must produce no duplicate
+    /// and no zero.
+    #[test]
+    fn test_salt_counter_wrap_no_duplicate() {
+        use std::collections::HashSet;
+
+        let counter = SaltCounter::from_value(u64::MAX - 2);
+        let mut seen = HashSet::new();
+        // Sequence crosses u64::MAX and the wrap-to-zero boundary.
+        for _ in 0..6 {
+            let v = counter.next();
+            assert_ne!(v, 0, "SaltCounter must never return zero");
+            assert!(seen.insert(v), "SaltCounter emitted duplicate: {v}");
+        }
     }
 
     /// Test that `PrivKey`'s internal salt counter never produces zero.
