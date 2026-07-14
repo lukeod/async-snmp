@@ -184,9 +184,11 @@ pub enum PrivProtocol {
     Des3,
     /// AES-128-CFB (RFC 3826)
     Aes128,
-    /// AES-192-CFB (RFC 3826)
+    /// AES-192-CFB (draft/vendor extension; e.g. Cisco/Blumenthal-Lamm draft,
+    /// not standardized by RFC 3826 which only covers AES-128).
     Aes192,
-    /// AES-256-CFB (RFC 3826)
+    /// AES-256-CFB (draft/vendor extension; e.g. Cisco/Blumenthal-Lamm draft,
+    /// not standardized by RFC 3826 which only covers AES-128).
     Aes256,
 }
 

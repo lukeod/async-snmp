@@ -3,8 +3,8 @@
 //! This module implements:
 //! - DES-CBC privacy (RFC 3414 Section 8)
 //! - AES-128-CFB privacy (RFC 3826)
-//! - AES-192-CFB privacy (RFC 3826)
-//! - AES-256-CFB privacy (RFC 3826)
+//! - AES-192-CFB privacy (draft/vendor extension, not RFC 3826)
+//! - AES-256-CFB privacy (draft/vendor extension, not RFC 3826)
 //!
 //! # Salt/IV Construction
 //!
