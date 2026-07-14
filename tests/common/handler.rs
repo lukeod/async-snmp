@@ -4,7 +4,7 @@
 //! for GETNEXT operations.
 
 use async_snmp::handler::{
-    BoxFuture, GetNextResult, GetResult, MibHandler, RequestContext, SetResult,
+    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, SetResult,
 };
 use async_snmp::{Oid, Value, VarBind};
 use std::collections::BTreeMap;
@@ -63,19 +63,23 @@ impl TestHandler {
 }
 
 impl MibHandler for TestHandler {
-    fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+    fn get<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        oid: &'a Oid,
+    ) -> BoxFuture<'a, HandlerResult<GetResult>> {
         let result = match self.data.read().unwrap().get(oid) {
             Some(v) => GetResult::Value(v.clone()),
             None => GetResult::NoSuchInstance,
         };
-        Box::pin(async move { result })
+        Box::pin(async move { Ok(result) })
     }
 
     fn get_next<'a>(
         &'a self,
         _ctx: &'a RequestContext,
         oid: &'a Oid,
-    ) -> BoxFuture<'a, GetNextResult> {
+    ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
         let data = self.data.read().unwrap();
 
         // Find the first OID strictly greater than the requested OID.
@@ -88,7 +92,7 @@ impl MibHandler for TestHandler {
                 GetNextResult::Value(VarBind::new(k.clone(), v.clone()))
             });
 
-        Box::pin(async move { result })
+        Box::pin(async move { Ok(result) })
     }
 
     fn test_set<'a>(
@@ -162,7 +166,9 @@ mod tests {
         );
         let ctx = RequestContext::test_context();
 
-        let result = MibHandler::get(&handler, &ctx, &oid!(1, 3, 6, 1)).await;
+        let result = MibHandler::get(&handler, &ctx, &oid!(1, 3, 6, 1))
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::Value(Value::Integer(42))));
     }
 
@@ -171,7 +177,9 @@ mod tests {
         let handler = TestHandler::empty();
         let ctx = RequestContext::test_context();
 
-        let result = MibHandler::get(&handler, &ctx, &oid!(1, 3, 6, 1)).await;
+        let result = MibHandler::get(&handler, &ctx, &oid!(1, 3, 6, 1))
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::NoSuchInstance));
     }
 
@@ -189,7 +197,9 @@ mod tests {
         let ctx = RequestContext::test_context();
 
         // GETNEXT on 1.3.6.1 should return 1.3.6.2
-        let result = MibHandler::get_next(&handler, &ctx, &oid!(1, 3, 6, 1)).await;
+        let result = MibHandler::get_next(&handler, &ctx, &oid!(1, 3, 6, 1))
+            .await
+            .unwrap();
         match result {
             GetNextResult::Value(vb) => {
                 assert_eq!(vb.oid, oid!(1, 3, 6, 2));
@@ -209,7 +219,9 @@ mod tests {
         let ctx = RequestContext::test_context();
 
         // GETNEXT on last OID should return EndOfMibView
-        let result = MibHandler::get_next(&handler, &ctx, &oid!(1, 3, 6, 1)).await;
+        let result = MibHandler::get_next(&handler, &ctx, &oid!(1, 3, 6, 1))
+            .await
+            .unwrap();
         assert!(matches!(result, GetNextResult::EndOfMibView));
     }
 }

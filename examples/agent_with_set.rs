@@ -16,7 +16,7 @@
 
 use async_snmp::agent::Agent;
 use async_snmp::handler::{
-    BoxFuture, GetNextResult, GetResult, MibHandler, RequestContext, SetResult,
+    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, SetResult,
 };
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
@@ -83,25 +83,29 @@ impl ConfigHandler {
 }
 
 impl MibHandler for ConfigHandler {
-    fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
-        Box::pin(async move { self.get_value(oid) })
+    fn get<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        oid: &'a Oid,
+    ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+        Box::pin(async move { Ok(self.get_value(oid)) })
     }
 
     fn get_next<'a>(
         &'a self,
         _ctx: &'a RequestContext,
         oid: &'a Oid,
-    ) -> BoxFuture<'a, GetNextResult> {
+    ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
         Box::pin(async move {
             // Find the first OID strictly greater than the requested one.
             for candidate in Self::all_oids() {
                 if &candidate > oid
                     && let GetResult::Value(v) = self.get_value(&candidate)
                 {
-                    return GetNextResult::Value(VarBind::new(candidate, v));
+                    return Ok(GetNextResult::Value(VarBind::new(candidate, v)));
                 }
             }
-            GetNextResult::EndOfMibView
+            Ok(GetNextResult::EndOfMibView)
         })
     }
 

@@ -28,13 +28,13 @@ use super::SecurityModel;
 /// # Example
 ///
 /// ```rust
-/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, BoxFuture};
+/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, HandlerResult, BoxFuture};
 /// use async_snmp::{Oid, Value, oid};
 ///
 /// struct LoggingHandler;
 ///
 /// impl MibHandler for LoggingHandler {
-///     fn get<'a>(&'a self, ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+///     fn get<'a>(&'a self, ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetResult>> {
 ///         Box::pin(async move {
 ///             // Log request details
 ///             println!(
@@ -43,9 +43,9 @@ use super::SecurityModel;
 ///             );
 ///
 ///             if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-///                 GetResult::Value(Value::Integer(42))
+///                 Ok(GetResult::Value(Value::Integer(42)))
 ///             } else {
-///                 GetResult::NoSuchObject
+///                 Ok(GetResult::NoSuchObject)
 ///             }
 ///         })
 ///     }
@@ -54,8 +54,8 @@ use super::SecurityModel;
 ///         &'a self,
 ///         _ctx: &'a RequestContext,
 ///         _oid: &'a Oid,
-///     ) -> BoxFuture<'a, async_snmp::handler::GetNextResult> {
-///         Box::pin(async { async_snmp::handler::GetNextResult::EndOfMibView })
+///     ) -> BoxFuture<'a, HandlerResult<async_snmp::handler::GetNextResult>> {
+///         Box::pin(async { Ok(async_snmp::handler::GetNextResult::EndOfMibView) })
 ///     }
 /// }
 /// ```

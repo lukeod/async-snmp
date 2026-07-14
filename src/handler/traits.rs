@@ -6,7 +6,7 @@ use std::pin::Pin;
 use crate::oid::Oid;
 use crate::value::Value;
 
-use super::{GetNextResult, GetResult, RequestContext, SetResult};
+use super::{GetNextResult, GetResult, HandlerResult, RequestContext, SetResult};
 
 /// Type alias for boxed async return type (dyn-compatible).
 ///
@@ -17,12 +17,12 @@ use super::{GetNextResult, GetResult, RequestContext, SetResult};
 /// # Example
 ///
 /// ```rust
-/// use async_snmp::handler::{BoxFuture, GetResult};
+/// use async_snmp::handler::{BoxFuture, GetResult, HandlerResult};
 ///
-/// fn example_async_fn<'a>(value: &'a i32) -> BoxFuture<'a, GetResult> {
+/// fn example_async_fn<'a>(value: &'a i32) -> BoxFuture<'a, HandlerResult<GetResult>> {
 ///     Box::pin(async move {
 ///         // Async work here
-///         GetResult::Value(async_snmp::Value::Integer(*value))
+///         Ok(GetResult::Value(async_snmp::Value::Integer(*value)))
 ///     })
 /// }
 /// ```
@@ -50,9 +50,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # GET Implementation
 ///
 /// The [`get`](MibHandler::get) method should return:
-/// - [`GetResult::Value`] if the OID exists and has a value
-/// - [`GetResult::NoSuchObject`] if the object type is not implemented
-/// - [`GetResult::NoSuchInstance`] if the object exists but this instance doesn't
+/// - `Ok(`[`GetResult::Value`]`)` if the OID exists and has a value
+/// - `Ok(`[`GetResult::NoSuchObject`]`)` if the object type is not implemented
+/// - `Ok(`[`GetResult::NoSuchInstance`]`)` if the object exists but this instance doesn't
+/// - `Err(`[`HandlerError`](super::HandlerError)`)` if the handler failed to
+///   determine an answer (backing store unreachable, hardware fault, ...)
 ///
 /// # GETNEXT and Lexicographic Ordering
 ///
@@ -64,6 +66,16 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// - The returned OID must be strictly greater than the input OID
 /// - GETBULK uses GETNEXT repeatedly, so efficient implementation matters
 /// - Use [`OidTable`](super::OidTable) to simplify sorted OID management
+///
+/// # Error Handling
+///
+/// Both methods return [`HandlerResult`], so `?` works on any error type
+/// implementing [`std::error::Error`]. Return `Err` only for *processing
+/// failures* — "I could not find out" — never for "the object does not
+/// exist", which is expressed by the `Ok` variants above. On `Err`, the
+/// agent responds to the whole request with `genErr` and the error-index of
+/// the failing variable binding (RFC 3416 Section 4.2.1), and logs the
+/// error; the message is never sent to the manager.
 ///
 /// # SET Two-Phase Commit (RFC 3416)
 ///
@@ -96,7 +108,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # Example: Read-Only Handler
 ///
 /// ```rust
-/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
+/// use async_snmp::handler::{
+///     MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, BoxFuture,
+/// };
 /// use async_snmp::{Oid, Value, VarBind, oid};
 ///
 /// struct SystemInfoHandler {
@@ -105,39 +119,47 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// }
 ///
 /// impl MibHandler for SystemInfoHandler {
-///     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+///     fn get<'a>(
+///         &'a self,
+///         _ctx: &'a RequestContext,
+///         oid: &'a Oid,
+///     ) -> BoxFuture<'a, HandlerResult<GetResult>> {
 ///         Box::pin(async move {
 ///             // sysDescr.0
 ///             if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 1, 0) {
-///                 return GetResult::Value(Value::OctetString(self.sys_descr.clone().into()));
+///                 return Ok(GetResult::Value(Value::OctetString(self.sys_descr.clone().into())));
 ///             }
 ///             // sysUpTime.0
 ///             if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 3, 0) {
-///                 return GetResult::Value(Value::TimeTicks(self.sys_uptime));
+///                 return Ok(GetResult::Value(Value::TimeTicks(self.sys_uptime)));
 ///             }
-///             GetResult::NoSuchObject
+///             Ok(GetResult::NoSuchObject)
 ///         })
 ///     }
 ///
-///     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+///     fn get_next<'a>(
+///         &'a self,
+///         _ctx: &'a RequestContext,
+///         oid: &'a Oid,
+///     ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
 ///         Box::pin(async move {
 ///             let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 ///             let sys_uptime = oid!(1, 3, 6, 1, 2, 1, 1, 3, 0);
 ///
 ///             // Return the next OID in lexicographic order
 ///             if oid < &sys_descr {
-///                 return GetNextResult::Value(VarBind::new(
+///                 return Ok(GetNextResult::Value(VarBind::new(
 ///                     sys_descr,
 ///                     Value::OctetString("My System".into())
-///                 ));
+///                 )));
 ///             }
 ///             if oid < &sys_uptime {
-///                 return GetNextResult::Value(VarBind::new(
+///                 return Ok(GetNextResult::Value(VarBind::new(
 ///                     sys_uptime,
 ///                     Value::TimeTicks(12345)
-///                 ));
+///                 )));
 ///             }
-///             GetNextResult::EndOfMibView
+///             Ok(GetNextResult::EndOfMibView)
 ///         })
 ///     }
 /// }
@@ -147,7 +169,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// ```rust
 /// use async_snmp::handler::{
-///     MibHandler, RequestContext, GetResult, GetNextResult, SetResult, BoxFuture
+///     MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, SetResult, BoxFuture
 /// };
 /// use async_snmp::{Oid, Value, VarBind, oid};
 /// use std::sync::atomic::{AtomicI32, Ordering};
@@ -157,27 +179,35 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// }
 ///
 /// impl MibHandler for WritableHandler {
-///     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+///     fn get<'a>(
+///         &'a self,
+///         _ctx: &'a RequestContext,
+///         oid: &'a Oid,
+///     ) -> BoxFuture<'a, HandlerResult<GetResult>> {
 ///         Box::pin(async move {
 ///             if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-///                 return GetResult::Value(Value::Integer(
+///                 return Ok(GetResult::Value(Value::Integer(
 ///                     self.counter.load(Ordering::Relaxed)
-///                 ));
+///                 )));
 ///             }
-///             GetResult::NoSuchObject
+///             Ok(GetResult::NoSuchObject)
 ///         })
 ///     }
 ///
-///     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+///     fn get_next<'a>(
+///         &'a self,
+///         _ctx: &'a RequestContext,
+///         oid: &'a Oid,
+///     ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
 ///         Box::pin(async move {
 ///             let my_oid = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
 ///             if oid < &my_oid {
-///                 return GetNextResult::Value(VarBind::new(
+///                 return Ok(GetNextResult::Value(VarBind::new(
 ///                     my_oid,
 ///                     Value::Integer(self.counter.load(Ordering::Relaxed))
-///                 ));
+///                 )));
 ///             }
-///             GetNextResult::EndOfMibView
+///             Ok(GetNextResult::EndOfMibView)
 ///         })
 ///     }
 ///
@@ -219,23 +249,38 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait MibHandler: Send + Sync + 'static {
     /// Handle a GET request for a specific OID.
     ///
-    /// Return [`GetResult::Value`] if the OID exists, [`GetResult::NoSuchObject`]
-    /// if the object type is not implemented, or [`GetResult::NoSuchInstance`]
-    /// if the object type exists but this specific instance doesn't.
+    /// Return `Ok(`[`GetResult::Value`]`)` if the OID exists,
+    /// `Ok(`[`GetResult::NoSuchObject`]`)` if the object type is not implemented,
+    /// or `Ok(`[`GetResult::NoSuchInstance`]`)` if the object type exists but
+    /// this specific instance doesn't.
+    ///
+    /// Return `Err(`[`HandlerError`](super::HandlerError)`)` only when the
+    /// handler failed to determine an answer (e.g. its backing store is
+    /// unreachable); the agent then responds to the whole request with
+    /// `genErr` per RFC 3416 Section 4.2.1.
     ///
     /// See [`GetResult`] documentation for details on when to use each variant.
-    fn get<'a>(&'a self, ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult>;
+    fn get<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        oid: &'a Oid,
+    ) -> BoxFuture<'a, HandlerResult<GetResult>>;
 
     /// Handle a GETNEXT request.
     ///
-    /// Return [`GetNextResult::Value`] with the lexicographically next OID and value
-    /// after `oid`, or [`GetNextResult::EndOfMibView`] if there are no more OIDs
-    /// in this handler's subtree.
+    /// Return `Ok(`[`GetNextResult::Value`]`)` with the lexicographically next
+    /// OID and value after `oid`, or `Ok(`[`GetNextResult::EndOfMibView`]`)`
+    /// if there are no more OIDs in this handler's subtree.
+    ///
+    /// Return `Err(`[`HandlerError`](super::HandlerError)`)` only when the
+    /// handler failed to determine an answer; the agent then responds to the
+    /// whole request (including GETBULK) with `genErr` per RFC 3416
+    /// Section 4.2.1.
     fn get_next<'a>(
         &'a self,
         ctx: &'a RequestContext,
         oid: &'a Oid,
-    ) -> BoxFuture<'a, GetNextResult>;
+    ) -> BoxFuture<'a, HandlerResult<GetNextResult>>;
 
     /// Test if a SET operation would succeed (phase 1 of two-phase commit).
     ///

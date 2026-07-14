@@ -76,7 +76,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use crate::handler::{BoxFuture, GetNextResult, GetResult, MibHandler};
+    use crate::handler::{BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler};
 
     struct DummyHandler;
 
@@ -85,16 +85,16 @@ mod tests {
             &'a self,
             _ctx: &'a crate::handler::RequestContext,
             _oid: &'a Oid,
-        ) -> BoxFuture<'a, GetResult> {
-            Box::pin(async { GetResult::NoSuchObject })
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
         }
 
         fn get_next<'a>(
             &'a self,
             _ctx: &'a crate::handler::RequestContext,
             _oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
-            Box::pin(async { GetNextResult::EndOfMibView })
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
         }
     }
 

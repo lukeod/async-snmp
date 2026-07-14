@@ -444,8 +444,8 @@ pub use client::{
 };
 pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
 pub use handler::{
-    BoxFuture, GetNextResult, GetResult, MibHandler, OidTable, RequestContext, Response,
-    SecurityModel, SetResult,
+    BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,
+    RequestContext, Response, SecurityModel, SetResult,
 };
 pub use message::SecurityLevel;
 pub use notification::{

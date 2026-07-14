@@ -5,6 +5,7 @@
 //! - [`MibHandler`] - Trait for handling GET, GETNEXT, and SET operations
 //! - [`RequestContext`] - Information about the incoming request
 //! - [`GetResult`], [`GetNextResult`], [`SetResult`] - Operation results
+//! - [`HandlerError`], [`HandlerResult`] - Processing failures, reported as `genErr`
 //! - [`OidTable`] - Helper for implementing GETNEXT with sorted OID storage
 //!
 //! # Overview
@@ -14,33 +15,39 @@
 //! matching prefix. Each handler implements the [`MibHandler`] trait to respond to
 //! GET, GETNEXT, and optionally SET operations.
 //!
+//! GET and GETNEXT return [`HandlerResult`], so `?` works on any
+//! [`std::error::Error`] inside a handler. `Ok` carries the protocol answer —
+//! including the "doesn't exist" exception values — while `Err` means the
+//! handler failed to produce one (e.g. its backing store was unreachable) and
+//! makes the agent answer the request with `genErr` (RFC 3416 Section 4.2.1).
+//!
 //! # Basic Handler Example
 //!
 //! A minimal handler that provides two scalar values:
 //!
 //! ```rust
-//! use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
+//! use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, BoxFuture};
 //! use async_snmp::{Oid, Value, VarBind, oid};
 //!
 //! struct MyHandler;
 //!
 //! impl MibHandler for MyHandler {
-//!     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+//!     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetResult>> {
 //!         Box::pin(async move {
 //!             if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-//!                 return GetResult::Value(Value::Integer(42));
+//!                 return Ok(GetResult::Value(Value::Integer(42)));
 //!             }
-//!             GetResult::NoSuchObject
+//!             Ok(GetResult::NoSuchObject)
 //!         })
 //!     }
 //!
-//!     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+//!     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
 //!         Box::pin(async move {
 //!             let my_oid = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
 //!             if oid < &my_oid {
-//!                 return GetNextResult::Value(VarBind::new(my_oid, Value::Integer(42)));
+//!                 return Ok(GetNextResult::Value(VarBind::new(my_oid, Value::Integer(42))));
 //!             }
-//!             GetNextResult::EndOfMibView
+//!             Ok(GetNextResult::EndOfMibView)
 //!         })
 //!     }
 //! }
@@ -69,7 +76,7 @@
 //! GETNEXT implementation by maintaining OIDs in sorted order:
 //!
 //! ```rust
-//! use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, OidTable, BoxFuture};
+//! use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, OidTable, BoxFuture};
 //! use async_snmp::{Oid, Value, VarBind, oid};
 //!
 //! struct StaticHandler {
@@ -86,20 +93,20 @@
 //! }
 //!
 //! impl MibHandler for StaticHandler {
-//!     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+//!     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetResult>> {
 //!         Box::pin(async move {
-//!             self.table.get(oid)
+//!             Ok(self.table.get(oid)
 //!                 .cloned()
 //!                 .map(GetResult::Value)
-//!                 .unwrap_or(GetResult::NoSuchObject)
+//!                 .unwrap_or(GetResult::NoSuchObject))
 //!         })
 //!     }
 //!
-//!     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+//!     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
 //!         Box::pin(async move {
-//!             self.table.get_next(oid)
+//!             Ok(self.table.get_next(oid)
 //!                 .map(|(o, v)| GetNextResult::Value(VarBind::new(o.clone(), v.clone())))
-//!                 .unwrap_or(GetNextResult::EndOfMibView)
+//!                 .unwrap_or(GetNextResult::EndOfMibView))
 //!         })
 //!     }
 //! }
@@ -111,7 +118,7 @@ mod traits;
 
 pub use context::RequestContext;
 pub use oid_table::OidTable;
-pub use results::{GetNextResult, GetResult, Response, SetResult};
+pub use results::{GetNextResult, GetResult, HandlerError, HandlerResult, Response, SetResult};
 pub use traits::{BoxFuture, MibHandler};
 
 /// Security model identifiers (RFC 3411).

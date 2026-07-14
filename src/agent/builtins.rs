@@ -7,7 +7,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::handler::{BoxFuture, GetNextResult, GetResult, MibHandler, RequestContext};
+use crate::handler::{
+    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext,
+};
 use crate::oid;
 use crate::oid::Oid;
 use crate::value::Value;
@@ -58,20 +60,24 @@ impl SnmpEngineHandler {
 }
 
 impl MibHandler for SnmpEngineHandler {
-    fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+    fn get<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        oid: &'a Oid,
+    ) -> BoxFuture<'a, HandlerResult<GetResult>> {
         Box::pin(async move {
             let arcs = oid.arcs();
             if arcs.len() != SNMP_ENGINE_PREFIX_LEN + 2 {
-                return GetResult::NoSuchObject;
+                return Ok(GetResult::NoSuchObject);
             }
             let col = arcs[SNMP_ENGINE_PREFIX_LEN];
             let instance = arcs[SNMP_ENGINE_PREFIX_LEN + 1];
             if instance != 0 {
-                return GetResult::NoSuchInstance;
+                return Ok(GetResult::NoSuchInstance);
             }
             match self.get_column_value(col) {
-                Some(v) => GetResult::Value(v),
-                None => GetResult::NoSuchObject,
+                Some(v) => Ok(GetResult::Value(v)),
+                None => Ok(GetResult::NoSuchObject),
             }
         })
     }
@@ -80,17 +86,17 @@ impl MibHandler for SnmpEngineHandler {
         &'a self,
         _ctx: &'a RequestContext,
         oid: &'a Oid,
-    ) -> BoxFuture<'a, GetNextResult> {
+    ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
         Box::pin(async move {
             let prefix = Self::prefix();
             for col in 1..=4u32 {
                 let scalar_oid = prefix.child(col).child(0);
                 if oid < &scalar_oid {
                     let value = self.get_column_value(col).unwrap();
-                    return GetNextResult::Value(VarBind::new(scalar_oid, value));
+                    return Ok(GetNextResult::Value(VarBind::new(scalar_oid, value)));
                 }
             }
-            GetNextResult::EndOfMibView
+            Ok(GetNextResult::EndOfMibView)
         })
     }
 }
@@ -158,20 +164,24 @@ impl UsmStatsHandler {
 }
 
 impl MibHandler for UsmStatsHandler {
-    fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+    fn get<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        oid: &'a Oid,
+    ) -> BoxFuture<'a, HandlerResult<GetResult>> {
         Box::pin(async move {
             let arcs = oid.arcs();
             if arcs.len() != USM_STATS_PREFIX_LEN + 2 {
-                return GetResult::NoSuchObject;
+                return Ok(GetResult::NoSuchObject);
             }
             let col = arcs[USM_STATS_PREFIX_LEN];
             let instance = arcs[USM_STATS_PREFIX_LEN + 1];
             if instance != 0 {
-                return GetResult::NoSuchInstance;
+                return Ok(GetResult::NoSuchInstance);
             }
             match self.get_column_value(col) {
-                Some(v) => GetResult::Value(v),
-                None => GetResult::NoSuchObject,
+                Some(v) => Ok(GetResult::Value(v)),
+                None => Ok(GetResult::NoSuchObject),
             }
         })
     }
@@ -180,17 +190,17 @@ impl MibHandler for UsmStatsHandler {
         &'a self,
         _ctx: &'a RequestContext,
         oid: &'a Oid,
-    ) -> BoxFuture<'a, GetNextResult> {
+    ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
         Box::pin(async move {
             let prefix = Self::prefix();
             for col in 1..=6u32 {
                 let scalar_oid = prefix.child(col).child(0);
                 if oid < &scalar_oid {
                     let value = self.get_column_value(col).unwrap();
-                    return GetNextResult::Value(VarBind::new(scalar_oid, value));
+                    return Ok(GetNextResult::Value(VarBind::new(scalar_oid, value)));
                 }
             }
-            GetNextResult::EndOfMibView
+            Ok(GetNextResult::EndOfMibView)
         })
     }
 }
@@ -232,20 +242,24 @@ impl MpdStatsHandler {
 }
 
 impl MibHandler for MpdStatsHandler {
-    fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+    fn get<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        oid: &'a Oid,
+    ) -> BoxFuture<'a, HandlerResult<GetResult>> {
         Box::pin(async move {
             let arcs = oid.arcs();
             if arcs.len() != MPD_STATS_PREFIX_LEN + 2 {
-                return GetResult::NoSuchObject;
+                return Ok(GetResult::NoSuchObject);
             }
             let col = arcs[MPD_STATS_PREFIX_LEN];
             let instance = arcs[MPD_STATS_PREFIX_LEN + 1];
             if instance != 0 {
-                return GetResult::NoSuchInstance;
+                return Ok(GetResult::NoSuchInstance);
             }
             match self.get_column_value(col) {
-                Some(v) => GetResult::Value(v),
-                None => GetResult::NoSuchObject,
+                Some(v) => Ok(GetResult::Value(v)),
+                None => Ok(GetResult::NoSuchObject),
             }
         })
     }
@@ -254,17 +268,17 @@ impl MibHandler for MpdStatsHandler {
         &'a self,
         _ctx: &'a RequestContext,
         oid: &'a Oid,
-    ) -> BoxFuture<'a, GetNextResult> {
+    ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
         Box::pin(async move {
             let prefix = Self::prefix();
             for col in 1..=2u32 {
                 let scalar_oid = prefix.child(col).child(0);
                 if oid < &scalar_oid {
                     let value = self.get_column_value(col).unwrap();
-                    return GetNextResult::Value(VarBind::new(scalar_oid, value));
+                    return Ok(GetNextResult::Value(VarBind::new(scalar_oid, value)));
                 }
             }
-            GetNextResult::EndOfMibView
+            Ok(GetNextResult::EndOfMibView)
         })
     }
 }
@@ -336,7 +350,8 @@ mod tests {
         let ctx = test_ctx();
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0))
-            .await;
+            .await
+            .unwrap();
         match result {
             GetResult::Value(Value::OctetString(v)) => {
                 assert_eq!(v.as_ref(), &[0x80, 0x00, 0x01, 0x02, 0x03]);
@@ -353,7 +368,8 @@ mod tests {
         let ctx = test_ctx();
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 2, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::Value(Value::Integer(5))));
     }
 
@@ -365,7 +381,8 @@ mod tests {
         let ctx = test_ctx();
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 3, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::Value(Value::Integer(12345))));
     }
 
@@ -377,7 +394,8 @@ mod tests {
         let ctx = test_ctx();
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::Value(Value::Integer(1472))));
     }
 
@@ -389,7 +407,8 @@ mod tests {
         let ctx = test_ctx();
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 5, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::NoSuchObject));
     }
 
@@ -401,7 +420,8 @@ mod tests {
         let ctx = test_ctx();
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 1))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::NoSuchInstance));
     }
 
@@ -415,7 +435,7 @@ mod tests {
 
         let mut current = prefix.clone();
         let mut count = 0;
-        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await {
+        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await.unwrap() {
             count += 1;
             current = vb.oid;
         }
@@ -445,7 +465,7 @@ mod tests {
 
         for (col, expected_val) in &expected {
             let oid = prefix.child(*col).child(0);
-            let result = handler.get(&ctx, &oid).await;
+            let result = handler.get(&ctx, &oid).await.unwrap();
             match result {
                 GetResult::Value(Value::Counter32(v)) => {
                     assert_eq!(
@@ -468,7 +488,7 @@ mod tests {
 
         let mut current = prefix.clone();
         let mut count = 0;
-        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await {
+        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await.unwrap() {
             count += 1;
             current = vb.oid;
         }
@@ -494,7 +514,7 @@ mod tests {
 
         for (col, expected_val) in &expected {
             let oid = prefix.child(*col).child(0);
-            let result = handler.get(&ctx, &oid).await;
+            let result = handler.get(&ctx, &oid).await.unwrap();
             match result {
                 GetResult::Value(Value::Counter32(v)) => {
                     assert_eq!(
@@ -516,7 +536,8 @@ mod tests {
         // Column 3 (snmpUnknownPDUHandlers) is not tracked
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 3, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::NoSuchObject));
     }
 
@@ -530,7 +551,7 @@ mod tests {
 
         let mut current = prefix.clone();
         let mut count = 0;
-        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await {
+        while let GetNextResult::Value(vb) = handler.get_next(&ctx, &current).await.unwrap() {
             count += 1;
             current = vb.oid;
         }

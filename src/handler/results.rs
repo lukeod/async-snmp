@@ -6,11 +6,120 @@
 //! - [`GetResult`] - Result of a GET operation
 //! - [`GetNextResult`] - Result of a GETNEXT operation
 //! - [`SetResult`] - Result of SET test/commit phases
+//! - [`HandlerError`] / [`HandlerResult`] - Handler processing failures (mapped to `genErr`)
 //! - [`Response`] - Internal response type (typically not used directly)
+
+use std::borrow::Cow;
 
 use crate::error::ErrorStatus;
 use crate::value::Value;
 use crate::varbind::VarBind;
+
+/// A handler processing failure, reported to the manager as a `genErr` Response.
+///
+/// Returned as the `Err` side of [`HandlerResult`] from
+/// [`MibHandler::get`](super::MibHandler::get) and
+/// [`MibHandler::get_next`](super::MibHandler::get_next) when the handler
+/// *failed to process* the request — the backing store was unreachable, a lock
+/// was poisoned, a hardware read timed out. It is distinct from the RFC 3416
+/// exception values, which are successful answers about the MIB:
+///
+/// | Situation | Return |
+/// |-----------|--------|
+/// | Object/instance doesn't exist | `Ok(GetResult::NoSuchObject / NoSuchInstance)` |
+/// | No more OIDs in the subtree | `Ok(GetNextResult::EndOfMibView)` |
+/// | Couldn't find out (backend failure) | `Err(HandlerError)` |
+///
+/// When a handler returns an error, the agent answers the whole request with
+/// error-status `genErr` and error-index set to the failing variable binding
+/// (RFC 3416 Section 4.2.1), for all protocol versions. The message and source
+/// are logged by the agent; they are never sent on the wire — `genErr` carries
+/// no detail.
+///
+/// # Construction
+///
+/// Any [`std::error::Error`] converts via `?`, or build one from a message:
+///
+/// ```rust
+/// use async_snmp::handler::{HandlerError, HandlerResult, GetResult};
+///
+/// fn read_backend() -> std::io::Result<i32> {
+///     Err(std::io::Error::other("device bus timeout"))
+/// }
+///
+/// fn get_value() -> HandlerResult<GetResult> {
+///     let raw = read_backend()?; // io::Error -> HandlerError
+///     Ok(GetResult::Value(async_snmp::Value::Integer(raw)))
+/// }
+///
+/// let err: HandlerError = HandlerError::new("cache poisoned");
+/// assert_eq!(err.message(), "cache poisoned");
+/// assert!(get_value().is_err());
+/// ```
+///
+/// `HandlerError` intentionally does not implement [`std::error::Error`]:
+/// that keeps the blanket `From<E: std::error::Error>` conversion (and with it
+/// `?` on arbitrary error types) possible, the same trade-off `anyhow::Error`
+/// makes. It is a terminal type — the agent consumes it; nothing converts out
+/// of it.
+pub struct HandlerError {
+    message: Cow<'static, str>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl HandlerError {
+    /// Create an error from a message describing what failed.
+    pub fn new(message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// The failure message (used for agent-side logging only; never sent on
+    /// the wire).
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The underlying error this was converted from, if any.
+    #[must_use]
+    pub fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|e| e as _)
+    }
+}
+
+impl std::fmt::Display for HandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::fmt::Debug for HandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandlerError")
+            .field("message", &self.message)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<E> for HandlerError {
+    fn from(err: E) -> Self {
+        Self {
+            message: err.to_string().into(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+/// Result type returned by [`MibHandler::get`](super::MibHandler::get) and
+/// [`MibHandler::get_next`](super::MibHandler::get_next).
+///
+/// `Err` means the handler failed to process the request and the agent must
+/// answer `genErr`; see [`HandlerError`] for when to return which.
+pub type HandlerResult<T> = Result<T, HandlerError>;
 
 /// Result of a SET operation phase (RFC 3416).
 ///
@@ -465,6 +574,33 @@ mod tests {
             SetResult::CommitFailed.to_error_status(),
             ErrorStatus::CommitFailed
         );
+    }
+
+    #[test]
+    fn test_handler_error_message_only() {
+        let err = HandlerError::new("backend down");
+        assert_eq!(err.message(), "backend down");
+        assert!(err.source().is_none());
+        assert_eq!(err.to_string(), "backend down");
+    }
+
+    #[test]
+    fn test_handler_error_from_std_error() {
+        let io_err = std::io::Error::other("bus timeout");
+        let err: HandlerError = io_err.into();
+        assert_eq!(err.message(), "bus timeout");
+        assert!(err.source().is_some());
+        assert_eq!(err.to_string(), "bus timeout");
+    }
+
+    #[test]
+    fn test_handler_error_question_mark_conversion() {
+        fn inner() -> HandlerResult<GetResult> {
+            Err(std::io::Error::other("no route"))?;
+            unreachable!()
+        }
+        let err = inner().unwrap_err();
+        assert_eq!(err.message(), "no route");
     }
 
     #[test]

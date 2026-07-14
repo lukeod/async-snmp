@@ -173,7 +173,8 @@ mod tests {
     use crate::agent::Agent;
     use crate::error::ErrorStatus;
     use crate::handler::{
-        BoxFuture, GetNextResult, GetResult, MibHandler, RequestContext, SecurityModel, SetResult,
+        BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext,
+        SecurityModel, SetResult,
     };
     use crate::message::SecurityLevel;
     use crate::oid;
@@ -189,16 +190,20 @@ mod tests {
     }
 
     impl MibHandler for FreeSetTracker {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetResult> {
-            Box::pin(async { GetResult::NoSuchObject })
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
         }
 
         fn get_next<'a>(
             &'a self,
             _ctx: &'a RequestContext,
             _oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
-            Box::pin(async { GetNextResult::EndOfMibView })
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
         }
 
         fn test_set<'a>(
@@ -334,16 +339,20 @@ mod tests {
     }
 
     impl MibHandler for CommitTracker {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetResult> {
-            Box::pin(async { GetResult::NoSuchObject })
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
         }
 
         fn get_next<'a>(
             &'a self,
             _ctx: &'a RequestContext,
             _oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
-            Box::pin(async { GetNextResult::EndOfMibView })
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
         }
 
         fn test_set<'a>(
@@ -499,16 +508,20 @@ mod tests {
     }
 
     impl MibHandler for CommitFailHandler {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetResult> {
-            Box::pin(async { GetResult::NoSuchObject })
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
         }
 
         fn get_next<'a>(
             &'a self,
             _ctx: &'a RequestContext,
             _oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
-            Box::pin(async { GetNextResult::EndOfMibView })
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
         }
 
         fn test_set<'a>(

@@ -15,7 +15,7 @@
 //!
 //! ```rust,no_run
 //! use async_snmp::agent::Agent;
-//! use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
+//! use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, BoxFuture};
 //! use async_snmp::{Oid, Value, VarBind, oid};
 //! use std::sync::Arc;
 //!
@@ -23,33 +23,33 @@
 //! struct SystemMibHandler;
 //!
 //! impl MibHandler for SystemMibHandler {
-//!     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+//!     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetResult>> {
 //!         Box::pin(async move {
 //!             // sysDescr.0
 //!             if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 1, 0) {
-//!                 return GetResult::Value(Value::OctetString("My SNMP Agent".into()));
+//!                 return Ok(GetResult::Value(Value::OctetString("My SNMP Agent".into())));
 //!             }
 //!             // sysObjectID.0
 //!             if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 2, 0) {
-//!                 return GetResult::Value(Value::ObjectIdentifier(oid!(1, 3, 6, 1, 4, 1, 99999)));
+//!                 return Ok(GetResult::Value(Value::ObjectIdentifier(oid!(1, 3, 6, 1, 4, 1, 99999))));
 //!             }
-//!             GetResult::NoSuchObject
+//!             Ok(GetResult::NoSuchObject)
 //!         })
 //!     }
 //!
-//!     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+//!     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
 //!         Box::pin(async move {
 //!             // Return the lexicographically next OID after the given one
 //!             let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 //!             let sys_object_id = oid!(1, 3, 6, 1, 2, 1, 1, 2, 0);
 //!
 //!             if oid < &sys_descr {
-//!                 return GetNextResult::Value(VarBind::new(sys_descr, Value::OctetString("My SNMP Agent".into())));
+//!                 return Ok(GetNextResult::Value(VarBind::new(sys_descr, Value::OctetString("My SNMP Agent".into()))));
 //!             }
 //!             if oid < &sys_object_id {
-//!                 return GetNextResult::Value(VarBind::new(sys_object_id, Value::ObjectIdentifier(oid!(1, 3, 6, 1, 4, 1, 99999))));
+//!                 return Ok(GetNextResult::Value(VarBind::new(sys_object_id, Value::ObjectIdentifier(oid!(1, 3, 6, 1, 4, 1, 99999)))));
 //!             }
-//!             GetNextResult::EndOfMibView
+//!             Ok(GetNextResult::EndOfMibView)
 //!         })
 //!     }
 //! }
@@ -95,7 +95,7 @@ use std::io::IoSliceMut;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 
 use crate::error::{Error, ErrorStatus, Result};
-use crate::handler::{GetNextResult, GetResult, MibHandler, RequestContext};
+use crate::handler::{GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext};
 use crate::notification::UsmConfig;
 use crate::oid;
 use crate::oid::Oid;
@@ -192,17 +192,17 @@ pub(crate) struct RegisteredHandler {
 ///
 /// ```rust,no_run
 /// use async_snmp::agent::Agent;
-/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
+/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, BoxFuture};
 /// use async_snmp::{Oid, Value, VarBind, oid};
 /// use std::sync::Arc;
 ///
 /// struct MyHandler;
 /// impl MibHandler for MyHandler {
-///     fn get<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, GetResult> {
-///         Box::pin(async { GetResult::NoSuchObject })
+///     fn get<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, HandlerResult<GetResult>> {
+///         Box::pin(async { Ok(GetResult::NoSuchObject) })
 ///     }
-///     fn get_next<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, GetNextResult> {
-///         Box::pin(async { GetNextResult::EndOfMibView })
+///     fn get_next<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+///         Box::pin(async { Ok(GetNextResult::EndOfMibView) })
 ///     }
 /// }
 ///
@@ -514,23 +514,23 @@ impl AgentBuilder {
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
-    /// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, BoxFuture};
+    /// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, BoxFuture};
     /// use async_snmp::{Oid, Value, VarBind, oid};
     /// use std::sync::Arc;
     ///
     /// struct SystemHandler;
     /// impl MibHandler for SystemHandler {
-    ///     fn get<'a>(&'a self, _: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+    ///     fn get<'a>(&'a self, _: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetResult>> {
     ///         Box::pin(async move {
     ///             if oid == &oid!(1, 3, 6, 1, 2, 1, 1, 1, 0) {
-    ///                 GetResult::Value(Value::OctetString("My Agent".into()))
+    ///                 Ok(GetResult::Value(Value::OctetString("My Agent".into())))
     ///             } else {
-    ///                 GetResult::NoSuchObject
+    ///                 Ok(GetResult::NoSuchObject)
     ///             }
     ///         })
     ///     }
-    ///     fn get_next<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, GetNextResult> {
-    ///         Box::pin(async { GetNextResult::EndOfMibView })
+    ///     fn get_next<'a>(&'a self, _: &'a RequestContext, _: &'a Oid) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+    ///         Box::pin(async { Ok(GetNextResult::EndOfMibView) })
     ///     }
     /// }
     ///
@@ -1439,7 +1439,20 @@ impl Agent {
             }
 
             let result = if let Some(handler) = self.find_handler(&vb.oid) {
-                handler.handler.get(ctx, &vb.oid).await
+                match handler.handler.get(ctx, &vb.oid).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        // RFC 3416 Section 4.2.1: a varbind whose processing
+                        // fails yields a genErr Response naming its index.
+                        tracing::warn!(
+                            target: "async_snmp::agent",
+                            oid = %vb.oid,
+                            error = %err,
+                            "handler GET failed; responding genErr"
+                        );
+                        return Ok(pdu.to_error_response(ErrorStatus::GenErr, (index + 1) as i32));
+                    }
+                }
             } else {
                 GetResult::NoSuchObject
             };
@@ -1503,7 +1516,18 @@ impl Agent {
             // Try to find the next OID from any handler, skipping OIDs denied by
             // VACM. RFC 3413 classifies GETNEXT as Read-Class and requires
             // continuing the walk until an accessible OID is found.
-            let next = self.get_next_accessible_oid(ctx, &vb.oid).await;
+            let next = match self.get_next_accessible_oid(ctx, &vb.oid).await {
+                Ok(next) => next,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "async_snmp::agent",
+                        oid = %vb.oid,
+                        error = %err,
+                        "handler GETNEXT failed; responding genErr"
+                    );
+                    return Ok(pdu.to_error_response(ErrorStatus::GenErr, (index + 1) as i32));
+                }
+            };
 
             if let Some(next_vb) = next {
                 response_varbinds.push(next_vb);
@@ -1554,8 +1578,21 @@ impl Agent {
         };
 
         // Handle non-repeaters (first N varbinds get one GETNEXT each)
-        for vb in pdu.varbinds.iter().take(non_repeaters) {
-            let next = self.get_next_accessible_oid(ctx, &vb.oid).await;
+        for (index, vb) in pdu.varbinds.iter().take(non_repeaters).enumerate() {
+            let next = match self.get_next_accessible_oid(ctx, &vb.oid).await {
+                Ok(next) => next,
+                Err(err) => {
+                    // RFC 3416 Section 4.2.3: error-index names the varbind in
+                    // the received request.
+                    tracing::warn!(
+                        target: "async_snmp::agent",
+                        oid = %vb.oid,
+                        error = %err,
+                        "handler GETBULK failed; responding genErr"
+                    );
+                    return Ok(pdu.to_error_response(ErrorStatus::GenErr, (index + 1) as i32));
+                }
+            };
 
             let next_vb = match next {
                 Some(next_vb) => next_vb,
@@ -1599,7 +1636,25 @@ impl Agent {
                     let next_vb = if all_done[i] {
                         VarBind::new(oid.clone(), Value::EndOfMibView)
                     } else {
-                        let next = self.get_next_accessible_oid(ctx, oid).await;
+                        let next = match self.get_next_accessible_oid(ctx, oid).await {
+                            Ok(next) => next,
+                            Err(err) => {
+                                // error-index refers to the repeater's position
+                                // in the received request, whatever the
+                                // repetition it failed on (RFC 3416
+                                // Section 4.2.3).
+                                tracing::warn!(
+                                    target: "async_snmp::agent",
+                                    oid = %oid,
+                                    error = %err,
+                                    "handler GETBULK failed; responding genErr"
+                                );
+                                return Ok(pdu.to_error_response(
+                                    ErrorStatus::GenErr,
+                                    (non_repeaters + i + 1) as i32,
+                                ));
+                            }
+                        };
 
                         if let Some(next_vb) = next {
                             *oid = next_vb.oid.clone();
@@ -1659,17 +1714,18 @@ impl Agent {
 
     /// Find the next OID accessible under VACM, skipping denied OIDs by
     /// continuing the walk. Returns None when end-of-MIB is reached or all
-    /// remaining candidates are denied.
+    /// remaining candidates are denied. A handler processing failure
+    /// propagates as Err (mapped to genErr by the caller).
     async fn get_next_accessible_oid(
         &self,
         ctx: &RequestContext,
         from_oid: &Oid,
-    ) -> Option<VarBind> {
+    ) -> HandlerResult<Option<VarBind>> {
         let mut search_from = from_oid.clone();
         for _ in 0..MAX_VACM_SKIP_ITERATIONS {
-            let candidate = self.get_next_oid(ctx, &search_from).await;
+            let candidate = self.get_next_oid(ctx, &search_from).await?;
             match candidate {
-                None => return None,
+                None => return Ok(None),
                 Some(ref next_vb) => {
                     if next_vb.oid <= search_from {
                         tracing::error!(
@@ -1678,7 +1734,7 @@ impl Agent {
                             got = %next_vb.oid,
                             "handler returned non-increasing OID in GETNEXT"
                         );
-                        return None;
+                        return Ok(None);
                     }
                     if v1_rejects_counter64(ctx.version, &next_vb.value) {
                         search_from = next_vb.oid.clone();
@@ -1686,11 +1742,11 @@ impl Agent {
                     }
                     if let Some(ref vacm) = self.inner.vacm {
                         if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
-                            return candidate;
+                            return Ok(candidate);
                         }
                         search_from = next_vb.oid.clone();
                     } else {
-                        return candidate;
+                        return Ok(candidate);
                     }
                 }
             }
@@ -1703,11 +1759,15 @@ impl Agent {
             cap = MAX_VACM_SKIP_ITERATIONS,
             "VACM skip cap reached in GETNEXT; ending scan for this varbind"
         );
-        None
+        Ok(None)
     }
 
     /// Get the next OID from any handler.
-    async fn get_next_oid(&self, ctx: &RequestContext, oid: &Oid) -> Option<VarBind> {
+    async fn get_next_oid(
+        &self,
+        ctx: &RequestContext,
+        oid: &Oid,
+    ) -> HandlerResult<Option<VarBind>> {
         // Find the first handler that can provide a next OID.
         //
         // A handler can only return an OID > oid if:
@@ -1723,7 +1783,7 @@ impl Agent {
             if prefix <= oid && !oid.starts_with(prefix) {
                 continue;
             }
-            if let GetNextResult::Value(next) = handler.handler.get_next(ctx, oid).await {
+            if let GetNextResult::Value(next) = handler.handler.get_next(ctx, oid).await? {
                 // Must be lexicographically greater than the request OID
                 if next.oid > *oid {
                     match &best_result {
@@ -1735,7 +1795,7 @@ impl Agent {
             }
         }
 
-        best_result
+        Ok(best_result)
     }
 }
 
@@ -1751,7 +1811,8 @@ impl Clone for Agent {
 mod tests {
     use super::*;
     use crate::handler::{
-        BoxFuture, GetNextResult, GetResult, MibHandler, RequestContext, SecurityModel, SetResult,
+        BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler,
+        RequestContext, SecurityModel, SetResult,
     };
     use crate::message::SecurityLevel;
     use crate::oid;
@@ -1759,15 +1820,21 @@ mod tests {
     struct TestHandler;
 
     impl MibHandler for TestHandler {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
             Box::pin(async move {
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-                    return GetResult::Value(Value::Integer(42));
+                    return Ok(GetResult::Value(Value::Integer(42)));
                 }
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
-                    return GetResult::Value(Value::OctetString(Bytes::from_static(b"test")));
+                    return Ok(GetResult::Value(Value::OctetString(Bytes::from_static(
+                        b"test",
+                    ))));
                 }
-                GetResult::NoSuchObject
+                Ok(GetResult::NoSuchObject)
             })
         }
 
@@ -1775,21 +1842,21 @@ mod tests {
             &'a self,
             _ctx: &'a RequestContext,
             oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
             Box::pin(async move {
                 let oid1 = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
                 let oid2 = oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0);
 
                 if oid < &oid1 {
-                    return GetNextResult::Value(VarBind::new(oid1, Value::Integer(42)));
+                    return Ok(GetNextResult::Value(VarBind::new(oid1, Value::Integer(42))));
                 }
                 if oid < &oid2 {
-                    return GetNextResult::Value(VarBind::new(
+                    return Ok(GetNextResult::Value(VarBind::new(
                         oid2,
                         Value::OctetString(Bytes::from_static(b"test")),
-                    ));
+                    )));
                 }
-                GetNextResult::EndOfMibView
+                Ok(GetNextResult::EndOfMibView)
             })
         }
     }
@@ -1898,13 +1965,15 @@ mod tests {
         // Existing OID
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::Value(Value::Integer(42))));
 
         // Non-existing OID
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 4, 1, 99999, 99, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(result, GetResult::NoSuchObject));
     }
 
@@ -1915,7 +1984,10 @@ mod tests {
         ctx.pdu_type = PduType::GetNextRequest;
 
         // Before first OID
-        let next = handler.get_next(&ctx, &oid!(1, 3, 6, 1, 4, 1, 99999)).await;
+        let next = handler
+            .get_next(&ctx, &oid!(1, 3, 6, 1, 4, 1, 99999))
+            .await
+            .unwrap();
         assert!(next.is_value());
         if let GetNextResult::Value(vb) = next {
             assert_eq!(vb.oid, oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0));
@@ -1924,7 +1996,8 @@ mod tests {
         // Between OIDs
         let next = handler
             .get_next(&ctx, &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(next.is_value());
         if let GetNextResult::Value(vb) = next {
             assert_eq!(vb.oid, oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0));
@@ -1933,22 +2006,26 @@ mod tests {
         // After last OID
         let next = handler
             .get_next(&ctx, &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(next.is_end_of_mib_view());
     }
 
-    // FiveOidHandler has OIDs at .99999.{1,2,3,4,5}.0 with integer values 1-5.
-    struct FiveOidHandler;
+    // Serves .99999.1.0 and fails everything past it, simulating a backing
+    // store that is reachable for the first object and down for the rest.
+    struct FailingBackendHandler;
 
-    impl MibHandler for FiveOidHandler {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+    impl MibHandler for FailingBackendHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
             Box::pin(async move {
-                for i in 1u16..=5 {
-                    if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, i.into(), 0) {
-                        return GetResult::Value(Value::Integer(i.into()));
-                    }
+                if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
+                    return Ok(GetResult::Value(Value::Integer(1)));
                 }
-                GetResult::NoSuchObject
+                Err(HandlerError::new("backing store unavailable"))
             })
         }
 
@@ -1956,18 +2033,160 @@ mod tests {
             &'a self,
             _ctx: &'a RequestContext,
             oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async move {
+                let first = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
+                if oid < &first {
+                    return Ok(GetNextResult::Value(VarBind::new(first, Value::Integer(1))));
+                }
+                Err(HandlerError::new("backing store unavailable"))
+            })
+        }
+    }
+
+    async fn failing_backend_agent() -> Agent {
+        AgentBuilder::new()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999),
+                Arc::new(FailingBackendHandler),
+            )
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_handler_error_maps_to_generr() {
+        let agent = failing_backend_agent().await;
+        let ctx = test_ctx();
+
+        // First varbind succeeds, second hits the failing backend: RFC 3416
+        // Section 4.2.1 requires genErr with error-index of the failing varbind
+        // and the request varbinds echoed.
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0), Value::Null),
+            ],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index, 2);
+        assert_eq!(response.varbinds.len(), 2);
+        assert_eq!(response.varbinds[0].oid, pdu.varbinds[0].oid);
+    }
+
+    #[tokio::test]
+    async fn test_get_v1_handler_error_maps_to_generr() {
+        let agent = failing_backend_agent().await;
+        let mut ctx = test_ctx();
+        ctx.version = Version::V1;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 2,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
+                Value::Null,
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_getnext_handler_error_maps_to_generr() {
+        let agent = failing_backend_agent().await;
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetNextRequest;
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetNextRequest,
+            request_id: 3,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Null,
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_getbulk_handler_error_maps_to_generr() {
+        let agent = failing_backend_agent().await;
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+
+        // Non-repeater resolves to .1.0; the repeater's first GETNEXT fails.
+        // error-index refers to the varbind position in the received request
+        // (RFC 3416 Section 4.2.3), here 2, regardless of repetition count.
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 4,
+            error_status: 1, // non_repeaters
+            error_index: 5,  // max_repetitions
+            varbinds: vec![
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null),
+                VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null),
+            ],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index, 2);
+    }
+
+    // FiveOidHandler has OIDs at .99999.{1,2,3,4,5}.0 with integer values 1-5.
+    struct FiveOidHandler;
+
+    impl MibHandler for FiveOidHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async move {
+                for i in 1u16..=5 {
+                    if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, i.into(), 0) {
+                        return Ok(GetResult::Value(Value::Integer(i.into())));
+                    }
+                }
+                Ok(GetResult::NoSuchObject)
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
             Box::pin(async move {
                 for i in 1u32..=5 {
                     let candidate = oid!(1, 3, 6, 1, 4, 1, 99999, i, 0);
                     if oid < &candidate {
-                        return GetNextResult::Value(VarBind::new(
+                        return Ok(GetNextResult::Value(VarBind::new(
                             candidate,
                             Value::Integer(i as i32),
-                        ));
+                        )));
                     }
                 }
-                GetNextResult::EndOfMibView
+                Ok(GetNextResult::EndOfMibView)
             })
         }
     }
@@ -2091,22 +2310,26 @@ mod tests {
     }
 
     impl MibHandler for CountingRangeHandler {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetResult> {
-            Box::pin(async move { GetResult::NoSuchObject })
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async move { Ok(GetResult::NoSuchObject) })
         }
 
         fn get_next<'a>(
             &'a self,
             _ctx: &'a RequestContext,
             _oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
             Box::pin(async move {
                 // Nth call returns .99999.1.N; N strictly increases each call, so
                 // the returned OID is always greater than the previous one (the
                 // current search cursor), keeping the walk monotonically advancing.
                 let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let next = Oid::from_slice(&[1, 3, 6, 1, 4, 1, 99999, 1]).child(n as u32);
-                GetNextResult::Value(VarBind::new(next, Value::Integer(1)))
+                Ok(GetNextResult::Value(VarBind::new(next, Value::Integer(1))))
             })
         }
     }
@@ -2168,18 +2391,22 @@ mod tests {
     struct ThreeOidHandler;
 
     impl MibHandler for ThreeOidHandler {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
             Box::pin(async move {
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-                    return GetResult::Value(Value::Integer(1));
+                    return Ok(GetResult::Value(Value::Integer(1)));
                 }
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
-                    return GetResult::Value(Value::Integer(2));
+                    return Ok(GetResult::Value(Value::Integer(2)));
                 }
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0) {
-                    return GetResult::Value(Value::Integer(3));
+                    return Ok(GetResult::Value(Value::Integer(3)));
                 }
-                GetResult::NoSuchObject
+                Ok(GetResult::NoSuchObject)
             })
         }
 
@@ -2187,22 +2414,22 @@ mod tests {
             &'a self,
             _ctx: &'a RequestContext,
             oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
             Box::pin(async move {
                 let oid1 = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
                 let oid2 = oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0);
                 let oid3 = oid!(1, 3, 6, 1, 4, 1, 99999, 3, 0);
 
                 if oid < &oid1 {
-                    return GetNextResult::Value(VarBind::new(oid1, Value::Integer(1)));
+                    return Ok(GetNextResult::Value(VarBind::new(oid1, Value::Integer(1))));
                 }
                 if oid < &oid2 {
-                    return GetNextResult::Value(VarBind::new(oid2, Value::Integer(2)));
+                    return Ok(GetNextResult::Value(VarBind::new(oid2, Value::Integer(2))));
                 }
                 if oid < &oid3 {
-                    return GetNextResult::Value(VarBind::new(oid3, Value::Integer(3)));
+                    return Ok(GetNextResult::Value(VarBind::new(oid3, Value::Integer(3))));
                 }
-                GetNextResult::EndOfMibView
+                Ok(GetNextResult::EndOfMibView)
             })
         }
     }
@@ -2365,15 +2592,19 @@ mod tests {
     struct Counter64Handler;
 
     impl MibHandler for Counter64Handler {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
             Box::pin(async move {
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-                    return GetResult::Value(Value::Counter64(1_000_000_000_000));
+                    return Ok(GetResult::Value(Value::Counter64(1_000_000_000_000)));
                 }
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
-                    return GetResult::Value(Value::Integer(42));
+                    return Ok(GetResult::Value(Value::Integer(42)));
                 }
-                GetResult::NoSuchObject
+                Ok(GetResult::NoSuchObject)
             })
         }
 
@@ -2381,21 +2612,21 @@ mod tests {
             &'a self,
             _ctx: &'a RequestContext,
             oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
             Box::pin(async move {
                 let oid1 = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
                 let oid2 = oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0);
 
                 if oid < &oid1 {
-                    return GetNextResult::Value(VarBind::new(
+                    return Ok(GetNextResult::Value(VarBind::new(
                         oid1,
                         Value::Counter64(1_000_000_000_000),
-                    ));
+                    )));
                 }
                 if oid < &oid2 {
-                    return GetNextResult::Value(VarBind::new(oid2, Value::Integer(42)));
+                    return Ok(GetNextResult::Value(VarBind::new(oid2, Value::Integer(42))));
                 }
-                GetNextResult::EndOfMibView
+                Ok(GetNextResult::EndOfMibView)
             })
         }
     }
@@ -2684,17 +2915,24 @@ mod tests {
     struct MixedSizeHandler;
 
     impl MibHandler for MixedSizeHandler {
-        fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
             Box::pin(async move {
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)
                     || oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0)
                 {
-                    return GetResult::Value(Value::OctetString(Bytes::from(vec![0xAB; 200])));
+                    return Ok(GetResult::Value(Value::OctetString(Bytes::from(vec![
+                        0xAB;
+                        200
+                    ]))));
                 }
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 9, 0) {
-                    return GetResult::Value(Value::Integer(7));
+                    return Ok(GetResult::Value(Value::Integer(7)));
                 }
-                GetResult::NoSuchObject
+                Ok(GetResult::NoSuchObject)
             })
         }
 
@@ -2702,27 +2940,27 @@ mod tests {
             &'a self,
             _ctx: &'a RequestContext,
             oid: &'a Oid,
-        ) -> BoxFuture<'a, GetNextResult> {
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
             Box::pin(async move {
                 let big1 = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
                 let big2 = oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0);
                 let small = oid!(1, 3, 6, 1, 4, 1, 99999, 9, 0);
                 if oid < &big1 {
-                    return GetNextResult::Value(VarBind::new(
+                    return Ok(GetNextResult::Value(VarBind::new(
                         big1,
                         Value::OctetString(Bytes::from(vec![0xAB; 200])),
-                    ));
+                    )));
                 }
                 if oid < &big2 {
-                    return GetNextResult::Value(VarBind::new(
+                    return Ok(GetNextResult::Value(VarBind::new(
                         big2,
                         Value::OctetString(Bytes::from(vec![0xAB; 200])),
-                    ));
+                    )));
                 }
                 if oid < &small {
-                    return GetNextResult::Value(VarBind::new(small, Value::Integer(7)));
+                    return Ok(GetNextResult::Value(VarBind::new(small, Value::Integer(7))));
                 }
-                GetNextResult::EndOfMibView
+                Ok(GetNextResult::EndOfMibView)
             })
         }
     }
@@ -3148,7 +3386,8 @@ mod tests {
         let get_result = handler
             .handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(get_result, GetResult::Value(Value::Integer(_))));
 
         // usmStatsWrongDigests.0 should be queryable
@@ -3158,7 +3397,8 @@ mod tests {
         let get_result = handler
             .handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(get_result, GetResult::Value(Value::Counter32(0))));
 
         // snmpUnknownSecurityModels.0 should be queryable
@@ -3168,7 +3408,8 @@ mod tests {
         let get_result = handler
             .handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(get_result, GetResult::Value(Value::Counter32(0))));
     }
 

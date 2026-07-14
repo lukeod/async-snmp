@@ -11,7 +11,7 @@ use crate::oid::Oid;
 /// # Example
 ///
 /// ```rust
-/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, OidTable, BoxFuture};
+/// use async_snmp::handler::{MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, OidTable, BoxFuture};
 /// use async_snmp::{Oid, Value, VarBind, oid};
 ///
 /// struct MyHandler {
@@ -28,20 +28,20 @@ use crate::oid::Oid;
 /// }
 ///
 /// impl MibHandler for MyHandler {
-///     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+///     fn get<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetResult>> {
 ///         Box::pin(async move {
-///             self.table.get(oid)
+///             Ok(self.table.get(oid)
 ///                 .cloned()
 ///                 .map(GetResult::Value)
-///                 .unwrap_or(GetResult::NoSuchObject)
+///                 .unwrap_or(GetResult::NoSuchObject))
 ///         })
 ///     }
 ///
-///     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, GetNextResult> {
+///     fn get_next<'a>(&'a self, _ctx: &'a RequestContext, oid: &'a Oid) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
 ///         Box::pin(async move {
-///             self.table.get_next(oid)
+///             Ok(self.table.get_next(oid)
 ///                 .map(|(next_oid, value)| GetNextResult::Value(VarBind::new(next_oid.clone(), value.clone())))
-///                 .unwrap_or(GetNextResult::EndOfMibView)
+///                 .unwrap_or(GetNextResult::EndOfMibView))
 ///         })
 ///     }
 /// }
