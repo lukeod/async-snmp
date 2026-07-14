@@ -94,6 +94,22 @@ impl UsmConfig {
         }
     }
 
+    /// Validate the credential configuration.
+    ///
+    /// Rejects privacy without authentication: RFC 3411 requires
+    /// authentication whenever privacy is selected. Mirrors the client
+    /// builder validation so that agent and notification-receiver USM users
+    /// cannot be silently downgraded to noAuthNoPriv with the privacy key
+    /// dropped.
+    pub(crate) fn validate(&self) -> crate::error::Result<()> {
+        if self.privacy.is_some() && self.auth.is_none() {
+            return Err(
+                crate::error::Error::Config("privacy requires authentication".into()).boxed(),
+            );
+        }
+        Ok(())
+    }
+
     /// Derive localized keys for a specific engine ID.
     ///
     /// If master keys are configured, uses the cached master keys for efficient

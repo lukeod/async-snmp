@@ -678,6 +678,11 @@ impl AgentBuilder {
 
     /// Build the agent.
     pub async fn build(mut self) -> Result<Agent> {
+        // Reject any USM user configured with privacy but no authentication.
+        for config in self.usm_users.values() {
+            config.validate()?;
+        }
+
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
@@ -1772,6 +1777,24 @@ mod tests {
         let builder =
             AgentBuilder::new().handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler));
         assert_eq!(builder.handlers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_agent_builder_rejects_privacy_without_auth() {
+        let result = AgentBuilder::new()
+            .bind("127.0.0.1:0")
+            .usm_user("noauth", |u| {
+                u.privacy(crate::v3::PrivProtocol::Aes128, b"privpass")
+            })
+            .build()
+            .await;
+        match result {
+            Err(err) => assert!(
+                matches!(*err, Error::Config(_)),
+                "expected Config error, got {err:?}"
+            ),
+            Ok(_) => panic!("privacy without auth must be rejected"),
+        }
     }
 
     #[tokio::test]

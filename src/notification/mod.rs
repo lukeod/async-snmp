@@ -369,6 +369,11 @@ impl NotificationReceiverBuilder {
 
     /// Build the notification receiver.
     pub async fn build(self) -> Result<NotificationReceiver> {
+        // Reject any USM user configured with privacy but no authentication.
+        for config in self.usm_users.values() {
+            config.validate()?;
+        }
+
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
@@ -922,6 +927,24 @@ mod tests {
             .get(&Bytes::from_static(b"trapuser"))
             .unwrap();
         assert_eq!(user.security_level(), SecurityLevel::AuthNoPriv);
+    }
+
+    #[tokio::test]
+    async fn test_receiver_builder_rejects_privacy_without_auth() {
+        let result = NotificationReceiverBuilder::new()
+            .bind("127.0.0.1:0")
+            .usm_user("noauth", |u| {
+                u.privacy(crate::v3::PrivProtocol::Aes128, b"privpass")
+            })
+            .build()
+            .await;
+        match result {
+            Err(err) => assert!(
+                matches!(*err, Error::Config(_)),
+                "expected Config error, got {err:?}"
+            ),
+            Ok(_) => panic!("privacy without auth must be rejected"),
+        }
     }
 
     #[test]
