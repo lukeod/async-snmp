@@ -475,6 +475,9 @@ impl AgentBuilder {
     ///
     /// This controls memory usage under high load while still allowing
     /// parallel request processing.
+    ///
+    /// A limit of `Some(0)` is invalid (it would permit no requests and wedge
+    /// the agent) and is rejected by [`AgentBuilder::build`].
     #[must_use]
     pub fn max_concurrent_requests(mut self, limit: Option<usize>) -> Self {
         self.max_concurrent_requests = limit;
@@ -715,7 +718,13 @@ impl AgentBuilder {
 
         let cancel = self.cancel.unwrap_or_default();
 
-        // Create concurrency limiter if configured
+        // Create concurrency limiter if configured. A zero-permit semaphore
+        // would never grant a permit and wedge the agent, so reject it.
+        if self.max_concurrent_requests == Some(0) {
+            return Err(
+                Error::Config("max_concurrent_requests must be greater than 0".into()).into(),
+            );
+        }
         let concurrency_limit = self
             .max_concurrent_requests
             .map(|n| Arc::new(Semaphore::new(n)));
@@ -1080,7 +1089,15 @@ impl Agent {
             let agent = self.clone();
 
             let permit = if let Some(ref sem) = self.inner.concurrency_limit {
-                Some(sem.clone().acquire_owned().await.expect("semaphore closed"))
+                tokio::select! {
+                    result = sem.clone().acquire_owned() => {
+                        Some(result.expect("semaphore closed"))
+                    }
+                    () = self.inner.cancel.cancelled() => {
+                        tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
+                        return Ok(());
+                    }
+                }
             } else {
                 None
             };
@@ -2826,6 +2843,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(agent.engine_boots(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_zero_max_concurrent_requests_rejected() {
+        // A zero-permit concurrency limit would never grant a permit and wedge
+        // the agent on the first packet, so the builder must reject it.
+        let result = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_concurrent_requests(Some(0))
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(matches!(*err, Error::Config(_)));
     }
 
     #[tokio::test]
