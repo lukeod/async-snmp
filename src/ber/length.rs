@@ -191,6 +191,14 @@ pub(crate) fn parse_ber_length(data: &[u8]) -> Option<(usize, usize)> {
         len = (len << 8) | (data[1 + i] as usize);
     }
 
+    // Reject lengths that exceed the sanity cap or the remaining buffer,
+    // matching decode_length. Without this, an attacker-controlled length
+    // (e.g. eight 0xFF octets producing usize::MAX) causes overflow/panic
+    // in callers that compute `pos + len`.
+    if len > MAX_LENGTH || len > data.len() - (1 + num_octets) {
+        return None;
+    }
+
     Some((len, 1 + num_octets))
 }
 
@@ -416,6 +424,37 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ber_length_rejects_oversized() {
+        // Long-form length of usize::MAX (0x88 + eight 0xFF octets) must be
+        // rejected rather than returned, which would overflow `pos + len`
+        // arithmetic in callers.
+        let huge = [0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(parse_ber_length(&huge), None);
+
+        // Long-form length exceeding MAX_LENGTH is rejected even with a
+        // plausible encoding.
+        let over = MAX_LENGTH + 1;
+        let over_bytes = [
+            0x84,
+            ((over >> 24) & 0xFF) as u8,
+            ((over >> 16) & 0xFF) as u8,
+            ((over >> 8) & 0xFF) as u8,
+            (over & 0xFF) as u8,
+        ];
+        assert_eq!(parse_ber_length(&over_bytes), None);
+
+        // Long-form length exceeding the remaining buffer is rejected.
+        // 0x81 0x05 claims 5 content bytes but only 2 follow.
+        assert_eq!(parse_ber_length(&[0x81, 0x05, 0x00, 0x00]), None);
+
+        // Long-form length that exactly matches the remaining buffer is
+        // accepted. 0x81 0x80 = 128 content bytes.
+        let mut ok = vec![0x81, 0x80];
+        ok.extend(std::iter::repeat_n(0u8, 128));
+        assert_eq!(parse_ber_length(&ok), Some((128, 2)));
     }
 
     #[test]

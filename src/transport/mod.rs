@@ -436,4 +436,22 @@ mod extract_tests {
         assert_eq!(extract_request_id(&[0x02, 0x01, 0x00]), None);
         assert_eq!(extract_request_id(&[0x30, 0x10]), None);
     }
+
+    #[test]
+    fn test_extract_request_id_huge_long_form_length() {
+        // Regression: request-id INTEGER with long-form length 0x88 followed by
+        // eight 0xFF octets decodes to usize::MAX. Without a cap in
+        // parse_ber_length, `pos + id_len` overflows and slicing panics,
+        // killing the recv task.
+        let malicious = [
+            0x30, 0x0c, // SEQUENCE
+            0x02, 0x01, 0x01, // INTEGER 1 (v2c)
+            0x04, 0x00, // empty community
+            0xa2, 0x0b, // Response PDU
+            0x02, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, // INTEGER, length usize::MAX
+        ];
+
+        assert_eq!(extract_request_id(&malicious), None);
+    }
 }
