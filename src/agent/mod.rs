@@ -127,6 +127,13 @@ const V3_AUTH_OVERHEAD: usize = 48;
 /// scopedPDU, and up to a full DES/AES block of CBC padding.
 const V3_PRIV_OVERHEAD: usize = 20;
 
+/// Maximum number of VACM-denied OIDs skipped while advancing a single GETNEXT
+/// step before giving up and reporting end-of-MIB for that varbind. Without a
+/// cap, a request spanning a large denied range forces O(range) backing-store
+/// lookups per step, a CPU-DoS shape. When the cap is hit the scan for that
+/// varbind ends rather than continuing to probe.
+const MAX_VACM_SKIP_ITERATIONS: usize = 1000;
+
 /// RFC 2576 Section 4.1.2.3: SNMPv1 has no Counter64 type, so a Counter64
 /// value cannot be carried in a v1 response varbind. GET responds with
 /// noSuchName; GETNEXT/GETBULK skip the offending varbind.
@@ -1643,7 +1650,7 @@ impl Agent {
         from_oid: &Oid,
     ) -> Option<VarBind> {
         let mut search_from = from_oid.clone();
-        loop {
+        for _ in 0..MAX_VACM_SKIP_ITERATIONS {
             let candidate = self.get_next_oid(ctx, &search_from).await;
             match candidate {
                 None => return None,
@@ -1672,6 +1679,15 @@ impl Agent {
                 }
             }
         }
+        // Skip cap reached: treat as end-of-MIB for this varbind rather than
+        // continuing to probe an unboundedly large denied range.
+        tracing::warn!(
+            target: "async_snmp::agent",
+            from = %from_oid,
+            cap = MAX_VACM_SKIP_ITERATIONS,
+            "VACM skip cap reached in GETNEXT; ending scan for this varbind"
+        );
+        None
     }
 
     /// Get the next OID from any handler.
@@ -2048,6 +2064,88 @@ mod tests {
 
         // Second non-repeater walks to .99999.5.0 (denied), then end-of-MIB
         assert_eq!(response.varbinds[1].value, Value::EndOfMibView);
+    }
+
+    /// Handler exposing an effectively unbounded range of OIDs under
+    /// .99999.1.<n>, counting every `get_next` call. Used to exercise the VACM
+    /// skip cap: every OID it returns is denied by the accompanying view, so a
+    /// single GETNEXT step would loop forever without the bound.
+    struct CountingRangeHandler {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MibHandler for CountingRangeHandler {
+        fn get<'a>(&'a self, _ctx: &'a RequestContext, _oid: &'a Oid) -> BoxFuture<'a, GetResult> {
+            Box::pin(async move { GetResult::NoSuchObject })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, GetNextResult> {
+            Box::pin(async move {
+                // Nth call returns .99999.1.N; N strictly increases each call, so
+                // the returned OID is always greater than the previous one (the
+                // current search cursor), keeping the walk monotonically advancing.
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let next = Oid::from_slice(&[1, 3, 6, 1, 4, 1, 99999, 1]).child(n as u32);
+                GetNextResult::Value(VarBind::new(next, Value::Integer(1)))
+            })
+        }
+    }
+
+    // Regression: a GETNEXT over a large denied range must not make an unbounded
+    // number of backing-store lookups. The skip loop is capped, so the handler
+    // is called at most MAX_VACM_SKIP_ITERATIONS times per varbind and the step
+    // resolves to end-of-MIB instead of looping.
+    #[tokio::test]
+    async fn test_getnext_vacm_denied_range_is_capped() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999),
+                Arc::new(CountingRangeHandler {
+                    calls: calls.clone(),
+                }),
+            )
+            // View includes an unrelated subtree only, so every OID the handler
+            // returns under .99999 is denied.
+            .vacm(|v| {
+                v.group("public", SecurityModel::V2c, "readers")
+                    .access("readers", |a| a.read_view("restricted"))
+                    .view("restricted", |v| v.include(oid!(1, 3, 6, 1, 4, 1, 88888)))
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetNextRequest;
+        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+
+        let pdu = Pdu {
+            pdu_type: PduType::GetNextRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+
+        // The step resolves to end-of-MIB rather than returning a denied OID.
+        assert_eq!(response.varbinds.len(), 1);
+        assert_eq!(response.varbinds[0].value, Value::EndOfMibView);
+
+        // The skip loop is bounded: the handler is not called unboundedly.
+        let total = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            total <= MAX_VACM_SKIP_ITERATIONS,
+            "handler called {total} times, expected <= {MAX_VACM_SKIP_ITERATIONS}"
+        );
     }
 
     // TestHandler with three OIDs: .99999.1.0, .99999.2.0, .99999.3.0
