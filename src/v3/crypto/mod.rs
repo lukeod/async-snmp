@@ -33,6 +33,11 @@ pub enum CryptoError {
     CipherError,
     /// The OS random source is unavailable.
     RandomSource,
+    /// The supplied password is shorter than the RFC 3414 minimum (8 octets).
+    ///
+    /// RFC 3414 Section 11.2 requires passwords of at least 8 octets, and
+    /// net-snmp rejects shorter passwords with `USM_PASSWORDTOOSHORT`.
+    PasswordTooShort,
 }
 
 impl std::fmt::Display for CryptoError {
@@ -44,6 +49,10 @@ impl std::fmt::Display for CryptoError {
             Self::InvalidKeyLength => write!(f, "invalid key length"),
             Self::CipherError => write!(f, "cipher operation failed"),
             Self::RandomSource => write!(f, "OS random source unavailable"),
+            Self::PasswordTooShort => write!(
+                f,
+                "password is shorter than the RFC 3414 minimum of 8 octets"
+            ),
         }
     }
 }

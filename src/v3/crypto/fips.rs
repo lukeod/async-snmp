@@ -50,8 +50,8 @@ impl CryptoProvider for AwsLcFipsProvider {
 
         let alg = digest_algorithm(protocol)?;
 
-        if password.is_empty() {
-            return Ok(vec![0u8; protocol.digest_len()]);
+        if password.len() < crate::v3::auth::MIN_PASSWORD_LENGTH {
+            return Err(CryptoError::PasswordTooShort);
         }
         let mut ctx = digest::Context::new(alg);
 

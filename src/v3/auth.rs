@@ -35,11 +35,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use super::AuthProtocol;
 use super::crypto::{CryptoProvider, CryptoResult};
 
-/// Minimum password length recommended by net-snmp.
+/// Minimum password length required for password-based key derivation.
 ///
-/// Net-snmp rejects passwords shorter than 8 characters with `USM_PASSWORDTOOSHORT`.
-/// While this library accepts shorter passwords for flexibility, applications should
-/// enforce this minimum for security.
+/// RFC 3414 Section 11.2 requires passwords of at least 8 octets, and net-snmp
+/// rejects shorter passwords with `USM_PASSWORDTOOSHORT`. Password-based key
+/// derivation entry points reject passwords shorter than this with
+/// [`CryptoError::PasswordTooShort`](super::CryptoError::PasswordTooShort).
 pub const MIN_PASSWORD_LENGTH: usize = 8;
 
 /// Master authentication key (Ku) before engine localization.
@@ -100,12 +101,15 @@ impl MasterKey {
     ///
     /// # Empty and Short Passwords
     ///
-    /// Empty passwords result in an all-zero key. A warning is logged when
-    /// the password is shorter than [`MIN_PASSWORD_LENGTH`] (8 characters).
+    /// Passwords shorter than [`MIN_PASSWORD_LENGTH`] (8 octets) are rejected
+    /// with [`CryptoError::PasswordTooShort`](super::CryptoError::PasswordTooShort),
+    /// matching RFC 3414 Section 11.2 and net-snmp's `USM_PASSWORDTOOSHORT`.
+    /// This does not affect pre-derived key constructors such as
+    /// [`from_bytes`](Self::from_bytes), which take key material rather than a
+    /// plaintext password.
     pub fn from_password(protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Self> {
         if password.len() < MIN_PASSWORD_LENGTH {
-            tracing::warn!(target: "async_snmp::v3", { password_len = password.len(), min_len = MIN_PASSWORD_LENGTH }, "SNMPv3 password is shorter than recommended minimum; \
-                 net-snmp rejects passwords shorter than 8 characters");
+            return Err(super::CryptoError::PasswordTooShort);
         }
         let key = password_to_key(protocol, password)?;
         Ok(Self { key, protocol })
@@ -212,13 +216,9 @@ impl LocalizedKey {
     ///
     /// # Empty and Short Passwords
     ///
-    /// Empty passwords result in an all-zero key of the appropriate length for
-    /// the authentication protocol. This differs from net-snmp, which rejects
-    /// passwords shorter than 8 characters with `USM_PASSWORDTOOSHORT`.
-    ///
-    /// While empty/short passwords are accepted for flexibility, they provide
-    /// minimal security. A warning is logged at the `WARN` level when the
-    /// password is shorter than [`MIN_PASSWORD_LENGTH`] (8 characters).
+    /// Passwords shorter than [`MIN_PASSWORD_LENGTH`] (8 octets) are rejected
+    /// with [`CryptoError::PasswordTooShort`](super::CryptoError::PasswordTooShort),
+    /// matching RFC 3414 Section 11.2 and net-snmp's `USM_PASSWORDTOOSHORT`.
     pub fn from_password(
         protocol: AuthProtocol,
         password: &[u8],
@@ -815,10 +815,56 @@ mod tests {
 
     #[cfg(feature = "crypto-rustcrypto")]
     #[test]
-    fn test_empty_password() {
-        let key = password_to_key(AuthProtocol::Md5, b"").unwrap();
-        assert_eq!(key.len(), 16);
-        assert!(key.iter().all(|&b| b == 0));
+    fn test_empty_password_rejected() {
+        // RFC 3414 §11.2 / net-snmp USM_PASSWORDTOOSHORT: an empty password
+        // must be rejected rather than deriving an all-zero key.
+        assert_eq!(
+            password_to_key(AuthProtocol::Md5, b""),
+            Err(super::super::CryptoError::PasswordTooShort)
+        );
+    }
+
+    #[test]
+    fn test_short_password_rejected() {
+        // A 7-octet password is below the RFC 3414 minimum of 8 and must be
+        // rejected at every plaintext-password derivation entry point.
+        let engine_id = decode_hex("000000000000000000000002").unwrap();
+        let short = b"1234567"; // 7 octets
+
+        assert_eq!(
+            MasterKey::from_password(AuthProtocol::Sha1, short),
+            Err(super::super::CryptoError::PasswordTooShort)
+        );
+        assert_eq!(
+            LocalizedKey::from_password(AuthProtocol::Sha1, short, &engine_id).err(),
+            Some(super::super::CryptoError::PasswordTooShort)
+        );
+        assert_eq!(
+            MasterKeys::new(AuthProtocol::Sha1, short),
+            Err(super::super::CryptoError::PasswordTooShort)
+        );
+    }
+
+    #[test]
+    fn test_min_length_password_accepted() {
+        // An exactly-8-octet password meets the minimum and must succeed.
+        let engine_id = decode_hex("000000000000000000000002").unwrap();
+        let ok = b"12345678"; // 8 octets
+
+        assert!(MasterKey::from_password(AuthProtocol::Sha1, ok).is_ok());
+        assert!(LocalizedKey::from_password(AuthProtocol::Sha1, ok, &engine_id).is_ok());
+        assert!(MasterKeys::new(AuthProtocol::Sha1, ok).is_ok());
+    }
+
+    #[test]
+    fn test_from_bytes_bypasses_length_check() {
+        // Pre-derived key constructors take key material, not a plaintext
+        // password, and must remain unaffected by the length check.
+        let short_key = vec![0xAAu8; 4];
+        let master = MasterKey::from_bytes(AuthProtocol::Sha1, short_key.clone());
+        assert_eq!(master.as_bytes(), short_key.as_slice());
+        let localized = LocalizedKey::from_bytes(AuthProtocol::Sha1, short_key.clone());
+        assert_eq!(localized.as_bytes(), short_key.as_slice());
     }
 
     #[test]

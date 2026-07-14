@@ -29,6 +29,9 @@ impl CryptoProvider for RustCryptoProvider {
 
     fn password_to_key(&self, protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Vec<u8>> {
         const EXPANSION_SIZE: usize = 1_048_576; // 1MB
+        if password.len() < crate::v3::auth::MIN_PASSWORD_LENGTH {
+            return Err(CryptoError::PasswordTooShort);
+        }
         Ok(dispatch_auth!(
             protocol,
             password_to_key_impl,
