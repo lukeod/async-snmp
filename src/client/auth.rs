@@ -35,7 +35,10 @@ pub enum CommunityVersion {
 }
 
 /// Authentication configuration for SNMP clients.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// The [`Debug`] implementation redacts community strings so that credentials
+/// are not leaked through logs or diagnostics.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Auth {
     /// Community string authentication (`SNMPv1` or v2c).
     Community {
@@ -133,7 +136,10 @@ impl Auth {
 }
 
 /// `SNMPv3` USM authentication parameters.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// The [`Debug`] implementation redacts the authentication and privacy
+/// passwords so that credentials are not leaked through logs or diagnostics.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UsmAuth {
     /// `SNMPv3` username
     pub username: String,
@@ -154,7 +160,9 @@ pub struct UsmAuth {
 }
 
 /// Builder for `SNMPv3` USM authentication.
-#[derive(Debug)]
+///
+/// The [`Debug`] implementation redacts the authentication and privacy
+/// passwords so that credentials are not leaked through logs or diagnostics.
 pub struct UsmBuilder {
     username: String,
     auth: Option<(AuthProtocol, String)>,
@@ -314,6 +322,66 @@ impl From<UsmBuilder> for Auth {
     }
 }
 
+/// Placeholder printed in place of a redacted secret value.
+const REDACTED: &str = "[REDACTED]";
+
+/// Formats an `Option<String>` secret as either `None` or a redacted marker,
+/// never printing the underlying value.
+fn redact_opt(value: &Option<String>) -> &'static str {
+    match value {
+        Some(_) => REDACTED,
+        None => "None",
+    }
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::Community { version, .. } => f
+                .debug_struct("Auth::Community")
+                .field("version", version)
+                .field("community", &REDACTED)
+                .finish(),
+            Auth::Usm(usm) => f.debug_tuple("Auth::Usm").field(usm).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for UsmAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsmAuth")
+            .field("username", &self.username)
+            .field("auth_protocol", &self.auth_protocol)
+            .field("auth_password", &redact_opt(&self.auth_password))
+            .field("priv_protocol", &self.priv_protocol)
+            .field("priv_password", &redact_opt(&self.priv_password))
+            .field("context_name", &self.context_name)
+            .field("master_keys", &self.master_keys)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for UsmBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsmBuilder")
+            .field("username", &self.username)
+            .field(
+                "auth",
+                &self.auth.as_ref().map(|(protocol, _)| (protocol, REDACTED)),
+            )
+            .field(
+                "privacy",
+                &self
+                    .privacy
+                    .as_ref()
+                    .map(|(protocol, _)| (protocol, REDACTED)),
+            )
+            .field("context_name", &self.context_name)
+            .field("master_keys", &self.master_keys)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +514,39 @@ mod tests {
             }
             Auth::Community { .. } => panic!("expected Usm variant"),
         }
+    }
+
+    #[test]
+    fn test_debug_redacts_secrets() {
+        // Community string must not appear in Debug output.
+        let community = Auth::v2c("supersecretcommunity");
+        let rendered = format!("{community:?}");
+        assert!(!rendered.contains("supersecretcommunity"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+
+        // USM auth/priv passwords must not appear in Debug output.
+        let builder = Auth::usm("admin")
+            .auth(AuthProtocol::Sha256, "authpassword123")
+            .privacy(PrivProtocol::Aes128, "privpassword456")
+            .context_name("vlan100");
+        let builder_rendered = format!("{builder:?}");
+        assert!(
+            !builder_rendered.contains("authpassword123"),
+            "{builder_rendered}"
+        );
+        assert!(
+            !builder_rendered.contains("privpassword456"),
+            "{builder_rendered}"
+        );
+        // Non-secret fields remain visible.
+        assert!(builder_rendered.contains("admin"), "{builder_rendered}");
+        assert!(builder_rendered.contains("vlan100"), "{builder_rendered}");
+
+        let usm: Auth = builder.into();
+        let usm_rendered = format!("{usm:?}");
+        assert!(!usm_rendered.contains("authpassword123"), "{usm_rendered}");
+        assert!(!usm_rendered.contains("privpassword456"), "{usm_rendered}");
+        assert!(usm_rendered.contains("[REDACTED]"), "{usm_rendered}");
+        assert!(usm_rendered.contains("admin"), "{usm_rendered}");
     }
 }
