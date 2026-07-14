@@ -1294,7 +1294,7 @@ impl Agent {
                 self.handle_get_bulk(ctx, pdu).await
             }
             PduType::SetRequest => self.handle_set(ctx, pdu).await,
-            PduType::InformRequest => self.handle_inform(pdu),
+            PduType::InformRequest => self.handle_inform(ctx, pdu),
             _ => {
                 // Should not happen - filtered earlier
                 Ok(pdu.to_error_response(ErrorStatus::GenErr, 0))
@@ -1311,12 +1311,23 @@ impl Agent {
         clippy::unnecessary_wraps,
         reason = "TODO store received informs, which may be a fallible operation"
     )]
-    #[allow(
-        clippy::unused_self,
-        reason = "TODO store received informs, which may require self"
-    )]
-    fn handle_inform(&self, pdu: &Pdu) -> Result<Pdu> {
-        // Simply acknowledge by returning the same varbinds in a Response
+    fn handle_inform(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+        // Acknowledge by echoing the same varbinds in a Response.
+        //
+        // RFC 3416 Section 4.2.7: an InformRequest is a confirmed-class PDU. If
+        // the echoed Response would exceed the message-size limit, return a
+        // tooBig Response with an empty variable-bindings list rather than
+        // letting the oversized Response be silently dropped. A confirmed-class
+        // sender that never receives a fitting acknowledgement would otherwise
+        // retry indefinitely.
+        if !Self::response_fits(
+            &pdu.varbinds,
+            self.response_overhead(ctx),
+            self.effective_max_size(ctx),
+        ) {
+            return Ok(Self::too_big_response(pdu));
+        }
+
         Ok(pdu.to_response())
     }
 
@@ -3182,6 +3193,59 @@ mod tests {
         assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
         assert_eq!(response.error_index, 0);
         assert!(response.varbinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_inform_too_big_returns_toobig_response() {
+        let agent = small_limit_agent().await;
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::InformRequest;
+
+        // An InformRequest whose echoed Response would exceed the 150-byte
+        // effective limit. RFC 3416 Section 4.2.7 (confirmed-class) requires a
+        // fitting tooBig acknowledgement rather than silently dropping the
+        // oversized echo, which would make a confirmed-class sender retry
+        // indefinitely.
+        let big = Value::OctetString(Bytes::from(vec![0xABu8; 256]));
+        let pdu = Pdu {
+            pdu_type: PduType::InformRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), big)],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index, 0);
+        assert!(response.varbinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_inform_within_limit_echoes_varbinds() {
+        let agent = small_limit_agent().await;
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::InformRequest;
+
+        // A small Inform fits within the limit and is acknowledged by echoing
+        // the same varbinds in a Response.
+        let pdu = Pdu {
+            pdu_type: PduType::InformRequest,
+            request_id: 7,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+                Value::Integer(42),
+            )],
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.pdu_type, PduType::Response);
+        assert_eq!(response.error_status, 0);
+        assert_eq!(response.request_id, 7);
+        assert_eq!(response.varbinds.len(), 1);
+        assert!(matches!(response.varbinds[0].value, Value::Integer(42)));
     }
 
     #[tokio::test]
