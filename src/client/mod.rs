@@ -618,6 +618,10 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     } else if response.varbinds.len() < oids.len() {
                         tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has fewer varbinds than requested");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
                     }
                     results.extend(response.varbinds);
                     Ok(())
@@ -1219,8 +1223,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_many_warns_on_truncated_response() {
-        // Request 3 OIDs but the mock returns only 1 varbind - should warn and return what we got.
+    async fn get_many_rejects_truncated_response() {
+        // Request 3 OIDs but the mock returns only 1 varbind - an under-count breaks
+        // positional correspondence and must be rejected (RFC 3416 4.2.1).
         let client = make_client(1);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
@@ -1228,9 +1233,11 @@ mod tests {
             Oid::from_slice(&[1, 3, 6, 1, 3]),
         ];
 
-        let result = client.get_many(&oids).await;
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        assert_eq!(result.unwrap().len(), 1);
+        let err = client.get_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1266,8 +1273,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_next_many_warns_on_truncated_response() {
-        // Request 3 OIDs but the mock returns only 1 varbind - should warn and return what we got.
+    async fn get_next_many_rejects_truncated_response() {
+        // Request 3 OIDs but the mock returns only 1 varbind - an under-count breaks
+        // positional correspondence and must be rejected (RFC 3416 4.2.1).
         let client = make_client(1);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
@@ -1275,9 +1283,11 @@ mod tests {
             Oid::from_slice(&[1, 3, 6, 1, 3]),
         ];
 
-        let result = client.get_next_many(&oids).await;
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        assert_eq!(result.unwrap().len(), 1);
+        let err = client.get_next_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1548,9 +1558,10 @@ mod tests {
 
     // Batched path: get_many with more OIDs than max_per_request.
     #[tokio::test]
-    async fn get_many_batched_warns_on_truncated_response() {
+    async fn get_many_batched_rejects_truncated_response() {
         // max_oids_per_request = 10, request 12 OIDs, mock returns 1 per batch.
-        // Should warn and return 2 varbinds (1 per batch).
+        // The first batch under-counts, breaking positional correspondence, and must
+        // be rejected (RFC 3416 4.2.1).
         let transport = TruncatingTransport::new(1);
         let config = ClientConfig {
             version: Version::V2c,
@@ -1564,9 +1575,11 @@ mod tests {
             .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
             .collect();
 
-        let result = client.get_many(&oids).await;
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        assert_eq!(result.unwrap().len(), 2); // 1 varbind per batch, 2 batches
+        let err = client.get_many(&oids).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "expected MalformedResponse, got: {err}"
+        );
     }
 
     #[tokio::test]
