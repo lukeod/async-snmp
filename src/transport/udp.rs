@@ -460,6 +460,17 @@ impl Transport for UdpHandle {
         Ok(())
     }
 
+    async fn request(&self, data: &[u8], request_id: i32) -> Result<(Bytes, SocketAddr)> {
+        // If the send fails, reclaim the pending slot immediately rather than
+        // leaving it to expire at its deadline or be swept by the periodic
+        // cleanup. The slot was created by register_request before this call.
+        if let Err(e) = self.send(data).await {
+            self.inner.core.unregister(request_id);
+            return Err(e);
+        }
+        self.recv(request_id).await
+    }
+
     async fn recv(&self, request_id: i32) -> Result<(Bytes, SocketAddr)> {
         tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv waiting");
 
@@ -662,6 +673,40 @@ mod tests {
         assert!(
             matches!(*err, Error::Timeout { .. }),
             "expected Error::Timeout, got {err:?}"
+        );
+    }
+
+    // A send failure after register_request must reclaim the pending slot
+    // immediately rather than leaving it to expire at its deadline or be swept
+    // by the periodic cleanup. An oversized datagram (larger than the maximum
+    // UDP payload) makes send_to fail synchronously, exercising that path.
+    #[tokio::test]
+    async fn send_failure_unregisters_pending_slot() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+
+        let request_id = 55;
+        handle.register_request(request_id, Duration::from_secs(30));
+
+        // Payload beyond the maximum UDP datagram size; send_to returns EMSGSIZE.
+        let oversized = vec![0u8; 70_000];
+        let err = handle
+            .request(&oversized, request_id)
+            .await
+            .expect_err("oversized send should fail");
+        assert!(
+            matches!(*err, Error::Network { .. }),
+            "expected Error::Network, got {err:?}"
+        );
+
+        // The slot must already be gone: a response for this id finds nothing.
+        let packet = response_packet(request_id);
+        assert!(
+            !transport
+                .inner
+                .core
+                .deliver(request_id, packet, handle.peer_addr()),
+            "pending slot should have been reclaimed on send failure"
         );
     }
 
