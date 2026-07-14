@@ -199,6 +199,19 @@ impl super::NotificationReceiver {
                 }))
             }
             PduType::InformRequest => {
+                // RFC 3414 Section 1.5.1: the receiver of a Confirmed-class PDU
+                // is the authoritative engine, so an Inform must be localized to
+                // this receiver's local engine ID. Reject an Inform whose
+                // authoritative engine ID is a foreign (e.g. the sender's)
+                // engine: accepting one would acknowledge under, and sign the
+                // ack with keys localized to, an engine other than this
+                // receiver. Unconfirmed-class traps (handled above) remain under
+                // the remote authoritative engine ID and are unaffected.
+                if usm_params.engine_id.as_ref() != self.inner.engine_id.as_ref() {
+                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v3 Inform localized to a foreign authoritative engine ID");
+                    return Ok(None);
+                }
+
                 let (uptime, trap_oid, varbinds) = extract_notification_varbinds(pdu)?;
                 let request_id = pdu.request_id;
 

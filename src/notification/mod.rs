@@ -1620,13 +1620,13 @@ mod tests {
         assert_eq!(receiver.usm_unknown_engine_ids(), 1);
     }
 
-    /// A message under an engine ID other than the receiver's own is treated
-    /// as coming from a remote authoritative engine (RFC 3414 Section 3.2
-    /// Step 7b): authentication uses keys localized to that engine ID and
-    /// timeliness uses per-engine state, so it is accepted rather than
-    /// requiring the receiver to be configured with the sender's engine ID.
+    /// RFC 3414 Section 1.5.1: the receiver of a Confirmed-class PDU is the
+    /// authoritative engine, so an Inform must be localized to this receiver's
+    /// local engine ID. An Inform localized to a foreign (e.g. the sender's)
+    /// authoritative engine ID is rejected rather than acknowledged under that
+    /// foreign engine.
     #[tokio::test]
-    async fn test_v3_inform_under_remote_engine_id_accepted() {
+    async fn test_v3_inform_under_remote_engine_id_rejected() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"my-receiver-engine".to_vec())
@@ -1640,7 +1640,7 @@ mod tests {
 
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        // Build a message with a DIFFERENT engine ID
+        // Build a message with a DIFFERENT (foreign) authoritative engine ID.
         let msg = build_authed_v3_inform(
             b"remote-engine-id",
             1,
@@ -1652,8 +1652,43 @@ mod tests {
 
         let result = receiver.handle_v3(msg, source).await.unwrap();
         assert!(
+            result.is_none(),
+            "inform under a foreign authoritative engine ID should be dropped, got {result:?}"
+        );
+    }
+
+    /// An Inform localized to the receiver's own local engine ID is accepted
+    /// (RFC 3414 Section 1.5.1: the receiver is the authoritative engine for a
+    /// Confirmed-class PDU).
+    #[tokio::test]
+    async fn test_v3_inform_under_local_engine_id_accepted() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        // Localized to the receiver's own engine ID.
+        let msg = build_authed_v3_inform(
+            b"my-receiver-engine",
+            1,
+            0,
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+
+        let result = receiver.handle_v3(msg, source).await.unwrap();
+        assert!(
             matches!(result, Some(Notification::InformV3 { .. })),
-            "authenticated inform under a remote engine ID should be accepted, got {result:?}"
+            "inform under the local engine ID should be accepted, got {result:?}"
         );
     }
 
@@ -1676,9 +1711,11 @@ mod tests {
         let client_addr = client.local_addr().unwrap();
 
         // Inform advertises a small msgMaxSize (1400); the ack must NOT echo it.
+        // The Inform is localized to the receiver's own engine ID, as required
+        // for a Confirmed-class PDU (RFC 3414 Section 1.5.1).
         let msg = build_v3_notification_with_max(
             crate::pdu::PduType::InformRequest,
-            b"remote-engine-id",
+            b"my-receiver-engine",
             1,
             0,
             b"informuser",
@@ -1874,7 +1911,11 @@ mod tests {
 
     /// A stale inform under a remote sender's engine ID (Step 7b) gets no
     /// notInTimeWindows Report even though its reportableFlag is set: the
-    /// receiver is not authoritative for that engine's clock.
+    /// receiver is not authoritative for that engine's clock. Timeliness
+    /// (Step 7b) is evaluated in the shared USM core before the Inform is
+    /// rejected as foreign-engine (RFC 3414 Section 1.5.1), so a stale
+    /// remote-engine inform still fails at Step 7b rather than being
+    /// acknowledged.
     #[tokio::test]
     async fn test_v3_inform_remote_stale_gets_no_report() {
         let receiver = remote_trap_receiver().await;
@@ -1882,14 +1923,10 @@ mod tests {
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client.local_addr().unwrap();
 
-        let fresh = build_v3_notification(
-            crate::pdu::PduType::InformRequest,
-            b"remote-sender-engine",
-            7,
-            10_000,
-            b"trapuser",
-            Some((b"authpass12345678", AuthProtocol::Sha1)),
-        );
+        // Seed the remote engine's timeliness state with a fresh trap under the
+        // same engine ID (the per-engine state is keyed by engine ID and shared
+        // with informs).
+        let fresh = build_authed_v3_trap(b"remote-sender-engine", 7, 10_000);
         assert!(
             receiver
                 .handle_v3(fresh, client_addr)
@@ -1898,15 +1935,7 @@ mod tests {
                 .is_some()
         );
 
-        // Drain the inform acknowledgement.
         let mut buf = vec![0u8; 4096];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            client.recv_from(&mut buf),
-        )
-        .await
-        .expect("expected the inform response")
-        .unwrap();
 
         let stale = build_v3_notification(
             crate::pdu::PduType::InformRequest,
