@@ -17,8 +17,9 @@ use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 /// `error_status`/`error_index`) and `GetBulkPdu::encode` (the community path).
 /// It guarantees neither encoder can emit a negative value on the wire.
 ///
-/// Receive-side negative rejection is a separate concern and lives in
-/// `GetBulkPdu::decode`.
+/// The receive side reuses the same clamp: `Pdu::decode` applies it to the
+/// overloaded GETBULK `error_status`/`error_index` fields so a negative value
+/// from a buggy peer is normalized to 0 rather than rejected (net-snmp behavior).
 const fn clamp_bulk_field(value: i32) -> i32 {
     if value < 0 { 0 } else { value }
 }
@@ -244,16 +245,27 @@ impl Pdu {
         let mut pdu_decoder = decoder.sub_decoder(len)?;
 
         let request_id = pdu_decoder.read_integer()?;
-        let error_status = pdu_decoder.read_integer()?;
-        let error_index = pdu_decoder.read_integer()?;
+        let mut error_status = pdu_decoder.read_integer()?;
+        let mut error_index = pdu_decoder.read_integer()?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
 
-        // error_index is not validated here. net-snmp performs no bounds checking
-        // on this field (validation code in snmp_client.c is wrapped in
-        // #ifdef TEMPORARILY_DISABLED). RFC 3416 Section 3 annotates it "sometimes
-        // ignored" and places no MUST/SHOULD obligation on receivers. Rejecting
-        // out-of-range values would break compatibility with buggy agents that
-        // work fine with net-snmp.
+        // For GETBULK, error_status/error_index overload as non-repeaters and
+        // max-repetitions (RFC 3416 Section 4.2.3, INTEGER 0..2147483647). Clamp
+        // negatives to 0 here so the single decode path normalizes them before the
+        // agent sees them, matching net-snmp (snmp_agent.c) and the agent's own
+        // normalization. The upper bound already equals i32::MAX, so only the
+        // negative floor needs enforcing.
+        if pdu_type == PduType::GetBulkRequest {
+            error_status = clamp_bulk_field(error_status);
+            error_index = clamp_bulk_field(error_index);
+        }
+
+        // For non-GETBULK PDUs, error_index is not validated here. net-snmp
+        // performs no bounds checking on this field (validation code in
+        // snmp_client.c is wrapped in #ifdef TEMPORARILY_DISABLED). RFC 3416
+        // Section 3 annotates it "sometimes ignored" and places no MUST/SHOULD
+        // obligation on receivers. Rejecting out-of-range values would break
+        // compatibility with buggy agents that work fine with net-snmp.
 
         Ok(Pdu {
             pdu_type,
@@ -790,28 +802,17 @@ impl GetBulkPdu {
     }
 
     /// Decode from BER.
+    ///
+    /// Delegates to `Pdu::decode` so GETBULK requests share a single decode and
+    /// normalization path. `Pdu::decode` clamps negative non-repeaters and
+    /// max-repetitions to 0 per RFC 3416 Section 4.2.3 (net-snmp-compatible),
+    /// after which the overloaded `error_status`/`error_index` fields map back
+    /// onto the typed `GetBulkPdu` shape.
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
-        let mut pdu = decoder.read_constructed(tag::pdu::GET_BULK_REQUEST)?;
+        let pdu = Pdu::decode(decoder)?;
 
-        let request_id = pdu.read_integer()?;
-        let non_repeaters = pdu.read_integer()?;
-        let max_repetitions = pdu.read_integer()?;
-        let varbinds = decode_varbind_list(&mut pdu)?;
-
-        // Validate non_repeaters and max_repetitions per RFC 3416 Section 4.2.3.
-        if non_repeaters < 0 {
-            tracing::debug!(target: "async_snmp::pdu", { offset = pdu.offset(), non_repeaters = non_repeaters, kind = %DecodeErrorKind::NegativeNonRepeaters {
-                    value: non_repeaters,
-                } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
-        }
-        if max_repetitions < 0 {
-            tracing::debug!(target: "async_snmp::pdu", { offset = pdu.offset(), max_repetitions = max_repetitions, kind = %DecodeErrorKind::NegativeMaxRepetitions {
-                    value: max_repetitions,
-                } }, "decode error");
+        if pdu.pdu_type != PduType::GetBulkRequest {
+            tracing::debug!(target: "async_snmp::pdu", { pdu_type = ?pdu.pdu_type }, "expected GETBULK PDU");
             return Err(Error::MalformedResponse {
                 target: UNKNOWN_TARGET,
             }
@@ -819,10 +820,10 @@ impl GetBulkPdu {
         }
 
         Ok(GetBulkPdu {
-            request_id,
-            non_repeaters,
-            max_repetitions,
-            varbinds,
+            request_id: pdu.request_id,
+            non_repeaters: pdu.error_status,
+            max_repetitions: pdu.error_index,
+            varbinds: pdu.varbinds,
         })
     }
 }
@@ -1191,35 +1192,49 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_rejects_negative_non_repeaters() {
+    fn test_decode_clamps_negative_non_repeaters() {
+        // RFC 3416 Section 4.2.3: non-repeaters is INTEGER (0..2147483647).
+        // A negative value from a buggy peer is normalized to 0 (net-snmp
+        // snmp_agent.c behavior) rather than rejected.
         let raw = RawGetBulkPdu::new(1, -1, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
         let mut decoder = Decoder::new(encoded);
-        let result = GetBulkPdu::decode(&mut decoder);
-
-        assert!(result.is_err(), "should reject negative non_repeaters");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got {err:?}"
-        );
+        let decoded = GetBulkPdu::decode(&mut decoder).expect("negative non_repeaters clamps to 0");
+        assert_eq!(decoded.non_repeaters, 0);
+        assert_eq!(decoded.max_repetitions, 10);
     }
 
     #[test]
-    fn test_decode_rejects_negative_max_repetitions() {
+    fn test_decode_clamps_negative_max_repetitions() {
         let raw = RawGetBulkPdu::new(1, 0, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
         let mut decoder = Decoder::new(encoded);
-        let result = GetBulkPdu::decode(&mut decoder);
+        let decoded =
+            GetBulkPdu::decode(&mut decoder).expect("negative max_repetitions clamps to 0");
+        assert_eq!(decoded.non_repeaters, 0);
+        assert_eq!(decoded.max_repetitions, 0);
+    }
 
-        assert!(result.is_err(), "should reject negative max_repetitions");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(&*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got {err:?}"
-        );
+    #[test]
+    fn test_pdu_decode_getbulk_clamps_negative_non_repeaters_repro() {
+        // Regression (audit F06): production GETBULK decode goes through the
+        // generic Pdu::decode path (community.rs / v3.rs), which must clamp the
+        // overloaded non-repeaters/max-repetitions to 0 for negatives.
+        // Repro packet: GETBULK, request_id=1, non_repeaters=-1 (0xff),
+        // max_repetitions=1, empty varbinds.
+        let packet = [
+            0xa5, 0x0b, 0x02, 0x01, 0x01, 0x02, 0x01, 0xff, 0x02, 0x01, 0x01, 0x30, 0x00,
+        ];
+        let mut decoder = Decoder::new(bytes::Bytes::copy_from_slice(&packet));
+        let pdu = Pdu::decode(&mut decoder).expect("repro GETBULK packet must decode");
+        assert_eq!(pdu.pdu_type, PduType::GetBulkRequest);
+        assert_eq!(pdu.request_id, 1);
+        // error_status = non_repeaters (was -1, clamped to 0)
+        assert_eq!(pdu.error_status, 0);
+        // error_index = max_repetitions
+        assert_eq!(pdu.error_index, 1);
     }
 
     #[test]

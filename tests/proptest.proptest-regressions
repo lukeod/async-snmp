@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc e81c592d118b93f80957bdf29ff93bb1c00352d63fa4280364d77806ab6efa9a # shrinks to pdu = Pdu { pdu_type: GetRequest, request_id: 0, error_status: 0, error_index: 1, varbinds: [] }
+cc 1f288542a2cd9f5f446dec450642332c6b7663519b6f18fdf8ed10286b25d9e7 # shrinks to pdu = Pdu { pdu_type: GetBulkRequest, request_id: 0, error_status: -1, error_index: 0, varbinds: [] }

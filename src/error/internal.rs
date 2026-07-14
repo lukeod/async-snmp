@@ -103,10 +103,6 @@ pub(crate) enum DecodeErrorKind {
     InsufficientData { needed: usize, available: usize },
     /// Invalid OID in notification varbinds.
     InvalidOid,
-    /// Negative `non_repeaters` in GETBULK PDU.
-    NegativeNonRepeaters { value: i32 },
-    /// Negative `max_repetitions` in GETBULK PDU.
-    NegativeMaxRepetitions { value: i32 },
     /// OID exceeds maximum arc count during decode.
     OidTooLong { count: usize, max: usize },
     /// Signed integer encoding exceeds 4 bytes.
@@ -183,12 +179,6 @@ impl std::fmt::Display for DecodeErrorKind {
                 write!(f, "need {needed} bytes but only {available} remaining")
             }
             Self::InvalidOid => write!(f, "invalid OID in notification varbinds"),
-            Self::NegativeNonRepeaters { value } => {
-                write!(f, "negative non_repeaters: {value}")
-            }
-            Self::NegativeMaxRepetitions { value } => {
-                write!(f, "negative max_repetitions: {value}")
-            }
             Self::OidTooLong { count, max } => {
                 write!(f, "OID has {count} arcs, exceeds maximum {max}")
             }

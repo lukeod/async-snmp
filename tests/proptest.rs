@@ -200,9 +200,17 @@ fn arb_pdu_type() -> impl Strategy<Value = PduType> {
 fn arb_pdu() -> impl Strategy<Value = Pdu> {
     (arb_pdu_type(), any::<i32>(), any::<i32>(), arb_varbinds())
         .prop_flat_map(|(pdu_type, request_id, error_status, varbinds)| {
-            // For GETBULK, error_index holds max_repetitions (can be any non-negative)
-            // For other PDU types, error_index must be 0..=varbinds.len()
-            let max_error_index = if pdu_type == PduType::GetBulkRequest {
+            // For GETBULK, error_status/error_index hold non_repeaters/max_repetitions
+            // (RFC 3416 0..2147483647). Pdu::decode clamps negatives to 0, so the
+            // strategy only produces non-negative bulk fields to stay round-trippable.
+            // For other PDU types, error_index must be 0..=varbinds.len().
+            let is_bulk = pdu_type == PduType::GetBulkRequest;
+            let error_status = if is_bulk {
+                error_status.max(0)
+            } else {
+                error_status
+            };
+            let max_error_index = if is_bulk {
                 i32::MAX
             } else if varbinds.is_empty() {
                 0
