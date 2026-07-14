@@ -18,10 +18,25 @@ macro_rules! impl_stream_helpers {
             }
 
             /// Collect all remaining varbinds.
+            ///
+            /// If the walk completes with no results, a fallback GET is attempted
+            /// on the base OID to handle scalar objects (e.g. `sysDescr.0`) that a
+            /// GETNEXT/GETBULK walk would step past. The result is only returned
+            /// when it is a real value and the `max_results` cap permits it;
+            /// genuine absence is swallowed and real errors are propagated.
             pub async fn collect(mut self) -> crate::error::Result<Vec<crate::varbind::VarBind>> {
                 let mut results = Vec::new();
                 while let Some(result) = self.next().await {
                     results.push(result?);
+                }
+                if results.is_empty() {
+                    crate::client::walk::walk_scalar_fallback(
+                        &self.client,
+                        &self.base_oid,
+                        self.max_results,
+                        &mut results,
+                    )
+                    .await?;
                 }
                 Ok(results)
             }
@@ -131,6 +146,56 @@ fn validate_walk_varbind(
     match oid_tracker.check(&vb.oid, target) {
         Ok(()) => VarbindOutcome::Yield,
         Err(e) => VarbindOutcome::Abort(e),
+    }
+}
+
+/// Attempt a scalar-fallback GET on `base_oid` when a walk yielded no results.
+///
+/// Scalar objects (e.g. `sysDescr.0`) are not returned by a GETNEXT/GETBULK
+/// walk rooted at the scalar object OID, so a direct GET is used as a fallback
+/// when the walk produced nothing.
+///
+/// The fallback result is appended to `results` only when both:
+/// - the GET returns a real value (not an exception), and
+/// - the walk's `max_results` cap still permits another result (in particular
+///   `Some(0)` yields zero results, matching the streaming cap behaviour).
+///
+/// Genuine absence is swallowed: v2c+ `noSuchObject`/`noSuchInstance`/
+/// `endOfMibView` exception values, and the v1 `noSuchName` error-status. Any
+/// other error (timeout, authentication failure, malformed response, ...) is
+/// propagated to the caller.
+async fn walk_scalar_fallback<T: Transport + 'static>(
+    client: &Client<T>,
+    base_oid: &Oid,
+    max_results: Option<usize>,
+    results: &mut Vec<VarBind>,
+) -> Result<()> {
+    // Respect the walk result cap; Some(0) must yield zero results.
+    if matches!(max_results, Some(max) if results.len() >= max) {
+        return Ok(());
+    }
+    match client.get(base_oid).await {
+        // Real scalar value: return it.
+        Ok(vb) if !vb.value.is_exception() => {
+            results.push(vb);
+            Ok(())
+        }
+        // Genuine absence (v2c+): exception value in an otherwise-Ok response.
+        Ok(_) => Ok(()),
+        // Genuine absence (v1): noSuchName error-status.
+        Err(e)
+            if matches!(
+                &*e,
+                Error::Snmp {
+                    status: crate::error::ErrorStatus::NoSuchName,
+                    ..
+                }
+            ) =>
+        {
+            Ok(())
+        }
+        // Real failure (timeout, auth, malformed, ...): propagate.
+        Err(e) => Err(e),
     }
 }
 
@@ -500,23 +565,22 @@ impl<T: Transport + 'static> WalkStream<T> {
     /// If the walk completes with no results, a fallback GET is attempted on the
     /// base OID. This handles scalar OIDs (e.g. `sysDescr.0`) where GETNEXT would
     /// walk past the value. The GET result is only returned if it contains a real
-    /// value (not `NoSuchObject`, `NoSuchInstance`, or `EndOfMibView`).
+    /// value (not `NoSuchObject`, `NoSuchInstance`, or `EndOfMibView`) and the
+    /// `max_results` cap permits it. Genuine absence (including the v1
+    /// `noSuchName` error-status) is swallowed; other errors (timeout,
+    /// authentication failure, malformed response) are propagated. This matches
+    /// the fallback behaviour of [`Walk::collect`] and [`BulkWalk::collect`].
     pub async fn collect(mut self) -> Result<Vec<VarBind>> {
         let mut results = Vec::new();
         while let Some(result) = self.next().await {
             results.push(result?);
         }
         if results.is_empty() {
-            let (client, base_oid) = match &self {
-                WalkStream::GetNext(w) => (&w.client, &w.base_oid),
-                WalkStream::GetBulk(bw) => (&bw.client, &bw.base_oid),
+            let (client, base_oid, max_results) = match &self {
+                WalkStream::GetNext(w) => (&w.client, &w.base_oid, w.max_results),
+                WalkStream::GetBulk(bw) => (&bw.client, &bw.base_oid, bw.max_results),
             };
-            match client.get(base_oid).await {
-                Ok(vb) if !vb.value.is_exception() => {
-                    results.push(vb);
-                }
-                _ => {}
-            }
+            walk_scalar_fallback(client, base_oid, max_results, &mut results).await?;
         }
         Ok(results)
     }
@@ -837,5 +901,245 @@ mod tests {
             ),
             "expected TooBig, got: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Mock transport exercising the scalar-fallback GET. Any GETNEXT/GETBULK
+    // terminates the walk immediately (EndOfMibView) so the walk yields nothing
+    // and `collect()` performs its fallback GET on the base OID. The GET
+    // response is governed by `ScalarGetMode`.
+    // -------------------------------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    enum ScalarGetMode {
+        /// GET returns a real scalar value.
+        Value,
+        /// GET returns a noSuchInstance exception (genuine absence).
+        Absent,
+        /// GET returns a non-absence SNMP error (genErr).
+        Error,
+    }
+
+    #[derive(Clone)]
+    struct ScalarFallbackTransport {
+        mode: ScalarGetMode,
+        /// Records (request_id, pdu_type) seen by `send`, drained by `recv`.
+        pending: Arc<Mutex<VecDeque<(i32, PduType)>>>,
+    }
+
+    impl ScalarFallbackTransport {
+        fn new(mode: ScalarGetMode) -> Self {
+            Self {
+                mode,
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+    }
+
+    impl Transport for ScalarFallbackTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let pdu = msg.pdu.standard().unwrap();
+            self.pending
+                .lock()
+                .unwrap()
+                .push_back((request_id, pdu.pdu_type));
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let (request_id, pdu_type) = self
+                .pending
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((1, PduType::GetRequest));
+            let mode = self.mode;
+            let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();
+            let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+
+            async move {
+                let pdu = match pdu_type {
+                    // Any walk step terminates immediately with no in-subtree value.
+                    PduType::GetNextRequest | PduType::GetBulkRequest => Pdu {
+                        pdu_type: PduType::Response,
+                        request_id,
+                        error_status: 0,
+                        error_index: 0,
+                        varbinds: vec![VarBind::new(
+                            oid!(1, 3, 6, 1, 2, 1, 99),
+                            Value::EndOfMibView,
+                        )],
+                    },
+                    // Fallback GET on the base OID.
+                    _ => match mode {
+                        ScalarGetMode::Value => Pdu {
+                            pdu_type: PduType::Response,
+                            request_id,
+                            error_status: 0,
+                            error_index: 0,
+                            varbinds: vec![VarBind::new(base.clone(), Value::Integer(7))],
+                        },
+                        ScalarGetMode::Absent => Pdu {
+                            pdu_type: PduType::Response,
+                            request_id,
+                            error_status: 0,
+                            error_index: 0,
+                            varbinds: vec![VarBind::new(base.clone(), Value::NoSuchInstance)],
+                        },
+                        ScalarGetMode::Error => Pdu {
+                            pdu_type: PduType::Response,
+                            request_id,
+                            error_status: ErrorStatus::GenErr.as_i32(),
+                            error_index: 1,
+                            varbinds: vec![VarBind::new(base.clone(), Value::Null)],
+                        },
+                    },
+                };
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                Ok((msg.encode(), peer))
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    fn scalar_client(
+        mode: ScalarGetMode,
+        max_walk_results: Option<usize>,
+    ) -> Client<ScalarFallbackTransport> {
+        let config = ClientConfig {
+            version: Version::V2c,
+            retry: crate::client::retry::Retry::none(),
+            max_walk_results,
+            ..Default::default()
+        };
+        Client::new(ScalarFallbackTransport::new(mode), config)
+    }
+
+    #[tokio::test]
+    async fn scalar_fallback_agrees_across_collect_paths() {
+        // The scalar GET returns a real value; every collect path must surface
+        // it identically (previously only WalkStream::collect did the fallback).
+        let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+        let expected = VarBind::new(base.clone(), Value::Integer(7));
+
+        let walk_getnext = scalar_client(ScalarGetMode::Value, None)
+            .walk_getnext(base.clone())
+            .collect()
+            .await
+            .unwrap();
+        let bulk_walk = scalar_client(ScalarGetMode::Value, None)
+            .bulk_walk(base.clone(), 10)
+            .collect()
+            .await
+            .unwrap();
+        let walk_stream = scalar_client(ScalarGetMode::Value, None)
+            .walk(base.clone())
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(walk_getnext, vec![expected.clone()]);
+        assert_eq!(bulk_walk, vec![expected.clone()]);
+        assert_eq!(walk_stream, vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn scalar_fallback_swallows_genuine_absence() {
+        // noSuchInstance from the fallback GET is genuine absence: yields nothing.
+        let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+        for results in [
+            scalar_client(ScalarGetMode::Absent, None)
+                .walk_getnext(base.clone())
+                .collect()
+                .await
+                .unwrap(),
+            scalar_client(ScalarGetMode::Absent, None)
+                .walk(base.clone())
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+        ] {
+            assert!(results.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_fallback_propagates_non_absence_error() {
+        // A genErr from the fallback GET is not absence and must propagate
+        // instead of being swallowed by a catch-all.
+        let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+
+        let err = scalar_client(ScalarGetMode::Error, None)
+            .walk_getnext(base.clone())
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &*err,
+                Error::Snmp {
+                    status: ErrorStatus::GenErr,
+                    ..
+                }
+            ),
+            "expected GenErr, got: {err}"
+        );
+
+        let err = scalar_client(ScalarGetMode::Error, None)
+            .walk(base.clone())
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &*err,
+                Error::Snmp {
+                    status: ErrorStatus::GenErr,
+                    ..
+                }
+            ),
+            "expected GenErr, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scalar_fallback_respects_max_results_zero() {
+        // max_walk_results = Some(0) caps the walk at zero results, so the
+        // fallback GET must not add a result even when the scalar exists.
+        let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+
+        let walk_getnext = scalar_client(ScalarGetMode::Value, Some(0))
+            .walk_getnext(base.clone())
+            .collect()
+            .await
+            .unwrap();
+        let walk_stream = scalar_client(ScalarGetMode::Value, Some(0))
+            .walk(base.clone())
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert!(walk_getnext.is_empty());
+        assert!(walk_stream.is_empty());
     }
 }
