@@ -485,9 +485,28 @@ impl Oid {
 
     /// Encode to BER format with validation.
     ///
-    /// Returns an error if the OID has invalid arcs per X.690 Section 8.19.4.
+    /// This is the strict, wire-safe encode entry point. It rejects OIDs that do
+    /// not have a well-formed, round-trippable BER encoding:
+    ///
+    /// - empty OIDs (no arcs): BER content would be zero bytes, which is not a
+    ///   valid OBJECT IDENTIFIER value (X.690 Section 8.19.4 requires at least one
+    ///   subidentifier);
+    /// - single-arc OIDs: rejected by [`validate()`](Self::validate) because the
+    ///   first subidentifier packs two arcs (`arc1 * 40 + arc2`) and `[n]` decodes
+    ///   back to `[n, 0]`;
+    /// - OIDs exceeding [`MAX_OID_LEN`] subidentifiers (RFC 2578 Section 3.5),
+    ///   rejected by [`validate_length()`](Self::validate_length);
+    /// - OIDs with invalid arc constraints per X.690 Section 8.19.4.
+    ///
+    /// Returns an error if any of the above hold.
     pub fn to_ber_checked(&self) -> Result<Vec<u8>> {
-        self.validate()?;
+        if self.arcs.is_empty() {
+            return Err(Error::InvalidOid(
+                "cannot BER-encode an empty OID (no subidentifiers)".into(),
+            )
+            .boxed());
+        }
+        self.validate_all()?;
         Ok(self.to_ber())
     }
 
@@ -939,6 +958,42 @@ mod tests {
         );
         // parse still accepts it (only validate() is stricter)
         assert_eq!(Oid::parse("1").unwrap().arcs(), &[1]);
+    }
+
+    #[test]
+    fn test_to_ber_checked_rejects_non_wire_safe_oids() {
+        // Empty OID: no subidentifiers, not a valid OBJECT IDENTIFIER value
+        // (X.690 Section 8.19.4). The strict encode entry point must reject it
+        // even though empty OIDs are usable as a prefix concept elsewhere.
+        assert!(
+            Oid::empty().to_ber_checked().is_err(),
+            "to_ber_checked must reject empty OID"
+        );
+
+        // Single-arc OID: no invertible BER encoding ([n] -> subid n*40 -> [n, 0]).
+        assert!(
+            Oid::from_slice(&[1]).to_ber_checked().is_err(),
+            "to_ber_checked must reject single-arc OID"
+        );
+
+        // Over-MAX_OID_LEN OID: RFC 2578 Section 3.5 caps values at MAX_OID_LEN
+        // subidentifiers. validate() alone does not catch this; validate_length() does.
+        let mut arcs = vec![1u32, 3];
+        arcs.extend(2..(MAX_OID_LEN as u32));
+        // arcs now has MAX_OID_LEN elements and is accepted.
+        let at_limit = Oid::new(arcs.clone());
+        assert_eq!(at_limit.arcs().len(), MAX_OID_LEN);
+        assert!(
+            at_limit.to_ber_checked().is_ok(),
+            "to_ber_checked should accept OID at MAX_OID_LEN"
+        );
+        arcs.push(0);
+        let over_limit = Oid::new(arcs);
+        assert_eq!(over_limit.arcs().len(), MAX_OID_LEN + 1);
+        assert!(
+            over_limit.to_ber_checked().is_err(),
+            "to_ber_checked must reject OID exceeding MAX_OID_LEN"
+        );
     }
 
     #[test]
