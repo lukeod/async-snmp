@@ -349,8 +349,9 @@ impl NotificationReceiverBuilder {
 
     /// Set the engine ID for `SNMPv3`.
     ///
-    /// If not set, a default engine ID will be generated based on the
-    /// RFC 3411 format using enterprise number and timestamp.
+    /// If not set, a valid RFC 3411 engine ID with a random local
+    /// identifier is generated. A supplied engine ID is validated at
+    /// build time (5..32 octets, not all-zero, not all-0xff).
     #[must_use]
     pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
         self.engine_id = Some(engine_id.into());
@@ -390,18 +391,14 @@ impl NotificationReceiverBuilder {
             source: e,
         })?;
 
-        let engine_id: Bytes = self.engine_id.map_or_else(
-            || {
-                let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01];
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                id.extend_from_slice(&timestamp.to_be_bytes());
+        // Validate a user-supplied engine ID, or generate a valid random one.
+        let engine_id: Bytes = match self.engine_id {
+            Some(id) => {
+                crate::v3::validate_engine_id(&id)?;
                 Bytes::from(id)
-            },
-            Bytes::from,
-        );
+            }
+            None => crate::v3::generate_engine_id(),
+        };
 
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {

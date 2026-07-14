@@ -706,21 +706,14 @@ impl AgentBuilder {
                 source: e,
             })?;
 
-        // Generate default engine ID if not provided
-        let engine_id: Bytes = self.engine_id.map_or_else(
-            || {
-                // RFC 3411 format: enterprise number + format + local identifier
-                // Use a simple format: 0x80 (local) + timestamp + random
-                let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01]; // Enterprise format indicator
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                id.extend_from_slice(&timestamp.to_be_bytes());
+        // Validate a user-supplied engine ID, or generate a valid random one.
+        let engine_id: Bytes = match self.engine_id {
+            Some(id) => {
+                crate::v3::validate_engine_id(&id)?;
                 Bytes::from(id)
-            },
-            Bytes::from,
-        );
+            }
+            None => crate::v3::generate_engine_id(),
+        };
 
         let cancel = self.cancel.unwrap_or_default();
 
@@ -2391,7 +2384,7 @@ mod tests {
     #[tokio::test]
     async fn test_response_overhead_scales_with_v3_security_level() {
         // A 17-octet engine ID is carried twice (authoritative + context).
-        let engine_id = vec![0u8; 17];
+        let engine_id = vec![0x11u8; 17];
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
@@ -2488,7 +2481,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .max_message_size(65507)
-            .engine_id(vec![0u8; 17])
+            .engine_id(vec![0x11u8; 17])
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .build()
             .await

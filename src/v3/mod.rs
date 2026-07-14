@@ -30,9 +30,10 @@ pub use crypto::RustCryptoProvider;
 pub use crypto::{CryptoError, CryptoProvider, CryptoResult};
 pub use engine::report_oids;
 pub use engine::{
-    DEFAULT_MSG_MAX_SIZE, EngineCache, EngineState, MAX_ENGINE_TIME, TIME_WINDOW,
-    compute_engine_boots_time, in_authoritative_time_window, parse_discovery_response,
-    parse_discovery_response_with_limits,
+    DEFAULT_MSG_MAX_SIZE, EngineCache, EngineState, MAX_ENGINE_ID_LEN, MAX_ENGINE_TIME,
+    MIN_ENGINE_ID_LEN, TIME_WINDOW, compute_engine_boots_time, generate_engine_id,
+    in_authoritative_time_window, parse_discovery_response, parse_discovery_response_with_limits,
+    validate_engine_id,
 };
 pub use engine::{
     is_decryption_error_report, is_not_in_time_window_report, is_unknown_engine_id_report,

@@ -63,6 +63,72 @@ pub fn compute_engine_boots_time(boots_base: u32, total_elapsed_secs: u64) -> (u
     (boots, current_time)
 }
 
+/// Minimum valid SnmpEngineID length in octets (RFC 3411 Section 5).
+pub const MIN_ENGINE_ID_LEN: usize = 5;
+
+/// Maximum valid SnmpEngineID length in octets (RFC 3411 Section 5).
+pub const MAX_ENGINE_ID_LEN: usize = 32;
+
+/// Private Enterprise Number used in generated engine IDs.
+///
+/// 32473 is the IANA example PEN reserved for documentation and testing
+/// (RFC 5612), used here as a stand-in since the crate has no registered
+/// enterprise number of its own.
+const GENERATED_ENGINE_ID_PEN: u32 = 32473;
+
+/// Format octet value 5: "administratively assigned octets" (RFC 3411
+/// Section 5), a variable-length opaque local identifier.
+const ENGINE_ID_FORMAT_OCTETS: u8 = 5;
+
+/// Number of random octets appended to a generated engine ID.
+const GENERATED_ENGINE_ID_RANDOM_LEN: usize = 12;
+
+/// Generate a locally-unique authoritative SnmpEngineID (RFC 3411 Section 5).
+///
+/// Layout: a 4-octet enterprise number with the high bit set, followed by a
+/// format octet of 5 ("administratively assigned octets"), followed by 12
+/// random octets from the OS CSPRNG. The total length is 17 octets, within
+/// the RFC 3411 5..32 range. The random suffix ensures two instances started
+/// in the same second (or on the same host) do not collide, which would
+/// otherwise yield identical localized keys under shared credentials.
+#[must_use]
+pub fn generate_engine_id() -> Bytes {
+    let mut id = Vec::with_capacity(5 + GENERATED_ENGINE_ID_RANDOM_LEN);
+    // High bit of the first octet signals the RFC 3411 variable-length format.
+    let enterprise = 0x8000_0000_u32 | GENERATED_ENGINE_ID_PEN;
+    id.extend_from_slice(&enterprise.to_be_bytes());
+    id.push(ENGINE_ID_FORMAT_OCTETS);
+    let mut random = [0_u8; GENERATED_ENGINE_ID_RANDOM_LEN];
+    getrandom::fill(&mut random).expect("getrandom failed");
+    id.extend_from_slice(&random);
+    Bytes::from(id)
+}
+
+/// Validate a user-configured SnmpEngineID (RFC 3411 Section 5).
+///
+/// Rejects IDs whose length is outside the 5..32 octet range, IDs that are
+/// all zero, and IDs that are all 0xff. All three are invalid or reserved
+/// per RFC 3411 and would break USM key localization or engine discovery.
+pub fn validate_engine_id(engine_id: &[u8]) -> Result<()> {
+    let len = engine_id.len();
+    if !(MIN_ENGINE_ID_LEN..=MAX_ENGINE_ID_LEN).contains(&len) {
+        return Err(Error::Config(
+            format!(
+                "engine ID length {len} out of range (must be {MIN_ENGINE_ID_LEN}..={MAX_ENGINE_ID_LEN} octets)"
+            )
+            .into(),
+        )
+        .boxed());
+    }
+    if engine_id.iter().all(|&b| b == 0x00) {
+        return Err(Error::Config("engine ID must not be all zero".into()).boxed());
+    }
+    if engine_id.iter().all(|&b| b == 0xff) {
+        return Err(Error::Config("engine ID must not be all 0xff".into()).boxed());
+    }
+    Ok(())
+}
+
 /// USM statistics OIDs used in Report PDUs.
 pub mod report_oids {
     use crate::Oid;
@@ -604,6 +670,54 @@ pub fn is_decryption_error_report(pdu: &crate::pdu::Pdu) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_generate_engine_id_is_valid_and_well_formed() {
+        let id = generate_engine_id();
+
+        // Valid length within RFC 3411 5..32 range.
+        assert!((MIN_ENGINE_ID_LEN..=MAX_ENGINE_ID_LEN).contains(&id.len()));
+        validate_engine_id(&id).expect("generated engine ID must validate");
+
+        // High bit of the first octet set -> variable-length format.
+        assert_eq!(id[0] & 0x80, 0x80);
+        // Enterprise number matches the generator's PEN.
+        let enterprise = u32::from_be_bytes([id[0], id[1], id[2], id[3]]);
+        assert_eq!(enterprise, 0x8000_0000 | GENERATED_ENGINE_ID_PEN);
+        // Format octet is "administratively assigned octets".
+        assert_eq!(id[4], ENGINE_ID_FORMAT_OCTETS);
+        // Random suffix present.
+        assert_eq!(id.len(), 5 + GENERATED_ENGINE_ID_RANDOM_LEN);
+    }
+
+    #[test]
+    fn test_generate_engine_id_distinct_across_generations() {
+        let a = generate_engine_id();
+        let b = generate_engine_id();
+        assert_ne!(a, b, "two generated engine IDs must not collide");
+    }
+
+    #[test]
+    fn test_validate_engine_id_rejects_invalid() {
+        // Too short.
+        assert!(validate_engine_id(&[0x80, 0x00, 0x00, 0x01]).is_err());
+        // Too long.
+        assert!(validate_engine_id(&[0x11; MAX_ENGINE_ID_LEN + 1]).is_err());
+        // All zero.
+        assert!(validate_engine_id(&[0x00; 8]).is_err());
+        // All 0xff.
+        assert!(validate_engine_id(&[0xff; 8]).is_err());
+    }
+
+    #[test]
+    fn test_validate_engine_id_accepts_valid() {
+        // Minimum length.
+        validate_engine_id(&[0x80, 0x00, 0x00, 0x00, 0x01]).unwrap();
+        // Maximum length.
+        validate_engine_id(&[0x22; MAX_ENGINE_ID_LEN]).unwrap();
+        // Typical text-format ID.
+        validate_engine_id(b"\x80\x00\x00\x00\x01MyEngine").unwrap();
+    }
 
     #[test]
     fn test_engine_state_estimated_time() {
