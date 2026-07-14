@@ -161,6 +161,14 @@ impl UdpCore {
                 self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
+            if slot.response.is_some() {
+                // A response is already waiting to be consumed for this
+                // request-id. Ignore the duplicate datagram rather than
+                // overwriting the pending response and double-counting.
+                drop(pending);
+                self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
             slot.response = Some((data, source));
             let notify = slot.notify.clone();
             drop(pending);
@@ -328,5 +336,29 @@ mod tests {
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    // A duplicate datagram for a request-id whose response has not yet been
+    // consumed is ignored: it neither overwrites the pending response nor
+    // increments the delivered counter a second time.
+    #[tokio::test]
+    async fn duplicate_delivery_is_ignored() {
+        let core = UdpCore::new();
+        let addr = test_addr();
+        core.register(7, Duration::from_secs(30), None);
+
+        let first = Bytes::from_static(b"first");
+        let dup = Bytes::from_static(b"second");
+
+        assert!(core.deliver(7, first.clone(), addr));
+        // Second datagram for the same request-id, response still unconsumed.
+        assert!(!core.deliver(7, dup, addr));
+
+        let stats = core.stats();
+        assert_eq!(stats.delivered, 1, "duplicate must not be counted");
+        assert_eq!(stats.unmatched, 1, "duplicate counts as unmatched");
+
+        let (data, _) = core.wait_for_response(7, addr).await.unwrap();
+        assert_eq!(data, first, "original response must not be overwritten");
     }
 }
