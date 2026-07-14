@@ -1065,6 +1065,28 @@ mod tests {
         username: &[u8],
         auth: Option<(&[u8], AuthProtocol)>,
     ) -> Bytes {
+        build_v3_notification_with_max(
+            pdu_type,
+            engine_id,
+            engine_boots,
+            engine_time,
+            username,
+            auth,
+            65507,
+        )
+    }
+
+    /// As [`build_v3_notification`], but with an explicit advertised
+    /// `msg_max_size` in the message header.
+    fn build_v3_notification_with_max(
+        pdu_type: crate::pdu::PduType,
+        engine_id: &[u8],
+        engine_boots: u32,
+        engine_time: u32,
+        username: &[u8],
+        auth: Option<(&[u8], AuthProtocol)>,
+        msg_max_size: i32,
+    ) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
         use crate::pdu::Pdu;
         use crate::v3::auth::authenticate_message;
@@ -1098,7 +1120,7 @@ mod tests {
         // Informs are Confirmed Class and are sent with the reportableFlag
         // set; traps are Unconfirmed Class and are not (RFC 3412 Section 6.4).
         let reportable = pdu_type == crate::pdu::PduType::InformRequest;
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(level, reportable));
+        let global = MsgGlobalData::new(1, msg_max_size, MsgFlags::new(level, reportable));
 
         let mut usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
@@ -1635,6 +1657,59 @@ mod tests {
         assert!(
             matches!(result, Some(Notification::InformV3 { .. })),
             "authenticated inform under a remote engine ID should be accepted, got {result:?}"
+        );
+    }
+
+    /// RFC 3412 Section 6.3: the inform acknowledgement advertises the
+    /// receiver's own receive capacity, not the sender's echoed msgMaxSize.
+    #[tokio::test]
+    async fn test_v3_inform_ack_advertises_local_max_size() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // Inform advertises a small msgMaxSize (1400); the ack must NOT echo it.
+        let msg = build_v3_notification_with_max(
+            crate::pdu::PduType::InformRequest,
+            b"remote-engine-id",
+            1,
+            0,
+            b"informuser",
+            Some((b"authpass12345678", AuthProtocol::Sha1)),
+            1400,
+        );
+
+        let result = receiver.handle_v3(msg, client_addr).await.unwrap();
+        assert!(
+            matches!(result, Some(Notification::InformV3 { .. })),
+            "inform should be accepted, got {result:?}"
+        );
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected the inform acknowledgement")
+        .unwrap();
+
+        use crate::message::V3Message;
+        let ack = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        assert_eq!(
+            ack.global_data.msg_max_size,
+            crate::v3::DEFAULT_MSG_MAX_SIZE as i32,
+            "ack must advertise the receiver's local receive capacity, not the sender's 1400"
         );
     }
 

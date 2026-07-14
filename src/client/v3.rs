@@ -218,7 +218,11 @@ impl<T: Transport> Client<T> {
             derived.as_ref(),
             &self.inner.salt_counter,
             true, // reportable=true for requests
-            engine_state.msg_max_size,
+            // RFC 3412 Section 6.3: msgMaxSize advertises THIS sender's own
+            // receive capacity, not the remote's. `engine_state.msg_max_size`
+            // holds the remote's advertised limit (used to constrain our
+            // outbound size), so advertise the local transport capacity here.
+            self.inner.transport.max_message_size(),
         )
     }
 
@@ -1015,6 +1019,7 @@ mod response_validation_tests {
     struct CannedTransport {
         peer: SocketAddr,
         response: Bytes,
+        max_size: u32,
     }
 
     impl CannedTransport {
@@ -1022,6 +1027,7 @@ mod response_validation_tests {
             Self {
                 peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
                 response,
+                max_size: crate::v3::DEFAULT_MSG_MAX_SIZE,
             }
         }
     }
@@ -1029,6 +1035,10 @@ mod response_validation_tests {
     impl Transport for CannedTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
+        }
+
+        fn max_message_size(&self) -> u32 {
+            self.max_size
         }
 
         fn recv(
@@ -1174,6 +1184,47 @@ mod response_validation_tests {
         let (offset, len) = UsmSecurityParams::find_auth_params_offset(&bytes).unwrap();
         authenticate_message(&key, &mut bytes, offset, len).unwrap();
         Bytes::from(bytes)
+    }
+
+    /// RFC 3412 Section 6.3: an outgoing request advertises the manager's own
+    /// receive capacity (the transport's `max_message_size`), not the remote
+    /// engine's cached advertised limit.
+    #[tokio::test]
+    async fn v3_advertises_local_receive_capacity_not_remote() {
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let transport = CannedTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            response: Bytes::new(),
+            max_size: 1400,
+        };
+        let config = ClientConfig {
+            version: crate::version::Version::V3,
+            v3_security: Some(security.clone()),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config);
+        {
+            // Cached remote capacity differs from the local transport limit.
+            let mut state = client.inner.engine_state.write().unwrap();
+            *state = Some(EngineState::with_msg_max_size(
+                Bytes::from_static(ENGINE_ID),
+                5,
+                1000,
+                9000,
+            ));
+        }
+        {
+            let mut derived = client.inner.derived_keys.write().unwrap();
+            *derived = Some(security.derive_keys(ENGINE_ID).unwrap());
+        }
+
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
+        let bytes = client.build_v3_message(&pdu, 1).unwrap();
+        let msg = V3Message::decode(Bytes::from(bytes)).unwrap();
+        assert_eq!(
+            msg.global_data.msg_max_size, 1400,
+            "request must advertise the local transport capacity, not the remote's cached 9000"
+        );
     }
 
     /// RFC 3414 Section 2.3: an authenticated notInTimeWindows Report whose

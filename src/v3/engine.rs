@@ -118,7 +118,12 @@ pub struct EngineState {
     pub synced_at: Instant,
     /// Latest received engine time (for anti-replay, RFC 3414 Section 2.3)
     pub latest_received_engine_time: u32,
-    /// Maximum message size the remote engine can accept (from msgMaxSize header).
+    /// Maximum message size the remote engine can accept (from its advertised
+    /// msgMaxSize header). This is the remote's outbound limit and is used to
+    /// constrain the size of messages we send to it. It is NOT the value we
+    /// advertise in our own outgoing messages: RFC 3412 Section 6.3 requires
+    /// msgMaxSize to carry the sender's OWN receive capacity (our transport's
+    /// `max_message_size`), tracked separately from this field.
     pub msg_max_size: u32,
 }
 

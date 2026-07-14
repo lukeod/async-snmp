@@ -44,10 +44,15 @@ impl Agent {
             incoming_usm.username.clone(),
         );
 
+        // RFC 3412 Section 6.3: msgMaxSize advertises this agent's own receive
+        // capacity, not the requester's echoed value.
+        let advertised_max_size =
+            i32::try_from(self.inner.state.max_message_size).unwrap_or(i32::MAX);
+
         encode_v3_response(
             response_pdu,
             incoming.global_data.msg_id,
-            incoming.global_data.msg_max_size,
+            advertised_max_size,
             security_level,
             response_usm,
             context_engine_id,
@@ -255,6 +260,43 @@ mod tests {
         assert!(
             result.is_some(),
             "noAuthNoPriv should work when boots is below max"
+        );
+    }
+
+    // RFC 3412 Section 6.3: the advertised msgMaxSize is this agent's own
+    // receive capacity, not the requester's echoed value.
+    #[tokio::test]
+    async fn test_response_advertises_local_max_size() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(1400)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(DummyHandler))
+            .build()
+            .await
+            .unwrap();
+
+        // Incoming message advertises a much larger msgMaxSize (65507).
+        let msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
+        assert_eq!(msg.global_data.msg_max_size, 65507);
+        let usm = dummy_usm();
+
+        let result = agent
+            .build_v3_response(
+                &msg,
+                &usm,
+                dummy_response_pdu(),
+                Bytes::from_static(b"engine"),
+                Bytes::new(),
+                None,
+            )
+            .unwrap()
+            .expect("noAuthNoPriv response should be produced");
+
+        let decoded = V3Message::decode(result).unwrap();
+        assert_eq!(
+            decoded.global_data.msg_max_size, 1400,
+            "response must advertise the agent's local receive capacity, not the requester's value"
         );
     }
 }

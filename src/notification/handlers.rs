@@ -266,7 +266,10 @@ fn build_v3_response(
     encode_v3_response(
         response_pdu,
         incoming_msg.global_data.msg_id,
-        incoming_msg.global_data.msg_max_size,
+        // RFC 3412 Section 6.3: msgMaxSize advertises this receiver's own
+        // receive capacity, not the sender's echoed value. The receiver has no
+        // configurable limit, so advertise the default UDP receive capacity.
+        crate::v3::DEFAULT_MSG_MAX_SIZE as i32,
         incoming_msg.global_data.msg_flags.security_level,
         response_usm,
         context_engine_id,
