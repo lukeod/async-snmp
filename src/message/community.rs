@@ -75,6 +75,28 @@ impl From<TrapV1Pdu> for CommunityPdu {
     }
 }
 
+/// Check whether a standard PDU type is valid in a community message of the
+/// given version.
+///
+/// SNMPv1 (RFC 1157) defines GetRequest, GetNextRequest, Response, SetRequest,
+/// and the v1 Trap. GETBULK, InformRequest, SNMPv2-Trap, and Report are SNMPv2
+/// constructs (RFC 3416) and are not valid in an SNMPv1 message. The v1 Trap PDU
+/// is handled separately via its distinct wire tag and is never a `Standard` PDU
+/// here, so it is not represented in this check.
+fn pdu_type_valid_for_version(pdu_type: PduType, version: Version) -> bool {
+    match version {
+        Version::V1 => matches!(
+            pdu_type,
+            PduType::GetRequest | PduType::GetNextRequest | PduType::Response | PduType::SetRequest
+        ),
+        // V2c permits the full SNMPv2 PDU set. TrapV1 is dispatched by tag before
+        // reaching this check, so it can never appear as a Standard PDU.
+        Version::V2c => pdu_type != PduType::TrapV1,
+        // V3 messages are not decoded through this path.
+        Version::V3 => false,
+    }
+}
+
 /// Community-based SNMP message (v1/v2c).
 ///
 /// This unified type handles both `SNMPv1` and `SNMPv2c` messages,
@@ -186,9 +208,30 @@ impl CommunityMessage {
         })?;
 
         let pdu = if pdu_tag == tag::pdu::TRAP_V1 {
+            // The SNMPv1 Trap PDU (tag 0xA4) is only defined for SNMPv1
+            // (RFC 1157 Section 4.1.6); SNMPv2c uses the SNMPv2-Trap PDU
+            // (tag 0xA7) instead. Reject a v1 Trap carried in a v2c message.
+            if version != Version::V1 {
+                tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), version = ?version }, "v1 Trap PDU (0xA4) not valid in this version");
+                return Err(Error::MalformedResponse {
+                    target: UNKNOWN_TARGET,
+                }
+                .boxed());
+            }
             CommunityPdu::TrapV1(TrapV1Pdu::decode(seq)?)
         } else {
-            CommunityPdu::Standard(Pdu::decode(seq)?)
+            let pdu = Pdu::decode(seq)?;
+            // Enforce version<->PDU-type compatibility. GETBULK, InformRequest,
+            // and SNMPv2-Trap are SNMPv2 constructs (RFC 3416) and are not valid
+            // in an SNMPv1 message (RFC 1157).
+            if !pdu_type_valid_for_version(pdu.pdu_type, version) {
+                tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), version = ?version, pdu_type = %pdu.pdu_type }, "PDU type not valid for SNMP version");
+                return Err(Error::MalformedResponse {
+                    target: UNKNOWN_TARGET,
+                }
+                .boxed());
+            }
+            CommunityPdu::Standard(pdu)
         };
 
         Ok(CommunityMessage {
@@ -290,6 +333,76 @@ mod tests {
         assert_eq!(decoded.version, Version::V2c);
         assert_eq!(decoded.community.as_ref(), b"private");
         assert_eq!(decoded.pdu.standard().unwrap().request_id, 123);
+    }
+
+    #[test]
+    fn test_v1_getbulk_rejected() {
+        // GETBULK is an SNMPv2 construct (RFC 3416) and must be rejected in an
+        // SNMPv1 message even though the encoder will emit it.
+        let pdu = Pdu::get_bulk(1, 0, 10, vec![]);
+        let msg = CommunityMessage::new(Version::V1, b"public".as_slice(), pdu);
+        let encoded = msg.encode();
+
+        let result = CommunityMessage::decode(encoded);
+        assert!(
+            result.is_err(),
+            "v1 GETBULK must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_inform_rejected() {
+        // InformRequest is an SNMPv2 construct and must be rejected in a v1 message.
+        let pdu = Pdu::inform_request(1, 0, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), vec![]);
+        let msg = CommunityMessage::new(Version::V1, b"public".as_slice(), pdu);
+        let encoded = msg.encode();
+
+        let result = CommunityMessage::decode(encoded);
+        assert!(
+            result.is_err(),
+            "v1 Inform must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_trapv2_rejected() {
+        // SNMPv2-Trap must be rejected in a v1 message.
+        let pdu = Pdu::trap_v2(1, 0, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), vec![]);
+        let msg = CommunityMessage::new(Version::V1, b"public".as_slice(), pdu);
+        let encoded = msg.encode();
+
+        let result = CommunityMessage::decode(encoded);
+        assert!(
+            result.is_err(),
+            "v1 SNMPv2-Trap must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v2c_trapv1_rejected() {
+        // The v1 Trap PDU (tag 0xA4) has a distinct wire layout and is only
+        // defined for SNMPv1; a v2c message carrying it must be rejected.
+        let trap = TrapV1Pdu::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999),
+            [192, 168, 1, 1],
+            GenericTrap::LinkDown,
+            0,
+            12345,
+            vec![],
+        );
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            trap.encode(buf);
+            buf.push_octet_string(b"public");
+            buf.push_integer(Version::V2c.as_i32());
+        });
+        let encoded = buf.finish();
+
+        let result = CommunityMessage::decode(encoded);
+        assert!(
+            result.is_err(),
+            "v2c v1-Trap (0xA4) must be rejected, got {result:?}"
+        );
     }
 
     #[test]

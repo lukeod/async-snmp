@@ -224,6 +224,12 @@ impl Pdu {
 
     /// Encode to BER.
     pub fn encode(&self, buf: &mut EncodeBuf) {
+        // The SNMPv1 Trap PDU has a distinct wire layout and must be encoded via
+        // `TrapV1Pdu::encode`; the generic layout here is not round-trippable for it.
+        debug_assert!(
+            self.pdu_type != PduType::TrapV1,
+            "TrapV1 must be encoded via TrapV1Pdu, not the generic Pdu encoder"
+        );
         // For GETBULK, error_status/error_index overload as non-repeaters and
         // max-repetitions (RFC 3416 Section 4.2.3, INTEGER 0..2147483647). Clamp
         // negatives to 0 at the encode choke point so a directly-constructed
@@ -256,6 +262,19 @@ impl Pdu {
             }
             .boxed()
         })?;
+
+        // The SNMPv1 Trap PDU (tag 0xA4) has a distinct wire layout (RFC 1157
+        // Section 4.1.6) that this generic decoder cannot parse correctly. It is
+        // only ever carried in v1 messages and must be routed through
+        // `TrapV1Pdu::decode`; reaching it here means a v2c/v3 message carried a
+        // v1 Trap tag, which is rejected.
+        if pdu_type == PduType::TrapV1 {
+            tracing::debug!(target: "async_snmp::pdu", { offset = decoder.offset(), tag = tag }, "TrapV1 PDU tag not valid in generic PDU context");
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
 
         let len = decoder.read_length()?;
         let mut pdu_decoder = decoder.sub_decoder(len)?;
@@ -986,6 +1005,31 @@ mod tests {
         assert_eq!(decoded.specific_trap, 0);
         assert_eq!(decoded.time_stamp, 1234_5678);
         assert_eq!(decoded.varbinds.len(), 1);
+    }
+
+    #[test]
+    fn test_generic_pdu_decode_rejects_trap_v1_tag() {
+        // The v1 Trap PDU (tag 0xA4) has a distinct wire layout and must only be
+        // decoded via TrapV1Pdu. The generic Pdu decoder must reject the tag so a
+        // v1 Trap cannot slip into a v2c/v3 (generic PDU) context.
+        let trap = TrapV1Pdu::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999),
+            [192, 168, 1, 1],
+            GenericTrap::LinkDown,
+            0,
+            12345,
+            vec![],
+        );
+        let mut buf = EncodeBuf::new();
+        trap.encode(&mut buf);
+        let bytes = buf.finish();
+
+        let mut decoder = Decoder::new(bytes);
+        let result = Pdu::decode(&mut decoder);
+        assert!(
+            result.is_err(),
+            "generic Pdu::decode must reject TrapV1 tag, got {result:?}"
+        );
     }
 
     #[test]
