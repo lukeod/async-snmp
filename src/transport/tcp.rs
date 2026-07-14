@@ -79,7 +79,7 @@ use crate::error::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -209,6 +209,7 @@ impl TcpTransportBuilder {
                 target,
                 local_addr,
                 max_allocation_size: self.options.max_allocation_size,
+                poisoned: AtomicBool::new(false),
             }),
         })
     }
@@ -278,6 +279,35 @@ struct TcpTransportInner {
     local_addr: SocketAddr,
     /// Maximum allocation size for incoming messages
     max_allocation_size: usize,
+    /// Set once the stream framing is known to be lost.
+    ///
+    /// TCP is a byte stream framed by BER length prefixes. A read that times
+    /// out, is truncated, or is rejected as malformed/oversized leaves an
+    /// unknown number of bytes for the current frame still buffered in the
+    /// kernel. Because the client does not retry on a reliable transport
+    /// (`is_reliable() == true`), a subsequent read would parse those leftover
+    /// bytes as the start of the next message. Once this flag is set the stream
+    /// is treated as unusable and every later request/recv fails fast with
+    /// [`Error::Closed`]; recovery requires constructing a new transport
+    /// (RFC 3430 section 2: close the connection on lost framing).
+    poisoned: AtomicBool,
+}
+
+impl TcpTransportInner {
+    /// Report whether the stream framing has been marked lost.
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Mark the stream unusable and best-effort close it.
+    ///
+    /// Called while holding the stream lock after any read that leaves the
+    /// framing in an unknown state. The shutdown is best-effort; failures are
+    /// ignored because the connection is already being abandoned.
+    async fn poison(&self, stream: &mut TcpStream) {
+        self.poisoned.store(true, Ordering::Release);
+        let _ = stream.shutdown().await;
+    }
 }
 
 impl TcpTransport {
@@ -363,6 +393,7 @@ impl TcpTransport {
                 target,
                 local_addr,
                 max_allocation_size: options.max_allocation_size,
+                poisoned: AtomicBool::new(false),
             }),
         })
     }
@@ -401,6 +432,13 @@ impl Transport for TcpTransport {
         // is a local, so it is released on return or task cancellation.
         let mut stream = self.inner.stream.clone().lock_owned().await;
 
+        // Refuse to read from a stream whose framing was previously lost; the
+        // leftover bytes of the abandoned frame would be misparsed as a new
+        // message.
+        if self.inner.is_poisoned() {
+            return Err(Error::Closed { target }.boxed());
+        }
+
         // Read a complete BER-encoded message using the framing protocol.
         let max_alloc = self.inner.max_allocation_size;
         let result = timeout(
@@ -411,9 +449,17 @@ impl Transport for TcpTransport {
 
         match result {
             Ok(Ok(data)) => Ok((data, target)),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // A malformed/oversized/truncated frame leaves the stream at an
+                // unknown offset; abandon the connection.
+                self.inner.poison(&mut stream).await;
+                Err(e)
+            }
             Err(_) => {
                 tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
+                // A timeout mid-frame leaves unread content bytes buffered;
+                // abandon the connection.
+                self.inner.poison(&mut stream).await;
                 Err(Error::Timeout {
                     target,
                     elapsed: recv_timeout,
@@ -438,14 +484,21 @@ impl Transport for TcpTransport {
         // future were dropped between the send and the recv.
         let mut stream = self.inner.stream.clone().lock_owned().await;
 
-        stream
-            .write_all(data)
-            .await
-            .map_err(|e| Error::Network { target, source: e }.boxed())?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+        // Refuse to reuse a stream whose framing was previously lost.
+        if self.inner.is_poisoned() {
+            return Err(Error::Closed { target }.boxed());
+        }
+
+        // A write failure may have left a partial request on the wire, so the
+        // stream can no longer be trusted for framing; poison before returning.
+        if let Err(e) = stream.write_all(data).await {
+            self.inner.poison(&mut stream).await;
+            return Err(Error::Network { target, source: e }.boxed());
+        }
+        if let Err(e) = stream.flush().await {
+            self.inner.poison(&mut stream).await;
+            return Err(Error::Network { target, source: e }.boxed());
+        }
 
         let result = timeout(
             recv_timeout,
@@ -455,9 +508,17 @@ impl Transport for TcpTransport {
 
         match result {
             Ok(Ok(response)) => Ok((response, target)),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // A malformed/oversized/truncated frame leaves the stream at an
+                // unknown offset; abandon the connection.
+                self.inner.poison(&mut stream).await;
+                Err(e)
+            }
             Err(_) => {
                 tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
+                // A timeout mid-frame leaves unread content bytes buffered;
+                // abandon the connection.
+                self.inner.poison(&mut stream).await;
                 Err(Error::Timeout {
                     target,
                     elapsed: recv_timeout,
@@ -1179,6 +1240,131 @@ mod tests {
             .expect("second request should not hang");
         let (response, _) = result.expect("second request should succeed");
         assert_eq!(response[0], 0x30);
+
+        server.await.unwrap();
+    }
+
+    /// Regression test: a malformed frame must poison the stream so the next
+    /// request fails fast instead of parsing leftover/misaligned bytes.
+    ///
+    /// With `is_reliable() == true` the client does not retry, so a desynced
+    /// stream would otherwise have its next `request()` parse the tail of the
+    /// abandoned frame as a fresh message. The transport now marks the stream
+    /// poisoned after any malformed/oversized/truncated/timed-out read and
+    /// rejects later requests with [`Error::Closed`].
+    #[tokio::test]
+    async fn test_tcp_malformed_frame_poisons_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            // Read the first request framing.
+            let mut hdr = [0u8; 2];
+            socket.read_exact(&mut hdr).await.unwrap();
+            let mut body = vec![0u8; hdr[1] as usize];
+            socket.read_exact(&mut body).await.unwrap();
+
+            // Reply with a non-SEQUENCE tag (0x31) plus trailing bytes that, if
+            // the stream were reused, could be misparsed as a following frame.
+            socket
+                .write_all(&[0x31, 0x02, 0xde, 0xad, 0x30, 0x00])
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            // Keep the connection open; the point is that the client must not
+            // reuse it, not that the server closed it.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+
+        // First request: the malformed reply is rejected and poisons the stream.
+        let request = build_request_with_id(1);
+        transport.register_request(1, Duration::from_secs(5));
+        let first = transport.request(&request, 1).await;
+        let err = first.expect_err("malformed frame should error");
+        assert!(
+            matches!(*err, Error::MalformedResponse { .. }),
+            "Expected MalformedResponse, got: {err:?}"
+        );
+
+        // The stream must now be flagged as poisoned.
+        assert!(
+            transport.inner.is_poisoned(),
+            "stream should be poisoned after a malformed frame"
+        );
+
+        // The next request must fail fast with Closed rather than read the
+        // leftover bytes of the abandoned frame.
+        let request2 = build_request_with_id(2);
+        transport.register_request(2, Duration::from_secs(5));
+        let second = timeout(Duration::from_secs(5), transport.request(&request2, 2))
+            .await
+            .expect("second request should not hang");
+        let err2 = second.expect_err("poisoned stream should reject the next request");
+        assert!(
+            matches!(*err2, Error::Closed { .. }),
+            "Expected Closed on poisoned stream, got: {err2:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// Regression test: a read that times out mid-frame poisons the stream.
+    ///
+    /// The server sends a frame header claiming more content than it delivers
+    /// and then stalls, so the client's content `read_exact` times out with
+    /// bytes still buffered. `recv()` must poison the stream so a later `recv()`
+    /// does not resume parsing at a misaligned offset.
+    #[tokio::test]
+    async fn test_tcp_timeout_mid_frame_poisons_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut buf = [0u8; 64];
+            let _ = socket.read(&mut buf).await;
+
+            // Claim 8 content octets but send only 2, then stall without
+            // closing so the client's content read times out.
+            socket.write_all(&[0x30, 0x08, 0x01, 0x02]).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+
+        let request = build_request_with_id(1);
+        transport.send(&request).await.unwrap();
+
+        transport.register_request(1, Duration::from_millis(100));
+        let first = transport.recv(1).await;
+        let err = first.expect_err("mid-frame read should time out");
+        assert!(
+            matches!(*err, Error::Timeout { .. }),
+            "Expected Timeout, got: {err:?}"
+        );
+
+        assert!(
+            transport.inner.is_poisoned(),
+            "stream should be poisoned after a mid-frame timeout"
+        );
+
+        // A later recv must fail fast rather than parse leftover content bytes.
+        transport.register_request(1, Duration::from_secs(5));
+        let second = timeout(Duration::from_secs(5), transport.recv(1))
+            .await
+            .expect("second recv should not hang");
+        let err2 = second.expect_err("poisoned stream should reject the next recv");
+        assert!(
+            matches!(*err2, Error::Closed { .. }),
+            "Expected Closed on poisoned stream, got: {err2:?}"
+        );
 
         server.await.unwrap();
     }
