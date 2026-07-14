@@ -752,6 +752,7 @@ impl AgentBuilder {
             snmp_invalid_msgs: AtomicU32::new(0),
             snmp_unknown_security_models: AtomicU32::new(0),
             snmp_silent_drops: AtomicU32::new(0),
+            snmp_unknown_contexts: AtomicU32::new(0),
             usm_stats: UsmStats::default(),
         });
 
@@ -829,6 +830,9 @@ pub(crate) struct AgentState {
     /// snmpSilentDrops (1.3.6.1.6.3.11.2.1.3) - confirmed-class PDUs silently
     /// dropped because even an empty response would exceed max message size
     pub(crate) snmp_silent_drops: AtomicU32,
+    /// snmpUnknownContexts (1.3.6.1.6.3.12.1.5) - requests whose scopedPDU
+    /// contextEngineID did not name a context served by this engine
+    pub(crate) snmp_unknown_contexts: AtomicU32,
     /// RFC 3414 usmStats counters
     pub(crate) usm_stats: UsmStats,
 }
@@ -954,6 +958,22 @@ impl Agent {
     #[must_use]
     pub fn snmp_silent_drops(&self) -> u32 {
         self.inner.state.snmp_silent_drops.load(Ordering::Relaxed)
+    }
+
+    /// Get the snmpUnknownContexts counter value.
+    ///
+    /// This counter tracks requests whose scopedPDU contextEngineID did not
+    /// name a context served by this engine (RFC 3413 Section 3.2). Such
+    /// requests are answered with a Report PDU rather than dispatched against
+    /// the local MIB.
+    ///
+    /// OID: 1.3.6.1.6.3.12.1.5
+    #[must_use]
+    pub fn snmp_unknown_contexts(&self) -> u32 {
+        self.inner
+            .state
+            .snmp_unknown_contexts
+            .load(Ordering::Relaxed)
     }
 
     /// Get the usmStatsUnknownEngineIDs counter value.

@@ -596,8 +596,12 @@ pub fn parse_discovery_response_with_limits(
 ) -> Result<EngineState> {
     let usm = UsmSecurityParams::decode(security_params.clone())?;
 
-    if usm.engine_id.is_empty() {
-        tracing::debug!(target: "async_snmp::engine", "discovery response contained empty engine ID");
+    // RFC 3411 Section 5: a valid SnmpEngineID is 5..=32 octets and is neither
+    // all-zero nor all-0xff. Reject discovery responses carrying an engine ID
+    // outside those bounds (including the empty ID) rather than caching it and
+    // deriving unusable localized keys from it.
+    if validate_engine_id(&usm.engine_id).is_err() {
+        tracing::debug!(target: "async_snmp::engine", { length = usm.engine_id.len() }, "discovery response contained invalid engine ID");
         return Err(Error::MalformedResponse {
             target: SocketAddr::from(([0, 0, 0, 0], 0)),
         }
@@ -1127,6 +1131,30 @@ mod tests {
         let result = parse_discovery_response(&encoded);
         assert!(matches!(
             *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_discovery_response_rejects_invalid_engine_id() {
+        // Too short (< 5 octets).
+        let usm = UsmSecurityParams::new(b"abcd".as_slice(), 1, 1, b"".as_slice());
+        assert!(matches!(
+            *parse_discovery_response(&usm.encode()).unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
+
+        // All-zero engine ID of otherwise valid length.
+        let usm = UsmSecurityParams::new([0u8; 8].as_slice(), 1, 1, b"".as_slice());
+        assert!(matches!(
+            *parse_discovery_response(&usm.encode()).unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
+
+        // All-0xff engine ID of otherwise valid length.
+        let usm = UsmSecurityParams::new([0xffu8; 8].as_slice(), 1, 1, b"".as_slice());
+        assert!(matches!(
+            *parse_discovery_response(&usm.encode()).unwrap_err(),
             Error::MalformedResponse { .. }
         ));
     }

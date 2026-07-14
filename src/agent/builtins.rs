@@ -293,6 +293,7 @@ mod tests {
             snmp_invalid_msgs: AtomicU32::new(10),
             snmp_unknown_security_models: AtomicU32::new(20),
             snmp_silent_drops: AtomicU32::new(30),
+            snmp_unknown_contexts: AtomicU32::new(0),
             usm_stats: {
                 let stats = crate::v3::process::UsmStats::default();
                 stats.unknown_engine_ids.store(40, Ordering::Relaxed);
