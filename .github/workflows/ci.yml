@@ -34,6 +34,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread -- -D warnings
 
+  feature-checks:
+    name: Feature combination checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --no-default-features --features crypto-rustcrypto
+      - run: cargo check --no-default-features --features crypto-fips
+
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.toolchain }})
     runs-on: ${{ matrix.os }}
