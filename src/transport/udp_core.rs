@@ -64,6 +64,9 @@ struct ResponseSlot {
     response: Option<(Bytes, SocketAddr)>,
     deadline: Instant,
     notify: Arc<Notify>,
+    /// When set, only responses from exactly this address are delivered;
+    /// mismatched sources are rejected without consuming the slot.
+    expected_source: Option<SocketAddr>,
 }
 
 impl UdpCore {
@@ -117,13 +120,21 @@ impl UdpCore {
 
     /// Register a pending request with a timeout.
     ///
-    /// Creates a slot that will accept the response when it arrives.
-    pub fn register(&self, request_id: i32, timeout: Duration) {
+    /// Creates a slot that will accept the response when it arrives. When
+    /// `expected_source` is `Some`, only responses from exactly that address
+    /// are delivered to the slot; others are counted as unmatched.
+    pub fn register(
+        &self,
+        request_id: i32,
+        timeout: Duration,
+        expected_source: Option<SocketAddr>,
+    ) {
         let shard = self.shard(request_id);
         let slot = ResponseSlot {
             response: None,
             deadline: Instant::now() + timeout,
             notify: Arc::new(Notify::new()),
+            expected_source,
         };
         shard.pending.lock().unwrap().insert(request_id, slot);
     }
@@ -137,6 +148,14 @@ impl UdpCore {
         let mut pending = shard.pending.lock().unwrap();
 
         if let Some(slot) = pending.get_mut(&request_id) {
+            if let Some(expected) = slot.expected_source
+                && expected != source
+            {
+                // Leave the slot intact so the genuine response can still land.
+                drop(pending);
+                self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
             slot.response = Some((data, source));
             let notify = slot.notify.clone();
             drop(pending);

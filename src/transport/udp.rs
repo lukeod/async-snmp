@@ -154,6 +154,7 @@ impl UdpTransport {
         UdpHandle {
             inner: self.inner.clone(),
             target,
+            strict_source: false,
         }
     }
 
@@ -392,6 +393,24 @@ impl Default for UdpTransportBuilder {
 pub struct UdpHandle {
     inner: Arc<UdpTransportInner>,
     target: SocketAddr,
+    strict_source: bool,
+}
+
+impl UdpHandle {
+    /// Require responses to originate from this handle's target address.
+    ///
+    /// By default (false), responses are matched by request ID alone and a
+    /// source mismatch only logs a warning (see
+    /// [`warn_on_source_mismatch`](UdpTransportBuilder::warn_on_source_mismatch)),
+    /// because multihomed agents may legitimately reply from a different
+    /// address. When enabled, a response from any other address is dropped
+    /// (counted as `unmatched` in [`TransportStats`]) and the request keeps
+    /// waiting for a response from the target.
+    #[must_use]
+    pub fn strict_source(mut self, strict: bool) -> Self {
+        self.strict_source = strict;
+        self
+    }
 }
 
 impl Transport for UdpHandle {
@@ -450,7 +469,8 @@ impl Transport for UdpHandle {
     }
 
     fn register_request(&self, request_id: i32, timeout: Duration) {
-        self.inner.core.register(request_id, timeout);
+        let expected = self.strict_source.then_some(self.target);
+        self.inner.core.register(request_id, timeout, expected);
     }
 }
 
@@ -675,7 +695,12 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let source: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
-        assert!(!transport.inner.core.deliver(42, response_packet(42), source));
+        assert!(
+            !transport
+                .inner
+                .core
+                .deliver(42, response_packet(42), source)
+        );
 
         let stats = transport.stats();
         assert_eq!(stats.unmatched, 1);
@@ -734,6 +759,54 @@ mod tests {
         transport.inner.core.cleanup_expired();
 
         assert_eq!(transport.stats().expired, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_handle_rejects_mismatched_source_and_keeps_slot() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        let mismatched: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let handle = transport.handle(target).strict_source(true);
+        handle.register_request(21, Duration::from_secs(5));
+
+        let packet = response_packet(21);
+        assert!(
+            !transport.inner.core.deliver(21, packet.clone(), mismatched),
+            "strict handle must reject a mismatched source"
+        );
+        assert_eq!(transport.stats().unmatched, 1);
+
+        // The slot must survive rejection so the genuine response still lands.
+        assert!(transport.inner.core.deliver(21, packet.clone(), target));
+
+        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(21))
+            .await
+            .expect("recv timed out")
+            .expect("matching-source response must be delivered after a rejected one");
+
+        assert_eq!(data, packet);
+        assert_eq!(source, target);
+    }
+
+    #[tokio::test]
+    async fn strict_handle_accepts_matching_source() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+
+        let handle = transport.handle(target).strict_source(true);
+        handle.register_request(22, Duration::from_secs(5));
+
+        let packet = response_packet(22);
+        assert!(transport.inner.core.deliver(22, packet.clone(), target));
+
+        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(22))
+            .await
+            .expect("recv timed out")
+            .expect("matching-source response must be accepted by a strict handle");
+
+        assert_eq!(data, packet);
+        assert_eq!(source, target);
     }
 
     #[tokio::test]
