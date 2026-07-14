@@ -66,7 +66,7 @@ use async_snmp::{Auth, Client, oid};
 use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<(), async_snmp::Error> {
+async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
         .timeout(Duration::from_secs(5))
         .connect()
@@ -102,7 +102,7 @@ let client = Client::builder(addr, Auth::v2c("public"))
 use async_snmp::{Auth, Client, oid, v3::{AuthProtocol, PrivProtocol}};
 
 #[tokio::main]
-async fn main() -> Result<(), async_snmp::Error> {
+async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161),
         Auth::usm("admin")
             .auth(AuthProtocol::Sha256, "authpass123")
@@ -121,10 +121,9 @@ async fn main() -> Result<(), async_snmp::Error> {
 
 ```rust
 use async_snmp::{Auth, Client, oid};
-use futures::StreamExt;
 
 #[tokio::main]
-async fn main() -> Result<(), async_snmp::Error> {
+async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
         .connect()
         .await?;
@@ -148,7 +147,7 @@ For monitoring systems polling many targets, share a single UDP socket across al
 use async_snmp::{Auth, Client, UdpTransport, oid};
 
 #[tokio::main]
-async fn main() -> Result<(), async_snmp::Error> {
+async fn main() -> Result<(), Box<async_snmp::Error>> {
     // Single socket shared across all clients
     let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
@@ -163,8 +162,9 @@ async fn main() -> Result<(), async_snmp::Error> {
     }
 
     // Poll all targets concurrently - sharing one UDP socket
+    let sys_uptime = oid!(1, 3, 6, 1, 2, 1, 1, 3, 0);
     let results = futures::future::join_all(
-        clients.iter().map(|c| c.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)))
+        clients.iter().map(|c| c.get(&sys_uptime))
     ).await;
 
     for (client, result) in clients.iter().zip(results) {
@@ -192,7 +192,7 @@ async-snmp doesn't require your whole application to be async. For CLI tools, sc
 
 ```rust
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), async_snmp::Error> {
+async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
         .connect().await?;
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
@@ -204,7 +204,7 @@ async fn main() -> Result<(), async_snmp::Error> {
 Or wrap async-snmp for use in a fully synchronous call chain with `block_on()`:
 
 ```rust
-fn snmp_get(target: (&str, u16), community: &str) -> Result<VarBind, async_snmp::Error> {
+fn snmp_get(target: (&str, u16), community: &str) -> Result<VarBind, Box<async_snmp::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -229,7 +229,7 @@ use async_snmp::agent::Agent;
 use async_snmp::{Auth, oid};
 
 #[tokio::main]
-async fn main() -> Result<(), async_snmp::Error> {
+async fn main() -> Result<(), Box<async_snmp::Error>> {
     let agent = Agent::builder()
         .bind("0.0.0.0:161")
         .community(b"public")
@@ -249,7 +249,7 @@ async fn main() -> Result<(), async_snmp::Error> {
 }
 ```
 
-Client-based sending is useful for one-shot notifications without running an agent. See [examples/notification_sender.rs](examples/notification_sender.rs) for both approaches with V1, V2c, and V3 examples.
+Client-based sending is useful for one-shot notifications without running an agent. See [examples/notification_sender.rs](examples/notification_sender.rs) for both approaches with V2c and V3 examples.
 
 ### Tracing
 

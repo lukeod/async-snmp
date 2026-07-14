@@ -118,6 +118,14 @@ path = "src/bin/asnmp_set.rs"
 required-features = ["cli"]
 
 [[example]]
+name = "notification_sender"
+required-features = ["agent"]
+
+[[example]]
+name = "agent_with_set"
+required-features = ["agent"]
+
+[[example]]
 name = "mib_get"
 required-features = ["mib"]
 

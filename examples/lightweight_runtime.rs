@@ -1,6 +1,6 @@
 //! Lightweight Runtime Configuration
 //!
-//! All async-snmp examples use #[tokio::main], which spawns a multi-threaded
+//! Most async-snmp examples use #[tokio::main], which spawns a multi-threaded
 //! runtime by default. This is overkill for simple tools that talk to one or
 //! a few devices.
 //!

@@ -180,8 +180,8 @@ impl UdpTransport {
 
     /// Snapshot transport statistics.
     ///
-    /// Returns cumulative counters for delivered and expired requests.
-    /// Useful for monitoring transport health under load.
+    /// Returns cumulative counters for delivered, expired, unmatched, and
+    /// malformed datagrams. Useful for monitoring transport health under load.
     #[must_use]
     pub fn stats(&self) -> TransportStats {
         self.inner.core.stats()

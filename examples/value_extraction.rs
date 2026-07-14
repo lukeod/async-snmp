@@ -379,9 +379,7 @@ fn main() {
         if let [if_index, a, b, c, d] = index {
             println!("  Parsed: ifIndex={if_index}, IP={a}.{b}.{c}.{d}");
         } else {
-            // TODO const-generic suffix method so that the compiler knows this
-            //      branch should be impossible
-            println!("  (cosmic ray or typo)");
+            unreachable!("suffix(5) always returns 5 arcs");
         }
     }
 

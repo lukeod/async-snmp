@@ -8,7 +8,9 @@
 //! - UdpTransport: A single UDP socket shared across multiple clients
 //! - `.build_with(&transport).await`: Creates a client using the shared transport
 //! - Request ID correlation: Responses are matched to requests by ID
+//!   (opt-in strict source matching is available via `UdpHandle::strict_source()`)
 //! - Engine cache: Share SNMPv3 engine discovery across clients
+//! - Transport stats: `UdpTransport::stats()` counters for transport health
 //!
 //! Run with: cargo run --example shared_transport
 //!
@@ -195,6 +197,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nResults: {success} success, {timeout} timeout");
+
+    // Transport-level counters: delivered responses, expired (timed-out) request
+    // slots, unmatched datagrams (no pending request), and malformed datagrams.
+    let stats = shared.stats();
+    println!(
+        "Transport stats: delivered={} expired={} unmatched={} malformed={}",
+        stats.delivered, stats.expired, stats.unmatched, stats.malformed
+    );
 
     println!("\nExample complete!");
     Ok(())
