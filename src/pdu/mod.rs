@@ -12,10 +12,12 @@ use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 /// Section 4.2.3 range `INTEGER (0..2147483647)`.
 ///
 /// `i32::MAX` already equals the upper bound, so only the negative floor needs
-/// enforcing. This is the single encode-side choke point shared by both GETBULK
-/// representations: `Pdu::get_bulk` (the SNMPv3 path, which overloads
-/// `error_status`/`error_index`) and `GetBulkPdu::encode` (the community path).
-/// It guarantees neither encoder can emit a negative value on the wire.
+/// enforcing. Both GETBULK encode paths apply it at their choke point:
+/// `Pdu::encode` clamps the overloaded `error_status`/`error_index` for the
+/// SNMPv3 representation (so even a directly-constructed `Pdu` with negative
+/// fields is normalized), and `GetBulkPdu::encode` clamps `non_repeaters`/
+/// `max_repetitions` for the community path. It guarantees neither encoder can
+/// emit a negative value on the wire.
 ///
 /// The receive side reuses the same clamp: `Pdu::decode` applies it to the
 /// overloaded GETBULK `error_status`/`error_index` fields so a negative value
@@ -222,10 +224,24 @@ impl Pdu {
 
     /// Encode to BER.
     pub fn encode(&self, buf: &mut EncodeBuf) {
+        // For GETBULK, error_status/error_index overload as non-repeaters and
+        // max-repetitions (RFC 3416 Section 4.2.3, INTEGER 0..2147483647). Clamp
+        // negatives to 0 at the encode choke point so a directly-constructed
+        // `Pdu { pdu_type: GetBulkRequest, error_status: -1, .. }` cannot emit a
+        // negative value on the wire, regardless of how the fields were set.
+        let (error_status, error_index) = if self.pdu_type == PduType::GetBulkRequest {
+            (
+                clamp_bulk_field(self.error_status),
+                clamp_bulk_field(self.error_index),
+            )
+        } else {
+            (self.error_status, self.error_index)
+        };
+
         buf.push_constructed(self.pdu_type.tag(), |buf| {
             encode_varbind_list(buf, &self.varbinds);
-            buf.push_integer(self.error_index);
-            buf.push_integer(self.error_status);
+            buf.push_integer(error_index);
+            buf.push_integer(error_status);
             buf.push_integer(self.request_id);
         });
     }
@@ -1309,6 +1325,38 @@ mod tests {
             .expect("clamped generic GETBULK encode should decode as valid");
         assert_eq!(decoded.non_repeaters, 0);
         assert_eq!(decoded.max_repetitions, 0);
+    }
+
+    #[test]
+    fn test_directly_constructed_getbulk_pdu_encode_clamps_negative_fields() {
+        // The pub fields let a caller build a GETBULK Pdu directly, bypassing
+        // Pdu::get_bulk's constructor-side clamp. Pdu::encode must still clamp the
+        // overloaded non-repeaters/max-repetitions (error_status/error_index) to 0
+        // so a directly-constructed PDU cannot emit a negative on the wire.
+        let pdu = Pdu {
+            pdu_type: PduType::GetBulkRequest,
+            request_id: 1,
+            error_status: -1,
+            error_index: -5,
+            varbinds: vec![VarBind::null(oid!(1, 3, 6, 1))],
+        };
+
+        let mut buf = EncodeBuf::new();
+        pdu.encode(&mut buf);
+        let bytes = buf.finish();
+
+        // Read the raw wire integers directly rather than via GetBulkPdu::decode,
+        // which would re-clamp on the decode side (F06) and mask a broken encoder.
+        let mut decoder = Decoder::new(bytes);
+        let tag = decoder.read_tag().expect("read pdu tag");
+        assert_eq!(tag, PduType::GetBulkRequest.tag());
+        let len = decoder.read_length().expect("read pdu length");
+        let mut inner = decoder.sub_decoder(len).expect("pdu sub-decoder");
+        let _request_id = inner.read_integer().expect("read request_id");
+        let non_repeaters = inner.read_integer().expect("read non_repeaters");
+        let max_repetitions = inner.read_integer().expect("read max_repetitions");
+        assert_eq!(non_repeaters, 0);
+        assert_eq!(max_repetitions, 0);
     }
 
     #[test]
