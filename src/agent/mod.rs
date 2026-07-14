@@ -112,8 +112,9 @@ const DEFAULT_MAX_MESSAGE_SIZE: usize = 1472;
 /// Base overhead for SNMP message encoding: the v1/v2c community wrapper plus
 /// the fixed BER framing shared by every response (message and PDU sequence
 /// headers, request-id / error-status / error-index integers, and, for v3, the
-/// msgGlobalData, USM, and scopedPDU framing). Variable-length v3 fields and
-/// the auth/priv material are added on top in [`Agent::response_overhead`].
+/// msgGlobalData, USM, and scopedPDU framing). The variable-length community
+/// string (v1/v2c), variable-length v3 fields, and the auth/priv material are
+/// added on top in [`Agent::response_overhead`].
 const RESPONSE_OVERHEAD: usize = 100;
 
 /// Additional v3 overhead when the message is authenticated:
@@ -1332,7 +1333,11 @@ impl Agent {
     /// tooBig.
     fn response_overhead(&self, ctx: &RequestContext) -> usize {
         if ctx.version != Version::V3 {
-            return RESPONSE_OVERHEAD;
+            // v1/v2c echo the request's community string in the response
+            // wrapper. A long, operator-configured community can otherwise
+            // push the encoded Response past the size limit after
+            // response_fits has already accepted it.
+            return RESPONSE_OVERHEAD + ctx.security_name.len();
         }
         let mut overhead = RESPONSE_OVERHEAD
             + 2 * self.inner.state.engine_id.len()
@@ -2395,10 +2400,13 @@ mod tests {
             .await
             .unwrap();
 
-        // v1/v2c: fixed community-wrapper overhead, unaffected by the security
-        // level field.
+        // v1/v2c: base overhead plus the echoed community string, unaffected by
+        // the security level field.
         let v2c = test_ctx();
-        assert_eq!(agent.response_overhead(&v2c), RESPONSE_OVERHEAD);
+        assert_eq!(
+            agent.response_overhead(&v2c),
+            RESPONSE_OVERHEAD + v2c.security_name.len()
+        );
 
         let username = Bytes::from_static(b"user");
         let variable = 2 * engine_id.len() + username.len(); // context name empty
@@ -2430,6 +2438,44 @@ mod tests {
         assert!(agent.response_overhead(&v2c) < agent.response_overhead(&noauth));
         assert!(agent.response_overhead(&noauth) < agent.response_overhead(&authnopriv));
         assert!(agent.response_overhead(&authnopriv) < agent.response_overhead(&authpriv));
+    }
+
+    #[tokio::test]
+    async fn test_response_overhead_counts_community_length() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        // A long, operator-configured community is echoed in the v1/v2c
+        // response wrapper and must be reflected in the overhead estimate so
+        // response_fits does not accept a Response that then exceeds the size
+        // limit (silent drop) instead of returning tooBig.
+        let short = test_ctx();
+        let mut long = test_ctx();
+        long.security_name = Bytes::from(vec![b'x'; 200]);
+
+        assert_eq!(
+            agent.response_overhead(&long) - agent.response_overhead(&short),
+            long.security_name.len() - short.security_name.len()
+        );
+
+        // With a single varbind sized to fit only when the community length is
+        // ignored, the long community must flip response_fits to false.
+        let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Integer(0));
+        let max = RESPONSE_OVERHEAD + short.security_name.len() + vb.encoded_size();
+        assert!(Agent::response_fits(
+            std::slice::from_ref(&vb),
+            agent.response_overhead(&short),
+            max
+        ));
+        assert!(!Agent::response_fits(
+            std::slice::from_ref(&vb),
+            agent.response_overhead(&long),
+            max
+        ));
     }
 
     #[tokio::test]
