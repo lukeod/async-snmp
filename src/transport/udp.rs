@@ -237,6 +237,7 @@ impl UdpTransport {
                                         tracing::debug!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.source = %source }, "response for unknown request");
                                     }
                                 } else {
+                                    core.note_malformed();
                                     tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, snmp.bytes = len }, "malformed response (no request_id)");
                                 }
                             }
@@ -667,6 +668,72 @@ mod tests {
         assert_eq!(data, packet);
         assert_eq!(source, mismatched);
         assert_ne!(source, handle.peer_addr());
+    }
+
+    #[tokio::test]
+    async fn deliver_to_unregistered_id_counts_unmatched() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let source: SocketAddr = "127.0.0.1:161".parse().unwrap();
+
+        assert!(!transport.inner.core.deliver(42, response_packet(42), source));
+
+        let stats = transport.stats();
+        assert_eq!(stats.unmatched, 1);
+        assert_eq!(stats.delivered, 0);
+    }
+
+    #[tokio::test]
+    async fn second_deliver_after_recv_counts_unmatched() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        let handle = transport.handle(target);
+        handle.register_request(7, Duration::from_secs(5));
+
+        let packet = response_packet(7);
+        assert!(transport.inner.core.deliver(7, packet.clone(), target));
+        tokio::time::timeout(Duration::from_secs(1), handle.recv(7))
+            .await
+            .expect("recv timed out")
+            .expect("first response must be delivered");
+
+        // Slot consumed by recv: a duplicate is unmatched.
+        assert!(!transport.inner.core.deliver(7, packet, target));
+
+        let stats = transport.stats();
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.unmatched, 1);
+    }
+
+    #[tokio::test]
+    async fn garbage_datagram_counts_malformed() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(b"not snmp", transport.local_addr())
+            .await
+            .unwrap();
+
+        // The recv loop processes the datagram asynchronously; poll briefly.
+        let mut malformed = 0;
+        for _ in 0..100 {
+            malformed = transport.stats().malformed;
+            if malformed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(malformed, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_counts_expired() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        handle.register_request(13, Duration::ZERO);
+
+        transport.inner.core.cleanup_expired();
+
+        assert_eq!(transport.stats().expired, 1);
     }
 
     #[tokio::test]

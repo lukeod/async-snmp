@@ -32,17 +32,28 @@ struct CoreStats {
     delivered: AtomicU64,
     /// Requests that timed out without receiving a response.
     expired: AtomicU64,
+    /// Responses with no matching pending request (late, duplicate, or
+    /// never registered).
+    unmatched: AtomicU64,
+    /// Datagrams from which no request ID could be extracted.
+    malformed: AtomicU64,
 }
 
 /// Transport-level statistics.
 ///
 /// Returned by [`UdpTransport::stats()`](super::UdpTransport::stats).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct TransportStats {
     /// Responses successfully matched to a pending request.
     pub delivered: u64,
     /// Requests that timed out without receiving a response.
     pub expired: u64,
+    /// Responses with no matching pending request (late, duplicate, or
+    /// never registered).
+    pub unmatched: u64,
+    /// Datagrams from which no request ID could be extracted.
+    pub malformed: u64,
 }
 
 struct Shard {
@@ -71,6 +82,8 @@ impl UdpCore {
             stats: CoreStats {
                 delivered: AtomicU64::new(0),
                 expired: AtomicU64::new(0),
+                unmatched: AtomicU64::new(0),
+                malformed: AtomicU64::new(0),
             },
             closed: AtomicBool::new(false),
         }
@@ -131,7 +144,13 @@ impl UdpCore {
             self.stats.delivered.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
         false
+    }
+
+    /// Record a datagram from which no request ID could be extracted.
+    pub(crate) fn note_malformed(&self) {
+        self.stats.malformed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Wait for a response to arrive for the given request.
@@ -209,6 +228,8 @@ impl UdpCore {
         TransportStats {
             delivered: self.stats.delivered.load(Ordering::Relaxed),
             expired: self.stats.expired.load(Ordering::Relaxed),
+            unmatched: self.stats.unmatched.load(Ordering::Relaxed),
+            malformed: self.stats.malformed.load(Ordering::Relaxed),
         }
     }
 
@@ -226,9 +247,19 @@ impl UdpCore {
     /// but were never waited on.
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
+        let mut removed = 0u64;
         for shard in self.shards.iter() {
             let mut pending = shard.pending.lock().unwrap();
-            pending.retain(|_, slot| slot.deadline > now);
+            pending.retain(|_, slot| {
+                let keep = slot.deadline > now;
+                if !keep {
+                    removed += 1;
+                }
+                keep
+            });
+        }
+        if removed > 0 {
+            self.stats.expired.fetch_add(removed, Ordering::Relaxed);
         }
     }
 }
