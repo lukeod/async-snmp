@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-14
+
+### Added
+
+- `UdpHandle::strict_source()`, opt-in strict source matching on a shared-transport handle. By default responses are matched by request ID alone and a source-address mismatch only logs a warning (multihomed agents may legitimately reply from a different address); with strict matching enabled, a response from any address other than the handle's target is dropped (counted as `unmatched`) and the request keeps waiting.
+- `TransportStats::unmatched` and `TransportStats::malformed` counters: datagrams whose request ID matched no pending request slot, and datagrams that failed message decode. Slots removed by the periodic cleanup pass are now counted under the existing `expired` counter.
+- `Error::Closed`, returned when the transport is shut down while a request is pending. Not retriable; recovery requires a new transport.
+
+### Changed
+
+- A request pending on a transport that shuts down now fails with `Error::Closed` instead of `Error::Timeout`, so client retry loops no longer burn full retry cycles with backoff against a dead transport. The slot-missing path still returns `Timeout` when the transport is open.
+
+### Fixed
+
+- The crate failed to compile without the `agent` feature (e.g. `--no-default-features --features crypto-rustcrypto`): the shared v3 inbound processing referenced `DecodeErrorKind::ExpectedEncryption`, which was gated behind `agent`. The variant is now unconditional.
+
 ## [0.14.0] - 2026-07-14
 
 ### Added
@@ -417,19 +433,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/async-snmp/async-snmp/compare/v0.14.0...HEAD
-[0.14.0]: https://github.com/async-snmp/async-snmp/compare/v0.13.0...v0.14.0
-[0.13.0]: https://github.com/async-snmp/async-snmp/compare/v0.12.0...v0.13.0
-[0.12.0]: https://github.com/async-snmp/async-snmp/compare/v0.11.0...v0.12.0
-[0.11.0]: https://github.com/async-snmp/async-snmp/compare/v0.10.0...v0.11.0
-[0.10.0]: https://github.com/async-snmp/async-snmp/compare/v0.9.0...v0.10.0
-[0.9.0]: https://github.com/async-snmp/async-snmp/compare/v0.8.0...v0.9.0
-[0.8.0]: https://github.com/async-snmp/async-snmp/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/async-snmp/async-snmp/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/async-snmp/async-snmp/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/async-snmp/async-snmp/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/async-snmp/async-snmp/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/async-snmp/async-snmp/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/async-snmp/async-snmp/compare/v0.1.2...v0.2.0
-[0.1.2]: https://github.com/async-snmp/async-snmp/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/async-snmp/async-snmp/releases/tag/v0.1.1
+[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/lukeod/async-snmp/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/lukeod/async-snmp/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/lukeod/async-snmp/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/lukeod/async-snmp/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/lukeod/async-snmp/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/lukeod/async-snmp/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/lukeod/async-snmp/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/lukeod/async-snmp/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/lukeod/async-snmp/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/lukeod/async-snmp/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/lukeod/async-snmp/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/lukeod/async-snmp/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/lukeod/async-snmp/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/lukeod/async-snmp/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/lukeod/async-snmp/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/lukeod/async-snmp/releases/tag/v0.1.1
