@@ -4,7 +4,7 @@ use async_snmp::agent::Agent;
 use async_snmp::notification::{Notification, NotificationReceiver};
 use async_snmp::v3::{AuthProtocol, PrivProtocol};
 use async_snmp::varbind::VarBind;
-use async_snmp::{Auth, Client, Pdu, Value, oid};
+use async_snmp::{Auth, Client, Pdu, Retry, Value, oid};
 use std::time::Duration;
 
 // ============================================================================
@@ -698,5 +698,43 @@ async fn agent_no_sinks_is_noop() {
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
     // Should succeed without error (no sinks = no-op)
     agent.send_trap(&trap_oid, 0, vec![]).await.unwrap();
+    agent.send_inform(&trap_oid, 0, vec![]).await.unwrap();
+
+    // Detailed variants report an empty (all-succeeded) outcome for no sinks.
+    let outcome = agent.send_trap_detailed(&trap_oid, 0, vec![]).await;
+    assert!(outcome.is_empty());
+    assert!(outcome.all_succeeded());
+}
+
+#[tokio::test]
+async fn agent_inform_detailed_reports_failing_sink() {
+    // Bind a socket to reserve a port, then drop it so nothing listens there.
+    // The inform to this dead destination times out and must be reported as a
+    // failure in the per-sink outcome rather than silently discarded.
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink(dead_addr.to_string(), Auth::v2c("public"))
+        .inform_timeout(Duration::from_millis(50))
+        .inform_retry(Retry::none())
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
+    let outcome = agent.send_inform_detailed(&trap_oid, 0, vec![]).await;
+
+    assert_eq!(outcome.len(), 1);
+    assert!(!outcome.all_succeeded());
+    let failures: Vec<_> = outcome.failures().collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].dest, dead_addr);
+    assert!(failures[0].result.is_err());
+
+    // The lossy wrapper still returns Ok(()) for backward compatibility.
     agent.send_inform(&trap_oid, 0, vec![]).await.unwrap();
 }

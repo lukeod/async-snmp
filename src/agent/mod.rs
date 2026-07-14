@@ -74,6 +74,7 @@ mod response;
 mod set_handler;
 pub mod vacm;
 
+pub use notification::{NotificationOutcome, SinkOutcome};
 pub use vacm::{SecurityModel, VacmBuilder, VacmConfig, View, ViewCheckResult, ViewSubtree};
 
 use std::collections::{HashMap, HashSet};

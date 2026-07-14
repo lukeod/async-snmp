@@ -171,6 +171,64 @@ fn resolve_usm_config(usm: &UsmAuth) -> UsmConfig {
     security
 }
 
+/// Delivery outcome for a single trap sink.
+///
+/// Reports the destination and the result of the delivery attempt. For traps
+/// this reflects the local send (encoding and socket write); for confirmed
+/// informs it reflects the full request/response exchange, including timeout.
+#[derive(Debug)]
+pub struct SinkOutcome {
+    /// The sink destination address.
+    pub dest: SocketAddr,
+    /// The delivery result for this sink. `Ok(())` on success.
+    pub result: Result<()>,
+}
+
+/// Aggregate outcome of sending a notification to all configured sinks.
+///
+/// Returned by [`Agent::send_trap_detailed`](super::Agent::send_trap_detailed)
+/// and [`Agent::send_inform_detailed`](super::Agent::send_inform_detailed) so
+/// callers can observe partial success: which sinks succeeded and which failed
+/// with their errors. Sinks that were skipped (e.g. v1 sinks for informs) are
+/// not included.
+#[derive(Debug)]
+pub struct NotificationOutcome {
+    sinks: Vec<SinkOutcome>,
+}
+
+impl NotificationOutcome {
+    /// Per-sink outcomes, in sink configuration order.
+    pub fn sinks(&self) -> &[SinkOutcome] {
+        &self.sinks
+    }
+
+    /// Iterator over the sinks whose delivery failed.
+    pub fn failures(&self) -> impl Iterator<Item = &SinkOutcome> {
+        self.sinks.iter().filter(|s| s.result.is_err())
+    }
+
+    /// `true` if every attempted sink succeeded (also `true` when no sinks
+    /// were attempted).
+    pub fn all_succeeded(&self) -> bool {
+        self.sinks.iter().all(|s| s.result.is_ok())
+    }
+
+    /// Number of sinks attempted.
+    pub fn len(&self) -> usize {
+        self.sinks.len()
+    }
+
+    /// `true` if no sinks were attempted.
+    pub fn is_empty(&self) -> bool {
+        self.sinks.is_empty()
+    }
+
+    /// Consume the outcome, returning the per-sink outcomes.
+    pub fn into_sinks(self) -> Vec<SinkOutcome> {
+        self.sinks
+    }
+}
+
 impl super::Agent {
     /// Send a trap to all configured trap sinks.
     ///
@@ -204,21 +262,46 @@ impl super::Agent {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> Result<()> {
+        let outcome = self.send_trap_detailed(trap_oid, uptime, varbinds).await;
+        for sink in outcome.failures() {
+            if let Err(ref e) = sink.result {
+                tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %e }, "failed to send trap");
+            }
+        }
+        Ok(())
+    }
+
+    /// Send a trap to all configured trap sinks, reporting per-sink outcomes.
+    ///
+    /// Behaves like [`send_trap`](Self::send_trap) but returns a
+    /// [`NotificationOutcome`] describing which sinks succeeded and which
+    /// failed with their errors, rather than discarding per-sink failures.
+    /// Unlike [`send_trap`](Self::send_trap), it does not emit warning logs for
+    /// failures; the caller is expected to inspect the returned outcome.
+    pub async fn send_trap_detailed(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> NotificationOutcome {
         let sinks = &self.inner.trap_sinks;
+        let mut outcomes = Vec::with_capacity(sinks.len());
         if sinks.is_empty() {
-            return Ok(());
+            return NotificationOutcome { sinks: outcomes };
         }
 
         let request_id = self.next_notification_id();
         let pdu = Pdu::trap_v2(request_id, uptime, trap_oid, varbinds);
 
         for sink in sinks {
-            if let Err(e) = self.send_trap_to_sink(sink, &pdu).await {
-                tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %e }, "failed to send trap");
-            }
+            let result = self.send_trap_to_sink(sink, &pdu).await;
+            outcomes.push(SinkOutcome {
+                dest: sink.dest,
+                result,
+            });
         }
 
-        Ok(())
+        NotificationOutcome { sinks: outcomes }
     }
 
     /// Send an inform to all configured trap sinks.
@@ -253,25 +336,48 @@ impl super::Agent {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> Result<()> {
-        let sinks = &self.inner.trap_sinks;
-        if sinks.is_empty() {
-            return Ok(());
+        let outcome = self.send_inform_detailed(trap_oid, uptime, varbinds).await;
+        for sink in outcome.failures() {
+            if let Err(ref e) = sink.result {
+                tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %e }, "failed to send inform");
+            }
         }
+        Ok(())
+    }
+
+    /// Send an inform to all configured trap sinks, reporting per-sink outcomes.
+    ///
+    /// Behaves like [`send_inform`](Self::send_inform) but returns a
+    /// [`NotificationOutcome`] describing which sinks acknowledged and which
+    /// failed with their errors (including confirmed-inform timeouts), rather
+    /// than discarding per-sink failures. v1 sinks are skipped and are not
+    /// included in the outcome. Unlike [`send_inform`](Self::send_inform), it
+    /// does not emit warning logs for failures; the caller is expected to
+    /// inspect the returned outcome.
+    pub async fn send_inform_detailed(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> NotificationOutcome {
+        let sinks = &self.inner.trap_sinks;
+        let mut outcomes = Vec::new();
 
         for sink in sinks {
             if sink.version == Version::V1 {
                 continue;
             }
 
-            if let Err(e) = self
+            let result = self
                 .send_inform_to_sink(sink, trap_oid, uptime, &varbinds)
-                .await
-            {
-                tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %e }, "failed to send inform");
-            }
+                .await;
+            outcomes.push(SinkOutcome {
+                dest: sink.dest,
+                result,
+            });
         }
 
-        Ok(())
+        NotificationOutcome { sinks: outcomes }
     }
 
     /// Send a trap PDU to a single sink.
