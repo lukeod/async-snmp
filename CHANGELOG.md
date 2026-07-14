@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-14
+
 ### Added
 
 - `Agent::send_trap_detailed()` and `Agent::send_inform_detailed()`, plus the `NotificationOutcome`/`SinkOutcome` types, which report per-sink delivery results (including confirmed-Inform timeouts) instead of discarding them. The existing `send_trap()`/`send_inform()` are unchanged and still return `Ok(())` after warn-and-discard; callers that need to observe delivery failures opt into the `_detailed` variants.
@@ -478,7 +480,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/lukeod/async-snmp/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/lukeod/async-snmp/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/lukeod/async-snmp/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/lukeod/async-snmp/compare/v0.12.0...v0.13.0
