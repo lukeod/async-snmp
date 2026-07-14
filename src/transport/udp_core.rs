@@ -62,6 +62,9 @@ struct Shard {
 
 struct ResponseSlot {
     response: Option<(Bytes, SocketAddr)>,
+    /// When the request was registered; used to report the real elapsed time
+    /// on timeout instead of deriving it from the deadline.
+    registered_at: Instant,
     deadline: Instant,
     notify: Arc<Notify>,
     /// When set, only responses from exactly this address are delivered;
@@ -130,9 +133,11 @@ impl UdpCore {
         expected_source: Option<SocketAddr>,
     ) {
         let shard = self.shard(request_id);
+        let now = Instant::now();
         let slot = ResponseSlot {
             response: None,
-            deadline: Instant::now() + timeout,
+            registered_at: now,
+            deadline: now + timeout,
             notify: Arc::new(Notify::new()),
             expected_source,
         };
@@ -185,14 +190,14 @@ impl UdpCore {
 
         loop {
             // Single lock: check for response, or grab notify + deadline for waiting.
-            let (notify, deadline) = {
+            let (notify, deadline, registered_at) = {
                 let mut pending = shard.pending.lock().unwrap();
                 if let Some(slot) = pending.get_mut(&request_id) {
                     if let Some(response) = slot.response.take() {
                         pending.remove(&request_id);
                         return Ok(response);
                     }
-                    (slot.notify.clone(), slot.deadline)
+                    (slot.notify.clone(), slot.deadline, slot.registered_at)
                 } else if self.closed.load(Ordering::Acquire) {
                     tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target }, "transport shut down (slot missing)");
                     return Err(Error::Closed { target }.boxed());
@@ -219,9 +224,7 @@ impl UdpCore {
             if now >= deadline {
                 self.unregister(request_id);
                 self.stats.expired.fetch_add(1, Ordering::Relaxed);
-                let elapsed = now.saturating_duration_since(
-                    deadline.checked_sub(Duration::from_secs(1)).unwrap(),
-                );
+                let elapsed = now.saturating_duration_since(registered_at);
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target, ?elapsed }, "transport timeout");
                 return Err(Error::Timeout {
                     target,
@@ -286,5 +289,44 @@ impl UdpCore {
 impl Default for UdpCore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:161".parse().unwrap()
+    }
+
+    // A timed-out wait reports elapsed based on the registration time, not a
+    // hardcoded 1s offset from the deadline, and does not panic when the
+    // deadline is close to the Instant epoch (short timeout).
+    #[tokio::test]
+    async fn timeout_reports_elapsed_from_registration() {
+        let core = UdpCore::new();
+        let addr = test_addr();
+        let timeout = Duration::from_millis(50);
+        core.register(1, timeout, None);
+
+        let err = core.wait_for_response(1, addr).await.unwrap_err();
+        match *err {
+            Error::Timeout {
+                elapsed, retries, ..
+            } => {
+                // Elapsed reflects the configured timeout, not deadline - 1s.
+                assert!(
+                    elapsed >= timeout,
+                    "elapsed {elapsed:?} should be at least the timeout {timeout:?}"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "elapsed {elapsed:?} should not be derived from a 1s offset"
+                );
+                assert_eq!(retries, 0);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 }

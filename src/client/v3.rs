@@ -629,18 +629,21 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        // All retries exhausted
+        // All retries exhausted. Every failing attempt was a timeout (other
+        // errors return early), so build the final error here with the true
+        // total elapsed time and retry count rather than propagating the
+        // per-attempt transport timeout, whose elapsed/retries are not
+        // meaningful at this layer.
+        let _ = last_error;
         let elapsed = start.elapsed();
         Span::current().record("snmp.elapsed_ms", elapsed.as_millis() as u64);
         tracing::debug!(target: "async_snmp::client", { request_id = pdu.request_id, peer = %self.peer_addr(), ?elapsed, retries = max_attempts }, "request timed out");
-        Err(last_error.unwrap_or_else(|| {
-            Error::Timeout {
-                target: self.peer_addr(),
-                elapsed,
-                retries: max_attempts,
-            }
-            .boxed()
-        }))
+        Err(Error::Timeout {
+            target: self.peer_addr(),
+            elapsed,
+            retries: max_attempts,
+        }
+        .boxed())
     }
 
     /// Ensure keys are derived against the local engine ID for V3 trap sending.
