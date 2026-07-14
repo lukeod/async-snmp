@@ -87,9 +87,13 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-/// Maximum SNMP message size for TCP (per RFC 3430).
+/// Protocol-level maximum SNMP message size for TCP (per RFC 3430).
 ///
-/// This is the protocol-level maximum used for msgMaxSize advertisement.
+/// This is the largest value that can be advertised in a v3 msgMaxSize field
+/// (which is encoded as an i32). The advertised value is clamped to this
+/// ceiling, but the effective advertisement is the transport's actual
+/// acceptance limit (`max_allocation_size`) so that a peer honoring the
+/// advertised size cannot send a response the reader would then reject.
 const MAX_TCP_MESSAGE_SIZE: usize = 0x7FFF_FFFF;
 
 /// Default allocation limit for incoming TCP messages.
@@ -568,7 +572,12 @@ impl Transport for TcpTransport {
     }
 
     fn max_message_size(&self) -> u32 {
-        MAX_TCP_MESSAGE_SIZE as u32
+        // Advertise the true acceptance limit rather than the protocol ceiling.
+        // The reader rejects any frame whose claimed content length exceeds
+        // `max_allocation_size`, so advertising a larger msgMaxSize would invite
+        // a peer to send a legitimate-but-oversized response that then gets
+        // rejected. Clamp to the i32-encodable protocol maximum.
+        self.inner.max_allocation_size.min(MAX_TCP_MESSAGE_SIZE) as u32
     }
 }
 
@@ -758,6 +767,47 @@ mod tests {
         assert_eq!(response[2], 0xc8); // 200 in hex
 
         server.await.unwrap();
+    }
+
+    /// Regression test: the advertised msgMaxSize must equal the transport's
+    /// actual acceptance limit (`max_allocation_size`), not the protocol
+    /// ceiling. Advertising more than the reader accepts would let a v3 peer
+    /// honor the advertisement with a response the reader then rejects.
+    #[tokio::test]
+    async fn test_tcp_advertised_max_matches_accepted_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                conns.push(socket);
+            }
+        });
+
+        // Default limit.
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+        assert_eq!(
+            transport.max_message_size() as usize,
+            transport.inner.max_allocation_size,
+            "advertised msgMaxSize must equal the accepted allocation limit"
+        );
+        assert_eq!(
+            transport.max_message_size() as usize,
+            DEFAULT_MAX_ALLOCATION_SIZE
+        );
+
+        // Custom limit via the builder.
+        let custom = 512 * 1024;
+        let transport = TcpTransport::builder()
+            .max_allocation_size(custom)
+            .connect(server_addr)
+            .await
+            .unwrap();
+        assert_eq!(transport.max_message_size() as usize, custom);
+        assert_eq!(
+            transport.max_message_size() as usize,
+            transport.inner.max_allocation_size
+        );
     }
 
     #[tokio::test]
