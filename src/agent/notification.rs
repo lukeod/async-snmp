@@ -467,11 +467,48 @@ impl super::Agent {
     /// Generate a notification request/message ID.
     fn next_notification_id(&self) -> i32 {
         use std::sync::atomic::Ordering;
-        static COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
-        COUNTER
+        self.inner
+            .notification_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(if v == i32::MAX { 1 } else { v + 1 })
             })
             .unwrap_or(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agent::Agent;
+
+    #[tokio::test]
+    async fn test_notification_ids_are_per_agent() {
+        // Each Agent must own its own notification id sequence; two independent
+        // agents must not share a process-global counter.
+        let agent_a = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+        let agent_b = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        // Advance agent_a's sequence a few times.
+        let a1 = agent_a.next_notification_id();
+        let a2 = agent_a.next_notification_id();
+        let a3 = agent_a.next_notification_id();
+        assert_eq!((a1, a2, a3), (1, 2, 3));
+
+        // agent_b is unaffected by agent_a's advancement and starts fresh.
+        let b1 = agent_b.next_notification_id();
+        let b2 = agent_b.next_notification_id();
+        assert_eq!((b1, b2), (1, 2));
+
+        // agent_a continues its own monotonic sequence.
+        assert_eq!(agent_a.next_notification_id(), 4);
     }
 }

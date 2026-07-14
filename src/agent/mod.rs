@@ -808,6 +808,7 @@ impl AgentBuilder {
                 vacm: self.vacm,
                 cancel,
                 trap_sinks,
+                notification_id: std::sync::atomic::AtomicI32::new(1),
             }),
         })
     }
@@ -861,6 +862,8 @@ pub(crate) struct AgentInner {
     pub(crate) cancel: CancellationToken,
     /// Configured trap/inform destinations.
     pub(crate) trap_sinks: Vec<notification::TrapSink>,
+    /// Per-agent monotonic counter for trap request-ids and v3 notification msgIDs.
+    pub(crate) notification_id: std::sync::atomic::AtomicI32,
 }
 
 /// SNMP Agent.
