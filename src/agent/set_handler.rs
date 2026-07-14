@@ -43,7 +43,7 @@ impl Agent {
             self.response_overhead(ctx),
             self.effective_max_size(ctx),
         ) {
-            return Ok(Self::too_big_response(pdu));
+            return Ok(Self::too_big_response(ctx.version, pdu));
         }
 
         // Track which handlers we need to commit/undo

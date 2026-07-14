@@ -1336,7 +1336,7 @@ impl Agent {
             self.response_overhead(ctx),
             self.effective_max_size(ctx),
         ) {
-            return Ok(Self::too_big_response(pdu));
+            return Ok(Self::too_big_response(ctx.version, pdu));
         }
 
         Ok(pdu.to_response())
@@ -1396,14 +1396,24 @@ impl Agent {
     }
 
     /// Build the `tooBig` Response for `pdu`: error-status `tooBig`, error-index
-    /// zero, and an empty variable-bindings field, per RFC 3416 Section 4.2.
-    pub(super) fn too_big_response(pdu: &Pdu) -> Pdu {
+    /// zero, per RFC 3416 Section 4.2.
+    ///
+    /// RFC 3416 clears the variable-bindings field for v2c/v3. SNMPv1 predates
+    /// that rule: RFC 1157 Sections 4.1.2-4.1.4 specify that on a tooBig error
+    /// the Response echoes the original request's variable bindings unchanged,
+    /// so v1 tooBig Responses carry the request varbinds.
+    pub(super) fn too_big_response(version: Version, pdu: &Pdu) -> Pdu {
+        let varbinds = if version == Version::V1 {
+            pdu.varbinds.clone()
+        } else {
+            Vec::new()
+        };
         Pdu {
             pdu_type: PduType::Response,
             request_id: pdu.request_id,
             error_status: ErrorStatus::TooBig.as_i32(),
             error_index: 0,
-            varbinds: Vec::new(),
+            varbinds,
         }
     }
 
@@ -1470,7 +1480,7 @@ impl Agent {
             self.response_overhead(ctx),
             self.effective_max_size(ctx),
         ) {
-            return Ok(Self::too_big_response(pdu));
+            return Ok(Self::too_big_response(ctx.version, pdu));
         }
 
         Ok(Pdu {
@@ -1510,7 +1520,7 @@ impl Agent {
             self.response_overhead(ctx),
             self.effective_max_size(ctx),
         ) {
-            return Ok(Self::too_big_response(pdu));
+            return Ok(Self::too_big_response(ctx.version, pdu));
         }
 
         Ok(Pdu {
@@ -1552,7 +1562,7 @@ impl Agent {
             if !can_add(&next_vb, current_size) {
                 // Can't fit even non-repeaters, return tooBig if we have nothing
                 if response_varbinds.is_empty() {
-                    return Ok(Self::too_big_response(pdu));
+                    return Ok(Self::too_big_response(ctx.version, pdu));
                 }
                 // RFC 3416 Section 4.2.3: truncation removes variable bindings
                 // from the END of the positional set. All repeaters are
@@ -1609,7 +1619,7 @@ impl Agent {
                         // manager's walk instead of prompting a retry with a
                         // smaller max-repetitions.
                         if response_varbinds.is_empty() {
-                            return Ok(Self::too_big_response(pdu));
+                            return Ok(Self::too_big_response(ctx.version, pdu));
                         }
                         // Some varbinds already fit: truncate (partial response).
                         break 'outer;
@@ -3252,6 +3262,36 @@ mod tests {
         assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
         assert_eq!(response.error_index, 0);
         assert!(response.varbinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_too_big_v1_echoes_request_varbinds() {
+        let agent = small_limit_agent().await;
+
+        // SNMPv1 (RFC 1157 Sections 4.1.2-4.1.4): a tooBig Response echoes the
+        // original request's variable bindings, unlike v2c/v3 which clear them.
+        let mut ctx = test_ctx();
+        ctx.version = Version::V1;
+        ctx.security_model = SecurityModel::V1;
+
+        let request_varbinds = five_varbinds();
+        let pdu = Pdu {
+            pdu_type: PduType::GetRequest,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds: request_varbinds.clone(),
+        };
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index, 0);
+        assert_eq!(response.varbinds, request_varbinds);
+
+        // The same oversized request under v2c must still clear the varbinds.
+        let v2c_response = agent.dispatch_request(&test_ctx(), &pdu).await.unwrap();
+        assert_eq!(v2c_response.error_status, ErrorStatus::TooBig.as_i32());
+        assert!(v2c_response.varbinds.is_empty());
     }
 
     #[tokio::test]
