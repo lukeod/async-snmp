@@ -125,6 +125,13 @@ pub enum Error {
         retries: u32,
     },
 
+    /// Transport was shut down while a request was pending.
+    ///
+    /// Not retriable: the transport will never deliver a response again.
+    /// Recovery requires creating a new transport.
+    #[error("transport closed while waiting for {target}")]
+    Closed { target: SocketAddr },
+
     /// SNMP protocol error from agent.
     #[error("SNMP error from {target}: {status} at index {index}")]
     Snmp {

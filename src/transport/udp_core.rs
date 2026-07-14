@@ -155,6 +155,9 @@ impl UdpCore {
                         return Ok(response);
                     }
                     (slot.notify.clone(), slot.deadline)
+                } else if self.closed.load(Ordering::Acquire) {
+                    tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target }, "transport shut down (slot missing)");
+                    return Err(Error::Closed { target }.boxed());
                 } else {
                     tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target, elapsed = ?Duration::ZERO }, "transport timeout (slot missing)");
                     return Err(Error::Timeout {
@@ -171,12 +174,7 @@ impl UdpCore {
             if self.closed.load(Ordering::Acquire) {
                 self.unregister(request_id);
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target }, "transport shut down");
-                return Err(Error::Timeout {
-                    target,
-                    elapsed: Duration::ZERO,
-                    retries: 0,
-                }
-                .boxed());
+                return Err(Error::Closed { target }.boxed());
             }
 
             let now = Instant::now();

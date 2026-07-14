@@ -548,7 +548,43 @@ mod tests {
             .await
             .expect("pending waiter not woken by shutdown")
             .unwrap();
-        assert!(result.is_err(), "waiter should fail after shutdown");
+        let err = result.expect_err("waiter should fail after shutdown");
+        assert!(
+            matches!(*err, Error::Closed { .. }),
+            "expected Error::Closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_after_shutdown_without_slot_returns_closed() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+
+        transport.shutdown().await;
+
+        let err = handle
+            .recv(42)
+            .await
+            .expect_err("recv on closed transport should fail");
+        assert!(
+            matches!(*err, Error::Closed { .. }),
+            "expected Error::Closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_unregistered_id_on_open_transport_returns_timeout() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+
+        let err = handle
+            .recv(42)
+            .await
+            .expect_err("recv without register should fail");
+        assert!(
+            matches!(*err, Error::Timeout { .. }),
+            "expected Error::Timeout, got {err:?}"
+        );
     }
 
     #[tokio::test]
