@@ -84,6 +84,23 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 /// We use 65535 to be safe with any potential header variations.
 const UDP_RECV_BUFFER_SIZE: usize = 65535;
 
+/// Initial backoff applied after a UDP recv error before retrying, doubling up
+/// to [`UDP_RECV_ERROR_BACKOFF_MAX`] while errors persist.
+const UDP_RECV_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(1);
+
+/// Upper bound for the recv-error backoff.
+const UDP_RECV_ERROR_BACKOFF_MAX: Duration = Duration::from_millis(100);
+
+/// Computes the next recv-error backoff from the current one: the first error
+/// starts at [`UDP_RECV_ERROR_BACKOFF_MIN`], subsequent errors double up to
+/// [`UDP_RECV_ERROR_BACKOFF_MAX`]. A zero input means no prior error.
+fn next_recv_error_backoff(current: Duration) -> Duration {
+    match current {
+        Duration::ZERO => UDP_RECV_ERROR_BACKOFF_MIN,
+        d => (d * 2).min(UDP_RECV_ERROR_BACKOFF_MAX),
+    }
+}
+
 /// Configuration for UDP transport.
 #[derive(Clone)]
 pub struct UdpTransportConfig {
@@ -214,6 +231,11 @@ impl UdpTransport {
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
+            // Backoff applied after a recv error to avoid a hot spin when the
+            // socket is in a persistent error state (e.g. ENOBUFS or a stream
+            // of ICMP port-unreachable errors). Reset on any successful recv so
+            // the normal success path is never delayed.
+            let mut recv_error_backoff = Duration::ZERO;
 
             loop {
                 tokio::select! {
@@ -231,6 +253,7 @@ impl UdpTransport {
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((len, source)) => {
+                                recv_error_backoff = Duration::ZERO;
                                 let data = Bytes::copy_from_slice(&buf[..len]);
 
                                 if let Some(request_id) = extract_request_id(&data) {
@@ -245,6 +268,16 @@ impl UdpTransport {
                             Err(_) if shutdown.is_cancelled() => break,
                             Err(e) => {
                                 tracing::error!(target: "async_snmp::transport", { error = %e }, "UDP recv error");
+                                // Exponential backoff, capped, to keep a persistent
+                                // error condition from spinning a CPU core and
+                                // flooding logs. The sleep is interruptible by
+                                // shutdown so cancellation stays responsive.
+                                recv_error_backoff = next_recv_error_backoff(recv_error_backoff);
+                                tokio::select! {
+                                    biased;
+                                    () = shutdown.cancelled() => break,
+                                    () = tokio::time::sleep(recv_error_backoff) => {}
+                                }
                             }
                         }
                     }
@@ -477,6 +510,30 @@ impl Transport for UdpHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recv_error_backoff_starts_at_min_and_grows() {
+        // No prior error -> first backoff is the minimum, never zero, so a
+        // persistent recv error cannot hot-spin the loop.
+        let first = next_recv_error_backoff(Duration::ZERO);
+        assert_eq!(first, UDP_RECV_ERROR_BACKOFF_MIN);
+        assert!(first > Duration::ZERO);
+
+        // Repeated errors double the backoff.
+        let second = next_recv_error_backoff(first);
+        assert_eq!(second, first * 2);
+    }
+
+    #[test]
+    fn recv_error_backoff_is_capped() {
+        // Growth saturates at the maximum rather than increasing unbounded.
+        let capped = next_recv_error_backoff(UDP_RECV_ERROR_BACKOFF_MAX);
+        assert_eq!(capped, UDP_RECV_ERROR_BACKOFF_MAX);
+
+        let near_max =
+            next_recv_error_backoff(UDP_RECV_ERROR_BACKOFF_MAX / 2 + Duration::from_millis(1));
+        assert_eq!(near_max, UDP_RECV_ERROR_BACKOFF_MAX);
+    }
 
     #[tokio::test]
     async fn ipv6_transport_maps_ipv4_target() {
