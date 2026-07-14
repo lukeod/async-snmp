@@ -77,9 +77,10 @@
 use super::Transport;
 use crate::error::{Error, Result};
 use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -100,6 +101,11 @@ const MAX_TCP_MESSAGE_SIZE: usize = 0x7FFF_FFFF;
 /// 10MB is generous for SNMP - even large table walks rarely exceed a few MB.
 /// Real-world SNMP messages typically range from a few hundred bytes to a few KB.
 const DEFAULT_MAX_ALLOCATION_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
+/// Fallback receive timeout used when a request/recv is invoked without a
+/// prior [`register_request`] (or after its per-request entry was already
+/// consumed).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration options for [`TcpTransport`].
 ///
@@ -205,7 +211,7 @@ impl TcpTransportBuilder {
         Ok(TcpTransport {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                current_timeout_ms: AtomicU64::new(30_000),
+                pending_timeouts: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
                 max_allocation_size: self.options.max_allocation_size,
@@ -273,8 +279,14 @@ pub struct TcpTransport {
 struct TcpTransportInner {
     /// The TCP stream, wrapped in Arc for owned guard pattern
     stream: Arc<Mutex<TcpStream>>,
-    /// Timeout for current request in milliseconds (set by `register_request`)
-    current_timeout_ms: AtomicU64,
+    /// Per-request receive timeouts, keyed by request ID.
+    ///
+    /// [`register_request`](Transport::register_request) inserts the timeout for
+    /// a request ID; the matching `request`/`recv` removes and uses it. Keeping
+    /// the value keyed per request (rather than in a single shared field) means a
+    /// second client sharing this cloned transport cannot overwrite the receive
+    /// timeout of another client's in-flight request.
+    pending_timeouts: StdMutex<HashMap<i32, Duration>>,
     target: SocketAddr,
     local_addr: SocketAddr,
     /// Maximum allocation size for incoming messages
@@ -297,6 +309,20 @@ impl TcpTransportInner {
     /// Report whether the stream framing has been marked lost.
     fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Remove and return the receive timeout registered for `request_id`.
+    ///
+    /// Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when no entry was registered
+    /// (or it was already consumed). Taking the value here keeps it local to the
+    /// request that owns the stream guard, so a concurrent registration for a
+    /// different request cannot alter it.
+    fn take_timeout(&self, request_id: i32) -> Duration {
+        self.pending_timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
     }
 
     /// Mark the stream unusable and best-effort close it.
@@ -389,7 +415,7 @@ impl TcpTransport {
         Ok(Self {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                current_timeout_ms: AtomicU64::new(30_000),
+                pending_timeouts: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
                 max_allocation_size: options.max_allocation_size,
@@ -417,15 +443,16 @@ impl Transport for TcpTransport {
         Ok(())
     }
 
-    fn register_request(&self, _request_id: i32, timeout: Duration) {
+    fn register_request(&self, request_id: i32, timeout: Duration) {
         self.inner
-            .current_timeout_ms
-            .store(timeout.as_millis() as u64, Ordering::Relaxed);
+            .pending_timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id, timeout);
     }
 
     async fn recv(&self, request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        let recv_timeout =
-            Duration::from_millis(self.inner.current_timeout_ms.load(Ordering::Relaxed));
+        let recv_timeout = self.inner.take_timeout(request_id);
         let target = self.inner.target;
 
         // Acquire the stream lock for the duration of this read only. The guard
@@ -471,8 +498,7 @@ impl Transport for TcpTransport {
     }
 
     async fn request(&self, data: &[u8], request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        let recv_timeout =
-            Duration::from_millis(self.inner.current_timeout_ms.load(Ordering::Relaxed));
+        let recv_timeout = self.inner.take_timeout(request_id);
         let target = self.inner.target;
         let max_alloc = self.inner.max_allocation_size;
 
@@ -1311,6 +1337,56 @@ mod tests {
         );
 
         server.await.unwrap();
+    }
+
+    /// Regression test: a second client sharing a cloned transport must not be
+    /// able to overwrite the receive timeout of another client's request.
+    ///
+    /// Previously the timeout lived in a single shared `AtomicU64`, so client
+    /// B's `register_request` (with a long timeout) would clobber the value
+    /// client A registered (a short timeout) before A's `recv` read it. A's
+    /// `recv` would then wait for B's long timeout. Timeouts are now keyed per
+    /// request ID, so A's `recv` uses exactly the timeout A registered.
+    #[tokio::test]
+    async fn test_tcp_per_request_timeout_not_overwritten_by_clone() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        // Server accepts the connection but never responds.
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let transport_a = TcpTransport::connect(server_addr).await.unwrap();
+        let transport_b = transport_a.clone();
+
+        // Client A registers a short timeout for its request.
+        transport_a.register_request(1, Duration::from_millis(150));
+        // Client B, sharing the same cloned transport, registers a long timeout
+        // for a different request. With the old shared atomic this overwrote A's
+        // value; per-request keying keeps them independent.
+        transport_b.register_request(2, Duration::from_secs(20));
+
+        // A's recv must time out at ~150ms, not at B's 20s. Guard with a 5s
+        // outer bound: if the bug regresses, A would wait 20s and this fails.
+        let start = std::time::Instant::now();
+        let result = timeout(Duration::from_secs(5), transport_a.recv(1))
+            .await
+            .expect("recv should honor A's short timeout, not B's long one");
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("recv should time out");
+        assert!(
+            matches!(*err, Error::Timeout { .. }),
+            "Expected Timeout, got: {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "recv honored the wrong timeout; elapsed {elapsed:?}"
+        );
+
+        server.abort();
     }
 
     /// Regression test: a read that times out mid-frame poisons the stream.
