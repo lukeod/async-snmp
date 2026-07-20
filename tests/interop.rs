@@ -16,7 +16,6 @@ use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
-use tokio::sync::OnceCell;
 
 // ============================================================================
 // Container Runtime Detection
@@ -60,17 +59,21 @@ macro_rules! require_container_runtime {
 }
 
 // ============================================================================
-// Shared Container Infrastructure
+// Container Fixture
 // ============================================================================
 
-struct ContainerInfo {
+/// A per-test snmpd container.
+///
+/// Each test starts its own container and holds this guard for the test's
+/// duration; dropping it removes the container. Keep it in a local so the
+/// container is cleaned up when the test ends — storing it in a static would
+/// leak the container, since statics are never dropped.
+struct Snmpd {
     _container: ContainerAsync<GenericImage>,
     host: String,
     udp_port: u16,
     tcp_port: u16,
 }
-
-static SNMPD_CONTAINER: OnceCell<ContainerInfo> = OnceCell::const_new();
 
 fn check_image_exists(image: &str) -> Result<(), String> {
     let output = std::process::Command::new("docker")
@@ -103,55 +106,61 @@ fn parse_image(image: &str) -> (&str, &str) {
     (image, "latest")
 }
 
-async fn get_snmpd_container() -> &'static ContainerInfo {
-    SNMPD_CONTAINER
-        .get_or_init(|| async {
-            let image_str = snmpd_image();
-            let (name, tag) = parse_image(&image_str);
+impl Snmpd {
+    async fn start() -> Snmpd {
+        let image_str = snmpd_image();
+        let (name, tag) = parse_image(&image_str);
 
-            if let Err(msg) = check_image_exists(&image_str) {
-                panic!("{msg}");
-            }
+        if let Err(msg) = check_image_exists(&image_str) {
+            panic!("{msg}");
+        }
 
-            // Use log-based waiting: entrypoint.sh outputs "SNMPD_READY" when snmpd is responsive
-            let container = GenericImage::new(name, tag)
-                .with_exposed_port(161.udp())
-                .with_exposed_port(161.tcp())
-                .with_wait_for(WaitFor::message_on_stdout("SNMPD_READY"))
-                .start()
-                .await
-                .expect("Failed to start snmpd container");
+        // Use log-based waiting: entrypoint.sh outputs "SNMPD_READY" when snmpd is responsive
+        let container = GenericImage::new(name, tag)
+            .with_exposed_port(161.udp())
+            .with_exposed_port(161.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("SNMPD_READY"))
+            .start()
+            .await
+            .expect("Failed to start snmpd container");
 
-            #[cfg(not(target_os = "linux"))]
-            tokio::time::sleep(Duration::from_millis(4000)).await; // Wait a moment for host port forwarding to be ready
+        #[cfg(not(target_os = "linux"))]
+        tokio::time::sleep(Duration::from_millis(4000)).await; // Wait a moment for host port forwarding to be ready
 
-            let host = container.get_host().await.expect("Failed to get host");
-            let udp_port = container
-                .get_host_port_ipv4(161.udp())
-                .await
-                .expect("Failed to get UDP port");
-            let tcp_port = container
-                .get_host_port_ipv4(161.tcp())
-                .await
-                .expect("Failed to get TCP port");
+        let host = container.get_host().await.expect("Failed to get host");
+        let udp_port = container
+            .get_host_port_ipv4(161.udp())
+            .await
+            .expect("Failed to get UDP port");
+        let tcp_port = container
+            .get_host_port_ipv4(161.tcp())
+            .await
+            .expect("Failed to get TCP port");
 
-            ContainerInfo {
-                _container: container,
-                host: host.to_string(),
-                udp_port,
-                tcp_port,
-            }
-        })
-        .await
-}
+        Snmpd {
+            _container: container,
+            host: host.to_string(),
+            udp_port,
+            tcp_port,
+        }
+    }
 
-fn parse_target(info: &ContainerInfo) -> SocketAddr {
-    use std::net::ToSocketAddrs;
-    format!("{}:{}", info.host, info.udp_port)
-        .to_socket_addrs()
-        .expect("Failed to resolve target")
-        .next()
-        .expect("No addresses resolved")
+    fn udp_target(&self) -> String {
+        format!("{}:{}", self.host, self.udp_port)
+    }
+
+    fn tcp_target(&self) -> String {
+        format!("{}:{}", self.host, self.tcp_port)
+    }
+
+    fn udp_socket_addr(&self) -> SocketAddr {
+        use std::net::ToSocketAddrs;
+        self.udp_target()
+            .to_socket_addrs()
+            .expect("Failed to resolve target")
+            .next()
+            .expect("No addresses resolved")
+    }
 }
 
 // ============================================================================
@@ -184,8 +193,8 @@ mod users {
 async fn v2c_get_returns_value() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .timeout(Duration::from_secs(5))
@@ -206,8 +215,8 @@ async fn v2c_get_returns_value() {
 async fn v1_get_returns_value() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v1(COMMUNITY))
         .timeout(Duration::from_secs(5))
@@ -224,8 +233,8 @@ async fn v1_get_returns_value() {
 async fn getnext_returns_next_oid() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .connect()
@@ -245,8 +254,8 @@ async fn getnext_returns_next_oid() {
 async fn getbulk_returns_multiple() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .connect()
@@ -269,8 +278,8 @@ async fn getbulk_returns_multiple() {
 async fn walk_system_mib() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .connect()
@@ -294,8 +303,8 @@ async fn walk_system_mib() {
 async fn bulk_walk_interfaces() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .connect()
@@ -319,8 +328,8 @@ async fn bulk_walk_interfaces() {
 async fn v3_no_auth_no_priv() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::usm(users::NOAUTH_USER))
         .timeout(Duration::from_secs(5))
@@ -336,8 +345,8 @@ async fn v3_no_auth_no_priv() {
 async fn v3_auth_no_priv() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(
         &target,
@@ -356,8 +365,8 @@ async fn v3_auth_no_priv() {
 async fn v3_auth_priv() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(
         &target,
@@ -383,8 +392,8 @@ async fn v3_auth_priv() {
 async fn v3_auth_md5() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(
         &target,
@@ -403,8 +412,8 @@ async fn v3_auth_md5() {
 async fn v3_auth_sha1() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(
         &target,
@@ -423,8 +432,8 @@ async fn v3_auth_sha1() {
 async fn v3_auth_sha256() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(
         &target,
@@ -441,8 +450,8 @@ async fn v3_auth_sha256() {
 
 /// authNoPriv GET against net-snmp for a given RFC 7860 SHA-2 auth protocol.
 async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::usm(user).auth(protocol, AUTH_PASS))
         .timeout(Duration::from_secs(5))
@@ -481,8 +490,8 @@ async fn v3_auth_sha512() {
 async fn v3_priv_des() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(
         &target,
@@ -503,8 +512,8 @@ async fn v3_priv_des() {
 async fn v3_priv_aes128() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(
         &target,
@@ -529,8 +538,8 @@ async fn v3_priv_aes128() {
 async fn missing_oid_returns_no_such() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .connect()
@@ -550,8 +559,8 @@ async fn missing_oid_returns_no_such() {
 async fn wrong_community_fails() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c("wrongcommunity"))
         .timeout(Duration::from_secs(2))
@@ -574,8 +583,8 @@ async fn wrong_community_fails() {
 async fn value_types_decode_correctly() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .connect()
@@ -607,8 +616,8 @@ async fn value_types_decode_correctly() {
 async fn tcp_transport_get() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.tcp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.tcp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
         .timeout(Duration::from_secs(5))
@@ -631,8 +640,8 @@ async fn tcp_transport_get() {
 async fn shared_transport_multiple_clients() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = parse_target(info);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_socket_addr();
 
     let bind_addr = if target.is_ipv6() {
         "[::]:0"
@@ -677,8 +686,8 @@ async fn shared_transport_multiple_clients() {
 async fn v3_engine_discovery_and_request() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     // This test verifies the full V3 flow: discovery + authenticated request
     let client = Client::builder(
@@ -709,8 +718,8 @@ async fn v3_engine_discovery_and_request() {
 async fn set_writable_oid() {
     require_container_runtime!();
 
-    let info = get_snmpd_container().await;
-    let target = format!("{}:{}", info.host, info.udp_port);
+    let snmpd = Snmpd::start().await;
+    let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c("private"))
         .timeout(Duration::from_secs(5))
