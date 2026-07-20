@@ -1,0 +1,983 @@
+//! Scripted SNMPv3 peers and packet builders for adversarial client tests.
+
+use async_snmp::ber::Decoder;
+use async_snmp::message::{
+    MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
+};
+use async_snmp::pdu::{Pdu, PduType};
+use async_snmp::transport::Transport;
+use async_snmp::v3::auth::{authenticate_message, verify_message};
+use async_snmp::v3::{SaltCounter, UsmSecurityParams};
+use async_snmp::{Error, Oid, UsmConfig, Value, VarBind};
+use bytes::Bytes;
+use std::collections::VecDeque;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+/// An authoritative engine profile used to decode requests and build replies.
+#[derive(Clone)]
+pub struct TestV3Engine {
+    pub engine_id: Bytes,
+    pub engine_boots: u32,
+    pub engine_time: u32,
+    pub msg_max_size: i32,
+    pub users: Vec<UsmConfig>,
+    salt: Arc<SaltCounter>,
+}
+
+impl TestV3Engine {
+    pub fn new(engine_id: impl Into<Bytes>) -> Self {
+        Self {
+            engine_id: engine_id.into(),
+            engine_boots: 1,
+            engine_time: 1,
+            msg_max_size: 65_507,
+            users: Vec::new(),
+            salt: Arc::new(SaltCounter::from_value(1)),
+        }
+    }
+
+    pub fn boots_time(mut self, engine_boots: u32, engine_time: u32) -> Self {
+        self.engine_boots = engine_boots;
+        self.engine_time = engine_time;
+        self
+    }
+
+    pub fn user(mut self, user: UsmConfig) -> Self {
+        self.users.push(user);
+        self
+    }
+
+    fn user_for(&self, username: &[u8]) -> Option<&UsmConfig> {
+        self.users
+            .iter()
+            .find(|user| user.username.as_ref() == username)
+    }
+}
+
+/// Decoded fields and exact bytes from one request received by a test peer.
+#[derive(Clone, Debug)]
+pub struct CapturedV3Request {
+    pub raw: Bytes,
+    pub source: SocketAddr,
+    /// The ID passed to `Transport::request`; network peers leave this unset.
+    pub transport_request_id: Option<i32>,
+    pub global_data: MsgGlobalData,
+    pub usm: UsmSecurityParams,
+    pub wire_data: V3MessageData,
+    pub scoped_pdu: Option<ScopedPdu>,
+    /// `None` for noAuthNoPriv, otherwise whether the received HMAC verified.
+    pub authentication_valid: Option<bool>,
+}
+
+impl CapturedV3Request {
+    fn decode(
+        raw: Bytes,
+        source: SocketAddr,
+        transport_request_id: Option<i32>,
+        engine: &TestV3Engine,
+    ) -> Result<Self, String> {
+        let message = V3Message::decode(raw.clone()).map_err(|error| error.to_string())?;
+        let usm = UsmSecurityParams::decode(message.security_params.clone())
+            .map_err(|error| error.to_string())?;
+        let level = message.global_data.msg_flags.security_level;
+
+        let keys = engine
+            .user_for(&usm.username)
+            .map(|user| user.derive_keys(&usm.engine_id))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+
+        let authentication_valid = if level.requires_auth() {
+            let valid = keys
+                .as_ref()
+                .and_then(|keys| keys.auth_key.as_ref())
+                .and_then(|key| {
+                    UsmSecurityParams::find_auth_params_offset(&raw)
+                        .map(|(offset, len)| verify_message(key, &raw, offset, len))
+                })
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false);
+            Some(valid)
+        } else {
+            None
+        };
+
+        let scoped_pdu = match &message.data {
+            V3MessageData::Plaintext(scoped) => Some(scoped.clone()),
+            V3MessageData::Encrypted(ciphertext) => {
+                let priv_key = keys
+                    .as_ref()
+                    .and_then(|keys| keys.priv_key.as_ref())
+                    .ok_or_else(|| "no privacy key available for encrypted request".to_string())?;
+                let plaintext = priv_key
+                    .decrypt(
+                        ciphertext,
+                        usm.engine_boots,
+                        usm.engine_time,
+                        &usm.priv_params,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let mut decoder = Decoder::new(plaintext);
+                Some(ScopedPdu::decode(&mut decoder).map_err(|error| error.to_string())?)
+            }
+        };
+
+        Ok(Self {
+            raw,
+            source,
+            transport_request_id,
+            global_data: message.global_data,
+            usm,
+            wire_data: message.data,
+            scoped_pdu,
+            authentication_valid,
+        })
+    }
+}
+
+/// Shared request log retained after a peer has stopped.
+#[derive(Clone, Default)]
+pub struct V3RequestLog(Arc<Mutex<Vec<CapturedV3Request>>>);
+
+impl V3RequestLog {
+    pub fn snapshot(&self) -> Vec<CapturedV3Request> {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    fn push(&self, request: CapturedV3Request) {
+        self.0.lock().unwrap().push(request);
+    }
+}
+
+/// Builder for a valid response whose individual correlation/security fields
+/// can be changed independently.
+pub struct V3ReplyBuilder {
+    msg_id: i32,
+    msg_max_size: i32,
+    security_level: SecurityLevel,
+    reportable: bool,
+    raw_msg_flags: Option<u8>,
+    engine_id: Bytes,
+    engine_boots: u32,
+    engine_time: u32,
+    username: Bytes,
+    signing_user: Option<UsmConfig>,
+    context_engine_id: Bytes,
+    context_name: Bytes,
+    pdu: Pdu,
+    salt: Arc<SaltCounter>,
+}
+
+impl V3ReplyBuilder {
+    pub fn response_to(request: &CapturedV3Request, engine: &TestV3Engine) -> Self {
+        let scoped = request
+            .scoped_pdu
+            .as_ref()
+            .expect("response requires a decoded request scopedPDU");
+        Self {
+            msg_id: request.global_data.msg_id,
+            msg_max_size: engine.msg_max_size,
+            security_level: request.global_data.msg_flags.security_level,
+            reportable: false,
+            raw_msg_flags: None,
+            engine_id: engine.engine_id.clone(),
+            engine_boots: engine.engine_boots,
+            engine_time: engine.engine_time,
+            username: request.usm.username.clone(),
+            signing_user: engine.user_for(&request.usm.username).cloned(),
+            context_engine_id: scoped.context_engine_id.clone(),
+            context_name: scoped.context_name.clone(),
+            pdu: scoped.pdu.to_response(),
+            salt: engine.salt.clone(),
+        }
+    }
+
+    pub fn report_to(
+        request: &CapturedV3Request,
+        engine: &TestV3Engine,
+        oid: Oid,
+        counter: u32,
+    ) -> Self {
+        let mut builder = Self::response_to(request, engine);
+        builder.security_level = SecurityLevel::NoAuthNoPriv;
+        // Reports default to the reporting entity's context, not the request context.
+        builder.context_engine_id = engine.engine_id.clone();
+        builder.context_name = Bytes::new();
+        builder.pdu = Pdu {
+            pdu_type: PduType::Report,
+            request_id: 0,
+            error_status: 0,
+            error_index: 0,
+            varbinds: vec![VarBind::new(oid, Value::Counter32(counter))],
+        };
+        builder
+    }
+
+    pub fn msg_id(mut self, msg_id: i32) -> Self {
+        self.msg_id = msg_id;
+        self
+    }
+
+    pub fn msg_max_size(mut self, msg_max_size: i32) -> Self {
+        self.msg_max_size = msg_max_size;
+        self
+    }
+
+    pub fn security_level(mut self, security_level: SecurityLevel) -> Self {
+        self.security_level = security_level;
+        self
+    }
+
+    pub fn reportable(mut self, reportable: bool) -> Self {
+        self.reportable = reportable;
+        self
+    }
+
+    /// Override the encoded flags byte after ordinary message construction.
+    /// This permits reserved bits and invalid priv-without-auth packets.
+    pub fn raw_msg_flags(mut self, raw_msg_flags: u8) -> Self {
+        self.raw_msg_flags = Some(raw_msg_flags);
+        self
+    }
+
+    pub fn engine_id(mut self, engine_id: impl Into<Bytes>) -> Self {
+        self.engine_id = engine_id.into();
+        self
+    }
+
+    pub fn engine_boots(mut self, engine_boots: u32) -> Self {
+        self.engine_boots = engine_boots;
+        self
+    }
+
+    pub fn engine_time(mut self, engine_time: u32) -> Self {
+        self.engine_time = engine_time;
+        self
+    }
+
+    pub fn username(mut self, username: impl Into<Bytes>) -> Self {
+        self.username = username.into();
+        self
+    }
+
+    /// Select credentials independently from the username put on the wire.
+    pub fn signing_user(mut self, signing_user: UsmConfig) -> Self {
+        self.signing_user = Some(signing_user);
+        self
+    }
+
+    pub fn context_engine_id(mut self, context_engine_id: impl Into<Bytes>) -> Self {
+        self.context_engine_id = context_engine_id.into();
+        self
+    }
+
+    pub fn context_name(mut self, context_name: impl Into<Bytes>) -> Self {
+        self.context_name = context_name.into();
+        self
+    }
+
+    pub fn pdu_type(mut self, pdu_type: PduType) -> Self {
+        self.pdu.pdu_type = pdu_type;
+        self
+    }
+
+    pub fn request_id(mut self, request_id: i32) -> Self {
+        self.pdu.request_id = request_id;
+        self
+    }
+
+    pub fn error_status(mut self, error_status: i32) -> Self {
+        self.pdu.error_status = error_status;
+        self
+    }
+
+    pub fn error_index(mut self, error_index: i32) -> Self {
+        self.pdu.error_index = error_index;
+        self
+    }
+
+    pub fn varbinds(mut self, varbinds: Vec<VarBind>) -> Self {
+        self.pdu.varbinds = varbinds;
+        self
+    }
+
+    pub fn build(self) -> Result<Bytes, String> {
+        let keys = self
+            .signing_user
+            .as_ref()
+            .map(|user| user.derive_keys(&self.engine_id))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+
+        let mut usm = UsmSecurityParams::new(
+            self.engine_id,
+            self.engine_boots,
+            self.engine_time,
+            self.username,
+        );
+        let scoped = ScopedPdu::new(self.context_engine_id, self.context_name, self.pdu);
+
+        let global = MsgGlobalData::new(
+            self.msg_id,
+            self.msg_max_size,
+            MsgFlags::new(self.security_level, self.reportable),
+        );
+        let message = if self.security_level.requires_priv() {
+            let priv_key = keys
+                .as_ref()
+                .and_then(|keys| keys.priv_key.as_ref())
+                .ok_or_else(|| "no privacy key configured for encrypted reply".to_string())?;
+            let (ciphertext, priv_params) = priv_key
+                .encrypt(
+                    &scoped.encode_to_bytes(),
+                    self.engine_boots,
+                    self.engine_time,
+                    Some(&self.salt),
+                )
+                .map_err(|error| error.to_string())?;
+            usm = usm.with_priv_params(priv_params);
+            if let Some(auth_key) = keys.as_ref().and_then(|keys| keys.auth_key.as_ref()) {
+                usm = usm.with_auth_placeholder(auth_key.mac_len());
+            }
+            V3Message::new_encrypted(global, usm.encode(), ciphertext)
+        } else {
+            if self.security_level.requires_auth() {
+                let auth_key = keys
+                    .as_ref()
+                    .and_then(|keys| keys.auth_key.as_ref())
+                    .ok_or_else(|| {
+                        "no authentication key configured for signed reply".to_string()
+                    })?;
+                usm = usm.with_auth_placeholder(auth_key.mac_len());
+            }
+            V3Message::new(global, usm.encode(), scoped)
+        };
+
+        let mut encoded = message.encode().to_vec();
+        if let Some(flags) = self.raw_msg_flags {
+            raw_ber::patch_msg_flags(&mut encoded, flags)?;
+        }
+        if self.security_level.requires_auth() {
+            let auth_key = keys
+                .as_ref()
+                .and_then(|keys| keys.auth_key.as_ref())
+                .ok_or_else(|| "no authentication key configured for signed reply".to_string())?;
+            let (offset, len) = UsmSecurityParams::find_auth_params_offset(&encoded)
+                .ok_or_else(|| "authentication parameters not found".to_string())?;
+            authenticate_message(auth_key, &mut encoded, offset, len)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(Bytes::from(encoded))
+    }
+}
+
+enum ScriptOutput {
+    Replies(Vec<Bytes>),
+    Silence,
+    TransportError(Box<Error>),
+}
+
+type ScriptFn =
+    Box<dyn FnOnce(&CapturedV3Request) -> Result<ScriptOutput, String> + Send + 'static>;
+
+/// One request/reply action consumed in FIFO order.
+pub struct ScriptStep(ScriptFn);
+
+impl ScriptStep {
+    pub fn reply(
+        build: impl FnOnce(&CapturedV3Request) -> Result<Bytes, String> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(move |request| {
+            build(request).map(|reply| ScriptOutput::Replies(vec![reply]))
+        }))
+    }
+
+    pub fn replies(
+        build: impl FnOnce(&CapturedV3Request) -> Result<Vec<Bytes>, String> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(move |request| {
+            build(request).map(ScriptOutput::Replies)
+        }))
+    }
+
+    pub fn bytes(bytes: impl Into<Bytes>) -> Self {
+        let bytes = bytes.into();
+        Self::reply(move |_| Ok(bytes))
+    }
+
+    pub fn silence() -> Self {
+        Self(Box::new(|_| Ok(ScriptOutput::Silence)))
+    }
+
+    pub fn transport_error(error: Error) -> Self {
+        Self(Box::new(move |_| {
+            Ok(ScriptOutput::TransportError(error.boxed()))
+        }))
+    }
+
+    fn run(self, request: &CapturedV3Request) -> Result<ScriptOutput, String> {
+        (self.0)(request)
+    }
+}
+
+struct PeerState {
+    steps: Mutex<VecDeque<ScriptStep>>,
+    log: V3RequestLog,
+    error: Mutex<Option<String>>,
+}
+
+impl PeerState {
+    fn new(steps: Vec<ScriptStep>) -> Self {
+        Self {
+            steps: Mutex::new(steps.into()),
+            log: V3RequestLog::default(),
+            error: Mutex::new(None),
+        }
+    }
+
+    fn set_error(&self, error: impl Into<String>) {
+        let mut slot = self.error.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(error.into());
+        }
+    }
+
+    fn handle_request(
+        &self,
+        raw: Bytes,
+        source: SocketAddr,
+        transport_request_id: Option<i32>,
+        engine: &TestV3Engine,
+    ) -> Result<(CapturedV3Request, Option<ScriptStep>), String> {
+        let request = CapturedV3Request::decode(raw, source, transport_request_id, engine)?;
+        self.log.push(request.clone());
+        let step = self.steps.lock().unwrap().pop_front();
+        Ok((request, step))
+    }
+}
+
+/// A scripted UDP or TCP SNMPv3 peer.
+pub struct ScriptedV3Peer {
+    addr: SocketAddr,
+    state: Arc<PeerState>,
+    cancel: CancellationToken,
+    task: Option<JoinHandle<()>>,
+}
+
+impl ScriptedV3Peer {
+    pub async fn udp(engine: TestV3Engine, steps: Vec<ScriptStep>) -> Self {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let state = Arc::new(PeerState::new(steps));
+        let cancel = CancellationToken::new();
+        let task_state = state.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; 65_535];
+            loop {
+                let received = tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    received = socket.recv_from(&mut buffer) => received,
+                };
+                let (len, source) = match received {
+                    Ok(received) => received,
+                    Err(error) => {
+                        task_state.set_error(format!("UDP receive failed: {error}"));
+                        break;
+                    }
+                };
+                let raw = Bytes::copy_from_slice(&buffer[..len]);
+                let (request, step) = match task_state.handle_request(raw, source, None, &engine) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        task_state.set_error(format!("request decode failed: {error}"));
+                        break;
+                    }
+                };
+                let output = match step {
+                    Some(step) => step.run(&request),
+                    None => {
+                        task_state.set_error("received more requests than the script defines");
+                        Ok(ScriptOutput::Replies(vec![correlated_malformed_reply(
+                            request.global_data.msg_id,
+                        )]))
+                    }
+                };
+                match output {
+                    Ok(ScriptOutput::Replies(replies)) => {
+                        for reply in replies {
+                            if let Err(error) = socket.send_to(&reply, source).await {
+                                task_state.set_error(format!("UDP send failed: {error}"));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(ScriptOutput::Silence) => {}
+                    Ok(ScriptOutput::TransportError(error)) => {
+                        task_state.set_error(format!(
+                            "transport-only script error used by UDP peer: {error}"
+                        ));
+                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let _ = socket.send_to(&reply, source).await;
+                    }
+                    Err(error) => {
+                        task_state.set_error(format!("reply build failed: {error}"));
+                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let _ = socket.send_to(&reply, source).await;
+                    }
+                }
+            }
+        });
+        Self {
+            addr,
+            state,
+            cancel,
+            task: Some(task),
+        }
+    }
+
+    pub async fn tcp(engine: TestV3Engine, steps: Vec<ScriptStep>) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(PeerState::new(steps));
+        let cancel = CancellationToken::new();
+        let task_state = state.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let accepted = tokio::select! {
+                _ = task_cancel.cancelled() => return,
+                accepted = listener.accept() => accepted,
+            };
+            let (mut stream, source) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    task_state.set_error(format!("TCP accept failed: {error}"));
+                    return;
+                }
+            };
+            loop {
+                let raw = tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    raw = read_ber_message(&mut stream) => raw,
+                };
+                let raw = match raw {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        task_state.set_error(format!("TCP frame read failed: {error}"));
+                        break;
+                    }
+                };
+                let (request, step) = match task_state.handle_request(raw, source, None, &engine) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        task_state.set_error(format!("request decode failed: {error}"));
+                        break;
+                    }
+                };
+                let output = match step {
+                    Some(step) => step.run(&request),
+                    None => {
+                        task_state.set_error("received more requests than the script defines");
+                        Ok(ScriptOutput::Replies(vec![correlated_malformed_reply(
+                            request.global_data.msg_id,
+                        )]))
+                    }
+                };
+                match output {
+                    Ok(ScriptOutput::Replies(replies)) => {
+                        for reply in replies {
+                            let result = tokio::select! {
+                                _ = task_cancel.cancelled() => return,
+                                result = stream.write_all(&reply) => result,
+                            };
+                            if let Err(error) = result {
+                                task_state.set_error(format!("TCP send failed: {error}"));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(ScriptOutput::Silence) => {}
+                    Ok(ScriptOutput::TransportError(error)) => {
+                        task_state.set_error(format!(
+                            "transport-only script error used by TCP peer: {error}"
+                        ));
+                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let _ = tokio::select! {
+                            _ = task_cancel.cancelled() => return,
+                            result = stream.write_all(&reply) => result,
+                        };
+                    }
+                    Err(error) => {
+                        task_state.set_error(format!("reply build failed: {error}"));
+                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let _ = tokio::select! {
+                            _ = task_cancel.cancelled() => return,
+                            result = stream.write_all(&reply) => result,
+                        };
+                    }
+                }
+            }
+        });
+        Self {
+            addr,
+            state,
+            cancel,
+            task: Some(task),
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn log(&self) -> V3RequestLog {
+        self.state.log.clone()
+    }
+
+    pub async fn finish(mut self) -> Result<(), String> {
+        self.cancel.cancel();
+        if let Some(mut task) = self.task.take() {
+            match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+                Ok(result) => result.map_err(|error| error.to_string())?,
+                Err(_) => {
+                    task.abort();
+                    return Err("peer task did not stop after cancellation".to_string());
+                }
+            }
+        }
+        if let Some(error) = self.state.error.lock().unwrap().take() {
+            return Err(error);
+        }
+        let remaining = self.state.steps.lock().unwrap().len();
+        if remaining != 0 {
+            return Err(format!("script finished with {remaining} unconsumed steps"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ScriptedV3Peer {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+struct ScriptedTransportInner {
+    engine: TestV3Engine,
+    state: PeerState,
+    peer: SocketAddr,
+    local: SocketAddr,
+    next_id: AtomicI32,
+    reliable: bool,
+}
+
+/// A custom transport that deliberately returns the next scripted bytes
+/// without filtering them by the `request_id` argument.
+#[derive(Clone)]
+pub struct ScriptedTransport(Arc<ScriptedTransportInner>);
+
+impl ScriptedTransport {
+    pub fn new(
+        engine: TestV3Engine,
+        steps: Vec<ScriptStep>,
+        first_request_id: i32,
+        reliable: bool,
+    ) -> Self {
+        Self(Arc::new(ScriptedTransportInner {
+            engine,
+            state: PeerState::new(steps),
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            local: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            next_id: AtomicI32::new(first_request_id),
+            reliable,
+        }))
+    }
+
+    pub fn log(&self) -> V3RequestLog {
+        self.0.state.log.clone()
+    }
+
+    pub fn remaining_steps(&self) -> usize {
+        self.0.state.steps.lock().unwrap().len()
+    }
+}
+
+impl Transport for ScriptedTransport {
+    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+        Ok(())
+    }
+
+    async fn recv(&self, _request_id: i32) -> async_snmp::Result<(Bytes, SocketAddr)> {
+        Err(Error::Config("ScriptedTransport uses request()".into()).boxed())
+    }
+
+    async fn request(
+        &self,
+        data: &[u8],
+        request_id: i32,
+    ) -> async_snmp::Result<(Bytes, SocketAddr)> {
+        let (request, step) = self
+            .0
+            .state
+            .handle_request(
+                Bytes::copy_from_slice(data),
+                self.0.local,
+                Some(request_id),
+                &self.0.engine,
+            )
+            .map_err(|error| Error::Config(error.into()).boxed())?;
+        let step =
+            step.ok_or_else(|| Error::Config("scripted transport exhausted".into()).boxed())?;
+        match step
+            .run(&request)
+            .map_err(|error| Error::Config(error.into()).boxed())?
+        {
+            ScriptOutput::Replies(mut replies) if replies.len() == 1 => {
+                Ok((replies.remove(0), self.0.peer))
+            }
+            ScriptOutput::Replies(replies) => Err(Error::Config(
+                format!(
+                    "scripted transport request requires exactly one reply, got {}",
+                    replies.len()
+                )
+                .into(),
+            )
+            .boxed()),
+            ScriptOutput::Silence => Err(Error::Timeout {
+                target: self.0.peer,
+                elapsed: Duration::ZERO,
+                retries: 0,
+            }
+            .boxed()),
+            ScriptOutput::TransportError(error) => Err(error),
+        }
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        self.0.peer
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.0.local
+    }
+
+    fn alloc_request_id(&self) -> i32 {
+        self.0.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn is_reliable(&self) -> bool {
+        self.0.reliable
+    }
+}
+
+async fn read_ber_message(stream: &mut TcpStream) -> Result<Bytes, String> {
+    let mut header = vec![0_u8; 2];
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(|error| error.to_string())?;
+    if header[0] != 0x30 {
+        return Err(format!("expected SEQUENCE tag, got 0x{:02x}", header[0]));
+    }
+    let content_len = if header[1] < 0x80 {
+        usize::from(header[1])
+    } else {
+        let octets = usize::from(header[1] & 0x7f);
+        if octets == 0 || octets > 4 {
+            return Err("invalid BER frame length".to_string());
+        }
+        let mut length = vec![0_u8; octets];
+        stream
+            .read_exact(&mut length)
+            .await
+            .map_err(|error| error.to_string())?;
+        header.extend_from_slice(&length);
+        length
+            .into_iter()
+            .fold(0_usize, |value, byte| (value << 8) | usize::from(byte))
+    };
+    if content_len > 1_048_576 {
+        return Err("BER frame exceeds test peer allocation limit".to_string());
+    }
+    let mut content = vec![0_u8; content_len];
+    stream
+        .read_exact(&mut content)
+        .await
+        .map_err(|error| error.to_string())?;
+    header.extend_from_slice(&content);
+    Ok(Bytes::from(header))
+}
+
+fn correlated_malformed_reply(msg_id: i32) -> Bytes {
+    let usm = raw_ber::usm_security_params(&[], &[0], &[0], &[], &[], &[]);
+    raw_ber::v3_message(
+        &raw_ber::signed_integer_content(msg_id),
+        &[0x00, 0xff, 0xe3],
+        &[0],
+        &[3],
+        &usm,
+        &raw_ber::tlv(0x05, &[]),
+    )
+}
+
+/// Minimal forward BER construction for values the production encoder cannot
+/// represent, such as over-width integers and invalid flags.
+pub mod raw_ber {
+    use bytes::Bytes;
+
+    pub fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(1 + content.len() + 5);
+        encoded.push(tag);
+        push_length(&mut encoded, content.len());
+        encoded.extend_from_slice(content);
+        encoded
+    }
+
+    pub fn sequence(elements: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+        let content: Vec<u8> = elements.into_iter().flatten().collect();
+        tlv(0x30, &content)
+    }
+
+    pub fn integer_from_content(content: &[u8]) -> Vec<u8> {
+        tlv(0x02, content)
+    }
+
+    pub fn signed_integer_content(value: i32) -> Vec<u8> {
+        let bytes = value.to_be_bytes();
+        let mut start = 0;
+        while start < bytes.len() - 1
+            && ((bytes[start] == 0 && bytes[start + 1] & 0x80 == 0)
+                || (bytes[start] == 0xff && bytes[start + 1] & 0x80 != 0))
+        {
+            start += 1;
+        }
+        bytes[start..].to_vec()
+    }
+
+    pub fn usm_security_params(
+        engine_id: &[u8],
+        engine_boots_content: &[u8],
+        engine_time_content: &[u8],
+        username: &[u8],
+        auth_params: &[u8],
+        priv_params: &[u8],
+    ) -> Bytes {
+        Bytes::from(sequence([
+            tlv(0x04, engine_id),
+            integer_from_content(engine_boots_content),
+            integer_from_content(engine_time_content),
+            tlv(0x04, username),
+            tlv(0x04, auth_params),
+            tlv(0x04, priv_params),
+        ]))
+    }
+
+    pub fn v3_message(
+        msg_id_content: &[u8],
+        msg_max_size_content: &[u8],
+        msg_flags: &[u8],
+        security_model_content: &[u8],
+        encoded_usm: &[u8],
+        encoded_msg_data_tlv: &[u8],
+    ) -> Bytes {
+        let global = sequence([
+            integer_from_content(msg_id_content),
+            integer_from_content(msg_max_size_content),
+            tlv(0x04, msg_flags),
+            integer_from_content(security_model_content),
+        ]);
+        Bytes::from(sequence([
+            integer_from_content(&[3]),
+            global,
+            tlv(0x04, encoded_usm),
+            encoded_msg_data_tlv.to_vec(),
+        ]))
+    }
+
+    pub fn patch_msg_flags(packet: &mut [u8], flags: u8) -> Result<(), String> {
+        let (outer_tag, mut position, outer_end) = read_tlv(packet, 0)?;
+        if outer_tag != 0x30 {
+            return Err("message is not a SEQUENCE".to_string());
+        }
+        let (_, _, version_end) = read_tlv(packet, position)?;
+        position = version_end;
+        let (global_tag, mut global_position, global_end) = read_tlv(packet, position)?;
+        if global_tag != 0x30 {
+            return Err("msgGlobalData is not a SEQUENCE".to_string());
+        }
+        let (_, _, msg_id_end) = read_tlv(packet, global_position)?;
+        global_position = msg_id_end;
+        let (_, _, msg_max_end) = read_tlv(packet, global_position)?;
+        global_position = msg_max_end;
+        let (flags_tag, flags_start, flags_end) = read_tlv(packet, global_position)?;
+        if flags_tag != 0x04 || flags_end - flags_start != 1 {
+            return Err("msgFlags is not a one-byte OCTET STRING".to_string());
+        }
+        if flags_end > global_end || global_end > outer_end {
+            return Err("msgFlags lies outside its containing SEQUENCE".to_string());
+        }
+        packet[flags_start] = flags;
+        Ok(())
+    }
+
+    fn push_length(output: &mut Vec<u8>, len: usize) {
+        if len < 0x80 {
+            output.push(len as u8);
+            return;
+        }
+        let bytes = len.to_be_bytes();
+        let first = bytes.iter().position(|byte| *byte != 0).unwrap();
+        let significant = &bytes[first..];
+        output.push(0x80 | significant.len() as u8);
+        output.extend_from_slice(significant);
+    }
+
+    fn read_tlv(data: &[u8], position: usize) -> Result<(u8, usize, usize), String> {
+        let tag = *data
+            .get(position)
+            .ok_or_else(|| "truncated BER tag".to_string())?;
+        let first_length = *data
+            .get(position + 1)
+            .ok_or_else(|| "truncated BER length".to_string())?;
+        let (len, header_len) = if first_length < 0x80 {
+            (usize::from(first_length), 2)
+        } else {
+            let octets = usize::from(first_length & 0x7f);
+            if octets == 0 || octets > std::mem::size_of::<usize>() {
+                return Err("invalid BER length".to_string());
+            }
+            let length_end = position
+                .checked_add(2 + octets)
+                .ok_or_else(|| "BER length overflow".to_string())?;
+            let length_bytes = data
+                .get(position + 2..length_end)
+                .ok_or_else(|| "truncated BER length".to_string())?;
+            let len = length_bytes
+                .iter()
+                .fold(0_usize, |value, byte| (value << 8) | usize::from(*byte));
+            (len, 2 + octets)
+        };
+        let content_start = position
+            .checked_add(header_len)
+            .ok_or_else(|| "BER offset overflow".to_string())?;
+        let end = content_start
+            .checked_add(len)
+            .ok_or_else(|| "BER length overflow".to_string())?;
+        if end > data.len() {
+            return Err("truncated BER content".to_string());
+        }
+        Ok((tag, content_start, end))
+    }
+}

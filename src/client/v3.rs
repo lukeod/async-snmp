@@ -826,15 +826,15 @@ mod tests {
     struct RetryTestTransport {
         peer: SocketAddr,
         recv_count: Arc<AtomicU32>,
-        discovery_response: Bytes,
+        engine_id: Bytes,
     }
 
     impl RetryTestTransport {
-        fn new(discovery_response: Bytes) -> Self {
+        fn new(engine_id: Bytes) -> Self {
             Self {
                 peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
                 recv_count: Arc::new(AtomicU32::new(0)),
-                discovery_response,
+                engine_id,
             }
         }
     }
@@ -846,11 +846,11 @@ mod tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            request_id: i32,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let count = self.recv_count.fetch_add(1, Ordering::Relaxed);
             let peer = self.peer;
-            let response = self.discovery_response.clone();
+            let engine_id = self.engine_id.clone();
             async move {
                 if count == 0 {
                     // First call: simulate a timeout
@@ -861,7 +861,7 @@ mod tests {
                     }
                     .boxed())
                 } else {
-                    Ok((response, peer))
+                    Ok((build_discovery_response(&engine_id, request_id), peer))
                 }
             }
         }
@@ -882,7 +882,7 @@ mod tests {
     }
 
     /// Build a minimal valid discovery response with the given engine ID.
-    fn build_discovery_response(engine_id: &[u8]) -> Bytes {
+    fn build_discovery_response(engine_id: &[u8], msg_id: i32) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
         use crate::pdu::{Pdu, PduType};
         use crate::v3::UsmSecurityParams;
@@ -901,7 +901,7 @@ mod tests {
         };
 
         let global = MsgGlobalData::new(
-            1,
+            msg_id,
             65507,
             MsgFlags::new(crate::message::SecurityLevel::NoAuthNoPriv, false),
         );
@@ -914,8 +914,7 @@ mod tests {
     #[tokio::test]
     async fn test_discovery_retries_on_timeout() {
         let engine_id = b"test-engine";
-        let response = build_discovery_response(engine_id);
-        let transport = RetryTestTransport::new(response);
+        let transport = RetryTestTransport::new(Bytes::copy_from_slice(engine_id));
         let recv_count = transport.recv_count.clone();
 
         let config = ClientConfig {
@@ -1060,6 +1059,11 @@ mod response_validation_tests {
             true
         }
 
+        fn alloc_request_id(&self) -> i32 {
+            // Canned responses in this module are intentionally built for ID 99.
+            99
+        }
+
         fn register_request(&self, _request_id: i32, _timeout: Duration) {}
     }
 
@@ -1145,47 +1149,6 @@ mod response_validation_tests {
         client
     }
 
-    /// Build an authenticated notInTimeWindows Report under ENGINE_ID for
-    /// user "user" with the given boots/time in its USM params.
-    fn build_not_in_time_window_report(
-        engine_boots: u32,
-        engine_time: u32,
-        auth_password: &[u8],
-    ) -> Bytes {
-        use crate::value::Value;
-        use crate::varbind::VarBind;
-
-        let global = MsgGlobalData::new(99, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
-        let key =
-            LocalizedKey::from_password(AuthProtocol::Sha1, auth_password, ENGINE_ID).unwrap();
-        let usm = UsmSecurityParams::new(
-            Bytes::from_static(ENGINE_ID),
-            engine_boots,
-            engine_time,
-            Bytes::from_static(b"user"),
-        )
-        .with_auth_placeholder(key.mac_len());
-        let scoped = ScopedPdu::new(
-            Bytes::from_static(ENGINE_ID),
-            Bytes::new(),
-            Pdu {
-                pdu_type: PduType::Report,
-                request_id: 123,
-                error_status: 0,
-                error_index: 0,
-                varbinds: vec![VarBind::new(
-                    crate::v3::report_oids::not_in_time_windows(),
-                    Value::Counter32(1),
-                )],
-            },
-        );
-        let msg = V3Message::new(global, usm.encode(), scoped);
-        let mut bytes = msg.encode().to_vec();
-        let (offset, len) = UsmSecurityParams::find_auth_params_offset(&bytes).unwrap();
-        authenticate_message(&key, &mut bytes, offset, len).unwrap();
-        Bytes::from(bytes)
-    }
-
     /// RFC 3412 Section 6.3: an outgoing request advertises the manager's own
     /// receive capacity (the transport's `max_message_size`), not the remote
     /// engine's cached advertised limit.
@@ -1224,57 +1187,6 @@ mod response_validation_tests {
         assert_eq!(
             msg.global_data.msg_max_size, 1400,
             "request must advertise the local transport capacity, not the remote's cached 9000"
-        );
-    }
-
-    /// RFC 3414 Section 2.3: an authenticated notInTimeWindows Report whose
-    /// boots/time are behind the local notion resyncs the cached engine
-    /// state backward, recovering from an agent that reset time without
-    /// incrementing boots.
-    #[tokio::test]
-    async fn v3_authenticated_not_in_time_window_report_resyncs_backward() {
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
-        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
-        // Local notion is boots=5, time=1000. The report carries the same
-        // boots but a much lower time (agent reset without bumping boots).
-        let response = build_not_in_time_window_report(5, 100, b"authpass12345678");
-        let client = canned_client(response, 5, 1000, security);
-
-        // The report drives a resync then a retry; the canned transport keeps
-        // returning the report, so the call ultimately errors, but the point
-        // is the state moved backward.
-        let _ = client.send_v3_and_recv(pdu).await;
-
-        let state = client.inner.engine_state.read().unwrap();
-        let s = state
-            .as_ref()
-            .expect("engine state should still be present");
-        assert_eq!(s.engine_boots, 5);
-        assert_eq!(s.engine_time, 100, "time should resync backward to report");
-        assert_eq!(
-            s.latest_received_engine_time, 100,
-            "latest received time should resync backward"
-        );
-    }
-
-    /// After a stale authenticated response is rejected, the cached engine
-    /// state is cleared so the next call re-runs discovery and recovers.
-    #[tokio::test]
-    async fn v3_stale_authenticated_response_clears_engine_state() {
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
-        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
-        // Local notion is time 1000; 500 is beyond the 150-second window.
-        let response = build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));
-        let client = canned_client(response, 1, 1000, security);
-
-        let err = client.send_v3_and_recv(pdu).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::Auth { .. }),
-            "expected Auth error, got: {err}"
-        );
-        assert!(
-            client.inner.engine_state.read().unwrap().is_none(),
-            "engine state should be cleared after stale-response rejection"
         );
     }
 

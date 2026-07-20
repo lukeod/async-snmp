@@ -8,6 +8,7 @@
 
 pub mod fixtures;
 pub mod handler;
+pub mod v3;
 
 #[cfg(feature = "agent")]
 pub mod agent;
