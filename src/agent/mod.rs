@@ -1308,7 +1308,7 @@ impl Agent {
                 self.handle_get_bulk(ctx, pdu).await
             }
             PduType::SetRequest => self.handle_set(ctx, pdu).await,
-            PduType::InformRequest => self.handle_inform(ctx, pdu),
+            PduType::InformRequest => Ok(self.handle_inform(ctx, pdu)),
             _ => {
                 // Should not happen - filtered earlier
                 Ok(pdu.to_error_response(ErrorStatus::GenErr, 0))
@@ -1321,11 +1321,12 @@ impl Agent {
     /// Per RFC 3416 Section 4.2.7, an `InformRequest` is a confirmed-class PDU
     /// that the receiver acknowledges by returning a Response with the same
     /// request-id and varbind list.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "TODO store received informs, which may be a fallible operation"
-    )]
-    fn handle_inform(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    ///
+    /// The agent only acknowledges the inform; its contents are discarded. In
+    /// the RFC 3413 architecture informs are addressed to notification
+    /// receivers, not command responders; applications that want to consume
+    /// informs should use [`crate::notification::NotificationReceiver`].
+    fn handle_inform(&self, ctx: &RequestContext, pdu: &Pdu) -> Pdu {
         // Acknowledge by echoing the same varbinds in a Response.
         //
         // RFC 3416 Section 4.2.7: an InformRequest is a confirmed-class PDU. If
@@ -1339,10 +1340,10 @@ impl Agent {
             self.response_overhead(ctx),
             self.effective_max_size(ctx),
         ) {
-            return Ok(Self::too_big_response(ctx.version, pdu));
+            return Self::too_big_response(ctx.version, pdu);
         }
 
-        Ok(pdu.to_response())
+        pdu.to_response()
     }
 
     /// Effective maximum response message size for a request: the smaller of
