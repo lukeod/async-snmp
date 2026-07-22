@@ -140,13 +140,16 @@ impl<T: Transport> Clone for Client<T> {
     }
 }
 
+struct ClientEngine {
+    state: EngineState,
+    derived_keys: DerivedKeys,
+}
+
 struct ClientInner<T: Transport> {
     transport: T,
     config: ClientConfig,
-    /// Cached engine state (V3)
-    engine_state: RwLock<Option<EngineState>>,
-    /// Derived keys for this engine (V3)
-    derived_keys: RwLock<Option<DerivedKeys>>,
+    /// Coherent V3 identity, trusted time, and identity-localized keys.
+    engine: RwLock<Option<ClientEngine>>,
     /// Salt counter for privacy (V3)
     salt_counter: SaltCounter,
     /// Shared engine cache (V3, optional)
@@ -244,8 +247,7 @@ impl<T: Transport> Client<T> {
             inner: Arc::new(ClientInner {
                 transport,
                 config: config.sanitized(),
-                engine_state: RwLock::new(None),
-                derived_keys: RwLock::new(None),
+                engine: RwLock::new(None),
                 salt_counter: SaltCounter::new(),
                 engine_cache: None,
                 discovery_lock: AsyncMutex::new(()),
@@ -265,8 +267,7 @@ impl<T: Transport> Client<T> {
             inner: Arc::new(ClientInner {
                 transport,
                 config: config.sanitized(),
-                engine_state: RwLock::new(None),
-                derived_keys: RwLock::new(None),
+                engine: RwLock::new(None),
                 salt_counter: SaltCounter::new(),
                 engine_cache: Some(engine_cache),
                 discovery_lock: AsyncMutex::new(()),

@@ -3222,22 +3222,26 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_time_at_max_wraps() {
-        // Exactly at MAX_ENGINE_TIME seconds: boots increments, time resets to 0
+    fn test_engine_time_at_max_is_representable() {
         let max = crate::v3::MAX_ENGINE_TIME;
         let (boots, time) = crate::v3::compute_engine_boots_time(1, u64::from(max));
-        assert_eq!(
-            boots, 2,
-            "boots should increment when elapsed reaches MAX_ENGINE_TIME"
-        );
-        assert_eq!(time, 0, "time should wrap to 0");
+        assert_eq!(boots, 1);
+        assert_eq!(time, max);
+    }
+
+    #[test]
+    fn test_engine_time_wraps_after_max() {
+        let max = crate::v3::MAX_ENGINE_TIME;
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, u64::from(max) + 1);
+        assert_eq!(boots, 2);
+        assert_eq!(time, 0);
     }
 
     #[test]
     fn test_engine_time_past_max() {
-        // 500 seconds past the first wrap
-        let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = crate::v3::compute_engine_boots_time(1, u64::from(max) + 500);
+        // 500 seconds into the second complete 31-bit cycle.
+        let cycle = u64::from(crate::v3::MAX_ENGINE_TIME) + 1;
+        let (boots, time) = crate::v3::compute_engine_boots_time(1, cycle + 500);
         assert_eq!(boots, 2);
         assert_eq!(time, 500);
     }
@@ -3245,8 +3249,8 @@ mod tests {
     #[test]
     fn test_engine_time_multiple_wraps() {
         // Three full cycles
-        let max = crate::v3::MAX_ENGINE_TIME;
-        let elapsed = u64::from(max) * 3 + 42;
+        let cycle = u64::from(crate::v3::MAX_ENGINE_TIME) + 1;
+        let elapsed = cycle * 3 + 42;
         let (boots, time) = crate::v3::compute_engine_boots_time(1, elapsed);
         assert_eq!(boots, 4, "base 1 + 3 wraps = 4");
         assert_eq!(time, 42);
@@ -3256,7 +3260,8 @@ mod tests {
     fn test_engine_time_boots_capped_at_max() {
         // If enough wraps happen that boots would exceed MAX_ENGINE_TIME, cap it
         let max = crate::v3::MAX_ENGINE_TIME;
-        let elapsed = u64::from(max) * u64::from(max); // way more wraps than max allows
+        let cycle = u64::from(max) + 1;
+        let elapsed = cycle * u64::from(max); // way more wraps than max allows
         let (boots, _time) = crate::v3::compute_engine_boots_time(1, elapsed);
         assert_eq!(boots, max, "boots should be capped at MAX_ENGINE_TIME");
     }
@@ -3264,8 +3269,8 @@ mod tests {
     #[test]
     fn test_engine_time_base_boots_preserved() {
         // A non-1 base boots (e.g. from persistence) is respected
-        let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, time) = crate::v3::compute_engine_boots_time(5, u64::from(max) + 100);
+        let cycle = u64::from(crate::v3::MAX_ENGINE_TIME) + 1;
+        let (boots, time) = crate::v3::compute_engine_boots_time(5, cycle + 100);
         assert_eq!(boots, 6, "base 5 + 1 wrap = 6");
         assert_eq!(time, 100);
     }
@@ -3274,7 +3279,8 @@ mod tests {
     fn test_engine_time_high_base_boots_capped() {
         // Base boots near MAX_ENGINE_TIME with a wrap should cap
         let max = crate::v3::MAX_ENGINE_TIME;
-        let (boots, _time) = crate::v3::compute_engine_boots_time(max - 1, u64::from(max) * 2);
+        let cycle = u64::from(max) + 1;
+        let (boots, _time) = crate::v3::compute_engine_boots_time(max - 1, cycle * 2);
         assert_eq!(boots, max, "should cap at MAX_ENGINE_TIME, not overflow");
     }
 

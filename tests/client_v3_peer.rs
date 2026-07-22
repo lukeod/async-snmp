@@ -130,6 +130,11 @@ async fn udp_success_at_level(level: SecurityLevel) {
     assert!(requests[0].usm.engine_id.is_empty());
     assert!(requests[0].usm.username.is_empty());
     assert_eq!(requests[1].usm.engine_id.as_ref(), ENGINE_ID);
+    assert_eq!(
+        (requests[1].usm.engine_boots, requests[1].usm.engine_time),
+        (0, 0),
+        "unauthenticated discovery must not seed trusted time"
+    );
     assert_eq!(requests[1].global_data.msg_flags.security_level, level);
     assert!(requests[1].scoped_pdu.is_some());
     assert_eq!(
@@ -365,8 +370,8 @@ async fn v3_authenticated_wrong_username_does_not_mutate_time_or_retry() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3, "the invalid Report must not add a retry");
     assert_eq!(
-        requests[2].usm.engine_boots, 7,
-        "wrong-user authentication must not advance engine state"
+        requests[2].usm.engine_boots, 0,
+        "wrong-user authentication must not establish trusted engine time"
     );
 }
 
@@ -469,8 +474,8 @@ async fn v3_auth_no_priv_client_rejects_auth_priv_without_time_mutation() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_eq!(
-        requests[2].usm.engine_boots, 7,
-        "unsupported privacy must not advance engine state"
+        requests[2].usm.engine_boots, 0,
+        "unsupported privacy must not establish trusted engine time"
     );
 }
 
@@ -530,7 +535,7 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
     peer.finish().await.unwrap();
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2].usm.engine_boots, 7);
+    assert_eq!(requests[2].usm.engine_boots, 0);
 }
 
 /// Timeliness processing must reject authenticated stale authPriv input before
@@ -544,14 +549,14 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
         engine.clone(),
         vec![
             discovery_step(engine.clone()),
+            response_step(engine.clone(), "synchronized"),
             ScriptStep::reply(move |request| {
                 V3ReplyBuilder::response_to(request, &stale_engine)
                     .engine_time(100)
                     .ciphertext(Bytes::from_static(b"not a scoped PDU"))
                     .build()
             }),
-            discovery_step(engine.clone()),
-            response_step(engine, "rediscovered"),
+            response_step(engine, "state preserved"),
         ],
     )
     .await;
@@ -563,6 +568,9 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
         .connect()
         .await
         .unwrap();
+    let synchronized = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(synchronized.value.as_str(), Some("synchronized"));
+
     let err = client
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
@@ -573,15 +581,17 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("rediscovered"));
+    assert_eq!(result.value.as_str(), Some("state preserved"));
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
     assert_eq!(requests.len(), 4);
-    assert!(
-        requests[2].usm.engine_id.is_empty(),
-        "timeliness rejection must occur before ciphertext decode and clear the stale notion"
+    assert_eq!(
+        requests[3].usm.engine_id.as_ref(),
+        ENGINE_ID,
+        "timeliness rejection must not clear an established identity"
     );
+    assert_eq!(requests[3].usm.engine_boots, 7);
 }
 
 /// An authenticated session must not accept an unauthenticated reply

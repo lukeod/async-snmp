@@ -176,7 +176,7 @@
 //!
 //! `SNMPv3` has two expensive per-connection operations:
 //! - **Password derivation**: ~850μs to derive keys from passwords (SHA-256)
-//! - **Engine discovery**: Round-trip to learn the agent's engine ID and time
+//! - **Engine discovery**: Round-trip to learn the agent's engine ID and message-size limit
 //!
 //! For polling many targets with shared credentials, cache both:
 //!

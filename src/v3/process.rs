@@ -309,7 +309,7 @@ pub(crate) fn process_v3_inbound(
                     && engines.len() >= *max_remote_engines
                     && let Some(oldest) = engines
                         .iter()
-                        .min_by_key(|(_, s)| s.synced_at)
+                        .min_by_key(|(_, state)| state.last_trusted_update_at())
                         .map(|(k, _)| k.clone())
                 {
                     engines.remove(&oldest);
@@ -320,7 +320,8 @@ pub(crate) fn process_v3_inbound(
                 let timely = state
                     .check_and_update_timeliness(usm_params.engine_boots, usm_params.engine_time);
                 if !timely {
-                    tracing::warn!(target: "async_snmp::v3", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = state.engine_boots, snmp.our_time = state.estimated_time() }, "message outside time window");
+                    let (our_boots, our_time) = state.estimated_boots_time();
+                    tracing::warn!(target: "async_snmp::v3", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = our_boots, snmp.our_time = our_time }, "message outside time window");
                 }
                 timely
             };

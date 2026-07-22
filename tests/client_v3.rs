@@ -100,13 +100,11 @@ async fn v3_auth_sha512() {
     auth_only_roundtrip(AuthProtocol::Sha512).await;
 }
 
-/// A request carrying the wrong msgAuthoritativeEngineBoots is rejected with
-/// a notInTimeWindows Report (RFC 3414 Section 3.2 Step 7a: boots must match,
-/// not just time). The Report is authenticated at authNoPriv, so the client
-/// resyncs its engine state from it and the retried request succeeds; the
-/// agent counter records the rejection.
+/// A stale whole-state cache insert cannot overwrite a newer authenticated
+/// boots/time generation. A second authNoPriv client sharing the cache uses the
+/// canonical tuple without causing another notInTimeWindows Report.
 #[tokio::test]
-async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
+async fn v3_shared_cache_rejects_stale_boots_overwrite() {
     use async_snmp::v3::{EngineCache, EngineState};
     use std::sync::Arc;
 
@@ -129,22 +127,23 @@ async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
     .await
     .unwrap();
 
-    // Discover and authenticate normally, seeding the shared cache.
+    // Discovery contributes identity only, so the first authenticated request
+    // synchronizes through one notInTimeWindows Report.
     client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(agent.agent().usm_not_in_time_windows(), 0);
+    let baseline_reports = agent.agent().usm_not_in_time_windows();
+    assert_eq!(baseline_reports, 1);
 
-    // Lower the cached boots value, modeling cached state that predates an
-    // agent reboot; time stays within the window. A second client sharing
-    // the cache adopts the stale state (the first client keeps its own
-    // per-connection copy). Resync via update_time only moves boots forward
-    // (RFC 3414 Section 2.3), so the stale side must be below the agent.
+    // A stale whole-state insert must not overwrite the cache's newer trusted
+    // high-water value. A second client sharing the cache adopts the canonical
+    // monotonic state and sends no additional stale request.
     let good = cache.get(&agent.addr()).expect("cache seeded");
-    assert!(good.engine_boots > 0, "agent boots must be nonzero");
+    let good_boots = good.trusted_time().unwrap().boots();
+    assert!(good_boots > 0, "agent boots must be nonzero");
     cache.insert(
         agent.addr(),
         EngineState::new(
-            good.engine_id.clone(),
-            good.engine_boots - 1,
+            good.engine_id().clone(),
+            good_boots - 1,
             good.estimated_time(),
         ),
     );
@@ -161,22 +160,19 @@ async fn v3_wrong_engine_boots_gets_not_in_time_windows_report() {
     let result = client2
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
-        .expect("client must resync from the authenticated Report and retry");
+        .expect("client must use the canonical shared time generation");
     assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
 
     assert_eq!(
         agent.agent().usm_not_in_time_windows(),
-        1,
-        "agent must reject mismatched engineBoots with notInTimeWindows"
+        baseline_reports,
+        "stale cache insertion must not cause another time-window rejection"
     );
 }
 
-/// Same resync scenario as above but over an authPriv session: the agent's
-/// Step 7a Report is plaintext at authNoPriv (RFC 3414 Section 3.2 Step 7a),
-/// and the client must still verify it, resync, and succeed on retry with
-/// re-encrypted boots/time.
+/// The same stale-cache overwrite protection applies to authPriv clients.
 #[tokio::test]
-async fn v3_wrong_engine_boots_resync_auth_priv() {
+async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
     use async_snmp::v3::{EngineCache, EngineState};
     use std::sync::Arc;
 
@@ -204,15 +200,17 @@ async fn v3_wrong_engine_boots_resync_auth_priv() {
     .unwrap();
 
     client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(agent.agent().usm_not_in_time_windows(), 0);
+    let baseline_reports = agent.agent().usm_not_in_time_windows();
+    assert_eq!(baseline_reports, 1);
 
     let good = cache.get(&agent.addr()).expect("cache seeded");
-    assert!(good.engine_boots > 0, "agent boots must be nonzero");
+    let good_boots = good.trusted_time().unwrap().boots();
+    assert!(good_boots > 0, "agent boots must be nonzero");
     cache.insert(
         agent.addr(),
         EngineState::new(
-            good.engine_id.clone(),
-            good.engine_boots - 1,
+            good.engine_id().clone(),
+            good_boots - 1,
             good.estimated_time(),
         ),
     );
@@ -231,10 +229,10 @@ async fn v3_wrong_engine_boots_resync_auth_priv() {
     let result = client2
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
-        .expect("authPriv client must resync from the authNoPriv Report and retry");
+        .expect("authPriv client must use the canonical shared time generation");
     assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
 
-    assert_eq!(agent.agent().usm_not_in_time_windows(), 1);
+    assert_eq!(agent.agent().usm_not_in_time_windows(), baseline_reports);
 }
 
 /// V3 authPriv with SHA-256 and AES-128.
