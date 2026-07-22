@@ -5,7 +5,9 @@ mod common;
 use async_snmp::message::{SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
 use async_snmp::v3::{AuthProtocol, PrivProtocol, report_oids};
-use async_snmp::{Auth, Client, MasterKeys, Retry, UsmConfig, Value, VarBind, oid};
+use async_snmp::{
+    Auth, Client, ClientConfig, MasterKeys, Retry, UsmConfig, Value, VarBind, Version, oid,
+};
 use bytes::Bytes;
 use common::v3::{
     ScriptStep, ScriptedTransport, ScriptedV3Peer, TestV3Engine, V3ReplyBuilder, raw_ber,
@@ -72,6 +74,27 @@ fn response_step(engine: TestV3Engine, value: &'static str) -> ScriptStep {
             )])
             .build()
     })
+}
+
+fn custom_client(
+    transport: ScriptedTransport,
+    level: SecurityLevel,
+    context_name: Option<&'static str>,
+) -> Client<ScriptedTransport> {
+    let mut security = user_for(level);
+    if let Some(context_name) = context_name {
+        security = security.context_name(context_name);
+    }
+    Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::none(),
+            v3_security: Some(security),
+            ..ClientConfig::default()
+        },
+    )
 }
 
 async fn udp_success_at_level(level: SecurityLevel) {
@@ -605,6 +628,45 @@ async fn v3_auth_client_rejects_unauthenticated_response() {
     peer.finish().await.unwrap();
 }
 
+/// An ordinary Response at a lower security level must not use the
+/// lower-security Report policy path. It is rejected after processing at its
+/// received level.
+#[tokio::test]
+async fn v3_auth_priv_client_rejects_auth_no_priv_response() {
+    let requested_level = SecurityLevel::AuthPriv;
+    let received_level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(requested_level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .security_level(received_level)
+                    .build()
+            }),
+        ],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(requested_level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        "lower-security ordinary Response must not be accepted: {err}"
+    );
+    peer.finish().await.unwrap();
+}
+
 /// An encrypted authPriv Report must be decrypted and classified as a
 /// Report (here a terminal credential failure), not rejected as a
 /// malformed non-Response.
@@ -733,6 +795,342 @@ async fn v3_scripted_udp_timeout_retry_count() {
         attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
         attempts[2].scoped_pdu.as_ref().unwrap().pdu.request_id
     );
+}
+
+#[tokio::test]
+async fn v3_udp_pending_map_ignores_wrong_ids_before_correlated_response() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::replies(move |request| {
+                let stale = V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(request.global_data.msg_id - 1)
+                    .build()?;
+                let future = V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(request.global_data.msg_id + 1)
+                    .build()?;
+                let matching = V3ReplyBuilder::response_to(request, &response_engine).build()?;
+                Ok(vec![stale, future, matching])
+            }),
+        ],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    peer.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_tcp_rejects_wrong_response_msg_id() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::tcp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(request.global_data.msg_id + 1)
+                    .build()
+            }),
+        ],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .connect_tcp()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        "wrong TCP msgID must be terminal, got: {err}"
+    );
+    peer.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_tcp_rejects_wrong_discovery_msg_id() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let peer = ScriptedV3Peer::tcp(
+        engine,
+        vec![ScriptStep::reply(move |request| {
+            V3ReplyBuilder::report_to(
+                request,
+                &report_engine,
+                report_oids::unknown_engine_ids(),
+                1,
+            )
+            .msg_id(request.global_data.msg_id - 1)
+            .build()
+        })],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .connect_tcp()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(*err, async_snmp::Error::MalformedResponse { .. }));
+    peer.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_custom_transport_rejects_prior_attempt_msg_id() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(request.global_data.msg_id - 1)
+                    .build()
+            }),
+        ],
+        100,
+        false,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, None);
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        "matching PDU request-id must not rescue a prior msgID: {err}"
+    );
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].global_data.msg_id + 1,
+        requests[1].global_data.msg_id
+    );
+}
+
+#[tokio::test]
+async fn v3_custom_transport_rejects_future_discovery_msg_id() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine,
+        vec![ScriptStep::reply(move |request| {
+            V3ReplyBuilder::report_to(
+                request,
+                &report_engine,
+                report_oids::unknown_engine_ids(),
+                1,
+            )
+            .msg_id(request.global_data.msg_id + 1)
+            .build()
+        })],
+        100,
+        false,
+    );
+    let client = custom_client(transport, level, None);
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(*err, async_snmp::Error::MalformedResponse { .. }));
+}
+
+/// RFC 3412 Section 7.2 processes the Security Model before parsing the
+/// scopedPDU and correlating an Internal-class Report by msgID. The unknown
+/// target on this error distinguishes USM engine-ID validation from the later
+/// peer-bound parse/correlation failures.
+#[tokio::test]
+async fn v3_discovery_usm_processing_precedes_parse_and_correlation() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let transport = ScriptedTransport::new(
+        engine,
+        vec![ScriptStep::reply(move |request| {
+            let invalid_usm = raw_ber::usm_security_params(&[], &[0], &[0], &[], &[], &[]);
+            Ok(raw_ber::v3_message(
+                &raw_ber::signed_integer_content(request.global_data.msg_id + 1),
+                &[0x00, 0xff, 0xe3],
+                &[0],
+                &[3],
+                &invalid_usm,
+                &raw_ber::tlv(0x05, &[]),
+            ))
+        })],
+        100,
+        false,
+    );
+    let client = custom_client(transport, level, None);
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    match *err {
+        async_snmp::Error::MalformedResponse { target } => {
+            assert_eq!(target, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        }
+        _ => panic!("invalid discovery USM parameters must be rejected first: {err}"),
+    }
+}
+
+#[tokio::test]
+async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let advanced_engine = engine.clone().boots_time(8, 10);
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(10)
+                .msg_id(request.global_data.msg_id - 1)
+                .build()
+            }),
+            response_step(advanced_engine, "state advanced before correlation"),
+        ],
+        100,
+        false,
+    );
+    let log = transport.log();
+    let mut security = user_for(level);
+    security = security.context_name("requested-context");
+    let client = Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::fixed(1, Duration::ZERO),
+            v3_security: Some(security),
+            ..ClientConfig::default()
+        },
+    );
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        "wrong-ID Report with request-id zero must not be acted on: {err}"
+    );
+    assert_eq!(
+        log.len(),
+        2,
+        "wrong-ID Report must not add a corrected send"
+    );
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(
+        result.value.as_str(),
+        Some("state advanced before correlation")
+    );
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].usm.engine_boots, 8);
+    assert!(requests[2].usm.engine_time >= 10);
+}
+
+#[tokio::test]
+async fn v3_rejects_wrong_scoped_context_at_every_security_level() {
+    for level in [
+        SecurityLevel::NoAuthNoPriv,
+        SecurityLevel::AuthNoPriv,
+        SecurityLevel::AuthPriv,
+    ] {
+        for wrong_context_name in [false, true] {
+            let engine = engine_for(level);
+            let response_engine = engine.clone();
+            let transport = ScriptedTransport::new(
+                engine.clone(),
+                vec![
+                    discovery_step(engine),
+                    ScriptStep::reply(move |request| {
+                        let builder = V3ReplyBuilder::response_to(request, &response_engine);
+                        if wrong_context_name {
+                            builder
+                                .context_name(Bytes::from_static(b"wrong-context"))
+                                .build()
+                        } else {
+                            builder
+                                .context_engine_id(Bytes::from_static(
+                                    b"\x80\x00\x7e\xd9\x05wrong-context-engine",
+                                ))
+                                .build()
+                        }
+                    }),
+                ],
+                100,
+                false,
+            );
+            let client = custom_client(transport, level, Some("requested-context"));
+
+            let err = client
+                .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+                "{level:?}, wrong_context_name={wrong_context_name}: {err}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn v3_custom_transport_accepts_matching_ids_and_context() {
+    let level = SecurityLevel::AuthPriv;
+    let engine = engine_for(level);
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            response_step(engine, "custom response"),
+        ],
+        100,
+        false,
+    );
+    let client = custom_client(transport, level, Some("requested-context"));
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("custom response"));
 }
 
 #[tokio::test]

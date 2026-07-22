@@ -22,6 +22,12 @@ use tracing::{Span, instrument};
 
 use super::Client;
 
+struct EncodedV3Request {
+    data: Vec<u8>,
+    context_engine_id: Bytes,
+    context_name: Bytes,
+}
+
 // V3-specific Client implementation
 impl<T: Transport> Client<T> {
     /// Ensure engine ID is discovered for V3 operations.
@@ -92,7 +98,7 @@ impl<T: Transport> Client<T> {
         };
 
         let mut last_error: Option<Box<Error>> = None;
-        let mut response_data_opt: Option<(Bytes, SocketAddr)> = None;
+        let mut response_data_opt: Option<(Bytes, SocketAddr, i32)> = None;
 
         'discovery: for attempt in 0..=max_attempts {
             if attempt > 0 {
@@ -108,8 +114,8 @@ impl<T: Transport> Client<T> {
                 .register_request(msg_id, self.inner.config.timeout);
 
             match self.inner.transport.request(&discovery_data, msg_id).await {
-                Ok(result) => {
-                    response_data_opt = Some(result);
+                Ok((data, source)) => {
+                    response_data_opt = Some((data, source, msg_id));
                     break 'discovery;
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
@@ -127,7 +133,7 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let (response_data, _source) = response_data_opt.ok_or_else(|| {
+        let (response_data, _source, expected_msg_id) = response_data_opt.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
                 Error::Timeout {
                     target: self.peer_addr(),
@@ -138,15 +144,10 @@ impl<T: Transport> Client<T> {
             })
         })?;
 
-        // Parse the response envelope. Discovery only consults the header
-        // and security parameters, but a plaintext scoped PDU must still be
-        // well-formed to be accepted.
+        // Parse the response envelope and apply the existing discovery USM
+        // validation before parsing the scoped PDU or performing Message
+        // Processing Model correlation (RFC 3412 Section 7.2).
         let response = RawV3Message::decode(response_data)?;
-        if let RawMsgData::Plaintext(bytes) = &response.msg_data {
-            let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
-            ScopedPdu::decode(&mut decoder)?;
-        }
-
         let reported_msg_max_size = response.global_data.msg_max_size as u32;
         let session_max = self.inner.transport.max_message_size();
         let engine_state = crate::v3::parse_discovery_response_with_limits(
@@ -154,6 +155,24 @@ impl<T: Transport> Client<T> {
             reported_msg_max_size,
             session_max,
         )?;
+
+        // Discovery does not otherwise consult the scoped PDU yet, but a
+        // plaintext value must still be well-formed to be accepted.
+        if let RawMsgData::Plaintext(bytes) = &response.msg_data {
+            let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
+            ScopedPdu::decode(&mut decoder)?;
+        }
+
+        // Discovery responses are also bound to the current outstanding
+        // request by msgID. UDP normally filters this in the pending map; the
+        // protocol-layer check covers TCP and custom transports as well.
+        if response.global_data.msg_id != expected_msg_id {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_id, actual_msg_id = response.global_data.msg_id }, "msgID mismatch in discovery response");
+            return Err(Error::MalformedResponse {
+                target: self.peer_addr(),
+            }
+            .boxed());
+        }
         tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.engine_boots = engine_state.engine_boots, snmp.engine_time = engine_state.engine_time, snmp.msg_max_size = engine_state.msg_max_size }, "discovered engine");
 
         // Derive keys for this engine
@@ -191,7 +210,7 @@ impl<T: Transport> Client<T> {
     ///
     /// The `msg_id` parameter is separate from `pdu.request_id` per RFC 3412
     /// Section 6.2: retransmissions SHOULD use a new msgID for each attempt.
-    pub(super) fn build_v3_message(&self, pdu: &Pdu, msg_id: i32) -> Result<Vec<u8>> {
+    fn build_v3_message(&self, pdu: &Pdu, msg_id: i32) -> Result<EncodedV3Request> {
         let security = self
             .inner
             .config
@@ -214,10 +233,12 @@ impl<T: Transport> Client<T> {
             .read()
             .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
 
-        crate::v3::encode::encode_v3_message(
+        let context_engine_id = engine_state.engine_id.clone();
+        let context_name = security.context_name.clone();
+        let data = crate::v3::encode::encode_v3_message(
             pdu,
             msg_id,
-            &engine_state.engine_id,
+            &context_engine_id,
             engine_state.engine_boots,
             engine_state.estimated_time(),
             security,
@@ -229,7 +250,13 @@ impl<T: Transport> Client<T> {
             // holds the remote's advertised limit (used to constrain our
             // outbound size), so advertise the local transport capacity here.
             self.inner.transport.max_message_size(),
-        )
+        )?;
+
+        Ok(EncodedV3Request {
+            data,
+            context_engine_id,
+            context_name,
+        })
     }
 
     /// Apply the received USM identity, capability, and authentication policy.
@@ -428,10 +455,10 @@ impl<T: Transport> Client<T> {
 
             // RFC 3412 Section 6.2: use fresh msgID for each transmission attempt
             let msg_id = self.next_request_id();
-            let data = self.build_v3_message(&pdu, msg_id)?;
+            let request = self.build_v3_message(&pdu, msg_id)?;
 
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type, snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type);
-            tracing::trace!(target: "async_snmp::client", { snmp.bytes = data.len() }, "sending V3 request");
+            tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
 
             // Register (or re-register) with fresh deadline before sending
             self.inner
@@ -440,7 +467,7 @@ impl<T: Transport> Client<T> {
 
             // Send request and wait for response as a single unit so reliable
             // transports own their stream lock for the whole exchange.
-            match self.inner.transport.request(&data, msg_id).await {
+            match self.inner.transport.request(&request.data, msg_id).await {
                 Ok((response_data, _source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received V3 response");
 
@@ -522,6 +549,20 @@ impl<T: Transport> Client<T> {
                             self.decrypt_scoped_pdu(ciphertext, &response_usm)?
                         }
                     };
+
+                    // RFC 3412 Section 7.2: Security Model processing above
+                    // precedes Message Processing Model correlation. Bind both
+                    // ordinary Responses and Reports to this exact attempt.
+                    // A mismatch terminates the exchange because Transport's
+                    // request API does not universally support receiving a
+                    // second packet (notably custom transports).
+                    if raw.global_data.msg_id != msg_id {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_id = msg_id, actual_msg_id = raw.global_data.msg_id }, "msgID mismatch in response");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
+                    }
 
                     // Check for Report PDU (error response)
                     if scoped_pdu.pdu.pdu_type == PduType::Report {
@@ -616,6 +657,20 @@ impl<T: Transport> Client<T> {
                         tracing::warn!(target: "async_snmp::client", {
                             peer = %self.peer_addr()
                         }, "username mismatch in response");
+                        return Err(Error::MalformedResponse {
+                            target: self.peer_addr(),
+                        }
+                        .boxed());
+                    }
+
+                    // RFC 3412 Section 7.2: an ordinary Response must match
+                    // both scoped-context values cached for the request.
+                    if scoped_pdu.context_engine_id != request.context_engine_id
+                        || scoped_pdu.context_name != request.context_name
+                    {
+                        tracing::warn!(target: "async_snmp::client", {
+                            peer = %self.peer_addr()
+                        }, "scoped context mismatch in response");
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
@@ -856,7 +911,8 @@ mod tests {
         let encoded = client
             .build_v3_message(&pdu, 456)
             .expect("v3 message should encode");
-        let decoded = V3Message::decode(Bytes::from(encoded)).expect("v3 message should decode");
+        let decoded =
+            V3Message::decode(Bytes::from(encoded.data)).expect("v3 message should decode");
         let scoped = match decoded.data {
             V3MessageData::Plaintext(scoped) => scoped,
             V3MessageData::Encrypted(_) => panic!("expected plaintext scoped PDU"),
@@ -1227,8 +1283,8 @@ mod response_validation_tests {
         }
 
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
-        let bytes = client.build_v3_message(&pdu, 1).unwrap();
-        let msg = V3Message::decode(Bytes::from(bytes)).unwrap();
+        let request = client.build_v3_message(&pdu, 1).unwrap();
+        let msg = V3Message::decode(Bytes::from(request.data)).unwrap();
         assert_eq!(
             msg.global_data.msg_max_size, 1400,
             "request must advertise the local transport capacity, not the remote's cached 9000"
