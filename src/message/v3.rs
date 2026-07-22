@@ -262,6 +262,13 @@ impl MsgGlobalData {
                 .boxed()
             })?;
 
+        if !seq.is_empty() {
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
+
         Ok(Self {
             msg_id,
             msg_max_size,
@@ -329,6 +336,13 @@ impl ScopedPdu {
         let context_engine_id = seq.read_octet_string()?;
         let context_name = seq.read_octet_string()?;
         let pdu = Pdu::decode(&mut seq)?;
+
+        if !seq.is_empty() {
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
 
         Ok(Self {
             context_engine_id,
@@ -520,6 +534,103 @@ impl V3Message {
     }
 }
 
+/// An `SNMPv3` message whose msgData has not been through security
+/// processing.
+///
+/// [`RawV3Message::decode`] parses only the outer envelope: version, global
+/// header, and the opaque security parameters. The scoped PDU stays as raw
+/// bytes (plaintext or ciphertext) so that authentication and decryption can
+/// run before any PDU parsing, in the RFC 3412 Section 7.2 order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawV3Message {
+    /// Global data (header)
+    pub(crate) global_data: MsgGlobalData,
+    /// Security parameters (opaque, USM-encoded)
+    pub(crate) security_params: Bytes,
+    /// Raw msgData, form selected by the received privacy flag
+    pub(crate) msg_data: RawMsgData,
+}
+
+/// Raw msgData payload of a [`RawV3Message`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawMsgData {
+    /// Unparsed plaintext `ScopedPDU` TLV bytes (noAuthNoPriv or authNoPriv)
+    Plaintext(Bytes),
+    /// Encrypted `ScopedPDU` ciphertext (authPriv)
+    Encrypted(Bytes),
+}
+
+impl RawV3Message {
+    /// Decode the outer envelope from BER without touching the scoped PDU.
+    ///
+    /// The received security level is derived from the message's own flags;
+    /// invalid flag combinations (privacy without authentication) are
+    /// rejected here, before any authentication or PDU processing.
+    pub fn decode(data: Bytes) -> Result<Self> {
+        let mut decoder = Decoder::new(data);
+        let mut seq = decoder.read_sequence()?;
+
+        let version = seq.read_integer()?;
+        if version != 3 {
+            tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), version, kind = %DecodeErrorKind::UnknownVersion(version) }, "decode error");
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
+
+        let global_data = MsgGlobalData::decode(&mut seq)?;
+        let security_params = seq.read_octet_string()?;
+
+        let msg_data = if global_data.msg_flags.security_level.requires_priv() {
+            RawMsgData::Encrypted(seq.read_octet_string()?)
+        } else {
+            // Capture the complete plaintext ScopedPDU TLV unparsed.
+            let start = seq.offset();
+            seq.skip_tlv()?;
+            RawMsgData::Plaintext(seq.as_bytes().slice(start..seq.offset()))
+        };
+
+        if !seq.is_empty() || !decoder.is_empty() {
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
+
+        Ok(Self {
+            global_data,
+            security_params,
+            msg_data,
+        })
+    }
+
+    /// Get the decoded global header.
+    pub fn global_data(&self) -> &MsgGlobalData {
+        &self.global_data
+    }
+
+    /// Get the opaque security parameters.
+    pub fn security_params(&self) -> &Bytes {
+        &self.security_params
+    }
+
+    /// Get the unprocessed message data.
+    pub fn msg_data(&self) -> &RawMsgData {
+        &self.msg_data
+    }
+
+    /// Get the message ID.
+    pub fn msg_id(&self) -> i32 {
+        self.global_data.msg_id
+    }
+
+    /// Get the security level indicated by the received flags.
+    pub fn security_level(&self) -> SecurityLevel {
+        self.global_data.msg_flags.security_level
+    }
+}
+
 /// RFC 3412 MPD failures that must be counted before the message is
 /// discarded (Sections 7.2.4 and 7.2.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,6 +782,171 @@ mod tests {
         assert_eq!(classify_mpd_failure(neg_id_unknown_model), None);
     }
 
+    /// A valid envelope around a malformed plaintext scoped PDU must decode
+    /// as a raw message (the scoped PDU is not parsed), while the eager
+    /// decode fails. This is the invariant that lets HMAC verification run
+    /// before plaintext PDU parsing.
+    #[test]
+    fn raw_decode_does_not_parse_plaintext_scoped_pdu() {
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            // msgData: structurally a SEQUENCE TLV, but garbage inside
+            buf.push_sequence(|buf| {
+                buf.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            });
+            buf.push_octet_string(b"usm-params");
+            MsgGlobalData::new(7, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false))
+                .encode(buf);
+            buf.push_integer(3);
+        });
+        let encoded = buf.finish();
+
+        assert!(
+            V3Message::decode(encoded.clone()).is_err(),
+            "eager decode must reject the malformed scoped PDU"
+        );
+
+        let raw = RawV3Message::decode(encoded).unwrap();
+        assert_eq!(raw.msg_id(), 7);
+        assert_eq!(raw.security_level(), SecurityLevel::AuthNoPriv);
+        assert_eq!(raw.security_params.as_ref(), b"usm-params");
+        let RawMsgData::Plaintext(scoped) = raw.msg_data else {
+            panic!("expected plaintext msgData");
+        };
+        assert_eq!(scoped.as_ref(), &[0x30, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// The captured plaintext bytes are the complete ScopedPDU TLV, so a
+    /// later parse of a well-formed message succeeds from the raw bytes.
+    #[test]
+    fn raw_plaintext_bytes_reparse_as_scoped_pdu() {
+        let global = MsgGlobalData::new(9, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let pdu = Pdu::get_request(42, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
+        let scoped = ScopedPdu::new(b"eng".as_slice(), b"ctx".as_slice(), pdu);
+        let msg = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
+
+        let raw = RawV3Message::decode(msg.encode()).unwrap();
+        let RawMsgData::Plaintext(bytes) = raw.msg_data else {
+            panic!("expected plaintext msgData");
+        };
+        let mut decoder = Decoder::new(bytes);
+        let reparsed = ScopedPdu::decode(&mut decoder).unwrap();
+        assert_eq!(reparsed.context_engine_id.as_ref(), b"eng");
+        assert_eq!(reparsed.context_name.as_ref(), b"ctx");
+        assert_eq!(reparsed.pdu.request_id, 42);
+    }
+
+    /// authPriv messages keep their ciphertext untouched.
+    #[test]
+    fn raw_decode_keeps_ciphertext() {
+        let global = MsgGlobalData::new(200, 1472, MsgFlags::new(SecurityLevel::AuthPriv, false));
+        let msg = V3Message::new_encrypted(
+            global,
+            Bytes::from_static(b"usm-params"),
+            Bytes::from_static(b"encrypted-data"),
+        );
+
+        let raw = RawV3Message::decode(msg.encode()).unwrap();
+        assert_eq!(raw.security_level(), SecurityLevel::AuthPriv);
+        let RawMsgData::Encrypted(ciphertext) = raw.msg_data else {
+            panic!("expected encrypted msgData");
+        };
+        assert_eq!(ciphertext.as_ref(), b"encrypted-data");
+    }
+
+    /// Privacy without authentication is rejected during envelope decode,
+    /// before any authentication or PDU work can start.
+    #[test]
+    fn raw_decode_rejects_priv_without_auth_flags() {
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let pdu = Pdu::get_request(1, &[]);
+        let msg = V3Message::new(
+            global,
+            Bytes::from_static(b"usm"),
+            ScopedPdu::with_empty_context(pdu),
+        );
+        let mut bytes = msg.encode().to_vec();
+        // Locate the single-byte msgFlags OCTET STRING (0x04 0x01 0x04) and
+        // patch it to priv-without-auth (0x02).
+        let pos = bytes
+            .windows(3)
+            .position(|w| w == [0x04, 0x01, 0x04])
+            .expect("msgFlags not found");
+        bytes[pos + 2] = 0x02;
+
+        let result = RawV3Message::decode(Bytes::from(bytes));
+        assert!(result.is_err());
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::MalformedResponse { .. }
+        ));
+    }
+
+    /// Reserved and reportable flag bits do not alter the derived security
+    /// level (RFC 3412 Section 7.2 derives the level from the auth/priv bits
+    /// only).
+    #[test]
+    fn raw_decode_ignores_reserved_bits_for_level() {
+        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
+        let pdu = Pdu::get_request(1, &[]);
+        let msg = V3Message::new(
+            global,
+            Bytes::from_static(b"usm"),
+            ScopedPdu::with_empty_context(pdu),
+        );
+        let mut bytes = msg.encode().to_vec();
+        let pos = bytes
+            .windows(3)
+            .position(|w| w == [0x04, 0x01, 0x01])
+            .expect("msgFlags not found");
+        // auth + reportable + a reserved bit
+        bytes[pos + 2] = 0x01 | 0x04 | 0x08;
+
+        let raw = RawV3Message::decode(Bytes::from(bytes)).unwrap();
+        assert_eq!(raw.security_level(), SecurityLevel::AuthNoPriv);
+        assert!(raw.global_data.msg_flags.reportable);
+    }
+
+    #[test]
+    fn raw_decode_rejects_trailing_envelope_fields() {
+        let global =
+            MsgGlobalData::new(17, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, false));
+        let scoped = ScopedPdu::with_empty_context(Pdu::get_request(23, &[]));
+
+        // Encode an extra INTEGER after msgData inside the outer sequence.
+        let mut with_outer_field = EncodeBuf::new();
+        with_outer_field.push_sequence(|buf| {
+            buf.push_integer(99);
+            scoped.encode(buf);
+            buf.push_octet_string(b"usm");
+            global.encode(buf);
+            buf.push_integer(3);
+        });
+        assert!(RawV3Message::decode(with_outer_field.finish()).is_err());
+
+        // Encode an extra INTEGER inside msgGlobalData.
+        let mut with_global_field = EncodeBuf::new();
+        with_global_field.push_sequence(|buf| {
+            scoped.encode(buf);
+            buf.push_octet_string(b"usm");
+            buf.push_sequence(|buf| {
+                buf.push_integer(99);
+                buf.push_integer(SecurityModel::Usm.as_i32());
+                buf.push_octet_string(&[0]);
+                buf.push_integer(1472);
+                buf.push_integer(17);
+            });
+            buf.push_integer(3);
+        });
+        assert!(RawV3Message::decode(with_global_field.finish()).is_err());
+
+        // Append another top-level TLV after an otherwise complete message.
+        let message = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
+        let mut with_root_trailing = message.encode().to_vec();
+        with_root_trailing.extend_from_slice(&[0x05, 0]);
+        assert!(RawV3Message::decode(Bytes::from(with_root_trailing)).is_err());
+    }
+
     #[test]
     fn test_msg_global_data_roundtrip() {
         let global =
@@ -705,6 +981,21 @@ mod tests {
         assert_eq!(decoded.context_engine_id.as_ref(), b"engine");
         assert_eq!(decoded.context_name.as_ref(), b"ctx");
         assert_eq!(decoded.pdu.request_id, 42);
+    }
+
+    #[test]
+    fn scoped_pdu_rejects_trailing_sequence_fields() {
+        let pdu = Pdu::get_request(42, &[]);
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_integer(99);
+            pdu.encode(buf);
+            buf.push_octet_string(b"ctx");
+            buf.push_octet_string(b"engine");
+        });
+
+        let mut decoder = Decoder::new(buf.finish());
+        assert!(ScopedPdu::decode(&mut decoder).is_err());
     }
 
     #[test]

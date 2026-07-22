@@ -4,10 +4,10 @@
 //! and V3 message building/handling.
 
 use crate::ber::Decoder;
-use crate::error::internal::{AuthErrorKind, CryptoErrorKind, DecodeErrorKind};
+use crate::error::internal::{AuthErrorKind, CryptoErrorKind};
 use crate::error::{Error, ErrorStatus, Result};
 use crate::format::hex;
-use crate::message::{ScopedPdu, V3Message};
+use crate::message::{RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message};
 use crate::pdu::{Pdu, PduType};
 use crate::transport::Transport;
 use crate::v3::{
@@ -138,8 +138,14 @@ impl<T: Transport> Client<T> {
             })
         })?;
 
-        // Parse response
-        let response = V3Message::decode(response_data)?;
+        // Parse the response envelope. Discovery only consults the header
+        // and security parameters, but a plaintext scoped PDU must still be
+        // well-formed to be accepted.
+        let response = RawV3Message::decode(response_data)?;
+        if let RawMsgData::Plaintext(bytes) = &response.msg_data {
+            let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
+            ScopedPdu::decode(&mut decoder)?;
+        }
 
         let reported_msg_max_size = response.global_data.msg_max_size as u32;
         let session_max = self.inner.transport.max_message_size();
@@ -226,8 +232,62 @@ impl<T: Transport> Client<T> {
         )
     }
 
-    /// Verify HMAC authentication on a V3 response message.
-    fn verify_response_auth(&self, response_data: &[u8]) -> Result<()> {
+    /// Apply the received USM identity, capability, and authentication policy.
+    ///
+    /// The cached localized keys are valid only for the configured security
+    /// name and discovered authoritative engine. Bind the received parameters
+    /// to that tuple before using the keys, then perform RFC 3414 Step 5
+    /// capability checks before Step 6 HMAC verification.
+    fn verify_response_security(
+        &self,
+        response_data: &[u8],
+        response_usm: &UsmSecurityParams,
+        received_level: SecurityLevel,
+    ) -> Result<()> {
+        let security = self
+            .inner
+            .config
+            .v3_security
+            .as_ref()
+            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+
+        if response_usm.username != security.username {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "USM security name does not select the configured user");
+            return Err(Error::Auth {
+                target: self.peer_addr(),
+            }
+            .boxed());
+        }
+
+        {
+            let state = self
+                .inner
+                .engine_state
+                .read()
+                .map_err(|_| Error::Config("engine_state lock poisoned".into()).boxed())?;
+            let engine_matches = state
+                .as_ref()
+                .is_some_and(|state| state.engine_id == response_usm.engine_id);
+            if !engine_matches {
+                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "USM authoritative engine does not select the cached localized keys");
+                return Err(Error::Auth {
+                    target: self.peer_addr(),
+                }
+                .boxed());
+            }
+        }
+
+        if !received_level.requires_auth() {
+            if security.security_level().requires_auth() {
+                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "unauthenticated reply on authenticated session");
+                return Err(Error::Auth {
+                    target: self.peer_addr(),
+                }
+                .boxed());
+            }
+            return Ok(());
+        }
+
         tracing::trace!(target: "async_snmp::client", "verifying HMAC authentication on response");
 
         let derived = self
@@ -235,16 +295,28 @@ impl<T: Transport> Client<T> {
             .derived_keys
             .read()
             .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
-        let auth_key = derived
-            .as_ref()
-            .and_then(|d| d.auth_key.as_ref())
-            .ok_or_else(|| {
-                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %AuthErrorKind::NoAuthKey }, "authentication failed");
-                Error::Auth {
-                    target: self.peer_addr(),
-                }
-                .boxed()
-            })?;
+        let derived = derived.as_ref().ok_or_else(|| {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %AuthErrorKind::NoAuthKey }, "authentication failed");
+            Error::Auth {
+                target: self.peer_addr(),
+            }
+            .boxed()
+        })?;
+        let auth_key = derived.auth_key.as_ref().ok_or_else(|| {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %AuthErrorKind::NoAuthKey }, "authentication failed");
+            Error::Auth {
+                target: self.peer_addr(),
+            }
+            .boxed()
+        })?;
+
+        if received_level.requires_priv() && derived.priv_key.is_none() {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %CryptoErrorKind::NoPrivKey }, "received security level is unsupported");
+            return Err(Error::Auth {
+                target: self.peer_addr(),
+            }
+            .boxed());
+        }
 
         let (offset, len) = UsmSecurityParams::find_auth_params_offset(response_data).ok_or_else(
             || {
@@ -270,53 +342,49 @@ impl<T: Transport> Client<T> {
         Ok(())
     }
 
-    /// Decrypt an encrypted V3 response and extract the PDU.
-    fn decrypt_response_pdu(&self, response: V3Message, security_params: &Bytes) -> Result<Pdu> {
-        match response.data {
-            crate::message::V3MessageData::Encrypted(ciphertext) => {
-                tracing::trace!(target: "async_snmp::client", { ciphertext_len = ciphertext.len() }, "decrypting response");
+    /// Decrypt an encrypted scoped PDU and parse it.
+    fn decrypt_scoped_pdu(
+        &self,
+        ciphertext: &Bytes,
+        usm_params: &UsmSecurityParams,
+    ) -> Result<ScopedPdu> {
+        tracing::trace!(target: "async_snmp::client", { ciphertext_len = ciphertext.len() }, "decrypting response");
 
-                let derived = self
-                    .inner
-                    .derived_keys
-                    .read()
-                    .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
-                let priv_key =
-                    derived
-                        .as_ref()
-                        .and_then(|d| d.priv_key.as_ref())
-                        .ok_or_else(|| {
-                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %CryptoErrorKind::NoPrivKey }, "decryption failed");
-                            Error::Auth {
-                                target: self.peer_addr(),
-                            }
-                            .boxed()
-                        })?;
+        let derived = self
+            .inner
+            .derived_keys
+            .read()
+            .map_err(|_| Error::Config("derived_keys lock poisoned".into()).boxed())?;
+        let priv_key = derived
+            .as_ref()
+            .and_then(|d| d.priv_key.as_ref())
+            .ok_or_else(|| {
+                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %CryptoErrorKind::NoPrivKey }, "decryption failed");
+                Error::Auth {
+                    target: self.peer_addr(),
+                }
+                .boxed()
+            })?;
 
-                let usm_params = UsmSecurityParams::decode(security_params.clone())?;
-                let plaintext = priv_key
-                    .decrypt(
-                        &ciphertext,
-                        usm_params.engine_boots,
-                        usm_params.engine_time,
-                        &usm_params.priv_params,
-                    )
-                    .map_err(|e| {
-                        tracing::warn!(target: "async_snmp::crypto", { peer = %self.peer_addr(), error = %e }, "decryption failed");
-                        Error::Auth {
-                            target: self.peer_addr(),
-                        }
-                        .boxed()
-                    })?;
+        let plaintext = priv_key
+            .decrypt(
+                ciphertext,
+                usm_params.engine_boots,
+                usm_params.engine_time,
+                &usm_params.priv_params,
+            )
+            .map_err(|e| {
+                tracing::warn!(target: "async_snmp::crypto", { peer = %self.peer_addr(), error = %e }, "decryption failed");
+                Error::Auth {
+                    target: self.peer_addr(),
+                }
+                .boxed()
+            })?;
 
-                tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
+        tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
 
-                let mut decoder = Decoder::with_target(plaintext, self.peer_addr());
-                let scoped_pdu = ScopedPdu::decode(&mut decoder)?;
-                Ok(scoped_pdu.pdu)
-            }
-            crate::message::V3MessageData::Plaintext(scoped_pdu) => Ok(scoped_pdu.pdu),
-        }
+        let mut decoder = Decoder::with_target(plaintext, self.peer_addr());
+        ScopedPdu::decode(&mut decoder)
     }
 
     /// Send a V3 request and handle the response.
@@ -376,54 +444,94 @@ impl<T: Transport> Client<T> {
                 Ok((response_data, _source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received V3 response");
 
-                    // Verify authentication if required
-                    if security_level.requires_auth() {
-                        self.verify_response_auth(&response_data)?;
-                    }
+                    // RFC 3412 Section 7.2: decode only the envelope and
+                    // derive the security level from the received flags.
+                    // Invalid flag combinations (privacy without
+                    // authentication) are rejected inside the decode, before
+                    // any authentication work.
+                    let raw = RawV3Message::decode(response_data.clone())?;
+                    let received_level = raw.security_level();
+                    let response_usm = UsmSecurityParams::decode(raw.security_params.clone())?;
 
-                    // Decode response
-                    let response = V3Message::decode(response_data)?;
+                    // RFC 3414 Steps 3-6: bind the received engine ID and
+                    // security name to the cached localized keys, validate
+                    // support for the received level, then authenticate.
+                    self.verify_response_security(&response_data, &response_usm, received_level)?;
 
-                    // Check for Report PDU (error response)
-                    if let Some(scoped_pdu) = response.scoped_pdu()
-                        && scoped_pdu.pdu.pdu_type == PduType::Report
-                    {
-                        // Check for time window error - resync and retry
-                        if is_not_in_time_window_report(&scoped_pdu.pdu) {
-                            tracing::debug!(target: "async_snmp::client", "not in time window, resyncing");
-                            // Update engine time from response
-                            let usm_params =
-                                UsmSecurityParams::decode(response.security_params.clone())?;
+                    // RFC 3414 Section 3.2 Step 7b: for every HMAC-verified
+                    // message, advance the local notion of the engine's
+                    // boots/time and check timeliness before decryption and
+                    // PDU parsing. Only state for the message's claimed
+                    // engine is touched; unauthenticated messages never
+                    // mutate the notion.
+                    if received_level.requires_auth() {
+                        let timely = {
+                            let mut state = self.inner.engine_state.write().map_err(|_| {
+                                Error::Config("engine_state lock poisoned".into()).boxed()
+                            })?;
+                            match *state {
+                                Some(ref mut s) if s.engine_id == response_usm.engine_id => s
+                                    .check_and_update_timeliness(
+                                        response_usm.engine_boots,
+                                        response_usm.engine_time,
+                                    ),
+                                _ => true,
+                            }
+                        };
+                        if !timely {
+                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), msg_boots = response_usm.engine_boots, msg_time = response_usm.engine_time }, "message outside time window");
+                            // Clear cached engine state so the next call
+                            // re-runs discovery. update_time is forward-only
+                            // and discovery does not re-run while state
+                            // exists, so without this a notion that has
+                            // drifted ahead of the agent (e.g. an agent
+                            // restart that reset time without bumping boots)
+                            // would wedge every subsequent authenticated
+                            // request.
                             {
                                 let mut state = self.inner.engine_state.write().map_err(|_| {
                                     Error::Config("engine_state lock poisoned".into()).boxed()
                                 })?;
-                                if let Some(ref mut s) = *state {
-                                    if security_level.requires_auth() {
-                                        // The report was authenticated above
-                                        // (verify_response_auth), so per RFC 3414
-                                        // Section 2.3 its boots/time are trustworthy
-                                        // and replace the local notion even when
-                                        // lower. This is the only recovery path when
-                                        // an agent resets its time without bumping
-                                        // boots, leaving our notion permanently ahead.
-                                        s.resync(usm_params.engine_boots, usm_params.engine_time);
-                                        // Propagate the resync so other clients
-                                        // seeded from the shared cache do not
-                                        // repeat the rejected round-trip.
-                                        if let Some(cache) = &self.inner.engine_cache {
-                                            cache.insert(self.peer_addr(), s.clone());
-                                        }
-                                    } else {
-                                        // Unauthenticated report: forward-only so a
-                                        // spoofed report cannot drag the notion back.
-                                        s.update_time(
-                                            usm_params.engine_boots,
-                                            usm_params.engine_time,
-                                        );
-                                    }
-                                }
+                                *state = None;
                             }
+                            {
+                                let mut derived =
+                                    self.inner.derived_keys.write().map_err(|_| {
+                                        Error::Config("derived_keys lock poisoned".into()).boxed()
+                                    })?;
+                                *derived = None;
+                            }
+                            if let Some(cache) = &self.inner.engine_cache {
+                                cache.remove(&self.peer_addr());
+                            }
+                            return Err(Error::Auth {
+                                target: self.peer_addr(),
+                            }
+                            .boxed());
+                        }
+                    }
+
+                    // Security processing is complete: decrypt (per the
+                    // received level) and parse the scoped PDU.
+                    let scoped_pdu = match &raw.msg_data {
+                        RawMsgData::Plaintext(bytes) => {
+                            let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
+                            ScopedPdu::decode(&mut decoder)?
+                        }
+                        RawMsgData::Encrypted(ciphertext) => {
+                            self.decrypt_scoped_pdu(ciphertext, &response_usm)?
+                        }
+                    };
+
+                    // Check for Report PDU (error response)
+                    if scoped_pdu.pdu.pdu_type == PduType::Report {
+                        // Time window error - retry with the corrected
+                        // notion. For authenticated Reports the Step 7b
+                        // update above has already advanced the local
+                        // boots/time, so the retry carries the corrected
+                        // tuple; unauthenticated Reports never change state.
+                        if is_not_in_time_window_report(&scoped_pdu.pdu) {
+                            tracing::debug!(target: "async_snmp::client", "not in time window, retrying with updated notion");
                             last_error = Some(
                                 Error::Auth {
                                     target: self.peer_addr(),
@@ -472,18 +580,12 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
-                    // Extract security params before consuming response
-                    let response_security_params = response.security_params.clone();
-
-                    // Decode USM params early for security validation and later reuse
-                    let response_usm = UsmSecurityParams::decode(response_security_params.clone())?;
-
                     // Validate security level matches what we sent (prevent downgrade attacks)
-                    if response.global_data.msg_flags.security_level != security_level {
+                    if received_level != security_level {
                         tracing::warn!(target: "async_snmp::client", {
                             peer = %self.peer_addr(),
                             expected = ?security_level,
-                            actual = ?response.global_data.msg_flags.security_level
+                            actual = ?received_level
                         }, "security level mismatch in response");
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
@@ -520,18 +622,7 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
-                    // Extract PDU (with decryption if required)
-                    let response_pdu = if security_level.requires_priv() {
-                        self.decrypt_response_pdu(response, &response_security_params)?
-                    } else {
-                        response.into_pdu().ok_or_else(|| {
-                            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %DecodeErrorKind::MissingPdu }, "missing PDU in response");
-                            Error::MalformedResponse {
-                                target: self.peer_addr(),
-                            }
-                            .boxed()
-                        })?
-                    };
+                    let response_pdu = scoped_pdu.pdu;
 
                     // RFC 3416 Section 4.2: only a Response-PDU may answer a
                     // request; reject echoed request-type PDUs (Report PDUs
@@ -554,52 +645,6 @@ impl<T: Transport> Client<T> {
                     }
 
                     tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type, snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status, snmp.error_index = response_pdu.error_index }, "received V3 {} response", response_pdu.pdu_type);
-
-                    // RFC 3414 Section 3.2 Step 7b: advance the local notion
-                    // of the engine's boots/time and check the response is
-                    // timely (anti-replay). The check only gates
-                    // authenticated exchanges; unauthenticated boots/time
-                    // still update the notion as before.
-                    let timely = {
-                        let mut state = self.inner.engine_state.write().map_err(|_| {
-                            Error::Config("engine_state lock poisoned".into()).boxed()
-                        })?;
-                        match *state {
-                            Some(ref mut s) => s.check_and_update_timeliness(
-                                response_usm.engine_boots,
-                                response_usm.engine_time,
-                            ),
-                            None => true,
-                        }
-                    };
-                    if security_level.requires_auth() && !timely {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), msg_boots = response_usm.engine_boots, msg_time = response_usm.engine_time }, "response outside time window");
-                        // Clear cached engine state so the next call re-runs
-                        // discovery. update_time is forward-only and discovery
-                        // does not re-run while state exists, so without this a
-                        // notion that has drifted ahead of the agent (e.g. an
-                        // agent restart that reset time without bumping boots)
-                        // would wedge every subsequent authenticated request.
-                        {
-                            let mut state = self.inner.engine_state.write().map_err(|_| {
-                                Error::Config("engine_state lock poisoned".into()).boxed()
-                            })?;
-                            *state = None;
-                        }
-                        {
-                            let mut derived = self.inner.derived_keys.write().map_err(|_| {
-                                Error::Config("derived_keys lock poisoned".into()).boxed()
-                            })?;
-                            *derived = None;
-                        }
-                        if let Some(cache) = &self.inner.engine_cache {
-                            cache.remove(&self.peer_addr());
-                        }
-                        return Err(Error::Auth {
-                            target: self.peer_addr(),
-                        }
-                        .boxed());
-                    }
 
                     // Check for SNMP error
                     if let Some(err) = super::pdu_to_snmp_error(&response_pdu, self.peer_addr()) {
@@ -1187,6 +1232,23 @@ mod response_validation_tests {
         assert_eq!(
             msg.global_data.msg_max_size, 1400,
             "request must advertise the local transport capacity, not the remote's cached 9000"
+        );
+    }
+
+    /// A received message claiming authentication on a client configured
+    /// without authentication must be rejected for the missing capability,
+    /// not processed unauthenticated (RFC 3412 Section 7.2 processes at the
+    /// received level).
+    #[tokio::test]
+    async fn v3_noauth_client_rejects_received_auth_response() {
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
+        let response = build_response(PduType::Response, 123, 1, 1001, Some(b"authpass12345678"));
+        let client = canned_client(response, 1, 1000, UsmConfig::new("user"));
+
+        let err = client.send_v3_and_recv(pdu).await.unwrap_err();
+        assert!(
+            matches!(*err, Error::Auth { .. }),
+            "expected Auth error for unverifiable received auth, got: {err}"
         );
     }
 

@@ -83,10 +83,6 @@ pub(crate) enum DecodeErrorKind {
     InvalidUserNameLength { length: usize },
     /// NULL with non-zero length.
     InvalidNull,
-    /// Expected plaintext, got encrypted.
-    UnexpectedEncryption,
-    /// Expected encrypted, got plaintext.
-    ExpectedEncryption,
     /// Invalid IP address length.
     InvalidIpAddressLength { length: usize },
     /// Length field too long.
@@ -159,8 +155,6 @@ impl std::fmt::Display for DecodeErrorKind {
                 write!(f, "msgUserName length {length} exceeds maximum 32")
             }
             Self::InvalidNull => write!(f, "NULL with non-zero length"),
-            Self::UnexpectedEncryption => write!(f, "expected plaintext scoped PDU"),
-            Self::ExpectedEncryption => write!(f, "expected encrypted scoped PDU"),
             Self::InvalidIpAddressLength { length } => {
                 write!(f, "IP address must be 4 bytes, got {length}")
             }

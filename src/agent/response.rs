@@ -4,7 +4,7 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 
 use crate::error::Result;
-use crate::message::V3Message;
+use crate::message::MsgGlobalData;
 use crate::notification::DerivedKeys;
 use crate::pdu::Pdu;
 use crate::v3::encode::encode_v3_response;
@@ -16,14 +16,14 @@ impl Agent {
     /// Build a V3 response message with appropriate security.
     pub(super) fn build_v3_response(
         &self,
-        incoming: &V3Message,
+        incoming: &MsgGlobalData,
         incoming_usm: &UsmSecurityParams,
         response_pdu: Pdu,
         context_engine_id: Bytes,
         context_name: Bytes,
         derived_keys: Option<&DerivedKeys>,
     ) -> Result<Option<Bytes>> {
-        let security_level = incoming.global_data.msg_flags.security_level;
+        let security_level = incoming.msg_flags.security_level;
         let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
         let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
 
@@ -51,7 +51,7 @@ impl Agent {
 
         encode_v3_response(
             response_pdu,
-            incoming.global_data.msg_id,
+            incoming.msg_id,
             advertised_max_size,
             security_level,
             response_usm,
@@ -69,7 +69,7 @@ impl Agent {
 mod tests {
     use super::*;
     use crate::agent::Agent;
-    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel};
+    use crate::message::{MsgFlags, SecurityLevel, V3Message};
     use crate::oid;
     use crate::oid::Oid;
     use crate::pdu::PduType;
@@ -108,17 +108,8 @@ mod tests {
             .unwrap()
     }
 
-    fn dummy_v3_msg(security_level: SecurityLevel) -> V3Message {
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(security_level, true));
-        let pdu = Pdu {
-            pdu_type: PduType::Response,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![],
-        };
-        let scoped = ScopedPdu::new(Bytes::from_static(b"engine"), Bytes::new(), pdu);
-        V3Message::new(global, Bytes::new(), scoped)
+    fn dummy_v3_msg(security_level: SecurityLevel) -> MsgGlobalData {
+        MsgGlobalData::new(1, 65507, MsgFlags::new(security_level, true))
     }
 
     fn dummy_usm() -> UsmSecurityParams {
@@ -278,7 +269,7 @@ mod tests {
 
         // Incoming message advertises a much larger msgMaxSize (65507).
         let msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
-        assert_eq!(msg.global_data.msg_max_size, 65507);
+        assert_eq!(msg.msg_max_size, 65507);
         let usm = dummy_usm();
 
         let result = agent

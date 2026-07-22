@@ -174,6 +174,8 @@ pub struct V3ReplyBuilder {
     engine_time: u32,
     username: Bytes,
     signing_user: Option<UsmConfig>,
+    key_engine_id: Option<Bytes>,
+    ciphertext_override: Option<Bytes>,
     context_engine_id: Bytes,
     context_name: Bytes,
     pdu: Pdu,
@@ -197,6 +199,8 @@ impl V3ReplyBuilder {
             engine_time: engine.engine_time,
             username: request.usm.username.clone(),
             signing_user: engine.user_for(&request.usm.username).cloned(),
+            key_engine_id: None,
+            ciphertext_override: None,
             context_engine_id: scoped.context_engine_id.clone(),
             context_name: scoped.context_name.clone(),
             pdu: scoped.pdu.to_response(),
@@ -278,6 +282,20 @@ impl V3ReplyBuilder {
         self
     }
 
+    /// Localize signing/encryption keys against an engine ID independently
+    /// from the authoritative engine ID placed on the wire.
+    pub fn key_engine_id(mut self, engine_id: impl Into<Bytes>) -> Self {
+        self.key_engine_id = Some(engine_id.into());
+        self
+    }
+
+    /// Replace authPriv ciphertext after producing valid privacy parameters;
+    /// the final message is still authenticated over the replacement bytes.
+    pub fn ciphertext(mut self, ciphertext: impl Into<Bytes>) -> Self {
+        self.ciphertext_override = Some(ciphertext.into());
+        self
+    }
+
     pub fn context_engine_id(mut self, context_engine_id: impl Into<Bytes>) -> Self {
         self.context_engine_id = context_engine_id.into();
         self
@@ -317,7 +335,10 @@ impl V3ReplyBuilder {
         let keys = self
             .signing_user
             .as_ref()
-            .map(|user| user.derive_keys(&self.engine_id))
+            .map(|user| {
+                let key_engine_id = self.key_engine_id.as_ref().unwrap_or(&self.engine_id);
+                user.derive_keys(key_engine_id)
+            })
             .transpose()
             .map_err(|error| error.to_string())?;
 
@@ -347,6 +368,7 @@ impl V3ReplyBuilder {
                     Some(&self.salt),
                 )
                 .map_err(|error| error.to_string())?;
+            let ciphertext = self.ciphertext_override.unwrap_or(ciphertext);
             usm = usm.with_priv_params(priv_params);
             if let Some(auth_key) = keys.as_ref().and_then(|keys| keys.auth_key.as_ref()) {
                 usm = usm.with_auth_placeholder(auth_key.mac_len());

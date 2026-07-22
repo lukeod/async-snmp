@@ -10,7 +10,7 @@ use bytes::Bytes;
 use crate::ber::{Decoder, tag};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
-use crate::message::{CommunityMessage, V3Message};
+use crate::message::{CommunityMessage, MsgGlobalData};
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::v3::UsmSecurityParams;
 use crate::v3::compute_engine_boots_time;
@@ -174,7 +174,7 @@ impl super::NotificationReceiver {
             }
             V3Inbound::Message(inbound) => inbound,
         };
-        let msg = &inbound.msg;
+        let global_data = &inbound.global_data;
         let usm_params = &inbound.usm_params;
         let scoped_pdu = &inbound.scoped_pdu;
         let security_level = inbound.security_level;
@@ -220,7 +220,7 @@ impl super::NotificationReceiver {
 
                 let response_bytes = build_v3_response(
                     &self.inner,
-                    msg,
+                    global_data,
                     usm_params,
                     response_pdu,
                     context_engine_id.clone(),
@@ -262,7 +262,7 @@ impl super::NotificationReceiver {
 /// ID, and echoing also interoperates with senders that used their own.
 fn build_v3_response(
     inner: &ReceiverInner,
-    incoming_msg: &V3Message,
+    incoming: &MsgGlobalData,
     incoming_usm: &UsmSecurityParams,
     response_pdu: Pdu,
     context_engine_id: Bytes,
@@ -278,12 +278,12 @@ fn build_v3_response(
 
     encode_v3_response(
         response_pdu,
-        incoming_msg.global_data.msg_id,
+        incoming.msg_id,
         // RFC 3412 Section 6.3: msgMaxSize advertises this receiver's own
         // receive capacity, not the sender's echoed value. The receiver has no
         // configurable limit, so advertise the default UDP receive capacity.
         crate::v3::DEFAULT_MSG_MAX_SIZE as i32,
-        incoming_msg.global_data.msg_flags.security_level,
+        incoming.msg_flags.security_level,
         response_usm,
         context_engine_id,
         context_name,

@@ -15,9 +15,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bytes::Bytes;
 
 use crate::ber::Decoder;
-use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
-use crate::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
+use crate::message::{MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel};
 use crate::notification::{DerivedKeys, UsmConfig};
 use crate::oid::Oid;
 use crate::v3::auth::verify_message;
@@ -125,7 +124,7 @@ pub(crate) struct V3LocalContext<'a> {
 
 /// A fully USM-processed inbound message.
 pub(crate) struct V3InboundMessage {
-    pub(crate) msg: V3Message,
+    pub(crate) global_data: MsgGlobalData,
     pub(crate) usm_params: UsmSecurityParams,
     pub(crate) scoped_pdu: ScopedPdu,
     pub(crate) security_level: SecurityLevel,
@@ -162,7 +161,7 @@ pub(crate) fn process_v3_inbound(
 ) -> Result<V3Inbound> {
     let source = ctx.source;
 
-    let msg = match V3Message::decode(data.clone()) {
+    let msg = match RawV3Message::decode(data.clone()) {
         Ok(msg) => msg,
         Err(e) => {
             // RFC 3412 Section 7.2.4/7.2.7: invalid msgFlags and unknown
@@ -331,44 +330,39 @@ pub(crate) fn process_v3_inbound(
         }
     }
 
-    // Decrypt if needed. Key presence was checked at Step 5.
-    let scoped_pdu = if security_level == SecurityLevel::AuthPriv {
-        let priv_key = derived_keys
-            .priv_key
-            .as_ref()
-            .expect("authPriv without a privacy key is rejected at Step 5");
-        let encrypted_data = match &msg.data {
-            V3MessageData::Encrypted(data) => data,
-            V3MessageData::Plaintext(_) => {
-                tracing::debug!(target: "async_snmp::v3", { source = %source, kind = %DecodeErrorKind::ExpectedEncryption }, "expected encrypted scoped PDU");
-                return Err(Error::MalformedResponse { target: source }.boxed());
-            }
-        };
+    // Parse (and for authPriv decrypt) the scoped PDU only after every
+    // security check has passed. The msgData form is tied to the received
+    // privacy flag by RawV3Message::decode, so the match is total.
+    let scoped_pdu = match &msg.msg_data {
+        RawMsgData::Encrypted(encrypted_data) => {
+            let priv_key = derived_keys
+                .priv_key
+                .as_ref()
+                .expect("authPriv without a privacy key is rejected at Step 5");
+            let decrypted = match priv_key.decrypt(
+                encrypted_data,
+                usm_params.engine_boots,
+                usm_params.engine_time,
+                &usm_params.priv_params,
+            ) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::debug!(target: "async_snmp::v3", { source = %source, error = %e }, "decryption failed");
+                    return fail(UsmFailure::DecryptionErrors, None);
+                }
+            };
 
-        let decrypted = match priv_key.decrypt(
-            encrypted_data,
-            usm_params.engine_boots,
-            usm_params.engine_time,
-            &usm_params.priv_params,
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::debug!(target: "async_snmp::v3", { source = %source, error = %e }, "decryption failed");
-                return fail(UsmFailure::DecryptionErrors, None);
-            }
-        };
-
-        let mut decoder = Decoder::with_target(decrypted, source);
-        ScopedPdu::decode(&mut decoder)?
-    } else if let Some(sp) = msg.scoped_pdu() {
-        sp.clone()
-    } else {
-        tracing::debug!(target: "async_snmp::v3", { source = %source, kind = %DecodeErrorKind::UnexpectedEncryption }, "unexpected encrypted scoped PDU");
-        return Err(Error::MalformedResponse { target: source }.boxed());
+            let mut decoder = Decoder::with_target(decrypted, source);
+            ScopedPdu::decode(&mut decoder)?
+        }
+        RawMsgData::Plaintext(raw) => {
+            let mut decoder = Decoder::with_target(raw.clone(), source);
+            ScopedPdu::decode(&mut decoder)?
+        }
     };
 
     Ok(V3Inbound::Message(Box::new(V3InboundMessage {
-        msg,
+        global_data: msg.global_data,
         usm_params,
         scoped_pdu,
         security_level,
@@ -545,6 +539,53 @@ mod tests {
             "reportable=false must suppress the report"
         );
         assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 1);
+    }
+
+    /// RFC 3414 Section 3.2 Step 6 precedes scoped-PDU parsing: a message
+    /// whose digest fails must be answered with usmStatsWrongDigests even
+    /// when its plaintext scoped PDU is malformed garbage. Parsing the
+    /// plaintext before authentication would turn this into a bare decode
+    /// error and skip the counter and Report.
+    #[test]
+    fn test_wrong_digest_reported_before_plaintext_pdu_parse() {
+        use crate::ber::EncodeBuf;
+        use crate::v3::AuthProtocol;
+
+        let engine_id = local_engine_id();
+        let mut users = HashMap::new();
+        users.insert(
+            Bytes::from_static(b"user"),
+            UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678"),
+        );
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+
+        let usm = UsmSecurityParams::new(engine_id.clone(), 7, 1000, Bytes::from_static(b"user"))
+            .with_auth_params(vec![0xAA; 12]); // not a valid HMAC
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            // msgData: SEQUENCE TLV wrapping garbage, not a parsable ScopedPDU
+            buf.push_sequence(|buf| {
+                buf.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            });
+            buf.push_octet_string(&usm.encode());
+            crate::message::MsgGlobalData::new(
+                1,
+                65507,
+                MsgFlags::new(SecurityLevel::AuthNoPriv, true),
+            )
+            .encode(buf);
+            buf.push_integer(3);
+        });
+        let data = buf.finish();
+
+        let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
+        let V3Inbound::Failed { failure, report } = outcome else {
+            panic!("failed authentication must be a USM failure, not a decode error");
+        };
+        assert_eq!(failure, UsmFailure::WrongDigests);
+        assert!(report.is_some(), "reportable message gets a report");
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 1);
     }
 
     /// RFC 3414 Section 3.2 Step 3: the authoritative role rejects messages

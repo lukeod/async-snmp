@@ -235,6 +235,459 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
     );
 }
 
+/// A client configured without authentication cannot verify a received
+/// authenticated Report, so it must fail with an Auth error instead of
+/// acting on the Report's contents (RFC 3412 Section 7.2 processes at the
+/// received level; acting requires the claimed authentication to be checked).
+#[tokio::test]
+async fn v3_noauth_client_rejects_authenticated_report() {
+    let engine = engine_for(SecurityLevel::NoAuthNoPriv);
+    let report_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .security_level(SecurityLevel::AuthNoPriv)
+                .signing_user(user_for(SecurityLevel::AuthNoPriv))
+                .engine_boots(8)
+                .engine_time(500)
+                .build()
+            }),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(SecurityLevel::NoAuthNoPriv))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::fixed(1, Duration::ZERO))
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "expected Auth error, got: {err}"
+    );
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the unverifiable Report must not trigger a corrected retry"
+    );
+}
+
+/// A wire username which does not select the cached user's key must be
+/// rejected before its authenticated boots/time or Report status are used.
+#[tokio::test]
+async fn v3_authenticated_wrong_username_does_not_mutate_time_or_retry() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .username(Bytes::from_static(b"other-user"))
+                .signing_user(user_for(level))
+                .engine_boots(8)
+                .engine_time(500)
+                .security_level(level)
+                .build()
+            }),
+            response_step(engine, "state preserved"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "wrong security name must fail USM processing, got: {err}"
+    );
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("state preserved"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3, "the invalid Report must not add a retry");
+    assert_eq!(
+        requests[2].usm.engine_boots, 7,
+        "wrong-user authentication must not advance engine state"
+    );
+}
+
+/// An authenticated packet whose wire engine ID does not identify the cached
+/// localized key must fail before Report classification.
+#[tokio::test]
+async fn v3_authenticated_wrong_engine_id_does_not_trigger_report_retry() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let expected_engine_id = engine.engine_id.clone();
+    let report_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .engine_id(Bytes::from_static(b"\x80\x00\x7e\xd9\x05foreign-engine"))
+                .key_engine_id(expected_engine_id)
+                .security_level(level)
+                .build()
+            }),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::fixed(1, Duration::ZERO))
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "wrong authoritative engine must fail USM processing, got: {err}"
+    );
+
+    peer.finish().await.unwrap();
+    assert_eq!(
+        log.len(),
+        2,
+        "the identity-confused Report must not trigger a corrected send"
+    );
+}
+
+/// Step 5 rejects a received authPriv level which the configured user cannot
+/// support before HMAC-verified time can update the local notion.
+#[tokio::test]
+async fn v3_auth_no_priv_client_rejects_auth_priv_without_time_mutation() {
+    let client_level = SecurityLevel::AuthNoPriv;
+    let peer_level = SecurityLevel::AuthPriv;
+    let engine = engine_for(peer_level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .security_level(peer_level)
+                    .engine_boots(8)
+                    .engine_time(500)
+                    .build()
+            }),
+            response_step(engine, "state preserved"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(client_level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "unsupported authPriv must fail capability selection, got: {err}"
+    );
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("state preserved"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].usm.engine_boots, 7,
+        "unsupported privacy must not advance engine state"
+    );
+}
+
+/// A failed HMAC must stop processing before malformed plaintext ScopedPDU
+/// bytes are parsed or their claimed time can mutate local state.
+#[tokio::test]
+async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let malformed_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                let usm = raw_ber::usm_security_params(
+                    &malformed_engine.engine_id,
+                    &[8],
+                    &[0x01, 0xf4],
+                    USERNAME.as_bytes(),
+                    &[0xaa; 24],
+                    &[],
+                );
+                Ok(raw_ber::v3_message(
+                    &raw_ber::signed_integer_content(request.global_data.msg_id),
+                    &[0x00, 0xff, 0xe3],
+                    &[0x01],
+                    &[3],
+                    &usm,
+                    &raw_ber::tlv(0x30, &[0xde, 0xad, 0xbe, 0xef]),
+                ))
+            }),
+            response_step(engine, "state preserved"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "failed HMAC must win over malformed plaintext, got: {err}"
+    );
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("state preserved"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].usm.engine_boots, 7);
+}
+
+/// Timeliness processing must reject authenticated stale authPriv input before
+/// attempting to decrypt or parse its intentionally invalid ciphertext.
+#[tokio::test]
+async fn v3_auth_priv_timeliness_precedes_decryption() {
+    let level = SecurityLevel::AuthPriv;
+    let engine = engine_for(level).boots_time(7, 1000);
+    let stale_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::response_to(request, &stale_engine)
+                    .engine_time(100)
+                    .ciphertext(Bytes::from_static(b"not a scoped PDU"))
+                    .build()
+            }),
+            discovery_step(engine.clone()),
+            response_step(engine, "rediscovered"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "stale ciphertext must fail timeliness before decode, got: {err}"
+    );
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("rediscovered"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[2].usm.engine_id.is_empty(),
+        "timeliness rejection must occur before ciphertext decode and clear the stale notion"
+    );
+}
+
+/// An authenticated session must not accept an unauthenticated reply
+/// (received noAuthNoPriv on a configured authNoPriv exchange).
+#[tokio::test]
+async fn v3_auth_client_rejects_unauthenticated_response() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .security_level(SecurityLevel::NoAuthNoPriv)
+                    .varbinds(vec![VarBind::new(
+                        oid,
+                        Value::OctetString(Bytes::from_static(b"unauthenticated")),
+                    )])
+                    .build()
+            }),
+        ],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "expected Auth error, got: {err}"
+    );
+    peer.finish().await.unwrap();
+}
+
+/// An encrypted authPriv Report must be decrypted and classified as a
+/// Report (here a terminal credential failure), not rejected as a
+/// malformed non-Response.
+#[tokio::test]
+async fn v3_auth_priv_client_classifies_encrypted_report() {
+    let level = SecurityLevel::AuthPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::unknown_user_names(),
+                    1,
+                )
+                .security_level(SecurityLevel::AuthPriv)
+                .build()
+            }),
+        ],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "encrypted Report must classify as a credential failure, got: {err}"
+    );
+    peer.finish().await.unwrap();
+}
+
+/// Reserved and reportable flag bits in a reply do not change the derived
+/// security level: an authNoPriv response carrying an extra reserved bit is
+/// still verified and accepted.
+#[tokio::test]
+async fn v3_reserved_flag_bits_in_reply_ignored_for_level() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            ScriptStep::reply(move |request| {
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    // auth bit plus reportable and a reserved bit
+                    .raw_msg_flags(0x01 | 0x04 | 0x08)
+                    .varbinds(vec![VarBind::new(
+                        oid,
+                        Value::OctetString(Bytes::from_static(b"reserved bits ok")),
+                    )])
+                    .build()
+            }),
+        ],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("reserved bits ok"));
+    peer.finish().await.unwrap();
+}
+
 #[tokio::test]
 async fn v3_scripted_udp_timeout_retry_count() {
     let level = SecurityLevel::AuthNoPriv;

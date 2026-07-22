@@ -110,7 +110,7 @@ impl Agent {
             V3Inbound::RemoteNotInTimeWindow => return Ok(None),
             V3Inbound::Message(inbound) => inbound,
         };
-        let msg = &inbound.msg;
+        let global_data = &inbound.global_data;
         let usm_params = &inbound.usm_params;
         let scoped_pdu = &inbound.scoped_pdu;
         let security_level = inbound.security_level;
@@ -159,7 +159,7 @@ impl Agent {
             // local engine ID as its contextEngineID rather than echoing the
             // rejected value.
             return self.build_v3_response(
-                msg,
+                global_data,
                 usm_params,
                 report_pdu,
                 state.engine_id.clone(),
@@ -181,7 +181,7 @@ impl Agent {
             group_name: None,
             read_view: None,
             write_view: None,
-            msg_max_size: Some(msg.global_data.msg_max_size as u32),
+            msg_max_size: Some(global_data.msg_max_size as u32),
         };
 
         // VACM resolution (if enabled)
@@ -191,7 +191,7 @@ impl Agent {
 
         // Build response
         self.build_v3_response(
-            msg,
+            global_data,
             usm_params,
             response_pdu,
             scoped_pdu.context_engine_id.clone(),
