@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- SNMPv3 timeout retransmissions reuse the PDU request-id and a response
+  correlating to any transmitted msgID of the operation is accepted,
+  matching net-snmp and snmp4j. Protocol corrections still use fresh
+  message and request IDs and reset the acceptance window.
+
 ## [0.16.0] - 2026-07-14
 
 ### Added

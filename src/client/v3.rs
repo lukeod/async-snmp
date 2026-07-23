@@ -5,15 +5,14 @@
 
 use crate::ber::Decoder;
 use crate::error::internal::{AuthErrorKind, CryptoErrorKind};
-use crate::error::{Error, ErrorStatus, Result};
+use crate::error::{Error, Result};
 use crate::format::hex;
 use crate::message::{RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message};
 use crate::pdu::{Pdu, PduType};
 use crate::transport::Transport;
 use crate::v3::{
-    EngineCache, EngineState, UsmSecurityParams, auth::verify_message, compute_engine_boots_time,
-    is_decryption_error_report, is_not_in_time_window_report, is_unknown_engine_id_report,
-    is_unknown_user_name_report, is_unsupported_sec_level_report, is_wrong_digest_report,
+    EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
+    classify_report, compute_engine_boots_time,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -330,18 +329,10 @@ impl<T: Transport> Client<T> {
             return Err(malformed());
         }
 
-        let pdu = &scoped_pdu.pdu;
-        let valid_varbind = matches!(
-            pdu.varbinds.as_slice(),
-            [varbind]
-                if varbind.oid == crate::v3::report_oids::unknown_engine_ids()
-                    && matches!(&varbind.value, crate::Value::Counter32(_))
-        );
-        if pdu.pdu_type != PduType::Report
-            || pdu.error_status != 0
-            || pdu.error_index != 0
-            || !valid_varbind
-        {
+        if !matches!(
+            classify_report(&scoped_pdu.pdu),
+            Ok(ReportStatus::UnknownEngineId { .. })
+        ) {
             return Err(malformed());
         }
 
@@ -576,6 +567,7 @@ impl<T: Transport> Client<T> {
             snmp.request_id = pdu.request_id,
             snmp.security_level = ?self.inner.config.v3_security.as_ref().map(crate::UsmConfig::security_level),
             snmp.attempt = tracing::field::Empty,
+            snmp.protocol_correction = tracing::field::Empty,
             snmp.elapsed_ms = tracing::field::Empty,
         )
     )]
@@ -593,20 +585,25 @@ impl<T: Transport> Client<T> {
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
         let security_level = security.security_level();
 
-        let mut last_error: Option<Box<Error>> = None;
-        let max_attempts = if self.inner.transport.is_reliable() {
+        let max_timeout_retries = if self.inner.transport.is_reliable() {
             0
         } else {
             self.inner.config.retry.max_attempts
         };
+        let mut timeout_retries = 0;
+        let mut correction_used = false;
+        let mut pdu = pdu;
+        // msgIDs transmitted for the current exchange. A response correlating to
+        // any of them is acceptable; corrections reset the window because the
+        // corrected message is a new exchange.
+        let mut msg_id_window: Vec<i32> = Vec::new();
 
-        for attempt in 0..=max_attempts {
-            Span::current().record("snmp.attempt", attempt);
-            if attempt > 0 {
-                tracing::debug!(target: "async_snmp::client", "retrying V3 request");
-            }
+        loop {
+            Span::current().record("snmp.attempt", timeout_retries);
+            Span::current().record("snmp.protocol_correction", correction_used);
 
-            // RFC 3412 Section 6.2: use fresh msgID for each transmission attempt
+            // RFC 3412 Section 6.2: use fresh msgID for every transmission. Prior
+            // attempts' msgIDs stay acceptable via the window below.
             let msg_id = self.next_request_id();
             let request = self.build_v3_message(&pdu, msg_id)?;
 
@@ -617,6 +614,14 @@ impl<T: Transport> Client<T> {
             self.inner
                 .transport
                 .register_request(msg_id, self.inner.config.timeout);
+            for &prior in &msg_id_window {
+                self.inner.transport.register_request_alias(
+                    prior,
+                    msg_id,
+                    self.inner.config.timeout,
+                );
+            }
+            msg_id_window.push(msg_id);
 
             // Send request and wait for response as a single unit so reliable
             // transports own their stream lock for the whole exchange.
@@ -689,67 +694,49 @@ impl<T: Transport> Client<T> {
                     // A mismatch terminates the exchange because Transport's
                     // request API does not universally support receiving a
                     // second packet (notably custom transports).
-                    if raw.global_data.msg_id != msg_id {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_id = msg_id, actual_msg_id = raw.global_data.msg_id }, "msgID mismatch in response");
+                    if !msg_id_window.contains(&raw.global_data.msg_id) {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_ids = ?msg_id_window, actual_msg_id = raw.global_data.msg_id }, "msgID mismatch in response");
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
                         .boxed());
                     }
 
-                    // Check for Report PDU (error response)
+                    // Report action begins only after USM processing and exact
+                    // outer-msgID correlation. Strict classification prevents
+                    // an OID hidden in a malformed/multi-status Report from
+                    // triggering a corrected send.
                     if scoped_pdu.pdu.pdu_type == PduType::Report {
-                        // Time window error - retry with the corrected
-                        // notion. For authenticated Reports the Step 7b
-                        // update above has already advanced the local
-                        // boots/time, so the retry carries the corrected
-                        // tuple; unauthenticated Reports never change state.
-                        if is_not_in_time_window_report(&scoped_pdu.pdu) {
-                            tracing::debug!(target: "async_snmp::client", "not in time window, retrying with updated notion");
-                            last_error = Some(
-                                Error::Auth {
-                                    target: self.peer_addr(),
-                                }
-                                .boxed(),
-                            );
-                            // Apply backoff delay before retry (if not last attempt)
-                            if attempt < max_attempts {
-                                let delay = self.inner.config.retry.compute_delay(attempt);
-                                if !delay.is_zero() {
-                                    tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
-                                    tokio::time::sleep(delay).await;
-                                }
+                        let status = classify_report(&scoped_pdu.pdu).map_err(|_| {
+                            Error::MalformedResponse {
+                                target: self.peer_addr(),
                             }
+                            .boxed()
+                        })?;
+
+                        if matches!(status, ReportStatus::NotInTimeWindow { .. })
+                            && received_level.requires_auth()
+                            && !correction_used
+                        {
+                            // RFC 3414 Step 7(b) above has already established
+                            // the authenticated tuple. One protocol correction
+                            // is allowed independently of timeout retries and
+                            // transport reliability. A corrected message is a
+                            // new request and receives fresh message and PDU IDs.
+                            correction_used = true;
+                            pdu.request_id = self.next_request_id();
+                            msg_id_window.clear();
+                            Span::current().record("snmp.protocol_correction", true);
+                            tracing::debug!(target: "async_snmp::client", { snmp.report_status = %status }, "sending SNMPv3 protocol correction");
                             continue;
                         }
 
-                        // Check for unknown engine ID
-                        if is_unknown_engine_id_report(&scoped_pdu.pdu) {
-                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "unknown engine ID");
-                            return Err(Error::Auth {
-                                target: self.peer_addr(),
-                            }
-                            .boxed());
-                        }
-
-                        // Security/authentication failure Reports
-                        if is_unknown_user_name_report(&scoped_pdu.pdu)
-                            || is_wrong_digest_report(&scoped_pdu.pdu)
-                            || is_unsupported_sec_level_report(&scoped_pdu.pdu)
-                            || is_decryption_error_report(&scoped_pdu.pdu)
-                        {
-                            return Err(Error::Auth {
-                                target: self.peer_addr(),
-                            }
-                            .boxed());
-                        }
-
-                        // Other Report errors
-                        return Err(Error::Snmp {
+                        // Credential failures, unknown statuses, unauthenticated
+                        // time Reports, and a repeated time-window Report are
+                        // typed terminal protocol outcomes, never timeouts.
+                        return Err(Error::Report {
                             target: self.peer_addr(),
-                            status: ErrorStatus::GenErr,
-                            index: 0,
-                            oid: scoped_pdu.pdu.varbinds.first().map(|vb| vb.oid.clone()),
+                            status: Box::new(status),
                         }
                         .boxed());
                     }
@@ -846,16 +833,21 @@ impl<T: Transport> Client<T> {
                     return Ok(response_pdu);
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
-                    last_error = Some(e);
-                    // Apply backoff delay before next retry (if not last attempt)
-                    if attempt < max_attempts {
-                        let delay = self.inner.config.retry.compute_delay(attempt);
-                        if !delay.is_zero() {
-                            tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
-                            tokio::time::sleep(delay).await;
-                        }
+                    if timeout_retries >= max_timeout_retries {
+                        break;
                     }
-                    // fall thru to next loop iteration
+
+                    let delay = self.inner.config.retry.compute_delay(timeout_retries);
+                    timeout_retries += 1;
+                    // The retransmission is the same request: the PDU request-id is
+                    // reused, matching net-snmp and snmp4j. RFC 3414 Section 11.1's
+                    // distinct-request-id rule is applied per operation, not per
+                    // transmission; a fresh msgID still distinguishes each copy on the
+                    // wire and any windowed transmission's response remains acceptable.
+                    tracing::debug!(target: "async_snmp::client", { timeout_retries, delay_ms = delay.as_millis() as u64 }, "retransmitting V3 request after timeout");
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                 }
                 Err(e) => {
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
@@ -864,19 +856,15 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        // All retries exhausted. Every failing attempt was a timeout (other
-        // errors return early), so build the final error here with the true
-        // total elapsed time and retry count rather than propagating the
-        // per-attempt transport timeout, whose elapsed/retries are not
-        // meaningful at this layer.
-        let _ = last_error;
+        // Only transport timeouts reach loop exhaustion. Reports always take a
+        // protocol transition or return their typed terminal outcome.
         let elapsed = start.elapsed();
         Span::current().record("snmp.elapsed_ms", elapsed.as_millis() as u64);
-        tracing::debug!(target: "async_snmp::client", { request_id = pdu.request_id, peer = %self.peer_addr(), ?elapsed, retries = max_attempts }, "request timed out");
+        tracing::debug!(target: "async_snmp::client", { request_id = pdu.request_id, peer = %self.peer_addr(), ?elapsed, retries = timeout_retries }, "request timed out");
         Err(Error::Timeout {
             target: self.peer_addr(),
             elapsed,
-            retries: max_attempts,
+            retries: timeout_retries,
         }
         .boxed())
     }

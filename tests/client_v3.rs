@@ -5,7 +5,7 @@ mod common;
 
 use async_snmp::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
 use async_snmp::pdu::{Pdu, PduType};
-use async_snmp::v3::{AuthProtocol, PrivProtocol, UsmSecurityParams};
+use async_snmp::v3::{AuthProtocol, PrivProtocol, ReportStatus, UsmSecurityParams};
 use async_snmp::varbind::VarBind;
 use async_snmp::{Auth, Client, Error, Retry, Value, oid};
 use bytes::Bytes;
@@ -406,8 +406,16 @@ async fn v3_unknown_user_no_auth_fails() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     assert!(
-        matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
-        "expected Auth error for unknown noAuthNoPriv user, got {result:?}"
+        matches!(
+            result,
+            Err(ref e)
+                if matches!(
+                    &**e,
+                    Error::Report { status, .. }
+                        if matches!(status.as_ref(), ReportStatus::UnknownUserName { .. })
+                )
+        ),
+        "expected typed unknown-user Report for noAuthNoPriv user, got {result:?}"
     );
 }
 

@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //!
-//! - [`Error`] - The main error type (8 variants covering all failure modes)
+//! - [`Error`] - The main error type covering all failure modes
 //! - [`ErrorStatus`] - SNMP protocol errors returned by agents (RFC 3416)
 //! - [`WalkAbortReason`] - Reasons a walk operation was aborted
 //!
@@ -35,6 +35,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::oid::Oid;
+use crate::v3::ReportStatus;
 
 /// Placeholder target address used when no target is known.
 ///
@@ -144,6 +145,13 @@ pub enum Error {
     /// Authentication/authorization failed.
     #[error("authentication failed for {target}")]
     Auth { target: SocketAddr },
+
+    /// A structurally valid SNMPv3 Report terminated the operation.
+    #[error("SNMPv3 Report from {target}: {status}")]
+    Report {
+        target: SocketAddr,
+        status: Box<ReportStatus>,
+    },
 
     /// Malformed response from agent.
     #[error("malformed response from {target}")]

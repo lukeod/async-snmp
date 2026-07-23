@@ -472,6 +472,13 @@ impl ScriptStep {
         Self(Box::new(|_| Ok(ScriptOutput::Silence)))
     }
 
+    pub fn silence_with(observe: impl FnOnce(&CapturedV3Request) + Send + 'static) -> Self {
+        Self(Box::new(move |request| {
+            observe(request);
+            Ok(ScriptOutput::Silence)
+        }))
+    }
+
     pub fn transport_error(error: Error) -> Self {
         Self(Box::new(move |_| {
             Ok(ScriptOutput::TransportError(error.boxed()))

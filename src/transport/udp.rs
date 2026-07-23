@@ -516,6 +516,12 @@ impl Transport for UdpHandle {
         let expected = self.strict_source.then_some(self.target);
         self.inner.core.register(request_id, timeout, expected);
     }
+
+    fn register_request_alias(&self, alias_id: i32, primary_id: i32, timeout: Duration) {
+        self.inner
+            .core
+            .register_alias(alias_id, primary_id, timeout);
+    }
 }
 
 #[cfg(test)]

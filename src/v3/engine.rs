@@ -890,60 +890,6 @@ pub fn parse_discovery_response_with_limits(
     ))
 }
 
-/// Returns true if `pdu` is a Report PDU containing a varbind with the given OID.
-fn pdu_has_report_oid(pdu: &crate::pdu::Pdu, expected_oid: &crate::Oid) -> bool {
-    use crate::pdu::PduType;
-    pdu.pdu_type == PduType::Report && pdu.varbinds.iter().any(|vb| &vb.oid == expected_oid)
-}
-
-/// Check if a Report PDU indicates "unknown engine ID" (discovery response).
-///
-/// Returns true if the PDU contains usmStatsUnknownEngineIDs varbind.
-#[must_use]
-pub fn is_unknown_engine_id_report(pdu: &crate::pdu::Pdu) -> bool {
-    pdu_has_report_oid(pdu, &report_oids::unknown_engine_ids())
-}
-
-/// Check if a Report PDU indicates "not in time window".
-///
-/// Returns true if the PDU contains usmStatsNotInTimeWindows varbind.
-#[must_use]
-pub fn is_not_in_time_window_report(pdu: &crate::pdu::Pdu) -> bool {
-    pdu_has_report_oid(pdu, &report_oids::not_in_time_windows())
-}
-
-/// Check if a Report PDU indicates "wrong digest" (authentication failure).
-///
-/// Returns true if the PDU contains usmStatsWrongDigests varbind.
-#[must_use]
-pub fn is_wrong_digest_report(pdu: &crate::pdu::Pdu) -> bool {
-    pdu_has_report_oid(pdu, &report_oids::wrong_digests())
-}
-
-/// Check if a Report PDU indicates "unsupported security level".
-///
-/// Returns true if the PDU contains usmStatsUnsupportedSecLevels varbind.
-#[must_use]
-pub fn is_unsupported_sec_level_report(pdu: &crate::pdu::Pdu) -> bool {
-    pdu_has_report_oid(pdu, &report_oids::unsupported_sec_levels())
-}
-
-/// Check if a Report PDU indicates "unknown user name".
-///
-/// Returns true if the PDU contains usmStatsUnknownUserNames varbind.
-#[must_use]
-pub fn is_unknown_user_name_report(pdu: &crate::pdu::Pdu) -> bool {
-    pdu_has_report_oid(pdu, &report_oids::unknown_user_names())
-}
-
-/// Check if a Report PDU indicates "decryption error".
-///
-/// Returns true if the PDU contains usmStatsDecryptionErrors varbind.
-#[must_use]
-pub fn is_decryption_error_report(pdu: &crate::pdu::Pdu) -> bool {
-    pdu_has_report_oid(pdu, &report_oids::decryption_errors())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1636,35 +1582,6 @@ mod tests {
             *parse_discovery_response(&usm.encode()).unwrap_err(),
             Error::MalformedResponse { .. }
         ));
-    }
-
-    #[test]
-    fn test_is_unknown_engine_id_report() {
-        use crate::Value;
-        use crate::VarBind;
-        use crate::pdu::{Pdu, PduType};
-
-        // Report with usmStatsUnknownEngineIDs
-        let mut pdu = Pdu {
-            pdu_type: PduType::Report,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind {
-                oid: report_oids::unknown_engine_ids(),
-                value: Value::Counter32(1),
-            }],
-        };
-
-        assert!(is_unknown_engine_id_report(&pdu));
-
-        // Different report type
-        pdu.varbinds[0].oid = report_oids::not_in_time_windows();
-        assert!(!is_unknown_engine_id_report(&pdu));
-
-        // Not a Report PDU
-        pdu.pdu_type = PduType::Response;
-        assert!(!is_unknown_engine_id_report(&pdu));
     }
 
     // ========================================================================

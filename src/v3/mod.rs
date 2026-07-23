@@ -20,6 +20,7 @@ pub(crate) mod encode;
 mod engine;
 mod privacy;
 pub(crate) mod process;
+mod report;
 mod usm;
 
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
@@ -35,11 +36,8 @@ pub use engine::{
     generate_engine_id, in_authoritative_time_window, parse_discovery_response,
     parse_discovery_response_with_limits, validate_engine_id,
 };
-pub use engine::{
-    is_decryption_error_report, is_not_in_time_window_report, is_unknown_engine_id_report,
-    is_unknown_user_name_report, is_unsupported_sec_level_report, is_wrong_digest_report,
-};
 pub use privacy::{PrivKey, PrivacyError, PrivacyResult, SaltCounter};
+pub use report::{MalformedReport, ReportStatus, classify_report};
 pub use usm::UsmSecurityParams;
 
 /// Key extension strategy for privacy key derivation.

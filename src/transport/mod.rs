@@ -131,6 +131,12 @@ pub trait Transport: Send + Sync {
         // Default: no-op for TCP and other transports that don't need pre-registration
     }
 
+    /// Route responses addressed to `alias_id` (a prior transmission of the
+    /// same operation) to the pending request registered under `primary_id`.
+    /// Transports without out-of-band demultiplexing ignore this; the client
+    /// still accepts windowed IDs in its own correlation check.
+    fn register_request_alias(&self, _alias_id: i32, _primary_id: i32, _timeout: Duration) {}
+
     /// Maximum message size this transport can handle.
     ///
     /// Used to cap agent-reported msgMaxSize values. Default is the maximum

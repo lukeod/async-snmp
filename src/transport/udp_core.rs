@@ -57,7 +57,7 @@ pub struct TransportStats {
 }
 
 struct Shard {
-    pending: Mutex<HashMap<i32, ResponseSlot>>,
+    pending: Mutex<HashMap<i32, PendingEntry>>,
 }
 
 struct ResponseSlot {
@@ -70,6 +70,16 @@ struct ResponseSlot {
     /// When set, only responses from exactly this address are delivered;
     /// mismatched sources are rejected without consuming the slot.
     expected_source: Option<SocketAddr>,
+}
+
+enum PendingEntry {
+    Slot(ResponseSlot),
+    /// Retransmission window alias: datagrams keyed by a prior attempt's
+    /// msgID are delivered to the current attempt's slot.
+    Alias {
+        primary: i32,
+        deadline: Instant,
+    },
 }
 
 impl UdpCore {
@@ -108,7 +118,10 @@ impl UdpCore {
                 .lock()
                 .unwrap()
                 .values()
-                .map(|slot| slot.notify.clone())
+                .filter_map(|entry| match entry {
+                    PendingEntry::Slot(slot) => Some(slot.notify.clone()),
+                    PendingEntry::Alias { .. } => None,
+                })
                 .collect();
             for notify in notifies {
                 notify.notify_one();
@@ -141,7 +154,48 @@ impl UdpCore {
             notify: Arc::new(Notify::new()),
             expected_source,
         };
-        shard.pending.lock().unwrap().insert(request_id, slot);
+        shard
+            .pending
+            .lock()
+            .unwrap()
+            .insert(request_id, PendingEntry::Slot(slot));
+    }
+
+    /// Route future deliveries for `alias_id` to the slot registered under
+    /// `primary_id`. Replaces any existing entry for `alias_id`; a response
+    /// already parked there is forwarded to the primary slot. Aliases are one
+    /// hop: the caller re-points every prior ID at the newest primary, so an
+    /// alias always names a slot, never another alias.
+    ///
+    /// Aliases are never explicitly unregistered. This is safe only because
+    /// every operation exit path removes its primary slot (consume,
+    /// timeout-unregister, send-failure-unregister, close), so a lingering
+    /// alias always ends up naming a dead slot and is reclaimed by
+    /// `cleanup_expired` once its own deadline passes. If a primary slot
+    /// could ever outlive its operation, aliases would need explicit cleanup
+    /// too.
+    pub fn register_alias(&self, alias_id: i32, primary_id: i32, timeout: Duration) {
+        if alias_id == primary_id {
+            return;
+        }
+        let carried = {
+            let mut pending = self.shard(alias_id).pending.lock().unwrap();
+            let carried = match pending.remove(&alias_id) {
+                Some(PendingEntry::Slot(slot)) => slot.response,
+                _ => None,
+            };
+            pending.insert(
+                alias_id,
+                PendingEntry::Alias {
+                    primary: primary_id,
+                    deadline: Instant::now() + timeout,
+                },
+            );
+            carried
+        };
+        if let Some((data, source)) = carried {
+            self.deliver(primary_id, data, source);
+        }
     }
 
     /// Deliver a response to its waiting request.
@@ -149,10 +203,18 @@ impl UdpCore {
     /// Returns `true` if the slot existed and the response was stored,
     /// `false` if there was no matching pending request.
     pub fn deliver(&self, request_id: i32, data: Bytes, source: SocketAddr) -> bool {
-        let shard = self.shard(request_id);
+        let target_id = {
+            let pending = self.shard(request_id).pending.lock().unwrap();
+            match pending.get(&request_id) {
+                Some(PendingEntry::Alias { primary, .. }) => *primary,
+                _ => request_id,
+            }
+        };
+
+        let shard = self.shard(target_id);
         let mut pending = shard.pending.lock().unwrap();
 
-        if let Some(slot) = pending.get_mut(&request_id) {
+        if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&target_id) {
             if let Some(expected) = slot.expected_source
                 && expected != source
             {
@@ -200,7 +262,7 @@ impl UdpCore {
             // Single lock: check for response, or grab notify + deadline for waiting.
             let (notify, deadline, registered_at) = {
                 let mut pending = shard.pending.lock().unwrap();
-                if let Some(slot) = pending.get_mut(&request_id) {
+                if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&request_id) {
                     if let Some(response) = slot.response.take() {
                         pending.remove(&request_id);
                         return Ok(response);
@@ -280,12 +342,15 @@ impl UdpCore {
         let mut removed = 0u64;
         for shard in self.shards.iter() {
             let mut pending = shard.pending.lock().unwrap();
-            pending.retain(|_, slot| {
-                let keep = slot.deadline > now;
-                if !keep {
-                    removed += 1;
+            pending.retain(|_, entry| match entry {
+                PendingEntry::Slot(slot) => {
+                    let keep = slot.deadline > now;
+                    if !keep {
+                        removed += 1;
+                    }
+                    keep
                 }
-                keep
+                PendingEntry::Alias { deadline, .. } => *deadline > now,
             });
         }
         if removed > 0 {
@@ -360,5 +425,92 @@ mod tests {
 
         let (data, _) = core.wait_for_response(7, addr).await.unwrap();
         assert_eq!(data, first, "original response must not be overwritten");
+    }
+
+    #[tokio::test]
+    async fn alias_routes_delivery_to_primary_slot() {
+        let core = UdpCore::new();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        core.register(2, Duration::from_secs(5), None);
+        core.register_alias(1, 2, Duration::from_secs(5));
+        assert!(core.deliver(1, Bytes::from_static(b"late"), target));
+        let (data, source) = core.wait_for_response(2, target).await.unwrap();
+        assert_eq!(data.as_ref(), b"late");
+        assert_eq!(source, target);
+    }
+
+    #[tokio::test]
+    async fn alias_replacement_repoints_to_newest_primary() {
+        let core = UdpCore::new();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        core.register(3, Duration::from_secs(5), None);
+        core.register_alias(1, 2, Duration::from_secs(5));
+        core.register_alias(1, 3, Duration::from_secs(5));
+        core.register_alias(2, 3, Duration::from_secs(5));
+        assert!(core.deliver(1, Bytes::from_static(b"a1"), target));
+        let (data, _) = core.wait_for_response(3, target).await.unwrap();
+        assert_eq!(data.as_ref(), b"a1");
+    }
+
+    #[test]
+    fn alias_to_missing_primary_counts_unmatched() {
+        let core = UdpCore::new();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        core.register_alias(1, 99, Duration::from_secs(5));
+        assert!(!core.deliver(1, Bytes::from_static(b"x"), target));
+        assert_eq!(core.stats().unmatched, 1);
+    }
+
+    #[test]
+    fn expired_alias_is_cleaned_up() {
+        let core = UdpCore::new();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        core.register(2, Duration::from_secs(5), None);
+        core.register_alias(1, 2, Duration::ZERO);
+        core.cleanup_expired();
+        // The expired alias is gone, but the still-live primary slot is not
+        // touched, and removing an alias must not count toward the
+        // requests-timed-out stat.
+        assert!(!core.deliver(1, Bytes::from_static(b"x"), target));
+        assert!(core.deliver(2, Bytes::from_static(b"x"), target));
+        assert_eq!(core.stats().expired, 0);
+    }
+
+    #[tokio::test]
+    async fn alias_registration_forwards_parked_response_to_primary() {
+        let core = UdpCore::new();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        core.register(2, Duration::from_secs(5), None);
+        assert!(core.deliver(2, Bytes::from_static(b"parked"), target));
+        core.register(3, Duration::from_secs(5), None);
+        core.register_alias(2, 3, Duration::from_secs(5));
+        let (data, _) = core.wait_for_response(3, target).await.unwrap();
+        assert_eq!(data.as_ref(), b"parked");
+    }
+
+    // Same-shard variant of `alias_routes_delivery_to_primary_slot`: alias 2
+    // and primary 66 land in the same shard (SHARDS=64), pinning the
+    // release-then-reacquire of a single shard mutex inside `deliver`.
+    #[tokio::test]
+    async fn alias_routes_delivery_to_primary_slot_same_shard() {
+        let core = UdpCore::new();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        core.register(66, Duration::from_secs(5), None);
+        core.register_alias(2, 66, Duration::from_secs(5));
+        assert!(core.deliver(2, Bytes::from_static(b"late"), target));
+        let (data, source) = core.wait_for_response(66, target).await.unwrap();
+        assert_eq!(data.as_ref(), b"late");
+        assert_eq!(source, target);
+    }
+
+    #[test]
+    fn alias_respects_primary_expected_source() {
+        let core = UdpCore::new();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        let other: SocketAddr = "127.0.0.2:161".parse().unwrap();
+        core.register(2, Duration::from_secs(5), Some(target));
+        core.register_alias(1, 2, Duration::from_secs(5));
+        assert!(!core.deliver(1, Bytes::from_static(b"spoof"), other));
+        assert!(core.deliver(1, Bytes::from_static(b"real"), target));
     }
 }

@@ -4,7 +4,7 @@ mod common;
 
 use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
-use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, report_oids};
+use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
     Auth, Client, ClientConfig, EngineCache, MasterKeys, Retry, UsmConfig, Value, VarBind, Version,
     oid,
@@ -13,7 +13,7 @@ use bytes::Bytes;
 use common::v3::{
     ScriptStep, ScriptedTransport, ScriptedV3Peer, TestV3Engine, V3ReplyBuilder, raw_ber,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // RFC 5612 documentation PEN 32473 with RFC 3411 format 5 opaque octets.
@@ -682,7 +682,7 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
 
     let client = Client::builder(peer.addr(), auth_for(level))
         .timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(1, Duration::ZERO))
+        .retry(Retry::none())
         .connect()
         .await
         .unwrap();
@@ -710,7 +710,7 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
     assert_eq!(first.authentication_valid, Some(true));
     assert_eq!(corrected.authentication_valid, Some(true));
     assert_ne!(first.global_data.msg_id, corrected.global_data.msg_id);
-    assert_eq!(
+    assert_ne!(
         first.scoped_pdu.as_ref().unwrap().pdu.request_id,
         corrected.scoped_pdu.as_ref().unwrap().pdu.request_id
     );
@@ -718,6 +718,395 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
         (corrected.usm.engine_boots, corrected.usm.engine_time),
         (8, 10)
     );
+}
+
+#[tokio::test]
+async fn v3_tcp_time_window_report_gets_one_protocol_correction() {
+    let level = SecurityLevel::AuthPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone().boots_time(8, 20);
+    let peer = ScriptedV3Peer::tcp(
+        engine,
+        vec![
+            discovery_step(report_engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    2,
+                )
+                .security_level(SecurityLevel::AuthNoPriv)
+                .engine_boots(8)
+                .engine_time(20)
+                .build()
+            }),
+            response_step(response_engine, "TCP corrected response"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect_tcp()
+        .await
+        .unwrap();
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("TCP corrected response"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_ne!(
+        requests[1].global_data.msg_id,
+        requests[2].global_data.msg_id
+    );
+    assert_ne!(
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+    );
+}
+
+#[tokio::test]
+async fn v3_reliable_custom_transport_allows_protocol_correction() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone().boots_time(8, 30);
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    3,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(30)
+                .build()
+            }),
+            response_step(response_engine, "custom corrected response"),
+        ],
+        200,
+        true,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, None);
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("custom corrected response"));
+
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_eq!(
+            request.transport_request_id,
+            Some(request.global_data.msg_id)
+        );
+    }
+    assert_ne!(
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+    );
+}
+
+#[tokio::test]
+async fn v3_report_on_final_timeout_attempt_still_gets_correction() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone().boots_time(8, 40);
+    let peer = ScriptedV3Peer::udp(
+        engine,
+        vec![
+            discovery_step(report_engine.clone()),
+            ScriptStep::silence(),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    4,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(40)
+                .build()
+            }),
+            response_step(response_engine, "corrected after final attempt"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::fixed(1, Duration::ZERO))
+        .connect()
+        .await
+        .unwrap();
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.value.as_str(), Some("corrected after final attempt"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 4);
+    let attempts = &requests[1..];
+    assert_eq!(
+        attempts[0].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        "timeout retransmission reuses the PDU request ID"
+    );
+    assert_ne!(
+        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        attempts[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        "protocol correction receives a fresh PDU request ID"
+    );
+}
+
+#[tokio::test]
+async fn v3_repeated_time_window_report_is_typed_and_bounded() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let first_report_engine = engine.clone();
+    let second_report_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &first_report_engine,
+                    report_oids::not_in_time_windows(),
+                    5,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(50)
+                .build()
+            }),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &second_report_engine,
+                    report_oids::not_in_time_windows(),
+                    6,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(50)
+                .build()
+            }),
+        ],
+        300,
+        false,
+    );
+    let log = transport.log();
+    let client = Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::fixed(5, Duration::ZERO),
+            v3_security: Some(user_for(level)),
+            ..ClientConfig::default()
+        },
+    );
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &*err,
+            async_snmp::Error::Report { status, .. }
+                if matches!(status.as_ref(), ReportStatus::NotInTimeWindow { counter: 6 })
+        ),
+        "repeated Report must retain its status instead of becoming a timeout: {err}"
+    );
+    assert_eq!(log.len(), 3, "only one corrected request is allowed");
+}
+
+#[tokio::test]
+async fn v3_malformed_reports_are_terminal_without_correction() {
+    type Mutate = Box<dyn Fn(V3ReplyBuilder) -> V3ReplyBuilder + Send>;
+    let cases: Vec<(&str, Mutate)> = vec![
+        ("nonzero status", Box::new(|reply| reply.error_status(1))),
+        ("nonzero index", Box::new(|reply| reply.error_index(1))),
+        ("empty varbinds", Box::new(|reply| reply.varbinds(vec![]))),
+        (
+            "wrong standard value type",
+            Box::new(|reply| {
+                reply.varbinds(vec![VarBind::new(
+                    report_oids::not_in_time_windows(),
+                    Value::Integer(1),
+                )])
+            }),
+        ),
+        (
+            "multiple statuses",
+            Box::new(|reply| {
+                reply.varbinds(vec![
+                    VarBind::new(report_oids::not_in_time_windows(), Value::Counter32(1)),
+                    VarBind::new(report_oids::wrong_digests(), Value::Counter32(1)),
+                ])
+            }),
+        ),
+    ];
+
+    for (case, mutate) in cases {
+        let level = SecurityLevel::AuthNoPriv;
+        let engine = engine_for(level);
+        let report_engine = engine.clone();
+        let transport = ScriptedTransport::new(
+            engine.clone(),
+            vec![
+                discovery_step(engine),
+                ScriptStep::reply(move |request| {
+                    mutate(
+                        V3ReplyBuilder::report_to(
+                            request,
+                            &report_engine,
+                            report_oids::not_in_time_windows(),
+                            1,
+                        )
+                        .security_level(level)
+                        .engine_boots(8)
+                        .engine_time(60),
+                    )
+                    .build()
+                }),
+            ],
+            400,
+            false,
+        );
+        let log = transport.log();
+        let client = custom_client(transport, level, None);
+
+        let err = client
+            .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+            "{case} should be malformed, got {err}"
+        );
+        assert_eq!(log.len(), 2, "{case} must not trigger correction");
+    }
+}
+
+#[tokio::test]
+async fn v3_terminal_reports_preserve_known_and_unknown_status() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let digest_engine = engine.clone();
+    let other_engine = engine.clone();
+    let other_oid = oid!(1, 3, 6, 1, 6, 3, 12, 1, 5, 0);
+    let expected_other_oid = other_oid.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(request, &digest_engine, report_oids::wrong_digests(), 9)
+                    .security_level(level)
+                    .build()
+            }),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(request, &other_engine, other_oid.clone(), 11)
+                    .security_level(level)
+                    .build()
+            }),
+        ],
+        500,
+        false,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, None);
+
+    let first = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &*first,
+        async_snmp::Error::Report { status, .. }
+            if matches!(status.as_ref(), ReportStatus::WrongDigest { counter: 9 })
+    ));
+
+    let second = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &*second,
+        async_snmp::Error::Report { status, .. }
+            if matches!(
+                status.as_ref(),
+                ReportStatus::Other {
+                    oid,
+                    value: Value::Counter32(11),
+                } if *oid == expected_other_oid
+            )
+    ));
+    assert_eq!(log.len(), 3, "terminal Reports must not add sends");
+}
+
+#[tokio::test]
+async fn v3_failed_correction_preserves_authenticated_report_time() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone().boots_time(8, 70);
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    12,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(70)
+                .build()
+            }),
+            ScriptStep::silence(),
+            response_step(response_engine, "state retained"),
+        ],
+        600,
+        false,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, None);
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *err,
+        async_snmp::Error::Timeout { retries: 0, .. }
+    ));
+
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(response.value.as_str(), Some("state retained"));
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[3].usm.engine_boots, 8);
+    assert!(requests[3].usm.engine_time >= 70);
 }
 
 /// A client configured without authentication cannot verify a received
@@ -1171,8 +1560,12 @@ async fn v3_auth_priv_client_classifies_encrypted_report() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "encrypted Report must classify as a credential failure, got: {err}"
+        matches!(
+            &*err,
+            async_snmp::Error::Report { status, .. }
+                if matches!(status.as_ref(), ReportStatus::UnknownUserName { counter: 1 })
+        ),
+        "encrypted Report must retain its typed status, got: {err}"
     );
     peer.finish().await.unwrap();
 }
@@ -1680,4 +2073,359 @@ fn raw_ber_targets_invalid_flags_and_oversized_msg_ids() {
         1,
         "the complete message must contain the oversized msgID"
     );
+}
+
+#[tokio::test]
+async fn v3_udp_accepts_late_response_to_prior_attempt() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let first_attempt = Arc::new(Mutex::new(None::<i32>));
+    let capture = first_attempt.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::silence_with(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+            }),
+            ScriptStep::reply(move |request| {
+                let prior = first_attempt.lock().unwrap().take().unwrap();
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(prior)
+                    .build()
+            }),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::fixed(1, Duration::ZERO))
+        .connect()
+        .await
+        .unwrap();
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_ne!(
+        requests[1].global_data.msg_id,
+        requests[2].global_data.msg_id
+    );
+    assert_eq!(
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+    );
+}
+
+#[tokio::test]
+async fn v3_custom_transport_accepts_late_response_to_prior_attempt() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let first_attempt = Arc::new(Mutex::new(None::<i32>));
+    let capture = first_attempt.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::silence_with(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+            }),
+            ScriptStep::reply(move |request| {
+                let prior = first_attempt.lock().unwrap().take().unwrap();
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(prior)
+                    .build()
+            }),
+        ],
+        100,
+        false,
+    );
+    let log = transport.log();
+    let client = Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::fixed(1, Duration::ZERO),
+            v3_security: Some(user_for(level)),
+            ..ClientConfig::default()
+        },
+    );
+
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_ne!(
+        requests[1].global_data.msg_id,
+        requests[2].global_data.msg_id
+    );
+    assert_eq!(
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+    );
+}
+
+#[tokio::test]
+async fn v3_pre_correction_msg_id_rejected_after_correction() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone().boots_time(8, 10);
+    let first_attempt = Arc::new(Mutex::new(None::<i32>));
+    let capture = first_attempt.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(10)
+                .build()
+            }),
+            ScriptStep::reply(move |request| {
+                let stale = first_attempt.lock().unwrap().take().unwrap();
+                V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(stale)
+                    .build()
+            }),
+        ],
+        100,
+        false,
+    );
+    let log = transport.log();
+    let client = Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::fixed(1, Duration::ZERO),
+            v3_security: Some(user_for(level)),
+            ..ClientConfig::default()
+        },
+    );
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        "correction resets the window; pre-correction msgID must not correlate: {err}"
+    );
+    assert_eq!(log.snapshot().len(), 3);
+}
+
+#[tokio::test]
+async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone().boots_time(8, 10);
+    let first_attempt = Arc::new(Mutex::new(None::<i32>));
+    let capture = first_attempt.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::silence_with(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+            }),
+            ScriptStep::reply(move |request| {
+                let prior = first_attempt.lock().unwrap().take().unwrap();
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(10)
+                .msg_id(prior)
+                .build()
+            }),
+            response_step(response_engine, "corrected from windowed report"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::fixed(1, Duration::ZERO))
+        .connect()
+        .await
+        .unwrap();
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(
+        result.value.as_str(),
+        Some("corrected from windowed report")
+    );
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[3].usm.engine_boots, 8);
+    assert!(requests[3].usm.engine_time >= 10);
+    assert_eq!(
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        "timeout retransmission reuses the PDU request ID"
+    );
+    assert_ne!(
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[3].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        "protocol correction receives a fresh PDU request ID"
+    );
+}
+
+#[tokio::test]
+async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let first_report_engine = engine.clone();
+    let second_report_engine = engine.clone();
+    let first_attempt = Arc::new(Mutex::new(None::<i32>));
+    let capture = first_attempt.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                V3ReplyBuilder::report_to(
+                    request,
+                    &first_report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(10)
+                .build()
+            }),
+            ScriptStep::reply(move |request| {
+                let stale = first_attempt.lock().unwrap().take().unwrap();
+                V3ReplyBuilder::report_to(
+                    request,
+                    &second_report_engine,
+                    report_oids::not_in_time_windows(),
+                    2,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(10)
+                .msg_id(stale)
+                .build()
+            }),
+        ],
+        100,
+        false,
+    );
+    let log = transport.log();
+    let client = Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::fixed(1, Duration::ZERO),
+            v3_security: Some(user_for(level)),
+            ..ClientConfig::default()
+        },
+    );
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        "a Report stamped with the pre-correction msgID must not trigger a second correction: {err}"
+    );
+    assert_eq!(
+        log.snapshot().len(),
+        3,
+        "no further send should occur after the stale-msgID report is rejected"
+    );
+}
+
+#[tokio::test]
+async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let first_response_engine = engine.clone();
+    let second_response_engine = engine.clone();
+    let first_op_msg_id = Arc::new(Mutex::new(None::<i32>));
+    let capture = first_op_msg_id.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                V3ReplyBuilder::response_to(request, &first_response_engine)
+                    .varbinds(vec![VarBind::new(
+                        oid,
+                        Value::OctetString(Bytes::from_static(b"operation one")),
+                    )])
+                    .build()
+            }),
+            ScriptStep::reply(move |request| {
+                let stale = first_op_msg_id.lock().unwrap().take().unwrap();
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                V3ReplyBuilder::response_to(request, &second_response_engine)
+                    .msg_id(stale)
+                    .varbinds(vec![VarBind::new(
+                        oid,
+                        Value::OctetString(Bytes::from_static(b"operation two")),
+                    )])
+                    .build()
+            }),
+        ],
+        100,
+        false,
+    );
+    let log = transport.log();
+    let client = Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::fixed(1, Duration::ZERO),
+            v3_security: Some(user_for(level)),
+            ..ClientConfig::default()
+        },
+    );
+
+    let first = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(first.value.as_str(), Some("operation one"));
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        "a completed operation's msgID must not correlate to the next operation: {err}"
+    );
+    assert_eq!(log.snapshot().len(), 3);
 }
