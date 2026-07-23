@@ -601,18 +601,44 @@ impl EngineCache {
     }
 
     fn insert_at(&self, target: SocketAddr, state: EngineState, now: Instant) {
-        let Ok(mut inner) = self.inner.write() else {
-            return;
-        };
+        let _ = self.store_at(target, state, now, false);
+    }
 
-        if let Some(existing) = inner.targets.get(&target)
+    /// Replace one target identity after an explicit, validated rediscovery.
+    ///
+    /// Unlike ordinary inserts, this deliberately overrides an active
+    /// conflicting mapping. Holding the cache write lock makes the replacement
+    /// win over stale clients that reinsert the old identity while discovery is
+    /// in flight; subsequent ordinary inserts cannot replace the new mapping.
+    /// The returned state includes trusted time already shared under the new
+    /// authoritative engine ID.
+    pub(crate) fn replace_target(
+        &self,
+        target: SocketAddr,
+        state: EngineState,
+    ) -> Result<EngineState> {
+        self.store_at(target, state, Instant::now(), true)
+            .ok_or_else(|| Error::Config("engine cache lock poisoned".into()).boxed())
+    }
+
+    fn store_at(
+        &self,
+        target: SocketAddr,
+        state: EngineState,
+        now: Instant,
+        replace_identity: bool,
+    ) -> Option<EngineState> {
+        let mut inner = self.inner.write().ok()?;
+
+        if !replace_identity
+            && let Some(existing) = inner.targets.get(&target)
             && existing.engine_id != state.engine_id
             && now
                 .checked_duration_since(existing.refreshed_at)
                 .unwrap_or_default()
                 <= self.ttl
         {
-            return;
+            return compose_cached_state(&inner, &target);
         }
 
         if let Some(cap) = self.max_capacity
@@ -647,6 +673,7 @@ impl EngineCache {
         if let Some(replaced_engine) = replaced_engine {
             remove_orphaned_time(&mut inner, &replaced_engine);
         }
+        compose_cached_state(&inner, &target)
     }
 
     /// Update time for an existing entry after authenticating a message.
@@ -961,12 +988,13 @@ mod tests {
 
     #[test]
     fn test_validate_engine_id_accepts_valid() {
-        // Minimum length.
+        // Minimum length. The RFC 3411 format layouts are a recommended
+        // generation algorithm, not additional syntax constraints.
         validate_engine_id(&[0x80, 0x00, 0x00, 0x00, 0x01]).unwrap();
-        // Maximum length.
+        // Maximum length, including an enterprise-defined legacy value.
         validate_engine_id(&[0x22; MAX_ENGINE_ID_LEN]).unwrap();
-        // Typical text-format ID.
-        validate_engine_id(b"\x80\x00\x00\x00\x01MyEngine").unwrap();
+        // Typical configured text value.
+        validate_engine_id(b"my-engine").unwrap();
     }
 
     #[test]
@@ -1322,6 +1350,29 @@ mod tests {
         let removed = cache.remove(&addr).unwrap();
         assert_eq!(removed.trusted_time().unwrap().latest_received_time(), 1100);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_engine_cache_explicit_replacement_latches_new_identity() {
+        let cache = EngineCache::new();
+        let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
+        let shared_addr: SocketAddr = "192.168.1.2:161".parse().unwrap();
+        let old = EngineState::discovered(Bytes::from_static(b"old-engine"), 1400);
+        let new = EngineState::discovered(Bytes::from_static(b"new-engine"), 1500);
+        let shared = EngineState::new(Bytes::from_static(b"new-engine"), 7, 500);
+
+        cache.insert(addr, old.clone());
+        cache.insert(shared_addr, shared);
+        let replaced = cache.replace_target(addr, new).unwrap();
+        cache.insert(addr, old);
+
+        assert_eq!(replaced.engine_id().as_ref(), b"new-engine");
+        let trusted = replaced.trusted_time().unwrap();
+        assert_eq!((trusted.boots(), trusted.latest_received_time()), (7, 500));
+
+        let cached = cache.get(&addr).unwrap();
+        assert_eq!(cached.engine_id().as_ref(), b"new-engine");
+        assert_eq!(cached.msg_max_size, 1500);
     }
 
     #[test]

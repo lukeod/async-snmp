@@ -283,6 +283,12 @@ impl Pdu {
         let mut error_status = pdu_decoder.read_integer()?;
         let mut error_index = pdu_decoder.read_integer()?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
+        if !pdu_decoder.is_empty() {
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
 
         // For GETBULK, error_status/error_index overload as non-repeaters and
         // max-repetitions (RFC 3416 Section 4.2.3, INTEGER 0..2147483647). Clamp

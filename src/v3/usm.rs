@@ -118,7 +118,14 @@ impl UsmSecurityParams {
     /// Decode from BER bytes.
     pub fn decode(data: Bytes) -> Result<Self> {
         let mut decoder = Decoder::new(data);
-        Self::decode_from(&mut decoder)
+        let params = Self::decode_from(&mut decoder)?;
+        if !decoder.is_empty() {
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
+        Ok(params)
     }
 
     /// Decode from an existing decoder.
@@ -161,6 +168,12 @@ impl UsmSecurityParams {
 
         let auth_params = seq.read_octet_string()?;
         let priv_params = seq.read_octet_string()?;
+        if !seq.is_empty() {
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
 
         Ok(Self {
             engine_id,
@@ -260,6 +273,22 @@ mod tests {
         assert_eq!(decoded.username.as_ref(), b"admin");
         assert_eq!(decoded.auth_params.as_ref(), b"auth123456789012");
         assert_eq!(decoded.priv_params.as_ref(), b"priv1234");
+    }
+
+    #[test]
+    fn test_usm_params_rejects_extra_fields_and_trailing_data() {
+        let encoded = UsmSecurityParams::empty().encode();
+
+        let mut trailing = encoded.to_vec();
+        trailing.extend_from_slice(&[0x05, 0x00]);
+        assert!(UsmSecurityParams::decode(Bytes::from(trailing)).is_err());
+
+        let mut extra_field = encoded.to_vec();
+        assert_eq!(extra_field[0], 0x30);
+        assert!(extra_field[1] < 0x80);
+        extra_field[1] += 2;
+        extra_field.extend_from_slice(&[0x05, 0x00]);
+        assert!(UsmSecurityParams::decode(Bytes::from(extra_field)).is_err());
     }
 
     #[test]

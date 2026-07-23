@@ -71,10 +71,40 @@ impl<T: Transport> Client<T> {
         // Serialize concurrent discovery attempts. Only one task runs discovery
         // at a time; the rest wait here and then take the fast path above.
         let _guard = self.inner.discovery_lock.lock().await;
+        self.discover_engine_locked(false).await
+    }
 
+    /// Discover and replace the established authoritative engine.
+    ///
+    /// This is the intentional recovery path when a device at the target
+    /// address has been replaced or reconfigured with a new engine ID.
+    /// Discovery never replaces an established identity during ordinary
+    /// request processing. The current identity, localized keys, and shared
+    /// cache mapping remain usable until a fresh response has been strictly
+    /// validated and replacement keys have been derived. A failed or cancelled
+    /// rediscovery therefore leaves the previous generation intact.
+    ///
+    /// Client clones share a successful replacement because they share the
+    /// same live engine state. Independently constructed clients retain their
+    /// own established identity until explicitly rediscovered. For UDP,
+    /// source-address policy is controlled by
+    /// [`ClientBuilder::strict_source`](crate::ClientBuilder::strict_source) or
+    /// by the supplied transport handle.
+    pub async fn rediscover_engine(&self) -> Result<()> {
+        if !self.is_v3() {
+            return Err(Error::Config("engine discovery requires SNMPv3".into()).boxed());
+        }
+
+        let _guard = self.inner.discovery_lock.lock().await;
+        self.discover_engine_locked(true).await
+    }
+
+    /// Load or discover an engine while `discovery_lock` is held.
+    async fn discover_engine_locked(&self, replace_cached_identity: bool) -> Result<()> {
         // Re-check after acquiring the lock: a previous waiter may have
-        // completed discovery while we were blocked.
-        {
+        // completed ordinary discovery while we were blocked. Explicit
+        // rediscovery always reaches the peer even with a live identity.
+        if !replace_cached_identity {
             let engine = self
                 .inner
                 .engine
@@ -85,8 +115,10 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        // Check shared cache first
-        if let Some(cache) = &self.inner.engine_cache
+        // Explicit rediscovery must reach the peer even if another client
+        // refreshes the previous target mapping while discovery is in progress.
+        if !replace_cached_identity
+            && let Some(cache) = &self.inner.engine_cache
             && let Some(cached_state) = cache.get(&self.peer_addr())
         {
             tracing::debug!(target: "async_snmp::client", "using cached engine state");
@@ -167,46 +199,13 @@ impl<T: Transport> Client<T> {
             })
         })?;
 
-        // Parse the response envelope and apply the existing discovery USM
-        // validation before parsing the scoped PDU or performing Message
-        // Processing Model correlation (RFC 3412 Section 7.2).
+        // Apply USM syntax/security processing and parse the scoped PDU before
+        // Message Processing Model correlation (RFC 3412 Section 7.2), then
+        // require the exact RFC 3414 discovery Report shape before adopting an
+        // unauthenticated engine-ID candidate.
         let response = RawV3Message::decode(response_data)?;
-        let reported_msg_max_size = response.global_data.msg_max_size as u32;
-        let session_max = self.inner.transport.max_message_size();
-        let engine_state = crate::v3::parse_discovery_response_with_limits(
-            &response.security_params,
-            reported_msg_max_size,
-            session_max,
-        )?;
-
-        // Discovery does not otherwise consult the scoped PDU yet, but a
-        // plaintext value must still be well-formed to be accepted.
-        if let RawMsgData::Plaintext(bytes) = &response.msg_data {
-            let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
-            ScopedPdu::decode(&mut decoder)?;
-        }
-
-        // Discovery responses are also bound to the current outstanding
-        // request by msgID. UDP normally filters this in the pending map; the
-        // protocol-layer check covers TCP and custom transports as well.
-        if response.global_data.msg_id != expected_msg_id {
-            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_id, actual_msg_id = response.global_data.msg_id }, "msgID mismatch in discovery response");
-            return Err(Error::MalformedResponse {
-                target: self.peer_addr(),
-            }
-            .boxed());
-        }
+        let engine_state = self.validate_discovery_response(&response, expected_msg_id)?;
         tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size }, "discovered engine identity");
-
-        // A concurrent client sharing this cache may already have installed a
-        // newer identity/time generation. Merge discovery without replacing an
-        // active target mapping, then install the canonical cached state.
-        let engine_state = if let Some(cache) = &self.inner.engine_cache {
-            cache.insert(self.peer_addr(), engine_state.clone());
-            cache.get(&self.peer_addr()).unwrap_or(engine_state)
-        } else {
-            engine_state
-        };
 
         let security = self
             .inner
@@ -214,6 +213,55 @@ impl<T: Transport> Client<T> {
             .v3_security
             .as_ref()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+
+        // Prepare replacement keys before changing either the live generation
+        // or its cache mapping. Ordinary discovery must first resolve any
+        // canonical state already installed by another client sharing the
+        // cache, then derive keys for that identity.
+        let replacement_keys = if replace_cached_identity {
+            Some(
+                security
+                    .derive_keys(&engine_state.engine_id)
+                    .map_err(|e| Error::Config(e.to_string().into()).boxed())?,
+            )
+        } else {
+            None
+        };
+
+        if let Some(derived_keys) = replacement_keys {
+            // Lock the live generation before publishing its cache mapping.
+            // This matches the live-then-cache lock order used by authenticated
+            // timeliness updates and prevents clones from observing a new
+            // mapping alongside the old identity-localized keys. Reloading the
+            // cache state also adopts trusted time already shared by another
+            // target for the newly discovered engine ID.
+            let mut engine = self
+                .inner
+                .engine
+                .write()
+                .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
+            let engine_state = if let Some(cache) = &self.inner.engine_cache {
+                cache.replace_target(self.peer_addr(), engine_state)?
+            } else {
+                engine_state
+            };
+            *engine = Some(ClientEngine {
+                state: engine_state,
+                derived_keys,
+            });
+            return Ok(());
+        }
+
+        // A concurrent client sharing this cache may already have installed a
+        // newer identity/time generation. Merge ordinary discovery without
+        // replacing an active target mapping, then derive keys for the
+        // canonical identity.
+        let engine_state = if let Some(cache) = &self.inner.engine_cache {
+            cache.insert(self.peer_addr(), engine_state.clone());
+            cache.get(&self.peer_addr()).unwrap_or(engine_state)
+        } else {
+            engine_state
+        };
         let derived_keys = security
             .derive_keys(&engine_state.engine_id)
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
@@ -228,6 +276,76 @@ impl<T: Transport> Client<T> {
         });
 
         Ok(())
+    }
+
+    fn validate_discovery_response(
+        &self,
+        response: &RawV3Message,
+        expected_msg_id: i32,
+    ) -> Result<EngineState> {
+        let malformed = || {
+            Error::MalformedResponse {
+                target: self.peer_addr(),
+            }
+            .boxed()
+        };
+
+        // Discovery is deliberately unauthenticated. Authenticated or private
+        // messages are not an alternative discovery response shape. RFC 3412
+        // requires a received Report's reportableFlag to be treated as zero,
+        // so that bit does not affect acceptance.
+        if response.security_level() != SecurityLevel::NoAuthNoPriv {
+            return Err(malformed());
+        }
+
+        // Decode and validate the candidate before parsing the plaintext PDU,
+        // preserving USM-before-scoped-PDU processing order. Boots/time are
+        // syntactically decoded but discarded as unauthenticated input.
+        let usm = UsmSecurityParams::decode(response.security_params.clone())?;
+        let engine_state = crate::v3::parse_discovery_response_with_limits(
+            &response.security_params,
+            response.global_data.msg_max_size as u32,
+            self.inner.transport.max_message_size(),
+        )?;
+        if !usm.username.is_empty() || !usm.auth_params.is_empty() || !usm.priv_params.is_empty() {
+            return Err(malformed());
+        }
+
+        let RawMsgData::Plaintext(bytes) = &response.msg_data else {
+            return Err(malformed());
+        };
+        let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
+        let scoped_pdu = ScopedPdu::decode(&mut decoder)?;
+
+        // Bind the Internal-class Report to the exact outstanding discovery
+        // attempt only after Security Model processing and scoped-PDU parsing.
+        if response.global_data.msg_id != expected_msg_id {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_id, actual_msg_id = response.global_data.msg_id }, "msgID mismatch in discovery response");
+            return Err(malformed());
+        }
+
+        if scoped_pdu.context_engine_id != engine_state.engine_id
+            || !scoped_pdu.context_name.is_empty()
+        {
+            return Err(malformed());
+        }
+
+        let pdu = &scoped_pdu.pdu;
+        let valid_varbind = matches!(
+            pdu.varbinds.as_slice(),
+            [varbind]
+                if varbind.oid == crate::v3::report_oids::unknown_engine_ids()
+                    && matches!(&varbind.value, crate::Value::Counter32(_))
+        );
+        if pdu.pdu_type != PduType::Report
+            || pdu.error_status != 0
+            || pdu.error_index != 0
+            || !valid_varbind
+        {
+            return Err(malformed());
+        }
+
+        Ok(engine_state)
     }
 
     fn refresh_engine_from_cache(&self) -> Result<()> {

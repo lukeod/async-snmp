@@ -147,6 +147,7 @@ pub struct ClientBuilder {
     oid_ordering: OidOrdering,
     max_walk_results: Option<usize>,
     engine_cache: Option<Arc<EngineCache>>,
+    strict_source: bool,
     local_engine_id: Option<Vec<u8>>,
     local_engine_boots: u32,
 }
@@ -193,6 +194,7 @@ impl ClientBuilder {
             oid_ordering: OidOrdering::Strict,
             max_walk_results: None,
             engine_cache: None,
+            strict_source: false,
             local_engine_id: None,
             local_engine_boots: 1,
         }
@@ -447,6 +449,23 @@ impl ClientBuilder {
         self
     }
 
+    /// Require UDP responses to originate from the configured target.
+    ///
+    /// By default, UDP responses are matched by request ID and a source
+    /// mismatch only logs a warning, which permits multihomed agents to reply
+    /// from another address. Enabling this option drops off-target datagrams
+    /// while leaving the request pending for a response from the configured
+    /// target. The policy applies to discovery and ordinary exchanges made by
+    /// [`connect`](Self::connect) or [`build_with`](Self::build_with).
+    ///
+    /// TCP is inherently connected to one peer. Clients constructed with a
+    /// custom transport configure source policy on that transport instead.
+    #[must_use]
+    pub fn strict_source(mut self, strict: bool) -> Self {
+        self.strict_source = strict;
+        self
+    }
+
     /// Validate the configuration.
     fn validate(&self) -> Result<()> {
         if self.max_oids_per_request == 0 {
@@ -650,7 +669,7 @@ impl ClientBuilder {
             "0.0.0.0:0"
         };
         let transport = UdpTransport::bind(bind_addr).await?;
-        let handle = transport.handle(addr);
+        let handle = transport.handle(addr).strict_source(self.strict_source);
         Ok(self.build_inner(handle))
     }
 
@@ -678,7 +697,7 @@ impl ClientBuilder {
     pub async fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
         self.validate()?;
         let addr = self.resolve_target().await?;
-        let handle = transport.handle(addr);
+        let handle = transport.handle(addr).strict_source(self.strict_source);
         Ok(self.build_inner(handle))
     }
 
@@ -768,6 +787,7 @@ mod tests {
         assert_eq!(builder.oid_ordering, OidOrdering::Strict);
         assert!(builder.max_walk_results.is_none());
         assert!(builder.engine_cache.is_none());
+        assert!(!builder.strict_source);
     }
 
     #[test]
@@ -781,7 +801,8 @@ mod tests {
             .walk_mode(WalkMode::GetNext)
             .oid_ordering(OidOrdering::AllowNonIncreasing)
             .max_walk_results(1000)
-            .engine_cache(cache.clone());
+            .engine_cache(cache.clone())
+            .strict_source(true);
 
         assert_eq!(builder.timeout, Duration::from_secs(10));
         assert_eq!(builder.retry.max_attempts, 5);
@@ -791,6 +812,7 @@ mod tests {
         assert_eq!(builder.oid_ordering, OidOrdering::AllowNonIncreasing);
         assert_eq!(builder.max_walk_results, Some(1000));
         assert!(builder.engine_cache.is_some());
+        assert!(builder.strict_source);
     }
 
     #[test]

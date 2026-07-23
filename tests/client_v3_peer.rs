@@ -2,16 +2,18 @@
 
 mod common;
 
-use async_snmp::message::{SecurityLevel, V3Message, V3MessageData};
+use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
-use async_snmp::v3::{AuthProtocol, PrivProtocol, report_oids};
+use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, report_oids};
 use async_snmp::{
-    Auth, Client, ClientConfig, MasterKeys, Retry, UsmConfig, Value, VarBind, Version, oid,
+    Auth, Client, ClientConfig, EngineCache, MasterKeys, Retry, UsmConfig, Value, VarBind, Version,
+    oid,
 };
 use bytes::Bytes;
 use common::v3::{
     ScriptStep, ScriptedTransport, ScriptedV3Peer, TestV3Engine, V3ReplyBuilder, raw_ber,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 // RFC 5612 documentation PEN 32473 with RFC 3411 format 5 opaque octets.
@@ -152,6 +154,461 @@ async fn v3_scripted_udp_success_at_all_security_levels() {
     ] {
         udp_success_at_level(level).await;
     }
+}
+
+type DiscoveryMutation = Box<dyn FnOnce(V3ReplyBuilder) -> V3ReplyBuilder + Send>;
+
+#[tokio::test]
+async fn v3_discovery_rejects_noncanonical_security_and_report_shapes() {
+    let cases: Vec<(&str, DiscoveryMutation)> = vec![
+        (
+            "authNoPriv level",
+            Box::new(|reply| {
+                reply
+                    .security_level(SecurityLevel::AuthNoPriv)
+                    .username(USERNAME)
+                    .signing_user(user_for(SecurityLevel::AuthNoPriv))
+            }),
+        ),
+        (
+            "authPriv level",
+            Box::new(|reply| {
+                reply
+                    .security_level(SecurityLevel::AuthPriv)
+                    .username(USERNAME)
+                    .signing_user(user_for(SecurityLevel::AuthPriv))
+            }),
+        ),
+        ("username", Box::new(|reply| reply.username(USERNAME))),
+        (
+            "authentication parameters",
+            Box::new(|reply| reply.auth_params(Bytes::from_static(b"unexpected"))),
+        ),
+        (
+            "privacy parameters",
+            Box::new(|reply| reply.priv_params(Bytes::from_static(b"unexpected"))),
+        ),
+        (
+            "context engine ID",
+            Box::new(|reply| reply.context_engine_id(Bytes::from_static(b"wrong-context"))),
+        ),
+        (
+            "context name",
+            Box::new(|reply| reply.context_name(Bytes::from_static(b"ctx"))),
+        ),
+        (
+            "ordinary Response PDU",
+            Box::new(|reply| reply.pdu_type(async_snmp::pdu::PduType::Response)),
+        ),
+        ("nonzero status", Box::new(|reply| reply.error_status(1))),
+        ("nonzero index", Box::new(|reply| reply.error_index(1))),
+        (
+            "empty varbind list",
+            Box::new(|reply| reply.varbinds(vec![])),
+        ),
+        (
+            "wrong report OID",
+            Box::new(|reply| {
+                reply.varbinds(vec![VarBind::new(
+                    report_oids::not_in_time_windows(),
+                    Value::Counter32(1),
+                )])
+            }),
+        ),
+        (
+            "wrong report value type",
+            Box::new(|reply| {
+                reply.varbinds(vec![VarBind::new(
+                    report_oids::unknown_engine_ids(),
+                    Value::Integer(1),
+                )])
+            }),
+        ),
+        (
+            "multiple varbinds",
+            Box::new(|reply| {
+                reply.varbinds(vec![
+                    VarBind::new(report_oids::unknown_engine_ids(), Value::Counter32(1)),
+                    VarBind::new(report_oids::not_in_time_windows(), Value::Counter32(1)),
+                ])
+            }),
+        ),
+        (
+            "short engine ID",
+            Box::new(|reply| reply.engine_id(Bytes::from_static(b"tiny"))),
+        ),
+        (
+            "all-zero engine ID",
+            Box::new(|reply| reply.engine_id(Bytes::from_static(b"\0\0\0\0\0"))),
+        ),
+        (
+            "all-ff engine ID",
+            Box::new(|reply| reply.engine_id(Bytes::from_static(b"\xff\xff\xff\xff\xff"))),
+        ),
+        (
+            "overlong engine ID",
+            Box::new(|reply| reply.engine_id(Bytes::from(vec![1; 33]))),
+        ),
+    ];
+
+    for (case, mutate) in cases {
+        let engine = engine_for(SecurityLevel::NoAuthNoPriv);
+        let reply_engine = engine.clone();
+        let step = ScriptStep::reply(move |request| {
+            mutate(V3ReplyBuilder::report_to(
+                request,
+                &reply_engine,
+                report_oids::unknown_engine_ids(),
+                1,
+            ))
+            .build()
+        });
+        let transport = ScriptedTransport::new(engine, vec![step], 100, false);
+        let client = custom_client(transport.clone(), SecurityLevel::NoAuthNoPriv, None);
+
+        let error = client
+            .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(*error, async_snmp::Error::MalformedResponse { .. }),
+            "{case} should be rejected as malformed, got {error}"
+        );
+        assert_eq!(transport.log().len(), 1, "{case} must not continue");
+    }
+}
+
+#[tokio::test]
+async fn v3_discovery_rejects_trailing_usm_security_parameter_data() {
+    let engine = engine_for(SecurityLevel::NoAuthNoPriv);
+    let reply_engine = engine.clone();
+    let step = ScriptStep::reply(move |request| {
+        let mut usm =
+            raw_ber::usm_security_params(&reply_engine.engine_id, &[1], &[1], &[], &[], &[])
+                .to_vec();
+        usm.extend_from_slice(&[0x05, 0x00]);
+        let scoped = ScopedPdu::new(
+            reply_engine.engine_id.clone(),
+            Bytes::new(),
+            async_snmp::pdu::Pdu {
+                pdu_type: async_snmp::pdu::PduType::Report,
+                request_id: 0,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(
+                    report_oids::unknown_engine_ids(),
+                    Value::Counter32(1),
+                )],
+            },
+        )
+        .encode_to_bytes();
+        Ok(raw_ber::v3_message(
+            &raw_ber::signed_integer_content(request.global_data.msg_id),
+            &raw_ber::signed_integer_content(reply_engine.msg_max_size),
+            &[0],
+            &[3],
+            &usm,
+            &scoped,
+        ))
+    });
+    let transport = ScriptedTransport::new(engine, vec![step], 100, false);
+    let client = custom_client(transport, SecurityLevel::NoAuthNoPriv, None);
+
+    let error = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *error,
+        async_snmp::Error::MalformedResponse { .. }
+    ));
+}
+
+#[tokio::test]
+async fn v3_discovery_treats_reportable_flag_as_zero_on_report() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .reportable(true)
+                .build()
+            }),
+            response_step(engine, "accepted"),
+        ],
+        100,
+        false,
+    );
+    let client = custom_client(transport, level, None);
+
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(response.value.as_str(), Some("accepted"));
+}
+
+#[tokio::test]
+async fn v3_udp_discovery_source_policy_is_builder_configurable() {
+    let level = SecurityLevel::NoAuthNoPriv;
+
+    let permissive_engine = engine_for(level);
+    let reply_engine = permissive_engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        permissive_engine,
+        vec![
+            ScriptStep::reply_from_other_source(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &reply_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()
+            }),
+            response_step(engine_for(level), "off-source discovery accepted"),
+        ],
+    )
+    .await;
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(
+        response.value.as_str(),
+        Some("off-source discovery accepted")
+    );
+    peer.finish().await.unwrap();
+
+    let strict_engine = engine_for(level);
+    let reply_engine = strict_engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        strict_engine,
+        vec![ScriptStep::reply_from_other_source(move |request| {
+            V3ReplyBuilder::report_to(request, &reply_engine, report_oids::unknown_engine_ids(), 1)
+                .build()
+        })],
+    )
+    .await;
+    let log = peer.log();
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .strict_source(true)
+        .connect()
+        .await
+        .unwrap();
+    let error = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
+    assert_eq!(log.len(), 1, "off-source discovery must not be adopted");
+    peer.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_established_identity_ignores_ordinary_discovery_traffic() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine_a = engine_for(level);
+    let engine_b = TestV3Engine::new(Bytes::from_static(
+        b"\x80\x00\x7e\xd9\x05replacement-engine",
+    ))
+    .user(user_for(level));
+    let report_engine = engine_b.clone();
+    let transport = ScriptedTransport::new(
+        engine_a.clone(),
+        vec![
+            discovery_step(engine_a.clone()),
+            response_step(engine_a.clone(), "before"),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::unknown_engine_ids(),
+                    2,
+                )
+                .build()
+            }),
+            response_step(engine_a, "after"),
+        ],
+        100,
+        false,
+    );
+    let client = custom_client(transport.clone(), level, None);
+    let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+
+    assert_eq!(
+        client.get(&oid).await.unwrap().value.as_str(),
+        Some("before")
+    );
+    let error = client.get(&oid).await.unwrap_err();
+    assert!(matches!(*error, async_snmp::Error::Auth { .. }));
+    assert_eq!(
+        client.get(&oid).await.unwrap().value.as_str(),
+        Some("after")
+    );
+
+    let requests = transport.log().snapshot();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[1].usm.engine_id.as_ref(), ENGINE_ID);
+    assert_eq!(requests[2].usm.engine_id.as_ref(), ENGINE_ID);
+    assert_eq!(requests[3].usm.engine_id.as_ref(), ENGINE_ID);
+}
+
+#[tokio::test]
+async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine_a = engine_for(level);
+    let replacement_id = Bytes::from_static(b"\x80\x00\x7e\xd9\x05replacement-engine");
+    let engine_b = TestV3Engine::new(replacement_id.clone()).user(user_for(level));
+    let cache = Arc::new(EngineCache::new());
+    let stale_cache = cache.clone();
+    let stale_identity = EngineState::discovered(engine_a.engine_id.clone(), 65_507);
+    let target = "127.0.0.1:161".parse().unwrap();
+    let report_engine = engine_b.clone();
+    let transport = ScriptedTransport::new(
+        engine_a.clone(),
+        vec![
+            discovery_step(engine_a.clone()),
+            response_step(engine_a, "before"),
+            ScriptStep::reply(move |request| {
+                // Model an independent stale client refreshing engine A's
+                // mapping while rediscovery is in flight.
+                stale_cache.insert(target, stale_identity);
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()
+            }),
+            response_step(engine_b, "after"),
+        ],
+        100,
+        false,
+    );
+    let client = Client::with_engine_cache(
+        transport.clone(),
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::none(),
+            v3_security: Some(user_for(level)),
+            ..ClientConfig::default()
+        },
+        cache.clone(),
+    );
+    let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+
+    assert_eq!(
+        client.get(&oid).await.unwrap().value.as_str(),
+        Some("before")
+    );
+    assert_eq!(
+        cache.get(&client.peer_addr()).unwrap().engine_id().as_ref(),
+        ENGINE_ID
+    );
+
+    client.rediscover_engine().await.unwrap();
+    assert_eq!(
+        cache.get(&client.peer_addr()).unwrap().engine_id(),
+        replacement_id.as_ref()
+    );
+    assert_eq!(
+        client.get(&oid).await.unwrap().value.as_str(),
+        Some("after")
+    );
+
+    let requests = transport.log().snapshot();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].usm.engine_id.is_empty());
+    assert_eq!(requests[1].usm.engine_id.as_ref(), ENGINE_ID);
+    assert!(requests[2].usm.engine_id.is_empty());
+    assert_eq!(requests[3].usm.engine_id, replacement_id);
+}
+
+#[tokio::test]
+async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine_a = engine_for(level);
+    let replacement_id = Bytes::from_static(b"replacement-engine");
+    let engine_b = TestV3Engine::new(replacement_id).user(user_for(level));
+    let cache = Arc::new(EngineCache::new());
+    let stale_cache = cache.clone();
+    let stale_identity = EngineState::discovered(engine_a.engine_id.clone(), 65_507);
+    let target = "127.0.0.1:161".parse().unwrap();
+    let report_engine = engine_b.clone();
+    let transport = ScriptedTransport::new(
+        engine_a.clone(),
+        vec![
+            discovery_step(engine_a.clone()),
+            response_step(engine_a.clone(), "before"),
+            ScriptStep::reply(move |request| {
+                stale_cache.insert(target, stale_identity);
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .context_name(Bytes::from_static(b"invalid"))
+                .build()
+            }),
+            response_step(engine_a, "after"),
+        ],
+        100,
+        false,
+    );
+    let client = Client::with_engine_cache(
+        transport.clone(),
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::none(),
+            v3_security: Some(user_for(level)),
+            ..ClientConfig::default()
+        },
+        cache.clone(),
+    );
+    let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+
+    assert_eq!(
+        client.get(&oid).await.unwrap().value.as_str(),
+        Some("before")
+    );
+
+    let error = client.rediscover_engine().await.unwrap_err();
+    assert!(matches!(
+        *error,
+        async_snmp::Error::MalformedResponse { .. }
+    ));
+    assert_eq!(
+        cache.get(&client.peer_addr()).unwrap().engine_id().as_ref(),
+        ENGINE_ID
+    );
+
+    // Removing the shared mapping proves the live generation survived rather
+    // than being silently reloaded from a stale cache entry.
+    cache.remove(&client.peer_addr());
+    assert_eq!(
+        client.get(&oid).await.unwrap().value.as_str(),
+        Some("after")
+    );
+
+    let requests = transport.log().snapshot();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].usm.engine_id.is_empty());
+    assert_eq!(requests[3].usm.engine_id.as_ref(), ENGINE_ID);
 }
 
 #[tokio::test]

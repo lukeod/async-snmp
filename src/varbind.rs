@@ -3,7 +3,7 @@
 //! A `VarBind` pairs an OID with a value.
 
 use crate::ber::{Decoder, EncodeBuf};
-use crate::error::Result;
+use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::oid::Oid;
 use crate::value::Value;
 
@@ -60,6 +60,12 @@ impl VarBind {
         let mut seq = decoder.read_sequence()?;
         let oid = seq.read_oid()?;
         let value = Value::decode(&mut seq)?;
+        if !seq.is_empty() {
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
         Ok(VarBind { oid, value })
     }
 }

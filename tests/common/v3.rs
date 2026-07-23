@@ -173,6 +173,8 @@ pub struct V3ReplyBuilder {
     engine_boots: u32,
     engine_time: u32,
     username: Bytes,
+    auth_params_override: Option<Bytes>,
+    priv_params_override: Option<Bytes>,
     signing_user: Option<UsmConfig>,
     key_engine_id: Option<Bytes>,
     ciphertext_override: Option<Bytes>,
@@ -198,6 +200,8 @@ impl V3ReplyBuilder {
             engine_boots: engine.engine_boots,
             engine_time: engine.engine_time,
             username: request.usm.username.clone(),
+            auth_params_override: None,
+            priv_params_override: None,
             signing_user: engine.user_for(&request.usm.username).cloned(),
             key_engine_id: None,
             ciphertext_override: None,
@@ -276,6 +280,16 @@ impl V3ReplyBuilder {
         self
     }
 
+    pub fn auth_params(mut self, auth_params: impl Into<Bytes>) -> Self {
+        self.auth_params_override = Some(auth_params.into());
+        self
+    }
+
+    pub fn priv_params(mut self, priv_params: impl Into<Bytes>) -> Self {
+        self.priv_params_override = Some(priv_params.into());
+        self
+    }
+
     /// Select credentials independently from the username put on the wire.
     pub fn signing_user(mut self, signing_user: UsmConfig) -> Self {
         self.signing_user = Some(signing_user);
@@ -348,6 +362,12 @@ impl V3ReplyBuilder {
             self.engine_time,
             self.username,
         );
+        if let Some(auth_params) = self.auth_params_override {
+            usm = usm.with_auth_params(auth_params);
+        }
+        if let Some(priv_params) = self.priv_params_override {
+            usm = usm.with_priv_params(priv_params);
+        }
         let scoped = ScopedPdu::new(self.context_engine_id, self.context_name, self.pdu);
 
         let global = MsgGlobalData::new(
@@ -407,6 +427,7 @@ impl V3ReplyBuilder {
 
 enum ScriptOutput {
     Replies(Vec<Bytes>),
+    RepliesFromOtherSource(Vec<Bytes>),
     Silence,
     TransportError(Box<Error>),
 }
@@ -431,6 +452,14 @@ impl ScriptStep {
     ) -> Self {
         Self(Box::new(move |request| {
             build(request).map(ScriptOutput::Replies)
+        }))
+    }
+
+    pub fn reply_from_other_source(
+        build: impl FnOnce(&CapturedV3Request) -> Result<Bytes, String> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(move |request| {
+            build(request).map(|reply| ScriptOutput::RepliesFromOtherSource(vec![reply]))
         }))
     }
 
@@ -546,6 +575,25 @@ impl ScriptedV3Peer {
                             }
                         }
                     }
+                    Ok(ScriptOutput::RepliesFromOtherSource(replies)) => {
+                        let other = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await {
+                            Ok(socket) => socket,
+                            Err(error) => {
+                                task_state.set_error(format!(
+                                    "alternate UDP source bind failed: {error}"
+                                ));
+                                return;
+                            }
+                        };
+                        for reply in replies {
+                            if let Err(error) = other.send_to(&reply, source).await {
+                                task_state.set_error(format!(
+                                    "alternate UDP source send failed: {error}"
+                                ));
+                                return;
+                            }
+                        }
+                    }
                     Ok(ScriptOutput::Silence) => {}
                     Ok(ScriptOutput::TransportError(error)) => {
                         task_state.set_error(format!(
@@ -629,6 +677,12 @@ impl ScriptedV3Peer {
                                 return;
                             }
                         }
+                    }
+                    Ok(ScriptOutput::RepliesFromOtherSource(_)) => {
+                        task_state.set_error(
+                            "alternate-source script output is only supported by UDP peers",
+                        );
+                        return;
                     }
                     Ok(ScriptOutput::Silence) => {}
                     Ok(ScriptOutput::TransportError(error)) => {
@@ -775,6 +829,10 @@ impl Transport for ScriptedTransport {
                     replies.len()
                 )
                 .into(),
+            )
+            .boxed()),
+            ScriptOutput::RepliesFromOtherSource(_) => Err(Error::Config(
+                "alternate-source script output is only supported by UDP peers".into(),
             )
             .boxed()),
             ScriptOutput::Silence => Err(Error::Timeout {
