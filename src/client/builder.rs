@@ -15,7 +15,7 @@ use crate::client::retry::Retry;
 use crate::client::walk::{OidOrdering, WalkMode};
 use crate::client::{
     Auth, ClientConfig, CommunityVersion, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_TIMEOUT, UsmConfig,
+    DEFAULT_TIMEOUT,
 };
 use crate::error::{Error, Result};
 use crate::transport::{TcpTransport, Transport, UdpHandle, UdpTransport};
@@ -148,6 +148,7 @@ pub struct ClientBuilder {
     max_walk_results: Option<usize>,
     engine_cache: Option<Arc<EngineCache>>,
     strict_source: bool,
+    allow_unauthenticated_v3_time_correction: bool,
     local_engine_id: Option<Vec<u8>>,
     local_engine_boots: u32,
 }
@@ -195,6 +196,7 @@ impl ClientBuilder {
             max_walk_results: None,
             engine_cache: None,
             strict_source: false,
+            allow_unauthenticated_v3_time_correction: false,
             local_engine_id: None,
             local_engine_boots: 1,
         }
@@ -466,32 +468,33 @@ impl ClientBuilder {
         self
     }
 
+    /// Allow one packet-local correction from an unauthenticated SNMPv3
+    /// `usmStatsNotInTimeWindows` Report (default: false).
+    ///
+    /// Some devices reply to an authenticated request with a noAuthNoPriv
+    /// time-window Report, contrary to RFC 3414. When enabled, a correlated
+    /// Report with the established engine ID and exact status shape may supply
+    /// the boots/time tuple for one authenticated corrected packet. The tuple
+    /// is not written to live or shared trusted state. Only a subsequent
+    /// authenticated, correlated, fully matched Response can advance trusted
+    /// time normally.
+    ///
+    /// Enabling this weakens spoof resistance: an attacker able to inject a
+    /// matching Report can choose the time fields on one outbound authenticated
+    /// packet. Use [`strict_source`](Self::strict_source) for UDP when the
+    /// device does not legitimately reply from another address.
+    #[must_use]
+    pub fn allow_unauthenticated_v3_time_correction(mut self, allow: bool) -> Self {
+        self.allow_unauthenticated_v3_time_correction = allow;
+        self
+    }
+
     /// Validate the configuration.
     fn validate(&self) -> Result<()> {
         if self.max_oids_per_request == 0 {
             return Err(
                 Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
             );
-        }
-
-        if let Auth::Usm(usm) = &self.auth {
-            // Privacy requires authentication
-            if usm.priv_protocol.is_some() && usm.auth_protocol.is_none() {
-                return Err(Error::Config("privacy requires authentication".into()).boxed());
-            }
-            // Protocol requires password (unless using master keys)
-            if usm.auth_protocol.is_some()
-                && usm.auth_password.is_none()
-                && usm.master_keys.is_none()
-            {
-                return Err(Error::Config("auth protocol requires password".into()).boxed());
-            }
-            if usm.priv_protocol.is_some()
-                && usm.priv_password.is_none()
-                && usm.master_keys.is_none()
-            {
-                return Err(Error::Config("priv protocol requires password".into()).boxed());
-            }
         }
 
         // Validate walk mode for v1
@@ -566,6 +569,8 @@ impl ClientBuilder {
                     retry: self.retry.clone(),
                     max_oids_per_request: self.max_oids_per_request,
                     v3_security: None,
+                    allow_unauthenticated_v3_time_correction: self
+                        .allow_unauthenticated_v3_time_correction,
                     walk_mode: self.walk_mode,
                     oid_ordering: self.oid_ordering,
                     max_walk_results: self.max_walk_results,
@@ -577,48 +582,25 @@ impl ClientBuilder {
                     local_engine_boots: self.local_engine_boots,
                 }
             }
-            Auth::Usm(usm) => {
-                let mut security = UsmConfig::new(Bytes::copy_from_slice(usm.username.as_bytes()));
-                if let Some(context_name) = &usm.context_name {
-                    security =
-                        security.context_name(Bytes::copy_from_slice(context_name.as_bytes()));
-                }
-
-                // Prefer master_keys over passwords if available
-                if let Some(ref master_keys) = usm.master_keys {
-                    security = security.with_master_keys(master_keys.clone());
-                } else {
-                    if let (Some(auth_proto), Some(auth_pass)) =
-                        (usm.auth_protocol, &usm.auth_password)
-                    {
-                        security = security.auth(auth_proto, auth_pass.as_bytes());
-                    }
-
-                    if let (Some(priv_proto), Some(priv_pass)) =
-                        (usm.priv_protocol, &usm.priv_password)
-                    {
-                        security = security.privacy(priv_proto, priv_pass.as_bytes());
-                    }
-                }
-
-                ClientConfig {
-                    version: Version::V3,
-                    community: Bytes::new(),
-                    timeout: self.timeout,
-                    retry: self.retry.clone(),
-                    max_oids_per_request: self.max_oids_per_request,
-                    v3_security: Some(security),
-                    walk_mode: self.walk_mode,
-                    oid_ordering: self.oid_ordering,
-                    max_walk_results: self.max_walk_results,
-                    max_repetitions: self.max_repetitions,
-                    local_engine_id: self
-                        .local_engine_id
-                        .as_ref()
-                        .map(|id| Bytes::copy_from_slice(id)),
-                    local_engine_boots: self.local_engine_boots,
-                }
-            }
+            Auth::Usm(security) => ClientConfig {
+                version: Version::V3,
+                community: Bytes::new(),
+                timeout: self.timeout,
+                retry: self.retry.clone(),
+                max_oids_per_request: self.max_oids_per_request,
+                v3_security: Some(security.clone()),
+                allow_unauthenticated_v3_time_correction: self
+                    .allow_unauthenticated_v3_time_correction,
+                walk_mode: self.walk_mode,
+                oid_ordering: self.oid_ordering,
+                max_walk_results: self.max_walk_results,
+                max_repetitions: self.max_repetitions,
+                local_engine_id: self
+                    .local_engine_id
+                    .as_ref()
+                    .map(|id| Bytes::copy_from_slice(id)),
+                local_engine_boots: self.local_engine_boots,
+            },
         }
     }
 
@@ -788,6 +770,7 @@ mod tests {
         assert!(builder.max_walk_results.is_none());
         assert!(builder.engine_cache.is_none());
         assert!(!builder.strict_source);
+        assert!(!builder.allow_unauthenticated_v3_time_correction);
     }
 
     #[test]
@@ -802,7 +785,8 @@ mod tests {
             .oid_ordering(OidOrdering::AllowNonIncreasing)
             .max_walk_results(1000)
             .engine_cache(cache.clone())
-            .strict_source(true);
+            .strict_source(true)
+            .allow_unauthenticated_v3_time_correction(true);
 
         assert_eq!(builder.timeout, Duration::from_secs(10));
         assert_eq!(builder.retry.max_attempts, 5);
@@ -813,6 +797,12 @@ mod tests {
         assert_eq!(builder.max_walk_results, Some(1000));
         assert!(builder.engine_cache.is_some());
         assert!(builder.strict_source);
+        assert!(builder.allow_unauthenticated_v3_time_correction);
+        assert!(
+            builder
+                .build_config()
+                .allow_unauthenticated_v3_time_correction
+        );
     }
 
     #[test]
@@ -851,73 +841,18 @@ mod tests {
     fn test_validate_usm_auth_priv_ok() {
         let builder = ClientBuilder::new(
             "192.168.1.1:161",
-            Auth::usm("admin")
-                .auth(AuthProtocol::Sha256, "authpass")
-                .privacy(PrivProtocol::Aes128, "privpass"),
+            Auth::usm("admin").auth_priv(
+                AuthProtocol::Sha256,
+                "authpass",
+                PrivProtocol::Aes128,
+                "privpass",
+            ),
         );
         assert!(builder.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_priv_without_auth_error() {
-        // Manually construct UsmAuth with priv but no auth
-        let usm = crate::client::UsmAuth {
-            username: "user".to_string(),
-            auth_protocol: None,
-            auth_password: None,
-            priv_protocol: Some(PrivProtocol::Aes128),
-            priv_password: Some("privpass".to_string()),
-            context_name: None,
-            master_keys: None,
-        };
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
-        let err = builder.validate().unwrap_err();
-        assert!(
-            matches!(*err, Error::Config(ref msg) if msg.contains("privacy requires authentication"))
-        );
-    }
-
-    #[test]
-    fn test_validate_auth_protocol_without_password_error() {
-        // Manually construct UsmAuth with auth protocol but no password
-        let usm = crate::client::UsmAuth {
-            username: "user".to_string(),
-            auth_protocol: Some(AuthProtocol::Sha256),
-            auth_password: None,
-            priv_protocol: None,
-            priv_password: None,
-            context_name: None,
-            master_keys: None,
-        };
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
-        let err = builder.validate().unwrap_err();
-        assert!(
-            matches!(*err, Error::Config(ref msg) if msg.contains("auth protocol requires password"))
-        );
-    }
-
-    #[test]
-    fn test_validate_priv_protocol_without_password_error() {
-        // Manually construct UsmAuth with priv protocol but no password
-        let usm = crate::client::UsmAuth {
-            username: "user".to_string(),
-            auth_protocol: Some(AuthProtocol::Sha256),
-            auth_password: Some("authpass".to_string()),
-            priv_protocol: Some(PrivProtocol::Aes128),
-            priv_password: None,
-            context_name: None,
-            master_keys: None,
-        };
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
-        let err = builder.validate().unwrap_err();
-        assert!(
-            matches!(*err, Error::Config(ref msg) if msg.contains("priv protocol requires password"))
-        );
-    }
-
-    #[test]
-    fn test_builder_with_usm_builder() {
-        // Test that UsmBuilder can be passed directly (via Into<Auth>)
+    fn test_builder_with_usm_config() {
         let builder = ClientBuilder::new(
             "192.168.1.1:161",
             Auth::usm("admin").auth(AuthProtocol::Sha256, "pass"),
@@ -926,39 +861,22 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_master_keys_bypass_auth_password() {
-        // When master keys are set, auth password is not required
-        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
-        let usm = crate::client::UsmAuth {
-            username: "user".to_string(),
-            auth_protocol: Some(AuthProtocol::Sha256),
-            auth_password: None, // No password
-            priv_protocol: None,
-            priv_password: None,
-            context_name: None,
-            master_keys: Some(master_keys),
-        };
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
+    fn test_validate_master_keys_configs() {
+        let auth_only = MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
+        let builder = ClientBuilder::new(
+            "192.168.1.1:161",
+            Auth::usm("user").with_master_keys(auth_only),
+        );
         assert!(builder.validate().is_ok());
-    }
 
-    #[test]
-    fn test_validate_master_keys_bypass_priv_password() {
-        // When master keys are set, priv password is not required
-        let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass")
+        let auth_priv = MasterKeys::new(AuthProtocol::Sha256, b"authpass")
             .unwrap()
             .with_privacy(PrivProtocol::Aes128, b"privpass")
             .unwrap();
-        let usm = crate::client::UsmAuth {
-            username: "user".to_string(),
-            auth_protocol: Some(AuthProtocol::Sha256),
-            auth_password: None, // No password
-            priv_protocol: Some(PrivProtocol::Aes128),
-            priv_password: None, // No password
-            context_name: None,
-            master_keys: Some(master_keys),
-        };
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::Usm(usm));
+        let builder = ClientBuilder::new(
+            "192.168.1.1:161",
+            Auth::usm("user").with_master_keys(auth_priv),
+        );
         assert!(builder.validate().is_ok());
     }
 
@@ -976,7 +894,7 @@ mod tests {
             .v3_security
             .expect("expected v3 security config to be built");
 
-        assert_eq!(security.context_name.as_ref(), b"vlan100");
+        assert_eq!(security.configured_context_name().as_ref(), b"vlan100");
     }
 
     #[test]

@@ -46,8 +46,12 @@ fn auth_for(level: SecurityLevel) -> Auth {
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
             .into(),
         SecurityLevel::AuthPriv => Auth::usm(USERNAME)
-            .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .privacy(PrivProtocol::Aes128, PRIV_PASSWORD)
+            .auth_priv(
+                AuthProtocol::Sha256,
+                AUTH_PASSWORD,
+                PrivProtocol::Aes128,
+                PRIV_PASSWORD,
+            )
             .into(),
     }
 }
@@ -83,6 +87,15 @@ fn custom_client(
     level: SecurityLevel,
     context_name: Option<&'static str>,
 ) -> Client<ScriptedTransport> {
+    custom_client_with_compatibility(transport, level, context_name, false)
+}
+
+fn custom_client_with_compatibility(
+    transport: ScriptedTransport,
+    level: SecurityLevel,
+    context_name: Option<&'static str>,
+    allow_unauthenticated_v3_time_correction: bool,
+) -> Client<ScriptedTransport> {
     let mut security = user_for(level);
     if let Some(context_name) = context_name {
         security = security.context_name(context_name);
@@ -94,6 +107,7 @@ fn custom_client(
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::none(),
             v3_security: Some(security),
+            allow_unauthenticated_v3_time_correction,
             ..ClientConfig::default()
         },
     )
@@ -718,6 +732,494 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
         (corrected.usm.engine_boots, corrected.usm.engine_time),
         (8, 10)
     );
+}
+
+#[tokio::test]
+async fn v3_unauthenticated_time_report_compatibility_is_explicit() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .build()
+            }),
+        ],
+        175,
+        false,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, None);
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(*err, async_snmp::Error::Auth { .. }),
+        "the compatibility path must remain disabled by default: {err}"
+    );
+    assert_eq!(log.len(), 2, "a disabled path must not send a correction");
+}
+
+#[tokio::test]
+async fn v3_udp_unauthenticated_time_report_gets_packet_local_correction() {
+    let level = SecurityLevel::AuthPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let corrected_response_engine = engine.clone();
+    let final_response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine,
+        vec![
+            discovery_step(report_engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .engine_boots(7)
+                .engine_time(100)
+                .build()
+            }),
+            response_step(corrected_response_engine, "compatibility response"),
+            response_step(final_response_engine, "converged response"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .allow_unauthenticated_v3_time_correction(true)
+        .connect()
+        .await
+        .unwrap();
+    let first = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(first.value.as_str(), Some("compatibility response"));
+    let second = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(second.value.as_str(), Some("converged response"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        (requests[1].usm.engine_boots, requests[1].usm.engine_time),
+        (0, 0)
+    );
+    assert_eq!(
+        (requests[2].usm.engine_boots, requests[2].usm.engine_time),
+        (7, 100),
+        "the unauthenticated tuple applies to the corrected packet"
+    );
+    assert_eq!(requests[2].authentication_valid, Some(true));
+    assert_eq!(
+        requests[2].global_data.msg_flags.security_level,
+        SecurityLevel::AuthPriv
+    );
+    assert_ne!(
+        requests[1].global_data.msg_id,
+        requests[2].global_data.msg_id
+    );
+    assert_ne!(
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+    );
+    assert_eq!(requests[3].usm.engine_boots, 7);
+    assert!(requests[3].usm.engine_time >= 100);
+}
+
+#[tokio::test]
+async fn v3_udp_compatibility_respects_strict_source_policy() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine,
+        vec![
+            discovery_step(report_engine.clone()),
+            ScriptStep::reply_from_other_source(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .build()
+            }),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .strict_source(true)
+        .allow_unauthenticated_v3_time_correction(true)
+        .connect()
+        .await
+        .unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(*err, async_snmp::Error::Timeout { .. }));
+    assert_eq!(log.len(), 2, "an off-source Report must not add a send");
+    peer.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_tcp_unauthenticated_time_report_compatibility_succeeds() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::tcp(
+        engine,
+        vec![
+            discovery_step(report_engine.clone()),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    2,
+                )
+                .engine_boots(7)
+                .engine_time(100)
+                .build()
+            }),
+            response_step(response_engine, "TCP compatibility response"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .allow_unauthenticated_v3_time_correction(true)
+        .connect_tcp()
+        .await
+        .unwrap();
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(response.value.as_str(), Some("TCP compatibility response"));
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        (requests[2].usm.engine_boots, requests[2].usm.engine_time),
+        (7, 100)
+    );
+    assert_eq!(requests[2].authentication_valid, Some(true));
+}
+
+#[tokio::test]
+async fn v3_reliable_custom_transport_allows_packet_local_compatibility() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    3,
+                )
+                .engine_boots(7)
+                .engine_time(100)
+                .build()
+            }),
+            response_step(response_engine, "custom compatibility response"),
+        ],
+        183,
+        true,
+    );
+    let log = transport.log();
+    let client = custom_client_with_compatibility(transport, level, None, true);
+
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(
+        response.value.as_str(),
+        Some("custom compatibility response")
+    );
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        (requests[2].usm.engine_boots, requests[2].usm.engine_time),
+        (7, 100)
+    );
+    assert_eq!(requests[2].authentication_valid, Some(true));
+    for request in requests {
+        assert_eq!(
+            request.transport_request_id,
+            Some(request.global_data.msg_id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn v3_failed_packet_local_correction_preserves_trusted_time() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            response_step(engine.clone(), "established"),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    3,
+                )
+                .engine_boots(1)
+                .engine_time(2)
+                .build()
+            }),
+            ScriptStep::silence(),
+            response_step(engine, "state retained"),
+        ],
+        185,
+        false,
+    );
+    let log = transport.log();
+    let client = Client::new(
+        transport,
+        ClientConfig {
+            version: Version::V3,
+            timeout: LOOPBACK_TIMEOUT,
+            retry: Retry::fixed(3, Duration::ZERO),
+            v3_security: Some(user_for(level)),
+            allow_unauthenticated_v3_time_correction: true,
+            ..ClientConfig::default()
+        },
+    );
+
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *err,
+        async_snmp::Error::Timeout { retries: 0, .. }
+    ));
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(response.value.as_str(), Some("state retained"));
+
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        (requests[3].usm.engine_boots, requests[3].usm.engine_time),
+        (1, 2),
+        "the spoofable tuple may affect one packet"
+    );
+    assert_eq!(requests[3].authentication_valid, Some(true));
+    assert_eq!(requests[4].usm.engine_boots, 7);
+    assert!(
+        requests[4].usm.engine_time >= 100,
+        "the lower unauthenticated tuple must not enter trusted state"
+    );
+}
+
+#[tokio::test]
+async fn v3_repeated_unauthenticated_time_report_is_typed_and_bounded() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let first_report_engine = engine.clone();
+    let second_report_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &first_report_engine,
+                    report_oids::not_in_time_windows(),
+                    4,
+                )
+                .build()
+            }),
+            ScriptStep::reply(move |request| {
+                V3ReplyBuilder::report_to(
+                    request,
+                    &second_report_engine,
+                    report_oids::not_in_time_windows(),
+                    5,
+                )
+                .build()
+            }),
+        ],
+        187,
+        false,
+    );
+    let log = transport.log();
+    let client = custom_client_with_compatibility(transport, level, None, true);
+
+    let err = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &*err,
+        async_snmp::Error::Report { status, .. }
+            if matches!(status.as_ref(), ReportStatus::NotInTimeWindow { counter: 5 })
+    ));
+    assert_eq!(log.len(), 3, "only one compatibility packet is allowed");
+}
+
+#[tokio::test]
+async fn v3_unauthenticated_time_report_compatibility_enforces_protocol_gates() {
+    type Mutate = Box<dyn FnOnce(V3ReplyBuilder) -> V3ReplyBuilder + Send>;
+    let wrong_engine_id = Bytes::from_static(b"\x80\x00\x7e\xd9\x05wrong-engine");
+    let cases: Vec<(&str, Mutate)> = vec![
+        ("wrong msgID", Box::new(|reply| reply.msg_id(999_999))),
+        (
+            "wrong engine ID",
+            Box::new(move |reply| reply.engine_id(wrong_engine_id)),
+        ),
+        ("wrong username", Box::new(|reply| reply.username("other"))),
+        (
+            "non-empty authentication parameters",
+            Box::new(|reply| reply.auth_params(Bytes::from_static(b"not-empty"))),
+        ),
+        (
+            "non-empty privacy parameters",
+            Box::new(|reply| reply.priv_params(Bytes::from_static(b"not-empty"))),
+        ),
+        (
+            "ordinary lower-security Response",
+            Box::new(|reply| reply.pdu_type(async_snmp::pdu::PduType::Response)),
+        ),
+        ("malformed Report", Box::new(|reply| reply.error_status(1))),
+    ];
+
+    for (case, mutate) in cases {
+        let level = SecurityLevel::AuthNoPriv;
+        let engine = engine_for(level);
+        let report_engine = engine.clone();
+        let transport = ScriptedTransport::new(
+            engine.clone(),
+            vec![
+                discovery_step(engine),
+                ScriptStep::reply(move |request| {
+                    mutate(
+                        V3ReplyBuilder::report_to(
+                            request,
+                            &report_engine,
+                            report_oids::not_in_time_windows(),
+                            1,
+                        )
+                        .engine_boots(7)
+                        .engine_time(100),
+                    )
+                    .build()
+                }),
+            ],
+            190,
+            false,
+        );
+        let log = transport.log();
+        let client = custom_client_with_compatibility(transport, level, None, true);
+
+        client
+            .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+            .await
+            .unwrap_err();
+        assert_eq!(log.len(), 2, "{case} must not trigger a correction");
+    }
+}
+
+#[tokio::test]
+async fn v3_failed_authenticated_compatibility_reply_does_not_publish_time() {
+    type Mutate = Box<dyn FnOnce(V3ReplyBuilder) -> V3ReplyBuilder + Send>;
+    let cases: Vec<(&str, Mutate)> = vec![
+        ("wrong msgID", Box::new(|reply| reply.msg_id(999_999))),
+        (
+            "wrong context engine ID",
+            Box::new(|reply| reply.context_engine_id(Bytes::from_static(b"wrong-context"))),
+        ),
+        (
+            "wrong PDU request ID",
+            Box::new(|reply| reply.request_id(999_999)),
+        ),
+        (
+            "wrong PDU type",
+            Box::new(|reply| reply.pdu_type(async_snmp::pdu::PduType::GetRequest)),
+        ),
+    ];
+
+    for (case, mutate) in cases {
+        let level = SecurityLevel::AuthNoPriv;
+        let engine = engine_for(level);
+        let report_engine = engine.clone();
+        let advanced_engine = engine.clone().boots_time(9, 300);
+        let transport = ScriptedTransport::new(
+            engine.clone(),
+            vec![
+                discovery_step(engine.clone()),
+                response_step(engine.clone(), "established"),
+                ScriptStep::reply(move |request| {
+                    V3ReplyBuilder::report_to(
+                        request,
+                        &report_engine,
+                        report_oids::not_in_time_windows(),
+                        1,
+                    )
+                    .engine_boots(8)
+                    .engine_time(200)
+                    .build()
+                }),
+                ScriptStep::reply(move |request| {
+                    mutate(V3ReplyBuilder::response_to(request, &advanced_engine)).build()
+                }),
+                response_step(engine, "prior state retained"),
+            ],
+            195,
+            false,
+        );
+        let log = transport.log();
+        let client = custom_client_with_compatibility(transport, level, None, true);
+
+        client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+        client
+            .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+            .await
+            .unwrap_err();
+        let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+        assert_eq!(response.value.as_str(), Some("prior state retained"));
+
+        let requests = log.snapshot();
+        assert_eq!(requests.len(), 5, "unexpected request count for {case}");
+        assert_eq!(
+            requests[4].usm.engine_boots, 7,
+            "{case} must not publish the authenticated tuple"
+        );
+        assert!(requests[4].usm.engine_time >= 100);
+        assert!(requests[4].usm.engine_time < 300);
+    }
 }
 
 #[tokio::test]

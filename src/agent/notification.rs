@@ -10,14 +10,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::client::{Auth, Client, ClientConfig, CommunityVersion, Retry, UsmAuth};
+use crate::client::{Auth, Client, ClientConfig, CommunityVersion, Retry};
 use crate::error::{Error, Result};
 use crate::message::CommunityMessage;
-use crate::notification::{DerivedKeys, UsmConfig};
 use crate::oid::Oid;
 use crate::pdu::Pdu;
 use crate::transport::{UdpHandle, UdpTransport};
 use crate::v3::compute_engine_boots_time;
+use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
@@ -66,19 +66,16 @@ impl TrapSink {
                     inform_client: AsyncMutex::new(None),
                 }
             }
-            Auth::Usm(usm) => {
-                let security = resolve_usm_config(&usm);
-                TrapSink {
-                    dest,
-                    version: Version::V3,
-                    community: Bytes::new(),
-                    v3_security: Some(security),
-                    derived_keys: RwLock::new(None),
-                    inform_timeout,
-                    inform_retry,
-                    inform_client: AsyncMutex::new(None),
-                }
-            }
+            Auth::Usm(security) => TrapSink {
+                dest,
+                version: Version::V3,
+                community: Bytes::new(),
+                v3_security: Some(security),
+                derived_keys: RwLock::new(None),
+                inform_timeout,
+                inform_retry,
+                inform_client: AsyncMutex::new(None),
+            },
         }
     }
 
@@ -148,27 +145,6 @@ impl TrapSink {
         *guard = Some((transport, client.clone()));
         Ok(client)
     }
-}
-
-/// Convert `UsmAuth` (builder-level) to `UsmConfig` (runtime-level).
-fn resolve_usm_config(usm: &UsmAuth) -> UsmConfig {
-    let mut security = UsmConfig::new(Bytes::copy_from_slice(usm.username.as_bytes()));
-    if let Some(context_name) = &usm.context_name {
-        security = security.context_name(Bytes::copy_from_slice(context_name.as_bytes()));
-    }
-
-    if let Some(ref master_keys) = usm.master_keys {
-        security = security.with_master_keys(master_keys.clone());
-    } else {
-        if let (Some(auth_proto), Some(auth_pass)) = (usm.auth_protocol, &usm.auth_password) {
-            security = security.auth(auth_proto, auth_pass.as_bytes());
-        }
-        if let (Some(priv_proto), Some(priv_pass)) = (usm.priv_protocol, &usm.priv_password) {
-            security = security.privacy(priv_proto, priv_pass.as_bytes());
-        }
-    }
-
-    security
 }
 
 /// Delivery outcome for a single trap sink.

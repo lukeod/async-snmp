@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 
 use crate::error::Result;
 use crate::message::MsgGlobalData;
-use crate::notification::DerivedKeys;
 use crate::pdu::Pdu;
+use crate::v3::DerivedKeys;
 use crate::v3::encode::encode_v3_response;
 use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 

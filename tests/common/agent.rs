@@ -237,16 +237,18 @@ impl TestAgentBuilder {
         }
 
         for user in &self.usm_users {
-            builder = builder.usm_user(user.username.clone(), |u| {
-                let mut u = u;
-                if let Some((proto, pass)) = &user.auth {
-                    u = u.auth(*proto, pass);
-                }
-                if let Some((proto, pass)) = &user.priv_ {
-                    u = u.privacy(*proto, pass);
-                }
-                u
-            });
+            builder =
+                builder.usm_user(user.username.clone(), |u| match (&user.auth, &user.priv_) {
+                    (
+                        Some((auth_protocol, auth_password)),
+                        Some((priv_protocol, priv_password)),
+                    ) => u.auth_priv(*auth_protocol, auth_password, *priv_protocol, priv_password),
+                    (Some((auth_protocol, auth_password)), None) => {
+                        u.auth(*auth_protocol, auth_password)
+                    }
+                    (None, None) => u,
+                    (None, Some(_)) => panic!("test USM privacy requires authentication"),
+                });
         }
 
         let agent = builder.build().await.expect("failed to build test agent");

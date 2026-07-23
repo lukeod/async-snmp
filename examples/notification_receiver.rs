@@ -54,8 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind("0.0.0.0:1163")
         // Configure USM user for authenticated traps/informs
         .usm_user("trapuser", |u| {
-            u.auth(AuthProtocol::Sha1, b"authpass123")
-                .privacy(PrivProtocol::Aes128, b"privpass123")
+            u.auth_priv(
+                AuthProtocol::Sha1,
+                b"authpass123",
+                PrivProtocol::Aes128,
+                b"privpass123",
+            )
         })
         // Can add multiple users
         .usm_user("readonly", |u| {

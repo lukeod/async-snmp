@@ -222,8 +222,12 @@ async fn v3_inform_send_receive() {
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .usm_user("informuser", |u| {
-            u.auth(AuthProtocol::Sha256, b"authpass12345678")
-                .privacy(PrivProtocol::Aes128, b"privpass12345678")
+            u.auth_priv(
+                AuthProtocol::Sha256,
+                b"authpass12345678",
+                PrivProtocol::Aes128,
+                b"privpass12345678",
+            )
         })
         .build()
         .await
@@ -239,9 +243,12 @@ async fn v3_inform_send_receive() {
 
     let client = Client::builder(
         recv_addr.to_string(),
-        Auth::usm("informuser")
-            .auth(AuthProtocol::Sha256, "authpass12345678")
-            .privacy(PrivProtocol::Aes128, "privpass12345678"),
+        Auth::usm("informuser").auth_priv(
+            AuthProtocol::Sha256,
+            "authpass12345678",
+            PrivProtocol::Aes128,
+            "privpass12345678",
+        ),
     )
     .connect()
     .await

@@ -190,9 +190,12 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
     let cache = Arc::new(EngineCache::new());
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authprivuser")
-            .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+        Auth::usm("authprivuser").auth_priv(
+            AuthProtocol::Sha256,
+            AUTH_PASS,
+            PrivProtocol::Aes128,
+            PRIV_PASS,
+        ),
     )
     .engine_cache(cache.clone())
     .connect()
@@ -217,9 +220,12 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
 
     let client2 = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authprivuser")
-            .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+        Auth::usm("authprivuser").auth_priv(
+            AuthProtocol::Sha256,
+            AUTH_PASS,
+            PrivProtocol::Aes128,
+            PRIV_PASS,
+        ),
     )
     .engine_cache(cache)
     .connect()
@@ -251,9 +257,12 @@ async fn v3_auth_priv_sha256_aes128() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authprivuser")
-            .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+        Auth::usm("authprivuser").auth_priv(
+            AuthProtocol::Sha256,
+            AUTH_PASS,
+            PrivProtocol::Aes128,
+            PRIV_PASS,
+        ),
     )
     .connect()
     .await
@@ -307,9 +316,7 @@ async fn v3_auth_priv_sha1_des() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("desuser")
-            .auth(AuthProtocol::Sha1, AUTH_PASS)
-            .privacy(PrivProtocol::Des, PRIV_PASS),
+        Auth::usm("desuser").auth_priv(AuthProtocol::Sha1, AUTH_PASS, PrivProtocol::Des, PRIV_PASS),
     )
     .connect()
     .await

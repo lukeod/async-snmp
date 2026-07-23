@@ -130,7 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for oid in &v3_oids {
-        // Create auth with master keys (cheap: just clones Arc)
+        // Cloning copies only the small zeroizing key buffers and avoids
+        // repeating password-to-key derivation.
         // Uses container user: privaes192_user (SHA-256 + AES-192)
         let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
 

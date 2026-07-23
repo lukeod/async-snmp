@@ -57,7 +57,7 @@ impl TestV3Engine {
     fn user_for(&self, username: &[u8]) -> Option<&UsmConfig> {
         self.users
             .iter()
-            .find(|user| user.username.as_ref() == username)
+            .find(|user| user.username().as_ref() == username)
     }
 }
 

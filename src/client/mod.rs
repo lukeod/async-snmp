@@ -6,7 +6,7 @@ mod retry;
 mod v3;
 mod walk;
 
-pub use auth::{Auth, CommunityVersion, UsmAuth, UsmBuilder};
+pub use auth::{Auth, CommunityVersion};
 pub use builder::{ClientBuilder, Target};
 pub use retry::{Backoff, Retry, RetryBuilder};
 
@@ -63,7 +63,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{Span, instrument};
 
-pub use crate::notification::{DerivedKeys, UsmConfig};
+pub use crate::v3::{DerivedKeys, UsmConfig};
 pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 
 // ============================================================================
@@ -160,6 +160,8 @@ struct ClientInner<T: Transport> {
     local_engine_start: Instant,
     /// Keys derived against `local_engine_id` for V3 trap sending.
     local_derived_keys: RwLock<Option<DerivedKeys>>,
+    #[cfg(test)]
+    deferred_authenticated_update_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Client configuration.
@@ -179,6 +181,15 @@ pub struct ClientConfig {
     pub max_oids_per_request: usize,
     /// `SNMPv3` security configuration (default: None)
     pub v3_security: Option<UsmConfig>,
+    /// Permit one packet-local correction from an unauthenticated
+    /// `usmStatsNotInTimeWindows` Report on an authenticated V3 operation.
+    ///
+    /// This is disabled by default because the Report's boots/time tuple is
+    /// unauthenticated and can cause one authenticated packet to be sent with
+    /// attacker-selected time fields. The tuple is never stored as trusted
+    /// engine state; only a subsequent authenticated, fully matched Response
+    /// may advance that state.
+    pub allow_unauthenticated_v3_time_correction: bool,
     /// Walk operation mode (default: Auto)
     pub walk_mode: WalkMode,
     /// OID ordering behavior during walk operations (default: Strict)
@@ -208,6 +219,7 @@ impl Default for ClientConfig {
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             v3_security: None,
+            allow_unauthenticated_v3_time_correction: false,
             walk_mode: WalkMode::Auto,
             oid_ordering: OidOrdering::Strict,
             max_walk_results: None,
@@ -253,6 +265,8 @@ impl<T: Transport> Client<T> {
                 discovery_lock: AsyncMutex::new(()),
                 local_engine_start: Instant::now(),
                 local_derived_keys: RwLock::new(None),
+                #[cfg(test)]
+                deferred_authenticated_update_hook: RwLock::new(None),
             }),
         }
     }
@@ -273,6 +287,8 @@ impl<T: Transport> Client<T> {
                 discovery_lock: AsyncMutex::new(()),
                 local_engine_start: Instant::now(),
                 local_derived_keys: RwLock::new(None),
+                #[cfg(test)]
+                deferred_authenticated_update_hook: RwLock::new(None),
             }),
         }
     }

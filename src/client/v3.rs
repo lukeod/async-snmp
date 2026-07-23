@@ -27,6 +27,12 @@ struct EncodedV3Request {
     context_name: Bytes,
 }
 
+struct PacketLocalEngineTime {
+    engine_id: Bytes,
+    boots: u32,
+    time: u32,
+}
+
 fn check_and_update_engine_timeliness(
     state: &mut EngineState,
     cache: Option<&EngineCache>,
@@ -361,7 +367,12 @@ impl<T: Transport> Client<T> {
     ///
     /// The `msg_id` parameter is separate from `pdu.request_id` per RFC 3412
     /// Section 6.2: retransmissions SHOULD use a new msgID for each attempt.
-    fn build_v3_message(&self, pdu: &Pdu, msg_id: i32) -> Result<EncodedV3Request> {
+    fn build_v3_message(
+        &self,
+        pdu: &Pdu,
+        msg_id: i32,
+        engine_time_override: Option<&PacketLocalEngineTime>,
+    ) -> Result<EncodedV3Request> {
         let security = self
             .inner
             .config
@@ -380,8 +391,21 @@ impl<T: Transport> Client<T> {
             .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?;
 
         let context_engine_id = engine.state.engine_id.clone();
-        let context_name = security.context_name.clone();
-        let (engine_boots, engine_time) = engine.state.estimated_boots_time();
+        let context_name = security.configured_context_name().clone();
+        let (engine_boots, engine_time) = if let Some(engine_time) = engine_time_override {
+            // Keep the untrusted tuple bound to the engine generation that
+            // supplied it. Concurrent explicit rediscovery must not combine
+            // one engine's tuple with another engine's identity/localized keys.
+            if engine_time.engine_id != engine.state.engine_id {
+                return Err(Error::MalformedResponse {
+                    target: self.peer_addr(),
+                }
+                .boxed());
+            }
+            (engine_time.boots, engine_time.time)
+        } else {
+            engine.state.estimated_boots_time()
+        };
         let data = crate::v3::encode::encode_v3_message(
             pdu,
             msg_id,
@@ -425,7 +449,7 @@ impl<T: Transport> Client<T> {
             .as_ref()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
-        if response_usm.username != security.username {
+        if response_usm.username != security.username() {
             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "USM security name does not select the configured user");
             return Err(Error::Auth {
                 target: self.peer_addr(),
@@ -452,7 +476,9 @@ impl<T: Transport> Client<T> {
         }
 
         if !received_level.requires_auth() {
-            if security.security_level().requires_auth() {
+            if security.security_level().requires_auth()
+                && !self.inner.config.allow_unauthenticated_v3_time_correction
+            {
                 tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "unauthenticated reply on authenticated session");
                 return Err(Error::Auth {
                     target: self.peer_addr(),
@@ -592,6 +618,7 @@ impl<T: Transport> Client<T> {
         };
         let mut timeout_retries = 0;
         let mut correction_used = false;
+        let mut packet_local_engine_time = None;
         let mut pdu = pdu;
         // msgIDs transmitted for the current exchange. A response correlating to
         // any of them is acceptable; corrections reset the window because the
@@ -603,9 +630,12 @@ impl<T: Transport> Client<T> {
             Span::current().record("snmp.protocol_correction", correction_used);
 
             // RFC 3412 Section 6.2: use fresh msgID for every transmission. Prior
-            // attempts' msgIDs stay acceptable via the window below.
+            // attempts' msgIDs stay acceptable via the window below. A
+            // compatibility tuple is consumed by exactly one packet and is never
+            // available to a timeout retransmission.
             let msg_id = self.next_request_id();
-            let request = self.build_v3_message(&pdu, msg_id)?;
+            let engine_time_override = packet_local_engine_time.take();
+            let request = self.build_v3_message(&pdu, msg_id, engine_time_override.as_ref())?;
 
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type, snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type);
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
@@ -649,8 +679,52 @@ impl<T: Transport> Client<T> {
                     // PDU parsing. Only state for the message's claimed
                     // engine is touched; unauthenticated messages never
                     // mutate the notion.
+                    let mut deferred_authenticated_update = false;
                     if received_level.requires_auth() {
-                        let timely = {
+                        let timely = if engine_time_override.is_some() {
+                            // A response to the packet-local compatibility
+                            // correction is provisional until it is proven to
+                            // be the fully matched Response for this request.
+                            // Evaluate Step 7(b) on a clone so malformed,
+                            // uncorrelated, or Report replies cannot mutate live
+                            // or shared trusted state.
+                            let local_state = {
+                                let engine = self.inner.engine.read().map_err(|_| {
+                                    Error::Config("engine lock poisoned".into()).boxed()
+                                })?;
+                                engine
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        Error::Config("engine not discovered".into()).boxed()
+                                    })?
+                                    .state
+                                    .clone()
+                            };
+                            let timely = self
+                                .inner
+                                .engine_cache
+                                .as_deref()
+                                .and_then(|cache| {
+                                    cache.timeliness_candidate(
+                                        &self.peer_addr(),
+                                        &local_state,
+                                        &response_usm.engine_id,
+                                        response_usm.engine_boots,
+                                        response_usm.engine_time,
+                                    )
+                                })
+                                .map_or_else(
+                                    || {
+                                        local_state.clone().check_and_update_timeliness(
+                                            response_usm.engine_boots,
+                                            response_usm.engine_time,
+                                        )
+                                    },
+                                    |(timely, _candidate)| timely,
+                                );
+                            deferred_authenticated_update = true;
+                            timely
+                        } else {
                             let mut engine = self.inner.engine.write().map_err(|_| {
                                 Error::Config("engine lock poisoned".into()).boxed()
                             })?;
@@ -673,6 +747,19 @@ impl<T: Transport> Client<T> {
                                 target: self.peer_addr(),
                             }
                             .boxed());
+                        }
+                    }
+
+                    #[cfg(test)]
+                    if deferred_authenticated_update {
+                        let hook = self
+                            .inner
+                            .deferred_authenticated_update_hook
+                            .read()
+                            .expect("deferred update hook lock poisoned")
+                            .clone();
+                        if let Some(hook) = hook {
+                            hook();
                         }
                     }
 
@@ -731,9 +818,37 @@ impl<T: Transport> Client<T> {
                             continue;
                         }
 
-                        // Credential failures, unknown statuses, unauthenticated
-                        // time Reports, and a repeated time-window Report are
-                        // typed terminal protocol outcomes, never timeouts.
+                        if matches!(status, ReportStatus::NotInTimeWindow { .. })
+                            && received_level == SecurityLevel::NoAuthNoPriv
+                            && security_level.requires_auth()
+                            && self.inner.config.allow_unauthenticated_v3_time_correction
+                            && response_usm.auth_params.is_empty()
+                            && response_usm.priv_params.is_empty()
+                            && !correction_used
+                        {
+                            // Compatibility for devices that violate RFC 3414
+                            // Step 7(a) by returning this Report without HMAC.
+                            // Identity, username, source policy, msgID, and exact
+                            // Report shape have all been checked. The untrusted
+                            // tuple is consumed by one authenticated packet and
+                            // is never installed into live or cache state.
+                            correction_used = true;
+                            packet_local_engine_time = Some(PacketLocalEngineTime {
+                                engine_id: response_usm.engine_id.clone(),
+                                boots: response_usm.engine_boots,
+                                time: response_usm.engine_time,
+                            });
+                            pdu.request_id = self.next_request_id();
+                            msg_id_window.clear();
+                            Span::current().record("snmp.protocol_correction", true);
+                            tracing::debug!(target: "async_snmp::client", { snmp.report_status = %status }, "sending packet-local SNMPv3 compatibility correction");
+                            continue;
+                        }
+
+                        // Credential failures, unknown statuses, disabled or
+                        // repeated unauthenticated time Reports, and repeated
+                        // authenticated time Reports are typed terminal
+                        // protocol outcomes, never timeouts.
                         return Err(Error::Report {
                             target: self.peer_addr(),
                             status: Box::new(status),
@@ -774,7 +889,7 @@ impl<T: Transport> Client<T> {
                     }
 
                     // Validate username matches what we sent
-                    if response_usm.username != security.username {
+                    if response_usm.username != security.username() {
                         tracing::warn!(target: "async_snmp::client", {
                             peer = %self.peer_addr()
                         }, "username mismatch in response");
@@ -820,6 +935,42 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
+                    // The response to a packet-local compatibility correction
+                    // is now authenticated, correlated, and fully matched.
+                    // Revalidate against the current coherent live/cache state
+                    // before publishing: another request may have advanced the
+                    // time window while this response was being processed.
+                    if deferred_authenticated_update {
+                        let timely = {
+                            let mut engine = self.inner.engine.write().map_err(|_| {
+                                Error::Config("engine lock poisoned".into()).boxed()
+                            })?;
+                            let engine = engine.as_mut().ok_or_else(|| {
+                                Error::Config("engine not discovered".into()).boxed()
+                            })?;
+                            if engine.state.engine_id != response_usm.engine_id {
+                                return Err(Error::MalformedResponse {
+                                    target: self.peer_addr(),
+                                }
+                                .boxed());
+                            }
+                            check_and_update_engine_timeliness(
+                                &mut engine.state,
+                                self.inner.engine_cache.as_deref(),
+                                self.peer_addr(),
+                                &response_usm.engine_id,
+                                response_usm.engine_boots,
+                                response_usm.engine_time,
+                            )
+                        };
+                        if !timely {
+                            return Err(Error::Auth {
+                                target: self.peer_addr(),
+                            }
+                            .boxed());
+                        }
+                    }
+
                     tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type, snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status, snmp.error_index = response_pdu.error_index }, "received V3 {} response", response_pdu.pdu_type);
 
                     // Check for SNMP error
@@ -833,7 +984,9 @@ impl<T: Transport> Client<T> {
                     return Ok(response_pdu);
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
-                    if timeout_retries >= max_timeout_retries {
+                    // A spoofable compatibility tuple is authorized for one
+                    // authenticated packet only, not a retransmission.
+                    if engine_time_override.is_some() || timeout_retries >= max_timeout_retries {
                         break;
                     }
 
@@ -1030,6 +1183,37 @@ mod tests {
     }
 
     #[test]
+    fn test_deferred_time_revalidation_rejects_concurrently_stale_response() {
+        let cache = EngineCache::new();
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
+        let engine_id = Bytes::from_static(b"engine");
+        let mut state = EngineState::new(engine_id.clone(), 1, 1000);
+        cache.insert(target, state.clone());
+
+        let (initially_timely, _) = cache
+            .timeliness_candidate(&target, &state, &engine_id, 1, 1100)
+            .expect("cached identity");
+        assert!(initially_timely);
+
+        assert!(check_and_update_engine_timeliness(
+            &mut state,
+            Some(&cache),
+            target,
+            &engine_id,
+            1,
+            1400,
+        ));
+        assert!(!check_and_update_engine_timeliness(
+            &mut state,
+            Some(&cache),
+            target,
+            &engine_id,
+            1,
+            1100,
+        ));
+    }
+
+    #[test]
     fn test_build_v3_message_uses_configured_context_name() {
         let transport = TestTransport::new();
         let config = ClientConfig {
@@ -1052,7 +1236,7 @@ mod tests {
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
 
         let encoded = client
-            .build_v3_message(&pdu, 456)
+            .build_v3_message(&pdu, 456, None)
             .expect("v3 message should encode");
         let decoded =
             V3Message::decode(Bytes::from(encoded.data)).expect("v3 message should decode");
@@ -1062,6 +1246,40 @@ mod tests {
         };
 
         assert_eq!(scoped.context_name.as_ref(), b"ctx");
+    }
+
+    #[test]
+    fn test_packet_local_time_rejects_changed_engine_generation() {
+        let transport = TestTransport::new();
+        let config = ClientConfig {
+            version: crate::version::Version::V3,
+            v3_security: Some(UsmConfig::new("user")),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config);
+
+        {
+            let security = client.inner.config.v3_security.as_ref().unwrap();
+            let state = EngineState::new(Bytes::from_static(b"engine-a"), 1, 42);
+            let derived_keys = security.derive_keys(&state.engine_id).unwrap();
+            *client.inner.engine.write().expect("engine lock poisoned") = Some(ClientEngine {
+                state,
+                derived_keys,
+            });
+        }
+
+        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
+        let packet_time = PacketLocalEngineTime {
+            engine_id: Bytes::from_static(b"engine-b"),
+            boots: 9,
+            time: 99,
+        };
+        let err = client
+            .build_v3_message(&pdu, 456, Some(&packet_time))
+            .err()
+            .expect("changed engine generation must fail");
+
+        assert!(matches!(*err, Error::MalformedResponse { .. }));
     }
 
     /// Transport that times out on the first recv call, then returns a valid
@@ -1246,13 +1464,15 @@ mod response_validation_tests {
     use super::*;
     use crate::UsmConfig;
     use crate::client::ClientConfig;
-    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel};
+    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3MessageData};
     use crate::oid;
     use crate::v3::auth::authenticate_message;
     use crate::v3::{AuthProtocol, EngineState, LocalizedKey};
     use bytes::Bytes;
     use std::future::ready;
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
     use std::time::Duration;
 
     /// Transport that answers every request with one canned response.
@@ -1309,6 +1529,55 @@ mod response_validation_tests {
         fn register_request(&self, _request_id: i32, _timeout: Duration) {}
     }
 
+    #[derive(Clone)]
+    struct DeferredUpdateTransport {
+        peer: SocketAddr,
+        response_number: Arc<AtomicU32>,
+        next_request_id: Arc<AtomicI32>,
+    }
+
+    impl DeferredUpdateTransport {
+        fn new() -> Self {
+            Self {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+                response_number: Arc::new(AtomicU32::new(0)),
+                next_request_id: Arc::new(AtomicI32::new(100)),
+            }
+        }
+    }
+
+    impl Transport for DeferredUpdateTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&self, _request_id: i32) -> Result<(Bytes, SocketAddr)> {
+            Err(Error::Config("DeferredUpdateTransport uses request()".into()).boxed())
+        }
+
+        async fn request(&self, data: &[u8], _request_id: i32) -> Result<(Bytes, SocketAddr)> {
+            let response_number = self.response_number.fetch_add(1, Ordering::SeqCst);
+            let response = build_deferred_update_response(data, response_number);
+            Ok((response, self.peer))
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn alloc_request_id(&self) -> i32 {
+            self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+    }
+
     const ENGINE_ID: &[u8] = b"engine";
 
     /// Build a v3 response message under ENGINE_ID for user "user". With
@@ -1362,6 +1631,83 @@ mod response_validation_tests {
         }
     }
 
+    fn build_deferred_update_response(request_data: &[u8], response_number: u32) -> Bytes {
+        let request = V3Message::decode(Bytes::copy_from_slice(request_data)).unwrap();
+        let scoped_request = match request.data {
+            V3MessageData::Plaintext(scoped) => scoped,
+            V3MessageData::Encrypted(_) => panic!("expected authNoPriv request"),
+        };
+        let (level, engine_time, pdu) = match response_number {
+            0 => (
+                SecurityLevel::NoAuthNoPriv,
+                1100,
+                Pdu {
+                    pdu_type: PduType::Report,
+                    request_id: 0,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds: vec![crate::VarBind::new(
+                        crate::v3::report_oids::not_in_time_windows(),
+                        crate::Value::Counter32(1),
+                    )],
+                },
+            ),
+            1 => (
+                SecurityLevel::AuthNoPriv,
+                1100,
+                Pdu {
+                    pdu_type: PduType::Response,
+                    request_id: scoped_request.pdu.request_id,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds: vec![],
+                },
+            ),
+            2 => (
+                SecurityLevel::AuthNoPriv,
+                1400,
+                Pdu {
+                    pdu_type: PduType::Response,
+                    request_id: scoped_request.pdu.request_id,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds: vec![],
+                },
+            ),
+            _ => panic!("unexpected deferred-update response {response_number}"),
+        };
+        let global = MsgGlobalData::new(
+            request.global_data.msg_id,
+            65507,
+            MsgFlags::new(level, false),
+        );
+        let auth_key = (level == SecurityLevel::AuthNoPriv).then(|| {
+            LocalizedKey::from_password(AuthProtocol::Sha1, b"authpass12345678", ENGINE_ID).unwrap()
+        });
+        let mut usm = UsmSecurityParams::new(
+            Bytes::from_static(ENGINE_ID),
+            1,
+            engine_time,
+            Bytes::from_static(b"user"),
+        );
+        if let Some(key) = &auth_key {
+            usm = usm.with_auth_placeholder(key.mac_len());
+        }
+        let scoped = ScopedPdu::new(
+            scoped_request.context_engine_id,
+            scoped_request.context_name,
+            pdu,
+        );
+        let mut response = V3Message::new(global, usm.encode(), scoped)
+            .encode()
+            .to_vec();
+        if let Some(key) = auth_key {
+            let (offset, len) = UsmSecurityParams::find_auth_params_offset(&response).unwrap();
+            authenticate_message(&key, &mut response, offset, len).unwrap();
+        }
+        Bytes::from(response)
+    }
+
     /// Build a client over `response` with engine state (and derived keys,
     /// when authenticated) preset so no discovery round-trip runs.
     fn canned_client(
@@ -1385,6 +1731,82 @@ mod response_validation_tests {
             });
         }
         client
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v3_deferred_update_revalidates_after_concurrent_advancement() {
+        let transport = DeferredUpdateTransport::new();
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let cache = Arc::new(EngineCache::new());
+        let config = ClientConfig {
+            version: crate::version::Version::V3,
+            retry: crate::client::Retry::none(),
+            v3_security: Some(security.clone()),
+            allow_unauthenticated_v3_time_correction: true,
+            ..ClientConfig::default()
+        };
+        let client = Client::with_engine_cache(transport, config, cache.clone());
+        let state = EngineState::new(Bytes::from_static(ENGINE_ID), 1, 1000);
+        let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
+        cache.insert(client.peer_addr(), state.clone());
+        *client.inner.engine.write().unwrap() = Some(ClientEngine {
+            state,
+            derived_keys,
+        });
+
+        let (candidate_checked_tx, candidate_checked_rx) = std::sync::mpsc::channel();
+        let (advancement_complete_tx, advancement_complete_rx) = std::sync::mpsc::channel();
+        let advancement_complete_rx = std::sync::Mutex::new(advancement_complete_rx);
+        *client
+            .inner
+            .deferred_authenticated_update_hook
+            .write()
+            .unwrap() = Some(Arc::new(move || {
+            candidate_checked_tx
+                .send(())
+                .expect("candidate-check waiter dropped");
+            advancement_complete_rx
+                .lock()
+                .expect("advancement-complete lock poisoned")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("concurrent advancement did not complete");
+        }));
+
+        let stale_client = client.clone();
+        let stale_request = tokio::spawn(async move {
+            stale_client
+                .send_v3_and_recv(Pdu::get_request(1, &[oid!(1, 3, 6, 1, 1)]))
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            candidate_checked_rx.recv_timeout(Duration::from_secs(5))
+        })
+        .await
+        .expect("candidate-check waiter panicked")
+        .expect("provisional timeliness check did not complete");
+
+        client
+            .send_v3_and_recv(Pdu::get_request(2, &[oid!(1, 3, 6, 1, 1)]))
+            .await
+            .expect("concurrent response should advance trusted time");
+        advancement_complete_tx
+            .send(())
+            .expect("advancement-complete waiter dropped");
+
+        let err = stale_request.await.unwrap().unwrap_err();
+        assert!(matches!(*err, Error::Auth { .. }));
+        let engine = client.inner.engine.read().unwrap();
+        let trusted = engine.as_ref().unwrap().state.trusted_time().unwrap();
+        assert_eq!(trusted.latest_received_time(), 1400);
+        assert_eq!(
+            cache
+                .get(&client.peer_addr())
+                .unwrap()
+                .trusted_time()
+                .unwrap()
+                .latest_received_time(),
+            1400
+        );
     }
 
     /// RFC 3412 Section 6.3: an outgoing request advertises the manager's own
@@ -1416,7 +1838,7 @@ mod response_validation_tests {
         }
 
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
-        let request = client.build_v3_message(&pdu, 1).unwrap();
+        let request = client.build_v3_message(&pdu, 1, None).unwrap();
         let msg = V3Message::decode(Bytes::from(request.data)).unwrap();
         assert_eq!(
             msg.global_data.msg_max_size, 1400,

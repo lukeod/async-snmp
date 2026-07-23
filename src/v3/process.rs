@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
+use super::{DerivedKeys, UsmConfig};
 use crate::ber::Decoder;
 use crate::error::{Error, Result};
 use crate::message::{MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel};
-use crate::notification::{DerivedKeys, UsmConfig};
 use crate::oid::Oid;
 use crate::v3::auth::verify_message;
 use crate::v3::encode::encode_v3_report;

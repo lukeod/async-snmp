@@ -104,9 +104,12 @@ use async_snmp::{Auth, Client, oid, v3::{AuthProtocol, PrivProtocol}};
 #[tokio::main]
 async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161),
-        Auth::usm("admin")
-            .auth(AuthProtocol::Sha256, "authpass123")
-            .privacy(PrivProtocol::Aes128, "privpass123"))
+        Auth::usm("admin").auth_priv(
+            AuthProtocol::Sha256,
+            "authpass123",
+            PrivProtocol::Aes128,
+            "privpass123",
+        ))
         .connect()
         .await?;
 

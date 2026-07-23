@@ -17,9 +17,9 @@ use crate::v3::compute_engine_boots_time;
 use crate::v3::encode::encode_v3_response;
 use crate::v3::process::{UsmFailure, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
 
-use super::types::DerivedKeys;
 use super::varbind::extract_notification_varbinds;
 use super::{Notification, ReceiverInner};
+use crate::v3::DerivedKeys;
 
 impl super::NotificationReceiver {
     /// Handle `SNMPv1` message.

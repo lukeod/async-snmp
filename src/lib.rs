@@ -44,9 +44,12 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<async_snmp::Error>> {
 //!     let client = Client::builder(("192.168.1.1", 161),
-//!         Auth::usm("admin")
-//!             .auth(AuthProtocol::Sha256, "authpass123")
-//!             .privacy(PrivProtocol::Aes128, "privpass123"))
+//!         Auth::usm("admin").auth_priv(
+//!             AuthProtocol::Sha256,
+//!             "authpass123",
+//!             PrivProtocol::Aes128,
+//!             "privpass123",
+//!         ))
 //!         .connect()
 //!         .await?;
 //!
@@ -440,7 +443,7 @@ pub use agent::{Agent, AgentBuilder, BuiltinMib, VacmBuilder, VacmConfig, View};
 pub use client::{
     Auth, Backoff, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
     DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT, OidOrdering, Retry,
-    RetryBuilder, Target, UsmAuth, UsmBuilder, Walk, WalkMode, WalkStream,
+    RetryBuilder, Target, Walk, WalkMode, WalkStream,
 };
 pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
 pub use handler::{
@@ -449,8 +452,7 @@ pub use handler::{
 };
 pub use message::SecurityLevel;
 pub use notification::{
-    Notification, NotificationReceiver, NotificationReceiverBuilder, UsmConfig,
-    validate_notification_varbinds,
+    Notification, NotificationReceiver, NotificationReceiverBuilder, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};
@@ -461,7 +463,7 @@ pub use v3::AwsLcFipsProvider;
 pub use v3::RustCryptoProvider;
 pub use v3::{
     AuthProtocol, CryptoError, CryptoProvider, CryptoResult, EngineCache, LocalizedKey, MasterKey,
-    MasterKeys, ParseProtocolError, PrivProtocol,
+    MasterKeys, ParseProtocolError, PrivProtocol, UsmConfig,
 };
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;

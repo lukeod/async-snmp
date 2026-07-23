@@ -16,13 +16,13 @@
 //! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
 //!     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 //!
-//! // Use with USM builder - localization is cheap (~1μs per engine)
+//! // Use with the shared USM config - localization is cheap (~1μs per engine)
 //! let auth: Auth = Auth::usm("admin")
 //!     .with_master_keys(master_keys)
 //!     .into();
 //! ```
 
-use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol};
+use crate::v3::UsmConfig;
 
 /// SNMP version for community-based authentication.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -48,7 +48,7 @@ pub enum Auth {
         community: String,
     },
     /// User-based Security Model (`SNMPv3`).
-    Usm(UsmAuth),
+    Usm(UsmConfig),
 }
 
 impl Default for Auth {
@@ -103,10 +103,10 @@ impl Auth {
         }
     }
 
-    /// Start building `SNMPv3` USM authentication.
+    /// Create an `SNMPv3` USM configuration.
     ///
-    /// Returns a builder that allows configuring authentication and privacy
-    /// protocols. `SNMPv3` supports three security levels:
+    /// Returns the shared [`UsmConfig`] used by clients, agents, notification
+    /// receivers, and trap sinks. `SNMPv3` supports three security levels:
     /// - noAuthNoPriv: username only (no security)
     /// - authNoPriv: username with authentication (integrity)
     /// - authPriv: username with authentication and encryption (confidentiality)
@@ -126,213 +126,27 @@ impl Auth {
     ///
     /// // authPriv: with authentication and encryption
     /// let auth: Auth = Auth::usm("admin")
-    ///     .auth(AuthProtocol::Sha256, "authpassword")
-    ///     .privacy(PrivProtocol::Aes128, "privpassword")
+    ///     .auth_priv(
+    ///         AuthProtocol::Sha256,
+    ///         "authpassword",
+    ///         PrivProtocol::Aes128,
+    ///         "privpassword",
+    ///     )
     ///     .into();
     /// ```
-    pub fn usm(username: impl Into<String>) -> UsmBuilder {
-        UsmBuilder::new(username)
+    pub fn usm(username: impl Into<String>) -> UsmConfig {
+        UsmConfig::new(bytes::Bytes::from(username.into()))
     }
 }
 
-/// `SNMPv3` USM authentication parameters.
-///
-/// The [`Debug`] implementation redacts the authentication and privacy
-/// passwords so that credentials are not leaked through logs or diagnostics.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UsmAuth {
-    /// `SNMPv3` username
-    pub username: String,
-    /// Authentication protocol (None for noAuthNoPriv)
-    pub auth_protocol: Option<AuthProtocol>,
-    /// Authentication password
-    pub auth_password: Option<String>,
-    /// Privacy protocol (None for noPriv)
-    pub priv_protocol: Option<PrivProtocol>,
-    /// Privacy password
-    pub priv_password: Option<String>,
-    /// `SNMPv3` context name for VACM context selection.
-    /// Most deployments use empty string (default).
-    pub context_name: Option<String>,
-    /// Pre-computed master keys for caching.
-    /// When set, passwords are ignored and keys are derived from master keys.
-    pub master_keys: Option<MasterKeys>,
-}
-
-/// Builder for `SNMPv3` USM authentication.
-///
-/// The [`Debug`] implementation redacts the authentication and privacy
-/// passwords so that credentials are not leaked through logs or diagnostics.
-pub struct UsmBuilder {
-    username: String,
-    auth: Option<(AuthProtocol, String)>,
-    privacy: Option<(PrivProtocol, String)>,
-    context_name: Option<String>,
-    master_keys: Option<MasterKeys>,
-}
-
-impl UsmBuilder {
-    /// Create a new USM builder with the given username.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::Auth;
-    ///
-    /// let builder = Auth::usm("admin");
-    /// ```
-    pub fn new(username: impl Into<String>) -> Self {
-        Self {
-            username: username.into(),
-            auth: None,
-            privacy: None,
-            context_name: None,
-            master_keys: None,
-        }
-    }
-
-    /// Add authentication (authNoPriv or authPriv).
-    ///
-    /// This method performs the full key derivation (~850us for SHA-256) when
-    /// the client connects. When polling many engines with shared credentials,
-    /// consider using [`with_master_keys`](Self::with_master_keys) instead.
-    ///
-    /// # Supported Protocols
-    ///
-    /// - `AuthProtocol::Md5` - HMAC-MD5-96 (legacy)
-    /// - `AuthProtocol::Sha1` - HMAC-SHA-96 (legacy)
-    /// - `AuthProtocol::Sha224` - HMAC-SHA-224
-    /// - `AuthProtocol::Sha256` - HMAC-SHA-256
-    /// - `AuthProtocol::Sha384` - HMAC-SHA-384
-    /// - `AuthProtocol::Sha512` - HMAC-SHA-512
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, AuthProtocol};
-    ///
-    /// let auth: Auth = Auth::usm("admin")
-    ///     .auth(AuthProtocol::Sha256, "mypassword")
-    ///     .into();
-    /// ```
-    #[must_use]
-    pub fn auth(mut self, protocol: AuthProtocol, password: impl Into<String>) -> Self {
-        self.auth = Some((protocol, password.into()));
-        self
-    }
-
-    /// Add privacy/encryption (authPriv).
-    ///
-    /// Privacy requires authentication; this is validated at connection time.
-    ///
-    /// # Supported Protocols
-    ///
-    /// - `PrivProtocol::Des` - DES-CBC (legacy, insecure)
-    /// - `PrivProtocol::Aes128` - AES-128-CFB
-    /// - `PrivProtocol::Aes192` - AES-192-CFB
-    /// - `PrivProtocol::Aes256` - AES-256-CFB
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, AuthProtocol, PrivProtocol};
-    ///
-    /// let auth: Auth = Auth::usm("admin")
-    ///     .auth(AuthProtocol::Sha256, "authpassword")
-    ///     .privacy(PrivProtocol::Aes128, "privpassword")
-    ///     .into();
-    /// ```
-    #[must_use]
-    pub fn privacy(mut self, protocol: PrivProtocol, password: impl Into<String>) -> Self {
-        self.privacy = Some((protocol, password.into()));
-        self
-    }
-
-    /// Use pre-computed master keys for authentication and privacy.
-    ///
-    /// This is the efficient path when polling many engines with shared
-    /// credentials. The expensive password-to-key derivation
-    /// (~850μs) is done once when creating the [`MasterKeys`], and only the
-    /// cheap localization (~1μs) is performed per engine.
-    ///
-    /// When master keys are set, the [`auth`](Self::auth) and
-    /// [`privacy`](Self::privacy) methods are ignored.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, AuthProtocol, PrivProtocol, MasterKeys};
-    ///
-    /// // Derive master keys once
-    /// let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
-    ///     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
-    ///
-    /// // Use with multiple clients
-    /// let auth: Auth = Auth::usm("admin")
-    ///     .with_master_keys(master_keys)
-    ///     .into();
-    /// ```
-    #[must_use]
-    pub fn with_master_keys(mut self, master_keys: MasterKeys) -> Self {
-        self.master_keys = Some(master_keys);
-        self
-    }
-
-    /// Set the `SNMPv3` context name for VACM context selection.
-    ///
-    /// The context name allows selecting different MIB views on the same agent.
-    /// Most deployments use empty string (default).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, AuthProtocol};
-    ///
-    /// let auth: Auth = Auth::usm("admin")
-    ///     .auth(AuthProtocol::Sha256, "password")
-    ///     .context_name("vlan100")
-    ///     .into();
-    /// ```
-    #[must_use]
-    pub fn context_name(mut self, name: impl Into<String>) -> Self {
-        self.context_name = Some(name.into());
-        self
-    }
-}
-
-impl From<UsmBuilder> for Auth {
-    fn from(b: UsmBuilder) -> Auth {
-        Auth::Usm(UsmAuth {
-            username: b.username,
-            auth_protocol: b
-                .master_keys
-                .as_ref()
-                .map(super::super::v3::auth::MasterKeys::auth_protocol)
-                .or(b.auth.as_ref().map(|(p, _)| *p)),
-            auth_password: b.auth.map(|(_, pw)| pw),
-            priv_protocol: b
-                .master_keys
-                .as_ref()
-                .and_then(super::super::v3::auth::MasterKeys::priv_protocol)
-                .or(b.privacy.as_ref().map(|(p, _)| *p)),
-            priv_password: b.privacy.map(|(_, pw)| pw),
-            context_name: b.context_name,
-            master_keys: b.master_keys,
-        })
+impl From<UsmConfig> for Auth {
+    fn from(config: UsmConfig) -> Self {
+        Self::Usm(config)
     }
 }
 
 /// Placeholder printed in place of a redacted secret value.
 const REDACTED: &str = "[REDACTED]";
-
-/// Formats an `Option<String>` secret as either `None` or a redacted marker,
-/// never printing the underlying value.
-fn redact_opt(value: &Option<String>) -> &'static str {
-    match value {
-        Some(_) => REDACTED,
-        None => "None",
-    }
-}
 
 impl std::fmt::Debug for Auth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -347,44 +161,11 @@ impl std::fmt::Debug for Auth {
     }
 }
 
-impl std::fmt::Debug for UsmAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UsmAuth")
-            .field("username", &self.username)
-            .field("auth_protocol", &self.auth_protocol)
-            .field("auth_password", &redact_opt(&self.auth_password))
-            .field("priv_protocol", &self.priv_protocol)
-            .field("priv_password", &redact_opt(&self.priv_password))
-            .field("context_name", &self.context_name)
-            .field("master_keys", &self.master_keys)
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for UsmBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UsmBuilder")
-            .field("username", &self.username)
-            .field(
-                "auth",
-                &self.auth.as_ref().map(|(protocol, _)| (protocol, REDACTED)),
-            )
-            .field(
-                "privacy",
-                &self
-                    .privacy
-                    .as_ref()
-                    .map(|(protocol, _)| (protocol, REDACTED)),
-            )
-            .field("context_name", &self.context_name)
-            .field("master_keys", &self.master_keys)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::SecurityLevel;
+    use crate::v3::{AuthProtocol, PrivProtocol};
 
     #[test]
     fn test_default_auth() {
@@ -433,12 +214,9 @@ mod tests {
         let auth: Auth = Auth::usm("readonly").into();
         match auth {
             Auth::Usm(usm) => {
-                assert_eq!(usm.username, "readonly");
-                assert!(usm.auth_protocol.is_none());
-                assert!(usm.auth_password.is_none());
-                assert!(usm.priv_protocol.is_none());
-                assert!(usm.priv_password.is_none());
-                assert!(usm.context_name.is_none());
+                assert_eq!(usm.username().as_ref(), b"readonly");
+                assert_eq!(usm.security_level(), SecurityLevel::NoAuthNoPriv);
+                assert!(usm.configured_context_name().is_empty());
             }
             Auth::Community { .. } => panic!("expected Usm variant"),
         }
@@ -451,11 +229,8 @@ mod tests {
             .into();
         match auth {
             Auth::Usm(usm) => {
-                assert_eq!(usm.username, "admin");
-                assert_eq!(usm.auth_protocol, Some(AuthProtocol::Sha256));
-                assert_eq!(usm.auth_password, Some("authpass123".to_string()));
-                assert!(usm.priv_protocol.is_none());
-                assert!(usm.priv_password.is_none());
+                assert_eq!(usm.username().as_ref(), b"admin");
+                assert_eq!(usm.security_level(), SecurityLevel::AuthNoPriv);
             }
             Auth::Community { .. } => panic!("expected Usm variant"),
         }
@@ -464,16 +239,17 @@ mod tests {
     #[test]
     fn test_usm_auth_priv() {
         let auth: Auth = Auth::usm("admin")
-            .auth(AuthProtocol::Sha256, "authpass")
-            .privacy(PrivProtocol::Aes128, "privpass")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                "authpass",
+                PrivProtocol::Aes128,
+                "privpass",
+            )
             .into();
         match auth {
             Auth::Usm(usm) => {
-                assert_eq!(usm.username, "admin");
-                assert_eq!(usm.auth_protocol, Some(AuthProtocol::Sha256));
-                assert_eq!(usm.auth_password, Some("authpass".to_string()));
-                assert_eq!(usm.priv_protocol, Some(PrivProtocol::Aes128));
-                assert_eq!(usm.priv_password, Some("privpass".to_string()));
+                assert_eq!(usm.username().as_ref(), b"admin");
+                assert_eq!(usm.security_level(), SecurityLevel::AuthPriv);
             }
             Auth::Community { .. } => panic!("expected Usm variant"),
         }
@@ -487,8 +263,8 @@ mod tests {
             .into();
         match auth {
             Auth::Usm(usm) => {
-                assert_eq!(usm.username, "admin");
-                assert_eq!(usm.context_name, Some("vlan100".to_string()));
+                assert_eq!(usm.username().as_ref(), b"admin");
+                assert_eq!(usm.configured_context_name().as_ref(), b"vlan100");
             }
             Auth::Community { .. } => panic!("expected Usm variant"),
         }
@@ -498,19 +274,15 @@ mod tests {
     fn test_usm_builder_chaining() {
         // Verify all methods can be chained
         let auth: Auth = Auth::usm("user")
-            .auth(AuthProtocol::Sha512, "auth")
-            .privacy(PrivProtocol::Aes256, "priv")
+            .auth_priv(AuthProtocol::Sha512, "auth", PrivProtocol::Aes256, "priv")
             .context_name("ctx")
             .into();
 
         match auth {
             Auth::Usm(usm) => {
-                assert_eq!(usm.username, "user");
-                assert_eq!(usm.auth_protocol, Some(AuthProtocol::Sha512));
-                assert_eq!(usm.auth_password, Some("auth".to_string()));
-                assert_eq!(usm.priv_protocol, Some(PrivProtocol::Aes256));
-                assert_eq!(usm.priv_password, Some("priv".to_string()));
-                assert_eq!(usm.context_name, Some("ctx".to_string()));
+                assert_eq!(usm.username().as_ref(), b"user");
+                assert_eq!(usm.security_level(), SecurityLevel::AuthPriv);
+                assert_eq!(usm.configured_context_name().as_ref(), b"ctx");
             }
             Auth::Community { .. } => panic!("expected Usm variant"),
         }
@@ -525,24 +297,28 @@ mod tests {
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
 
         // USM auth/priv passwords must not appear in Debug output.
-        let builder = Auth::usm("admin")
-            .auth(AuthProtocol::Sha256, "authpassword123")
-            .privacy(PrivProtocol::Aes128, "privpassword456")
+        let config = Auth::usm("admin")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                "authpassword123",
+                PrivProtocol::Aes128,
+                "privpassword456",
+            )
             .context_name("vlan100");
-        let builder_rendered = format!("{builder:?}");
+        let config_rendered = format!("{config:?}");
         assert!(
-            !builder_rendered.contains("authpassword123"),
-            "{builder_rendered}"
+            !config_rendered.contains("authpassword123"),
+            "{config_rendered}"
         );
         assert!(
-            !builder_rendered.contains("privpassword456"),
-            "{builder_rendered}"
+            !config_rendered.contains("privpassword456"),
+            "{config_rendered}"
         );
         // Non-secret fields remain visible.
-        assert!(builder_rendered.contains("admin"), "{builder_rendered}");
-        assert!(builder_rendered.contains("vlan100"), "{builder_rendered}");
+        assert!(config_rendered.contains("admin"), "{config_rendered}");
+        assert!(config_rendered.contains("vlan100"), "{config_rendered}");
 
-        let usm: Auth = builder.into();
+        let usm: Auth = config.into();
         let usm_rendered = format!("{usm:?}");
         assert!(!usm_rendered.contains("authpassword123"), "{usm_rendered}");
         assert!(!usm_rendered.contains("privpassword456"), "{usm_rendered}");

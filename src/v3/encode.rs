@@ -7,10 +7,10 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
+use super::{DerivedKeys, UsmConfig};
 use crate::error::internal::{AuthErrorKind, CryptoErrorKind, EncodeErrorKind};
 use crate::error::{Error, Result};
 use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
-use crate::notification::{DerivedKeys, UsmConfig};
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::v3::auth::authenticate_message;
@@ -55,7 +55,7 @@ pub fn encode_v3_message(
     // Build scoped PDU
     let scoped_pdu = ScopedPdu::new(
         Bytes::copy_from_slice(engine_id),
-        security.context_name.clone(),
+        security.configured_context_name().clone(),
         pdu.clone(),
     );
 
@@ -96,7 +96,7 @@ pub fn encode_v3_message(
         Bytes::copy_from_slice(engine_id),
         engine_boots,
         engine_time,
-        security.username.clone(),
+        security.username().clone(),
     );
 
     if let Some(key) = &auth_key {

@@ -170,22 +170,43 @@ impl V3Args {
     /// Otherwise, builds a community auth based on the version and community from common args.
     pub fn auth(&self, common: &CommonArgs) -> Result<Auth, String> {
         if let Some(ref username) = self.username {
-            let mut builder = Auth::usm(username);
-            if let Some(proto) = self.auth_protocol {
-                let pass = self
-                    .auth_password
-                    .as_ref()
-                    .ok_or("auth password required")?;
-                builder = builder.auth(proto, pass);
+            if self.auth_protocol.is_none() && self.auth_password.is_some() {
+                return Err("authentication protocol required when using auth password".into());
             }
-            if let Some(proto) = self.priv_protocol {
-                let pass = self
-                    .priv_password
-                    .as_ref()
-                    .ok_or("priv password required")?;
-                builder = builder.privacy(proto, pass);
+            if self.priv_protocol.is_none() && self.priv_password.is_some() {
+                return Err("privacy protocol required when using priv password".into());
             }
-            Ok(builder.into())
+
+            let config = match (
+                self.auth_protocol,
+                self.auth_password.as_deref(),
+                self.priv_protocol,
+                self.priv_password.as_deref(),
+            ) {
+                (None, _, None, _) => Auth::usm(username),
+                (Some(auth_protocol), Some(auth_password), None, _) => {
+                    Auth::usm(username).auth(auth_protocol, auth_password)
+                }
+                (
+                    Some(auth_protocol),
+                    Some(auth_password),
+                    Some(priv_protocol),
+                    Some(priv_password),
+                ) => Auth::usm(username).auth_priv(
+                    auth_protocol,
+                    auth_password,
+                    priv_protocol,
+                    priv_password,
+                ),
+                (None, _, Some(_), _) => {
+                    return Err("authentication protocol required when using privacy".into());
+                }
+                (Some(_), None, _, _) => return Err("auth password required".into()),
+                (Some(_), Some(_), Some(_), None) => {
+                    return Err("priv password required".into());
+                }
+            };
+            Ok(config.into())
         } else {
             let community = &common.community;
             Ok(match common.snmp_version {
@@ -198,6 +219,16 @@ impl V3Args {
     /// Validate V3 arguments and return an error message if invalid.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(ref _username) = self.username {
+            if self.auth_protocol.is_none() && self.auth_password.is_some() {
+                return Err(
+                    "authentication protocol (-a) required when using auth password".into(),
+                );
+            }
+
+            if self.priv_protocol.is_none() && self.priv_password.is_some() {
+                return Err("privacy protocol (-x) required when using priv password".into());
+            }
+
             // If auth-protocol is specified, auth-password is required
             if self.auth_protocol.is_some() && self.auth_password.is_none() {
                 return Err(
@@ -409,6 +440,20 @@ impl ValueType {
 mod tests {
     use super::*;
 
+    fn common_args() -> CommonArgs {
+        CommonArgs {
+            target: "192.168.1.1".to_string(),
+            snmp_version: SnmpVersion::V3,
+            community: "public".to_string(),
+            timeout: 5.0,
+            retries: 3,
+            backoff: BackoffStrategy::None,
+            backoff_delay: 100,
+            backoff_max: 5000,
+            backoff_jitter: 0.25,
+        }
+    }
+
     #[test]
     fn test_retry_config_none() {
         let args = CommonArgs {
@@ -499,6 +544,17 @@ mod tests {
         };
         assert!(args.validate().is_ok());
 
+        // Auth password without protocol - invalid
+        let args = V3Args {
+            username: Some("admin".to_string()),
+            auth_protocol: None,
+            auth_password: Some("pass".to_string()),
+            priv_protocol: None,
+            priv_password: None,
+        };
+        assert!(args.validate().is_err());
+        assert!(args.auth(&common_args()).is_err());
+
         // Auth protocol without password - invalid
         let args = V3Args {
             username: Some("admin".to_string()),
@@ -508,6 +564,29 @@ mod tests {
             priv_password: None,
         };
         assert!(args.validate().is_err());
+        assert!(args.auth(&common_args()).is_err());
+
+        // Privacy password without protocol - invalid
+        let args = V3Args {
+            username: Some("admin".to_string()),
+            auth_protocol: Some(AuthProtocol::Sha256),
+            auth_password: Some("authpass".to_string()),
+            priv_protocol: None,
+            priv_password: Some("privpass".to_string()),
+        };
+        assert!(args.validate().is_err());
+        assert!(args.auth(&common_args()).is_err());
+
+        // Privacy protocol without password - invalid
+        let args = V3Args {
+            username: Some("admin".to_string()),
+            auth_protocol: Some(AuthProtocol::Sha256),
+            auth_password: Some("authpass".to_string()),
+            priv_protocol: Some(PrivProtocol::Aes128),
+            priv_password: None,
+        };
+        assert!(args.validate().is_err());
+        assert!(args.auth(&common_args()).is_err());
 
         // Privacy without auth - invalid
         let args = V3Args {
@@ -518,6 +597,7 @@ mod tests {
             priv_password: Some("pass".to_string()),
         };
         assert!(args.validate().is_err());
+        assert!(args.auth(&common_args()).is_err());
 
         // SHA-1 with AES-256 - valid (key extension auto-applied)
         let args = V3Args {
@@ -528,6 +608,54 @@ mod tests {
             priv_password: Some("pass".to_string()),
         };
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_v3_args_auth_constructs_valid_security_levels() {
+        let no_auth = V3Args {
+            username: Some("user".to_string()),
+            auth_protocol: None,
+            auth_password: None,
+            priv_protocol: None,
+            priv_password: None,
+        }
+        .auth(&common_args())
+        .unwrap();
+        let Auth::Usm(no_auth) = no_auth else {
+            panic!("expected USM config");
+        };
+        assert_eq!(no_auth.auth_protocol(), None);
+        assert_eq!(no_auth.priv_protocol(), None);
+
+        let auth = V3Args {
+            username: Some("user".to_string()),
+            auth_protocol: Some(AuthProtocol::Sha256),
+            auth_password: Some("authpass".to_string()),
+            priv_protocol: None,
+            priv_password: None,
+        }
+        .auth(&common_args())
+        .unwrap();
+        let Auth::Usm(auth) = auth else {
+            panic!("expected USM config");
+        };
+        assert_eq!(auth.auth_protocol(), Some(AuthProtocol::Sha256));
+        assert_eq!(auth.priv_protocol(), None);
+
+        let auth_priv = V3Args {
+            username: Some("user".to_string()),
+            auth_protocol: Some(AuthProtocol::Sha1),
+            auth_password: Some("authpass".to_string()),
+            priv_protocol: Some(PrivProtocol::Aes128),
+            priv_password: Some("privpass".to_string()),
+        }
+        .auth(&common_args())
+        .unwrap();
+        let Auth::Usm(auth_priv) = auth_priv else {
+            panic!("expected USM config");
+        };
+        assert_eq!(auth_priv.auth_protocol(), Some(AuthProtocol::Sha1));
+        assert_eq!(auth_priv.priv_protocol(), Some(PrivProtocol::Aes128));
     }
 
     #[test]

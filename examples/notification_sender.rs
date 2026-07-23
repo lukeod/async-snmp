@@ -32,8 +32,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind("127.0.0.1:0")
         .engine_id(engine_id.clone())
         .usm_user("v3user", |u| {
-            u.auth(AuthProtocol::Sha256, b"authpass12345678")
-                .privacy(PrivProtocol::Aes128, b"privpass12345678")
+            u.auth_priv(
+                AuthProtocol::Sha256,
+                b"authpass12345678",
+                PrivProtocol::Aes128,
+                b"privpass12345678",
+            )
         })
         .build()
         .await?;
@@ -65,8 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .community(b"public")
         .engine_id(engine_id.clone())
         .usm_user("v3user", |u| {
-            u.auth(AuthProtocol::Sha256, b"authpass12345678")
-                .privacy(PrivProtocol::Aes128, b"privpass12345678")
+            u.auth_priv(
+                AuthProtocol::Sha256,
+                b"authpass12345678",
+                PrivProtocol::Aes128,
+                b"privpass12345678",
+            )
         })
         // Configure trap sinks - agent sends to all of them
         .trap_sink(recv_addr.to_string(), Auth::v2c("public"))
@@ -120,9 +128,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Client: sending v3 inform ---");
     let v3_priv_client = Client::builder(
         recv_addr.to_string(),
-        Auth::usm("v3user")
-            .auth(AuthProtocol::Sha256, "authpass12345678")
-            .privacy(PrivProtocol::Aes128, "privpass12345678"),
+        Auth::usm("v3user").auth_priv(
+            AuthProtocol::Sha256,
+            "authpass12345678",
+            PrivProtocol::Aes128,
+            "privpass12345678",
+        ),
     )
     .connect()
     .await?;

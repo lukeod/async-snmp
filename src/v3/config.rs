@@ -1,0 +1,497 @@
+//! USM configuration types for `SNMPv3` authentication.
+//!
+//! These types store authentication and privacy settings for `SNMPv3` operations
+//! used by clients, Agents, notification receivers, and trap sinks.
+
+use bytes::Bytes;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::message::SecurityLevel;
+use crate::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol};
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Password(Vec<u8>);
+
+impl AsRef<[u8]> for Password {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum UsmCredentials {
+    NoAuthNoPriv,
+    Passwords {
+        auth: (AuthProtocol, Password),
+        privacy: Option<(PrivProtocol, Password)>,
+    },
+    MasterKeys(crate::v3::MasterKeys),
+}
+
+/// USM user credentials for `SNMPv3` authentication.
+///
+/// A configuration represents exactly one valid USM security state:
+/// noAuthNoPriv, password-backed authNoPriv/authPriv, or master-key-backed
+/// authNoPriv/authPriv. Privacy-only and incomplete protocol/password states
+/// cannot be constructed.
+///
+/// # Master Key Caching
+///
+/// When polling many engines with shared credentials, use
+/// [`MasterKeys`](crate::MasterKeys) to cache the expensive password-to-key
+/// derivation. Calling [`with_master_keys`](Self::with_master_keys) replaces
+/// any password-backed credentials with cached master keys. Credential
+/// configurators use last-call-wins semantics.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UsmConfig {
+    username: Bytes,
+    credentials: UsmCredentials,
+    context_name: Bytes,
+}
+
+impl UsmConfig {
+    /// Create a noAuthNoPriv USM config with the given username.
+    pub fn new(username: impl Into<Bytes>) -> Self {
+        Self {
+            username: username.into(),
+            credentials: UsmCredentials::NoAuthNoPriv,
+            context_name: Bytes::new(),
+        }
+    }
+
+    /// Configure password-backed authentication (authNoPriv).
+    #[must_use]
+    pub fn auth(mut self, protocol: AuthProtocol, password: impl AsRef<[u8]>) -> Self {
+        self.credentials = UsmCredentials::Passwords {
+            auth: (protocol, Password(password.as_ref().to_vec())),
+            privacy: None,
+        };
+        self
+    }
+
+    /// Configure password-backed authentication and privacy (authPriv).
+    #[must_use]
+    pub fn auth_priv(
+        mut self,
+        auth_protocol: AuthProtocol,
+        auth_password: impl AsRef<[u8]>,
+        priv_protocol: PrivProtocol,
+        priv_password: impl AsRef<[u8]>,
+    ) -> Self {
+        self.credentials = UsmCredentials::Passwords {
+            auth: (auth_protocol, Password(auth_password.as_ref().to_vec())),
+            privacy: Some((priv_protocol, Password(priv_password.as_ref().to_vec()))),
+        };
+        self
+    }
+
+    /// Set the `SNMPv3` context name for scoped PDUs.
+    #[must_use]
+    pub fn context_name(mut self, context_name: impl Into<Bytes>) -> Self {
+        self.context_name = context_name.into();
+        self
+    }
+
+    /// Use pre-computed master keys for efficient key derivation.
+    #[must_use]
+    pub fn with_master_keys(mut self, master_keys: crate::v3::MasterKeys) -> Self {
+        self.credentials = UsmCredentials::MasterKeys(master_keys);
+        self
+    }
+
+    /// Return the configured USM username.
+    #[must_use]
+    pub fn username(&self) -> &Bytes {
+        &self.username
+    }
+
+    /// Return the configured scoped-PDU context name.
+    #[must_use]
+    pub fn configured_context_name(&self) -> &Bytes {
+        &self.context_name
+    }
+
+    /// Return the configured authentication protocol, if any.
+    #[must_use]
+    pub fn auth_protocol(&self) -> Option<AuthProtocol> {
+        match &self.credentials {
+            UsmCredentials::NoAuthNoPriv => None,
+            UsmCredentials::Passwords { auth, .. } => Some(auth.0),
+            UsmCredentials::MasterKeys(master_keys) => Some(master_keys.auth_protocol()),
+        }
+    }
+
+    /// Return the configured privacy protocol, if any.
+    #[must_use]
+    pub fn priv_protocol(&self) -> Option<PrivProtocol> {
+        match &self.credentials {
+            UsmCredentials::NoAuthNoPriv | UsmCredentials::Passwords { privacy: None, .. } => None,
+            UsmCredentials::Passwords {
+                privacy: Some((protocol, _)),
+                ..
+            } => Some(*protocol),
+            UsmCredentials::MasterKeys(master_keys) => master_keys.priv_protocol(),
+        }
+    }
+
+    /// Get the configured security level.
+    #[must_use]
+    pub fn security_level(&self) -> SecurityLevel {
+        match &self.credentials {
+            UsmCredentials::NoAuthNoPriv => SecurityLevel::NoAuthNoPriv,
+            UsmCredentials::Passwords { privacy: None, .. } => SecurityLevel::AuthNoPriv,
+            UsmCredentials::Passwords {
+                privacy: Some(_), ..
+            } => SecurityLevel::AuthPriv,
+            UsmCredentials::MasterKeys(master_keys) if master_keys.priv_protocol().is_some() => {
+                SecurityLevel::AuthPriv
+            }
+            UsmCredentials::MasterKeys(_) => SecurityLevel::AuthNoPriv,
+        }
+    }
+
+    /// Precompute and cache master keys from configured passwords.
+    ///
+    /// On success, the password-backed state is replaced so plaintext passwords
+    /// are no longer retained. On failure, the original password state remains
+    /// available so later key derivation reports the original crypto error.
+    pub(crate) fn precompute_master_keys(&mut self) {
+        let UsmCredentials::Passwords { auth, privacy } = &self.credentials else {
+            return;
+        };
+        let (auth_protocol, auth_password) = auth;
+        let master_keys = match crate::v3::MasterKeys::new(*auth_protocol, auth_password.as_ref()) {
+            Ok(master_keys) => master_keys,
+            Err(_) => return,
+        };
+        let master_keys = match privacy {
+            Some((priv_protocol, priv_password)) if priv_password == auth_password => {
+                master_keys.with_privacy_same_password(*priv_protocol)
+            }
+            Some((priv_protocol, priv_password)) => {
+                match master_keys.with_privacy(*priv_protocol, priv_password.as_ref()) {
+                    Ok(master_keys) => master_keys,
+                    Err(_) => return,
+                }
+            }
+            None => master_keys,
+        };
+        self.credentials = UsmCredentials::MasterKeys(master_keys);
+    }
+
+    /// Derive localized keys for a specific engine ID.
+    pub fn derive_keys(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
+        match &self.credentials {
+            UsmCredentials::NoAuthNoPriv => Ok(DerivedKeys {
+                auth_key: None,
+                priv_key: None,
+            }),
+            UsmCredentials::MasterKeys(master_keys) => {
+                tracing::trace!(target: "async_snmp::client", { engine_id_len = engine_id.len(), auth_protocol = ?master_keys.auth_protocol(), priv_protocol = ?master_keys.priv_protocol() }, "localizing from cached master keys");
+                let (auth_key, priv_key) = master_keys.localize(engine_id)?;
+                Ok(DerivedKeys {
+                    auth_key: Some(auth_key),
+                    priv_key,
+                })
+            }
+            UsmCredentials::Passwords { auth, privacy } => {
+                let (auth_protocol, auth_password) = auth;
+                tracing::trace!(target: "async_snmp::client", { engine_id_len = engine_id.len(), auth_protocol = ?auth_protocol }, "deriving localized keys from passwords");
+                let auth_key =
+                    LocalizedKey::from_password(*auth_protocol, auth_password.as_ref(), engine_id)?;
+                let priv_key = privacy
+                    .as_ref()
+                    .map(|(priv_protocol, priv_password)| {
+                        PrivKey::from_password(
+                            *auth_protocol,
+                            *priv_protocol,
+                            priv_password.as_ref(),
+                            engine_id,
+                        )
+                    })
+                    .transpose()?;
+                Ok(DerivedKeys {
+                    auth_key: Some(auth_key),
+                    priv_key,
+                })
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for UsmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (auth, auth_password, privacy, priv_password, master_keys) = match &self.credentials {
+            UsmCredentials::NoAuthNoPriv => (None, None, None, None, None),
+            UsmCredentials::Passwords { auth, privacy } => (
+                Some(auth.0),
+                Some("[REDACTED]"),
+                privacy.as_ref().map(|value| value.0),
+                privacy.as_ref().map(|_| "[REDACTED]"),
+                None,
+            ),
+            UsmCredentials::MasterKeys(master_keys) => (
+                Some(master_keys.auth_protocol()),
+                None,
+                master_keys.priv_protocol(),
+                None,
+                Some("[REDACTED]"),
+            ),
+        };
+        f.debug_struct("UsmConfig")
+            .field("username", &String::from_utf8_lossy(&self.username))
+            .field("auth_protocol", &auth)
+            .field("auth_password", &auth_password)
+            .field("priv_protocol", &privacy)
+            .field("priv_password", &priv_password)
+            .field("context_name", &String::from_utf8_lossy(&self.context_name))
+            .field("master_keys", &master_keys)
+            .finish()
+    }
+}
+
+/// Derived keys for a specific engine ID.
+///
+/// Used internally for V3 authentication in both client and notification receiver.
+#[derive(Debug)]
+pub struct DerivedKeys {
+    /// Localized authentication key
+    pub auth_key: Option<LocalizedKey>,
+    /// Privacy key
+    pub priv_key: Option<PrivKey>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_usm_user_config_no_auth() {
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"));
+        assert_eq!(config.security_level(), SecurityLevel::NoAuthNoPriv);
+        assert_eq!(config.auth_protocol(), None);
+        assert_eq!(config.priv_protocol(), None);
+    }
+
+    #[test]
+    fn test_usm_user_config_auth_only() {
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"))
+            .auth(AuthProtocol::Sha1, b"password123");
+        assert_eq!(config.security_level(), SecurityLevel::AuthNoPriv);
+        assert_eq!(config.auth_protocol(), Some(AuthProtocol::Sha1));
+        assert_eq!(config.priv_protocol(), None);
+        assert!(config.configured_context_name().is_empty());
+    }
+
+    #[test]
+    fn test_usm_user_config_auth_priv() {
+        let config = UsmConfig::new(Bytes::from_static(b"testuser")).auth_priv(
+            AuthProtocol::Sha256,
+            b"authpass",
+            PrivProtocol::Aes128,
+            b"privpass",
+        );
+        assert_eq!(config.security_level(), SecurityLevel::AuthPriv);
+        assert_eq!(config.auth_protocol(), Some(AuthProtocol::Sha256));
+        assert_eq!(config.priv_protocol(), Some(PrivProtocol::Aes128));
+    }
+
+    #[test]
+    fn test_usm_user_config_master_key_levels() {
+        let auth = crate::v3::MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
+        let auth_config = UsmConfig::new("user").with_master_keys(auth);
+        assert_eq!(auth_config.security_level(), SecurityLevel::AuthNoPriv);
+        assert_eq!(auth_config.auth_protocol(), Some(AuthProtocol::Sha256));
+        assert_eq!(auth_config.priv_protocol(), None);
+
+        let auth_priv = crate::v3::MasterKeys::new(AuthProtocol::Sha256, b"authpass")
+            .unwrap()
+            .with_privacy(PrivProtocol::Aes128, b"privpass")
+            .unwrap();
+        let auth_priv_config = UsmConfig::new("user").with_master_keys(auth_priv);
+        assert_eq!(auth_priv_config.security_level(), SecurityLevel::AuthPriv);
+        assert_eq!(auth_priv_config.auth_protocol(), Some(AuthProtocol::Sha256));
+        assert_eq!(auth_priv_config.priv_protocol(), Some(PrivProtocol::Aes128));
+        let keys = auth_priv_config.derive_keys(b"test-engine-id").unwrap();
+        assert!(keys.auth_key.is_some());
+        assert!(keys.priv_key.is_some());
+    }
+
+    #[test]
+    fn test_password_configurators_replace_master_keys() {
+        let master_keys = crate::v3::MasterKeys::new(AuthProtocol::Sha256, b"masterauthpass")
+            .unwrap()
+            .with_privacy(PrivProtocol::Aes128, b"masterprivpass")
+            .unwrap();
+        let auth_config = UsmConfig::new("user")
+            .with_master_keys(master_keys.clone())
+            .auth(AuthProtocol::Sha1, b"passwordauth");
+
+        assert_eq!(auth_config.security_level(), SecurityLevel::AuthNoPriv);
+        assert_eq!(auth_config.auth_protocol(), Some(AuthProtocol::Sha1));
+        assert_eq!(auth_config.priv_protocol(), None);
+
+        let auth_priv_config = UsmConfig::new("user")
+            .with_master_keys(master_keys)
+            .auth_priv(
+                AuthProtocol::Sha512,
+                b"otherauthpass",
+                PrivProtocol::Aes256,
+                b"otherprivpass",
+            );
+
+        assert_eq!(auth_priv_config.security_level(), SecurityLevel::AuthPriv);
+        assert_eq!(auth_priv_config.auth_protocol(), Some(AuthProtocol::Sha512));
+        assert_eq!(auth_priv_config.priv_protocol(), Some(PrivProtocol::Aes256));
+        assert!(
+            auth_priv_config
+                .derive_keys(b"test-engine-id")
+                .unwrap()
+                .priv_key
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_master_key_debug_redacts_key_material() {
+        let master_keys = crate::v3::MasterKeys::new(AuthProtocol::Sha256, b"masterauthpass")
+            .unwrap()
+            .with_privacy(PrivProtocol::Aes128, b"masterprivpass")
+            .unwrap();
+        let rendered = format!("{:?}", UsmConfig::new("user").with_master_keys(master_keys));
+
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(rendered.contains("auth_password: None"), "{rendered}");
+        assert!(rendered.contains("priv_password: None"), "{rendered}");
+        assert!(rendered.contains("master_keys: Some"), "{rendered}");
+        assert!(!rendered.contains("masterauthpass"), "{rendered}");
+        assert!(!rendered.contains("masterprivpass"), "{rendered}");
+    }
+
+    #[test]
+    fn test_usm_user_config_context_name() {
+        let config = UsmConfig::new(Bytes::from_static(b"testuser")).context_name("ctx");
+        assert_eq!(config.configured_context_name().as_ref(), b"ctx");
+    }
+
+    #[test]
+    fn test_usm_user_config_derive_keys() {
+        let config = UsmConfig::new(Bytes::from_static(b"testuser"))
+            .auth(AuthProtocol::Sha1, b"password123");
+
+        let engine_id = b"test-engine-id";
+        let keys = config.derive_keys(engine_id).unwrap();
+
+        assert!(keys.auth_key.is_some());
+        assert!(keys.priv_key.is_none());
+    }
+
+    #[test]
+    fn test_usm_user_config_derive_keys_with_privacy() {
+        let config = UsmConfig::new(Bytes::from_static(b"testuser")).auth_priv(
+            AuthProtocol::Sha256,
+            b"authpass",
+            PrivProtocol::Aes128,
+            b"privpass",
+        );
+
+        let engine_id = b"test-engine-id";
+        let keys = config.derive_keys(engine_id).unwrap();
+
+        assert!(keys.auth_key.is_some());
+        assert!(keys.priv_key.is_some());
+    }
+
+    /// Precomputing master keys populates the cache, so subsequent
+    /// `derive_keys` calls take the master-key localization path instead of
+    /// re-running the 1 MiB password expansion (the CPU-amplification vector).
+    #[test]
+    fn test_precompute_master_keys_replaces_passwords() {
+        let mut config = UsmConfig::new(Bytes::from_static(b"testuser")).auth_priv(
+            AuthProtocol::Sha256,
+            b"authpass",
+            PrivProtocol::Aes128,
+            b"privpass",
+        );
+
+        config.precompute_master_keys();
+        assert!(matches!(config.credentials, UsmCredentials::MasterKeys(_)));
+
+        // Idempotent: a second call is a no-op and keeps the cache.
+        config.precompute_master_keys();
+        assert!(matches!(config.credentials, UsmCredentials::MasterKeys(_)));
+    }
+
+    /// The cached (master-key) path and the uncached (password) path must
+    /// derive identical localized keys, for both auth-only and authPriv.
+    #[test]
+    fn test_precompute_master_keys_preserves_derivation() {
+        let engine_id = b"\x80\x00\x00\x00\x01test-engine";
+
+        // authNoPriv
+        let uncached =
+            UsmConfig::new(Bytes::from_static(b"u")).auth(AuthProtocol::Sha256, b"authpass");
+        let mut cached = uncached.clone();
+        cached.precompute_master_keys();
+        let a = uncached.derive_keys(engine_id).unwrap();
+        let b = cached.derive_keys(engine_id).unwrap();
+        assert_eq!(
+            a.auth_key.as_ref().map(AsRef::as_ref),
+            b.auth_key.as_ref().map(AsRef::as_ref),
+            "auth key must match between password and master-key paths"
+        );
+
+        // authPriv, distinct auth/priv passwords
+        let uncached = UsmConfig::new(Bytes::from_static(b"u")).auth_priv(
+            AuthProtocol::Sha1,
+            b"authpassword",
+            PrivProtocol::Aes128,
+            b"privpassword",
+        );
+        let mut cached = uncached.clone();
+        cached.precompute_master_keys();
+        let a = uncached.derive_keys(engine_id).unwrap();
+        let b = cached.derive_keys(engine_id).unwrap();
+        assert_eq!(
+            a.auth_key.as_ref().map(AsRef::as_ref),
+            b.auth_key.as_ref().map(AsRef::as_ref),
+        );
+        let a_priv = a.priv_key.as_ref().expect("password path privacy key");
+        let b_priv = b.priv_key.as_ref().expect("master-key path privacy key");
+        assert_eq!(a_priv.protocol(), b_priv.protocol());
+        assert_eq!(a_priv.encryption_key(), b_priv.encryption_key());
+
+        // authPriv, same auth/priv password (with_privacy_same_password path)
+        let uncached = UsmConfig::new(Bytes::from_static(b"u")).auth_priv(
+            AuthProtocol::Sha1,
+            b"sharedpassword",
+            PrivProtocol::Aes128,
+            b"sharedpassword",
+        );
+        let mut cached = uncached.clone();
+        cached.precompute_master_keys();
+        let a = uncached.derive_keys(engine_id).unwrap();
+        let b = cached.derive_keys(engine_id).unwrap();
+        assert_eq!(
+            a.auth_key.as_ref().map(AsRef::as_ref),
+            b.auth_key.as_ref().map(AsRef::as_ref),
+        );
+        let a_priv = a.priv_key.as_ref().expect("password path privacy key");
+        let b_priv = b.priv_key.as_ref().expect("master-key path privacy key");
+        assert_eq!(a_priv.protocol(), b_priv.protocol());
+        assert_eq!(a_priv.encryption_key(), b_priv.encryption_key());
+    }
+
+    /// A password too short for the crypto backend leaves the config on the
+    /// original password path (no silent success, error preserved for later).
+    #[test]
+    fn test_precompute_master_keys_short_password_is_noop() {
+        let mut config =
+            UsmConfig::new(Bytes::from_static(b"u")).auth(AuthProtocol::Sha256, b"short");
+        config.precompute_master_keys();
+        assert!(
+            matches!(config.credentials, UsmCredentials::Passwords { .. }),
+            "a rejected password must preserve the password-backed state"
+        );
+    }
+}

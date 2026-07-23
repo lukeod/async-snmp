@@ -45,8 +45,12 @@
 //! let receiver = NotificationReceiver::builder()
 //!     .bind("0.0.0.0:162")
 //!     .usm_user("informuser", |u| {
-//!         u.auth(AuthProtocol::Sha1, b"authpass123")
-//!          .privacy(PrivProtocol::Aes128, b"privpass123")
+//!         u.auth_priv(
+//!             AuthProtocol::Sha1,
+//!             b"authpass123",
+//!             PrivProtocol::Aes128,
+//!             b"privpass123",
+//!         )
 //!     })
 //!     .build()
 //!     .await?;
@@ -70,8 +74,12 @@
 //!     .bind("0.0.0.0:162")
 //!     .communities(["public", "monitor"]) // gates v1/v2c
 //!     .usm_user("trapuser", |u| {          // gates v3
-//!         u.auth(AuthProtocol::Sha1, b"authpass123")
-//!          .privacy(PrivProtocol::Aes128, b"privpass123")
+//!         u.auth_priv(
+//!             AuthProtocol::Sha1,
+//!             b"authpass123",
+//!             PrivProtocol::Aes128,
+//!             b"privpass123",
+//!         )
 //!     })
 //!     .build()
 //!     .await?;
@@ -86,7 +94,6 @@
 //! branch on the variant when `recv` returns to apply per-version policy.
 
 mod handlers;
-mod types;
 mod varbind;
 
 use std::collections::HashMap;
@@ -110,8 +117,8 @@ use crate::v3::{EngineState, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
-// Re-exports
-pub use types::{DerivedKeys, UsmConfig};
+// Re-exports retained for compatibility with the original notification-local path.
+pub use crate::v3::{DerivedKeys, UsmConfig};
 pub use varbind::validate_notification_varbinds;
 
 /// Maximum number of distinct remote authoritative engines whose timeliness
@@ -264,8 +271,12 @@ impl NotificationReceiverBuilder {
     /// let receiver = NotificationReceiver::builder()
     ///     .bind("0.0.0.0:162")
     ///     .usm_user("trapuser", |u| {
-    ///         u.auth(AuthProtocol::Sha1, b"authpassword")
-    ///          .privacy(PrivProtocol::Aes128, b"privpassword")
+    ///         u.auth_priv(
+    ///             AuthProtocol::Sha1,
+    ///             b"authpassword",
+    ///             PrivProtocol::Aes128,
+    ///             b"privpassword",
+    ///         )
     ///     })
     ///     .build()
     ///     .await?;
@@ -370,11 +381,9 @@ impl NotificationReceiverBuilder {
 
     /// Build the notification receiver.
     pub async fn build(mut self) -> Result<NotificationReceiver> {
-        // Reject any USM user configured with privacy but no authentication,
-        // and precompute master keys so the expensive password expansion runs
-        // once here instead of on every inbound packet (CPU amplification).
+        // Precompute master keys so the expensive password expansion runs once
+        // here instead of on every inbound packet (CPU amplification).
         for config in self.usm_users.values_mut() {
-            config.validate()?;
             config.precompute_master_keys();
         }
 
@@ -927,24 +936,6 @@ mod tests {
             .get(&Bytes::from_static(b"trapuser"))
             .unwrap();
         assert_eq!(user.security_level(), SecurityLevel::AuthNoPriv);
-    }
-
-    #[tokio::test]
-    async fn test_receiver_builder_rejects_privacy_without_auth() {
-        let result = NotificationReceiverBuilder::new()
-            .bind("127.0.0.1:0")
-            .usm_user("noauth", |u| {
-                u.privacy(crate::v3::PrivProtocol::Aes128, b"privpass")
-            })
-            .build()
-            .await;
-        match result {
-            Err(err) => assert!(
-                matches!(*err, Error::Config(_)),
-                "expected Config error, got {err:?}"
-            ),
-            Ok(_) => panic!("privacy without auth must be rejected"),
-        }
     }
 
     #[test]
@@ -2007,8 +1998,12 @@ mod tests {
             .bind("127.0.0.1:0")
             .engine_id(b"my-receiver-engine".to_vec())
             .usm_user("privuser", |u| {
-                u.auth(AuthProtocol::Sha1, b"authpass12345678")
-                    .privacy(crate::v3::PrivProtocol::Aes128, b"privpass12345678")
+                u.auth_priv(
+                    AuthProtocol::Sha1,
+                    b"authpass12345678",
+                    crate::v3::PrivProtocol::Aes128,
+                    b"privpass12345678",
+                )
             })
             .build()
             .await

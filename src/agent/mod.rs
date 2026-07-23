@@ -96,11 +96,11 @@ use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 
 use crate::error::{Error, ErrorStatus, Result};
 use crate::handler::{GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext};
-use crate::notification::UsmConfig;
 use crate::oid;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::util::bind_udp_socket;
+use crate::v3::UsmConfig;
 use crate::v3::process::UsmStats;
 use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
@@ -389,8 +389,12 @@ impl AgentBuilder {
     ///     })
     ///     // Admin user with full encryption
     ///     .usm_user("admin", |u| {
-    ///         u.auth(AuthProtocol::Sha256, b"adminauth123")
-    ///          .privacy(PrivProtocol::Aes128, b"adminpriv123")
+    ///         u.auth_priv(
+    ///             AuthProtocol::Sha256,
+    ///             b"adminauth123",
+    ///             PrivProtocol::Aes128,
+    ///             b"adminpriv123",
+    ///         )
     ///     })
     ///     .build()
     ///     .await?;
@@ -624,9 +628,12 @@ impl AgentBuilder {
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
     ///     .trap_sink("192.168.1.100:162", Auth::v2c("public"))
-    ///     .trap_sink("10.0.0.1:162", Auth::usm("trapuser")
-    ///         .auth(AuthProtocol::Sha256, "authpass")
-    ///         .privacy(PrivProtocol::Aes128, "privpass"))
+    ///     .trap_sink("10.0.0.1:162", Auth::usm("trapuser").auth_priv(
+    ///         AuthProtocol::Sha256,
+    ///         "authpass",
+    ///         PrivProtocol::Aes128,
+    ///         "privpass",
+    ///     ))
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -687,11 +694,9 @@ impl AgentBuilder {
 
     /// Build the agent.
     pub async fn build(mut self) -> Result<Agent> {
-        // Reject any USM user configured with privacy but no authentication,
-        // and precompute master keys so the expensive password expansion runs
-        // once here instead of on every inbound packet (CPU amplification).
+        // Precompute master keys so the expensive password expansion runs once
+        // here instead of on every inbound packet (CPU amplification).
         for config in self.usm_users.values_mut() {
-            config.validate()?;
             config.precompute_master_keys();
         }
 
@@ -1907,24 +1912,6 @@ mod tests {
         let builder =
             AgentBuilder::new().handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler));
         assert_eq!(builder.handlers.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_agent_builder_rejects_privacy_without_auth() {
-        let result = AgentBuilder::new()
-            .bind("127.0.0.1:0")
-            .usm_user("noauth", |u| {
-                u.privacy(crate::v3::PrivProtocol::Aes128, b"privpass")
-            })
-            .build()
-            .await;
-        match result {
-            Err(err) => assert!(
-                matches!(*err, Error::Config(_)),
-                "expected Config error, got {err:?}"
-            ),
-            Ok(_) => panic!("privacy without auth must be rejected"),
-        }
     }
 
     #[tokio::test]

@@ -31,11 +31,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("--- SNMPv3 authPriv (SHA-1 + AES-128) ---\n");
 
-    // Build authentication using the fluent builder API
+    // Build authentication using the USM configuration API
     // Uses container user: privaes128_user (SHA + AES-128)
-    let auth = Auth::usm("privaes128_user")
-        .auth(AuthProtocol::Sha1, "authpass123")
-        .privacy(PrivProtocol::Aes128, "privpass123");
+    let auth = Auth::usm("privaes128_user").auth_priv(
+        AuthProtocol::Sha1,
+        "authpass123",
+        PrivProtocol::Aes128,
+        "privpass123",
+    );
 
     let client = Client::builder(target, auth)
         .timeout(Duration::from_secs(10))
@@ -56,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Uses container user: authsha256_user (SHA-256 auth, no privacy)
     let auth_only = Auth::usm("authsha256_user").auth(AuthProtocol::Sha256, "authpass123");
-    // Note: no .privacy() call
+    // auth() selects authNoPriv.
 
     let client_auth = Client::builder(target, auth_only)
         .timeout(Duration::from_secs(10))
@@ -111,7 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let targets = [("192.0.2.1", 161), ("192.0.2.2", 161), ("192.0.2.3", 161)];
 
     for target_addr in &targets {
-        // Clone master keys (cheap - just Arc increment)
+        // Cloning copies only the small zeroizing key buffers and avoids
+        // repeating password-to-key derivation.
         let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
 
         // Each client reuses the master keys; only localization is performed
@@ -158,9 +162,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - PrivProtocol::Aes192
     // - PrivProtocol::Aes256   (strongest)
 
-    let strong_auth = Auth::usm("admin")
-        .auth(AuthProtocol::Sha512, "strongauthpass")
-        .privacy(PrivProtocol::Aes256, "strongprivpass");
+    let strong_auth = Auth::usm("admin").auth_priv(
+        AuthProtocol::Sha512,
+        "strongauthpass",
+        PrivProtocol::Aes256,
+        "strongprivpass",
+    );
 
     println!("Created auth config: SHA-512 + AES-256");
     println!("Auth protocol: {:?}", AuthProtocol::Sha512);
@@ -176,8 +183,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Some agents use context names for View-based Access Control (VACM)
     let auth_with_context = Auth::usm("snmpuser")
-        .auth(AuthProtocol::Sha256, "authpass123")
-        .privacy(PrivProtocol::Aes128, "privpass123")
+        .auth_priv(
+            AuthProtocol::Sha256,
+            "authpass123",
+            PrivProtocol::Aes128,
+            "privpass123",
+        )
         .context_name("vlan100");
 
     println!("Created auth config with context name 'vlan100'");

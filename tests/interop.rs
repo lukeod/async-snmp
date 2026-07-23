@@ -370,9 +370,12 @@ async fn v3_auth_priv() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVAES128_USER)
-            .auth(AuthProtocol::Sha1, AUTH_PASS)
-            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+        Auth::usm(users::PRIVAES128_USER).auth_priv(
+            AuthProtocol::Sha1,
+            AUTH_PASS,
+            PrivProtocol::Aes128,
+            PRIV_PASS,
+        ),
     )
     .timeout(Duration::from_secs(5))
     .connect()
@@ -495,9 +498,12 @@ async fn v3_priv_des() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVDES_USER)
-            .auth(AuthProtocol::Sha1, AUTH_PASS)
-            .privacy(PrivProtocol::Des, PRIV_PASS),
+        Auth::usm(users::PRIVDES_USER).auth_priv(
+            AuthProtocol::Sha1,
+            AUTH_PASS,
+            PrivProtocol::Des,
+            PRIV_PASS,
+        ),
     )
     .timeout(Duration::from_secs(5))
     .connect()
@@ -517,9 +523,12 @@ async fn v3_priv_aes128() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVAES128_USER)
-            .auth(AuthProtocol::Sha1, AUTH_PASS)
-            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+        Auth::usm(users::PRIVAES128_USER).auth_priv(
+            AuthProtocol::Sha1,
+            AUTH_PASS,
+            PrivProtocol::Aes128,
+            PRIV_PASS,
+        ),
     )
     .timeout(Duration::from_secs(5))
     .connect()
@@ -692,9 +701,12 @@ async fn v3_engine_discovery_and_request() {
     // This test verifies the full V3 flow: discovery + authenticated request
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVAES128_USER)
-            .auth(AuthProtocol::Sha1, AUTH_PASS)
-            .privacy(PrivProtocol::Aes128, PRIV_PASS),
+        Auth::usm(users::PRIVAES128_USER).auth_priv(
+            AuthProtocol::Sha1,
+            AUTH_PASS,
+            PrivProtocol::Aes128,
+            PRIV_PASS,
+        ),
     )
     .timeout(Duration::from_secs(5))
     .connect()

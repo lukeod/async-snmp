@@ -748,6 +748,31 @@ impl EngineCache {
         )
     }
 
+    /// Evaluate authenticated timeliness against a coherent live/cache
+    /// snapshot without publishing the message tuple or refreshing cache TTL.
+    ///
+    /// Used while a response to a packet-local compatibility correction is
+    /// still provisional. The returned state may be merged only after full
+    /// response correlation succeeds.
+    pub(crate) fn timeliness_candidate(
+        &self,
+        target: &SocketAddr,
+        local_state: &EngineState,
+        engine_id: &[u8],
+        msg_boots: u32,
+        msg_time: u32,
+    ) -> Option<(bool, EngineState)> {
+        let inner = self.inner.read().ok()?;
+        let cached_engine_id = &inner.targets.get(target)?.engine_id;
+        if cached_engine_id.as_ref() != engine_id || local_state.engine_id.as_ref() != engine_id {
+            return None;
+        }
+        let mut candidate = local_state.clone();
+        candidate.merge_from(&compose_cached_state(&inner, target)?);
+        let timely = candidate.check_and_update_timeliness(msg_boots, msg_time);
+        Some((timely, candidate))
+    }
+
     fn check_and_update_timeliness_at(
         &self,
         target: &SocketAddr,

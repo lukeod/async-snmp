@@ -132,9 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- SNMPv3 over TCP ---\n");
 
     // Uses container user: privaes128_user (SHA + AES-128)
-    let auth = Auth::usm("privaes128_user")
-        .auth(AuthProtocol::Sha1, "authpass123")
-        .privacy(PrivProtocol::Aes128, "privpass123");
+    let auth = Auth::usm("privaes128_user").auth_priv(
+        AuthProtocol::Sha1,
+        "authpass123",
+        PrivProtocol::Aes128,
+        "privpass123",
+    );
 
     match Client::builder(target, auth)
         .timeout(Duration::from_secs(15))

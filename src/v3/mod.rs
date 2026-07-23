@@ -15,6 +15,7 @@
 //! the crate-level documentation for details.
 
 pub mod auth;
+mod config;
 mod crypto;
 pub(crate) mod encode;
 mod engine;
@@ -24,6 +25,7 @@ mod report;
 mod usm;
 
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
+pub use config::{DerivedKeys, UsmConfig};
 #[cfg(feature = "crypto-fips")]
 pub use crypto::AwsLcFipsProvider;
 #[cfg(feature = "crypto-rustcrypto")]
