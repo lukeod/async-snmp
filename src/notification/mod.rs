@@ -708,15 +708,7 @@ impl NotificationReceiver {
             source: e,
         })?;
 
-        let engine_id: Bytes = {
-            let mut id = vec![0x80, 0x00, 0x00, 0x00, 0x01];
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            id.extend_from_slice(&timestamp.to_be_bytes());
-            Bytes::from(id)
-        };
+        let engine_id = crate::v3::generate_engine_id();
 
         Ok(Self {
             inner: Arc::new(ReceiverInner {
@@ -1750,10 +1742,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_generates_engine_id() {
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
-        assert!(!receiver.engine_id().is_empty());
+        let first = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let second = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+
+        crate::v3::validate_engine_id(first.engine_id()).unwrap();
+        crate::v3::validate_engine_id(second.engine_id()).unwrap();
         // RFC 3411 format: starts with 0x80 enterprise indicator
-        assert_eq!(receiver.engine_id()[0], 0x80);
+        assert_eq!(first.engine_id()[0], 0x80);
+        assert_ne!(first.engine_id(), second.engine_id());
     }
 
     #[tokio::test]
