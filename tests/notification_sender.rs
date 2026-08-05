@@ -2,10 +2,14 @@
 
 use async_snmp::agent::Agent;
 use async_snmp::notification::{Notification, NotificationReceiver};
-use async_snmp::v3::{AuthProtocol, PrivProtocol};
+use async_snmp::v3::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
 use async_snmp::varbind::VarBind;
 use async_snmp::{Auth, Client, Pdu, Retry, Value, oid};
 use std::time::Duration;
+
+fn test_authoritative_engine(engine_id: Vec<u8>) -> AuthoritativeEngine {
+    AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(())).unwrap()
+}
 
 // ============================================================================
 // PDU constructor unit tests
@@ -168,10 +172,11 @@ async fn v3_trap_send_receive() {
     // The receiver must be configured with the sender's engine ID so it can
     // verify the authentication.
     let shared_engine_id = b"test-trap-sender-engine".to_vec();
+    let shared_engine = test_authoritative_engine(shared_engine_id);
 
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
-        .engine_id(shared_engine_id.clone())
+        .authoritative_engine(shared_engine.clone())
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
@@ -184,7 +189,7 @@ async fn v3_trap_send_receive() {
         recv_addr.to_string(),
         Auth::usm("trapuser").auth(AuthProtocol::Sha256, "authpass12345678"),
     )
-    .local_engine_id(shared_engine_id)
+    .local_authoritative_engine(shared_engine)
     .connect()
     .await
     .unwrap();
@@ -219,8 +224,10 @@ async fn v3_trap_send_receive() {
 
 #[tokio::test]
 async fn v3_inform_send_receive() {
+    let engine = test_authoritative_engine(b"inform-receiver-engine".to_vec());
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
+        .authoritative_engine(engine)
         .usm_user("informuser", |u| {
             u.auth_priv(
                 AuthProtocol::Sha256,
@@ -399,9 +406,11 @@ async fn v1_inform_returns_error() {
 }
 
 #[tokio::test]
-async fn v3_trap_without_local_engine_id_returns_error() {
+async fn v3_trap_without_local_authoritative_engine_returns_error() {
+    let engine = test_authoritative_engine(b"trap-receiver-engine".to_vec());
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
+        .authoritative_engine(engine)
         .usm_user("user", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
@@ -414,7 +423,7 @@ async fn v3_trap_without_local_engine_id_returns_error() {
         recv_addr.to_string(),
         Auth::usm("user").auth(AuthProtocol::Sha256, "authpass12345678"),
     )
-    // No local_engine_id set
+    // No local authoritative engine state set.
     .connect()
     .await
     .unwrap();
@@ -506,10 +515,11 @@ async fn agent_v2c_inform_to_sink() {
 async fn agent_v3_trap_to_sink() {
     // Agent sends V3 trap using its own engine_id
     let engine_id = b"agent-trap-test-engine".to_vec();
+    let engine = test_authoritative_engine(engine_id);
 
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
-        .engine_id(engine_id.clone())
+        .authoritative_engine(engine.clone())
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
@@ -521,7 +531,7 @@ async fn agent_v3_trap_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .engine_id(engine_id)
+        .authoritative_engine(engine)
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })

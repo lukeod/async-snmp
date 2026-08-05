@@ -8,6 +8,7 @@
 //! - Authentication (HMAC-MD5-96, HMAC-SHA-96, HMAC-SHA-224/256/384/512)
 //! - Privacy (DES-CBC, 3DES-EDE-CBC, AES-128/192/256-CFB)
 //! - Engine discovery and time synchronization
+//! - Validated, increment-before-use authoritative engine startup state
 //! - Pluggable cryptographic backends via the [`CryptoProvider`] trait
 //!
 //! The crypto backend is selected at compile time via the `crypto-rustcrypto`
@@ -15,6 +16,7 @@
 //! the crate-level documentation for details.
 
 pub mod auth;
+mod authoritative;
 mod config;
 mod crypto;
 pub(crate) mod encode;
@@ -25,6 +27,7 @@ mod report;
 mod usm;
 
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
+pub use authoritative::{AuthoritativeEngine, PersistedAuthoritativeEngine};
 pub use config::{DerivedKeys, UsmConfig};
 #[cfg(feature = "crypto-fips")]
 pub use crypto::AwsLcFipsProvider;

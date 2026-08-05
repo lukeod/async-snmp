@@ -39,11 +39,17 @@
 //!
 //! ```rust,no_run
 //! use async_snmp::notification::NotificationReceiver;
-//! use async_snmp::{AuthProtocol, PrivProtocol};
+//! use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+//! use std::convert::Infallible;
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
+//! # // Replace this no-op with durable storage in an application.
+//! let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
+//!     Ok::<(), Infallible>(())
+//! })?;
 //! let receiver = NotificationReceiver::builder()
 //!     .bind("0.0.0.0:162")
+//!     .authoritative_engine(engine)
 //!     .usm_user("informuser", |u| {
 //!         u.auth_priv(
 //!             AuthProtocol::Sha1,
@@ -67,11 +73,17 @@
 //!
 //! ```rust,no_run
 //! use async_snmp::notification::NotificationReceiver;
-//! use async_snmp::{AuthProtocol, PrivProtocol};
+//! use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+//! use std::convert::Infallible;
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
+//! # // Replace this no-op with durable storage in an application.
+//! let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
+//!     Ok::<(), Infallible>(())
+//! })?;
 //! let receiver = NotificationReceiver::builder()
 //!     .bind("0.0.0.0:162")
+//!     .authoritative_engine(engine)
 //!     .communities(["public", "monitor"]) // gates v1/v2c
 //!     .usm_user("trapuser", |u| {          // gates v3
 //!         u.auth_priv(
@@ -113,7 +125,7 @@ use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 use crate::util::bind_udp_socket;
 use crate::v3::process::UsmStats;
-use crate::v3::{EngineState, SaltCounter};
+use crate::v3::{AuthoritativeEngine, EngineState, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
@@ -229,8 +241,7 @@ pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
     communities: Vec<Vec<u8>>,
-    engine_id: Option<Vec<u8>>,
-    engine_boots: u32,
+    authoritative_engine: Option<AuthoritativeEngine>,
 }
 
 impl NotificationReceiverBuilder {
@@ -245,8 +256,7 @@ impl NotificationReceiverBuilder {
             bind_addr: "0.0.0.0:162".to_string(),
             usm_users: HashMap::new(),
             communities: Vec::new(),
-            engine_id: None,
-            engine_boots: 1,
+            authoritative_engine: None,
         }
     }
 
@@ -358,24 +368,35 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Set the engine ID for `SNMPv3`.
+    /// Set the persisted local authoritative engine state for `SNMPv3`.
     ///
-    /// If not set, a valid RFC 3411 engine ID with a random local
-    /// identifier is generated. A supplied engine ID is validated at
-    /// build time (5..32 octets, not all-zero, not all-0xff).
+    /// A receiver with USM users can be authoritative for Informs and requires
+    /// this value. Construct it with [`AuthoritativeEngine::install`] on first
+    /// installation or [`AuthoritativeEngine::restart`] on later starts.
     #[must_use]
-    pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
-        self.engine_id = Some(engine_id.into());
+    pub fn authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
+        self.authoritative_engine = Some(engine);
         self
     }
 
-    /// Set the initial engine boots value.
-    ///
-    /// This should be persisted across restarts and incremented each time
-    /// the receiver starts. Default is 1.
-    #[must_use]
-    pub fn engine_boots(mut self, boots: u32) -> Self {
-        self.engine_boots = boots;
+    #[cfg(test)]
+    pub(crate) fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
+        let boots = self
+            .authoritative_engine
+            .as_ref()
+            .map_or(1, AuthoritativeEngine::engine_boots);
+        self.authoritative_engine = Some(AuthoritativeEngine::for_test(engine_id.into(), boots));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn engine_boots(mut self, boots: u32) -> Self {
+        let engine_id = self
+            .authoritative_engine
+            .as_ref()
+            .map(|engine| engine.engine_id().to_vec())
+            .unwrap_or_else(|| crate::v3::generate_engine_id().to_vec());
+        self.authoritative_engine = Some(AuthoritativeEngine::for_test(engine_id, boots));
         self
     }
 
@@ -403,13 +424,19 @@ impl NotificationReceiverBuilder {
             source: e,
         })?;
 
-        // Validate a user-supplied engine ID, or generate a valid random one.
-        let engine_id: Bytes = match self.engine_id {
-            Some(id) => {
-                crate::v3::validate_engine_id(&id)?;
-                Bytes::from(id)
+        let (engine_id, engine_boots) = match self.authoritative_engine {
+            Some(engine) => (
+                Bytes::copy_from_slice(engine.engine_id()),
+                engine.engine_boots(),
+            ),
+            None if !self.usm_users.is_empty() => {
+                return Err(Error::Config(
+                    "authoritative engine state is required for SNMPv3 notification receiving"
+                        .into(),
+                )
+                .boxed());
             }
-            None => crate::v3::generate_engine_id(),
+            None => (crate::v3::generate_engine_id(), 1),
         };
 
         Ok(NotificationReceiver {
@@ -420,7 +447,7 @@ impl NotificationReceiverBuilder {
                 communities: self.communities,
                 engine_id,
                 salt_counter: SaltCounter::new(),
-                engine_boots_base: self.engine_boots,
+                engine_boots_base: engine_boots,
                 engine_start: Instant::now(),
                 usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(HashMap::new()),
@@ -746,6 +773,12 @@ impl NotificationReceiver {
         &self.inner.engine_id
     }
 
+    /// Get the current local authoritative engine boots value.
+    #[must_use]
+    pub fn engine_boots(&self) -> u32 {
+        self.inner.authoritative_boots_time().0
+    }
+
     /// Get the usmStatsUnknownEngineIDs counter value.
     #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
@@ -938,6 +971,18 @@ mod tests {
         assert_eq!(user.security_level(), SecurityLevel::AuthNoPriv);
     }
 
+    #[tokio::test]
+    async fn test_v3_receiver_requires_authoritative_engine() {
+        let result = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .usm_user("user", |user| user)
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(matches!(*err, Error::Config(_)));
+    }
+
     #[test]
     fn test_notification_v3_inform() {
         let notification = Notification::InformV3 {
@@ -1033,15 +1078,16 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_engine_boots_default() {
+    fn test_builder_authoritative_engine_default() {
         let builder = NotificationReceiverBuilder::new();
-        assert_eq!(builder.engine_boots, 1);
+        assert!(builder.authoritative_engine.is_none());
     }
 
     #[test]
-    fn test_builder_engine_boots_custom() {
-        let builder = NotificationReceiverBuilder::new().engine_boots(5);
-        assert_eq!(builder.engine_boots, 5);
+    fn test_builder_authoritative_engine_custom() {
+        let engine = AuthoritativeEngine::for_test(b"test-engine".to_vec(), 5);
+        let builder = NotificationReceiverBuilder::new().authoritative_engine(engine);
+        assert_eq!(builder.authoritative_engine.unwrap().engine_boots(), 5);
     }
 
     /// Build a V3 notification message of the given PDU type with the given
@@ -1805,8 +1851,7 @@ mod tests {
     #[test]
     fn test_auto_generated_engine_id_non_empty() {
         let builder = NotificationReceiverBuilder::new();
-        // engine_id field should be None (auto-generate on build)
-        assert!(builder.engine_id.is_none());
+        assert!(builder.authoritative_engine.is_none());
     }
 
     #[tokio::test]

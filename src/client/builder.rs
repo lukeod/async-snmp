@@ -19,7 +19,7 @@ use crate::client::{
 };
 use crate::error::{Error, Result};
 use crate::transport::{TcpTransport, Transport, UdpHandle, UdpTransport};
-use crate::v3::{EngineCache, validate_engine_id};
+use crate::v3::{AuthoritativeEngine, EngineCache};
 use crate::version::Version;
 
 use super::Client;
@@ -149,8 +149,7 @@ pub struct ClientBuilder {
     engine_cache: Option<Arc<EngineCache>>,
     strict_source: bool,
     allow_unauthenticated_v3_time_correction: bool,
-    local_engine_id: Option<Vec<u8>>,
-    local_engine_boots: u32,
+    local_authoritative_engine: Option<AuthoritativeEngine>,
 }
 
 impl ClientBuilder {
@@ -197,8 +196,7 @@ impl ClientBuilder {
             engine_cache: None,
             strict_source: false,
             allow_unauthenticated_v3_time_correction: false,
-            local_engine_id: None,
-            local_engine_boots: 1,
+            local_authoritative_engine: None,
         }
     }
 
@@ -389,36 +387,31 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the local engine ID for V3 trap sending.
+    /// Set the persisted local authoritative engine state for V3 trap sending.
     ///
     /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
-    /// trap PDUs. This engine ID is used to localize keys for outbound V3 traps.
-    /// Required when sending V3 traps; not needed for V3 informs (which use
-    /// engine discovery against the receiver). Supplied IDs are validated when
-    /// the client is built.
+    /// trap PDUs. Required when sending V3 traps; not needed for V3 informs
+    /// (which use engine discovery against the receiver). Construct the value
+    /// with [`AuthoritativeEngine::install`] on first installation or
+    /// [`AuthoritativeEngine::restart`] on subsequent process starts.
     ///
     /// # Example
     ///
     /// ```rust
     /// use async_snmp::{Auth, AuthProtocol, ClientBuilder};
+    /// use async_snmp::v3::AuthoritativeEngine;
+    /// use std::convert::Infallible;
     ///
+    /// let engine = AuthoritativeEngine::install(b"my-engine-id".to_vec(), |_| {
+    ///     Ok::<(), Infallible>(())
+    /// }).unwrap();
     /// let builder = ClientBuilder::new(("192.168.1.1", 162),
     ///     Auth::usm("trapuser").auth(AuthProtocol::Sha256, "password"))
-    ///     .local_engine_id(b"my-engine-id".to_vec());
+    ///     .local_authoritative_engine(engine);
     /// ```
     #[must_use]
-    pub fn local_engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
-        self.local_engine_id = Some(engine_id.into());
-        self
-    }
-
-    /// Set the local engine boots value for V3 trap sending (default: 1).
-    ///
-    /// This is the base boots counter. Engine time is computed from the
-    /// elapsed time since the client was created.
-    #[must_use]
-    pub fn local_engine_boots(mut self, boots: u32) -> Self {
-        self.local_engine_boots = boots;
+    pub fn local_authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
+        self.local_authoritative_engine = Some(engine);
         self
     }
 
@@ -496,10 +489,6 @@ impl ClientBuilder {
             return Err(
                 Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
             );
-        }
-
-        if let Some(engine_id) = &self.local_engine_id {
-            validate_engine_id(engine_id)?;
         }
 
         // Validate walk mode for v1
@@ -580,11 +569,7 @@ impl ClientBuilder {
                     oid_ordering: self.oid_ordering,
                     max_walk_results: self.max_walk_results,
                     max_repetitions: self.max_repetitions,
-                    local_engine_id: self
-                        .local_engine_id
-                        .as_ref()
-                        .map(|id| Bytes::copy_from_slice(id)),
-                    local_engine_boots: self.local_engine_boots,
+                    local_authoritative_engine: self.local_authoritative_engine.clone(),
                 }
             }
             Auth::Usm(security) => ClientConfig {
@@ -600,11 +585,7 @@ impl ClientBuilder {
                 oid_ordering: self.oid_ordering,
                 max_walk_results: self.max_walk_results,
                 max_repetitions: self.max_repetitions,
-                local_engine_id: self
-                    .local_engine_id
-                    .as_ref()
-                    .map(|id| Bytes::copy_from_slice(id)),
-                local_engine_boots: self.local_engine_boots,
+                local_authoritative_engine: self.local_authoritative_engine.clone(),
             },
         }
     }
@@ -828,21 +809,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_local_engine_id() {
+    fn test_validate_local_authoritative_engine() {
+        let engine = AuthoritativeEngine::install(b"valid-engine".to_vec(), |_| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
         let valid = ClientBuilder::new("192.168.1.1:162", Auth::usm("trapuser"))
-            .local_engine_id(b"valid-engine".to_vec());
+            .local_authoritative_engine(engine);
         assert!(valid.validate().is_ok());
-
-        for invalid in [
-            vec![0x80, 0x00, 0x00, 0x01],
-            vec![0x00; 5],
-            vec![0xff; 5],
-            vec![0x11; 33],
-        ] {
-            let builder = ClientBuilder::new("192.168.1.1:162", Auth::usm("trapuser"))
-                .local_engine_id(invalid);
-            assert!(matches!(*builder.validate().unwrap_err(), Error::Config(_)));
-        }
     }
 
     #[test]

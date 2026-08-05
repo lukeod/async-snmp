@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `configured_context_name()`, `auth_protocol()`, and `priv_protocol()`.
   Credential configurators use last-call-wins semantics, and owned plaintext
   password buffers are zeroized when dropped.
+- **Breaking:** authoritative V3 roles now use `AuthoritativeEngine` instead of
+  independent engine-ID and boots setters. `install` and `restart` validate the
+  stored pair and complete the caller's persistence callback before returning;
+  `restart` increments boots first. Agents with USM users or V3 trap sinks and
+  notification receivers with USM users reject construction without this
+  state. V3 client trap sending requires it through
+  `local_authoritative_engine`; polling and Inform sending remain unchanged.
 
 ## [0.16.0] - 2026-07-14
 

@@ -13,6 +13,7 @@
 
 use async_snmp::agent::Agent;
 use async_snmp::notification::{Notification, NotificationReceiver};
+use async_snmp::v3::AuthoritativeEngine;
 use async_snmp::varbind::VarBind;
 use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, Value, oid};
 use std::time::Duration;
@@ -28,9 +29,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start a local receiver so we can verify the notifications arrive.
     let engine_id = b"example-sender-engine".to_vec();
+    // This example uses a no-op persistence callback. A deployed application
+    // must store both fields durably and use AuthoritativeEngine::restart on
+    // subsequent process starts.
+    let engine =
+        AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(()))?;
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
-        .engine_id(engine_id.clone())
+        .authoritative_engine(engine.clone())
         .usm_user("v3user", |u| {
             u.auth_priv(
                 AuthProtocol::Sha256,
@@ -67,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .engine_id(engine_id.clone())
+        .authoritative_engine(engine.clone())
         .usm_user("v3user", |u| {
             u.auth_priv(
                 AuthProtocol::Sha256,
@@ -111,13 +117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.send_trap(&link_down, 99999, vec![]).await?;
     println!("Sent v2c trap (linkDown)\n");
 
-    // V3 trap via client (needs local_engine_id)
+    // V3 trap via client (needs local authoritative engine state)
     println!("--- Client: sending v3 trap ---");
     let v3_client = Client::builder(
         recv_addr.to_string(),
         Auth::usm("v3user").auth(AuthProtocol::Sha256, "authpass12345678"),
     )
-    .local_engine_id(engine_id)
+    .local_authoritative_engine(engine)
     .connect()
     .await?;
     let link_up = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 4);

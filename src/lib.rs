@@ -462,8 +462,9 @@ pub use v3::AwsLcFipsProvider;
 #[cfg(feature = "crypto-rustcrypto")]
 pub use v3::RustCryptoProvider;
 pub use v3::{
-    AuthProtocol, CryptoError, CryptoProvider, CryptoResult, EngineCache, LocalizedKey, MasterKey,
-    MasterKeys, ParseProtocolError, PrivProtocol, UsmConfig,
+    AuthProtocol, AuthoritativeEngine, CryptoError, CryptoProvider, CryptoResult, EngineCache,
+    LocalizedKey, MasterKey, MasterKeys, ParseProtocolError, PersistedAuthoritativeEngine,
+    PrivProtocol, UsmConfig, generate_engine_id,
 };
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;

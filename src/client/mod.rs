@@ -158,7 +158,7 @@ struct ClientInner<T: Transport> {
     discovery_lock: AsyncMutex<()>,
     /// Local engine start time for computing engine time in V3 traps.
     local_engine_start: Instant,
-    /// Keys derived against `local_engine_id` for V3 trap sending.
+    /// Keys derived against the local authoritative engine ID for V3 traps.
     local_derived_keys: RwLock<Option<DerivedKeys>>,
     #[cfg(test)]
     deferred_authenticated_update_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -198,14 +198,12 @@ pub struct ClientConfig {
     pub max_walk_results: Option<usize>,
     /// Max-repetitions for GETBULK operations (default: 25)
     pub max_repetitions: u32,
-    /// Local engine ID for V3 trap sending (default: None).
+    /// Local authoritative engine state for V3 trap sending (default: None).
     ///
-    /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
-    /// trap PDUs. This engine ID is used to localize keys for outbound V3 traps.
-    /// A directly constructed config is validated when a V3 trap is sent.
-    pub local_engine_id: Option<Bytes>,
-    /// Local engine boots base value for V3 trap sending (default: 1).
-    pub local_engine_boots: u32,
+    /// Per RFC 3412 Section 6.4, the sender is authoritative for trap PDUs.
+    /// Construct this through the persistence-enforcing
+    /// [`AuthoritativeEngine`](crate::v3::AuthoritativeEngine) API.
+    pub local_authoritative_engine: Option<crate::v3::AuthoritativeEngine>,
 }
 
 impl Default for ClientConfig {
@@ -225,8 +223,7 @@ impl Default for ClientConfig {
             oid_ordering: OidOrdering::Strict,
             max_walk_results: None,
             max_repetitions: DEFAULT_MAX_REPETITIONS,
-            local_engine_id: None,
-            local_engine_boots: 1,
+            local_authoritative_engine: None,
         }
     }
 }
@@ -761,7 +758,8 @@ impl<T: Transport> Client<T> {
     /// For V2c/V3 clients: constructs a `TrapV2` PDU with the mandatory sysUpTime.0
     /// and snmpTrapOID.0 prefix.
     ///
-    /// For V3: uses the local engine ID (set via `ClientBuilder::local_engine_id`).
+    /// For V3: uses the persisted local authoritative engine state configured
+    /// through `ClientBuilder::local_authoritative_engine`.
     ///
     /// # Arguments
     ///

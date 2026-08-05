@@ -100,8 +100,8 @@ use crate::oid;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::util::bind_udp_socket;
-use crate::v3::UsmConfig;
 use crate::v3::process::UsmStats;
+use crate::v3::{AuthoritativeEngine, UsmConfig};
 use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
 use crate::varbind::VarBind;
@@ -221,8 +221,7 @@ pub struct AgentBuilder {
     communities: Vec<Vec<u8>>,
     usm_users: HashMap<Bytes, UsmConfig>,
     handlers: Vec<RegisteredHandler>,
-    engine_id: Option<Vec<u8>>,
-    engine_boots: u32,
+    authoritative_engine: Option<AuthoritativeEngine>,
     max_message_size: usize,
     max_concurrent_requests: Option<usize>,
     recv_buffer_size: Option<usize>,
@@ -251,8 +250,7 @@ impl AgentBuilder {
             communities: Vec::new(),
             usm_users: HashMap::new(),
             handlers: Vec::new(),
-            engine_id: None,
-            engine_boots: 1,
+            authoritative_engine: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_requests: Some(1000),
             recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
@@ -412,20 +410,27 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the engine ID for `SNMPv3`.
+    /// Set the persisted local authoritative engine state for `SNMPv3`.
     ///
-    /// If not set, a default engine ID will be generated based on the
-    /// RFC 3411 format using enterprise number and timestamp.
-    ///
-    /// # Example
+    /// An agent with USM users or V3 trap sinks requires this value. Construct
+    /// it with [`AuthoritativeEngine::install`] on first installation or
+    /// [`AuthoritativeEngine::restart`] on later process starts. Those
+    /// constructors persist the stable engine ID and incremented boots counter
+    /// before returning.
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
+    /// use async_snmp::v3::AuthoritativeEngine;
+    /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// # // Replace this no-op with durable storage in an application.
+    /// let engine = AuthoritativeEngine::install(b"my-engine".to_vec(), |_| {
+    ///     Ok::<(), Infallible>(())
+    /// })?;
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
-    ///     .engine_id(b"\x80\x00\x00\x00\x01MyEngine".to_vec())
+    ///     .authoritative_engine(engine)
     ///     .community(b"public")
     ///     .build()
     ///     .await?;
@@ -433,38 +438,29 @@ impl AgentBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
-        self.engine_id = Some(engine_id.into());
+    pub fn authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
+        self.authoritative_engine = Some(engine);
         self
     }
 
-    /// Set the initial engine boots value.
-    ///
-    /// Per RFC 3414 Section 2.3, snmpEngineBoots must be monotonically
-    /// increasing across restarts. The application is responsible for
-    /// persisting and restoring this value. If not set, defaults to 1.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use async_snmp::agent::Agent;
-    ///
-    /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// // Load persisted value (e.g. from file or database)
-    /// let persisted_boots: u32 = 42;
-    ///
-    /// let agent = Agent::builder()
-    ///     .bind("0.0.0.0:1161")
-    ///     .engine_boots(persisted_boots)
-    ///     .community(b"public")
-    ///     .build()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use]
-    pub fn engine_boots(mut self, boots: u32) -> Self {
-        self.engine_boots = boots;
+    #[cfg(test)]
+    pub(crate) fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
+        let boots = self
+            .authoritative_engine
+            .as_ref()
+            .map_or(1, AuthoritativeEngine::engine_boots);
+        self.authoritative_engine = Some(AuthoritativeEngine::for_test(engine_id.into(), boots));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn engine_boots(mut self, boots: u32) -> Self {
+        let engine_id = self
+            .authoritative_engine
+            .as_ref()
+            .map(|engine| engine.engine_id().to_vec())
+            .unwrap_or_else(|| crate::v3::generate_engine_id().to_vec());
+        self.authoritative_engine = Some(AuthoritativeEngine::for_test(engine_id, boots));
         self
     }
 
@@ -722,13 +718,23 @@ impl AgentBuilder {
                 source: e,
             })?;
 
-        // Validate a user-supplied engine ID, or generate a valid random one.
-        let engine_id: Bytes = match self.engine_id {
-            Some(id) => {
-                crate::v3::validate_engine_id(&id)?;
-                Bytes::from(id)
+        let requires_authoritative_engine = !self.usm_users.is_empty()
+            || self
+                .trap_sinks
+                .iter()
+                .any(|(_, auth)| matches!(auth, crate::client::Auth::Usm(_)));
+        let (engine_id, engine_boots) = match self.authoritative_engine {
+            Some(engine) => (
+                Bytes::copy_from_slice(engine.engine_id()),
+                engine.engine_boots(),
+            ),
+            None if requires_authoritative_engine => {
+                return Err(Error::Config(
+                    "authoritative engine state is required for SNMPv3 agent roles".into(),
+                )
+                .boxed());
             }
-            None => crate::v3::generate_engine_id(),
+            None => (crate::v3::generate_engine_id(), 1),
         };
 
         let cancel = self.cancel.unwrap_or_default();
@@ -760,10 +766,10 @@ impl AgentBuilder {
 
         let state = Arc::new(AgentState {
             engine_id,
-            engine_boots: AtomicU32::new(self.engine_boots),
+            engine_boots: AtomicU32::new(engine_boots),
             engine_time: AtomicU32::new(0),
             engine_start: Instant::now(),
-            engine_boots_base: self.engine_boots,
+            engine_boots_base: engine_boots,
             max_message_size: self.max_message_size,
             snmp_invalid_msgs: AtomicU32::new(0),
             snmp_unknown_security_models: AtomicU32::new(0),
@@ -927,9 +933,8 @@ impl Agent {
 
     /// Get the current engine boots value.
     ///
-    /// Useful for persisting across restarts per RFC 3414 Section 2.3.
-    /// The persisted value should be passed to `AgentBuilder::engine_boots()`
-    /// on the next startup.
+    /// This value was persisted before construction. If it changes because
+    /// engine time wraps, persist the new value with the same engine ID.
     #[must_use]
     pub fn engine_boots(&self) -> u32 {
         self.inner.state.engine_boots.load(Ordering::Relaxed)
@@ -3278,17 +3283,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_engine_boots_builder() {
-        // engine_boots builder method sets the initial boots value
+    async fn test_authoritative_engine_builder() {
+        let engine = AuthoritativeEngine::install(b"test-agent-engine".to_vec(), |_| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .engine_boots(42)
+            .authoritative_engine(engine)
             .build()
             .await
             .unwrap();
 
-        assert_eq!(agent.engine_boots(), 42);
+        assert_eq!(agent.engine_boots(), 1);
+        assert_eq!(agent.engine_id(), b"test-agent-engine");
+    }
+
+    #[tokio::test]
+    async fn test_v3_agent_requires_authoritative_engine() {
+        let result = Agent::builder()
+            .bind("127.0.0.1:0")
+            .usm_user("user", |user| user)
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(matches!(*err, Error::Config(_)));
     }
 
     #[tokio::test]

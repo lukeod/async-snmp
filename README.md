@@ -51,6 +51,46 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 - `crypto-rustcrypto` (default) - RustCrypto crates, supports all protocols
 - `crypto-fips` - aws-lc-rs for FIPS 140-3 compliance (rejects MD5, DES, 3DES)
 
+### Authoritative Engine Persistence
+
+An Agent with USM users or V3 trap sinks, a V3 notification receiver, and a
+client sending V3 traps can be authoritative for an exchange. RFC 3414 requires
+each such engine to retain one stable engine ID and its boots counter in
+non-volatile storage. On restart, load both values, increment boots, and persist
+the new pair before sending or accepting V3 traffic.
+
+`AuthoritativeEngine` enforces that startup order. On first installation, use
+`install`; on later starts, validate the loaded record and use `restart`:
+
+```rust,ignore
+use async_snmp::{
+    AuthoritativeEngine, PersistedAuthoritativeEngine, generate_engine_id,
+};
+
+let engine = match load_engine_state()? {
+    Some((engine_id, previous_boots)) => {
+        let previous = PersistedAuthoritativeEngine::new(engine_id, previous_boots)?;
+        AuthoritativeEngine::restart(previous, |current| {
+            store_engine_state(current.engine_id(), current.engine_boots())
+        })?
+    }
+    None => AuthoritativeEngine::install(generate_engine_id(), |current| {
+        store_engine_state(current.engine_id(), current.engine_boots())
+    })?,
+};
+
+let agent = Agent::builder()
+    .authoritative_engine(engine)
+    // configure USM users, handlers, and transport
+    .build()
+    .await?;
+```
+
+The persistence callback must durably store both fields. If it fails, no usable
+`AuthoritativeEngine` is returned. Polling clients and V3 Inform senders do not
+need local authoritative state because the remote responder is authoritative
+for those exchanges.
+
 ## Installation
 
 ```bash
@@ -236,7 +276,6 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
     let agent = Agent::builder()
         .bind("0.0.0.0:161")
         .community(b"public")
-        .engine_id(b"my-engine".to_vec())
         .trap_sink("192.168.1.100:162", Auth::v2c("public"))
         .build()
         .await?;

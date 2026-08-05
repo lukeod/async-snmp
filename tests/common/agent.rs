@@ -7,7 +7,7 @@ use crate::common::fixtures;
 use crate::common::handler::TestHandler;
 
 use async_snmp::handler::MibHandler;
-use async_snmp::v3::{AuthProtocol, PrivProtocol};
+use async_snmp::v3::{AuthProtocol, AuthoritativeEngine, PrivProtocol, generate_engine_id};
 use async_snmp::{Agent, Oid, Value, oid};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -249,6 +249,14 @@ impl TestAgentBuilder {
                     (None, None) => u,
                     (None, Some(_)) => panic!("test USM privacy requires authentication"),
                 });
+        }
+
+        if !self.usm_users.is_empty() {
+            let engine = AuthoritativeEngine::install(generate_engine_id(), |_| {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .expect("failed to initialize test authoritative engine");
+            builder = builder.authoritative_engine(engine);
         }
 
         let agent = builder.build().await.expect("failed to build test agent");

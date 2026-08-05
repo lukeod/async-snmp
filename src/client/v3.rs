@@ -12,7 +12,7 @@ use crate::pdu::{Pdu, PduType};
 use crate::transport::Transport;
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
-    classify_report, compute_engine_boots_time, validate_engine_id,
+    classify_report, compute_engine_boots_time,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -1035,7 +1035,7 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let local_engine_id = self.local_engine_id_for_trap()?;
+        let local_engine = self.local_engine_for_trap()?;
 
         let security = self
             .inner
@@ -1045,7 +1045,7 @@ impl<T: Transport> Client<T> {
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         let keys = security
-            .derive_keys(local_engine_id)
+            .derive_keys(local_engine.engine_id())
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
         let mut derived = self
@@ -1058,18 +1058,23 @@ impl<T: Transport> Client<T> {
         Ok(())
     }
 
-    fn local_engine_id_for_trap(&self) -> Result<&Bytes> {
-        let engine_id = self.inner.config.local_engine_id.as_ref().ok_or_else(|| {
-            Error::Config("local_engine_id required for V3 trap sending".into()).boxed()
-        })?;
-        validate_engine_id(engine_id)?;
-        Ok(engine_id)
+    fn local_engine_for_trap(&self) -> Result<&crate::v3::AuthoritativeEngine> {
+        self.inner
+            .config
+            .local_authoritative_engine
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Config(
+                    "local authoritative engine state required for V3 trap sending".into(),
+                )
+                .boxed()
+            })
     }
 
     /// Build and encode a V3 trap message using local engine ID.
     ///
     /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
-    /// trap PDUs. Uses `local_engine_id`, local boots/time, and sets
+    /// trap PDUs. Uses the persisted local engine state and sets
     /// reportable=false (no Report PDU expected for traps).
     pub(super) fn build_v3_trap_message(&self, pdu: &Pdu, msg_id: i32) -> Result<Vec<u8>> {
         let security = self
@@ -1079,7 +1084,7 @@ impl<T: Transport> Client<T> {
             .as_ref()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
-        let local_engine_id = self.local_engine_id_for_trap()?;
+        let local_engine = self.local_engine_for_trap()?;
 
         let derived = self
             .inner
@@ -1090,12 +1095,12 @@ impl<T: Transport> Client<T> {
         // Compute local engine boots/time
         let elapsed_secs = self.inner.local_engine_start.elapsed().as_secs();
         let (engine_boots, engine_time) =
-            compute_engine_boots_time(self.inner.config.local_engine_boots, elapsed_secs);
+            compute_engine_boots_time(local_engine.engine_boots(), elapsed_secs);
 
         crate::v3::encode::encode_v3_message(
             pdu,
             msg_id,
-            local_engine_id,
+            local_engine.engine_id(),
             engine_boots,
             engine_time,
             security,
@@ -1166,27 +1171,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_config_rejects_invalid_local_engine_id_before_sending_trap() {
-        for invalid in [
-            Bytes::from_static(b"tiny"),
-            Bytes::from_static(b"\0\0\0\0\0"),
-            Bytes::from_static(b"\xff\xff\xff\xff\xff"),
-            Bytes::from(vec![0x11; 33]),
-        ] {
-            let config = ClientConfig {
-                version: crate::Version::V3,
-                v3_security: Some(UsmConfig::new("trapuser")),
-                local_engine_id: Some(invalid),
-                ..ClientConfig::default()
-            };
-            let client = Client::new(TestTransport::new(), config);
+    async fn direct_config_requires_authoritative_state_before_sending_v3_trap() {
+        let config = ClientConfig {
+            version: crate::Version::V3,
+            v3_security: Some(UsmConfig::new("trapuser")),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(TestTransport::new(), config);
 
-            let err = client
-                .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
-                .await
-                .unwrap_err();
-            assert!(matches!(*err, Error::Config(_)));
-        }
+        let err = client
+            .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(*err, Error::Config(_)));
     }
 
     #[test]
