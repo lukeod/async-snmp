@@ -202,6 +202,7 @@ pub struct ClientConfig {
     ///
     /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
     /// trap PDUs. This engine ID is used to localize keys for outbound V3 traps.
+    /// A directly constructed config is validated when a V3 trap is sent.
     pub local_engine_id: Option<Bytes>,
     /// Local engine boots base value for V3 trap sending (default: 1).
     pub local_engine_boots: u32,

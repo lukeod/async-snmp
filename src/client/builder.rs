@@ -19,7 +19,7 @@ use crate::client::{
 };
 use crate::error::{Error, Result};
 use crate::transport::{TcpTransport, Transport, UdpHandle, UdpTransport};
-use crate::v3::EngineCache;
+use crate::v3::{EngineCache, validate_engine_id};
 use crate::version::Version;
 
 use super::Client;
@@ -394,7 +394,8 @@ impl ClientBuilder {
     /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
     /// trap PDUs. This engine ID is used to localize keys for outbound V3 traps.
     /// Required when sending V3 traps; not needed for V3 informs (which use
-    /// engine discovery against the receiver).
+    /// engine discovery against the receiver). Supplied IDs are validated when
+    /// the client is built.
     ///
     /// # Example
     ///
@@ -495,6 +496,10 @@ impl ClientBuilder {
             return Err(
                 Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
             );
+        }
+
+        if let Some(engine_id) = &self.local_engine_id {
+            validate_engine_id(engine_id)?;
         }
 
         // Validate walk mode for v1
@@ -820,6 +825,24 @@ mod tests {
             *err,
             Error::Config(ref msg) if msg.contains("max_oids_per_request must be greater than 0")
         ));
+    }
+
+    #[test]
+    fn test_validate_local_engine_id() {
+        let valid = ClientBuilder::new("192.168.1.1:162", Auth::usm("trapuser"))
+            .local_engine_id(b"valid-engine".to_vec());
+        assert!(valid.validate().is_ok());
+
+        for invalid in [
+            vec![0x80, 0x00, 0x00, 0x01],
+            vec![0x00; 5],
+            vec![0xff; 5],
+            vec![0x11; 33],
+        ] {
+            let builder = ClientBuilder::new("192.168.1.1:162", Auth::usm("trapuser"))
+                .local_engine_id(invalid);
+            assert!(matches!(*builder.validate().unwrap_err(), Error::Config(_)));
+        }
     }
 
     #[test]

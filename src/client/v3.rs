@@ -12,7 +12,7 @@ use crate::pdu::{Pdu, PduType};
 use crate::transport::Transport;
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
-    classify_report, compute_engine_boots_time,
+    classify_report, compute_engine_boots_time, validate_engine_id,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -1035,9 +1035,7 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let local_engine_id = self.inner.config.local_engine_id.as_ref().ok_or_else(|| {
-            Error::Config("local_engine_id required for V3 trap sending".into()).boxed()
-        })?;
+        let local_engine_id = self.local_engine_id_for_trap()?;
 
         let security = self
             .inner
@@ -1060,6 +1058,14 @@ impl<T: Transport> Client<T> {
         Ok(())
     }
 
+    fn local_engine_id_for_trap(&self) -> Result<&Bytes> {
+        let engine_id = self.inner.config.local_engine_id.as_ref().ok_or_else(|| {
+            Error::Config("local_engine_id required for V3 trap sending".into()).boxed()
+        })?;
+        validate_engine_id(engine_id)?;
+        Ok(engine_id)
+    }
+
     /// Build and encode a V3 trap message using local engine ID.
     ///
     /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
@@ -1073,9 +1079,7 @@ impl<T: Transport> Client<T> {
             .as_ref()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
-        let local_engine_id = self.inner.config.local_engine_id.as_ref().ok_or_else(|| {
-            Error::Config("local_engine_id required for V3 trap sending".into()).boxed()
-        })?;
+        let local_engine_id = self.local_engine_id_for_trap()?;
 
         let derived = self
             .inner
@@ -1159,6 +1163,30 @@ mod tests {
         }
 
         fn register_request(&self, _request_id: i32, _timeout: Duration) {}
+    }
+
+    #[tokio::test]
+    async fn direct_config_rejects_invalid_local_engine_id_before_sending_trap() {
+        for invalid in [
+            Bytes::from_static(b"tiny"),
+            Bytes::from_static(b"\0\0\0\0\0"),
+            Bytes::from_static(b"\xff\xff\xff\xff\xff"),
+            Bytes::from(vec![0x11; 33]),
+        ] {
+            let config = ClientConfig {
+                version: crate::Version::V3,
+                v3_security: Some(UsmConfig::new("trapuser")),
+                local_engine_id: Some(invalid),
+                ..ClientConfig::default()
+            };
+            let client = Client::new(TestTransport::new(), config);
+
+            let err = client
+                .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
+                .await
+                .unwrap_err();
+            assert!(matches!(*err, Error::Config(_)));
+        }
     }
 
     #[test]
