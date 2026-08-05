@@ -854,6 +854,14 @@ pub(crate) struct AgentState {
     pub(crate) usm_stats: UsmStats,
 }
 
+impl AgentState {
+    /// Return one coherent authoritative boots/time pair for the current instant.
+    pub(crate) fn authoritative_boots_time(&self) -> (u32, u32) {
+        let total_secs = self.engine_start.elapsed().as_secs();
+        compute_engine_boots_time(self.engine_boots_base, total_secs)
+    }
+}
+
 /// Inner state shared across agent clones.
 pub(crate) struct AgentInner {
     pub(crate) socket: Arc<UdpSocket>,
@@ -1255,9 +1263,7 @@ impl Agent {
     /// the base boots value at startup, so no mutable state beyond the
     /// atomics is needed.
     fn update_engine_time(&self) {
-        let total_secs = self.inner.state.engine_start.elapsed().as_secs();
-        let (boots, time) =
-            compute_engine_boots_time(self.inner.state.engine_boots_base, total_secs);
+        let (boots, time) = self.inner.state.authoritative_boots_time();
 
         if boots != self.inner.state.engine_boots.load(Ordering::Relaxed)
             && boots > self.inner.state.engine_boots_base

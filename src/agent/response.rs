@@ -24,8 +24,11 @@ impl Agent {
         derived_keys: Option<&DerivedKeys>,
     ) -> Result<Option<Bytes>> {
         let security_level = incoming.msg_flags.security_level;
-        let engine_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
-        let engine_time = self.inner.state.engine_time.load(Ordering::Relaxed);
+        // Handlers are asynchronous and may run long after the receive task's
+        // cached time refresh. Derive both fields from one elapsed-time sample
+        // at response generation so the authoritative tuple is current and
+        // cannot straddle a boots/time rollover.
+        let (engine_boots, engine_time) = self.inner.state.authoritative_boots_time();
 
         // RFC 3414 Section 2.3: refuse authenticated messages when boots latched
         if security_level.requires_auth() && engine_boots == MAX_ENGINE_TIME {
@@ -98,14 +101,19 @@ mod tests {
         }
     }
 
-    async fn test_agent() -> Agent {
+    async fn test_agent_with_boots(engine_boots: u32) -> Agent {
         Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .engine_boots(engine_boots)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(DummyHandler))
             .build()
             .await
             .unwrap()
+    }
+
+    async fn test_agent() -> Agent {
+        test_agent_with_boots(1).await
     }
 
     fn dummy_v3_msg(security_level: SecurityLevel) -> MsgGlobalData {
@@ -133,12 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_latched_drops_auth_nopriv_response() {
-        let agent = test_agent().await;
-        agent
-            .inner
-            .state
-            .engine_boots
-            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+        let agent = test_agent_with_boots(MAX_ENGINE_TIME).await;
 
         let msg = dummy_v3_msg(SecurityLevel::AuthNoPriv);
         let usm = dummy_usm();
@@ -167,12 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_latched_drops_auth_priv_response() {
-        let agent = test_agent().await;
-        agent
-            .inner
-            .state
-            .engine_boots
-            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+        let agent = test_agent_with_boots(MAX_ENGINE_TIME).await;
 
         let msg = dummy_v3_msg(SecurityLevel::AuthPriv);
         let usm = dummy_usm();
@@ -196,12 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_latched_allows_noauth_response() {
-        let agent = test_agent().await;
-        agent
-            .inner
-            .state
-            .engine_boots
-            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+        let agent = test_agent_with_boots(MAX_ENGINE_TIME).await;
 
         let msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
         let usm = dummy_usm();
@@ -225,13 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_below_max_allows_auth_response() {
-        let agent = test_agent().await;
-        // Boots just below max - should NOT trigger the latched check
-        agent
-            .inner
-            .state
-            .engine_boots
-            .store(MAX_ENGINE_TIME - 1, Ordering::Relaxed);
+        let agent = test_agent_with_boots(MAX_ENGINE_TIME - 1).await;
 
         let msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
         let usm = dummy_usm();
@@ -251,6 +238,46 @@ mod tests {
         assert!(
             result.is_some(),
             "noAuthNoPriv should work when boots is below max"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_uses_current_coherent_authoritative_time() {
+        let agent = test_agent().await;
+
+        // Model a response generated after handler dispatch without refreshing
+        // the legacy cached fields. A response must not use this stale,
+        // internally inconsistent tuple.
+        agent.inner.state.engine_boots.store(17, Ordering::Relaxed);
+        agent
+            .inner
+            .state
+            .engine_time
+            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+
+        let earliest = agent.inner.state.authoritative_boots_time();
+        let encoded = agent
+            .build_v3_response(
+                &dummy_v3_msg(SecurityLevel::NoAuthNoPriv),
+                &dummy_usm(),
+                dummy_response_pdu(),
+                Bytes::from_static(b"engine"),
+                Bytes::new(),
+                None,
+            )
+            .unwrap()
+            .expect("noAuthNoPriv response should be produced");
+        let latest = agent.inner.state.authoritative_boots_time();
+
+        let message = V3Message::decode(encoded).unwrap();
+        let response_usm = UsmSecurityParams::decode(message.security_params).unwrap();
+        let response_pair = (response_usm.engine_boots, response_usm.engine_time);
+
+        assert_ne!(response_pair, (17, MAX_ENGINE_TIME));
+        assert_eq!(response_pair.0, 1);
+        assert!(
+            response_pair.1 >= earliest.1 && response_pair.1 <= latest.1,
+            "response pair {response_pair:?} should come from one current elapsed-time sample between {earliest:?} and {latest:?}"
         );
     }
 
