@@ -13,7 +13,6 @@ use crate::error::{Error, Result};
 use crate::message::{CommunityMessage, MsgGlobalData};
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::v3::UsmSecurityParams;
-use crate::v3::compute_engine_boots_time;
 use crate::v3::encode::encode_v3_response;
 use crate::v3::process::{UsmFailure, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
 
@@ -128,9 +127,7 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        let total_secs = self.inner.engine_start.elapsed().as_secs();
-        let (our_boots, our_time) =
-            compute_engine_boots_time(self.inner.engine_boots_base, total_secs);
+        let (our_boots, our_time) = self.inner.authoritative_boots_time();
         let usm_ctx = V3LocalContext {
             engine_id: &self.inner.engine_id,
             engine_boots: our_boots,
@@ -257,9 +254,8 @@ impl super::NotificationReceiver {
 
 /// Build a V3 response message with appropriate security.
 ///
-/// The response echoes the incoming message's engine ID/boots/time (rather
-/// than the receiver's own): informs are addressed to this receiver's engine
-/// ID, and echoing also interoperates with senders that used their own.
+/// The response uses the receiver's current authoritative engine tuple and
+/// echoes only the requester's username from the incoming USM parameters.
 fn build_v3_response(
     inner: &ReceiverInner,
     incoming: &MsgGlobalData,
@@ -269,10 +265,13 @@ fn build_v3_response(
     context_name: Bytes,
     derived_keys: Option<&DerivedKeys>,
 ) -> Result<Bytes> {
+    // Derive both fields from one elapsed-time sample immediately before
+    // encoding so the response is current and cannot straddle a rollover.
+    let (engine_boots, engine_time) = inner.authoritative_boots_time();
     let response_usm = UsmSecurityParams::new(
-        incoming_usm.engine_id.clone(),
-        incoming_usm.engine_boots,
-        incoming_usm.engine_time,
+        inner.engine_id.clone(),
+        engine_boots,
+        engine_time,
         incoming_usm.username.clone(),
     );
 

@@ -656,6 +656,14 @@ struct ReceiverInner {
     remote_engines: Mutex<HashMap<Bytes, EngineState>>,
 }
 
+impl ReceiverInner {
+    /// Return one coherent authoritative boots/time pair for the current instant.
+    fn authoritative_boots_time(&self) -> (u32, u32) {
+        let total_secs = self.engine_start.elapsed().as_secs();
+        crate::v3::compute_engine_boots_time(self.engine_boots_base, total_secs)
+    }
+}
+
 impl NotificationReceiver {
     /// Create a builder for configuring the notification receiver.
     ///
@@ -1730,6 +1738,67 @@ mod tests {
             ack.global_data.msg_max_size,
             crate::v3::DEFAULT_MSG_MAX_SIZE as i32,
             "ack must advertise the receiver's local receive capacity, not the sender's 1400"
+        );
+    }
+
+    /// RFC 3414 Section 3.1 Steps 1(a) and 6: an Inform Response is generated
+    /// under the local authoritative engine and carries its current boots/time
+    /// tuple rather than echoing the accepted request's tuple.
+    #[tokio::test]
+    async fn test_v3_inform_ack_uses_current_authoritative_time() {
+        use crate::message::V3Message;
+        use crate::v3::UsmSecurityParams;
+
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .engine_boots(7)
+            .usm_user("informuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // This time is inside the authoritative window but deliberately ahead
+        // of the receiver's current clock, making an echo observable.
+        let incoming_time = 149;
+        let msg = build_authed_v3_inform(
+            b"my-receiver-engine",
+            7,
+            incoming_time,
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+
+        let earliest = receiver.inner.authoritative_boots_time();
+        let result = receiver.handle_v3(msg, client_addr).await.unwrap();
+        let latest = receiver.inner.authoritative_boots_time();
+        assert!(matches!(result, Some(Notification::InformV3 { .. })));
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("expected the inform acknowledgement")
+        .unwrap();
+
+        let ack = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let ack_usm = UsmSecurityParams::decode(ack.security_params).unwrap();
+        let ack_pair = (ack_usm.engine_boots, ack_usm.engine_time);
+
+        assert_eq!(ack_usm.engine_id.as_ref(), receiver.engine_id());
+        assert_ne!(ack_usm.engine_time, incoming_time);
+        assert_eq!(ack_pair.0, 7);
+        assert!(
+            ack_pair.1 >= earliest.1 && ack_pair.1 <= latest.1,
+            "ack pair {ack_pair:?} should come from one current elapsed-time sample between {earliest:?} and {latest:?}"
         );
     }
 
