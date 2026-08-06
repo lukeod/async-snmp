@@ -135,25 +135,11 @@ impl UsmSecurityParams {
         let engine_id = seq.read_octet_string()?;
 
         // RFC 3414: msgAuthoritativeEngineBoots INTEGER (0..2147483647)
-        let raw_boots = seq.read_integer()?;
-        if raw_boots < 0 {
-            tracing::debug!(target: "async_snmp::usm", { offset = seq.offset(), value = raw_boots, kind = %DecodeErrorKind::InvalidEngineBoots { value: raw_boots } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
-        }
+        let raw_boots = seq.read_bounded_integer(0, i32::MAX)?;
         let engine_boots = raw_boots as u32;
 
         // RFC 3414: msgAuthoritativeEngineTime INTEGER (0..2147483647)
-        let raw_time = seq.read_integer()?;
-        if raw_time < 0 {
-            tracing::debug!(target: "async_snmp::usm", { offset = seq.offset(), value = raw_time, kind = %DecodeErrorKind::InvalidEngineTime { value: raw_time } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
-        }
+        let raw_time = seq.read_bounded_integer(0, i32::MAX)?;
         let engine_time = raw_time as u32;
 
         // RFC 3414: msgUserName OCTET STRING (SIZE(0..32))
@@ -242,6 +228,25 @@ impl UsmSecurityParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn push_integer_content(buf: &mut EncodeBuf, content: &[u8]) {
+        buf.push_bytes(content);
+        buf.push_length(content.len());
+        buf.push_tag(crate::ber::tag::universal::INTEGER);
+    }
+
+    fn params_with_integer_contents(engine_boots: &[u8], engine_time: &[u8]) -> Bytes {
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            push_integer_content(buf, engine_time);
+            push_integer_content(buf, engine_boots);
+            buf.push_octet_string(&[]);
+        });
+        buf.finish()
+    }
 
     #[test]
     fn test_usm_params_empty_roundtrip() {
@@ -392,6 +397,15 @@ mod tests {
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
         assert_eq!(decoded.engine_boots, i32::MAX as u32);
         assert_eq!(decoded.engine_time, i32::MAX as u32);
+    }
+
+    #[test]
+    fn usm_params_reject_over_width_engine_time_aliases() {
+        const ZERO: &[u8] = &[0x00];
+        const TWO_TO_32: &[u8] = &[0x01, 0x00, 0x00, 0x00, 0x00];
+
+        assert!(UsmSecurityParams::decode(params_with_integer_contents(TWO_TO_32, ZERO)).is_err());
+        assert!(UsmSecurityParams::decode(params_with_integer_contents(ZERO, TWO_TO_32)).is_err());
     }
 
     #[test]

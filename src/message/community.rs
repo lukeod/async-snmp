@@ -174,7 +174,7 @@ impl CommunityMessage {
     pub(crate) fn decode_from(decoder: &mut Decoder) -> Result<Self> {
         let mut seq = decoder.read_sequence()?;
 
-        let version_num = seq.read_integer()?;
+        let version_num = seq.read_bounded_integer(0, i32::MAX)?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(version_num) }, "decode error");
             Error::MalformedResponse {

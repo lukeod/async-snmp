@@ -76,7 +76,7 @@ impl Message {
         let mut seq = decoder.read_sequence()?;
 
         // Read version to determine message type
-        let version_num = seq.read_integer()?;
+        let version_num = seq.read_bounded_integer(0, i32::MAX)?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::message", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(version_num) }, "decode error");
             Error::MalformedResponse {
@@ -105,7 +105,7 @@ impl Message {
 pub(crate) fn peek_version(data: Bytes, target: std::net::SocketAddr) -> Result<Version> {
     let mut decoder = Decoder::with_target(data, target);
     let mut seq = decoder.read_sequence()?;
-    let version_num = seq.read_integer()?;
+    let version_num = seq.read_bounded_integer(0, i32::MAX)?;
     Version::from_i32(version_num).ok_or_else(|| {
         tracing::debug!(target: "async_snmp::message", { source = %target, kind = %DecodeErrorKind::UnknownVersion(version_num) }, "unknown SNMP version");
         Error::MalformedResponse { target }.boxed()

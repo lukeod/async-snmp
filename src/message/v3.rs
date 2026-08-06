@@ -211,35 +211,10 @@ impl MsgGlobalData {
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
         let mut seq = decoder.read_sequence()?;
 
-        let msg_id = seq.read_integer()?;
-        let msg_max_size = seq.read_integer()?;
-
-        // RFC 3412 HeaderData: msgID INTEGER (0..2147483647)
-        if msg_id < 0 {
-            tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), value = msg_id, kind = %DecodeErrorKind::InvalidMsgId { value: msg_id } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
-        }
-
-        // RFC 3412 HeaderData: msgMaxSize INTEGER (484..2147483647)
-        // Negative values indicate the sender encoded a value > 2^31-1
-        if msg_max_size < 0 {
-            tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), value = msg_max_size, kind = %DecodeErrorKind::MsgMaxSizeTooLarge { value: msg_max_size } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
-        }
-
-        if msg_max_size < MSG_MAX_SIZE_MINIMUM {
-            tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), value = msg_max_size, minimum = MSG_MAX_SIZE_MINIMUM, kind = %DecodeErrorKind::MsgMaxSizeTooSmall { value: msg_max_size, minimum: MSG_MAX_SIZE_MINIMUM } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
-        }
+        // These ASN.1 constraints must be checked against the complete BER
+        // value before it is narrowed to i32.
+        let msg_id = seq.read_bounded_integer(0, i32::MAX)?;
+        let msg_max_size = seq.read_bounded_integer(MSG_MAX_SIZE_MINIMUM, i32::MAX)?;
 
         let flags_bytes = seq.read_octet_string()?;
         if flags_bytes.len() != 1 {
@@ -251,7 +226,7 @@ impl MsgGlobalData {
         }
         let msg_flags = MsgFlags::from_byte(flags_bytes[0])?;
 
-        let msg_security_model_raw = seq.read_integer()?;
+        let msg_security_model_raw = seq.read_bounded_integer(1, i32::MAX)?;
         // Reject unknown security models per RFC 3412 Section 7.2
         let msg_security_model =
             SecurityModel::from_i32(msg_security_model_raw).ok_or_else(|| {
@@ -473,7 +448,7 @@ impl V3Message {
         let mut seq = decoder.read_sequence()?;
 
         // Version
-        let version = seq.read_integer()?;
+        let version = seq.read_bounded_integer(0, i32::MAX)?;
         if version != 3 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), version, kind = %DecodeErrorKind::UnknownVersion(version) }, "decode error");
             return Err(Error::MalformedResponse {
@@ -570,7 +545,7 @@ impl RawV3Message {
         let mut decoder = Decoder::new(data);
         let mut seq = decoder.read_sequence()?;
 
-        let version = seq.read_integer()?;
+        let version = seq.read_bounded_integer(0, i32::MAX)?;
         if version != 3 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), version, kind = %DecodeErrorKind::UnknownVersion(version) }, "decode error");
             return Err(Error::MalformedResponse {
@@ -649,7 +624,7 @@ pub(crate) enum MpdFailure {
 pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
     let mut decoder = Decoder::new(data);
     let mut seq = decoder.read_sequence().ok()?;
-    if seq.read_integer().ok()? != 3 {
+    if seq.read_bounded_integer(0, i32::MAX).ok()? != 3 {
         return None;
     }
     let mut global = seq.read_sequence().ok()?;
@@ -659,14 +634,10 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
     // stopped at an earlier one (out-of-range msgID/msgMaxSize, wrong-length
     // msgFlags), and those earlier rejections are ASN.1/header errors rather
     // than snmpInvalidMsgs/snmpUnknownSecurityModels, so they return None.
-    let msg_id = global.read_integer().ok()?;
-    if msg_id < 0 {
-        return None;
-    }
-    let msg_max_size = global.read_integer().ok()?;
-    if msg_max_size < MSG_MAX_SIZE_MINIMUM {
-        return None;
-    }
+    global.read_bounded_integer(0, i32::MAX).ok()?;
+    global
+        .read_bounded_integer(MSG_MAX_SIZE_MINIMUM, i32::MAX)
+        .ok()?;
     let flags_bytes = global.read_octet_string().ok()?;
     if flags_bytes.len() != 1 {
         return None;
@@ -674,7 +645,7 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
     if MsgFlags::from_byte(flags_bytes[0]).is_err() {
         return Some(MpdFailure::InvalidMsgFlags);
     }
-    let model = global.read_integer().ok()?;
+    let model = global.read_bounded_integer(1, i32::MAX).ok()?;
     if SecurityModel::from_i32(model).is_none() {
         return Some(MpdFailure::UnknownSecurityModel);
     }
@@ -685,6 +656,27 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
 mod tests {
     use super::*;
     use crate::oid;
+
+    fn push_integer_content(buf: &mut EncodeBuf, content: &[u8]) {
+        buf.push_bytes(content);
+        buf.push_length(content.len());
+        buf.push_tag(crate::ber::tag::universal::INTEGER);
+    }
+
+    fn global_data_with_integer_contents(
+        msg_id: &[u8],
+        msg_max_size: &[u8],
+        security_model: &[u8],
+    ) -> Bytes {
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            push_integer_content(buf, security_model);
+            buf.push_octet_string(&[0x04]);
+            push_integer_content(buf, msg_max_size);
+            push_integer_content(buf, msg_id);
+        });
+        buf.finish()
+    }
 
     #[test]
     fn test_security_level_flags() {
@@ -814,6 +806,27 @@ mod tests {
             panic!("expected plaintext msgData");
         };
         assert_eq!(scoped.as_ref(), &[0x30, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn v3_decoders_reject_over_width_version_alias() {
+        let global = MsgGlobalData::new(7, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let scoped = ScopedPdu::with_empty_context(Pdu::get_request(42, &[]));
+        let security_params = crate::v3::UsmSecurityParams::empty().encode();
+
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            scoped.encode(buf);
+            buf.push_octet_string(&security_params);
+            global.encode(buf);
+            // 2^32 + 3 previously narrowed to the accepted v3 value.
+            push_integer_content(buf, &[0x01, 0x00, 0x00, 0x00, 0x03]);
+        });
+        let encoded = buf.finish();
+
+        assert!(V3Message::decode(encoded.clone()).is_err());
+        assert!(RawV3Message::decode(encoded.clone()).is_err());
+        assert!(crate::message::Message::decode(encoded).is_err());
     }
 
     /// The captured plaintext bytes are the complete ScopedPDU TLV, so a
@@ -1100,6 +1113,26 @@ mod tests {
             *result.unwrap_err(),
             Error::MalformedResponse { .. }
         ));
+    }
+
+    #[test]
+    fn msg_global_data_rejects_over_width_integer_aliases() {
+        const ZERO: &[u8] = &[0x00];
+        const MSG_MAX_SIZE: &[u8] = &[0x05, 0xC0];
+        const USM: &[u8] = &[0x03];
+
+        // Each value is 2^32 plus an otherwise accepted field value.
+        let aliased_msg_id =
+            global_data_with_integer_contents(&[0x01, 0x00, 0x00, 0x00, 0x00], MSG_MAX_SIZE, USM);
+        let aliased_msg_max_size =
+            global_data_with_integer_contents(ZERO, &[0x01, 0x00, 0x00, 0x05, 0xC0], USM);
+        let aliased_security_model =
+            global_data_with_integer_contents(ZERO, MSG_MAX_SIZE, &[0x01, 0x00, 0x00, 0x00, 0x03]);
+
+        for encoded in [aliased_msg_id, aliased_msg_max_size, aliased_security_model] {
+            let mut decoder = Decoder::new(encoded);
+            assert!(MsgGlobalData::decode(&mut decoder).is_err());
+        }
     }
 
     #[test]

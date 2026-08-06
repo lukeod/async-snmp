@@ -153,8 +153,35 @@ impl Decoder {
         self.read_integer_value(len)
     }
 
+    /// Read a BER integer whose ASN.1 type constrains it to an `i32` range.
+    ///
+    /// Unlike [`Self::read_integer`], this checks the complete decoded value
+    /// before narrowing it. This prevents over-width encodings such as
+    /// `2^32` from aliasing an in-range value after truncation.
+    pub(crate) fn read_bounded_integer(&mut self, minimum: i32, maximum: i32) -> Result<i32> {
+        debug_assert!(minimum <= maximum);
+
+        let len = self.expect_tag(tag::universal::INTEGER)?;
+        let value = self.read_signed_integer_value(len)?;
+        if value < i64::from(minimum) || value > i64::from(maximum) {
+            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::IntegerOutOfRange { value, minimum, maximum } }, "integer outside constrained range");
+            return Err(self.malformed());
+        }
+
+        Ok(value as i32)
+    }
+
     /// Read integer value given the length.
     pub fn read_integer_value(&mut self, len: usize) -> Result<i32> {
+        // The generic SNMP INTEGER path deliberately follows net-snmp's
+        // permissive truncation behavior. ASN.1 fields with narrower ranges
+        // must use `read_bounded_integer` instead.
+        Ok(self.read_signed_integer_value(len)? as i32)
+    }
+
+    /// Read the complete signed value of an INTEGER accepted by the generic
+    /// BER parser, without narrowing it to the public `i32` representation.
+    fn read_signed_integer_value(&mut self, len: usize) -> Result<i64> {
         if len == 0 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::ZeroLengthInteger }, "zero-length integer");
             return Err(self.malformed());
@@ -167,8 +194,8 @@ impl Decoder {
 
         let bytes = self.read_bytes(len)?;
 
-        // Sign-extend into i64, then truncate to i32. Net-snmp does the same (CHECK_OVERFLOW_S)
-        // to stay compatible with devices that send oversized but otherwise valid encodings.
+        // Sign-extend into i64. The generic caller truncates this to i32 to
+        // match net-snmp's CHECK_OVERFLOW_S compatibility behavior.
         let is_negative = bytes[0] & 0x80 != 0;
         let mut value: i64 = if is_negative { -1 } else { 0 };
 
@@ -176,7 +203,7 @@ impl Decoder {
             value = (value << 8) | i64::from(byte);
         }
 
-        Ok(value as i32)
+        Ok(value)
     }
 
     /// Read a 64-bit unsigned integer (Counter64).
@@ -431,6 +458,30 @@ mod tests {
         assert!(
             dec.read_integer().is_err(),
             "9-byte integer must be rejected"
+        );
+    }
+
+    #[test]
+    fn bounded_integer_rejects_values_that_generic_decode_truncates() {
+        const TWO_TO_32: &[u8] = &[0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00];
+        const NEGATIVE_TWO_TO_32: &[u8] = &[0x02, 0x05, 0xFF, 0x00, 0x00, 0x00, 0x00];
+
+        let mut generic = Decoder::from_slice(TWO_TO_32);
+        assert_eq!(generic.read_integer().unwrap(), 0);
+        let mut bounded = Decoder::from_slice(TWO_TO_32);
+        assert!(bounded.read_bounded_integer(0, i32::MAX).is_err());
+
+        let mut generic = Decoder::from_slice(NEGATIVE_TWO_TO_32);
+        assert_eq!(generic.read_integer().unwrap(), 0);
+        let mut bounded = Decoder::from_slice(NEGATIVE_TWO_TO_32);
+        assert!(bounded.read_bounded_integer(0, i32::MAX).is_err());
+
+        let mut lower_bound = Decoder::from_slice(&[0x02, 0x01, 0x00]);
+        assert_eq!(lower_bound.read_bounded_integer(0, i32::MAX).unwrap(), 0);
+        let mut upper_bound = Decoder::from_slice(&[0x02, 0x04, 0x7F, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            upper_bound.read_bounded_integer(0, i32::MAX).unwrap(),
+            i32::MAX
         );
     }
 

@@ -55,6 +55,12 @@ pub(crate) enum DecodeErrorKind {
     IndefiniteLength,
     /// Integer value overflow.
     IntegerOverflow,
+    /// Integer value outside a field's ASN.1 constraint.
+    IntegerOutOfRange {
+        value: i64,
+        minimum: i32,
+        maximum: i32,
+    },
     /// Zero-length integer.
     ZeroLengthInteger,
     /// Unknown SNMP version.
@@ -69,16 +75,6 @@ pub(crate) enum DecodeErrorKind {
     InvalidMsgFlags,
     /// Unknown security model.
     UnknownSecurityModel(i32),
-    /// msgMaxSize below RFC 3412 minimum (484 octets).
-    MsgMaxSizeTooSmall { value: i32, minimum: i32 },
-    /// msgMaxSize above RFC 3412 maximum (2147483647).
-    MsgMaxSizeTooLarge { value: i32 },
-    /// msgID outside RFC 3412 range (0..2147483647).
-    InvalidMsgId { value: i32 },
-    /// msgAuthoritativeEngineBoots outside RFC 3414 range (0..2147483647).
-    InvalidEngineBoots { value: i32 },
-    /// msgAuthoritativeEngineTime outside RFC 3414 range (0..2147483647).
-    InvalidEngineTime { value: i32 },
     /// msgUserName exceeds RFC 3414 maximum length (SIZE(0..32)).
     InvalidUserNameLength { length: usize },
     /// NULL with non-zero length.
@@ -121,6 +117,14 @@ impl std::fmt::Display for DecodeErrorKind {
             Self::InvalidLength => write!(f, "invalid length encoding"),
             Self::IndefiniteLength => write!(f, "indefinite length encoding not supported"),
             Self::IntegerOverflow => write!(f, "integer overflow"),
+            Self::IntegerOutOfRange {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                f,
+                "integer {value} outside constrained range {minimum}..{maximum}"
+            ),
             Self::ZeroLengthInteger => write!(f, "zero-length integer"),
             Self::UnknownVersion(v) => write!(f, "unknown SNMP version: {v}"),
             Self::UnknownPduType(t) => write!(f, "unknown PDU type: 0x{t:02X}"),
@@ -130,27 +134,6 @@ impl std::fmt::Display for DecodeErrorKind {
             Self::MissingPdu => write!(f, "missing PDU in message"),
             Self::InvalidMsgFlags => write!(f, "invalid msgFlags: privacy without authentication"),
             Self::UnknownSecurityModel(m) => write!(f, "unknown security model: {m}"),
-            Self::MsgMaxSizeTooSmall { value, minimum } => {
-                write!(f, "msgMaxSize {value} below RFC 3412 minimum {minimum}")
-            }
-            Self::MsgMaxSizeTooLarge { value } => {
-                write!(f, "msgMaxSize {value} above RFC 3412 maximum 2147483647")
-            }
-            Self::InvalidMsgId { value } => {
-                write!(f, "msgID {value} outside RFC 3412 range 0..2147483647")
-            }
-            Self::InvalidEngineBoots { value } => {
-                write!(
-                    f,
-                    "msgAuthoritativeEngineBoots {value} outside RFC 3414 range 0..2147483647"
-                )
-            }
-            Self::InvalidEngineTime { value } => {
-                write!(
-                    f,
-                    "msgAuthoritativeEngineTime {value} outside RFC 3414 range 0..2147483647"
-                )
-            }
             Self::InvalidUserNameLength { length } => {
                 write!(f, "msgUserName length {length} exceeds maximum 32")
             }
