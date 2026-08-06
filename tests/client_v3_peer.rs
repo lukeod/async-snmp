@@ -2796,6 +2796,85 @@ async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
 }
 
 #[tokio::test]
+async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correction() {
+    let level = SecurityLevel::AuthPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone();
+    let first_attempt = Arc::new(Mutex::new(None::<i32>));
+    let capture = first_attempt.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::silence_with(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+            }),
+            ScriptStep::reply(move |request| {
+                let prior = first_attempt.lock().unwrap().take().unwrap();
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::not_in_time_windows(),
+                    1,
+                )
+                .engine_boots(7)
+                .engine_time(100)
+                .msg_id(prior)
+                .build()
+            }),
+            response_step(
+                response_engine,
+                "corrected from windowed compatibility report",
+            ),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::fixed(1, Duration::ZERO))
+        .allow_unauthenticated_v3_time_correction(true)
+        .connect()
+        .await
+        .unwrap();
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(
+        result.value.as_str(),
+        Some("corrected from windowed compatibility report")
+    );
+
+    peer.finish().await.unwrap();
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 4);
+    assert_ne!(
+        requests[1].global_data.msg_id, requests[2].global_data.msg_id,
+        "timeout retransmission receives a fresh msgID"
+    );
+    assert_eq!(
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        "timeout retransmission reuses the PDU request ID"
+    );
+    assert_ne!(
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[3].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        "protocol correction receives a fresh PDU request ID"
+    );
+    assert_eq!(
+        (requests[3].usm.engine_boots, requests[3].usm.engine_time),
+        (7, 100),
+        "the earlier attempt's unauthenticated tuple applies to the corrected packet"
+    );
+    assert_eq!(requests[3].authentication_valid, Some(true));
+    assert_eq!(
+        requests[3].global_data.msg_flags.security_level,
+        SecurityLevel::AuthPriv
+    );
+}
+
+#[tokio::test]
 async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
     let level = SecurityLevel::AuthNoPriv;
     let engine = engine_for(level);
