@@ -11,6 +11,12 @@
 //! - Validated, increment-before-use authoritative engine startup state
 //! - Pluggable cryptographic backends via the [`CryptoProvider`] trait
 //!
+//! Discovery is unauthenticated and establishes only a remote identity
+//! candidate and message-size limit. Boots/time becomes trusted only after
+//! HMAC verification and RFC 3414 Step 7(b) processing. Local authoritative
+//! roles use [`AuthoritativeEngine`] so a stable engine ID and every boots
+//! increment are persisted before protocol use.
+//!
 //! The crypto backend is selected at compile time via the `crypto-rustcrypto`
 //! (default) or `crypto-fips` feature flags. See [`CryptoProvider`] and
 //! the crate-level documentation for details.

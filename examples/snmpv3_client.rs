@@ -158,9 +158,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Available privacy protocols:
     // - PrivProtocol::Des      (legacy, not recommended)
-    // - PrivProtocol::Aes128   (recommended)
-    // - PrivProtocol::Aes192
-    // - PrivProtocol::Aes256   (strongest)
+    // - PrivProtocol::Aes128   (recommended; RFC 3826)
+    // - PrivProtocol::Aes192   (draft/vendor extension)
+    // - PrivProtocol::Aes256   (draft/vendor extension)
 
     let strong_auth = Auth::usm("admin").auth_priv(
         AuthProtocol::Sha512,

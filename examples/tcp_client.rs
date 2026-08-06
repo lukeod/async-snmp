@@ -4,11 +4,12 @@
 //! TCP transport is useful when:
 //! - Large responses exceed UDP's 64KB limit
 //! - Firewalls block UDP but allow TCP
-//! - Reliable delivery is required without retries
+//! - Reliable delivery is required without timeout retransmissions
 //!
 //! Key differences from UDP:
 //! - Messages are framed using BER self-describing length
-//! - No retries (TCP guarantees delivery or connection failure)
+//! - No timeout retransmissions (TCP guarantees delivery or connection failure)
+//! - SNMPv3 protocol correction remains available independently
 //! - Connection-oriented (one TCP connection per target)
 //! - Requests are serialized per connection
 //!
@@ -45,7 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use connect_tcp() instead of connect()
     let client = Client::builder(target, Auth::v2c("public"))
         .timeout(Duration::from_secs(10))
-        // Note: retries are ignored for TCP (is_reliable = true)
+        // Timeout retries are ignored for TCP (is_reliable = true).
+        // SNMPv3 protocol correction is a separate state transition.
         .retry(Retry::fixed(3, Duration::ZERO))
         .connect_tcp()
         .await?;
@@ -173,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Retries: 3 (configured)");
     println!("  Behavior: Retries on timeout\n");
 
-    // TCP client - no retries
+    // TCP client - no timeout retransmissions
     let tcp_client = Client::builder(target, Auth::v2c("public"))
         .timeout(Duration::from_secs(2))
         .retry(Retry::fixed(3, Duration::ZERO)) // Ignored for TCP!
@@ -181,8 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     println!("TCP client:");
-    println!("  Retries: Ignored (is_reliable = true)");
-    println!("  Behavior: Single attempt, TCP guarantees delivery");
+    println!("  Timeout retries: Ignored (is_reliable = true)");
+    println!("  Behavior: Single transmission unless SNMPv3 protocol correction is needed");
 
     // Demonstrate both clients work the same way
     if let Ok(client) = udp_client {

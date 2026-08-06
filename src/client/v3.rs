@@ -992,11 +992,12 @@ impl<T: Transport> Client<T> {
 
                     let delay = self.inner.config.retry.compute_delay(timeout_retries);
                     timeout_retries += 1;
-                    // The retransmission is the same request: the PDU request-id is
-                    // reused, matching net-snmp and snmp4j. RFC 3414 Section 11.1's
-                    // distinct-request-id rule is applied per operation, not per
-                    // transmission; a fresh msgID still distinguishes each copy on the
-                    // wire and any windowed transmission's response remains acceptable.
+                    // Retain the PDU request-id across timeout retransmissions,
+                    // matching deployed net-snmp and SNMP4J behavior. RFC 3414
+                    // Section 11.1 literally requires distinct request-ids in all
+                    // Request PDUs sent during a TimeWindow, so this is a deliberate
+                    // interoperability deviation. A fresh msgID still distinguishes
+                    // each transmission, and any current-window msgID remains valid.
                     tracing::debug!(target: "async_snmp::client", { timeout_retries, delay_ms = delay.as_millis() as u64 }, "retransmitting V3 request after timeout");
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;

@@ -97,7 +97,7 @@ exchanges.
 ## Installation
 
 ```bash
-cargo add async-snmp
+cargo add async-snmp@0.17.0
 ```
 
 ## Quick Start

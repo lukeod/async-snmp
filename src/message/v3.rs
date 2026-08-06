@@ -441,8 +441,11 @@ impl V3Message {
 
     /// Decode from BER.
     ///
-    /// For encrypted messages, returns `V3MessageData::Encrypted` with the raw ciphertext.
-    /// The caller must decrypt using USM before accessing the scoped PDU.
+    /// For encrypted messages, returns `V3MessageData::Encrypted` with the raw
+    /// ciphertext. For plaintext messages this parses the scoped PDU without
+    /// performing USM authentication. Receive paths handling untrusted input
+    /// should use [`RawV3Message::decode`] so authentication and timeliness can
+    /// precede scoped-PDU parsing.
     pub fn decode(data: Bytes) -> Result<Self> {
         let mut decoder = Decoder::new(data);
         let mut seq = decoder.read_sequence()?;
@@ -488,7 +491,9 @@ impl V3Message {
 
     /// Create a discovery request message.
     ///
-    /// This is sent to discover the engine ID and time of a remote SNMP engine.
+    /// This is sent to discover a remote SNMP engine's identity and message-size
+    /// limit. The response is unauthenticated, so its boots/time tuple must not
+    /// establish trusted time; authenticated communication performs that step.
     /// Uses empty security parameters and no authentication.
     #[must_use]
     pub fn discovery_request(msg_id: i32) -> Self {

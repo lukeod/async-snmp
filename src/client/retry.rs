@@ -9,7 +9,16 @@ use std::time::Duration;
 /// Retry configuration for SNMP requests.
 ///
 /// Controls how the client handles timeouts on UDP transports. TCP transports
-/// ignore retry configuration since the transport layer handles reliability.
+/// ignore timeout retry configuration since the transport layer handles
+/// reliability. SNMPv3 protocol correction is separate from timeout retry
+/// policy: one authenticated time-window correction remains available with
+/// [`Retry::none`] and on reliable transports.
+///
+/// Each SNMPv3 timeout transmission uses a fresh outer msgID while retaining
+/// the PDU request-id, and a response to any transmission in the current
+/// exchange may correlate. Stable request-id reuse matches deployed stacks but
+/// deliberately deviates from RFC 3414 Section 11.1. A protocol correction
+/// uses fresh message and PDU IDs and resets that acceptance window.
 ///
 /// # Examples
 ///

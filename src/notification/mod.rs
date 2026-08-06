@@ -104,6 +104,16 @@
 //! variant carries how it was authenticated — the community for v1/v2c, the
 //! username and [`security_level`](Notification::security_level) for v3 — so
 //! branch on the variant when `recv` returns to apply per-version policy.
+//!
+//! # V3 Authoritative Roles
+//!
+//! The sender of an unconfirmed V3 trap is authoritative. The receiver verifies
+//! the trap against per-sender engine state and reports the received security
+//! level to the application. For a V3 Inform, this receiver is authoritative:
+//! the Inform must be localized to its stable engine ID, and the automatic
+//! Response uses its current coherent boots/time rather than echoing the
+//! incoming tuple. Configuring any USM user therefore requires a persisted
+//! [`AuthoritativeEngine`].
 
 mod handlers;
 mod varbind;
@@ -236,7 +246,8 @@ pub mod oids {
 /// Configures the bind address, optional community filtering for v1/v2c, and
 /// USM credentials for v3. Community filtering and USM users are independent
 /// and may be combined; a single receiver then handles all versions on one
-/// port. See the [module docs](crate::notification#mixed-versions-on-one-port).
+/// port. Any USM user also requires a persisted [`AuthoritativeEngine`]. See
+/// the [module docs](crate::notification#mixed-versions-on-one-port).
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
@@ -250,6 +261,7 @@ impl NotificationReceiverBuilder {
     /// Defaults:
     /// - Bind address: `0.0.0.0:162` (UDP, standard SNMP trap port)
     /// - No USM users (v3 notifications rejected until users are added)
+    /// - No authoritative engine (required when adding a USM user)
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -271,15 +283,25 @@ impl NotificationReceiverBuilder {
 
     /// Add a USM user for V3 authentication.
     ///
+    /// Adding any user requires a persisted [`AuthoritativeEngine`] before
+    /// [`build`](Self::build), because this receiver is authoritative for V3
+    /// Inform exchanges.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
     /// use async_snmp::notification::NotificationReceiver;
-    /// use async_snmp::{AuthProtocol, PrivProtocol};
+    /// use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+    /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// # // Replace this no-op with durable storage in an application.
+    /// let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
+    ///     Ok::<(), Infallible>(())
+    /// })?;
     /// let receiver = NotificationReceiver::builder()
     ///     .bind("0.0.0.0:162")
+    ///     .authoritative_engine(engine)
     ///     .usm_user("trapuser", |u| {
     ///         u.auth_priv(
     ///             AuthProtocol::Sha1,
@@ -372,7 +394,8 @@ impl NotificationReceiverBuilder {
     ///
     /// A receiver with USM users can be authoritative for Informs and requires
     /// this value. Construct it with [`AuthoritativeEngine::install`] on first
-    /// installation or [`AuthoritativeEngine::restart`] on later starts.
+    /// installation or [`AuthoritativeEngine::restart`] on later starts. The
+    /// retained callback persists runtime rollover increments before use.
     #[must_use]
     pub fn authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
         self.authoritative_engine = Some(engine);
@@ -401,6 +424,9 @@ impl NotificationReceiverBuilder {
     }
 
     /// Build the notification receiver.
+    ///
+    /// Returns a configuration error when a USM user is configured without a
+    /// persisted [`AuthoritativeEngine`].
     pub async fn build(mut self) -> Result<NotificationReceiver> {
         // Precompute master keys so the expensive password expansion runs once
         // here instead of on every inbound packet (CPU amplification).
@@ -635,16 +661,22 @@ impl Notification {
 ///
 /// # V3 Authentication
 ///
-/// To receive authenticated V3 notifications, use the builder pattern to configure
-/// USM credentials:
+/// To receive authenticated V3 notifications, use the builder pattern to
+/// configure USM credentials and persisted authoritative engine state:
 ///
 /// ```rust,no_run
 /// use async_snmp::notification::NotificationReceiver;
-/// use async_snmp::{AuthProtocol, PrivProtocol};
+/// use async_snmp::{AuthProtocol, AuthoritativeEngine};
+/// use std::convert::Infallible;
 ///
 /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+/// # // Replace this no-op with durable storage in an application.
+/// let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
+///     Ok::<(), Infallible>(())
+/// })?;
 /// let receiver = NotificationReceiver::builder()
 ///     .bind("0.0.0.0:162")
+///     .authoritative_engine(engine)
 ///     .usm_user("trapuser", |u| {
 ///         u.auth(AuthProtocol::Sha1, b"authpassword")
 ///     })
@@ -779,7 +811,11 @@ impl NotificationReceiver {
         self.inner.local_addr
     }
 
-    /// Get the engine ID.
+    /// Get the local engine ID.
+    ///
+    /// With an [`AuthoritativeEngine`] this is the stable persisted V3
+    /// identity. A receiver without USM users instead has a generated
+    /// process-local ID.
     #[must_use]
     pub fn engine_id(&self) -> &[u8] {
         &self.inner.engine_id

@@ -376,11 +376,17 @@ impl AgentBuilder {
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
-    /// use async_snmp::{AuthProtocol, PrivProtocol};
+    /// use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+    /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// # // Replace this no-op with durable storage in an application.
+    /// let engine = AuthoritativeEngine::install(b"agent-engine".to_vec(), |_| {
+    ///     Ok::<(), Infallible>(())
+    /// })?;
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
+    ///     .authoritative_engine(engine)
     ///     // Read-only user with authentication only
     ///     .usm_user("monitor", |u| {
     ///         u.auth(AuthProtocol::Sha256, b"monitorpass123")
@@ -415,8 +421,10 @@ impl AgentBuilder {
     /// An agent with USM users or V3 trap sinks requires this value. Construct
     /// it with [`AuthoritativeEngine::install`] on first installation or
     /// [`AuthoritativeEngine::restart`] on later process starts. Those
-    /// constructors persist the stable engine ID and incremented boots counter
-    /// before returning.
+    /// constructors persist the stable engine ID and startup boots counter
+    /// before returning: boots 1 for installation, or the incremented stored
+    /// value on restart. The retained callback also persists runtime rollover
+    /// increments before they are used.
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
@@ -612,16 +620,27 @@ impl AgentBuilder {
     ///
     /// The agent will send notifications to all configured trap sinks when
     /// [`Agent::send_trap()`] or [`Agent::send_inform()`] is called.
+    /// For V3 traps, the Agent is authoritative and uses its persisted
+    /// [`AuthoritativeEngine`]. For V3 Informs, the receiving sink is
+    /// authoritative and the Agent discovers the sink's engine. Configuring
+    /// any V3 sink still requires local authoritative state because it may be
+    /// used by [`Agent::send_trap()`].
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
-    /// use async_snmp::{Auth, AuthProtocol, PrivProtocol};
+    /// use async_snmp::{Auth, AuthProtocol, AuthoritativeEngine, PrivProtocol};
+    /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
+    /// # // Replace this no-op with durable storage in an application.
+    /// let engine = AuthoritativeEngine::install(b"agent-engine".to_vec(), |_| {
+    ///     Ok::<(), Infallible>(())
+    /// })?;
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
+    ///     .authoritative_engine(engine)
     ///     .community(b"public")
     ///     .trap_sink("192.168.1.100:162", Auth::v2c("public"))
     ///     .trap_sink("10.0.0.1:162", Auth::usm("trapuser").auth_priv(
@@ -689,6 +708,9 @@ impl AgentBuilder {
     }
 
     /// Build the agent.
+    ///
+    /// Returns a configuration error when USM users or V3 trap sinks are
+    /// configured without a persisted [`AuthoritativeEngine`].
     pub async fn build(mut self) -> Result<Agent> {
         // Precompute master keys so the expensive password expansion runs once
         // here instead of on every inbound packet (CPU amplification).
@@ -936,22 +958,30 @@ impl Agent {
         self.inner.local_addr
     }
 
-    /// Get the engine ID.
+    /// Get the local engine ID.
+    ///
+    /// With an [`AuthoritativeEngine`] this is the stable persisted V3
+    /// identity. A community-only Agent instead has a generated process-local
+    /// ID for its built-in engine objects.
     #[must_use]
     pub fn engine_id(&self) -> &[u8] {
         &self.inner.state.engine_id
     }
 
-    /// Get the current engine boots value.
+    /// Get the most recently sampled engine boots value.
     ///
-    /// This value was persisted before construction. If it changes because
-    /// engine time wraps, persist the new value with the same engine ID.
+    /// V3 processing samples the shared authoritative clock. Any rollover
+    /// increment has already been stored through the retained persistence
+    /// callback before this snapshot is published.
     #[must_use]
     pub fn engine_boots(&self) -> u32 {
         self.inner.state.engine_boots.load(Ordering::Relaxed)
     }
 
-    /// Get the current engine time value.
+    /// Get the most recently sampled engine time value.
+    ///
+    /// This snapshot is refreshed during protocol processing rather than by a
+    /// background timer, so it can remain unchanged while the Agent is idle.
     #[must_use]
     pub fn engine_time(&self) -> u32 {
         self.inner.state.engine_time.load(Ordering::Relaxed)

@@ -212,6 +212,8 @@ impl super::Agent {
     /// expected.
     ///
     /// V1 trap sinks receive a converted v1 trap (RFC 3584 Section 3.2).
+    /// For a V3 sink, this Agent is authoritative and sends its persisted
+    /// engine ID with the current boots/time tuple.
     ///
     /// # Example
     ///
@@ -286,6 +288,9 @@ impl super::Agent {
     /// sink for the request/response exchange.
     ///
     /// V1 trap sinks are skipped (v1 does not support informs).
+    /// For a V3 sink, the receiver is authoritative; the cached client
+    /// discovers and uses the sink's engine identity and trusted time rather
+    /// than the Agent's local authoritative state.
     ///
     /// # Example
     ///

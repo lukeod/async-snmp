@@ -164,7 +164,8 @@ pub(crate) fn sign_v3_message(
 /// `msg_id` and `msg_max_size` echo the incoming message header. With
 /// `auth_key` the report is sent authenticated at authNoPriv, as RFC 3414
 /// Section 3.2 Step 7a requires for notInTimeWindows reports so the sender
-/// can trust the boots/time for resynchronization. Otherwise noAuthNoPriv.
+/// can authenticate the tuple and apply normal Step 7(b) timeliness
+/// processing. Otherwise it is noAuthNoPriv.
 ///
 /// The reportableFlag check (whether a report may be sent at all) is the
 /// caller's responsibility.

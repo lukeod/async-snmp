@@ -56,6 +56,11 @@ impl PersistedAuthoritativeEngine {
 /// persistence callback. A protocol role cannot receive an unpersisted startup
 /// or engine-time rollover value through the public API. Clones share one
 /// authoritative clock and persistence state.
+///
+/// This state is required for an Agent with USM users or V3 trap sinks, a
+/// notification receiver with USM users, and a client originating V3 traps.
+/// Polling clients and V3 Inform originators do not need local authoritative
+/// state because the remote responder is authoritative for those exchanges.
 #[derive(Clone)]
 pub struct AuthoritativeEngine {
     inner: Arc<AuthoritativeEngineInner>,

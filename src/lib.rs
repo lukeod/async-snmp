@@ -60,6 +60,45 @@
 //! }
 //! ```
 //!
+//! ## `SNMPv3` Trust, Corrections, and Roles
+//!
+//! Engine discovery is unauthenticated. A client accepts only a correlated,
+//! standard `usmStatsUnknownEngineIDs.0` Report and learns an engine identity
+//! candidate and message-size limit; it discards the Report's boots/time tuple.
+//! Trusted time is established and advanced only after HMAC verification and
+//! RFC 3414 Step 7(b) processing.
+//!
+//! Incoming auth/privacy flags select the received security level. HMAC and
+//! timeliness processing precede decryption, scoped-PDU parsing, and msgID
+//! correlation. Ordinary Responses then require exact identity, security,
+//! context, PDU type, and request-id matches. Reports also require a current
+//! exchange msgID and exact shape; terminal statuses are returned as
+//! [`Error::Report`].
+//!
+//! On an SNMPv3 timeout, each transmission uses a fresh outer msgID while the
+//! PDU request-id remains stable, and any msgID in the current exchange can
+//! correlate. Stable request-id reuse is a deliberate RFC 3414 Section 11.1
+//! interoperability deviation. One authenticated time-window Report may cause
+//! a corrected request with fresh message and PDU IDs independently of timeout
+//! retry policy. Other or repeated Reports are terminal.
+//!
+//! [`EngineCache`] maps target addresses to discovered identities while sharing
+//! trusted time by authoritative engine ID. Cache TTL expiry affects future
+//! lookups, not a live client's established identity; use
+//! [`Client::rediscover_engine`] after an intentional device replacement.
+//!
+//! The default-off
+//! [`ClientBuilder::allow_unauthenticated_v3_time_correction`] option supports
+//! devices that emit an unauthenticated time-window Report. Its tuple is used
+//! for one authenticated packet and never installed as trusted state, but an
+//! injector can choose that packet's time fields; enable strict UDP source
+//! checking where possible.
+//!
+//! Agents with USM users or V3 trap sinks, notification receivers with USM
+//! users, and clients originating V3 traps are locally authoritative and need
+//! a persisted [`AuthoritativeEngine`]. Polling and V3 Inform originators use
+//! the remote responder as authoritative and do not need local engine state.
+//!
 //! # Advanced Topics
 //!
 //! ## Error Handling Patterns

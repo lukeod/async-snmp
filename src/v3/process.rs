@@ -281,8 +281,8 @@ pub(crate) fn process_v3_inbound(
             ) {
                 tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = ctx.engine_boots, snmp.our_time = ctx.engine_time }, "message outside time window");
                 // RFC 3414 Section 3.2 Step 7a: the report must be
-                // authenticated at authNoPriv so the sender can trust the
-                // boots/time for resynchronization.
+                // authenticated at authNoPriv so the sender can authenticate
+                // the tuple and apply normal Step 7(b) timeliness processing.
                 return fail(UsmFailure::NotInTimeWindows, Some(auth_key));
             }
         } else if let V3Role::Receiver {

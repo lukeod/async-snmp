@@ -223,8 +223,10 @@ impl ClientBuilder {
     /// Set the retry configuration (default: 3 retries, 1-second delay).
     ///
     /// On timeout, the client resends the request up to this many times before
-    /// returning an error. Retries are disabled for TCP (which handles
-    /// reliability at the transport layer).
+    /// returning an error. Timeout retransmissions are disabled for TCP (which
+    /// handles reliability at the transport layer). SNMPv3 protocol correction
+    /// is independent of this setting and remains available with
+    /// [`Retry::none`] and on reliable transports.
     ///
     /// # Example
     ///
@@ -417,9 +419,13 @@ impl ClientBuilder {
 
     /// Set shared engine cache (V3 only, for polling many targets).
     ///
-    /// Allows multiple clients to share discovered engine state, reducing
-    /// the number of discovery requests. This is particularly useful when
-    /// polling many devices with `SNMPv3`.
+    /// Allows multiple clients to share target-to-engine identity mappings and
+    /// per-authoritative-engine trusted time, reducing discovery requests and
+    /// keeping clients that reach the same engine coherent. Cache expiry affects
+    /// lookup by newly constructed clients; it does not replace an identity
+    /// already established by a live client. Use
+    /// [`Client::rediscover_engine`](crate::Client::rediscover_engine) for an
+    /// intentional identity replacement.
     ///
     /// # Example
     ///

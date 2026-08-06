@@ -7,9 +7,11 @@
 //! Key concepts:
 //! - UdpTransport: A single UDP socket shared across multiple clients
 //! - `.build_with(&transport).await`: Creates a client using the shared transport
-//! - Request ID correlation: Responses are matched to requests by ID
-//!   (opt-in strict source matching is available via `UdpHandle::strict_source()`)
-//! - Engine cache: Share SNMPv3 engine discovery across clients
+//! - Correlation: Community responses use the PDU request-id; V3 uses the outer
+//!   msgID (the PDU request-id is distinct)
+//! - Source policy: Opt-in strict matching is available through
+//!   `ClientBuilder::strict_source()` or `UdpHandle::strict_source()`
+//! - Engine cache: Share V3 target identities and trusted engine time
 //! - Transport stats: `UdpTransport::stats()` counters for transport health
 //!
 //! Run with: cargo run --example shared_transport
@@ -109,8 +111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\n--- SNMPv3 with Shared Engine Cache ---\n");
 
-    // For SNMPv3, engine discovery results are cached to avoid repeated
-    // discovery requests. The EngineCache can be shared across clients.
+    // For SNMPv3, target-to-engine identity mappings are cached to avoid
+    // repeated discovery, while trusted time is shared by authoritative engine
+    // ID. TTL expiry affects future cache lookups; a live client retains its
+    // established identity until rediscover_engine() is called explicitly.
     let engine_cache = Arc::new(EngineCache::new());
 
     // Pre-compute master keys once (expensive: ~850us for SHA-256).

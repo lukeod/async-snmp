@@ -7,12 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-06
+
+### Added
+
+- `Client::rediscover_engine()` provides an explicit, transactional way to
+  replace an established SNMPv3 engine identity after a device is replaced or
+  reconfigured. A failed or cancelled rediscovery leaves the previous identity,
+  localized keys, and shared-cache mapping intact.
+- `ReportStatus`, `MalformedReport`, and `classify_report()` provide exact-shape,
+  typed SNMPv3 Report handling. Terminal Reports are returned as
+  `Error::Report` instead of being collapsed into authentication or generic
+  SNMP errors.
+- `ClientBuilder::strict_source()` applies the existing opt-in UDP source check
+  to discovery and ordinary exchanges created through `connect()` or
+  `build_with()`.
+- `ClientBuilder::allow_unauthenticated_v3_time_correction()` and the matching
+  `ClientConfig` field enable a default-off compatibility path for devices that
+  answer an authenticated request with an unauthenticated
+  `usmStatsNotInTimeWindows` Report. The untrusted tuple is used by one
+  authenticated corrected packet and is never installed as trusted state;
+  enabling this weakens spoof resistance, so strict UDP source checking is
+  recommended where possible.
+- `RawV3Message` and `RawMsgData` expose outer-envelope decoding separately
+  from secured scoped-PDU processing.
+
 ### Changed
 
 - SNMPv3 timeout retransmissions reuse the PDU request-id and a response
-  correlating to any transmitted msgID of the operation is accepted,
-  matching net-snmp and snmp4j. Protocol corrections still use fresh
-  message and request IDs and reset the acceptance window.
+  correlating to any transmitted msgID of the current exchange is accepted.
+  Each transmission still uses a fresh msgID. Stable PDU request-id reuse
+  matches deployed net-snmp and SNMP4J behavior, while acceptance of older
+  attempt msgIDs follows SNMP4J's broader cache behavior. Reusing the PDU
+  request-id is a deliberate interoperability deviation from RFC 3414 Section
+  11.1. Protocol corrections use fresh message and request IDs and reset the
+  acceptance window.
+- SNMPv3 receive processing now derives the security level from the received
+  auth/privacy flags. HMAC verification and RFC 3414 timeliness processing
+  precede decryption, scoped-PDU parsing, and Message Processing Model
+  correlation. Privacy without authentication is rejected.
+- Ordinary SNMPv3 Responses now require a current exchange msgID and exact
+  matches for authoritative engine ID, security model, security name, security
+  level, context engine ID, context name, Response PDU type, and PDU request-id.
+  Reports must also correlate by msgID before they can trigger an action.
+- Discovery accepts only a correlated noAuthNoPriv
+  `usmStatsUnknownEngineIDs.0` Report with the standard shape. It adopts the
+  engine ID and message-size limit but discards the unauthenticated boots/time
+  tuple. Authenticated requests initially use boots/time zero and establish
+  trusted time only through HMAC-verified processing.
+- Engine identity, localized keys, trusted time, and shared-cache mappings are
+  now updated as one coherent generation. Trusted time is shared by
+  authoritative engine ID across target addresses and merges monotonically;
+  older in-window messages cannot lower the high-water value. Cache expiry no
+  longer silently replaces an identity already established by a live client.
+- **Breaking:** `EngineState` no longer exposes `engine_id`, `engine_boots`,
+  `engine_time`, `synced_at`, or `latest_received_engine_time` fields, and
+  `EngineState::resync()` was removed. Use `engine_id()`, `trusted_time()`, and
+  `estimated_boots_time()`; `TrustedEngineTime` exposes the authenticated boots,
+  received-time base, and high-water value. There is no backward-resync
+  replacement: call `Client::rediscover_engine()` when the remote identity has
+  intentionally changed.
+- SNMPv3 `usmStatsNotInTimeWindows` correction is independent of timeout retry
+  policy and transport reliability, so one authenticated correction remains
+  available with `Retry::none()`, TCP, custom reliable transports, or after the
+  final timeout attempt. A repeated correction Report is terminal.
 - **Breaking:** `Auth::Usm` now contains `UsmConfig` directly, and the duplicate
   `UsmAuth`/`UsmBuilder` types were removed. USM credential fields are private
   and use valid-state constructors; use `auth_priv(...)` instead of chaining a
@@ -29,6 +87,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `local_authoritative_engine`; polling and Inform sending remain unchanged.
   Clones share one authoritative clock, and runtime boots increments are
   persisted before use.
+
+### Removed
+
+- The boolean Report helpers (`is_not_in_time_window_report()`,
+  `is_unknown_engine_id_report()`, and the other standard-USM predicates) were
+  replaced by `classify_report()` and `ReportStatus`.
+
+### Migration
+
+- Custom `Transport` implementations may override `register_request_alias()`
+  when they demultiplex responses before returning them to the client. The
+  default no-op remains suitable for connected or in-band transports.
+- Direct `ClientConfig` struct literals must initialize
+  `allow_unauthenticated_v3_time_correction` and
+  `local_authoritative_engine`, or use `..ClientConfig::default()`.
+- Replace `Auth::usm(user).auth(...).privacy(...)` with
+  `Auth::usm(user).auth_priv(...)`. Notification users and client credentials
+  now use the same `UsmConfig` type.
+- Replace agent/receiver engine-ID and boots setters with a persisted
+  `AuthoritativeEngine`, passed through `authoritative_engine()`. For V3 client
+  traps, use `local_authoritative_engine()`; polling and Inform clients do not
+  need local authoritative state.
+- Code inspecting a Report should match `Error::Report { status, .. }` or call
+  `classify_report()` instead of inspecting the first varbind or using the
+  removed boolean helpers.
 
 ## [0.16.0] - 2026-07-14
 
@@ -97,7 +180,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `EngineState::resync()`, which unconditionally sets the engine boots/time notion from an authenticated source, allowing it to move backward — unlike the forward-only `update_time()`. Per RFC 3414 Section 2.3 an authenticated notInTimeWindows Report carries the authoritative engine's true boots/time; the client uses this to recover from an agent that reset its time without incrementing `snmpEngineBoots`.
+- `EngineState::resync()`, which unconditionally set the engine boots/time notion from an authenticated source and allowed it to move backward, unlike the forward-only `update_time()`. The client used this as a compatibility recovery for an agent that reset its time without incrementing `snmpEngineBoots`; backward replacement is not an RFC 3414 Section 2.3 timeliness transition and is removed in the next release.
 - `Value::UInteger32` (application tag 0x47, RFC 1442's UInteger32) and `Value::Nsap` (application tag 0x45, NsapAddress) variants. Values with these tags previously decoded as `Value::Gauge32` and `Value::OctetString` respectively, which re-encoded under the wrong tag; decode-then-encode now round-trips the original wire tag. `Value` is `#[non_exhaustive]`, so this compiles against existing matches, but code matching `Value::Gauge32`/`Value::OctetString` (or comparing with `==`) no longer sees values carrying these tags — such data now arrives under the new variants. NSAP values always display as hex (matching net-snmp), and the CLI `type` field for them changed from `STRING`/`Hex-STRING` to `Nsap`.
 
 ### Changed
@@ -121,7 +204,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Pdu::to_v1_trap()` treated a trap OID of `snmpTraps.x` with `x = 0` or `x > 6` as a generic enterprise-specific trap with `enterprise` set to the full trap OID and `specific-trap` 0; such an OID is not one of the standard traps, so RFC 3584 Section 3.2 rules (1), (3), and (4) apply instead: `generic-trap` 6, `specific-trap` = the last sub-identifier, and `enterprise` = the trap OID minus its final sub-identifier. Translation of `snmpTraps.1` through `snmpTraps.6` is unchanged.
 - SET commit rollback set the failing binding's index as the error-index for both `commitFailed` and `undoFailed` Responses; RFC 3416 Section 4.2.5 specifies that `undoFailed` carries error-index zero (only `commitFailed` identifies the failed binding). An `undoFailed` Response now has error-index 0.
 - Client accepted any PDU type as a response: a message echoing the request's own PDU type (or any other non-Response PDU) with a matching request-id was processed as a valid Response, though RFC 3416 Section 4.2 specifies only a Response-PDU may answer a request. Both the community (v1/v2c) and v3 receive paths now reject a non-Response PDU with `Error::MalformedResponse`. A v1/v2c response whose community does not echo the sent community is logged at warn but still accepted, matching net-snmp (proxies and some agents rewrite the community).
-- The v3 client ignored the RFC 3414 Section 3.2 step 7b timeliness check on responses: engine boots/time from a response only advanced the local notion, so a stale or replayed authenticated response was accepted. An authenticated response outside the time window is now rejected with `Error::Auth`, clearing the cached engine state and derived keys so the next call re-runs discovery. An authenticated notInTimeWindows Report now resyncs the notion backward per RFC 3414 Section 2.3 (propagated to the shared `EngineCache`); an unauthenticated Report remains forward-only so a spoofed Report cannot drag the notion back.
+- The v3 client ignored the RFC 3414 Section 3.2 step 7b timeliness check on responses: engine boots/time from a response only advanced the local notion, so a stale or replayed authenticated response was accepted. An authenticated response outside the time window is now rejected with `Error::Auth`, clearing the cached engine state and derived keys so the next call re-runs discovery. An authenticated notInTimeWindows Report used the compatibility `EngineState::resync()` path, including backward replacement, and propagated it to the shared `EngineCache`; this was not an RFC 3414 Section 2.3 timeliness transition and is removed in the next release. An unauthenticated Report remained forward-only so a spoofed Report could not drag the notion back.
 - `verify_message` bounds-checked `auth_offset + auth_len` only against the message length, so a `msgAuthenticationParameters` field longer than 48 octets (the SHA-512 MAC length, the largest any supported protocol produces) panicked slicing the internal zeros buffer — a remotely triggerable panic on malformed input. An `auth_len` above 48 now fails verification instead.
 - The agent's SNMP-MPD-MIB counters `snmpInvalidMsgs` and `snmpUnknownSecurityModels` (RFC 3412 Section 5.1) were declared but never incremented; the MIB scalars and the `Agent::snmp_invalid_msgs()`/`Agent::snmp_unknown_security_models()` accessors always read 0. Both are now counted by the shared v3 inbound processing, and classification follows `MsgGlobalData`'s field decode order so a message rejected at an earlier header field is not misattributed to `snmpUnknownSecurityModels`.
 - When `snmpEngineBoots` was latched at its maximum, the agent rejected authenticated requests with an unauthenticated Report emitted before HMAC verification; the rejection now occurs at the RFC 3414 Section 3.2 step 7a timeliness check after authentication, so the notInTimeWindows Report is itself authenticated and trustworthy to the receiver.
@@ -149,7 +232,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Agent evaluated RFC 3414 Section 3.2 Step 5 (security-level support) after authentication (Step 6), timeliness (Step 7), and the boots-latched gate; a request for a user lacking the required auth key (authNoPriv/authPriv) or privacy key (authPriv) now counts `usmStatsUnsupportedSecLevels` regardless of its HMAC, engine boots, or time
 - Agent accepted V3 requests carrying a mismatched `msgAuthoritativeEngineBoots` when the message time was within the window; now rejected with a `notInTimeWindows` Report per RFC 3414 Section 3.2 Step 7a (boots must match, not just time)
-- Agent's `notInTimeWindows` Report is now authenticated at authNoPriv per RFC 3414 Section 3.2 Step 7a, so a client with stale engine state can trust the boots/time and resync from it instead of failing with an auth error
+- Agent's `notInTimeWindows` Report is now authenticated at authNoPriv per RFC 3414 Section 3.2 Step 7a, so a client can authenticate the reported tuple instead of failing with an auth error; in this release the client applied it through the compatibility resync behavior described above
 - Authenticated v3 traps sent under the sender's own authoritative engine ID are now accepted by the notification receiver (previously rejected by an own-engine-ID gate)
 - Notification receiver now checks user existence before the security-level branch, so `noAuthNoPriv` messages from unknown users are counted (`usmStatsUnknownUserNames`) and dropped instead of delivered, per RFC 3414 Section 3.2 Step 4
 - Notification receiver now checks security-level support before digest verification, so an authPriv message for a user without a privacy key counts `usmStatsUnsupportedSecLevels` regardless of its HMAC, per RFC 3414 Section 3.2 (Step 5 before Step 6)
@@ -503,7 +586,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/lukeod/async-snmp/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/lukeod/async-snmp/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/lukeod/async-snmp/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/lukeod/async-snmp/compare/v0.13.0...v0.14.0

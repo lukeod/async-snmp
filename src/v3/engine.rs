@@ -459,10 +459,24 @@ pub fn in_authoritative_time_window(
 /// Default TTL for engine cache entries (5 minutes).
 ///
 /// Entries not refreshed by a successful authenticated exchange within
-/// this duration are considered stale. This handles device replacement
-/// (new engine ID at the same IP) without requiring unauthenticated
-/// re-discovery on Report PDUs.
+/// this duration are considered stale for future cache lookups. This avoids
+/// handing an old target mapping to newly constructed clients indefinitely;
+/// an existing client retains its established identity until
+/// [`Client::rediscover_engine`](crate::Client::rediscover_engine) is called.
 const DEFAULT_ENGINE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Debug)]
+struct CachedTarget {
+    engine_id: Bytes,
+    msg_max_size: u32,
+    refreshed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct EngineCacheInner {
+    targets: HashMap<SocketAddr, CachedTarget>,
+    trusted_times: HashMap<Bytes, TrustedEngineTime>,
+}
 
 /// Thread-safe cache of discovered `SNMPv3` engine state.
 ///
@@ -481,8 +495,9 @@ const DEFAULT_ENGINE_CACHE_TTL: Duration = Duration::from_secs(300);
 ///
 /// Expiry prevents a shared entry from being handed indefinitely to newly
 /// constructed clients after a target is replaced. It does not silently clear
-/// an existing client's established identity; explicit reset/re-discovery is a
-/// separate operation.
+/// an existing client's established identity; call
+/// [`Client::rediscover_engine`](crate::Client::rediscover_engine) to replace it
+/// intentionally.
 ///
 /// Actively polled authenticated targets refresh their entry on every accepted
 /// HMAC-verified response or Report, so the TTL has no effect during normal
@@ -497,38 +512,27 @@ const DEFAULT_ENGINE_CACHE_TTL: Duration = Duration::from_secs(300);
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust,no_run
+/// use async_snmp::{Auth, AuthProtocol, Client, EngineCache};
 /// use std::sync::Arc;
 ///
+/// # async fn example() -> async_snmp::Result<()> {
 /// let cache = Arc::new(EngineCache::new());
 ///
-/// let client1 = Client::builder("192.168.1.1:161")
-///     .username("admin")
-///     .auth(AuthProtocol::Sha1, "authpass")
+/// let client1 = Client::builder("192.168.1.1:161",
+///     Auth::usm("admin").auth(AuthProtocol::Sha1, "authpass"))
 ///     .engine_cache(cache.clone())
 ///     .connect()
 ///     .await?;
 ///
-/// let client2 = Client::builder("192.168.1.2:161")
-///     .username("admin")
-///     .auth(AuthProtocol::Sha1, "authpass")
+/// let client2 = Client::builder("192.168.1.2:161",
+///     Auth::usm("admin").auth(AuthProtocol::Sha1, "authpass"))
 ///     .engine_cache(cache.clone())
 ///     .connect()
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
-#[derive(Debug)]
-struct CachedTarget {
-    engine_id: Bytes,
-    msg_max_size: u32,
-    refreshed_at: Instant,
-}
-
-#[derive(Debug, Default)]
-struct EngineCacheInner {
-    targets: HashMap<SocketAddr, CachedTarget>,
-    trusted_times: HashMap<Bytes, TrustedEngineTime>,
-}
-
 #[derive(Debug)]
 pub struct EngineCache {
     inner: RwLock<EngineCacheInner>,
