@@ -59,8 +59,10 @@ each such engine to retain one stable engine ID and its boots counter in
 non-volatile storage. On restart, load both values, increment boots, and persist
 the new pair before sending or accepting V3 traffic.
 
-`AuthoritativeEngine` enforces that startup order. On first installation, use
-`install`; on later starts, validate the loaded record and use `restart`:
+`AuthoritativeEngine` enforces that startup order. Its clones share one clock,
+and it retains the persistence callback so a boots increment caused by engine
+time wrapping is stored before the new value is used. On first installation,
+use `install`; on later starts, validate the loaded record and use `restart`:
 
 ```rust,ignore
 use async_snmp::{
@@ -86,10 +88,11 @@ let agent = Agent::builder()
     .await?;
 ```
 
-The persistence callback must durably store both fields. If it fails, no usable
-`AuthoritativeEngine` is returned. Polling clients and V3 Inform senders do not
-need local authoritative state because the remote responder is authoritative
-for those exchanges.
+The persistence callback must be safe to call for the lifetime of the engine
+and durably store both fields. If a startup or rollover write fails, the new
+boots value is not used. Polling clients and V3 Inform senders do not need local
+authoritative state because the remote responder is authoritative for those
+exchanges.
 
 ## Installation
 

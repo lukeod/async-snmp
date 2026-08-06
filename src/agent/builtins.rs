@@ -298,6 +298,7 @@ mod tests {
 
     fn test_state() -> Arc<AgentState> {
         Arc::new(AgentState {
+            authoritative_engine: None,
             engine_id: Bytes::from_static(&[0x80, 0x00, 0x01, 0x02, 0x03]),
             engine_boots: AtomicU32::new(5),
             engine_time: AtomicU32::new(12345),

@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notification receivers with USM users reject construction without this
   state. V3 client trap sending requires it through
   `local_authoritative_engine`; polling and Inform sending remain unchanged.
+  Clones share one authoritative clock, and runtime boots increments are
+  persisted before use.
 
 ## [0.16.0] - 2026-07-14
 

@@ -723,18 +723,19 @@ impl AgentBuilder {
                 .trap_sinks
                 .iter()
                 .any(|(_, auth)| matches!(auth, crate::client::Auth::Usm(_)));
-        let (engine_id, engine_boots) = match self.authoritative_engine {
-            Some(engine) => (
-                Bytes::copy_from_slice(engine.engine_id()),
-                engine.engine_boots(),
-            ),
+        let (authoritative_engine, engine_id, engine_boots) = match self.authoritative_engine {
+            Some(engine) => {
+                let (engine_boots, _) = engine.current_boots_time()?;
+                let engine_id = Bytes::copy_from_slice(engine.engine_id());
+                (Some(engine), engine_id, engine_boots)
+            }
             None if requires_authoritative_engine => {
                 return Err(Error::Config(
                     "authoritative engine state is required for SNMPv3 agent roles".into(),
                 )
                 .boxed());
             }
-            None => (crate::v3::generate_engine_id(), 1),
+            None => (None, crate::v3::generate_engine_id(), 1),
         };
 
         let cancel = self.cancel.unwrap_or_default();
@@ -765,6 +766,7 @@ impl AgentBuilder {
         }
 
         let state = Arc::new(AgentState {
+            authoritative_engine,
             engine_id,
             engine_boots: AtomicU32::new(engine_boots),
             engine_time: AtomicU32::new(0),
@@ -836,6 +838,7 @@ impl Default for AgentBuilder {
 
 /// Engine state and counters shared across agent clones and (future) built-in handlers.
 pub(crate) struct AgentState {
+    pub(crate) authoritative_engine: Option<AuthoritativeEngine>,
     pub(crate) engine_id: Bytes,
     pub(crate) engine_boots: AtomicU32,
     pub(crate) engine_time: AtomicU32,
@@ -862,9 +865,17 @@ pub(crate) struct AgentState {
 
 impl AgentState {
     /// Return one coherent authoritative boots/time pair for the current instant.
-    pub(crate) fn authoritative_boots_time(&self) -> (u32, u32) {
-        let total_secs = self.engine_start.elapsed().as_secs();
-        compute_engine_boots_time(self.engine_boots_base, total_secs)
+    pub(crate) fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
+        let pair = match &self.authoritative_engine {
+            Some(engine) => engine.current_boots_time()?,
+            None => {
+                let total_secs = self.engine_start.elapsed().as_secs();
+                compute_engine_boots_time(self.engine_boots_base, total_secs)
+            }
+        };
+        self.engine_boots.store(pair.0, Ordering::Relaxed);
+        self.engine_time.store(pair.1, Ordering::Relaxed);
+        Ok(pair)
     }
 }
 
@@ -1154,7 +1165,9 @@ impl Agent {
             };
 
             tokio::spawn(async move {
-                agent.update_engine_time();
+                if let Err(error) = agent.update_engine_time() {
+                    tracing::warn!(target: "async_snmp::agent", %error, "could not persist authoritative engine time transition");
+                }
 
                 match agent.handle_request(data, recv_meta.addr).await {
                     Ok(Some(response_bytes)) => {
@@ -1267,12 +1280,11 @@ impl Agent {
     /// zero. The boots/time pair is derived from total elapsed seconds and
     /// the base boots value at startup, so no mutable state beyond the
     /// atomics is needed.
-    fn update_engine_time(&self) {
-        let (boots, time) = self.inner.state.authoritative_boots_time();
+    fn update_engine_time(&self) -> Result<()> {
+        let previous_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
+        let (boots, _) = self.inner.state.authoritative_boots_time()?;
 
-        if boots != self.inner.state.engine_boots.load(Ordering::Relaxed)
-            && boots > self.inner.state.engine_boots_base
-        {
+        if boots != previous_boots && boots > self.inner.state.engine_boots_base {
             tracing::warn!(
                 target: "async_snmp::agent",
                 engine_boots = boots,
@@ -1280,11 +1292,7 @@ impl Agent {
             );
         }
 
-        self.inner
-            .state
-            .engine_boots
-            .store(boots, Ordering::Relaxed);
-        self.inner.state.engine_time.store(time, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Validate community string using constant-time comparison.

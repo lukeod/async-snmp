@@ -12,7 +12,7 @@ use crate::pdu::{Pdu, PduType};
 use crate::transport::Transport;
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
-    classify_report, compute_engine_boots_time,
+    classify_report,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -1092,10 +1092,7 @@ impl<T: Transport> Client<T> {
             .read()
             .map_err(|_| Error::Config("local_derived_keys lock poisoned".into()).boxed())?;
 
-        // Compute local engine boots/time
-        let elapsed_secs = self.inner.local_engine_start.elapsed().as_secs();
-        let (engine_boots, engine_time) =
-            compute_engine_boots_time(local_engine.engine_boots(), elapsed_secs);
+        let (engine_boots, engine_time) = local_engine.current_boots_time()?;
 
         crate::v3::encode::encode_v3_message(
             pdu,

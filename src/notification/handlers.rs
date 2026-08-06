@@ -127,7 +127,7 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        let (our_boots, our_time) = self.inner.authoritative_boots_time();
+        let (our_boots, our_time) = self.inner.authoritative_boots_time()?;
         let usm_ctx = V3LocalContext {
             engine_id: &self.inner.engine_id,
             engine_boots: our_boots,
@@ -267,7 +267,7 @@ fn build_v3_response(
 ) -> Result<Bytes> {
     // Derive both fields from one elapsed-time sample immediately before
     // encoding so the response is current and cannot straddle a rollover.
-    let (engine_boots, engine_time) = inner.authoritative_boots_time();
+    let (engine_boots, engine_time) = inner.authoritative_boots_time()?;
     let response_usm = UsmSecurityParams::new(
         inner.engine_id.clone(),
         engine_boots,

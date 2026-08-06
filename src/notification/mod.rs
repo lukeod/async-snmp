@@ -424,11 +424,12 @@ impl NotificationReceiverBuilder {
             source: e,
         })?;
 
-        let (engine_id, engine_boots) = match self.authoritative_engine {
-            Some(engine) => (
-                Bytes::copy_from_slice(engine.engine_id()),
-                engine.engine_boots(),
-            ),
+        let (authoritative_engine, engine_id, engine_boots) = match self.authoritative_engine {
+            Some(engine) => {
+                let (engine_boots, _) = engine.current_boots_time()?;
+                let engine_id = Bytes::copy_from_slice(engine.engine_id());
+                (Some(engine), engine_id, engine_boots)
+            }
             None if !self.usm_users.is_empty() => {
                 return Err(Error::Config(
                     "authoritative engine state is required for SNMPv3 notification receiving"
@@ -436,11 +437,12 @@ impl NotificationReceiverBuilder {
                 )
                 .boxed());
             }
-            None => (crate::v3::generate_engine_id(), 1),
+            None => (None, crate::v3::generate_engine_id(), 1),
         };
 
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {
+                authoritative_engine,
                 socket,
                 local_addr,
                 usm_users: self.usm_users,
@@ -656,6 +658,7 @@ pub struct NotificationReceiver {
 }
 
 struct ReceiverInner {
+    authoritative_engine: Option<AuthoritativeEngine>,
     socket: UdpSocket,
     local_addr: SocketAddr,
     /// Configured USM users for V3 authentication
@@ -685,9 +688,17 @@ struct ReceiverInner {
 
 impl ReceiverInner {
     /// Return one coherent authoritative boots/time pair for the current instant.
-    fn authoritative_boots_time(&self) -> (u32, u32) {
-        let total_secs = self.engine_start.elapsed().as_secs();
-        crate::v3::compute_engine_boots_time(self.engine_boots_base, total_secs)
+    fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
+        match &self.authoritative_engine {
+            Some(engine) => engine.current_boots_time(),
+            None => {
+                let total_secs = self.engine_start.elapsed().as_secs();
+                Ok(crate::v3::compute_engine_boots_time(
+                    self.engine_boots_base,
+                    total_secs,
+                ))
+            }
+        }
     }
 }
 
@@ -747,6 +758,7 @@ impl NotificationReceiver {
 
         Ok(Self {
             inner: Arc::new(ReceiverInner {
+                authoritative_engine: None,
                 socket,
                 local_addr,
                 usm_users: HashMap::new(),
@@ -776,7 +788,13 @@ impl NotificationReceiver {
     /// Get the current local authoritative engine boots value.
     #[must_use]
     pub fn engine_boots(&self) -> u32 {
-        self.inner.authoritative_boots_time().0
+        match self.inner.authoritative_boots_time() {
+            Ok(pair) => pair.0,
+            Err(_) => self.inner.authoritative_engine.as_ref().map_or(
+                self.inner.engine_boots_base,
+                AuthoritativeEngine::engine_boots,
+            ),
+        }
     }
 
     /// Get the usmStatsUnknownEngineIDs counter value.
@@ -1821,9 +1839,9 @@ mod tests {
             AuthProtocol::Sha1,
         );
 
-        let earliest = receiver.inner.authoritative_boots_time();
+        let earliest = receiver.inner.authoritative_boots_time().unwrap();
         let result = receiver.handle_v3(msg, client_addr).await.unwrap();
-        let latest = receiver.inner.authoritative_boots_time();
+        let latest = receiver.inner.authoritative_boots_time().unwrap();
         assert!(matches!(result, Some(Notification::InformV3 { .. })));
 
         let mut buf = vec![0u8; 4096];

@@ -28,7 +28,7 @@ impl Agent {
         // cached time refresh. Derive both fields from one elapsed-time sample
         // at response generation so the authoritative tuple is current and
         // cannot straddle a boots/time rollover.
-        let (engine_boots, engine_time) = self.inner.state.authoritative_boots_time();
+        let (engine_boots, engine_time) = self.inner.state.authoritative_boots_time()?;
 
         // RFC 3414 Section 2.3: refuse authenticated messages when boots latched
         if security_level.requires_auth() && engine_boots == MAX_ENGINE_TIME {
@@ -255,7 +255,7 @@ mod tests {
             .engine_time
             .store(MAX_ENGINE_TIME, Ordering::Relaxed);
 
-        let earliest = agent.inner.state.authoritative_boots_time();
+        let earliest = agent.inner.state.authoritative_boots_time().unwrap();
         let encoded = agent
             .build_v3_response(
                 &dummy_v3_msg(SecurityLevel::NoAuthNoPriv),
@@ -267,7 +267,7 @@ mod tests {
             )
             .unwrap()
             .expect("noAuthNoPriv response should be produced");
-        let latest = agent.inner.state.authoritative_boots_time();
+        let latest = agent.inner.state.authoritative_boots_time().unwrap();
 
         let message = V3Message::decode(encoded).unwrap();
         let response_usm = UsmSecurityParams::decode(message.security_params).unwrap();

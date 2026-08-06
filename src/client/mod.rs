@@ -156,8 +156,6 @@ struct ClientInner<T: Transport> {
     engine_cache: Option<Arc<EngineCache>>,
     /// Serializes concurrent discovery attempts so only one runs at a time.
     discovery_lock: AsyncMutex<()>,
-    /// Local engine start time for computing engine time in V3 traps.
-    local_engine_start: Instant,
     /// Keys derived against the local authoritative engine ID for V3 traps.
     local_derived_keys: RwLock<Option<DerivedKeys>>,
     #[cfg(test)]
@@ -261,7 +259,6 @@ impl<T: Transport> Client<T> {
                 salt_counter: SaltCounter::new(),
                 engine_cache: None,
                 discovery_lock: AsyncMutex::new(()),
-                local_engine_start: Instant::now(),
                 local_derived_keys: RwLock::new(None),
                 #[cfg(test)]
                 deferred_authenticated_update_hook: RwLock::new(None),
@@ -283,7 +280,6 @@ impl<T: Transport> Client<T> {
                 salt_counter: SaltCounter::new(),
                 engine_cache: Some(engine_cache),
                 discovery_lock: AsyncMutex::new(()),
-                local_engine_start: Instant::now(),
                 local_derived_keys: RwLock::new(None),
                 #[cfg(test)]
                 deferred_authenticated_update_hook: RwLock::new(None),

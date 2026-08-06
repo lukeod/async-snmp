@@ -16,7 +16,6 @@ use crate::message::CommunityMessage;
 use crate::oid::Oid;
 use crate::pdu::Pdu;
 use crate::transport::{UdpHandle, UdpTransport};
-use crate::v3::compute_engine_boots_time;
 use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -390,9 +389,7 @@ impl super::Agent {
                     Error::Config("trap sink derived_keys lock poisoned".into()).boxed()
                 })?;
 
-                let elapsed_secs = self.inner.state.engine_start.elapsed().as_secs();
-                let (engine_boots, engine_time) =
-                    compute_engine_boots_time(self.inner.state.engine_boots_base, elapsed_secs);
+                let (engine_boots, engine_time) = self.inner.state.authoritative_boots_time()?;
 
                 let msg_id = self.next_notification_id();
                 let encoded = crate::v3::encode::encode_v3_message(
