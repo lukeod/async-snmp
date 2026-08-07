@@ -24,10 +24,8 @@ use bytes::Bytes;
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::message_size::{MESSAGE_SIZE_MINIMUM, MessageSize};
 use crate::pdu::Pdu;
-
-/// Minimum `msgMaxSize` per RFC 3412 `HeaderData` (INTEGER 484..2147483647).
-const MSG_MAX_SIZE_MINIMUM: i32 = 484;
 
 /// `SNMPv3` security model identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +170,7 @@ pub struct MsgGlobalData {
     /// Message identifier for request/response correlation
     pub msg_id: i32,
     /// Maximum message size the sender can accept
-    pub msg_max_size: i32,
+    pub msg_max_size: MessageSize,
     /// Message flags (security level + reportable)
     pub msg_flags: MsgFlags,
     /// Security model (always USM=3 for our implementation)
@@ -182,7 +180,7 @@ pub struct MsgGlobalData {
 impl MsgGlobalData {
     /// Create new global data.
     #[must_use]
-    pub fn new(msg_id: i32, msg_max_size: i32, msg_flags: MsgFlags) -> Self {
+    pub fn new(msg_id: i32, msg_max_size: MessageSize, msg_flags: MsgFlags) -> Self {
         Self {
             msg_id,
             msg_max_size,
@@ -197,7 +195,7 @@ impl MsgGlobalData {
             buf.push_integer(self.msg_security_model.as_i32());
             // msgFlags is a 1-byte OCTET STRING
             buf.push_octet_string(&[self.msg_flags.to_byte()]);
-            buf.push_integer(self.msg_max_size);
+            buf.push_integer(self.msg_max_size.as_i32());
             buf.push_integer(self.msg_id);
         });
     }
@@ -214,7 +212,9 @@ impl MsgGlobalData {
         // These ASN.1 constraints must be checked against the complete BER
         // value before it is narrowed to i32.
         let msg_id = seq.read_bounded_integer(0, i32::MAX)?;
-        let msg_max_size = seq.read_bounded_integer(MSG_MAX_SIZE_MINIMUM, i32::MAX)?;
+        let msg_max_size_raw = seq.read_bounded_integer(MESSAGE_SIZE_MINIMUM as i32, i32::MAX)?;
+        let msg_max_size =
+            MessageSize::from_i32(msg_max_size_raw).expect("bounded msgMaxSize must construct");
 
         let flags_bytes = seq.read_octet_string()?;
         if flags_bytes.len() != 1 {
@@ -492,12 +492,13 @@ impl V3Message {
     /// This is sent to discover a remote SNMP engine's identity and message-size
     /// limit. The response is unauthenticated, so its boots/time tuple must not
     /// establish trusted time; authenticated communication performs that step.
-    /// Uses empty security parameters and no authentication.
+    /// Uses empty security parameters and no authentication. The supplied local
+    /// receive capacity is advertised to the remote engine.
     #[must_use]
-    pub fn discovery_request(msg_id: i32) -> Self {
+    pub fn discovery_request(msg_id: i32, local_receive_capacity: MessageSize) -> Self {
         let global_data = MsgGlobalData::new(
             msg_id,
-            65507, // max UDP size
+            local_receive_capacity,
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
         );
 
@@ -545,6 +546,19 @@ impl RawV3Message {
     /// invalid flag combinations (privacy without authentication) are
     /// rejected here, before any authentication or PDU processing.
     pub fn decode(data: Bytes) -> Result<Self> {
+        let input_len = data.len();
+        Self::decode_bounded(data, input_len)
+    }
+
+    /// Decode raw V3 fields under a caller-supplied total input bound.
+    pub(crate) fn decode_bounded(data: Bytes, maximum: usize) -> Result<Self> {
+        if data.len() > maximum {
+            tracing::debug!(target: "async_snmp::v3", { received_size = data.len(), maximum }, "message exceeds receive limit");
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
         let mut decoder = Decoder::new(data);
         let mut seq = decoder.read_sequence()?;
 
@@ -639,7 +653,7 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
     // than snmpInvalidMsgs/snmpUnknownSecurityModels, so they return None.
     global.read_bounded_integer(0, i32::MAX).ok()?;
     global
-        .read_bounded_integer(MSG_MAX_SIZE_MINIMUM, i32::MAX)
+        .read_bounded_integer(MESSAGE_SIZE_MINIMUM as i32, i32::MAX)
         .ok()?;
     let flags_bytes = global.read_octet_string().ok()?;
     if flags_bytes.len() != 1 {
@@ -664,8 +678,11 @@ mod tests {
     fn encode_rejects_invalid_oid() {
         let pdu = Pdu::get_request(1, &[crate::oid::Oid::empty()]);
         let scoped = ScopedPdu::with_empty_context(pdu);
-        let global =
-            MsgGlobalData::new(1, 65_507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, false));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65_507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+        );
         let message = V3Message::new(global, Bytes::new(), scoped);
         assert!(matches!(
             &*message.encode().unwrap_err(),
@@ -755,7 +772,11 @@ mod tests {
 
         // Valid noAuthNoPriv v3 message; single-byte msgID and model keep the
         // byte patches below length-preserving.
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
         let usm =
             UsmSecurityParams::new(Bytes::from_static(b"eid"), 0, 0, Bytes::from_static(b"u"));
         let scoped = ScopedPdu::new(
@@ -805,8 +826,12 @@ mod tests {
                 buf.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]);
             });
             buf.push_octet_string(b"usm-params");
-            MsgGlobalData::new(7, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false))
-                .encode(buf);
+            MsgGlobalData::new(
+                7,
+                crate::MessageSize::new(65507).unwrap(),
+                MsgFlags::new(SecurityLevel::AuthNoPriv, false),
+            )
+            .encode(buf);
             buf.push_integer(3);
         });
         let encoded = buf.finish();
@@ -828,7 +853,11 @@ mod tests {
 
     #[test]
     fn v3_decoders_reject_over_width_version_alias() {
-        let global = MsgGlobalData::new(7, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            7,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
         let scoped = ScopedPdu::with_empty_context(Pdu::get_request(42, &[]));
         let security_params = crate::v3::UsmSecurityParams::empty().encode();
 
@@ -851,7 +880,11 @@ mod tests {
     /// later parse of a well-formed message succeeds from the raw bytes.
     #[test]
     fn raw_plaintext_bytes_reparse_as_scoped_pdu() {
-        let global = MsgGlobalData::new(9, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            9,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
         let pdu = Pdu::get_request(42, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
         let scoped = ScopedPdu::new(b"eng".as_slice(), b"ctx".as_slice(), pdu);
         let msg = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
@@ -870,7 +903,11 @@ mod tests {
     /// authPriv messages keep their ciphertext untouched.
     #[test]
     fn raw_decode_keeps_ciphertext() {
-        let global = MsgGlobalData::new(200, 1472, MsgFlags::new(SecurityLevel::AuthPriv, false));
+        let global = MsgGlobalData::new(
+            200,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthPriv, false),
+        );
         let msg = V3Message::new_encrypted(
             global,
             Bytes::from_static(b"usm-params"),
@@ -889,7 +926,11 @@ mod tests {
     /// before any authentication or PDU work can start.
     #[test]
     fn raw_decode_rejects_priv_without_auth_flags() {
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
         let pdu = Pdu::get_request(1, &[]);
         let msg = V3Message::new(
             global,
@@ -918,7 +959,11 @@ mod tests {
     /// only).
     #[test]
     fn raw_decode_ignores_reserved_bits_for_level() {
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, false));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthNoPriv, false),
+        );
         let pdu = Pdu::get_request(1, &[]);
         let msg = V3Message::new(
             global,
@@ -940,8 +985,11 @@ mod tests {
 
     #[test]
     fn raw_decode_rejects_trailing_envelope_fields() {
-        let global =
-            MsgGlobalData::new(17, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, false));
+        let global = MsgGlobalData::new(
+            17,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+        );
         let scoped = ScopedPdu::with_empty_context(Pdu::get_request(23, &[]));
 
         // Encode an extra INTEGER after msgData inside the outer sequence.
@@ -980,8 +1028,11 @@ mod tests {
 
     #[test]
     fn test_msg_global_data_roundtrip() {
-        let global =
-            MsgGlobalData::new(12345, 1472, MsgFlags::new(SecurityLevel::AuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            12345,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthNoPriv, true),
+        );
 
         let mut buf = EncodeBuf::new();
         global.encode(&mut buf);
@@ -1031,8 +1082,11 @@ mod tests {
 
     #[test]
     fn test_v3_message_plaintext_roundtrip() {
-        let global =
-            MsgGlobalData::new(100, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            100,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
         let pdu = Pdu::get_request(42, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
         let scoped = ScopedPdu::with_empty_context(pdu);
         let msg = V3Message::new(global, Bytes::from_static(b"usm-params"), scoped);
@@ -1050,7 +1104,11 @@ mod tests {
 
     #[test]
     fn test_v3_message_encrypted_roundtrip() {
-        let global = MsgGlobalData::new(200, 1472, MsgFlags::new(SecurityLevel::AuthPriv, false));
+        let global = MsgGlobalData::new(
+            200,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthPriv, false),
+        );
         let msg = V3Message::new_encrypted(
             global,
             Bytes::from_static(b"usm-params"),
@@ -1073,16 +1131,15 @@ mod tests {
 
     #[test]
     fn test_msg_global_data_rejects_msg_max_size_below_minimum() {
-        // Encode with invalid msgMaxSize (below 484)
-        let global = MsgGlobalData {
-            msg_id: 100,
-            msg_max_size: 400, // Below RFC 3412 minimum of 484
-            msg_flags: MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-            msg_security_model: SecurityModel::Usm,
-        };
-
+        // Build a low-level malformed inbound vector: safe construction cannot
+        // represent this below-minimum msgMaxSize.
         let mut buf = EncodeBuf::new();
-        global.encode(&mut buf);
+        buf.push_sequence(|buf| {
+            buf.push_integer(SecurityModel::Usm.as_i32());
+            buf.push_octet_string(&[MsgFlags::new(SecurityLevel::NoAuthNoPriv, true).to_byte()]);
+            buf.push_integer(400);
+            buf.push_integer(100);
+        });
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -1098,7 +1155,11 @@ mod tests {
     #[test]
     fn test_msg_global_data_accepts_msg_max_size_at_minimum() {
         // 484 is exactly the RFC 3412 minimum
-        let global = MsgGlobalData::new(100, 484, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            100,
+            crate::MessageSize::new(484).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
 
         let mut buf = EncodeBuf::new();
         global.encode(&mut buf);
@@ -1222,8 +1283,11 @@ mod tests {
     #[test]
     fn test_msg_global_data_accepts_usm_security_model() {
         // USM (3) should be accepted
-        let global =
-            MsgGlobalData::new(100, 1472, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            100,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
 
         let mut buf = EncodeBuf::new();
         global.encode(&mut buf);

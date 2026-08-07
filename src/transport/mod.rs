@@ -22,6 +22,7 @@ pub use udp::*;
 
 use crate::ber::length::parse_ber_length;
 use crate::error::Result;
+use crate::message_size::{ReceiveLimits, UDP_RECEIVE_LIMITS};
 use crate::version::Version;
 use bytes::Bytes;
 use std::future::Future;
@@ -29,12 +30,6 @@ use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
-
-/// Maximum UDP datagram payload size.
-///
-/// This is 65535 (max IP packet) minus 20 (IPv4 header) minus 8 (UDP header).
-/// Used as the default value for [`Transport::max_message_size()`].
-pub const MAX_UDP_PAYLOAD: u32 = 65507;
 
 /// Global request ID counter, initialized with a cryptographically random seed.
 ///
@@ -257,12 +252,13 @@ pub trait Transport: Send + Sync {
     /// still accepts windowed IDs in its own correlation check.
     fn register_request_alias(&self, _alias_id: i32, _primary_id: i32, _timeout: Duration) {}
 
-    /// Maximum message size this transport can handle.
+    /// Validated local receive limits for this transport.
     ///
-    /// Used to cap agent-reported msgMaxSize values. Default is the maximum
-    /// UDP datagram payload ([`MAX_UDP_PAYLOAD`]).
-    fn max_message_size(&self) -> u32 {
-        MAX_UDP_PAYLOAD
+    /// The advertised value is wire-valid for SNMPv3. The accepted value is
+    /// the hard total-input bound and may be slightly larger for bounded UDP
+    /// receive-side tolerance.
+    fn receive_limits(&self) -> ReceiveLimits {
+        UDP_RECEIVE_LIMITS
     }
 }
 
@@ -578,7 +574,7 @@ mod extract_tests {
     fn test_extract_request_id_v3() {
         // A minimal SNMPv3 Response message with msgID = 12345
         let v3_response = [
-            0x30, 0x35, // SEQUENCE
+            0x30, 0x33, // SEQUENCE
             0x02, 0x01, 0x03, // version = 3
             0x30, 0x11, // msgGlobalData SEQUENCE
             0x02, 0x02, 0x30, 0x39, // INTEGER 12345 (msgID)
@@ -623,8 +619,8 @@ mod extract_tests {
     fn test_extract_request_id_negative() {
         // Request ID = -1
         let response = [
-            0x30, 0x19, 0x02, 0x01, 0x01, 0x04, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0xa2,
-            0x0c, 0x02, 0x01, 0xff, // INTEGER -1
+            0x30, 0x18, 0x02, 0x01, 0x01, 0x04, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0xa2,
+            0x0b, 0x02, 0x01, 0xff, // INTEGER -1
             0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00,
         ];
 

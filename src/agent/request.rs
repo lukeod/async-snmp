@@ -119,6 +119,7 @@ impl Agent {
             engine_boots: state.engine_boots.load(Ordering::Relaxed),
             engine_time: state.engine_time.load(Ordering::Relaxed),
             local_receive_capacity: state.local_receive_capacity,
+            accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             usm_users: &self.inner.usm_users,
             stats: &state.usm_stats,
             mpd: Some(MpdCounters {
@@ -205,7 +206,7 @@ impl Agent {
             group_name: None,
             read_view: None,
             write_view: None,
-            msg_max_size: Some(global_data.msg_max_size as u32),
+            msg_max_size: Some(global_data.msg_max_size.as_usize()),
         };
 
         // VACM resolution (if enabled)
@@ -515,7 +516,11 @@ mod tests {
         let auth_key =
             LocalizedKey::from_password(AuthProtocol::Sha1, auth_password, engine_id).unwrap();
 
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthPriv, true));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthPriv, true),
+        );
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             7,
@@ -542,7 +547,11 @@ mod tests {
     /// auth-key-missing half of Step 5 never reach authentication, so the digest
     /// value is irrelevant.
     fn build_authnopriv_msg(engine_id: &[u8], username: &[u8]) -> Bytes {
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthNoPriv, true),
+        );
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             7,
@@ -570,7 +579,11 @@ mod tests {
     /// `context_engine_id`. The USM engine ID always matches the agent so the
     /// message passes Step 3; only the scopedPDU context varies.
     fn build_noauth_msg(engine_id: &[u8], username: &[u8], context_engine_id: &[u8]) -> Bytes {
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        );
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             0,

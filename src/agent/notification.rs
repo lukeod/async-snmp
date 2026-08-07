@@ -449,7 +449,7 @@ impl super::Agent {
                     derived.as_ref(),
                     &self.inner.salt_counter,
                     false, // reportable=false for traps
-                    crate::v3::DEFAULT_MSG_MAX_SIZE,
+                    self.inner.state.local_receive_capacity,
                 )?;
                 Ok(Bytes::from(encoded))
             }

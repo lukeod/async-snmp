@@ -70,6 +70,7 @@ pub use super::udp_core::TransportStats;
 use super::udp_core::UdpCore;
 use super::{RequestRegistration, Transport, extract_request_id};
 use crate::error::{Error, Result};
+use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
 use crate::util::bind_udp_socket;
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -78,12 +79,6 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
-
-/// Maximum UDP datagram size for receiving.
-///
-/// This is the UDP payload limit: 65535 - 20 (IP header) - 8 (UDP header) = 65507.
-/// We use 65535 to be safe with any potential header variations.
-const UDP_RECV_BUFFER_SIZE: usize = 65535;
 
 /// Initial backoff applied after a UDP recv error before retrying, doubling up
 /// to [`UDP_RECV_ERROR_BACKOFF_MAX`] while errors persist.
@@ -137,6 +132,7 @@ struct UdpTransportInner {
     local_addr: SocketAddr,
     core: Arc<UdpCore>,
     config: UdpTransportConfig,
+    receive_limits: ReceiveLimits,
     shutdown: CancellationToken,
     // Cancels the recv task when the last transport/handle reference drops.
     // The task itself must hold no strong reference to this struct, or the
@@ -229,8 +225,9 @@ impl UdpTransport {
         let core = inner.core.clone();
         let shutdown = inner.shutdown.clone();
         let local_addr = inner.local_addr;
+        let receive_limits = inner.receive_limits;
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
+            let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
             let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
             // Backoff applied after a recv error to avoid a hot spin when the
             // socket is in a persistent error state (e.g. ENOBUFS or a stream
@@ -255,6 +252,9 @@ impl UdpTransport {
                         match result {
                             Ok((len, source)) => {
                                 recv_error_backoff = Duration::ZERO;
+                                if len > receive_limits.advertised().as_usize() {
+                                    tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, received_size = len, advertised_size = receive_limits.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
+                                }
                                 let data = Bytes::copy_from_slice(&buf[..len]);
 
                                 if let Some(request_id) = extract_request_id(&data) {
@@ -373,6 +373,10 @@ impl UdpTransportBuilder {
 
     /// Build the transport.
     pub async fn build(self) -> Result<UdpTransport> {
+        // Validate before parsing or binding so invalid size configuration has
+        // deterministic precedence and can never be narrowed on advertisement.
+        let receive_limits = ReceiveLimits::udp(self.config.max_message_size)
+            .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
@@ -402,6 +406,7 @@ impl UdpTransportBuilder {
             local_addr,
             core: Arc::new(UdpCore::new()),
             config: self.config,
+            receive_limits,
             _shutdown_guard: shutdown.clone().drop_guard(),
             shutdown,
             recv_task: tokio::sync::Mutex::new(None),
@@ -504,8 +509,8 @@ impl Transport for UdpHandle {
         self.inner.local_addr
     }
 
-    fn max_message_size(&self) -> u32 {
-        self.inner.config.max_message_size as u32
+    fn receive_limits(&self) -> ReceiveLimits {
+        self.inner.receive_limits
     }
 
     fn is_reliable(&self) -> bool {
@@ -592,7 +597,7 @@ mod tests {
         let transport = UdpTransport::bind("0.0.0.0:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:161".parse().unwrap());
         // Default config is 1472
-        assert_eq!(handle.max_message_size(), 1472);
+        assert_eq!(handle.receive_limits().advertised().as_usize(), 1472);
     }
 
     #[tokio::test]
@@ -603,7 +608,25 @@ mod tests {
             .await
             .unwrap();
         let handle = transport.handle("127.0.0.1:161".parse().unwrap());
-        assert_eq!(handle.max_message_size(), 8192);
+        assert_eq!(handle.receive_limits().advertised().as_usize(), 8192);
+    }
+
+    #[tokio::test]
+    async fn invalid_message_sizes_are_rejected_before_bind_parsing() {
+        for size in [0usize, 483, crate::MAX_UDP_PAYLOAD + 1, usize::MAX] {
+            let error = UdpTransport::builder()
+                .bind("not a socket address")
+                .max_message_size(size)
+                .build()
+                .await
+                .err()
+                .expect("invalid size must fail");
+            assert!(
+                matches!(*error, Error::Config(_)),
+                "unexpected error: {error}"
+            );
+            assert!(error.to_string().contains("message size"));
+        }
     }
 
     #[tokio::test]

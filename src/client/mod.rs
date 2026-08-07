@@ -401,7 +401,10 @@ impl<T: Transport> Client<T> {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response");
 
                     // Decode response and extract PDU
-                    let response = Message::decode(response_data)?;
+                    let response = Message::decode_bounded(
+                        response_data,
+                        self.inner.transport.receive_limits().accepted(),
+                    )?;
 
                     // Validate response version matches request version
                     let response_version = response.version();

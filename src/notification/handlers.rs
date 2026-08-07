@@ -132,8 +132,8 @@ impl super::NotificationReceiver {
             engine_id: &self.inner.engine_id,
             engine_boots: our_boots,
             engine_time: our_time,
-            local_receive_capacity: i32::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE)
-                .expect("default SNMPv3 message size must fit in i32"),
+            local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
+            accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             usm_users: &self.inner.usm_users,
             stats: &self.inner.usm_stats,
             mpd: None,
@@ -283,7 +283,7 @@ fn build_v3_response(
         // RFC 3412 Section 6.3: msgMaxSize advertises this receiver's own
         // receive capacity, not the sender's echoed value. The receiver has no
         // configurable limit, so advertise the default UDP receive capacity.
-        crate::v3::DEFAULT_MSG_MAX_SIZE as i32,
+        crate::UDP_RECEIVE_LIMITS.advertised(),
         incoming.msg_flags.security_level,
         response_usm,
         context_engine_id,

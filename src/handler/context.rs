@@ -122,7 +122,7 @@ pub struct RequestContext {
     /// limit response sizes to `min(agent_max, msg_max_size)`.
     ///
     /// None for v1/v2c requests (no msgMaxSize field in those versions).
-    pub msg_max_size: Option<u32>,
+    pub msg_max_size: Option<usize>,
 }
 
 impl RequestContext {

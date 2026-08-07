@@ -18,6 +18,7 @@ use super::{DerivedKeys, UsmConfig};
 use crate::ber::Decoder;
 use crate::error::{Error, Result};
 use crate::message::{MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel};
+use crate::message_size::MessageSize;
 use crate::oid::Oid;
 use crate::v3::auth::verify_message;
 use crate::v3::encode::encode_v3_report;
@@ -117,7 +118,9 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) engine_boots: u32,
     pub(crate) engine_time: u32,
     /// Wire-valid `msgMaxSize` advertising this receiver's local capacity.
-    pub(crate) local_receive_capacity: i32,
+    pub(crate) local_receive_capacity: MessageSize,
+    /// Hard total-message bound for inbound decoding.
+    pub(crate) accepted_receive_size: usize,
     pub(crate) usm_users: &'a HashMap<Bytes, UsmConfig>,
     pub(crate) stats: &'a UsmStats,
     pub(crate) mpd: Option<MpdCounters<'a>>,
@@ -163,7 +166,7 @@ pub(crate) fn process_v3_inbound(
 ) -> Result<V3Inbound> {
     let source = ctx.source;
 
-    let msg = match RawV3Message::decode(data.clone()) {
+    let msg = match RawV3Message::decode_bounded(data.clone(), ctx.accepted_receive_size) {
         Ok(msg) => msg,
         Err(e) => {
             // RFC 3412 Section 7.2.4/7.2.7: invalid msgFlags and unknown
@@ -393,7 +396,8 @@ mod tests {
             engine_id,
             engine_boots: 7,
             engine_time: 1000,
-            local_receive_capacity: 8192,
+            local_receive_capacity: MessageSize::new(8192).unwrap(),
+            accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             usm_users,
             stats,
             mpd,
@@ -405,7 +409,7 @@ mod tests {
     fn build_msg(engine_id: &[u8], username: &[u8], reportable: bool) -> Bytes {
         let global = MsgGlobalData::new(
             1,
-            65507,
+            crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, reportable),
         );
         let usm = UsmSecurityParams::new(
@@ -505,7 +509,9 @@ mod tests {
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
-        let data = V3Message::discovery_request(5).encode().unwrap();
+        let data = V3Message::discovery_request(5, crate::UDP_RECEIVE_LIMITS.advertised())
+            .encode()
+            .unwrap();
         let request = V3Message::decode(data.clone()).unwrap();
         assert_ne!(
             request.global_data.msg_max_size, ctx.local_receive_capacity,
@@ -586,7 +592,7 @@ mod tests {
             buf.push_octet_string(&usm.encode());
             crate::message::MsgGlobalData::new(
                 1,
-                65507,
+                crate::MessageSize::new(65507).unwrap(),
                 MsgFlags::new(SecurityLevel::AuthNoPriv, true),
             )
             .encode(buf);

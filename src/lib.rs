@@ -464,6 +464,7 @@ pub mod error;
 pub mod format;
 pub mod handler;
 pub mod message;
+pub mod message_size;
 pub mod notification;
 pub mod oid;
 pub mod pdu;
@@ -497,14 +498,18 @@ pub use handler::{
     RequestContext, Response, SecurityModel, SetResult,
 };
 pub use message::SecurityLevel;
+pub use message_size::{
+    MAX_UDP_PAYLOAD, MESSAGE_SIZE_MAXIMUM, MESSAGE_SIZE_MINIMUM, MessageSize, MessageSizeError,
+    ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
+};
 pub use notification::{
     Notification, NotificationReceiver, NotificationReceiverBuilder, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};
 pub use transport::{
-    CommunityResponsePolicy, MAX_UDP_PAYLOAD, RequestRegistration, ResponseCorrelation,
-    TcpTransport, Transport, UdpHandle, UdpTransport,
+    CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport, Transport,
+    UdpHandle, UdpTransport,
 };
 #[cfg(feature = "crypto-fips")]
 pub use v3::AwsLcFipsProvider;

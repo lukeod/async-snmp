@@ -83,8 +83,6 @@ pub(crate) enum DecodeErrorKind {
     InvalidIpAddressLength { length: usize },
     /// Length field too long.
     LengthTooLong { octets: usize },
-    /// Length exceeds maximum.
-    LengthExceedsMax { length: usize, max: usize },
     /// Integer64 too long.
     Integer64TooLong { length: usize },
     /// TLV extends past end of data.
@@ -141,9 +139,6 @@ impl std::fmt::Display for DecodeErrorKind {
             }
             Self::LengthTooLong { octets } => {
                 write!(f, "length encoding too long ({octets} octets)")
-            }
-            Self::LengthExceedsMax { length, max } => {
-                write!(f, "length {length} exceeds maximum {max}")
             }
             Self::Integer64TooLong { length } => {
                 write!(f, "integer64 too long: {length} bytes")

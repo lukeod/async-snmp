@@ -11,6 +11,7 @@ use super::{DerivedKeys, UsmConfig};
 use crate::error::internal::{AuthErrorKind, CryptoErrorKind, EncodeErrorKind};
 use crate::error::{Error, Result};
 use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
+use crate::message_size::MessageSize;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
 use crate::v3::auth::authenticate_message;
@@ -48,7 +49,7 @@ pub fn encode_v3_message(
     derived_keys: Option<&DerivedKeys>,
     salt_counter: &SaltCounter,
     reportable: bool,
-    msg_max_size: u32,
+    msg_max_size: MessageSize,
 ) -> Result<Vec<u8>> {
     let security_level = security.security_level();
 
@@ -111,7 +112,7 @@ pub fn encode_v3_message(
 
     // Build global data
     let msg_flags = MsgFlags::new(security_level, reportable);
-    let global_data = MsgGlobalData::new(msg_id, msg_max_size as i32, msg_flags);
+    let global_data = MsgGlobalData::new(msg_id, msg_max_size, msg_flags);
 
     // Build complete message
     let msg = match msg_data {
@@ -172,7 +173,7 @@ pub(crate) fn sign_v3_message(
 /// caller's responsibility.
 pub(crate) fn encode_v3_report(
     msg_id: i32,
-    local_receive_capacity: i32,
+    local_receive_capacity: MessageSize,
     usm: UsmSecurityParams,
     report_oid: Oid,
     counter_value: u32,
@@ -232,7 +233,7 @@ pub(crate) fn encode_v3_report(
 pub(crate) fn encode_v3_response(
     response_pdu: Pdu,
     msg_id: i32,
-    msg_max_size: i32,
+    msg_max_size: MessageSize,
     security_level: SecurityLevel,
     usm: UsmSecurityParams,
     context_engine_id: Bytes,

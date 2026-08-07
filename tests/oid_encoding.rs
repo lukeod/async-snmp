@@ -78,7 +78,7 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             let scoped = ScopedPdu::new(Bytes::new(), Bytes::new(), pdu);
             let global = MsgGlobalData::new(
                 11,
-                65_507,
+                async_snmp::MessageSize::new(65_507).unwrap(),
                 MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
             );
             assert_invalid(V3Message::new(global, Bytes::new(), scoped).encode());

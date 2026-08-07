@@ -8,7 +8,7 @@ use async_snmp::pdu::{Pdu, PduType};
 use async_snmp::transport::Transport;
 use async_snmp::v3::auth::{authenticate_message, verify_message};
 use async_snmp::v3::{SaltCounter, UsmSecurityParams};
-use async_snmp::{Error, Oid, UsmConfig, Value, VarBind};
+use async_snmp::{Error, Oid, ReceiveLimits, UDP_RECEIVE_LIMITS, UsmConfig, Value, VarBind};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -370,9 +370,11 @@ impl V3ReplyBuilder {
         }
         let scoped = ScopedPdu::new(self.context_engine_id, self.context_name, self.pdu);
 
+        let msg_max_size = async_snmp::MessageSize::from_i32(self.msg_max_size)
+            .map_err(|error| error.to_string())?;
         let global = MsgGlobalData::new(
             self.msg_id,
-            self.msg_max_size,
+            msg_max_size,
             MsgFlags::new(self.security_level, self.reportable),
         );
         let message = if self.security_level.requires_priv() {
@@ -764,6 +766,7 @@ struct ScriptedTransportInner {
     local: SocketAddr,
     next_id: AtomicI32,
     reliable: bool,
+    receive_limits: ReceiveLimits,
 }
 
 /// A custom transport that deliberately returns the next scripted bytes
@@ -778,6 +781,22 @@ impl ScriptedTransport {
         first_request_id: i32,
         reliable: bool,
     ) -> Self {
+        Self::new_with_receive_limits(
+            engine,
+            steps,
+            first_request_id,
+            reliable,
+            UDP_RECEIVE_LIMITS,
+        )
+    }
+
+    pub fn new_with_receive_limits(
+        engine: TestV3Engine,
+        steps: Vec<ScriptStep>,
+        first_request_id: i32,
+        reliable: bool,
+        receive_limits: ReceiveLimits,
+    ) -> Self {
         Self(Arc::new(ScriptedTransportInner {
             engine,
             state: PeerState::new(steps),
@@ -785,6 +804,7 @@ impl ScriptedTransport {
             local: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             next_id: AtomicI32::new(first_request_id),
             reliable,
+            receive_limits,
         }))
     }
 
@@ -868,6 +888,10 @@ impl Transport for ScriptedTransport {
 
     fn is_reliable(&self) -> bool {
         self.0.reliable
+    }
+
+    fn receive_limits(&self) -> ReceiveLimits {
+        self.0.receive_limits
     }
 }
 

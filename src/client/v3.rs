@@ -165,7 +165,10 @@ impl<T: Transport> Client<T> {
             }
 
             let msg_id = self.next_request_id();
-            let discovery_msg = V3Message::discovery_request(msg_id);
+            let discovery_msg = V3Message::discovery_request(
+                msg_id,
+                self.inner.transport.receive_limits().advertised(),
+            );
             let discovery_data = discovery_msg.encode()?;
 
             self.inner
@@ -207,9 +210,12 @@ impl<T: Transport> Client<T> {
         // Message Processing Model correlation (RFC 3412 Section 7.2), then
         // require the exact RFC 3414 discovery Report shape before adopting an
         // unauthenticated engine-ID candidate.
-        let response = RawV3Message::decode(response_data)?;
+        let response = RawV3Message::decode_bounded(
+            response_data,
+            self.inner.transport.receive_limits().accepted(),
+        )?;
         let engine_state = self.validate_discovery_response(&response, expected_msg_id)?;
-        tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size }, "discovered engine identity");
+        tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size.as_usize() }, "discovered engine identity");
 
         let security = self
             .inner
@@ -307,8 +313,8 @@ impl<T: Transport> Client<T> {
         let usm = UsmSecurityParams::decode(response.security_params.clone())?;
         let engine_state = crate::v3::parse_discovery_response_with_limits(
             &response.security_params,
-            response.global_data.msg_max_size as u32,
-            self.inner.transport.max_message_size(),
+            response.global_data.msg_max_size,
+            self.inner.transport.receive_limits().advertised(),
         )?;
         if !usm.username.is_empty() || !usm.auth_params.is_empty() || !usm.priv_params.is_empty() {
             return Err(malformed());
@@ -417,7 +423,7 @@ impl<T: Transport> Client<T> {
             // receive capacity, not the remote's. `engine_state.msg_max_size`
             // holds the remote's advertised limit (used to constrain our
             // outbound size), so advertise the local transport capacity here.
-            self.inner.transport.max_message_size(),
+            self.inner.transport.receive_limits().advertised(),
         )?;
 
         Ok(EncodedV3Request {
@@ -664,7 +670,10 @@ impl<T: Transport> Client<T> {
                     // Invalid flag combinations (privacy without
                     // authentication) are rejected inside the decode, before
                     // any authentication work.
-                    let raw = RawV3Message::decode(response_data.clone())?;
+                    let raw = RawV3Message::decode_bounded(
+                        response_data.clone(),
+                        self.inner.transport.receive_limits().accepted(),
+                    )?;
                     let received_level = raw.security_level();
                     let response_usm = UsmSecurityParams::decode(raw.security_params.clone())?;
 
@@ -1103,7 +1112,7 @@ impl<T: Transport> Client<T> {
             derived.as_ref(),
             &self.inner.salt_counter,
             false, // reportable=false for traps
-            crate::v3::DEFAULT_MSG_MAX_SIZE,
+            self.inner.transport.receive_limits().advertised(),
         )
     }
 }
@@ -1382,7 +1391,7 @@ mod tests {
 
         let global = MsgGlobalData::new(
             msg_id,
-            65507,
+            crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(crate::message::SecurityLevel::NoAuthNoPriv, false),
         );
         let usm = UsmSecurityParams::new(Bytes::copy_from_slice(engine_id), 1, 100, Bytes::new());
@@ -1507,7 +1516,7 @@ mod response_validation_tests {
             Self {
                 peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
                 response,
-                max_size: crate::v3::DEFAULT_MSG_MAX_SIZE,
+                max_size: crate::MAX_UDP_PAYLOAD as u32,
             }
         }
     }
@@ -1519,8 +1528,8 @@ mod response_validation_tests {
             ready(Ok(()))
         }
 
-        fn max_message_size(&self) -> u32 {
-            self.max_size
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::ReceiveLimits::udp(self.max_size as usize).unwrap()
         }
 
         fn recv(
@@ -1616,7 +1625,11 @@ mod response_validation_tests {
         } else {
             SecurityLevel::NoAuthNoPriv
         };
-        let global = MsgGlobalData::new(99, 65507, MsgFlags::new(security_level, false));
+        let global = MsgGlobalData::new(
+            99,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(security_level, false),
+        );
         let mut usm = UsmSecurityParams::new(
             Bytes::from_static(ENGINE_ID),
             engine_boots,
@@ -1699,7 +1712,7 @@ mod response_validation_tests {
         };
         let global = MsgGlobalData::new(
             request.global_data.msg_id,
-            65507,
+            crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(level, false),
         );
         let auth_key = (level == SecurityLevel::AuthNoPriv).then(|| {
@@ -1849,8 +1862,12 @@ mod response_validation_tests {
         let client = Client::new(transport, config).expect("valid client config");
         {
             // Cached remote capacity differs from the local transport limit.
-            let state =
-                EngineState::with_msg_max_size(Bytes::from_static(ENGINE_ID), 5, 1000, 9000);
+            let state = EngineState::with_msg_max_size(
+                Bytes::from_static(ENGINE_ID),
+                5,
+                1000,
+                crate::MessageSize::new(9000).unwrap(),
+            );
             let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
             *client.inner.engine.write().unwrap() = Some(ClientEngine {
                 state,

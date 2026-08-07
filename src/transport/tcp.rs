@@ -76,6 +76,7 @@
 
 use super::{CorrelationResult, RequestRegistration, ResponseCorrelation, Transport};
 use crate::error::{Error, Result};
+use crate::message_size::ReceiveLimits;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -87,16 +88,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-/// Protocol-level maximum SNMP message size for TCP (per RFC 3430).
-///
-/// This is the largest value that can be advertised in a v3 msgMaxSize field
-/// (which is encoded as an i32). The advertised value is clamped to this
-/// ceiling, but the effective advertisement is the transport's actual
-/// acceptance limit (`max_allocation_size`) so that a peer honoring the
-/// advertised size cannot send a response the reader would then reject.
-const MAX_TCP_MESSAGE_SIZE: usize = 0x7FFF_FFFF;
-
-/// Default allocation limit for incoming TCP messages.
+/// Default total-message limit for incoming TCP messages.
 ///
 /// While the protocol allows messages up to 2GB, we impose a practical limit
 /// to prevent denial-of-service attacks where a malicious sender claims an
@@ -104,7 +96,7 @@ const MAX_TCP_MESSAGE_SIZE: usize = 0x7FFF_FFFF;
 ///
 /// 10MB is generous for SNMP - even large table walks rarely exceed a few MB.
 /// Real-world SNMP messages typically range from a few hundred bytes to a few KB.
-const DEFAULT_MAX_ALLOCATION_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Fallback receive timeout used when a request/recv is invoked without a
 /// prior [`register_request`] (or after its per-request entry was already
@@ -123,13 +115,13 @@ pub struct TcpOptions {
     /// any buffers, preventing denial-of-service attacks.
     ///
     /// Default: 10MB. Real SNMP messages rarely exceed a few KB.
-    pub max_allocation_size: usize,
+    pub max_message_size: usize,
 }
 
 impl Default for TcpOptions {
     fn default() -> Self {
         Self {
-            max_allocation_size: DEFAULT_MAX_ALLOCATION_SIZE,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 }
@@ -148,7 +140,7 @@ impl Default for TcpOptions {
 /// # async fn example() -> async_snmp::Result<()> {
 /// let transport = TcpTransport::builder()
 ///     .timeout(Duration::from_secs(10))
-///     .max_allocation_size(1_000_000)  // 1MB limit
+///     .max_message_size(1_000_000)  // 1MB limit
 ///     .connect("192.168.1.1:161".parse().unwrap())
 ///     .await?;
 /// # Ok(())
@@ -177,20 +169,24 @@ impl TcpTransportBuilder {
         self
     }
 
-    /// Set maximum allocation size for incoming messages.
+    /// Set the maximum total encoded size for incoming messages.
     ///
     /// Messages claiming to be larger than this are rejected before allocating
     /// any buffers, preventing denial-of-service attacks.
     ///
     /// Default: 10MB.
     #[must_use]
-    pub fn max_allocation_size(mut self, size: usize) -> Self {
-        self.options.max_allocation_size = size;
+    pub fn max_message_size(mut self, size: usize) -> Self {
+        self.options.max_message_size = size;
         self
     }
 
     /// Connect to the target address.
     pub async fn connect(self, target: SocketAddr) -> Result<TcpTransport> {
+        // Normalize before connecting so invalid configuration has deterministic
+        // precedence and cannot be silently clamped for V3 advertisement.
+        let receive_limits = ReceiveLimits::tcp(self.options.max_message_size)
+            .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
         let stream = match self.timeout {
             Some(t) => timeout(t, TcpStream::connect(target))
                 .await
@@ -218,7 +214,7 @@ impl TcpTransportBuilder {
                 pending_registrations: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
-                max_allocation_size: self.options.max_allocation_size,
+                receive_limits,
                 poisoned: AtomicBool::new(false),
             }),
         })
@@ -292,8 +288,8 @@ struct TcpTransportInner {
     pending_registrations: StdMutex<HashMap<i32, RequestRegistration>>,
     target: SocketAddr,
     local_addr: SocketAddr,
-    /// Maximum allocation size for incoming messages
-    max_allocation_size: usize,
+    /// One total-message bound shared by framing, decoding, and advertisement.
+    receive_limits: ReceiveLimits,
     /// Set once the stream framing is known to be lost.
     ///
     /// TCP is a byte stream framed by BER length prefixes. A read that times
@@ -368,7 +364,7 @@ impl TcpTransport {
     /// # async fn example() -> async_snmp::Result<()> {
     /// let transport = TcpTransport::builder()
     ///     .timeout(Duration::from_secs(10))
-    ///     .max_allocation_size(1_000_000)
+    ///     .max_message_size(1_000_000)
     ///     .connect("192.168.1.1:161".parse().unwrap())
     ///     .await?;
     /// # Ok(())
@@ -405,6 +401,8 @@ impl TcpTransport {
         target: SocketAddr,
         options: TcpOptions,
     ) -> Result<Self> {
+        let receive_limits = ReceiveLimits::tcp(options.max_message_size)
+            .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
         let stream = socket
             .connect(target)
             .await
@@ -420,7 +418,7 @@ impl TcpTransport {
                 pending_registrations: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
-                max_allocation_size: options.max_allocation_size,
+                receive_limits,
                 poisoned: AtomicBool::new(false),
             }),
         })
@@ -466,7 +464,7 @@ impl Transport for TcpTransport {
         let result = read_correlated_message(
             &mut stream,
             target,
-            self.inner.max_allocation_size,
+            self.inner.receive_limits.accepted(),
             &registration.correlation,
             recv_timeout,
             request_id,
@@ -504,7 +502,7 @@ impl Transport for TcpTransport {
         let result = read_correlated_message(
             &mut stream,
             target,
-            self.inner.max_allocation_size,
+            self.inner.receive_limits.accepted(),
             &registration.correlation,
             recv_timeout,
             request_id,
@@ -533,13 +531,8 @@ impl Transport for TcpTransport {
         true
     }
 
-    fn max_message_size(&self) -> u32 {
-        // Advertise the true acceptance limit rather than the protocol ceiling.
-        // The reader rejects any frame whose claimed content length exceeds
-        // `max_allocation_size`, so advertising a larger msgMaxSize would invite
-        // a peer to send a legitimate-but-oversized response that then gets
-        // rejected. Clamp to the i32-encodable protocol maximum.
-        self.inner.max_allocation_size.min(MAX_TCP_MESSAGE_SIZE) as u32
+    fn receive_limits(&self) -> ReceiveLimits {
+        self.inner.receive_limits
     }
 }
 
@@ -551,20 +544,18 @@ enum CorrelatedReadError {
 async fn read_correlated_message(
     stream: &mut TcpStream,
     target: SocketAddr,
-    max_allocation_size: usize,
+    max_message_size: usize,
     correlation: &ResponseCorrelation,
     recv_timeout: Duration,
     request_id: i32,
 ) -> std::result::Result<Bytes, CorrelatedReadError> {
     let deadline = tokio::time::Instant::now() + recv_timeout;
     loop {
-        let frame = tokio::time::timeout_at(
-            deadline,
-            read_ber_message(stream, target, max_allocation_size),
-        )
-        .await
-        .map_err(|_| CorrelatedReadError::Timeout)?
-        .map_err(CorrelatedReadError::Framing)?;
+        let frame =
+            tokio::time::timeout_at(deadline, read_ber_message(stream, target, max_message_size))
+                .await
+                .map_err(|_| CorrelatedReadError::Timeout)?
+                .map_err(CorrelatedReadError::Framing)?;
 
         match correlation.evaluate(&frame, true) {
             CorrelationResult::Match => return Ok(frame),
@@ -615,7 +606,7 @@ async fn finish_correlated_read(
 async fn read_ber_message(
     stream: &mut TcpStream,
     target: SocketAddr,
-    max_allocation_size: usize,
+    max_message_size: usize,
 ) -> Result<Bytes> {
     // Read tag byte
     let mut tag_buf = [0u8; 1];
@@ -674,11 +665,14 @@ async fn read_ber_message(
         }
     };
 
-    // Reject excessively large claimed sizes before allocating.
-    // This prevents DoS attacks where a malicious sender claims a huge message
-    // size without actually sending that much data.
-    if content_len > max_allocation_size {
-        tracing::warn!(target: "async_snmp::transport::tcp", { size = content_len, max = max_allocation_size, %target }, "message size exceeds limit");
+    // The configured quantity is total encoded message size, matching the V3
+    // advertisement. Check it before allocating attacker-declared content.
+    let total_len = 1usize
+        .checked_add(len_bytes.len())
+        .and_then(|header_len| header_len.checked_add(content_len))
+        .ok_or_else(|| Error::MalformedResponse { target }.boxed())?;
+    if total_len > max_message_size {
+        tracing::warn!(target: "async_snmp::transport::tcp", { size = total_len, max = max_message_size, %target }, "message size exceeds limit");
         return Err(Error::MalformedResponse { target }.boxed());
     }
 
@@ -690,7 +684,6 @@ async fn read_ber_message(
         .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
     // Reconstruct complete message: tag + length + content
-    let total_len = 1 + len_bytes.len() + content_len;
     let mut message = BytesMut::with_capacity(total_len);
     message.extend_from_slice(&[tag]);
     message.extend_from_slice(&len_bytes);
@@ -805,7 +798,7 @@ mod tests {
     }
 
     /// Regression test: the advertised msgMaxSize must equal the transport's
-    /// actual acceptance limit (`max_allocation_size`), not the protocol
+    /// actual acceptance limit (`max_message_size`), not the protocol
     /// ceiling. Advertising more than the reader accepts would let a v3 peer
     /// honor the advertisement with a response the reader then rejects.
     #[tokio::test]
@@ -822,26 +815,26 @@ mod tests {
         // Default limit.
         let transport = TcpTransport::connect(server_addr).await.unwrap();
         assert_eq!(
-            transport.max_message_size() as usize,
-            transport.inner.max_allocation_size,
-            "advertised msgMaxSize must equal the accepted allocation limit"
+            transport.receive_limits().advertised().as_usize(),
+            transport.inner.receive_limits.accepted(),
+            "advertised msgMaxSize must equal the accepted total-message limit"
         );
         assert_eq!(
-            transport.max_message_size() as usize,
-            DEFAULT_MAX_ALLOCATION_SIZE
+            transport.receive_limits().advertised().as_usize(),
+            DEFAULT_MAX_MESSAGE_SIZE
         );
 
         // Custom limit via the builder.
         let custom = 512 * 1024;
         let transport = TcpTransport::builder()
-            .max_allocation_size(custom)
+            .max_message_size(custom)
             .connect(server_addr)
             .await
             .unwrap();
-        assert_eq!(transport.max_message_size() as usize, custom);
+        assert_eq!(transport.receive_limits().advertised().as_usize(), custom);
         assert_eq!(
-            transport.max_message_size() as usize,
-            transport.inner.max_allocation_size
+            transport.receive_limits().advertised().as_usize(),
+            transport.inner.receive_limits.accepted()
         );
     }
 
@@ -1117,7 +1110,7 @@ mod tests {
         let mut client = TcpStream::connect(server_addr).await.unwrap();
         let result = timeout(
             Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
         )
         .await
         .expect("read_ber_message should not hang");
@@ -1146,7 +1139,7 @@ mod tests {
         let mut client = TcpStream::connect(server_addr).await.unwrap();
         let result = timeout(
             Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
         )
         .await
         .expect("read_ber_message should not hang");
@@ -1180,7 +1173,7 @@ mod tests {
         let mut client = TcpStream::connect(server_addr).await.unwrap();
         let result = timeout(
             Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
         )
         .await
         .expect("read_ber_message should not hang");
@@ -1231,7 +1224,7 @@ mod tests {
         let mut client = TcpStream::connect(server_addr).await.unwrap();
         let result = timeout(
             Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
         )
         .await
         .expect("read_ber_message should not hang");
@@ -1264,7 +1257,7 @@ mod tests {
         let mut client = TcpStream::connect(server_addr).await.unwrap();
         let result = timeout(
             Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_ALLOCATION_SIZE),
+            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
         )
         .await
         .expect("read_ber_message should not hang");
@@ -1279,9 +1272,62 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// Test that a custom `max_allocation_size` via builder is respected.
     #[tokio::test]
-    async fn test_tcp_builder_custom_allocation_limit() {
+    async fn invalid_tcp_message_sizes_are_rejected_before_connect() {
+        let target = "127.0.0.1:9".parse().unwrap();
+        for size in [0usize, 483, i32::MAX as usize + 1, usize::MAX] {
+            let error = TcpTransport::builder()
+                .max_message_size(size)
+                .connect(target)
+                .await
+                .err()
+                .expect("invalid size must fail before connect");
+            assert!(
+                matches!(*error, Error::Config(_)),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_frame_limit_counts_total_encoded_size() {
+        const CONTENT_LEN: usize = 481;
+        // 0x82 + two length octets gives a four-byte tag/length header.
+        const TOTAL_LEN: usize = 1 + 3 + CONTENT_LEN;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut frame = vec![0x30, 0x82, 0x01, 0xe1];
+            frame.resize(TOTAL_LEN, 0);
+            socket.write_all(&frame).await.unwrap();
+        });
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let frame = read_ber_message(&mut client, server_addr, TOTAL_LEN)
+            .await
+            .expect("exact total-message limit should be accepted");
+        assert_eq!(frame.len(), TOTAL_LEN);
+        server.await.unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Only the header is needed: rejection must precede content allocation/read.
+            socket.write_all(&[0x30, 0x82, 0x01, 0xe1]).await.unwrap();
+        });
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let error = read_ber_message(&mut client, server_addr, TOTAL_LEN - 1)
+            .await
+            .expect_err("one byte over total-message limit must be rejected");
+        assert!(matches!(*error, Error::MalformedResponse { .. }));
+        server.await.unwrap();
+    }
+
+    /// Test that a custom `max_message_size` via builder is respected.
+    #[tokio::test]
+    async fn test_tcp_builder_custom_message_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
 
@@ -1305,7 +1351,7 @@ mod tests {
 
         // Use builder with 1KB limit
         let transport = TcpTransport::builder()
-            .max_allocation_size(1024) // 1KB limit
+            .max_message_size(1024) // 1KB limit
             .connect(server_addr)
             .await
             .unwrap();

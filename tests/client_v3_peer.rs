@@ -6,7 +6,8 @@ use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
 use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
-    Auth, Client, ClientConfig, EngineCache, MasterKeys, Retry, UsmConfig, Value, VarBind, oid,
+    Auth, Client, ClientConfig, EngineCache, MasterKeys, ReceiveLimits, Retry, UsmConfig, Value,
+    VarBind, oid,
 };
 use bytes::Bytes;
 use common::v3::{
@@ -167,6 +168,44 @@ async fn v3_scripted_udp_success_at_all_security_levels() {
     ] {
         udp_success_at_level(level).await;
     }
+}
+
+#[tokio::test]
+async fn v3_discovery_advertises_active_transport_receive_limit() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let receive_limits = ReceiveLimits::tcp(10 * 1024 * 1024).unwrap();
+    let transport = ScriptedTransport::new_with_receive_limits(
+        engine.clone(),
+        vec![
+            discovery_step(engine.clone()),
+            response_step(engine, "custom limit response"),
+        ],
+        100,
+        true,
+        receive_limits,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, None);
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(
+        result.varbinds[0].value.as_str(),
+        Some("custom limit response")
+    );
+
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].global_data.msg_max_size,
+        receive_limits.advertised(),
+        "discovery must advertise the active transport capacity"
+    );
+    assert_eq!(
+        requests[1].global_data.msg_max_size,
+        receive_limits.advertised(),
+        "established requests must use the same transport capacity"
+    );
 }
 
 type DiscoveryMutation = Box<dyn FnOnce(V3ReplyBuilder) -> V3ReplyBuilder + Send>;
@@ -486,7 +525,10 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
     let engine_b = TestV3Engine::new(replacement_id.clone()).user(user_for(level));
     let cache = Arc::new(EngineCache::new());
     let stale_cache = cache.clone();
-    let stale_identity = EngineState::discovered(engine_a.engine_id.clone(), 65_507);
+    let stale_identity = EngineState::discovered(
+        engine_a.engine_id.clone(),
+        async_snmp::MessageSize::new(65_507).unwrap(),
+    );
     let target = "127.0.0.1:161".parse().unwrap();
     let report_engine = engine_b.clone();
     let transport = ScriptedTransport::new(
@@ -559,7 +601,10 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     let engine_b = TestV3Engine::new(replacement_id).user(user_for(level));
     let cache = Arc::new(EngineCache::new());
     let stale_cache = cache.clone();
-    let stale_identity = EngineState::discovered(engine_a.engine_id.clone(), 65_507);
+    let stale_identity = EngineState::discovered(
+        engine_a.engine_id.clone(),
+        async_snmp::MessageSize::new(65_507).unwrap(),
+    );
     let target = "127.0.0.1:161".parse().unwrap();
     let report_engine = engine_b.clone();
     let transport = ScriptedTransport::new(
@@ -2524,7 +2569,9 @@ async fn v3_custom_transport_accepts_matching_ids_and_context() {
 
 #[tokio::test]
 async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
-    let request = V3Message::discovery_request(41).encode().unwrap();
+    let request = V3Message::discovery_request(41, async_snmp::UDP_RECEIVE_LIMITS.advertised())
+        .encode()
+        .unwrap();
     let expected = Bytes::from_static(b"arbitrary response bytes");
     let transport = ScriptedTransport::new(
         TestV3Engine::new(Bytes::from_static(ENGINE_ID)),
@@ -2550,7 +2597,9 @@ async fn report_builder_uses_reporting_engine_context() {
     let expected_engine_id = engine.engine_id.clone();
     let transport =
         ScriptedTransport::new(engine.clone(), vec![discovery_step(engine)], 100, false);
-    let request = V3Message::discovery_request(41).encode().unwrap();
+    let request = V3Message::discovery_request(41, async_snmp::UDP_RECEIVE_LIMITS.advertised())
+        .encode()
+        .unwrap();
 
     let (response, _) = Transport::request(&transport, &request, 41).await.unwrap();
     let response = V3Message::decode(response).unwrap();
@@ -2564,7 +2613,10 @@ async fn report_builder_uses_reporting_engine_context() {
 
 #[test]
 fn raw_ber_targets_invalid_flags_and_oversized_msg_ids() {
-    let original = V3Message::discovery_request(7).encode().unwrap().to_vec();
+    let original = V3Message::discovery_request(7, async_snmp::UDP_RECEIVE_LIMITS.advertised())
+        .encode()
+        .unwrap()
+        .to_vec();
     let mut message = original.clone();
     raw_ber::patch_msg_flags(&mut message, 0x82).unwrap();
 

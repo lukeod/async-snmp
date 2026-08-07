@@ -479,7 +479,11 @@ fn build_raw_v3_get(engine_id: Bytes, username: Bytes) -> Bytes {
         varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Null)],
     };
     let scoped = ScopedPdu::with_empty_context(pdu);
-    let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
+    let global = MsgGlobalData::new(
+        1,
+        async_snmp::MessageSize::new(65507).unwrap(),
+        MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+    );
     V3Message::new(global, usm.encode(), scoped)
         .encode()
         .unwrap()

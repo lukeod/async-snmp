@@ -177,7 +177,7 @@ impl UsmSecurityParams {
     /// replace the placeholder zeros with the actual HMAC.
     ///
     /// The walk runs through the central [`Decoder`], so every length field is
-    /// bounds- and `MAX_LENGTH`-checked; any structural mismatch or truncation
+    /// bounded by its enclosing input; any structural mismatch or truncation
     /// yields `None`.
     #[must_use]
     pub fn find_auth_params_offset(encoded_msg: &[u8]) -> Option<(usize, usize)> {
@@ -312,8 +312,11 @@ mod tests {
         use crate::pdu::Pdu;
 
         // Create a V3 message with auth placeholder
-        let global =
-            MsgGlobalData::new(12345, 1472, MsgFlags::new(SecurityLevel::AuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            12345,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthNoPriv, true),
+        );
 
         let usm_params =
             UsmSecurityParams::new(b"engine123".as_slice(), 100, 200, b"testuser".as_slice())
@@ -484,7 +487,11 @@ mod tests {
         use crate::oid;
         use crate::pdu::Pdu;
 
-        let global = MsgGlobalData::new(1, 1472, MsgFlags::new(SecurityLevel::AuthNoPriv, true));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthNoPriv, true),
+        );
         let usm_params = UsmSecurityParams::new(b"eng".as_slice(), 1, 1, b"u".as_slice())
             .with_auth_placeholder(12);
         let pdu = Pdu::get_request(1, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);

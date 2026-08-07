@@ -892,7 +892,7 @@ impl NotificationReceiver {
     /// Returns the notification and the source address.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn recv(&self) -> Result<(Notification, SocketAddr)> {
-        let mut buf = vec![0u8; 65535];
+        let mut buf = vec![0u8; crate::UDP_RECEIVE_BUFFER_SIZE];
 
         loop {
             let (len, source) =
@@ -905,6 +905,9 @@ impl NotificationReceiver {
                         source: e,
                     })?;
 
+            if len > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
+                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, received_size = len, advertised_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
+            }
             let data = Bytes::copy_from_slice(&buf[..len]);
 
             match self.parse_and_respond(data, source).await {
@@ -1211,7 +1214,11 @@ mod tests {
         // Informs are Confirmed Class and are sent with the reportableFlag
         // set; traps are Unconfirmed Class and are not (RFC 3412 Section 6.4).
         let reportable = pdu_type == crate::pdu::PduType::InformRequest;
-        let global = MsgGlobalData::new(1, msg_max_size, MsgFlags::new(level, reportable));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::from_i32(msg_max_size).unwrap(),
+            MsgFlags::new(level, reportable),
+        );
 
         let mut usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
@@ -1621,7 +1628,7 @@ mod tests {
 
         let global = MsgGlobalData::new(
             msg_id,
-            65507,
+            crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, reportable),
         );
 
@@ -1836,7 +1843,7 @@ mod tests {
         let ack = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
         assert_eq!(
             ack.global_data.msg_max_size,
-            crate::v3::DEFAULT_MSG_MAX_SIZE as i32,
+            crate::UDP_RECEIVE_LIMITS.advertised(),
             "ack must advertise the receiver's local receive capacity, not the sender's 1400"
         );
     }
@@ -2132,7 +2139,11 @@ mod tests {
         let auth_key =
             LocalizedKey::from_password(AuthProtocol::Sha1, auth_password, engine_id).unwrap();
 
-        let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::AuthPriv, false));
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthPriv, false),
+        );
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             7,

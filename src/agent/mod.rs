@@ -96,6 +96,7 @@ use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 
 use crate::error::{Error, ErrorStatus, Result};
 use crate::handler::{GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext};
+use crate::message_size::{MessageSize, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS};
 use crate::oid;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType};
@@ -482,6 +483,8 @@ impl AgentBuilder {
     /// For `SNMPv3` requests, the agent uses the minimum of this value
     /// and the msgMaxSize from the request. This outbound response limit is
     /// independent of the local receive capacity advertised in V3 messages.
+    /// Values below the V3 advertisement minimum, including zero, are allowed:
+    /// they are response/drop policy and are never copied into a V3 header.
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
@@ -716,8 +719,7 @@ impl AgentBuilder {
     /// configured without a persisted [`AuthoritativeEngine`], or when the
     /// response-size limit exceeds the fixed UDP receive capacity.
     pub async fn build(mut self) -> Result<Agent> {
-        let max_udp_message_size = usize::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE)
-            .expect("default UDP message size must fit in usize");
+        let max_udp_message_size = UDP_RECEIVE_LIMITS.advertised().as_usize();
         if self.max_message_size > max_udp_message_size {
             return Err(Error::Config(
                 format!("max_message_size must not exceed UDP capacity {max_udp_message_size}")
@@ -725,8 +727,7 @@ impl AgentBuilder {
             )
             .boxed());
         }
-        let local_receive_capacity = i32::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE)
-            .expect("default SNMPv3 message size must fit in i32");
+        let local_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
 
         // Precompute master keys so the expensive password expansion runs once
         // here instead of on every inbound packet (CPU amplification).
@@ -888,7 +889,7 @@ pub(crate) struct AgentState {
     /// Configured upper bound for outbound response messages.
     pub(crate) max_message_size: usize,
     /// Wire-valid `msgMaxSize` advertising this agent's UDP receive capacity.
-    pub(crate) local_receive_capacity: i32,
+    pub(crate) local_receive_capacity: MessageSize,
     /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
     /// their ASN.1 representation is invalid for the received SNMP version
     pub(crate) snmp_in_asn_parse_errs: AtomicU32,
@@ -1202,7 +1203,7 @@ impl Agent {
     /// until the cancellation token is triggered.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn run(&self) -> Result<()> {
-        let mut buf = vec![0u8; 65535];
+        let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
 
         loop {
             let recv_meta = tokio::select! {
@@ -1215,6 +1216,9 @@ impl Agent {
                 }
             };
 
+            if recv_meta.len > UDP_RECEIVE_LIMITS.advertised().as_usize() {
+                tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, received_size = recv_meta.len, advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
+            }
             let data = Bytes::copy_from_slice(&buf[..recv_meta.len]);
             let agent = self.clone();
 
@@ -1444,7 +1448,7 @@ impl Agent {
     fn effective_max_size(&self, ctx: &RequestContext) -> usize {
         let agent_max = self.inner.state.max_message_size;
         match ctx.msg_max_size {
-            Some(client_max) => agent_max.min(client_max as usize),
+            Some(client_max) => agent_max.min(client_max),
             None => agent_max,
         }
     }
@@ -3068,7 +3072,7 @@ mod tests {
 
         let mut ctx = test_ctx();
         ctx.pdu_type = PduType::GetBulkRequest;
-        ctx.msg_max_size = Some(max as u32);
+        ctx.msg_max_size = Some(max);
 
         let pdu = Pdu {
             pdu_type: PduType::GetBulkRequest,
@@ -3126,7 +3130,7 @@ mod tests {
         let mut ctx = test_ctx();
         ctx.pdu_type = PduType::GetBulkRequest;
         // Below RESPONSE_OVERHEAD, so even the first varbind cannot fit.
-        ctx.msg_max_size = Some((RESPONSE_OVERHEAD - 1) as u32);
+        ctx.msg_max_size = Some(RESPONSE_OVERHEAD - 1);
 
         let pdu = Pdu {
             pdu_type: PduType::GetBulkRequest,
@@ -3180,7 +3184,7 @@ mod tests {
 
         let mut ctx = test_ctx();
         ctx.pdu_type = PduType::GetBulkRequest;
-        ctx.msg_max_size = Some(max as u32);
+        ctx.msg_max_size = Some(max);
 
         let pdu = Pdu {
             pdu_type: PduType::GetBulkRequest,
@@ -3389,8 +3393,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_subminimum_response_cap_is_not_an_advertised_capacity() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .max_message_size(0)
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(agent.inner.state.max_message_size, 0);
+        assert_eq!(
+            agent.inner.state.local_receive_capacity,
+            UDP_RECEIVE_LIMITS.advertised()
+        );
+    }
+
+    #[tokio::test]
     async fn test_max_message_size_above_udp_capacity_rejected_before_bind() {
-        let max_udp_message_size = usize::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE).unwrap();
+        let max_udp_message_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize();
         let result = Agent::builder()
             .bind("not a socket address")
             .max_message_size(max_udp_message_size + 1)

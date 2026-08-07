@@ -115,7 +115,11 @@ mod tests {
     }
 
     fn dummy_v3_msg(security_level: SecurityLevel) -> MsgGlobalData {
-        MsgGlobalData::new(1, 65507, MsgFlags::new(security_level, true))
+        MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(security_level, true),
+        )
     }
 
     fn dummy_usm() -> UsmSecurityParams {
@@ -294,7 +298,7 @@ mod tests {
 
         // Keep the incoming value, local capacity, and response cap distinct.
         let mut msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
-        msg.msg_max_size = 4096;
+        msg.msg_max_size = crate::MessageSize::new(4096).unwrap();
         assert_eq!(agent.inner.state.max_message_size, 1400);
         assert_eq!(agent.inner.state.local_receive_capacity, 65507);
         let usm = dummy_usm();

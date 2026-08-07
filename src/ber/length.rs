@@ -10,13 +10,6 @@ use std::net::SocketAddr;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 
-/// Maximum length we'll accept (to prevent `DoS`).
-///
-/// 2MB is far larger than any realistic SNMP message (typical messages are
-/// hundreds of bytes to a few KB). This provides a sanity check at the BER
-/// decode layer while still being generous enough for any legitimate use case.
-pub const MAX_LENGTH: usize = 0x20_0000; // 2MB
-
 /// Returns the number of bytes needed to encode a length value in BER.
 ///
 /// Uses short form (1 byte) for lengths <= 127, long form otherwise.
@@ -171,8 +164,11 @@ pub(crate) fn parse_ber_length(data: &[u8]) -> Option<(usize, usize)> {
     let first = data[0];
 
     if first < 0x80 {
-        // Short form
-        return Some((first as usize, 1));
+        let len = first as usize;
+        if len > data.len() - 1 {
+            return None;
+        }
+        return Some((len, 1));
     }
 
     if first == 0x80 {
@@ -188,14 +184,12 @@ pub(crate) fn parse_ber_length(data: &[u8]) -> Option<(usize, usize)> {
 
     let mut len: usize = 0;
     for i in 0..num_octets {
-        len = (len << 8) | (data[1 + i] as usize);
+        len = len.checked_mul(256)?.checked_add(data[1 + i] as usize)?;
     }
 
-    // Reject lengths that exceed the sanity cap or the remaining buffer,
-    // matching decode_length. Without this, an attacker-controlled length
-    // (e.g. eight 0xFF octets producing usize::MAX) causes overflow/panic
-    // in callers that compute `pos + len`.
-    if len > MAX_LENGTH || len > data.len() - (1 + num_octets) {
+    // The declared content must fit the enclosing input. Callers can therefore
+    // use checked offsets without a second, contradictory global size policy.
+    if len > data.len() - (1 + num_octets) {
         return None;
     }
 
@@ -252,12 +246,10 @@ pub fn decode_length(
 
         let mut len: usize = 0;
         for i in 0..num_octets {
-            len = (len << 8) | (data[1 + i] as usize);
-        }
-
-        if len > MAX_LENGTH {
-            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %base_offset, kind = %DecodeErrorKind::LengthExceedsMax { length: len, max: MAX_LENGTH } }, "length exceeds maximum");
-            return Err(Error::MalformedResponse { target }.boxed());
+            len = len
+                .checked_mul(256)
+                .and_then(|value| value.checked_add(data[1 + i] as usize))
+                .ok_or_else(|| Error::MalformedResponse { target }.boxed())?;
         }
 
         Ok((len, 1 + num_octets))
@@ -434,21 +426,11 @@ mod tests {
         let huge = [0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
         assert_eq!(parse_ber_length(&huge), None);
 
-        // Long-form length exceeding MAX_LENGTH is rejected even with a
-        // plausible encoding.
-        let over = MAX_LENGTH + 1;
-        let over_bytes = [
-            0x84,
-            ((over >> 24) & 0xFF) as u8,
-            ((over >> 16) & 0xFF) as u8,
-            ((over >> 8) & 0xFF) as u8,
-            (over & 0xFF) as u8,
-        ];
-        assert_eq!(parse_ber_length(&over_bytes), None);
-
-        // Long-form length exceeding the remaining buffer is rejected.
-        // 0x81 0x05 claims 5 content bytes but only 2 follow.
+        // Declared lengths exceeding the remaining buffer are rejected in
+        // both forms.
+        assert_eq!(parse_ber_length(&[0x05, 0x00, 0x00]), None);
         assert_eq!(parse_ber_length(&[0x81, 0x05, 0x00, 0x00]), None);
+        assert_eq!(parse_ber_length(&[0x02, 0x00, 0x00]), Some((2, 1)));
 
         // Long-form length that exactly matches the remaining buffer is
         // accepted. 0x81 0x80 = 128 content bytes.
@@ -458,34 +440,16 @@ mod tests {
     }
 
     #[test]
-    fn test_max_length_enforced() {
-        // Length at exactly MAX_LENGTH should succeed
-        let max = MAX_LENGTH;
-        let max_bytes = [
-            0x83,
-            ((max >> 16) & 0xFF) as u8,
-            ((max >> 8) & 0xFF) as u8,
-            (max & 0xFF) as u8,
+    fn lengths_above_previous_two_mib_policy_are_structurally_accepted() {
+        let length = 3 * 1024 * 1024;
+        let encoded = [
+            0x84,
+            ((length >> 24) & 0xff) as u8,
+            ((length >> 16) & 0xff) as u8,
+            ((length >> 8) & 0xff) as u8,
+            (length & 0xff) as u8,
         ];
-        let result = decode_length(&max_bytes, 0, None);
-        assert_eq!(result.unwrap(), (MAX_LENGTH, 4));
-
-        // Length exceeding MAX_LENGTH should fail (use 4-byte encoding)
-        let over = MAX_LENGTH + 1;
-        let over_bytes = [
-            0x84, // 4 length bytes follow
-            ((over >> 24) & 0xFF) as u8,
-            ((over >> 16) & 0xFF) as u8,
-            ((over >> 8) & 0xFF) as u8,
-            (over & 0xFF) as u8,
-        ];
-        let result = decode_length(&over_bytes, 0, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got {err:?}"
-        );
+        assert_eq!(decode_length(&encoded, 0, None).unwrap(), (length, 5));
     }
 
     mod proptests {

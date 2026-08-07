@@ -53,7 +53,7 @@ impl SnmpEngineHandler {
             3 => Some(Value::Integer(
                 self.state.engine_time.load(Ordering::Relaxed) as i32,
             )),
-            4 => Some(Value::Integer(self.state.local_receive_capacity)),
+            4 => Some(Value::Integer(self.state.local_receive_capacity.as_i32())),
             _ => None,
         }
     }
@@ -305,7 +305,7 @@ mod tests {
             engine_start: Instant::now(),
             engine_boots_base: 5,
             max_message_size: 1472,
-            local_receive_capacity: 65507,
+            local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(10),
             snmp_unknown_security_models: AtomicU32::new(20),

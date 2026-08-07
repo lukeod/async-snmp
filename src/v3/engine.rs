@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::error::{Error, Result};
+use crate::message_size::{MessageSize, UDP_RECEIVE_LIMITS};
 use crate::v3::UsmSecurityParams;
 
 /// Time window in seconds (RFC 3414 Section 2.2.3).
@@ -44,9 +45,6 @@ pub const TIME_WINDOW: u32 = 150;
 /// When the value reaches this maximum, the authoritative engine should
 /// reset it to zero and increment snmpEngineBoots.
 pub const MAX_ENGINE_TIME: u32 = 2_147_483_647;
-
-/// Default msgMaxSize for UDP transport (65535 - 20 IPv4 - 8 UDP = 65507).
-pub const DEFAULT_MSG_MAX_SIZE: u32 = 65507;
 
 /// Compute engine boots and time from a base boots value and total elapsed
 /// seconds since engine start.
@@ -266,19 +264,24 @@ pub struct EngineState {
     /// Authoritative engine ID.
     pub(crate) engine_id: Bytes,
     /// Maximum message size the remote engine can accept.
-    pub msg_max_size: u32,
+    pub msg_max_size: MessageSize,
     trusted_time: Option<TrustedEngineTime>,
 }
 
 impl EngineState {
     /// Create engine state whose boots/time are already authenticated.
     pub fn new(engine_id: Bytes, engine_boots: u32, engine_time: u32) -> Self {
-        Self::with_msg_max_size(engine_id, engine_boots, engine_time, DEFAULT_MSG_MAX_SIZE)
+        Self::with_msg_max_size(
+            engine_id,
+            engine_boots,
+            engine_time,
+            UDP_RECEIVE_LIMITS.advertised(),
+        )
     }
 
     /// Create an identity learned through unauthenticated discovery.
     #[must_use]
-    pub fn discovered(engine_id: Bytes, msg_max_size: u32) -> Self {
+    pub fn discovered(engine_id: Bytes, msg_max_size: MessageSize) -> Self {
         Self {
             engine_id,
             msg_max_size,
@@ -291,7 +294,7 @@ impl EngineState {
         engine_id: Bytes,
         engine_boots: u32,
         engine_time: u32,
-        msg_max_size: u32,
+        msg_max_size: MessageSize,
     ) -> Self {
         Self {
             engine_id,
@@ -309,8 +312,8 @@ impl EngineState {
         engine_id: Bytes,
         engine_boots: u32,
         engine_time: u32,
-        reported_msg_max_size: u32,
-        session_max: u32,
+        reported_msg_max_size: MessageSize,
+        session_max: MessageSize,
     ) -> Self {
         Self::with_msg_max_size(
             engine_id,
@@ -425,9 +428,9 @@ impl EngineState {
     }
 }
 
-fn cap_msg_max_size(reported: u32, session_max: u32) -> u32 {
+fn cap_msg_max_size(reported: MessageSize, session_max: MessageSize) -> MessageSize {
     if reported > session_max {
-        tracing::debug!(target: "async_snmp::v3", { reported, session_max }, "capping msgMaxSize to session limit");
+        tracing::debug!(target: "async_snmp::v3", { reported = reported.as_usize(), session_max = session_max.as_usize() }, "capping msgMaxSize to session limit");
         session_max
     } else {
         reported
@@ -468,7 +471,7 @@ const DEFAULT_ENGINE_CACHE_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 struct CachedTarget {
     engine_id: Bytes,
-    msg_max_size: u32,
+    msg_max_size: MessageSize,
     refreshed_at: Instant,
 }
 
@@ -884,8 +887,8 @@ fn remove_orphaned_time(inner: &mut EngineCacheInner, engine_id: &Bytes) {
 pub fn parse_discovery_response(security_params: &Bytes) -> Result<EngineState> {
     parse_discovery_response_with_limits(
         security_params,
-        DEFAULT_MSG_MAX_SIZE,
-        DEFAULT_MSG_MAX_SIZE,
+        UDP_RECEIVE_LIMITS.advertised(),
+        UDP_RECEIVE_LIMITS.advertised(),
     )
 }
 
@@ -896,8 +899,8 @@ pub fn parse_discovery_response(security_params: &Bytes) -> Result<EngineState> 
 /// Values are capped to prevent issues with non-compliant agents.
 pub fn parse_discovery_response_with_limits(
     security_params: &Bytes,
-    reported_msg_max_size: u32,
-    session_max: u32,
+    reported_msg_max_size: MessageSize,
+    session_max: MessageSize,
 ) -> Result<EngineState> {
     let usm = UsmSecurityParams::decode(security_params.clone())?;
 
@@ -1332,8 +1335,14 @@ mod tests {
         let cache = EngineCache::new();
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
         let shared_addr: SocketAddr = "192.168.1.2:161".parse().unwrap();
-        let old = EngineState::discovered(Bytes::from_static(b"old-engine"), 1400);
-        let new = EngineState::discovered(Bytes::from_static(b"new-engine"), 1500);
+        let old = EngineState::discovered(
+            Bytes::from_static(b"old-engine"),
+            crate::MessageSize::new(1400).unwrap(),
+        );
+        let new = EngineState::discovered(
+            Bytes::from_static(b"new-engine"),
+            crate::MessageSize::new(1500).unwrap(),
+        );
         let shared = EngineState::new(Bytes::from_static(b"new-engine"), 7, 500);
 
         cache.insert(addr, old.clone());
@@ -1357,8 +1366,14 @@ mod tests {
         let addr2: SocketAddr = "192.168.1.2:161".parse().unwrap();
         let engine_id = Bytes::from_static(b"shared-engine");
 
-        cache.insert(addr1, EngineState::discovered(engine_id.clone(), 1400));
-        cache.insert(addr2, EngineState::discovered(engine_id, 1500));
+        cache.insert(
+            addr1,
+            EngineState::discovered(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
+        );
+        cache.insert(
+            addr2,
+            EngineState::discovered(engine_id, crate::MessageSize::new(1500).unwrap()),
+        );
         assert!(cache.update_time(&addr1, 4, 500));
 
         let state2 = cache.get(&addr2).unwrap();
@@ -1375,7 +1390,10 @@ mod tests {
 
         cache.insert(addr, EngineState::new(engine_id.clone(), 7, 500));
         cache.insert(addr, EngineState::new(engine_id.clone(), 6, 9000));
-        cache.insert(addr, EngineState::discovered(engine_id, 1400));
+        cache.insert(
+            addr,
+            EngineState::discovered(engine_id, crate::MessageSize::new(1400).unwrap()),
+        );
 
         let state = cache.get(&addr).unwrap();
         let trusted = state.trusted_time().unwrap();
@@ -1390,7 +1408,10 @@ mod tests {
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
         cache.insert(
             addr,
-            EngineState::discovered(Bytes::from_static(b"engine1"), 1400),
+            EngineState::discovered(
+                Bytes::from_static(b"engine1"),
+                crate::MessageSize::new(1400).unwrap(),
+            ),
         );
 
         let older = Arc::clone(&cache);
@@ -1464,7 +1485,11 @@ mod tests {
         let mut local_state = EngineState::new(engine_id.clone(), 5, 1000);
         local_state.trusted_time.as_mut().unwrap().received_at = now;
 
-        cache.insert_at(addr, EngineState::discovered(engine_id.clone(), 1400), now);
+        cache.insert_at(
+            addr,
+            EngineState::discovered(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
+            now,
+        );
         let (timely, canonical) = cache
             .check_and_update_timeliness_at(
                 &addr,
@@ -1793,7 +1818,12 @@ mod tests {
     /// can accept, as reported in `SNMPv3` message headers.
     #[test]
     fn test_engine_state_stores_msg_max_size() {
-        let state = EngineState::with_msg_max_size(Bytes::from_static(b"engine"), 1, 1000, 65507);
+        let state = EngineState::with_msg_max_size(
+            Bytes::from_static(b"engine"),
+            1,
+            1000,
+            crate::MessageSize::new(65507).unwrap(),
+        );
         assert_eq!(state.msg_max_size, 65507);
     }
 
@@ -1805,7 +1835,8 @@ mod tests {
     fn test_engine_state_default_msg_max_size() {
         let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
         assert_eq!(
-            state.msg_max_size, DEFAULT_MSG_MAX_SIZE,
+            state.msg_max_size,
+            UDP_RECEIVE_LIMITS.advertised(),
             "Default msg_max_size should be the maximum UDP datagram size"
         );
     }
@@ -1822,8 +1853,8 @@ mod tests {
             Bytes::from_static(b"engine"),
             1,
             1000,
-            2_000_000_000, // Agent claims 2GB
-            65507,         // Our session maximum
+            MessageSize::new(2_000_000_000).unwrap(), // Agent claims 2GB
+            UDP_RECEIVE_LIMITS.advertised(),          // Our session maximum
         );
         assert_eq!(
             state.msg_max_size, 65507,
@@ -1841,8 +1872,8 @@ mod tests {
             Bytes::from_static(b"engine"),
             1,
             1000,
-            1472,  // Agent claims 1472 (Ethernet MTU - headers)
-            65507, // Our session maximum
+            MessageSize::new(1472).unwrap(), // Agent claims 1472 (Ethernet MTU - headers)
+            UDP_RECEIVE_LIMITS.advertised(), // Our session maximum
         );
         assert_eq!(
             state.msg_max_size, 1472,
@@ -1859,8 +1890,8 @@ mod tests {
             Bytes::from_static(b"engine"),
             1,
             1000,
-            65507, // Exactly at session max
-            65507, // Our session maximum
+            UDP_RECEIVE_LIMITS.advertised(), // Exactly at session max
+            UDP_RECEIVE_LIMITS.advertised(), // Our session maximum
         );
         assert_eq!(state.msg_max_size, 65507);
     }
@@ -1878,23 +1909,14 @@ mod tests {
             Bytes::from_static(b"engine"),
             1,
             1000,
-            TCP_MAX,
-            TCP_MAX,
+            MessageSize::try_from(TCP_MAX).unwrap(),
+            MessageSize::try_from(TCP_MAX).unwrap(),
         );
         assert_eq!(state.msg_max_size, TCP_MAX);
 
-        // Agent claims more than i32::MAX (wrapped negative), cap to limit
-        let state = EngineState::with_msg_max_size_capped(
-            Bytes::from_static(b"engine"),
-            1,
-            1000,
-            u32::MAX, // Larger than any valid msgMaxSize
-            TCP_MAX,
-        );
-        assert_eq!(
-            state.msg_max_size, TCP_MAX,
-            "Values exceeding session max should be capped"
-        );
+        // Values above i32::MAX cannot enter EngineState; wire decoding and
+        // transport configuration reject them before session capping.
+        assert!(MessageSize::try_from(u32::MAX).is_err());
     }
 
     /// Test that `EngineState::new` uses the default `msg_max_size` constant.
@@ -1902,8 +1924,8 @@ mod tests {
     fn test_engine_state_new_uses_default_constant() {
         let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
 
-        // DEFAULT_MSG_MAX_SIZE is the maximum UDP payload (65507)
-        assert_eq!(state.msg_max_size, DEFAULT_MSG_MAX_SIZE);
+        // UDP_RECEIVE_LIMITS.advertised() is the maximum UDP payload (65507)
+        assert_eq!(state.msg_max_size, UDP_RECEIVE_LIMITS.advertised());
     }
 
     // ========================================================================

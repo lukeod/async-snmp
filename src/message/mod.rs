@@ -72,6 +72,19 @@ impl Message {
     ///
     /// Automatically detects the SNMP version and parses accordingly.
     pub fn decode(data: Bytes) -> Result<Self> {
+        let input_len = data.len();
+        Self::decode_bounded(data, input_len)
+    }
+
+    /// Decode while enforcing a caller-supplied total input bound.
+    pub(crate) fn decode_bounded(data: Bytes, maximum: usize) -> Result<Self> {
+        if data.len() > maximum {
+            tracing::debug!(target: "async_snmp::message", { received_size = data.len(), maximum }, "message exceeds receive limit");
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
         let mut decoder = Decoder::new(data);
         let mut seq = decoder.read_sequence()?;
 
@@ -122,5 +135,24 @@ impl From<CommunityMessage> for Message {
 impl From<V3Message> for Message {
     fn from(msg: V3Message) -> Self {
         Message::V3(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_decode_replaces_the_previous_global_two_mib_ceiling() {
+        let message = CommunityMessage::new(
+            Version::V2c,
+            vec![b'x'; 3 * 1024 * 1024],
+            Pdu::get_request(1, &[]),
+        );
+        let encoded = message.encode().unwrap();
+        let encoded_len = encoded.len();
+
+        assert!(Message::decode_bounded(encoded.clone(), encoded_len).is_ok());
+        assert!(Message::decode_bounded(encoded, encoded_len - 1).is_err());
     }
 }
