@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `Agent::send_trap()` and `Agent::send_inform()` now return a
+  `NotificationOutcome` with a `SinkStatus` for every configured sink. Inform
+  sinks using SNMPv1 are reported as explicitly skipped, so an all-skipped send
+  is not reported as successful. The `_detailed` methods were removed; callers
+  that intentionally want warn-and-discard behavior can use
+  `send_trap_best_effort()` and `send_inform_best_effort()`.
 - **Breaking:** `ClientConfig` now uses one authoritative `auth: Auth` field
   instead of independent `version`, `community`, and `v3_security` fields.
   `Client::new` and `Client::with_engine_cache` now return `Result` and reject
@@ -37,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SET commit failure now undoes every attempted binding, including the failed
   attempt, and frees later tested reservations whose commit was not attempted.
   Cleanup continues after an undo failure.
+
+### Migration
+
+- Replace `send_trap_detailed()` and `send_inform_detailed()` with
+  `send_trap()` and `send_inform()`, and match each `SinkOutcome.status` as
+  `Succeeded`, `Failed(error)`, or `Skipped(reason)`. Code that deliberately
+  discards outcomes should call the corresponding `_best_effort()` method.
 
 ## [0.17.0] - 2026-08-06
 

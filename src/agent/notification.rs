@@ -140,26 +140,52 @@ impl TrapSink {
     }
 }
 
-/// Delivery outcome for a single trap sink.
+/// Reason that a configured notification sink was not attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SinkSkipReason {
+    /// SNMPv1 does not support Inform requests.
+    InformUnsupportedForV1,
+}
+
+impl std::fmt::Display for SinkSkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InformUnsupportedForV1 => write!(f, "SNMPv1 does not support informs"),
+        }
+    }
+}
+
+/// Delivery status for a configured notification sink.
+#[derive(Debug)]
+pub enum SinkStatus {
+    /// Encoding and the local socket write succeeded for a trap, or the Inform
+    /// was acknowledged.
+    Succeeded,
+    /// The delivery attempt failed.
+    Failed(Box<Error>),
+    /// The configured sink could not be attempted for the stated reason.
+    Skipped(SinkSkipReason),
+}
+
+/// Delivery outcome for a single configured notification sink.
 ///
-/// Reports the destination and the result of the delivery attempt. For traps
-/// this reflects the local send (encoding and socket write); for confirmed
-/// informs it reflects the full request/response exchange, including timeout.
+/// For traps, success reflects encoding and the local socket write, not remote
+/// receipt. For confirmed informs, success reflects the full request/response
+/// exchange, including acknowledgement.
 #[derive(Debug)]
 pub struct SinkOutcome {
     /// The sink destination address.
     pub dest: SocketAddr,
-    /// The delivery result for this sink. `Ok(())` on success.
-    pub result: Result<()>,
+    /// The delivery status for this sink.
+    pub status: SinkStatus,
 }
 
 /// Aggregate outcome of sending a notification to all configured sinks.
 ///
-/// Returned by [`Agent::send_trap_detailed`](super::Agent::send_trap_detailed)
-/// and [`Agent::send_inform_detailed`](super::Agent::send_inform_detailed) so
-/// callers can observe partial success: which sinks succeeded and which failed
-/// with their errors. Sinks that were skipped (e.g. v1 sinks for informs) are
-/// not included.
+/// Returned by [`Agent::send_trap`](super::Agent::send_trap) and
+/// [`Agent::send_inform`](super::Agent::send_inform) so callers can observe
+/// success, failure, or an explicit skip for every configured sink.
+#[must_use = "inspect notification outcomes or use the explicit best-effort helper"]
 #[derive(Debug)]
 pub struct NotificationOutcome {
     sinks: Vec<SinkOutcome>,
@@ -173,21 +199,34 @@ impl NotificationOutcome {
 
     /// Iterator over the sinks whose delivery failed.
     pub fn failures(&self) -> impl Iterator<Item = &SinkOutcome> {
-        self.sinks.iter().filter(|s| s.result.is_err())
+        self.sinks
+            .iter()
+            .filter(|s| matches!(s.status, SinkStatus::Failed(_)))
     }
 
-    /// `true` if every attempted sink succeeded (also `true` when no sinks
-    /// were attempted).
+    /// Iterator over configured sinks that were not attempted.
+    pub fn skipped(&self) -> impl Iterator<Item = &SinkOutcome> {
+        self.sinks
+            .iter()
+            .filter(|s| matches!(s.status, SinkStatus::Skipped(_)))
+    }
+
+    /// `true` if every configured sink succeeded.
+    ///
+    /// This is also `true` when no sinks are configured, but is `false` when
+    /// any configured sink failed or was skipped.
     pub fn all_succeeded(&self) -> bool {
-        self.sinks.iter().all(|s| s.result.is_ok())
+        self.sinks
+            .iter()
+            .all(|s| matches!(s.status, SinkStatus::Succeeded))
     }
 
-    /// Number of sinks attempted.
+    /// Number of configured sinks represented in this outcome.
     pub fn len(&self) -> usize {
         self.sinks.len()
     }
 
-    /// `true` if no sinks were attempted.
+    /// `true` if no sinks were configured.
     pub fn is_empty(&self) -> bool {
         self.sinks.is_empty()
     }
@@ -199,11 +238,12 @@ impl NotificationOutcome {
 }
 
 impl super::Agent {
-    /// Send a trap to all configured trap sinks.
+    /// Send a trap to all configured trap sinks, reporting every outcome.
     ///
-    /// Constructs a `TrapV2` PDU with the mandatory sysUpTime.0 and snmpTrapOID.0
-    /// prefix and sends it to each destination. Fire-and-forget: no response
-    /// expected.
+    /// Constructs a `TrapV2` PDU with the mandatory sysUpTime.0 and
+    /// snmpTrapOID.0 prefix and sends it to each destination. Trap success
+    /// means encoding and the local socket write succeeded; traps are
+    /// fire-and-forget and remote receipt is not confirmed.
     ///
     /// V1 trap sinks receive a converted v1 trap (RFC 3584 Section 3.2).
     /// For a V3 sink, this Agent is authoritative and sends its persisted
@@ -222,34 +262,14 @@ impl super::Agent {
     ///     .build()
     ///     .await?;
     ///
-    /// // Send coldStart trap to all sinks
-    /// agent.send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![]).await?;
+    /// let outcome = agent
+    ///     .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
+    ///     .await;
+    /// assert!(outcome.all_succeeded());
     /// # Ok(())
     /// # }
     /// ```
     pub async fn send_trap(
-        &self,
-        trap_oid: &Oid,
-        uptime: u32,
-        varbinds: Vec<VarBind>,
-    ) -> Result<()> {
-        let outcome = self.send_trap_detailed(trap_oid, uptime, varbinds).await;
-        for sink in outcome.failures() {
-            if let Err(ref e) = sink.result {
-                tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %e }, "failed to send trap");
-            }
-        }
-        Ok(())
-    }
-
-    /// Send a trap to all configured trap sinks, reporting per-sink outcomes.
-    ///
-    /// Behaves like [`send_trap`](Self::send_trap) but returns a
-    /// [`NotificationOutcome`] describing which sinks succeeded and which
-    /// failed with their errors, rather than discarding per-sink failures.
-    /// Unlike [`send_trap`](Self::send_trap), it does not emit warning logs for
-    /// failures; the caller is expected to inspect the returned outcome.
-    pub async fn send_trap_detailed(
         &self,
         trap_oid: &Oid,
         uptime: u32,
@@ -265,26 +285,48 @@ impl super::Agent {
         let pdu = Pdu::trap_v2(request_id, uptime, trap_oid, varbinds);
 
         for sink in sinks {
-            let result = self.send_trap_to_sink(sink, &pdu).await;
+            let status = match self.send_trap_to_sink(sink, &pdu).await {
+                Ok(()) => SinkStatus::Succeeded,
+                Err(error) => SinkStatus::Failed(error),
+            };
             outcomes.push(SinkOutcome {
                 dest: sink.dest,
-                result,
+                status,
             });
         }
 
         NotificationOutcome { sinks: outcomes }
     }
 
-    /// Send an inform to all configured trap sinks.
+    /// Send a trap to all configured sinks, warning and discarding outcomes.
+    ///
+    /// Use [`send_trap`](Self::send_trap) when the caller needs to observe
+    /// per-sink success or failure.
+    pub async fn send_trap_best_effort(&self, trap_oid: &Oid, uptime: u32, varbinds: Vec<VarBind>) {
+        let outcome = self.send_trap(trap_oid, uptime, varbinds).await;
+        for sink in outcome.sinks() {
+            match &sink.status {
+                SinkStatus::Failed(error) => {
+                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %error }, "failed to send trap");
+                }
+                SinkStatus::Skipped(reason) => {
+                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, reason = %reason }, "skipped trap sink");
+                }
+                SinkStatus::Succeeded => {}
+            }
+        }
+    }
+
+    /// Send an inform to all configured trap sinks, reporting every outcome.
     ///
     /// Constructs an `InformRequest` PDU and sends it to each destination,
-    /// waiting for acknowledgement from each. Reuses a cached client per
-    /// sink for the request/response exchange.
+    /// waiting for acknowledgement from each. Reuses a cached client per sink
+    /// for the request/response exchange.
     ///
-    /// V1 trap sinks are skipped (v1 does not support informs).
-    /// For a V3 sink, the receiver is authoritative; the cached client
-    /// discovers and uses the sink's engine identity and trusted time rather
-    /// than the Agent's local authoritative state.
+    /// V1 trap sinks are explicitly reported as skipped because v1 does not
+    /// support informs. For a V3 sink, the receiver is authoritative; the
+    /// cached client discovers and uses the sink's engine identity and trusted
+    /// time rather than the Agent's local authoritative state.
     ///
     /// # Example
     ///
@@ -299,8 +341,10 @@ impl super::Agent {
     ///     .build()
     ///     .await?;
     ///
-    /// // Send warmStart inform to all sinks (waits for acknowledgement)
-    /// agent.send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2), 0, vec![]).await?;
+    /// let outcome = agent
+    ///     .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2), 0, vec![])
+    ///     .await;
+    /// assert!(outcome.all_succeeded());
     /// # Ok(())
     /// # }
     /// ```
@@ -309,49 +353,53 @@ impl super::Agent {
         trap_oid: &Oid,
         uptime: u32,
         varbinds: Vec<VarBind>,
-    ) -> Result<()> {
-        let outcome = self.send_inform_detailed(trap_oid, uptime, varbinds).await;
-        for sink in outcome.failures() {
-            if let Err(ref e) = sink.result {
-                tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %e }, "failed to send inform");
-            }
-        }
-        Ok(())
-    }
-
-    /// Send an inform to all configured trap sinks, reporting per-sink outcomes.
-    ///
-    /// Behaves like [`send_inform`](Self::send_inform) but returns a
-    /// [`NotificationOutcome`] describing which sinks acknowledged and which
-    /// failed with their errors (including confirmed-inform timeouts), rather
-    /// than discarding per-sink failures. v1 sinks are skipped and are not
-    /// included in the outcome. Unlike [`send_inform`](Self::send_inform), it
-    /// does not emit warning logs for failures; the caller is expected to
-    /// inspect the returned outcome.
-    pub async fn send_inform_detailed(
-        &self,
-        trap_oid: &Oid,
-        uptime: u32,
-        varbinds: Vec<VarBind>,
     ) -> NotificationOutcome {
         let sinks = &self.inner.trap_sinks;
-        let mut outcomes = Vec::new();
+        let mut outcomes = Vec::with_capacity(sinks.len());
 
         for sink in sinks {
-            if sink.version == Version::V1 {
-                continue;
-            }
-
-            let result = self
-                .send_inform_to_sink(sink, trap_oid, uptime, &varbinds)
-                .await;
+            let status = if sink.version == Version::V1 {
+                SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
+            } else {
+                match self
+                    .send_inform_to_sink(sink, trap_oid, uptime, &varbinds)
+                    .await
+                {
+                    Ok(()) => SinkStatus::Succeeded,
+                    Err(error) => SinkStatus::Failed(error),
+                }
+            };
             outcomes.push(SinkOutcome {
                 dest: sink.dest,
-                result,
+                status,
             });
         }
 
         NotificationOutcome { sinks: outcomes }
+    }
+
+    /// Send an inform to all configured sinks, warning and discarding outcomes.
+    ///
+    /// Use [`send_inform`](Self::send_inform) when the caller needs to observe
+    /// per-sink acknowledgement, failure, or skip status.
+    pub async fn send_inform_best_effort(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) {
+        let outcome = self.send_inform(trap_oid, uptime, varbinds).await;
+        for sink in outcome.sinks() {
+            match &sink.status {
+                SinkStatus::Failed(error) => {
+                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %error }, "failed to send inform");
+                }
+                SinkStatus::Skipped(reason) => {
+                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, reason = %reason }, "skipped inform sink");
+                }
+                SinkStatus::Succeeded => {}
+            }
+        }
     }
 
     /// Send a trap PDU to a single sink.

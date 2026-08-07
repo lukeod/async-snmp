@@ -11,7 +11,7 @@
 //!
 //! Run with: cargo run --example notification_sender
 
-use async_snmp::agent::Agent;
+use async_snmp::agent::{Agent, NotificationOutcome, SinkStatus};
 use async_snmp::notification::{Notification, NotificationReceiver};
 use async_snmp::v3::AuthoritativeEngine;
 use async_snmp::varbind::VarBind;
@@ -90,8 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Send v2c trap to all configured sinks
     println!("--- Agent: sending v2c trap ---");
     let cold_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
-    agent.send_trap(&cold_start, 12345, vec![]).await?;
-    println!("Sent v2c trap (coldStart)\n");
+    let outcome = agent.send_trap(&cold_start, 12345, vec![]).await;
+    print_outcome("v2c trap (coldStart)", &outcome);
 
     // Send v2c inform to all configured sinks (waits for ack)
     println!("--- Agent: sending v2c inform ---");
@@ -100,8 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
         Value::from("example agent"),
     )];
-    agent.send_inform(&warm_start, 5000, extra).await?;
-    println!("Sent v2c inform (warmStart) - acknowledged\n");
+    let outcome = agent.send_inform(&warm_start, 5000, extra).await;
+    print_outcome("v2c inform (warmStart)", &outcome);
 
     // =========================================================================
     // Client-based sending (for standalone tools)
@@ -152,6 +152,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     recv_handle.await?;
     println!("Done!");
     Ok(())
+}
+
+fn print_outcome(label: &str, outcome: &NotificationOutcome) {
+    for sink in outcome.sinks() {
+        match &sink.status {
+            SinkStatus::Succeeded => println!("{label}: {} succeeded", sink.dest),
+            SinkStatus::Failed(error) => eprintln!("{label}: {} failed: {error}", sink.dest),
+            SinkStatus::Skipped(reason) => eprintln!("{label}: {} skipped: {reason}", sink.dest),
+        }
+    }
+    println!();
 }
 
 fn print_notification(notification: &Notification, source: std::net::SocketAddr) {

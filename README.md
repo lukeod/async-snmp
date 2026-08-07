@@ -279,7 +279,7 @@ See [examples/lightweight_runtime.rs](examples/lightweight_runtime.rs) and [exam
 Traps and informs can be sent from an agent (recommended for devices that also handle requests) or directly from a client (for standalone tools like `snmptrap`):
 
 ```rust
-use async_snmp::agent::Agent;
+use async_snmp::agent::{Agent, SinkStatus};
 use async_snmp::{Auth, oid};
 
 #[tokio::main]
@@ -291,16 +291,29 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
         .build()
         .await?;
 
-    // Send a coldStart trap to all configured sinks
+    // Trap success means encoding and the local socket write succeeded; traps
+    // do not confirm remote receipt.
     let cold_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
-    agent.send_trap(&cold_start, 0, vec![]).await?;
+    let trap_outcome = agent.send_trap(&cold_start, 0, vec![]).await;
 
-    // Send an inform (waits for acknowledgement)
-    agent.send_inform(&cold_start, 0, vec![]).await?;
+    // Inform success means the sink acknowledged the request.
+    let inform_outcome = agent.send_inform(&cold_start, 0, vec![]).await;
+
+    for sink in trap_outcome.sinks().iter().chain(inform_outcome.sinks()) {
+        match &sink.status {
+            SinkStatus::Succeeded => println!("{} succeeded", sink.dest),
+            SinkStatus::Failed(error) => eprintln!("{} failed: {error}", sink.dest),
+            SinkStatus::Skipped(reason) => eprintln!("{} skipped: {reason}", sink.dest),
+        }
+    }
 
     Ok(())
 }
 ```
+
+When outcomes are intentionally not needed, use the explicitly lossy
+`send_trap_best_effort` and `send_inform_best_effort` helpers; they warn for
+failed or skipped sinks and discard the aggregate outcome.
 
 Client-based sending is useful for one-shot notifications without running an agent. See [examples/notification_sender.rs](examples/notification_sender.rs) for both approaches with V2c and V3 examples.
 

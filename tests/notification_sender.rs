@@ -1,6 +1,6 @@
 //! Integration tests for notification sending (trap/inform).
 
-use async_snmp::agent::Agent;
+use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::notification::{Notification, NotificationReceiver};
 use async_snmp::v3::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
 use async_snmp::varbind::VarBind;
@@ -451,7 +451,9 @@ async fn agent_v2c_trap_to_sink() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1); // coldStart
-    agent.send_trap(&trap_oid, 500, vec![]).await.unwrap();
+    let outcome = agent.send_trap(&trap_oid, 500, vec![]).await;
+    assert!(outcome.all_succeeded());
+    assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
     let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
@@ -494,7 +496,9 @@ async fn agent_v2c_inform_to_sink() {
     });
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2); // warmStart
-    agent.send_inform(&trap_oid, 1000, vec![]).await.unwrap();
+    let outcome = agent.send_inform(&trap_oid, 1000, vec![]).await;
+    assert!(outcome.all_succeeded());
+    assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
     let (notification, _source) = recv_handle.await.unwrap();
 
@@ -544,7 +548,9 @@ async fn agent_v3_trap_to_sink() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3); // linkDown
-    agent.send_trap(&trap_oid, 9999, vec![]).await.unwrap();
+    let outcome = agent.send_trap(&trap_oid, 9999, vec![]).await;
+    assert!(outcome.all_succeeded());
+    assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
     let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
@@ -583,7 +589,9 @@ async fn agent_multiple_sinks() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
-    agent.send_trap(&trap_oid, 42, vec![]).await.unwrap();
+    let outcome = agent.send_trap(&trap_oid, 42, vec![]).await;
+    assert!(outcome.all_succeeded());
+    assert_eq!(outcome.len(), 2);
 
     // Both receivers should get the trap
     let (n1, _) = tokio::time::timeout(Duration::from_secs(5), recv1.recv())
@@ -629,7 +637,9 @@ async fn agent_v1_trap_to_sink() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2); // warmStart
-    agent.send_trap(&trap_oid, 1000, vec![]).await.unwrap();
+    let outcome = agent.send_trap(&trap_oid, 1000, vec![]).await;
+    assert!(outcome.all_succeeded());
+    assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
     let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
@@ -665,7 +675,9 @@ async fn agent_mixed_v1_v2c_sinks() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 4); // linkUp
-    agent.send_trap(&trap_oid, 777, vec![]).await.unwrap();
+    let outcome = agent.send_trap(&trap_oid, 777, vec![]).await;
+    assert!(outcome.all_succeeded());
+    assert_eq!(outcome.len(), 2);
 
     let (n1, _) = tokio::time::timeout(Duration::from_secs(5), recv_v1.recv())
         .await
@@ -713,18 +725,18 @@ async fn agent_no_sinks_is_noop() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
-    // Should succeed without error (no sinks = no-op)
-    agent.send_trap(&trap_oid, 0, vec![]).await.unwrap();
-    agent.send_inform(&trap_oid, 0, vec![]).await.unwrap();
+    // Primary methods report an empty (all-succeeded) outcome for no sinks.
+    let trap_outcome = agent.send_trap(&trap_oid, 0, vec![]).await;
+    assert!(trap_outcome.is_empty());
+    assert!(trap_outcome.all_succeeded());
 
-    // Detailed variants report an empty (all-succeeded) outcome for no sinks.
-    let outcome = agent.send_trap_detailed(&trap_oid, 0, vec![]).await;
-    assert!(outcome.is_empty());
-    assert!(outcome.all_succeeded());
+    let inform_outcome = agent.send_inform(&trap_oid, 0, vec![]).await;
+    assert!(inform_outcome.is_empty());
+    assert!(inform_outcome.all_succeeded());
 }
 
 #[tokio::test]
-async fn agent_inform_detailed_reports_failing_sink() {
+async fn agent_inform_reports_failing_sink() {
     // Bind a socket to reserve a port, then drop it so nothing listens there.
     // The inform to this dead destination times out and must be reported as a
     // failure in the per-sink outcome rather than silently discarded.
@@ -743,15 +755,140 @@ async fn agent_inform_detailed_reports_failing_sink() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
-    let outcome = agent.send_inform_detailed(&trap_oid, 0, vec![]).await;
+    let outcome = agent.send_inform(&trap_oid, 0, vec![]).await;
 
     assert_eq!(outcome.len(), 1);
     assert!(!outcome.all_succeeded());
     let failures: Vec<_> = outcome.failures().collect();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].dest, dead_addr);
-    assert!(failures[0].result.is_err());
+    assert!(matches!(&failures[0].status, SinkStatus::Failed(_)));
+}
 
-    // The lossy wrapper still returns Ok(()) for backward compatibility.
-    agent.send_inform(&trap_oid, 0, vec![]).await.unwrap();
+#[tokio::test]
+async fn agent_trap_reports_total_conversion_failure() {
+    let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = receiver.local_addr();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink(sink_addr.to_string(), Auth::v1("public"))
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    let outcome = agent
+        .send_trap(
+            &trap_oid,
+            0,
+            vec![VarBind::new(
+                oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+                Value::Counter64(12345),
+            )],
+        )
+        .await;
+
+    assert_eq!(outcome.len(), 1);
+    assert!(!outcome.all_succeeded());
+    assert_eq!(outcome.sinks()[0].dest, sink_addr);
+    assert!(matches!(
+        &outcome.sinks()[0].status,
+        SinkStatus::Failed(error)
+            if matches!(&**error, async_snmp::Error::Config(_))
+    ));
+}
+
+#[tokio::test]
+async fn agent_trap_reports_ordered_partial_success() {
+    let v1_receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let v2_receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let v1_addr = v1_receiver.local_addr();
+    let v2_addr = v2_receiver.local_addr();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink(v1_addr.to_string(), Auth::v1("public"))
+        .trap_sink(v2_addr.to_string(), Auth::v2c("public"))
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    let outcome = agent
+        .send_trap(
+            &trap_oid,
+            7,
+            vec![VarBind::new(
+                oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+                Value::Counter64(12345),
+            )],
+        )
+        .await;
+
+    assert_eq!(outcome.len(), 2);
+    assert!(!outcome.all_succeeded());
+    assert_eq!(outcome.sinks()[0].dest, v1_addr);
+    assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Failed(_)));
+    assert_eq!(outcome.sinks()[1].dest, v2_addr);
+    assert!(matches!(&outcome.sinks()[1].status, SinkStatus::Succeeded));
+
+    let (notification, _) = tokio::time::timeout(Duration::from_secs(5), v2_receiver.recv())
+        .await
+        .expect("timeout waiting for successful partial trap")
+        .unwrap();
+    assert_eq!(notification.uptime(), 7);
+    assert!(matches!(notification, Notification::TrapV2c { .. }));
+}
+
+#[tokio::test]
+async fn agent_v1_inform_is_explicitly_skipped() {
+    let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = receiver.local_addr();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink(sink_addr.to_string(), Auth::v1("public"))
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
+    let outcome = agent.send_inform(&trap_oid, 0, vec![]).await;
+
+    assert_eq!(outcome.len(), 1);
+    assert!(!outcome.is_empty());
+    assert!(!outcome.all_succeeded());
+    assert_eq!(outcome.failures().count(), 0);
+    assert_eq!(outcome.skipped().count(), 1);
+    assert_eq!(outcome.sinks()[0].dest, sink_addr);
+    assert!(matches!(
+        &outcome.sinks()[0].status,
+        SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
+    ));
+}
+
+#[tokio::test]
+async fn agent_best_effort_helpers_complete_after_failure_and_skip() {
+    let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink(receiver.local_addr().to_string(), Auth::v1("public"))
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    agent
+        .send_trap_best_effort(
+            &trap_oid,
+            0,
+            vec![VarBind::new(
+                oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+                Value::Counter64(12345),
+            )],
+        )
+        .await;
+    agent.send_inform_best_effort(&trap_oid, 0, vec![]).await;
 }
