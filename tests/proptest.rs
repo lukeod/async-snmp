@@ -64,36 +64,23 @@ impl SharedEnv {
 /// - arc2 can be any value when arc1 is 2 (but limited to avoid overflow)
 /// - BER encoding combines first two arcs as (arc1 * 40) + arc2, so single-arc
 ///   OIDs cannot round-trip (they become 2-arc OIDs on decode)
-/// - Empty OIDs and OIDs with >= 2 arcs round-trip correctly
+/// - Wire OIDs contain 2..=128 arcs
 fn arb_oid() -> impl Strategy<Value = Oid> {
-    prop_oneof![
-        // Empty OID
-        Just(Oid::empty()),
-        // OIDs with 2+ arcs (these round-trip correctly)
-        (0u32..=2, prop::collection::vec(any::<u32>(), 1..=19)).prop_filter_map(
-            "valid OID",
-            |(arc1, remaining_arcs)| {
-                let arc2 = if arc1 < 2 {
-                    // arc2 must be <= 39 when arc1 < 2
-                    remaining_arcs[0] % 40
-                } else {
-                    // arc1 == 2: arc2 can be large, but must not overflow
-                    // (arc1 * 40) + arc2 must fit in u32: arc2 <= u32::MAX - 80
-                    remaining_arcs[0] % (u32::MAX - 80)
-                };
+    (0u32..=2, prop::collection::vec(any::<u32>(), 1..=127)).prop_filter_map(
+        "wire-valid OID",
+        |(arc1, remaining_arcs)| {
+            let arc2 = if arc1 < 2 {
+                remaining_arcs[0] % 40
+            } else {
+                remaining_arcs[0] % (u32::MAX - 79)
+            };
 
-                let mut arcs = vec![arc1, arc2];
-                arcs.extend_from_slice(&remaining_arcs[1..]);
-
-                let oid = Oid::from_slice(&arcs);
-                if oid.validate().is_ok() {
-                    Some(oid)
-                } else {
-                    None
-                }
-            }
-        ),
-    ]
+            let mut arcs = vec![arc1, arc2];
+            arcs.extend_from_slice(&remaining_arcs[1..]);
+            let oid = Oid::from_slice(&arcs);
+            oid.validate_for_wire().is_ok().then_some(oid)
+        },
+    )
 }
 
 /// Strategy for generating valid OIDs under the test subtree (1.3.6.1.99).
@@ -426,7 +413,7 @@ proptest! {
 
     #[test]
     fn oid_ber_roundtrip(oid in arb_oid()) {
-        let encoded = oid.to_ber();
+        let encoded = oid.to_ber().unwrap();
         let decoded = Oid::from_ber(&encoded).expect("decode should succeed");
         prop_assert_eq!(oid, decoded, "OID round-trip failed");
     }
@@ -448,7 +435,7 @@ proptest! {
     #[test]
     fn value_ber_roundtrip(value in arb_value_with_exceptions()) {
         let mut buf = EncodeBuf::new();
-        value.encode(&mut buf);
+        value.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -464,7 +451,7 @@ proptest! {
     #[test]
     fn varbind_ber_roundtrip(varbind in arb_varbind()) {
         let mut buf = EncodeBuf::new();
-        varbind.encode(&mut buf);
+        varbind.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -480,7 +467,7 @@ proptest! {
     #[test]
     fn pdu_ber_roundtrip(pdu in arb_pdu()) {
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -496,7 +483,7 @@ proptest! {
     #[test]
     fn getbulk_pdu_ber_roundtrip(pdu in arb_getbulk_pdu()) {
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -511,7 +498,7 @@ proptest! {
     #[test]
     fn trap_v1_pdu_ber_roundtrip(pdu in arb_trap_v1_pdu()) {
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -599,29 +586,15 @@ proptest! {
 // =============================================================================
 
 #[test]
-fn oid_empty_roundtrip() {
-    let oid = Oid::empty();
-    let encoded = oid.to_ber();
-    assert!(encoded.is_empty());
-    let decoded = Oid::from_ber(&encoded).unwrap();
-    assert_eq!(oid, decoded);
+fn oid_empty_is_receive_only() {
+    assert!(Oid::empty().to_ber().is_err());
+    assert_eq!(Oid::from_ber(&[]).unwrap(), Oid::empty());
 }
 
 #[test]
-fn oid_single_arc_encoding_behavior() {
-    // Single-arc OIDs encode as arc1 * 40, which decodes to [arc1, 0].
-    // This is correct per X.690 Section 8.19 - BER always combines the first
-    // two arcs, so single-arc OIDs cannot be represented distinctly.
+fn oid_single_arc_encoding_is_rejected() {
     for arc1 in 0..=2 {
-        let oid = Oid::from_slice(&[arc1]);
-        let encoded = oid.to_ber();
-        let decoded = Oid::from_ber(&encoded).unwrap();
-        // Decoded OID should be [arc1, 0] since BER can't represent single arcs
-        let expected = Oid::from_slice(&[arc1, 0]);
-        assert_eq!(
-            decoded, expected,
-            "single arc {arc1} should decode to [{arc1}, 0]"
-        );
+        assert!(Oid::from_slice(&[arc1]).to_ber().is_err());
     }
 }
 
@@ -634,7 +607,7 @@ fn oid_two_arc_roundtrip() {
                 continue; // Invalid per X.690
             }
             let oid = Oid::from_slice(&[arc1, arc2]);
-            let encoded = oid.to_ber();
+            let encoded = oid.to_ber().unwrap();
             let decoded = Oid::from_ber(&encoded).unwrap();
             assert_eq!(oid, decoded, "arc1={arc1}, arc2={arc2} failed");
         }
@@ -647,14 +620,14 @@ fn oid_max_arc2_values() {
     // arc1=0, arc2=39 (max valid)
     let oid = Oid::from_slice(&[0, 39]);
     assert!(oid.validate().is_ok());
-    let encoded = oid.to_ber();
+    let encoded = oid.to_ber().unwrap();
     let decoded = Oid::from_ber(&encoded).unwrap();
     assert_eq!(oid, decoded);
 
     // arc1=1, arc2=39 (max valid)
     let oid = Oid::from_slice(&[1, 39]);
     assert!(oid.validate().is_ok());
-    let encoded = oid.to_ber();
+    let encoded = oid.to_ber().unwrap();
     let decoded = Oid::from_ber(&encoded).unwrap();
     assert_eq!(oid, decoded);
 
@@ -662,7 +635,7 @@ fn oid_max_arc2_values() {
     // Maximum safe arc2 when arc1=2: u32::MAX - 80
     let oid = Oid::from_slice(&[2, u32::MAX - 80]);
     assert!(oid.validate().is_ok());
-    let encoded = oid.to_ber();
+    let encoded = oid.to_ber().unwrap();
     let decoded = Oid::from_ber(&encoded).unwrap();
     assert_eq!(oid, decoded);
 }
@@ -738,7 +711,7 @@ fn value_all_variants_roundtrip() {
 
     for value in values {
         let mut buf = EncodeBuf::new();
-        value.encode(&mut buf);
+        value.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1152,7 +1125,7 @@ mod request_id_mismatch {
         );
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -1167,7 +1140,7 @@ mod request_id_mismatch {
         let pdu = make_response(-999, vec![]);
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -1182,7 +1155,7 @@ mod request_id_mismatch {
             let pdu = make_response(request_id, vec![]);
 
             let mut buf = EncodeBuf::new();
-            pdu.encode(&mut buf);
+            pdu.encode(&mut buf).unwrap();
             let encoded = buf.finish();
 
             let mut decoder = Decoder::new(encoded);

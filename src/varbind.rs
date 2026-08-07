@@ -32,11 +32,11 @@ impl VarBind {
     }
 
     /// Encode to BER.
-    pub fn encode(&self, buf: &mut EncodeBuf) {
-        buf.push_sequence(|buf| {
-            self.value.encode(buf);
-            buf.push_oid(&self.oid);
-        });
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        buf.try_push_sequence(|buf| {
+            self.value.encode(buf)?;
+            buf.push_oid(&self.oid)
+        })
     }
 
     /// Returns the exact encoded size of this `VarBind` in bytes.
@@ -80,13 +80,14 @@ impl std::fmt::Display for VarBind {
 ///
 /// Writes the `VarBind`s as a SEQUENCE of SEQUENCE elements, where each inner
 /// SEQUENCE contains an OID and its associated value.
-pub fn encode_varbind_list(buf: &mut EncodeBuf, varbinds: &[VarBind]) {
-    buf.push_sequence(|buf| {
+pub fn encode_varbind_list(buf: &mut EncodeBuf, varbinds: &[VarBind]) -> Result<()> {
+    buf.try_push_sequence(|buf| {
         // Encode in reverse order since we're using reverse buffer
         for vb in varbinds.iter().rev() {
-            vb.encode(buf);
+            vb.encode(buf)?;
         }
-    });
+        Ok(())
+    })
 }
 
 /// Decodes a BER-encoded `VarBind` list into a vector of `VarBind`s.
@@ -111,15 +112,16 @@ pub fn decode_varbind_list(decoder: &mut Decoder) -> Result<Vec<VarBind>> {
 ///
 /// Creates a `VarBind` list where each OID is paired with a NULL value,
 /// as required by SNMP GET, GETNEXT, and GETBULK request PDUs.
-pub fn encode_null_varbinds(buf: &mut EncodeBuf, oids: &[Oid]) {
-    buf.push_sequence(|buf| {
+pub fn encode_null_varbinds(buf: &mut EncodeBuf, oids: &[Oid]) -> Result<()> {
+    buf.try_push_sequence(|buf| {
         for oid in oids.iter().rev() {
-            buf.push_sequence(|buf| {
+            buf.try_push_sequence(|buf| {
                 buf.push_null();
-                buf.push_oid(oid);
-            });
+                buf.push_oid(oid)
+            })?;
         }
-    });
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -129,11 +131,22 @@ mod tests {
     use bytes::Bytes;
 
     #[test]
+    fn encode_rejects_invalid_oid() {
+        let mut buf = EncodeBuf::new();
+        let varbind = VarBind::null(Oid::empty());
+        assert!(matches!(
+            &*varbind.encode(&mut buf).unwrap_err(),
+            Error::InvalidOid(_)
+        ));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn test_varbind_roundtrip() {
         let vb = VarBind::new(oid!(1, 3, 6, 1), Value::Integer(42));
 
         let mut buf = EncodeBuf::new();
-        vb.encode(&mut buf);
+        vb.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -150,7 +163,7 @@ mod tests {
         ];
 
         let mut buf = EncodeBuf::new();
-        encode_varbind_list(&mut buf, &varbinds);
+        encode_varbind_list(&mut buf, &varbinds).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -168,7 +181,7 @@ mod tests {
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::NoSuchObject);
 
         let mut buf = EncodeBuf::new();
-        vb.encode(&mut buf);
+        vb.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -183,7 +196,7 @@ mod tests {
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::NoSuchInstance);
 
         let mut buf = EncodeBuf::new();
-        vb.encode(&mut buf);
+        vb.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -198,7 +211,7 @@ mod tests {
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::EndOfMibView);
 
         let mut buf = EncodeBuf::new();
-        vb.encode(&mut buf);
+        vb.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -259,7 +272,7 @@ mod tests {
         let varbinds: Vec<VarBind> = vec![];
 
         let mut buf = EncodeBuf::new();
-        encode_varbind_list(&mut buf, &varbinds);
+        encode_varbind_list(&mut buf, &varbinds).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -273,7 +286,7 @@ mod tests {
         let varbinds = vec![VarBind::new(oid!(1, 3, 6, 1), Value::Integer(42))];
 
         let mut buf = EncodeBuf::new();
-        encode_varbind_list(&mut buf, &varbinds);
+        encode_varbind_list(&mut buf, &varbinds).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -295,7 +308,7 @@ mod tests {
         ];
 
         let mut buf = EncodeBuf::new();
-        encode_varbind_list(&mut buf, &varbinds);
+        encode_varbind_list(&mut buf, &varbinds).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -317,7 +330,7 @@ mod tests {
         ];
 
         let mut buf = EncodeBuf::new();
-        encode_varbind_list(&mut buf, &varbinds);
+        encode_varbind_list(&mut buf, &varbinds).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -351,7 +364,7 @@ mod tests {
         ];
 
         let mut buf = EncodeBuf::new();
-        encode_varbind_list(&mut buf, &varbinds);
+        encode_varbind_list(&mut buf, &varbinds).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -369,7 +382,7 @@ mod tests {
         ];
 
         let mut buf = EncodeBuf::new();
-        encode_null_varbinds(&mut buf, &oids);
+        encode_null_varbinds(&mut buf, &oids).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -387,7 +400,7 @@ mod tests {
         let oids: Vec<Oid> = vec![];
 
         let mut buf = EncodeBuf::new();
-        encode_null_varbinds(&mut buf, &oids);
+        encode_null_varbinds(&mut buf, &oids).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -433,7 +446,7 @@ mod tests {
     /// Helper to verify `encoded_size()` matches actual encoding length
     fn verify_encoded_size(vb: &VarBind) {
         let mut buf = EncodeBuf::new();
-        vb.encode(&mut buf);
+        vb.encode(&mut buf).unwrap();
         let actual = buf.len();
         let computed = vb.encoded_size();
         assert_eq!(
@@ -556,7 +569,7 @@ mod tests {
             ) {
                 let vb = VarBind::new(oid, value);
                 let mut buf = EncodeBuf::new();
-                vb.encode(&mut buf);
+                vb.encode(&mut buf).unwrap();
                 prop_assert_eq!(
                     vb.encoded_size(),
                     buf.len(),

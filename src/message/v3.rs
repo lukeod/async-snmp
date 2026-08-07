@@ -289,19 +289,20 @@ impl ScopedPdu {
     }
 
     /// Encode to buffer.
-    pub fn encode(&self, buf: &mut EncodeBuf) {
-        buf.push_sequence(|buf| {
-            self.pdu.encode(buf);
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        buf.try_push_sequence(|buf| {
+            self.pdu.encode(buf)?;
             buf.push_octet_string(&self.context_name);
             buf.push_octet_string(&self.context_engine_id);
-        });
+            Ok(())
+        })
     }
 
     /// Encode to bytes.
-    pub fn encode_to_bytes(&self) -> Bytes {
+    pub fn encode_to_bytes(&self) -> Result<Bytes> {
         let mut buf = EncodeBuf::new();
-        self.encode(&mut buf);
-        buf.finish()
+        self.encode(&mut buf)?;
+        Ok(buf.finish())
     }
 
     /// Decode from decoder.
@@ -412,18 +413,14 @@ impl V3Message {
     /// 1. Encode with placeholder auth params (12 zero bytes for HMAC-96)
     /// 2. Compute HMAC over the entire encoded message
     /// 3. Replace the placeholder with the actual HMAC
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes> {
         let mut buf = EncodeBuf::new();
 
-        buf.push_sequence(|buf| {
+        buf.try_push_sequence(|buf| {
             // msgData
             match &self.data {
-                V3MessageData::Plaintext(scoped_pdu) => {
-                    scoped_pdu.encode(buf);
-                }
-                V3MessageData::Encrypted(ciphertext) => {
-                    buf.push_octet_string(ciphertext);
-                }
+                V3MessageData::Plaintext(scoped_pdu) => scoped_pdu.encode(buf)?,
+                V3MessageData::Encrypted(ciphertext) => buf.push_octet_string(ciphertext),
             }
 
             // msgSecurityParameters (as OCTET STRING)
@@ -434,9 +431,10 @@ impl V3Message {
 
             // version
             buf.push_integer(3);
-        });
+            Ok(())
+        })?;
 
-        buf.finish()
+        Ok(buf.finish())
     }
 
     /// Decode from BER.
@@ -662,6 +660,19 @@ mod tests {
     use super::*;
     use crate::oid;
 
+    #[test]
+    fn encode_rejects_invalid_oid() {
+        let pdu = Pdu::get_request(1, &[crate::oid::Oid::empty()]);
+        let scoped = ScopedPdu::with_empty_context(pdu);
+        let global =
+            MsgGlobalData::new(1, 65_507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, false));
+        let message = V3Message::new(global, Bytes::new(), scoped);
+        assert!(matches!(
+            &*message.encode().unwrap_err(),
+            Error::InvalidOid(_)
+        ));
+    }
+
     fn push_integer_content(buf: &mut EncodeBuf, content: &[u8]) {
         buf.push_bytes(content);
         buf.push_length(content.len());
@@ -752,7 +763,9 @@ mod tests {
             Bytes::new(),
             Pdu::get_request(42, &[]),
         );
-        let base = V3Message::new(global, usm.encode(), scoped).encode();
+        let base = V3Message::new(global, usm.encode(), scoped)
+            .encode()
+            .unwrap();
 
         let patch = |data: &Bytes, pattern: &[u8], off: usize, val: u8| -> Bytes {
             let mut b = data.to_vec();
@@ -821,7 +834,7 @@ mod tests {
 
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            scoped.encode(buf);
+            scoped.encode(buf).unwrap();
             buf.push_octet_string(&security_params);
             global.encode(buf);
             // 2^32 + 3 previously narrowed to the accepted v3 value.
@@ -843,7 +856,7 @@ mod tests {
         let scoped = ScopedPdu::new(b"eng".as_slice(), b"ctx".as_slice(), pdu);
         let msg = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
 
-        let raw = RawV3Message::decode(msg.encode()).unwrap();
+        let raw = RawV3Message::decode(msg.encode().unwrap()).unwrap();
         let RawMsgData::Plaintext(bytes) = raw.msg_data else {
             panic!("expected plaintext msgData");
         };
@@ -864,7 +877,7 @@ mod tests {
             Bytes::from_static(b"encrypted-data"),
         );
 
-        let raw = RawV3Message::decode(msg.encode()).unwrap();
+        let raw = RawV3Message::decode(msg.encode().unwrap()).unwrap();
         assert_eq!(raw.security_level(), SecurityLevel::AuthPriv);
         let RawMsgData::Encrypted(ciphertext) = raw.msg_data else {
             panic!("expected encrypted msgData");
@@ -883,7 +896,7 @@ mod tests {
             Bytes::from_static(b"usm"),
             ScopedPdu::with_empty_context(pdu),
         );
-        let mut bytes = msg.encode().to_vec();
+        let mut bytes = msg.encode().unwrap().to_vec();
         // Locate the single-byte msgFlags OCTET STRING (0x04 0x01 0x04) and
         // patch it to priv-without-auth (0x02).
         let pos = bytes
@@ -912,7 +925,7 @@ mod tests {
             Bytes::from_static(b"usm"),
             ScopedPdu::with_empty_context(pdu),
         );
-        let mut bytes = msg.encode().to_vec();
+        let mut bytes = msg.encode().unwrap().to_vec();
         let pos = bytes
             .windows(3)
             .position(|w| w == [0x04, 0x01, 0x01])
@@ -935,7 +948,7 @@ mod tests {
         let mut with_outer_field = EncodeBuf::new();
         with_outer_field.push_sequence(|buf| {
             buf.push_integer(99);
-            scoped.encode(buf);
+            scoped.encode(buf).unwrap();
             buf.push_octet_string(b"usm");
             global.encode(buf);
             buf.push_integer(3);
@@ -945,7 +958,7 @@ mod tests {
         // Encode an extra INTEGER inside msgGlobalData.
         let mut with_global_field = EncodeBuf::new();
         with_global_field.push_sequence(|buf| {
-            scoped.encode(buf);
+            scoped.encode(buf).unwrap();
             buf.push_octet_string(b"usm");
             buf.push_sequence(|buf| {
                 buf.push_integer(99);
@@ -960,7 +973,7 @@ mod tests {
 
         // Append another top-level TLV after an otherwise complete message.
         let message = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
-        let mut with_root_trailing = message.encode().to_vec();
+        let mut with_root_trailing = message.encode().unwrap().to_vec();
         with_root_trailing.extend_from_slice(&[0x05, 0]);
         assert!(RawV3Message::decode(Bytes::from(with_root_trailing)).is_err());
     }
@@ -990,7 +1003,7 @@ mod tests {
         let scoped = ScopedPdu::new(b"engine".as_slice(), b"ctx".as_slice(), pdu);
 
         let mut buf = EncodeBuf::new();
-        scoped.encode(&mut buf);
+        scoped.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -1007,7 +1020,7 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(99);
-            pdu.encode(buf);
+            pdu.encode(buf).unwrap();
             buf.push_octet_string(b"ctx");
             buf.push_octet_string(b"engine");
         });
@@ -1024,7 +1037,7 @@ mod tests {
         let scoped = ScopedPdu::with_empty_context(pdu);
         let msg = V3Message::new(global, Bytes::from_static(b"usm-params"), scoped);
 
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
         let decoded = V3Message::decode(encoded).unwrap();
 
         assert_eq!(decoded.global_data.msg_id, 100);
@@ -1044,7 +1057,7 @@ mod tests {
             Bytes::from_static(b"encrypted-data"),
         );
 
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
         let decoded = V3Message::decode(encoded).unwrap();
 
         assert_eq!(decoded.global_data.msg_id, 200);

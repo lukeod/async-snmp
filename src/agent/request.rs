@@ -82,7 +82,7 @@ impl Agent {
             Version::V3 => unreachable!("handle_community called with V3"),
         };
 
-        Ok(Some(response_msg.encode()))
+        Ok(Some(response_msg.encode()?))
     }
 
     /// Handle `SNMPv3` request.
@@ -298,7 +298,7 @@ mod tests {
             usm_params.encode(),
             Bytes::from_static(b"not-a-valid-ciphertext"),
         );
-        let mut msg_bytes = msg.encode().to_vec();
+        let mut msg_bytes = msg.encode().unwrap().to_vec();
         let (auth_offset, auth_len) =
             UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
         authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
@@ -331,7 +331,7 @@ mod tests {
             },
         );
         let msg = V3Message::new(global, usm_params.encode(), scoped);
-        msg.encode()
+        msg.encode().unwrap()
     }
 
     /// Build a noAuthNoPriv GetRequest whose scopedPDU carries an explicit
@@ -357,7 +357,7 @@ mod tests {
             },
         );
         let msg = V3Message::new(global, usm_params.encode(), scoped);
-        msg.encode()
+        msg.encode().unwrap()
     }
 
     /// RFC 3413 Section 3.2: a request whose scopedPDU contextEngineID names an

@@ -1,6 +1,10 @@
 //! Object Identifier (OID) type.
 //!
 //! OIDs are stored as `SmallVec<[u32; 16]>` to avoid heap allocation for common OIDs.
+//!
+//! `Oid` is a permissive tree and receive-side representation: empty or otherwise
+//! non-wire-valid values may exist in memory. Every outbound BER encoder validates
+//! OIDs and returns [`crate::Error::InvalidOid`] rather than emitting invalid bytes.
 
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
@@ -347,10 +351,9 @@ impl Oid {
         // A single-arc OID has no invertible BER encoding: X.690 8.19.4 packs the
         // first TWO components into one subidentifier (arc1*40 + arc2), so encoding
         // `[n]` produces subidentifier n*40, which decodes back to `[n, 0]`. This
-        // check only guards the validated paths (`validate()`/`to_ber_checked()`);
-        // the raw encode path (`to_ber()`/`VarBind` encoding) does not validate and
-        // will still emit the non-round-tripping form. Decoding never yields a
-        // single-arc OID (it always pushes two arcs, or zero for empty).
+        // check guards every public and structured outbound encode path.
+        // Decoding never yields a single-arc OID (it always pushes two arcs, or
+        // zero for empty).
         if self.arcs.len() == 1 {
             return Err(Error::InvalidOid(
                 "OID must have at least two arcs to be BER-encodable".into(),
@@ -432,6 +435,20 @@ impl Oid {
         self.validate_length()
     }
 
+    /// Validate that this OID can be emitted as an SNMP OBJECT IDENTIFIER.
+    ///
+    /// Empty OIDs remain useful as receive-side compatibility values and tree
+    /// prefixes, but are not valid outbound OBJECT IDENTIFIER values.
+    pub fn validate_for_wire(&self) -> Result<()> {
+        if self.arcs.is_empty() {
+            return Err(Error::InvalidOid(
+                "cannot BER-encode an empty OID (no subidentifiers)".into(),
+            )
+            .boxed());
+        }
+        self.validate_all()
+    }
+
     /// Encode to BER format, returning bytes in a stack-allocated buffer.
     ///
     /// Uses `SmallVec` to avoid heap allocation for OIDs with up to ~20 arcs.
@@ -459,28 +476,14 @@ impl Oid {
         bytes
     }
 
-    /// Encode to BER format.
+    /// Encode to BER content bytes after enforcing outbound wire validity.
     ///
-    /// OID encoding (X.690 Section 8.19):
-    /// - First two arcs encoded as (arc1 * 40) + arc2 using base-128
-    /// - Remaining arcs encoded as base-128 variable length
-    ///
-    /// # Empty OID Encoding
-    ///
-    /// Empty OIDs are encoded as zero bytes (empty content). Note that net-snmp
-    /// encodes empty OIDs as `[0x00]` (single zero byte). This difference is
-    /// unlikely to matter in practice since empty OIDs are rarely used in SNMP.
-    ///
-    /// # Validation
-    ///
-    /// This method does not validate arc constraints. Use [`to_ber_checked()`](Self::to_ber_checked)
-    /// for validation, or call [`validate()`](Self::validate) first. If the first two arcs combine
-    /// (`arc1 * 40 + arc2`) to a value exceeding `u32::MAX`, this method saturates that
-    /// subidentifier to `u32::MAX` rather than panicking or wrapping; such an OID is invalid and
-    /// is rejected by `validate()`/`to_ber_checked()`.
-    #[must_use]
-    pub fn to_ber(&self) -> Vec<u8> {
-        self.to_ber_smallvec().to_vec()
+    /// `Oid` itself remains permissive for receive-side compatibility and tree
+    /// operations. Encoding rejects empty, malformed, overlength, and
+    /// non-round-trippable values.
+    pub fn to_ber(&self) -> Result<Vec<u8>> {
+        self.validate_for_wire()?;
+        Ok(self.to_ber_smallvec().to_vec())
     }
 
     /// Encode to BER format with validation.
@@ -500,14 +503,7 @@ impl Oid {
     ///
     /// Returns an error if any of the above hold.
     pub fn to_ber_checked(&self) -> Result<Vec<u8>> {
-        if self.arcs.is_empty() {
-            return Err(Error::InvalidOid(
-                "cannot BER-encode an empty OID (no subidentifiers)".into(),
-            )
-            .boxed());
-        }
-        self.validate_all()?;
-        Ok(self.to_ber())
+        self.to_ber()
     }
 
     /// Returns the BER content size (excluding tag and length bytes).
@@ -591,13 +587,8 @@ impl Oid {
 /// Per X.690 Section 8.19: the first two arcs are encoded as `arc1 * 40 + arc2`.
 /// If there is only one arc, it is encoded as `arc1 * 40`.
 ///
-/// Uses saturating arithmetic: for every OID that passes [`Oid::validate()`], the
-/// combined value fits in `u32` and no saturation occurs, so this is byte-identical
-/// to unchecked arithmetic on all valid input. An OID with a first subidentifier
-/// that would exceed `u32::MAX` is not representable in this crate's decode model
-/// (see [`decode_subidentifier`]) and is rejected by `validate()`/`to_ber_checked()`;
-/// saturating here only prevents the unchecked [`Oid::to_ber()`] path from panicking
-/// (debug) or wrapping (release) on such an out-of-range OID.
+/// Uses saturating arithmetic defensively. All production callers validate via
+/// [`Oid::validate_for_wire`] before reaching this internal arithmetic helper.
 #[inline]
 fn first_subidentifier(arcs: &SmallVec<[u32; 16]>) -> u32 {
     if arcs.len() >= 2 {
@@ -864,7 +855,7 @@ mod tests {
     #[test]
     fn test_ber_roundtrip() {
         let oid = Oid::parse("1.3.6.1.2.1.1.1.0").unwrap();
-        let ber = oid.to_ber();
+        let ber = oid.to_ber().unwrap();
         let decoded = Oid::from_ber(&ber).unwrap();
         assert_eq!(oid, decoded);
     }
@@ -873,7 +864,7 @@ mod tests {
     fn test_ber_encoding() {
         // 1.3.6.1 encodes as: (1*40+3)=43, 6, 1 = [0x2B, 0x06, 0x01]
         let oid = Oid::parse("1.3.6.1").unwrap();
-        assert_eq!(oid.to_ber(), vec![0x2B, 0x06, 0x01]);
+        assert_eq!(oid.to_ber().unwrap(), vec![0x2B, 0x06, 0x01]);
     }
 
     #[test]
@@ -1014,7 +1005,7 @@ mod tests {
         // OID 2.999.3: first subid = 2*40 + 999 = 1079 = 0x437
         // 1079 in base-128: 0x88 0x37 (continuation bit set on first byte)
         let oid = Oid::from_slice(&[2, 999, 3]);
-        let ber = oid.to_ber();
+        let ber = oid.to_ber().unwrap();
         // First subidentifier 1079 = 0b10000110111 = 7 bits: 0b0110111 (0x37), 7 bits: 0b0001000 (0x08)
         // In base-128: (1079 >> 7) = 8, (1079 & 0x7F) = 55
         // So: 0x88 (8 | 0x80), 0x37 (55)
@@ -1034,7 +1025,7 @@ mod tests {
     fn test_ber_roundtrip_large_arc2() {
         // Ensure roundtrip works for OID with large arc2
         let oid = Oid::from_slice(&[2, 999, 3]);
-        let ber = oid.to_ber();
+        let ber = oid.to_ber().unwrap();
         let decoded = Oid::from_ber(&ber).unwrap();
         assert_eq!(oid, decoded, "roundtrip should preserve OID 2.999.3");
     }
@@ -1043,7 +1034,7 @@ mod tests {
     fn test_ber_encoding_arc2_equals_80() {
         // Edge case: arc1=2, arc2=0 gives first subid = 80, which is exactly 1 byte
         let oid = Oid::from_slice(&[2, 0]);
-        let ber = oid.to_ber();
+        let ber = oid.to_ber().unwrap();
         assert_eq!(ber, vec![80], "OID 2.0 should encode to [80]");
     }
 
@@ -1051,7 +1042,7 @@ mod tests {
     fn test_ber_encoding_arc2_equals_127() {
         // arc1=2, arc2=47 gives first subid = 127, still fits in 1 byte
         let oid = Oid::from_slice(&[2, 47]);
-        let ber = oid.to_ber();
+        let ber = oid.to_ber().unwrap();
         assert_eq!(ber, vec![127], "OID 2.47 should encode to [127]");
     }
 
@@ -1059,7 +1050,7 @@ mod tests {
     fn test_ber_encoding_arc2_equals_128_needs_2_bytes() {
         // arc1=2, arc2=48 gives first subid = 128, needs 2 bytes in base-128
         let oid = Oid::from_slice(&[2, 48]);
-        let ber = oid.to_ber();
+        let ber = oid.to_ber().unwrap();
         // 128 = 0x80 = base-128: 0x81 0x00
         assert_eq!(
             ber,
@@ -1335,31 +1326,11 @@ mod tests {
     }
 
     #[test]
-    fn to_ber_saturates_first_subidentifier_instead_of_overflowing() {
-        // arc1=2, arc2=u32::MAX: arc1*40 + arc2 overflows u32. The unchecked
-        // encode path must saturate rather than panic (debug) or wrap (release).
+    fn to_ber_rejects_first_subidentifier_overflow() {
         let oid = Oid::from_slice(&[2, u32::MAX]);
-
-        // Checked path still rejects this OID.
         assert!(oid.validate().is_err());
+        assert!(oid.to_ber().is_err());
         assert!(oid.to_ber_checked().is_err());
-
-        // Unchecked path must not panic and must be deterministic.
-        let bytes1 = oid.to_ber();
-        let bytes2 = oid.to_ber();
-        assert_eq!(bytes1, bytes2);
-        assert!(!bytes1.is_empty());
-
-        // Saturated first subidentifier is u32::MAX, encoded as the sole arc.
-        let expected = {
-            let mut v = SmallVec::<[u8; 64]>::new();
-            encode_subidentifier_smallvec(&mut v, u32::MAX);
-            v.to_vec()
-        };
-        assert_eq!(bytes1, expected);
-
-        // ber_content_size/ber_encoded_size stay self-consistent.
-        assert_eq!(oid.to_ber().len(), oid.ber_content_size());
     }
 
     #[test]
@@ -1367,6 +1338,6 @@ mod tests {
         // Control: a valid OID's encoding is unaffected by the saturating change.
         let oid = Oid::parse("1.3.6.1.2.1").unwrap();
         assert!(oid.validate().is_ok());
-        assert_eq!(oid.to_ber(), vec![0x2b, 0x06, 0x01, 0x02, 0x01]);
+        assert_eq!(oid.to_ber().unwrap(), vec![0x2b, 0x06, 0x01, 0x02, 0x01]);
     }
 }

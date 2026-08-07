@@ -223,7 +223,7 @@ impl Pdu {
     }
 
     /// Encode to BER.
-    pub fn encode(&self, buf: &mut EncodeBuf) {
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         // The SNMPv1 Trap PDU has a distinct wire layout and must be encoded via
         // `TrapV1Pdu::encode`; the generic layout here is not round-trippable for it.
         debug_assert!(
@@ -244,12 +244,13 @@ impl Pdu {
             (self.error_status, self.error_index)
         };
 
-        buf.push_constructed(self.pdu_type.tag(), |buf| {
-            encode_varbind_list(buf, &self.varbinds);
+        buf.try_push_constructed(self.pdu_type.tag(), |buf| {
+            encode_varbind_list(buf, &self.varbinds)?;
             buf.push_integer(error_index);
             buf.push_integer(error_status);
             buf.push_integer(self.request_id);
-        });
+            Ok(())
+        })
     }
 
     /// Decode from BER (after tag has been peeked).
@@ -720,9 +721,9 @@ impl TrapV1Pdu {
     }
 
     /// Encode to BER.
-    pub fn encode(&self, buf: &mut EncodeBuf) {
-        buf.push_constructed(tag::pdu::TRAP_V1, |buf| {
-            encode_varbind_list(buf, &self.varbinds);
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        buf.try_push_constructed(tag::pdu::TRAP_V1, |buf| {
+            encode_varbind_list(buf, &self.varbinds)?;
             buf.push_unsigned32(tag::application::TIMETICKS, self.time_stamp);
             buf.push_integer(self.specific_trap);
             buf.push_integer(self.generic_trap.as_i32());
@@ -731,8 +732,8 @@ impl TrapV1Pdu {
             buf.push_bytes(&self.agent_addr);
             buf.push_length(4);
             buf.push_tag(tag::application::IP_ADDRESS);
-            buf.push_oid(&self.enterprise);
-        });
+            buf.push_oid(&self.enterprise)
+        })
     }
 
     /// Decode from BER (after tag has been peeked).
@@ -831,15 +832,16 @@ impl GetBulkPdu {
     }
 
     /// Encode to BER.
-    pub fn encode(&self, buf: &mut EncodeBuf) {
-        buf.push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
-            encode_varbind_list(buf, &self.varbinds);
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        buf.try_push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
+            encode_varbind_list(buf, &self.varbinds)?;
             // Clamp the RFC 3416 (0..2147483647) fields via the shared
             // choke point so neither GETBULK encode path emits a negative.
             buf.push_integer(clamp_bulk_field(self.max_repetitions));
             buf.push_integer(clamp_bulk_field(self.non_repeaters));
             buf.push_integer(self.request_id);
-        });
+            Ok(())
+        })
     }
 
     /// Decode from BER.
@@ -905,7 +907,7 @@ mod tests {
         fn encode(&self) -> bytes::Bytes {
             let mut buf = EncodeBuf::new();
             buf.push_constructed(self.pdu_type, |buf| {
-                encode_varbind_list(buf, &self.varbinds);
+                encode_varbind_list(buf, &self.varbinds).unwrap();
                 buf.push_integer(self.error_index);
                 buf.push_integer(self.error_status);
                 buf.push_integer(self.request_id);
@@ -940,7 +942,7 @@ mod tests {
         fn encode(&self) -> bytes::Bytes {
             let mut buf = EncodeBuf::new();
             buf.push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
-                encode_varbind_list(buf, &self.varbinds);
+                encode_varbind_list(buf, &self.varbinds).unwrap();
                 buf.push_integer(self.max_repetitions);
                 buf.push_integer(self.non_repeaters);
                 buf.push_integer(self.request_id);
@@ -954,7 +956,7 @@ mod tests {
         let pdu = Pdu::get_request(12345, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -970,7 +972,7 @@ mod tests {
         let pdu = GetBulkPdu::new(12345, 0, 10, &[oid!(1, 3, 6, 1, 2, 1, 1)]);
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -999,7 +1001,7 @@ mod tests {
         );
 
         let mut buf = EncodeBuf::new();
-        trap.encode(&mut buf);
+        trap.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1027,7 +1029,7 @@ mod tests {
             vec![],
         );
         let mut buf = EncodeBuf::new();
-        trap.encode(&mut buf);
+        trap.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1053,7 +1055,7 @@ mod tests {
         assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
 
         let mut buf = EncodeBuf::new();
-        trap.encode(&mut buf);
+        trap.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1327,7 +1329,7 @@ mod tests {
         let pdu = GetBulkPdu::new(1, -1, -5, &[oid!(1, 3, 6, 1)]);
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1346,7 +1348,7 @@ mod tests {
         let pdu = GetBulkPdu::new(1, 0, 10, &[oid!(1, 3, 6, 1)]);
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1367,7 +1369,7 @@ mod tests {
         assert_eq!(pdu.error_index, 0);
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1392,7 +1394,7 @@ mod tests {
         };
 
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf);
+        pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         // Read the raw wire integers directly rather than via GetBulkPdu::decode,

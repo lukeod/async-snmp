@@ -315,7 +315,8 @@ async fn v3_discovery_rejects_trailing_usm_security_parameter_data() {
                 )],
             },
         )
-        .encode_to_bytes();
+        .encode_to_bytes()
+        .unwrap();
         Ok(raw_ber::v3_message(
             &raw_ber::signed_integer_content(request.global_data.msg_id),
             &raw_ber::signed_integer_content(reply_engine.msg_max_size),
@@ -2497,7 +2498,7 @@ async fn v3_custom_transport_accepts_matching_ids_and_context() {
 
 #[tokio::test]
 async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
-    let request = V3Message::discovery_request(41).encode();
+    let request = V3Message::discovery_request(41).encode().unwrap();
     let expected = Bytes::from_static(b"arbitrary response bytes");
     let transport = ScriptedTransport::new(
         TestV3Engine::new(Bytes::from_static(ENGINE_ID)),
@@ -2523,7 +2524,7 @@ async fn report_builder_uses_reporting_engine_context() {
     let expected_engine_id = engine.engine_id.clone();
     let transport =
         ScriptedTransport::new(engine.clone(), vec![discovery_step(engine)], 100, false);
-    let request = V3Message::discovery_request(41).encode();
+    let request = V3Message::discovery_request(41).encode().unwrap();
 
     let (response, _) = Transport::request(&transport, &request, 41).await.unwrap();
     let response = V3Message::decode(response).unwrap();
@@ -2537,7 +2538,7 @@ async fn report_builder_uses_reporting_engine_context() {
 
 #[test]
 fn raw_ber_targets_invalid_flags_and_oversized_msg_ids() {
-    let original = V3Message::discovery_request(7).encode().to_vec();
+    let original = V3Message::discovery_request(7).encode().unwrap().to_vec();
     let mut message = original.clone();
     raw_ber::patch_msg_flags(&mut message, 0x82).unwrap();
 

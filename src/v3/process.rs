@@ -416,7 +416,9 @@ mod tests {
             Bytes::new(),
             Pdu::get_request(42, &[]),
         );
-        V3Message::new(global, usm.encode(), scoped).encode()
+        V3Message::new(global, usm.encode(), scoped)
+            .encode()
+            .unwrap()
     }
 
     /// Patch the first occurrence of `pattern` in `data` at `offset` within
@@ -500,7 +502,7 @@ mod tests {
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
-        let data = V3Message::discovery_request(5).encode();
+        let data = V3Message::discovery_request(5).encode().unwrap();
         let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
 
         let V3Inbound::Failed { failure, report } = outcome else {

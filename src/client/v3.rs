@@ -3,7 +3,7 @@
 //! This module contains V3 security configuration, key derivation, engine discovery,
 //! and V3 message building/handling.
 
-use crate::ber::Decoder;
+use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::{AuthErrorKind, CryptoErrorKind};
 use crate::error::{Error, Result};
 use crate::format::hex;
@@ -167,7 +167,7 @@ impl<T: Transport> Client<T> {
 
             let msg_id = self.next_request_id();
             let discovery_msg = V3Message::discovery_request(msg_id);
-            let discovery_data = discovery_msg.encode();
+            let discovery_data = discovery_msg.encode()?;
 
             self.inner
                 .transport
@@ -600,7 +600,12 @@ impl<T: Transport> Client<T> {
     pub(super) async fn send_v3_and_recv(&self, pdu: Pdu) -> Result<Pdu> {
         let start = Instant::now();
 
-        // Ensure engine is discovered first
+        // Validate the caller's structured PDU before engine discovery, which
+        // may perform network I/O. The PDU is encoded again after discovery
+        // once the authoritative engine details are available.
+        let mut validation_buf = EncodeBuf::new();
+        pdu.encode(&mut validation_buf)?;
+
         self.ensure_engine_discovered().await?;
 
         let security = self
@@ -1393,7 +1398,9 @@ mod tests {
         let usm = UsmSecurityParams::new(Bytes::copy_from_slice(engine_id), 1, 100, Bytes::new());
         let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), report_pdu);
 
-        V3Message::new(global, usm.encode(), scoped).encode()
+        V3Message::new(global, usm.encode(), scoped)
+            .encode()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1648,12 +1655,12 @@ mod response_validation_tests {
         let msg = V3Message::new(global, usm.encode(), scoped);
         match auth_key {
             Some(key) => {
-                let mut bytes = msg.encode().to_vec();
+                let mut bytes = msg.encode().unwrap().to_vec();
                 let (offset, len) = UsmSecurityParams::find_auth_params_offset(&bytes).unwrap();
                 authenticate_message(&key, &mut bytes, offset, len).unwrap();
                 Bytes::from(bytes)
             }
-            None => msg.encode(),
+            None => msg.encode().unwrap(),
         }
     }
 
@@ -1726,6 +1733,7 @@ mod response_validation_tests {
         );
         let mut response = V3Message::new(global, usm.encode(), scoped)
             .encode()
+            .unwrap()
             .to_vec();
         if let Some(key) = auth_key {
             let (offset, len) = UsmSecurityParams::find_auth_params_offset(&response).unwrap();

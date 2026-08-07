@@ -742,7 +742,7 @@ mod tests {
     fn response_packet(request_id: i32) -> Bytes {
         let pdu = crate::pdu::Pdu::get_request(request_id, &[]).to_response();
         let msg = crate::message::CommunityMessage::v2c(b"public".as_slice(), pdu);
-        msg.encode()
+        msg.encode().unwrap()
     }
 
     // T9 (RFC 3417 3.1): a response whose datagram source differs from the

@@ -5,6 +5,7 @@
 
 use super::length::encode_length;
 use super::tag;
+use crate::error::Result;
 use bytes::Bytes;
 
 /// Buffer for BER encoding that writes backwards.
@@ -80,12 +81,36 @@ impl EncodeBuf {
         self.push_tag(tag);
     }
 
+    /// Encode a constructed type with rollback if nested encoding fails.
+    pub fn try_push_constructed<F>(&mut self, tag: u8, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        let start_len = self.len();
+        if let Err(error) = f(self) {
+            self.buf.truncate(start_len);
+            return Err(error);
+        }
+        let content_len = self.len() - start_len;
+        self.push_length(content_len);
+        self.push_tag(tag);
+        Ok(())
+    }
+
     /// Encode a SEQUENCE.
     pub fn push_sequence<F>(&mut self, f: F)
     where
         F: FnOnce(&mut Self),
     {
         self.push_constructed(tag::universal::SEQUENCE, f);
+    }
+
+    /// Encode a SEQUENCE with rollback if nested encoding fails.
+    pub fn try_push_sequence<F>(&mut self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        self.try_push_constructed(tag::universal::SEQUENCE, f)
     }
 
     /// Encode an INTEGER.
@@ -128,12 +153,16 @@ impl EncodeBuf {
         self.push_tag(tag::universal::NULL);
     }
 
-    /// Encode an OBJECT IDENTIFIER.
-    pub fn push_oid(&mut self, oid: &crate::oid::Oid) {
+    /// Encode a wire-valid OBJECT IDENTIFIER.
+    ///
+    /// Validation occurs before the buffer is modified.
+    pub fn push_oid(&mut self, oid: &crate::oid::Oid) -> Result<()> {
+        oid.validate_for_wire()?;
         let ber = oid.to_ber_smallvec();
         self.push_bytes(&ber);
         self.push_length(ber.len());
         self.push_tag(tag::universal::OBJECT_IDENTIFIER);
+        Ok(())
     }
 
     /// Encode an IP address.
@@ -317,5 +346,40 @@ mod tests {
             &bytes[..],
             &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]
         );
+    }
+
+    #[test]
+    fn push_oid_rejects_invalid_oids() {
+        let invalid = [
+            crate::oid::Oid::empty(),
+            crate::oid::Oid::from_slice(&[1]),
+            crate::oid::Oid::new(std::iter::repeat_n(1, crate::oid::MAX_OID_LEN + 1)),
+            crate::oid::Oid::from_slice(&[3, 0]),
+            crate::oid::Oid::from_slice(&[0, 40]),
+            crate::oid::Oid::from_slice(&[1, 40]),
+            crate::oid::Oid::from_slice(&[2, u32::MAX]),
+        ];
+
+        for oid in invalid {
+            let mut buf = EncodeBuf::new();
+            assert!(matches!(
+                &*buf.push_oid(&oid).unwrap_err(),
+                crate::Error::InvalidOid(_)
+            ));
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn fallible_constructed_encoding_rolls_back() {
+        let mut buf = EncodeBuf::new();
+        buf.push_integer(7);
+        let original_len = buf.len();
+        let result = buf.try_push_sequence(|buf| {
+            buf.push_null();
+            buf.push_oid(&crate::oid::Oid::empty())
+        });
+        assert!(result.is_err());
+        assert_eq!(buf.len(), original_len);
     }
 }

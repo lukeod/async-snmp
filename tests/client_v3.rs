@@ -467,7 +467,9 @@ fn build_raw_v3_get(engine_id: Bytes, username: Bytes) -> Bytes {
     };
     let scoped = ScopedPdu::with_empty_context(pdu);
     let global = MsgGlobalData::new(1, 65507, MsgFlags::new(SecurityLevel::NoAuthNoPriv, true));
-    V3Message::new(global, usm.encode(), scoped).encode()
+    V3Message::new(global, usm.encode(), scoped)
+        .encode()
+        .unwrap()
 }
 
 /// Send a raw UDP packet to addr and return the response bytes.

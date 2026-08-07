@@ -317,7 +317,7 @@ fn bench_request_overhead(c: &mut Criterion) {
         )),
     )];
     let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), response_pdu);
-    let encoded = msg.encode();
+    let encoded = msg.encode().unwrap();
 
     group.bench_function("decode_get_response", |b| {
         b.iter(|| {

@@ -33,7 +33,7 @@ fn bench_oid_encode(c: &mut Criterion) {
 
     for (name, oid) in common_oids() {
         group.bench_with_input(BenchmarkId::new("to_ber", name), &oid, |b, oid| {
-            b.iter(|| black_box(oid.to_ber()));
+            b.iter(|| black_box(oid.to_ber().unwrap()));
         });
     }
 
@@ -45,7 +45,7 @@ fn bench_oid_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("oid_decode");
 
     for (name, oid) in common_oids() {
-        let encoded = oid.to_ber();
+        let encoded = oid.to_ber().unwrap();
         group.bench_with_input(BenchmarkId::new("from_ber", name), &encoded, |b, data| {
             b.iter(|| black_box(Oid::from_ber(data).unwrap()));
         });
@@ -112,7 +112,7 @@ fn bench_value_encode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("encode", name), value, |b, value| {
             b.iter(|| {
                 let mut buf = EncodeBuf::new();
-                value.encode(&mut buf);
+                value.encode(&mut buf).unwrap();
                 black_box(buf.finish())
             });
         });
@@ -149,7 +149,7 @@ fn bench_value_decode(c: &mut Criterion) {
 
     for (name, value) in &values {
         let mut buf = EncodeBuf::new();
-        value.encode(&mut buf);
+        value.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         group.bench_with_input(BenchmarkId::new("decode", name), &encoded, |b, data| {
@@ -197,7 +197,7 @@ fn bench_varbind_encode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("encode", name), vb, |b, vb| {
             b.iter(|| {
                 let mut buf = EncodeBuf::new();
-                vb.encode(&mut buf);
+                vb.encode(&mut buf).unwrap();
                 black_box(buf.finish())
             });
         });
@@ -238,7 +238,7 @@ fn bench_varbind_decode(c: &mut Criterion) {
 
     for (name, vb) in &varbinds {
         let mut buf = EncodeBuf::new();
-        vb.encode(&mut buf);
+        vb.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         group.bench_with_input(BenchmarkId::new("decode", name), &encoded, |b, data| {
@@ -287,7 +287,7 @@ fn bench_encode_buf(c: &mut Criterion) {
         b.iter(|| {
             let mut buf = EncodeBuf::new();
             for vb in &varbinds {
-                vb.encode(&mut buf);
+                vb.encode(&mut buf).unwrap();
             }
             black_box(buf.finish())
         });
@@ -307,7 +307,7 @@ fn bench_encode_buf(c: &mut Criterion) {
         b.iter(|| {
             let mut buf = EncodeBuf::new();
             for vb in &many_varbinds {
-                vb.encode(&mut buf);
+                vb.encode(&mut buf).unwrap();
             }
             black_box(buf.finish())
         });
@@ -377,7 +377,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
     pdu.varbinds = varbinds;
 
     let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu);
-    let encoded = msg.encode();
+    let encoded = msg.encode().unwrap();
 
     group.throughput(Throughput::Bytes(encoded.len() as u64));
     group.bench_function("v2c_response_3_varbinds", |b| {
@@ -402,7 +402,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
     pdu.varbinds = many_varbinds;
 
     let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu);
-    let encoded_large = msg.encode();
+    let encoded_large = msg.encode().unwrap();
 
     group.throughput(Throughput::Bytes(encoded_large.len() as u64));
     group.bench_function("v2c_response_10_varbinds", |b| {

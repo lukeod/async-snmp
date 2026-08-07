@@ -90,7 +90,7 @@ impl super::NotificationReceiver {
                 // Send response
                 let response = pdu.to_response();
                 let response_msg = CommunityMessage::v2c(msg.community.clone(), response);
-                let response_bytes = response_msg.encode();
+                let response_bytes = response_msg.encode()?;
 
                 self.inner
                     .socket

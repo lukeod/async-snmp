@@ -382,7 +382,7 @@ impl V3ReplyBuilder {
                 .ok_or_else(|| "no privacy key configured for encrypted reply".to_string())?;
             let (ciphertext, priv_params) = priv_key
                 .encrypt(
-                    &scoped.encode_to_bytes(),
+                    &scoped.encode_to_bytes().unwrap(),
                     self.engine_boots,
                     self.engine_time,
                     Some(&self.salt),
@@ -407,7 +407,7 @@ impl V3ReplyBuilder {
             V3Message::new(global, usm.encode(), scoped)
         };
 
-        let mut encoded = message.encode().to_vec();
+        let mut encoded = message.encode().unwrap().to_vec();
         if let Some(flags) = self.raw_msg_flags {
             raw_ber::patch_msg_flags(&mut encoded, flags)?;
         }

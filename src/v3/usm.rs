@@ -323,7 +323,7 @@ mod tests {
         let scoped = ScopedPdu::with_empty_context(pdu);
         let msg = V3Message::new(global, usm_params.encode(), scoped);
 
-        let encoded = msg.encode();
+        let encoded = msg.encode().unwrap();
 
         // Find the auth params offset
         let (offset, len) = UsmSecurityParams::find_auth_params_offset(&encoded).unwrap();
@@ -490,7 +490,7 @@ mod tests {
         let pdu = Pdu::get_request(1, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
         let scoped = ScopedPdu::with_empty_context(pdu);
         let msg = V3Message::new(global, usm_params.encode(), scoped);
-        let encoded_bytes = msg.encode();
+        let encoded_bytes = msg.encode().unwrap();
         let mut encoded: Vec<u8> = encoded_bytes.to_vec();
 
         // Locate the real auth params offset so we can corrupt its length byte

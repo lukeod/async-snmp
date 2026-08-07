@@ -409,9 +409,9 @@ impl super::Agent {
                     false, // reportable=false for traps
                     crate::v3::DEFAULT_MSG_MAX_SIZE,
                 )?;
-                Bytes::from(encoded)
+                Ok(Bytes::from(encoded))
             }
-        };
+        }?;
 
         tracing::debug!(target: "async_snmp::agent", { snmp.dest = %sink.dest, snmp.bytes = data.len() }, "sending trap");
         self.inner

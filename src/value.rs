@@ -989,12 +989,12 @@ impl Value {
     }
 
     /// Encode to BER.
-    pub fn encode(&self, buf: &mut EncodeBuf) {
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         match self {
             Value::Integer(v) => buf.push_integer(*v),
             Value::OctetString(data) => buf.push_octet_string(data),
             Value::Null => buf.push_null(),
-            Value::ObjectIdentifier(oid) => buf.push_oid(oid),
+            Value::ObjectIdentifier(oid) => buf.push_oid(oid)?,
             Value::IpAddress(addr) => buf.push_ip_address(*addr),
             Value::Counter32(v) => buf.push_unsigned32(tag::application::COUNTER32, *v),
             Value::Gauge32(v) => buf.push_unsigned32(tag::application::GAUGE32, *v),
@@ -1029,6 +1029,7 @@ impl Value {
                 buf.push_tag(*t);
             }
         }
+        Ok(())
     }
 
     /// Decode from BER.
@@ -1347,7 +1348,7 @@ mod tests {
 
     fn roundtrip(value: &Value) -> Value {
         let mut buf = EncodeBuf::new();
-        value.encode(&mut buf);
+        value.encode(&mut buf).unwrap();
         let data = buf.finish();
         let mut decoder = Decoder::new(data);
         Value::decode(&mut decoder).unwrap()
@@ -1566,7 +1567,7 @@ mod tests {
         let value = Value::decode(&mut decoder).unwrap();
         assert_eq!(value, Value::Nsap(Bytes::from_static(&[0x01, 0x02, 0x03])));
         let mut buf = EncodeBuf::new();
-        value.encode(&mut buf);
+        value.encode(&mut buf).unwrap();
         assert_eq!(&buf.finish()[..], &bytes[..]);
     }
 
@@ -1578,7 +1579,7 @@ mod tests {
         let value = Value::decode(&mut decoder).unwrap();
         assert_eq!(value, Value::UInteger32(42));
         let mut buf = EncodeBuf::new();
-        value.encode(&mut buf);
+        value.encode(&mut buf).unwrap();
         assert_eq!(&buf.finish()[..], &bytes[..]);
     }
 

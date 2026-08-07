@@ -831,7 +831,7 @@ mod tests {
                 };
 
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
-                Ok((msg.encode(), peer))
+                Ok((msg.encode().unwrap(), peer))
             }
         }
 
@@ -1005,7 +1005,7 @@ mod tests {
                     },
                 };
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
-                Ok((msg.encode(), peer))
+                Ok((msg.encode().unwrap(), peer))
             }
         }
 

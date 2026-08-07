@@ -26,7 +26,7 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 - **Automatic tooBig recovery**: GET/GETNEXT batches are automatically bisected when an agent returns a tooBig error
 - **Multiple transports**: UDP (per-client or shared), TCP
 - **Zero-copy decoding**: Minimal allocations using `bytes` crate
-- **Type-safe**: Compile-time OID validation with `oid!` macro
+- **Checked OID encoding**: `oid!` constructs OIDs conveniently; outbound encoding rejects malformed or non-wire-valid values
 
 ### Protocol Support Matrix
 

@@ -481,7 +481,7 @@ impl<T: Transport> Client<T> {
             self.inner.config.community.clone(),
             pdu,
         );
-        let data = message.encode();
+        let data = message.encode()?;
         let response = self.send_and_recv(request_id, &data).await?;
 
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu_type, snmp.varbind_count = response.varbinds.len(), snmp.error_status = response.error_status, snmp.error_index = response.error_index }, "received {} response", response.pdu_type);
@@ -510,7 +510,7 @@ impl<T: Transport> Client<T> {
             self.inner.config.version,
             self.inner.config.community.clone(),
             &pdu,
-        );
+        )?;
         let response = self.send_and_recv(request_id, &data).await?;
 
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu_type, snmp.varbind_count = response.varbinds.len(), snmp.error_status = response.error_status, snmp.error_index = response.error_index }, "received {} response", response.pdu_type);
@@ -822,7 +822,7 @@ impl<T: Transport> Client<T> {
                 self.inner.config.community.clone(),
                 pdu,
             );
-            let data = message.encode();
+            let data = message.encode()?;
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.bytes = data.len() }, "sending v2c trap");
             self.inner.transport.send(&data).await?;
         }
@@ -866,7 +866,7 @@ impl<T: Transport> Client<T> {
         }
 
         let message = CommunityMessage::v1_trap(self.inner.config.community.clone(), trap);
-        let data = message.encode();
+        let data = message.encode()?;
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
         self.inner.transport.send(&data).await?;
 
@@ -1108,6 +1108,7 @@ mod tests {
     use bytes::Bytes;
     use std::collections::VecDeque;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     // -------------------------------------------------------------------------
@@ -1201,7 +1202,7 @@ mod tests {
                 };
 
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
-                let encoded = msg.encode();
+                let encoded = msg.encode().unwrap();
                 Ok((encoded, peer))
             }
         }
@@ -1228,6 +1229,127 @@ mod tests {
             ..Default::default()
         };
         Client::new(transport, config)
+    }
+
+    #[derive(Clone)]
+    struct CountingTransport {
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl Transport for CountingTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
+
+        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            async { panic!("receive must not be reached after encode failure") }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_oid_is_not_sent() {
+        fn assert_invalid<T>(result: Result<T>) {
+            match result {
+                Err(error) => assert!(matches!(&*error, Error::InvalidOid(_))),
+                Ok(_) => panic!("invalid OID operation succeeded"),
+            }
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let transport = CountingTransport {
+            sends: Arc::clone(&sends),
+        };
+        let client = Client::new(
+            transport.clone(),
+            ClientConfig {
+                version: Version::V2c,
+                retry: crate::client::retry::Retry::none(),
+                ..Default::default()
+            },
+        );
+        let invalid = Oid::empty();
+        let valid = Oid::from_slice(&[1, 3, 6, 1]);
+
+        assert_invalid(client.get(&invalid).await);
+        assert_invalid(client.get_next(&invalid).await);
+        assert_invalid(client.get_bulk(std::slice::from_ref(&invalid), 0, 10).await);
+        assert_invalid(client.set(&invalid, Value::Integer(1)).await);
+        assert_invalid(
+            client
+                .set(&valid, Value::ObjectIdentifier(invalid.clone()))
+                .await,
+        );
+        assert_invalid(client.send_trap(&invalid, 1, vec![]).await);
+        assert_invalid(
+            client
+                .send_trap(&valid, 1, vec![VarBind::null(invalid.clone())])
+                .await,
+        );
+        assert_invalid(client.send_inform(&invalid, 1, vec![]).await);
+
+        let v1_client = Client::new(
+            transport.clone(),
+            ClientConfig {
+                version: Version::V1,
+                retry: crate::client::retry::Retry::none(),
+                ..Default::default()
+            },
+        );
+        let trap = TrapV1Pdu::new(
+            invalid.clone(),
+            [127, 0, 0, 1],
+            crate::pdu::GenericTrap::EnterpriseSpecific,
+            1,
+            1,
+            vec![],
+        );
+        assert_invalid(v1_client.send_v1_trap(trap).await);
+
+        // The uncached V3 client must reject malformed request PDUs before
+        // engine discovery can write its own packet to the transport.
+        let v3_client = Client::new(
+            transport,
+            ClientConfig {
+                version: Version::V3,
+                v3_security: Some(crate::v3::UsmConfig::new("user")),
+                retry: crate::client::retry::Retry::none(),
+                ..Default::default()
+            },
+        );
+        assert_invalid(v3_client.get(&invalid).await);
+        assert_invalid(v3_client.get_next(&invalid).await);
+        assert_invalid(
+            v3_client
+                .get_bulk(std::slice::from_ref(&invalid), 0, 10)
+                .await,
+        );
+        assert_invalid(v3_client.set(&invalid, Value::Integer(1)).await);
+        assert_invalid(
+            v3_client
+                .set(&valid, Value::ObjectIdentifier(invalid.clone()))
+                .await,
+        );
+        assert_invalid(v3_client.send_inform(&invalid, 1, vec![]).await);
+
+        assert_eq!(sends.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1508,7 +1630,7 @@ mod tests {
                 };
 
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
-                Ok((msg.encode(), peer))
+                Ok((msg.encode().unwrap(), peer))
             }
         }
 
@@ -1698,7 +1820,7 @@ mod tests {
             } else {
                 CommunityMessage::v2c(community, pdu)
             };
-            let encoded = msg.encode();
+            let encoded = msg.encode().unwrap();
             async move { Ok((encoded, peer)) }
         }
 

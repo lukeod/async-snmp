@@ -1225,7 +1225,7 @@ mod tests {
 
         let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), pdu);
         let msg = V3Message::new(global, usm_params.encode(), scoped);
-        let mut msg_bytes = msg.encode().to_vec();
+        let mut msg_bytes = msg.encode().unwrap().to_vec();
 
         // Compute and insert HMAC
         if let Some(key) = &auth_key {
@@ -1634,7 +1634,7 @@ mod tests {
 
         let scoped = ScopedPdu::new(Bytes::new(), Bytes::new(), pdu);
         let msg = V3Message::new(global, usm_params.encode(), scoped);
-        msg.encode()
+        msg.encode().unwrap()
     }
 
     #[tokio::test]
@@ -2147,7 +2147,7 @@ mod tests {
             usm_params.encode(),
             Bytes::from_static(b"not-a-valid-ciphertext"),
         );
-        let mut msg_bytes = msg.encode().to_vec();
+        let mut msg_bytes = msg.encode().unwrap().to_vec();
         let (auth_offset, auth_len) =
             UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
         authenticate_message(&auth_key, &mut msg_bytes, auth_offset, auth_len).unwrap();
@@ -2444,14 +2444,18 @@ mod tests {
         use crate::message::CommunityMessage;
         use crate::pdu::Pdu;
         let pdu = Pdu::trap_v2(1, 100, &oids::cold_start(), vec![]);
-        CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu).encode()
+        CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu)
+            .encode()
+            .unwrap()
     }
 
     fn build_v2c_inform(community: &[u8]) -> Bytes {
         use crate::message::CommunityMessage;
         use crate::pdu::Pdu;
         let pdu = Pdu::inform_request(1, 100, &oids::cold_start(), vec![]);
-        CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu).encode()
+        CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu)
+            .encode()
+            .unwrap()
     }
 
     fn build_v1_trap(community: &[u8]) -> Bytes {
@@ -2465,7 +2469,9 @@ mod tests {
             12345,
             vec![],
         );
-        CommunityMessage::v1_trap(Bytes::copy_from_slice(community), trap).encode()
+        CommunityMessage::v1_trap(Bytes::copy_from_slice(community), trap)
+            .encode()
+            .unwrap()
     }
 
     #[tokio::test]

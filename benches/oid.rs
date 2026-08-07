@@ -147,7 +147,7 @@ fn bench_oid_ber_encode(c: &mut Criterion) {
         let oid = generate_oid(len);
 
         group.bench_with_input(BenchmarkId::new("to_ber", len), &oid, |b, oid| {
-            b.iter(|| black_box(oid.to_ber()));
+            b.iter(|| black_box(oid.to_ber().unwrap()));
         });
     }
 
@@ -160,7 +160,7 @@ fn bench_oid_ber_decode(c: &mut Criterion) {
 
     for len in [4, 8, 16, 24, 32, 64] {
         let oid = generate_oid(len);
-        let encoded = oid.to_ber();
+        let encoded = oid.to_ber().unwrap();
 
         group.bench_with_input(BenchmarkId::new("from_ber", len), &encoded, |b, data| {
             b.iter(|| black_box(Oid::from_ber(data).unwrap()));
@@ -218,7 +218,11 @@ fn bench_real_world_patterns(c: &mut Criterion) {
 
     // GETBULK response processing: decode multiple OIDs
     let encoded_oids: Vec<Vec<u8>> = (0..25)
-        .map(|i| Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, i]).to_ber())
+        .map(|i| {
+            Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 1, i])
+                .to_ber()
+                .unwrap()
+        })
         .collect();
 
     group.bench_function("bulk_decode_25_oids", |b| {

@@ -539,6 +539,7 @@ mod tests {
             },
         )
         .encode()
+        .unwrap()
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ pub fn encode_v3_message(
             .and_then(|d| d.priv_key.as_ref())
             .ok_or_else(|| Error::Config("privacy key not available".into()).boxed())?;
 
-        let scoped_pdu_bytes = scoped_pdu.encode_to_bytes();
+        let scoped_pdu_bytes = scoped_pdu.encode_to_bytes()?;
         let (ciphertext, salt) = priv_key
             .encrypt(
                 &scoped_pdu_bytes,
@@ -123,7 +123,7 @@ pub fn encode_v3_message(
         }
     };
 
-    let mut encoded = msg.encode().to_vec();
+    let mut encoded = msg.encode()?.to_vec();
 
     // Apply authentication if needed
     if let Some(key) = &auth_key {
@@ -208,11 +208,11 @@ pub(crate) fn encode_v3_report(
 
     match auth_key {
         Some(key) => {
-            let mut bytes = msg.encode().to_vec();
+            let mut bytes = msg.encode()?.to_vec();
             sign_v3_message(key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))
         }
-        None => Ok(msg.encode()),
+        None => msg.encode(),
     }
 }
 
@@ -241,12 +241,12 @@ pub(crate) fn encode_v3_response(
     let scoped = ScopedPdu::new(context_engine_id, context_name, response_pdu);
 
     match security_level {
-        SecurityLevel::NoAuthNoPriv => Ok(V3Message::new(global, usm.encode(), scoped).encode()),
+        SecurityLevel::NoAuthNoPriv => V3Message::new(global, usm.encode(), scoped).encode(),
         SecurityLevel::AuthNoPriv => {
             let (_, auth_key) = require_auth_key(derived_keys, target)?;
             let usm = usm.with_auth_placeholder(auth_key.mac_len());
             let mut bytes = V3Message::new(global, usm.encode(), scoped)
-                .encode()
+                .encode()?
                 .to_vec();
             sign_v3_message(auth_key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))
@@ -258,7 +258,7 @@ pub(crate) fn encode_v3_response(
                 Error::Auth { target }.boxed()
             })?;
 
-            let scoped_pdu_bytes = scoped.encode_to_bytes();
+            let scoped_pdu_bytes = scoped.encode_to_bytes()?;
             let (encrypted, priv_params) = priv_key
                 .encrypt(
                     &scoped_pdu_bytes,
@@ -275,7 +275,7 @@ pub(crate) fn encode_v3_response(
                 .with_auth_placeholder(auth_key.mac_len())
                 .with_priv_params(priv_params);
             let mut bytes = V3Message::new_encrypted(global, usm.encode(), encrypted)
-                .encode()
+                .encode()?
                 .to_vec();
             sign_v3_message(auth_key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))

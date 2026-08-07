@@ -13,7 +13,7 @@
 //! - Core types: [`Client`], [`Oid`], [`Value`], [`VarBind`]
 //! - Error handling: [`Error`], [`Result`]
 //! - V3 protocols: [`AuthProtocol`], [`PrivProtocol`]
-//! - The [`oid!`] macro for compile-time OID construction
+//! - The [`oid!`] macro for convenient OID construction (wire validity is checked during encoding)
 
 pub use crate::client::{Auth, Client, ClientBuilder, Retry};
 pub use crate::error::{Error, Result};

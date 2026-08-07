@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pre-1.0 `Transport::register_request` API now accepts
   `RequestRegistration` correlation metadata. Custom transports must ignore a
   failed correlation without consuming the pending request.
+- Outbound OBJECT IDENTIFIER encoding is now checked. `Oid::to_ber`,
+  `EncodeBuf::push_oid`, `Value::encode`, `VarBind::encode`, PDU encoders,
+  `CommunityMessage::encode`/`encode_bulk`, `ScopedPdu::encode`/`encode_to_bytes`,
+  and `V3Message::encode` now return `Result`. Empty, malformed, overlength, or
+  non-round-trippable OIDs return `Error::InvalidOid` before transport I/O,
+  encryption, or authentication. Receive-side empty OIDs and in-memory tree
+  operations remain supported.
 
 ### Fixed
 
@@ -151,7 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Client::new()` and `Client::with_engine_cache()` now clamp an invalid `max_oids_per_request` of 0 to the default instead of bypassing builder validation and later panicking in `slice::chunks(0)`.
 - A GET/GETNEXT response with fewer variable-bindings than the request is now rejected with `Error::MalformedResponse` (RFC 3416 Section 4.2.1) instead of being accepted with a warning, which caused positional misalignment between requested OIDs and returned values. Over-count responses were already rejected; walk/bulk paths are unaffected.
 - TCP transports now advertise `msgMaxSize` as their actual acceptance limit (`max_allocation_size`, clamped to the `i32` protocol ceiling) rather than a fixed `0x7FFFFFFF`, so a peer honoring the advertised size cannot send a v3 response that the reader then rejects.
-- `Oid::to_ber_checked()` now also enforces `validate_length()` and rejects zero-arc (empty) OIDs; it previously ran `validate()` alone and could emit over-length or empty OIDs. The unchecked production encode path is unchanged (routing it through validation would require a breaking change to the infallible encode API).
+- `Oid::to_ber_checked()` now also enforces `validate_length()` and rejects zero-arc (empty) OIDs; it previously ran `validate()` alone and could emit over-length or empty OIDs.
 
 ### Fixed
 
@@ -202,7 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `Oid::validate()` (and therefore `to_ber_checked()`/`validate_all()`) now rejects single-arc OIDs, which have no invertible BER encoding (X.690 8.19.4 packs the first two arcs into one subidentifier, so `[n]` encodes as a value that decodes to `[n, 0]`). The unchecked encode paths are unchanged.
+- `Oid::validate()` (and therefore `to_ber_checked()`/`validate_all()`) now rejects single-arc OIDs, which have no invertible BER encoding (X.690 8.19.4 packs the first two arcs into one subidentifier, so `[n]` encodes as a value that decodes to `[n, 0]`).
 
 ### Fixed
 
@@ -211,7 +218,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GETBULK truncation violated the RFC 3416 Section 4.2.3 positional layout: when a non-repeater varbind did not fit the size limit, the handler broke out of the non-repeater loop but fell through into the repeater loop, emitting repeater varbinds into the dropped non-repeater's slot and shifting every following position. Truncation removes bindings only from the end of the set, and all repeaters are positionally after every non-repeater, so a dropped non-repeater now returns the non-repeater prefix collected so far with no repeater bindings appended. GETBULK now returns a `tooBig` Response (error-status `tooBig`, error-index 0, empty variable-bindings per RFC 3416 Section 4.2) whenever no varbind fits the size limit, regardless of the non-repeaters count: both the non-repeater path (first non-repeater oversized) and the repeater path (`non_repeaters == 0` with the first repeater varbind oversized). The repeater path previously did `break 'outer` and returned a bare noError Response with empty varbinds, which a manager cannot distinguish from end-of-MIB, silently ending the walk instead of prompting a retry with a smaller max-repetitions (net-snmp returns tooBig here). Partial truncation once some varbinds already fit is unchanged.
 - VACM MIB-view matching (`View::contains` and `View::check_subtree`) resolved overlapping subtrees of equal length by insertion order, so `exclude` then `include` on the same specificity could grant access that `include` then `exclude` denied. Equal-length matches now follow RFC 3415: the lexicographically greatest matching subtree OID decides, making the outcome independent of the order subtrees were added.
 - VACM `View::check_subtree`'s child-detection branch compared subtree arcs against the query prefix literally, ignoring the subtree's family mask, while the primary match path was mask-aware: a masked subtree longer than the query with a wildcard arc inside the query prefix was missed as a child, so `check_subtree` returned `Included` where `Ambiguous` is correct, over-granting access on OIDs the masked family excludes. Both paths now share a mask-aware prefix comparison; `ViewSubtree::matches` behavior is unchanged.
-- `Oid::to_ber()` (and the other unchecked encode paths, `to_ber_smallvec()`/`ber_content_size()`) computed the first BER subidentifier as `arc1 * 40 + arc2` in `u32` with no overflow guard, so an OID constructed via `Oid::new()`/`Oid::from_slice()` whose first two arcs overflow `u32` (e.g. `[2, u32::MAX]`) panicked in debug builds and silently wrapped in release. The first-subidentifier computation now uses saturating arithmetic; valid OIDs (those accepted by `validate()`) are unaffected since no saturation occurs, and `validate()`/`to_ber_checked()` continue to reject the out-of-range OID.
+- OID BER arithmetic computed the first subidentifier as `arc1 * 40 + arc2` in `u32` with no overflow guard, so an OID constructed via `Oid::new()`/`Oid::from_slice()` whose first two arcs overflow `u32` (e.g. `[2, u32::MAX]`) panicked in debug builds and silently wrapped in release. The first-subidentifier computation now uses saturating arithmetic; valid OIDs (those accepted by `validate()`) are unaffected since no saturation occurs, and validation rejects the out-of-range OID.
 - `UsmSecurityParams::decode_from` accepted a `msgUserName` of any length; RFC 3414 Section 2.4 specifies `OCTET STRING (SIZE(0..32))`, and a username over 32 octets is now rejected on decode with `Error::MalformedResponse`. Encoding is unaffected.
 - `PrivKey::from_bytes` accepted a key of any length; a key shorter than `PrivProtocol::key_len()` (RFC 3414 Section 8.1.1.1's 16-octet DES secret, RFC 3826 Section 3.1.2's AES localized-key length) later panicked when the encryption/decryption routines sliced into it. `from_bytes` now returns `Err(CryptoError::InvalidKeyLength)` for an under-length key; a key at least `key_len()` long is still accepted, matching the ">=" length RFC 3826 specifies.
 - GETBULK's client-side encode path could put a negative `non-repeaters` or `max-repetitions` on the wire even though RFC 3416 Section 4.2.3 specifies both as `INTEGER (0..2147483647)` and the decode side already rejects negatives: `Client::get_bulk`'s raw `i32` parameters passed straight through to `GetBulkPdu::encode` with no validation, and `walk()`/`bulk_walk_default()` cast the configured `u32` `max_repetitions` to `i32` with `as`, which wraps to a negative value above `i32::MAX`. `GetBulkPdu::encode` now clamps both fields to a `0` floor before writing, and the walk paths use a saturating conversion (to `i32::MAX`) instead of the wrapping `as` cast, so a large configured `max_repetitions` no longer collapses to `0` repetitions via the encode-side clamp. The SNMPv3 encode path was separately affected: `Pdu::get_bulk` carries `non-repeaters`/`max-repetitions` in the overloaded `error_status`/`error_index` fields and encodes via the generic `Pdu::encode`, bypassing `GetBulkPdu::encode`'s clamp; both encoders now share a single clamp, so neither GETBULK representation can emit a negative on the wire.
@@ -599,7 +606,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Agent` with `MibHandler` trait for building SNMP agents
 - VACM (View-Based Access Control Model) support
 - Two-phase SET commit per RFC 3416
-- `oid!` macro for compile-time OID parsing
+- `oid!` macro for convenient OID construction
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 

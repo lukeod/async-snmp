@@ -7,7 +7,7 @@
 //! - Full `SNMPv1`, v2c, and v3 support
 //! - Async-first API built on Tokio
 //! - Zero-copy BER encoding/decoding
-//! - Type-safe OID and value handling
+//! - Permissive OID tree/receive representation with checked outbound wire encoding
 //! - Config-driven client construction
 //! - Trap and inform sending (agent-based multi-sink or client-based)
 //! - Trap and inform receiving with optional community filtering and per-notification

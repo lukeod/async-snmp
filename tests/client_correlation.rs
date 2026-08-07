@@ -36,6 +36,7 @@ async fn wrong_community_does_not_consume_pending_udp_request() {
                 },
             )
             .encode()
+            .unwrap()
         };
 
         socket
