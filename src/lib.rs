@@ -460,6 +460,7 @@
 pub mod agent;
 pub mod ber;
 pub mod client;
+pub mod compatibility;
 pub mod error;
 pub mod format;
 pub mod handler;
@@ -492,6 +493,7 @@ pub use client::{
     FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering, ResponseShapeAnomaly,
     ResponseShapePolicy, Retry, RetryBuilder, Target, Walk, WalkMode, WalkStream,
 };
+pub use compatibility::CompatibilityPolicy;
 pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,

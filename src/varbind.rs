@@ -245,10 +245,17 @@ mod tests {
         //   06 00  - OID tag, zero-length content (malformed)
         //   82 00  - endOfMibView, length 0
         let bytes = bytes::Bytes::from_static(&[0x30, 0x04, 0x06, 0x00, 0x82, 0x00]);
-        let mut decoder = Decoder::new(bytes);
+        let mut decoder = Decoder::new(bytes.clone());
         let vb = VarBind::decode(&mut decoder).unwrap();
         assert!(vb.oid.is_empty());
         assert_eq!(vb.value, Value::EndOfMibView);
+
+        let policy = crate::CompatibilityPolicy {
+            empty_object_identifier: false,
+            ..crate::CompatibilityPolicy::DEFAULT
+        };
+        let mut strict = Decoder::new(bytes).with_compatibility_policy(policy);
+        assert!(VarBind::decode(&mut strict).is_err());
     }
 
     #[test]
@@ -275,6 +282,27 @@ mod tests {
             vb.value,
             Value::OctetString(bytes::Bytes::from_static(b"ab"))
         );
+    }
+
+    #[test]
+    fn bounded_string_clamp_cannot_consume_following_varbind() {
+        let bytes = Bytes::from_static(&[
+            0x30, 0x16, // varbind list, 22 bytes
+            0x30, 0x0e, // first varbind, 14 bytes
+            0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00, 0x04, 0x03, b'a',
+            b'b', // declares 3, bounded sequence has 2
+            0x30, 0x04, // following canonical varbind
+            0x06, 0x00, 0x05, 0x00,
+        ]);
+        let mut decoder = Decoder::new(bytes);
+        let decoded = decode_varbind_list(&mut decoder).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            decoded[0].value,
+            Value::OctetString(Bytes::from_static(b"ab"))
+        );
+        assert!(decoded[1].oid.is_empty());
+        assert_eq!(decoded[1].value, Value::Null);
     }
 
     // ========================================================================

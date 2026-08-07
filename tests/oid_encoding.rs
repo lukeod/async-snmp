@@ -1,9 +1,11 @@
-use async_snmp::ber::EncodeBuf;
+use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message,
 };
 use async_snmp::pdu::GetBulkPdu;
-use async_snmp::{Error, GenericTrap, Oid, Pdu, PduType, TrapV1Pdu, Value, VarBind};
+use async_snmp::{
+    CompatibilityPolicy, Error, GenericTrap, Oid, Pdu, PduType, TrapV1Pdu, Value, VarBind,
+};
 use bytes::Bytes;
 
 fn invalid_oids() -> Vec<Oid> {
@@ -133,4 +135,15 @@ fn valid_oid_boundaries_preserve_identity() {
 #[test]
 fn empty_ber_oid_remains_receive_compatible() {
     assert_eq!(Oid::from_ber(&[]).unwrap(), Oid::empty());
+
+    let encoded_varbind = Bytes::from_static(&[0x30, 0x04, 0x06, 0x00, 0x82, 0x00]);
+    let mut compatible = Decoder::new(encoded_varbind.clone());
+    assert_eq!(VarBind::decode(&mut compatible).unwrap().oid, Oid::empty());
+
+    let policy = CompatibilityPolicy {
+        empty_object_identifier: false,
+        ..CompatibilityPolicy::DEFAULT
+    };
+    let mut strict = Decoder::new(encoded_varbind).with_compatibility_policy(policy);
+    assert!(VarBind::decode(&mut strict).is_err());
 }

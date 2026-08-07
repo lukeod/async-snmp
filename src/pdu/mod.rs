@@ -3,27 +3,25 @@
 //! PDUs represent the different SNMP operations.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
+use crate::compatibility::CompatibilityPolicy;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::oid::Oid;
 use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 
-/// Clamp a GETBULK `non-repeaters`/`max-repetitions` field to the RFC 3416
-/// Section 4.2.3 range `INTEGER (0..2147483647)`.
-///
-/// `i32::MAX` already equals the upper bound, so only the negative floor needs
-/// enforcing. Both GETBULK encode paths apply it at their choke point:
-/// `Pdu::encode` clamps the overloaded `error_status`/`error_index` for the
-/// SNMPv3 representation (so even a directly-constructed `Pdu` with negative
-/// fields is normalized), and `GetBulkPdu::encode` clamps `non_repeaters`/
-/// `max_repetitions` for the community path. It guarantees neither encoder can
-/// emit a negative value on the wire.
-///
-/// The receive side reuses the same clamp: `Pdu::decode` applies it to the
-/// overloaded GETBULK `error_status`/`error_index` fields so a negative value
-/// from a buggy peer is normalized to 0 rather than rejected (net-snmp behavior).
-const fn clamp_bulk_field(value: i32) -> i32 {
-    if value < 0 { 0 } else { value }
+fn encode_bulk_field(
+    value: i32,
+    field: &'static str,
+    compatibility: CompatibilityPolicy,
+) -> Result<i32> {
+    if value >= 0 {
+        return Ok(value);
+    }
+    if !compatibility.normalize_negative_get_bulk_fields {
+        return Err(Error::Config(format!("negative GETBULK {field}").into_boxed_str()).boxed());
+    }
+    tracing::warn!(target: "async_snmp::pdu", anomaly = "negative_get_bulk_field", direction = "encode", field, value, normalized = 0, "normalized negative GETBULK field");
+    Ok(0)
 }
 
 /// PDU type tag.
@@ -204,8 +202,8 @@ impl Pdu {
     /// Create a GETBULK request PDU.
     ///
     /// Note: For GETBULK, `error_status` holds `non_repeaters` and `error_index` holds `max_repetitions`.
-    /// Both are clamped via `clamp_bulk_field` so this (SNMPv3) encode path cannot emit a negative
-    /// value on the wire.
+    /// The encode choke point applies the selected compatibility policy before
+    /// either field reaches the wire.
     #[must_use]
     pub fn get_bulk(
         request_id: i32,
@@ -216,14 +214,23 @@ impl Pdu {
         Self {
             pdu_type: PduType::GetBulkRequest,
             request_id,
-            error_status: clamp_bulk_field(non_repeaters),
-            error_index: clamp_bulk_field(max_repetitions),
+            error_status: non_repeaters,
+            error_index: max_repetitions,
             varbinds,
         }
     }
 
-    /// Encode to BER.
+    /// Encode to BER using the default malformed-input compatibility policy.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.encode_with_compatibility_policy(buf, CompatibilityPolicy::default())
+    }
+
+    /// Encode to BER using an explicit compatibility policy.
+    pub fn encode_with_compatibility_policy(
+        &self,
+        buf: &mut EncodeBuf,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<()> {
         // The SNMPv1 Trap PDU has a distinct wire layout and must be encoded via
         // `TrapV1Pdu::encode`; the generic layout here is not round-trippable for it.
         debug_assert!(
@@ -237,8 +244,8 @@ impl Pdu {
         // negative value on the wire, regardless of how the fields were set.
         let (error_status, error_index) = if self.pdu_type == PduType::GetBulkRequest {
             (
-                clamp_bulk_field(self.error_status),
-                clamp_bulk_field(self.error_index),
+                encode_bulk_field(self.error_status, "non_repeaters", compatibility)?,
+                encode_bulk_field(self.error_index, "max_repetitions", compatibility)?,
             )
         } else {
             (self.error_status, self.error_index)
@@ -274,9 +281,11 @@ impl Pdu {
         let len = decoder.read_length()?;
         let mut pdu_decoder = decoder.sub_decoder(len)?;
 
-        let request_id = pdu_decoder.read_integer()?;
-        let mut error_status = pdu_decoder.read_integer()?;
-        let mut error_index = pdu_decoder.read_integer()?;
+        // These are protocol Integer32 fields, so decode the complete width
+        // without consulting generic value-truncation compatibility.
+        let request_id = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
+        let mut error_status = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
+        let mut error_index = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
         if !pdu_decoder.is_empty() {
             return Err(pdu_decoder.malformed());
@@ -289,8 +298,21 @@ impl Pdu {
         // normalization. The upper bound already equals i32::MAX, so only the
         // negative floor needs enforcing.
         if pdu_type == PduType::GetBulkRequest {
-            error_status = clamp_bulk_field(error_status);
-            error_index = clamp_bulk_field(error_index);
+            for (field, value) in [
+                ("non_repeaters", &mut error_status),
+                ("max_repetitions", &mut error_index),
+            ] {
+                if *value < 0 {
+                    if !decoder
+                        .compatibility_policy()
+                        .normalize_negative_get_bulk_fields
+                    {
+                        return Err(decoder.malformed());
+                    }
+                    tracing::warn!(target: "async_snmp::pdu", anomaly = "negative_get_bulk_field", direction = "decode", field, value = *value, normalized = 0, "normalized negative GETBULK field");
+                    *value = 0;
+                }
+            }
         }
 
         // For non-GETBULK PDUs, error_index is not validated here. net-snmp
@@ -756,11 +778,10 @@ impl TrapV1Pdu {
             agent_bytes[3],
         ];
 
-        // generic-trap INTEGER
-        let generic_trap = GenericTrap::from_i32(pdu.read_integer()?);
-
-        // specific-trap INTEGER
-        let specific_trap = pdu.read_integer()?;
+        // generic-trap and specific-trap are protocol Integer32 fields. Do not
+        // apply the generic value-truncation compatibility behavior here.
+        let generic_trap = GenericTrap::from_i32(pdu.read_bounded_integer(i32::MIN, i32::MAX)?);
+        let specific_trap = pdu.read_bounded_integer(i32::MIN, i32::MAX)?;
 
         // time-stamp TimeTicks
         let ts_tag = pdu.read_tag()?;
@@ -772,7 +793,7 @@ impl TrapV1Pdu {
             return Err(pdu.malformed());
         }
         let ts_len = pdu.read_length()?;
-        let time_stamp = pdu.read_unsigned32_value(ts_len)?;
+        let time_stamp = pdu.read_bounded_unsigned32_value(ts_len)?;
 
         // variable-bindings
         let varbinds = decode_varbind_list(&mut pdu)?;
@@ -816,14 +837,24 @@ impl GetBulkPdu {
         }
     }
 
-    /// Encode to BER.
+    /// Encode to BER using the default malformed-input compatibility policy.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.encode_with_compatibility_policy(buf, CompatibilityPolicy::default())
+    }
+
+    /// Encode to BER using an explicit compatibility policy.
+    pub fn encode_with_compatibility_policy(
+        &self,
+        buf: &mut EncodeBuf,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<()> {
+        let non_repeaters = encode_bulk_field(self.non_repeaters, "non_repeaters", compatibility)?;
+        let max_repetitions =
+            encode_bulk_field(self.max_repetitions, "max_repetitions", compatibility)?;
         buf.try_push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
             encode_varbind_list(buf, &self.varbinds)?;
-            // Clamp the RFC 3416 (0..2147483647) fields via the shared
-            // choke point so neither GETBULK encode path emits a negative.
-            buf.push_integer(clamp_bulk_field(self.max_repetitions));
-            buf.push_integer(clamp_bulk_field(self.non_repeaters));
+            buf.push_integer(max_repetitions);
+            buf.push_integer(non_repeaters);
             buf.push_integer(self.request_id);
             Ok(())
         })
@@ -857,6 +888,13 @@ impl GetBulkPdu {
 mod tests {
     use super::*;
     use crate::oid;
+
+    fn compatibility_without_negative_bulk_normalization() -> CompatibilityPolicy {
+        CompatibilityPolicy {
+            normalize_negative_get_bulk_fields: false,
+            ..CompatibilityPolicy::DEFAULT
+        }
+    }
 
     /// Test helper for encoding PDUs with arbitrary field values.
     ///
@@ -963,6 +1001,18 @@ mod tests {
         assert_eq!(decoded.request_id, 12345);
         assert_eq!(decoded.non_repeaters, 0);
         assert_eq!(decoded.max_repetitions, 10);
+    }
+
+    #[test]
+    fn protocol_integer_fields_never_use_generic_truncation() {
+        // request-id is encoded as 2^32. Generic value decoding can truncate
+        // this to zero by policy, but protocol Integer32 fields must reject it.
+        let encoded = bytes::Bytes::from_static(&[
+            0xa0, 0x0f, 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01,
+            0x00, 0x30, 0x00,
+        ]);
+        let mut decoder = Decoder::new(encoded);
+        assert!(Pdu::decode(&mut decoder).is_err());
     }
 
     #[test]
@@ -1271,10 +1321,14 @@ mod tests {
         let raw = RawGetBulkPdu::new(1, -1, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
-        let mut decoder = Decoder::new(encoded);
+        let mut decoder = Decoder::new(encoded.clone());
         let decoded = GetBulkPdu::decode(&mut decoder).expect("negative non_repeaters clamps to 0");
         assert_eq!(decoded.non_repeaters, 0);
         assert_eq!(decoded.max_repetitions, 10);
+
+        let mut strict = Decoder::new(encoded)
+            .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
+        assert!(GetBulkPdu::decode(&mut strict).is_err());
     }
 
     #[test]
@@ -1299,7 +1353,8 @@ mod tests {
         let packet = [
             0xa5, 0x0b, 0x02, 0x01, 0x01, 0x02, 0x01, 0xff, 0x02, 0x01, 0x01, 0x30, 0x00,
         ];
-        let mut decoder = Decoder::new(bytes::Bytes::copy_from_slice(&packet));
+        let encoded = bytes::Bytes::copy_from_slice(&packet);
+        let mut decoder = Decoder::new(encoded.clone());
         let pdu = Pdu::decode(&mut decoder).expect("repro GETBULK packet must decode");
         assert_eq!(pdu.pdu_type, PduType::GetBulkRequest);
         assert_eq!(pdu.request_id, 1);
@@ -1307,6 +1362,10 @@ mod tests {
         assert_eq!(pdu.error_status, 0);
         // error_index = max_repetitions
         assert_eq!(pdu.error_index, 1);
+
+        let mut strict = Decoder::new(encoded)
+            .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
+        assert!(Pdu::decode(&mut strict).is_err());
     }
 
     #[test]
@@ -1331,6 +1390,16 @@ mod tests {
         // (e.g. via a raw i32 passed to Client::get_bulk) round-trips through
         // decode instead of producing a malformed request on the wire.
         let pdu = GetBulkPdu::new(1, -1, -5, &[oid!(1, 3, 6, 1)]);
+
+        let mut strict_buf = EncodeBuf::new();
+        assert!(
+            pdu.encode_with_compatibility_policy(
+                &mut strict_buf,
+                compatibility_without_negative_bulk_normalization(),
+            )
+            .is_err()
+        );
+        assert!(strict_buf.is_empty());
 
         let mut buf = EncodeBuf::new();
         pdu.encode(&mut buf).unwrap();
@@ -1369,8 +1438,18 @@ mod tests {
         // path must apply the same RFC 3416 (0..max-bindings) clamp so a negative
         // passed to Client::get_bulk on a v3 client never reaches the wire.
         let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
-        assert_eq!(pdu.error_status, 0);
-        assert_eq!(pdu.error_index, 0);
+        assert_eq!(pdu.error_status, -1);
+        assert_eq!(pdu.error_index, -5);
+
+        let mut strict_buf = EncodeBuf::new();
+        assert!(
+            pdu.encode_with_compatibility_policy(
+                &mut strict_buf,
+                compatibility_without_negative_bulk_normalization(),
+            )
+            .is_err()
+        );
+        assert!(strict_buf.is_empty());
 
         let mut buf = EncodeBuf::new();
         pdu.encode(&mut buf).unwrap();
@@ -1385,10 +1464,10 @@ mod tests {
 
     #[test]
     fn test_directly_constructed_getbulk_pdu_encode_clamps_negative_fields() {
-        // The pub fields let a caller build a GETBULK Pdu directly, bypassing
-        // Pdu::get_bulk's constructor-side clamp. Pdu::encode must still clamp the
-        // overloaded non-repeaters/max-repetitions (error_status/error_index) to 0
-        // so a directly-constructed PDU cannot emit a negative on the wire.
+        // The pub fields let a caller build a GETBULK Pdu directly. The default
+        // encode policy must clamp overloaded non-repeaters/max-repetitions
+        // (error_status/error_index) to 0 so a directly-constructed PDU cannot
+        // emit a negative on the wire.
         let pdu = Pdu {
             pdu_type: PduType::GetBulkRequest,
             request_id: 1,

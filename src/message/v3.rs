@@ -23,6 +23,7 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
+use crate::compatibility::CompatibilityPolicy;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
@@ -281,10 +282,20 @@ impl ScopedPdu {
         }
     }
 
-    /// Encode to buffer.
+    /// Encode to buffer using the default malformed-input compatibility policy.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.encode_with_compatibility_policy(buf, CompatibilityPolicy::default())
+    }
+
+    /// Encode to buffer using an explicit compatibility policy.
+    pub fn encode_with_compatibility_policy(
+        &self,
+        buf: &mut EncodeBuf,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<()> {
         buf.try_push_sequence(|buf| {
-            self.pdu.encode(buf)?;
+            self.pdu
+                .encode_with_compatibility_policy(buf, compatibility)?;
             buf.push_octet_string(&self.context_name);
             buf.push_octet_string(&self.context_engine_id);
             Ok(())
@@ -404,12 +415,22 @@ impl V3Message {
     /// 2. Compute HMAC over the entire encoded message
     /// 3. Replace the placeholder with the actual HMAC
     pub fn encode(&self) -> Result<Bytes> {
+        self.encode_with_compatibility_policy(CompatibilityPolicy::default())
+    }
+
+    /// Encode using an explicit malformed-input compatibility policy.
+    pub fn encode_with_compatibility_policy(
+        &self,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<Bytes> {
         let mut buf = EncodeBuf::new();
 
         buf.try_push_sequence(|buf| {
             // msgData
             match &self.data {
-                V3MessageData::Plaintext(scoped_pdu) => scoped_pdu.encode(buf)?,
+                V3MessageData::Plaintext(scoped_pdu) => {
+                    scoped_pdu.encode_with_compatibility_policy(buf, compatibility)?
+                }
                 V3MessageData::Encrypted(ciphertext) => buf.push_octet_string(ciphertext),
             }
 
@@ -443,7 +464,24 @@ impl V3Message {
     /// Decode using an explicit top-level consumption policy and retain any
     /// compatible-mode trailing-byte anomaly.
     pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
-        let mut decoder = Decoder::new(data);
+        Self::decode_with_policies(data, policy, CompatibilityPolicy::default())
+    }
+
+    /// Decode using an explicit malformed-input compatibility policy.
+    pub fn decode_with_compatibility_policy(
+        data: Bytes,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<Self> {
+        Ok(Self::decode_with_policies(data, DecodePolicy::Compatible, compatibility)?.value)
+    }
+
+    /// Decode using independent envelope-consumption and malformed-input policies.
+    pub fn decode_with_policies(
+        data: Bytes,
+        policy: DecodePolicy,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<DecodeOutcome<Self>> {
+        let mut decoder = Decoder::new(data).with_compatibility_policy(compatibility);
         let mut seq = decoder.read_sequence()?;
 
         let version = seq.read_bounded_integer(0, i32::MAX)?;

@@ -18,6 +18,7 @@ pub use v3::{
 };
 
 use crate::ber::Decoder;
+use crate::compatibility::CompatibilityPolicy;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::pdu::Pdu;
@@ -136,8 +137,32 @@ impl Message {
 
     /// Decode using an explicit top-level consumption policy.
     pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
+        Self::decode_with_policies(data, policy, CompatibilityPolicy::default())
+    }
+
+    /// Decode using an explicit malformed-input compatibility policy and the
+    /// default compatible top-level consumption policy.
+    pub fn decode_with_compatibility_policy(
+        data: Bytes,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<Self> {
+        Ok(Self::decode_with_policies(data, DecodePolicy::Compatible, compatibility)?.value)
+    }
+
+    /// Decode using independent envelope-consumption and malformed-input policies.
+    pub fn decode_with_policies(
+        data: Bytes,
+        policy: DecodePolicy,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<DecodeOutcome<Self>> {
         let input_len = data.len();
-        Self::decode_bounded_with_target(data, input_len, UNKNOWN_TARGET, policy)
+        Self::decode_bounded_with_target_and_compatibility(
+            data,
+            input_len,
+            UNKNOWN_TARGET,
+            policy,
+            compatibility,
+        )
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
@@ -151,11 +176,28 @@ impl Message {
         target: SocketAddr,
         policy: DecodePolicy,
     ) -> Result<DecodeOutcome<Self>> {
+        Self::decode_bounded_with_target_and_compatibility(
+            data,
+            maximum,
+            target,
+            policy,
+            CompatibilityPolicy::default(),
+        )
+    }
+
+    fn decode_bounded_with_target_and_compatibility(
+        data: Bytes,
+        maximum: usize,
+        target: SocketAddr,
+        policy: DecodePolicy,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<DecodeOutcome<Self>> {
         if data.len() > maximum {
             tracing::debug!(target: "async_snmp::message", { received_size = data.len(), maximum, peer = %target }, "message exceeds receive limit");
             return Err(Error::MalformedResponse { target }.boxed());
         }
-        let mut decoder = Decoder::with_target(data, target);
+        let mut decoder =
+            Decoder::with_target(data, target).with_compatibility_policy(compatibility);
         let mut seq = decoder.read_sequence()?;
 
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;
@@ -204,6 +246,31 @@ impl From<V3Message> for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_exception_compatibility_policy_reaches_message_values() {
+        let encoded = Bytes::from_static(&[
+            0x30, 0x20, // message
+            0x02, 0x01, 0x01, // v2c
+            0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa2, 0x13, // response PDU
+            0x02, 0x01, 0x01, // request-id
+            0x02, 0x01, 0x00, // error-status
+            0x02, 0x01, 0x00, // error-index
+            0x30, 0x08, // varbind list
+            0x30, 0x06, 0x06, 0x01, 0x2b, 0x80, 0x01, 0xff,
+        ]);
+        assert!(Message::decode(encoded.clone()).is_err());
+
+        let compatibility = CompatibilityPolicy {
+            malformed_exception_payloads: true,
+            ..CompatibilityPolicy::STRICT
+        };
+        let decoded = Message::decode_with_compatibility_policy(encoded, compatibility).unwrap();
+        assert_eq!(
+            decoded.pdu().unwrap().varbinds[0].value,
+            crate::Value::NoSuchObject
+        );
+    }
 
     #[test]
     fn bounded_decode_replaces_the_previous_global_two_mib_ceiling() {

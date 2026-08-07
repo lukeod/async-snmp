@@ -8,6 +8,7 @@
 //! and are represented by the `CommunityPdu::TrapV1` variant.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
+use crate::compatibility::CompatibilityPolicy;
 use crate::error::Result;
 use crate::error::internal::DecodeErrorKind;
 use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
@@ -57,9 +58,13 @@ impl CommunityPdu {
     }
 
     /// Encode to BER.
-    pub(crate) fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+    pub(crate) fn encode_with_compatibility_policy(
+        &self,
+        buf: &mut EncodeBuf,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<()> {
         match self {
-            Self::Standard(p) => p.encode(buf),
+            Self::Standard(p) => p.encode_with_compatibility_policy(buf, compatibility),
             Self::TrapV1(t) => t.encode(buf),
         }
     }
@@ -151,12 +156,21 @@ impl CommunityMessage {
         }
     }
 
-    /// Encode to BER.
+    /// Encode to BER using the default malformed-input compatibility policy.
     pub fn encode(&self) -> Result<Bytes> {
+        self.encode_with_compatibility_policy(CompatibilityPolicy::default())
+    }
+
+    /// Encode to BER using an explicit compatibility policy.
+    pub fn encode_with_compatibility_policy(
+        &self,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<Bytes> {
         let mut buf = EncodeBuf::new();
 
         buf.try_push_sequence(|buf| {
-            self.pdu.encode(buf)?;
+            self.pdu
+                .encode_with_compatibility_policy(buf, compatibility)?;
             buf.push_octet_string(&self.community);
             buf.push_integer(self.version.as_i32());
             Ok(())
@@ -176,7 +190,29 @@ impl CommunityMessage {
 
     /// Decode using an explicit top-level consumption policy.
     pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
-        Self::decode_with_target_and_policy(data, crate::error::UNKNOWN_TARGET, policy)
+        Self::decode_with_policies(data, policy, CompatibilityPolicy::default())
+    }
+
+    /// Decode using an explicit malformed-input compatibility policy.
+    pub fn decode_with_compatibility_policy(
+        data: Bytes,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<Self> {
+        Ok(Self::decode_with_policies(data, DecodePolicy::Compatible, compatibility)?.value)
+    }
+
+    /// Decode using independent envelope-consumption and malformed-input policies.
+    pub fn decode_with_policies(
+        data: Bytes,
+        policy: DecodePolicy,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<DecodeOutcome<Self>> {
+        Self::decode_with_target_and_policies(
+            data,
+            crate::error::UNKNOWN_TARGET,
+            policy,
+            compatibility,
+        )
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
@@ -193,7 +229,17 @@ impl CommunityMessage {
         target: SocketAddr,
         policy: DecodePolicy,
     ) -> Result<DecodeOutcome<Self>> {
-        let mut decoder = Decoder::with_target(data, target);
+        Self::decode_with_target_and_policies(data, target, policy, CompatibilityPolicy::default())
+    }
+
+    fn decode_with_target_and_policies(
+        data: Bytes,
+        target: SocketAddr,
+        policy: DecodePolicy,
+        compatibility: CompatibilityPolicy,
+    ) -> Result<DecodeOutcome<Self>> {
+        let mut decoder =
+            Decoder::with_target(data, target).with_compatibility_policy(compatibility);
         let mut seq = decoder.read_sequence()?;
 
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;

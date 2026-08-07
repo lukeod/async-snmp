@@ -1032,6 +1032,23 @@ impl Value {
         Ok(())
     }
 
+    fn decode_exception(
+        decoder: &mut Decoder,
+        len: usize,
+        exception_type: &'static str,
+        value: Self,
+    ) -> Result<Self> {
+        if len == 0 {
+            return Ok(value);
+        }
+        if !decoder.compatibility_policy().malformed_exception_payloads {
+            return Err(decoder.malformed());
+        }
+        let _ = decoder.read_bytes(len)?;
+        tracing::warn!(target: "async_snmp::value", anomaly = "malformed_exception_payload", exception_type, payload_length = len, "discarded non-empty exception payload");
+        Ok(value)
+    }
+
     /// Decode from BER.
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
         let tag = decoder.read_tag()?;
@@ -1045,15 +1062,12 @@ impl Value {
             tag::universal::OCTET_STRING => {
                 let available = decoder.remaining();
                 let len = if len > available {
-                    // Some devices (notably MikroTik) send OctetString values
-                    // where the declared length exceeds the enclosing varbind
-                    // SEQUENCE boundary by 1-2 bytes (firmware bug). Trust the
-                    // SEQUENCE boundary over the value length field and clamp.
-                    tracing::warn!(
-                        target: "async_snmp::value",
-                        { snmp.offset = %decoder.offset(), declared = len, available },
-                        "OctetString length exceeds varbind SEQUENCE boundary, clamping to available bytes"
-                    );
+                    // The decoder is bounded to the enclosing varbind SEQUENCE,
+                    // so compatible clamping cannot consume the next varbind.
+                    if !decoder.compatibility_policy().clamp_bounded_strings {
+                        return Err(decoder.malformed());
+                    }
+                    tracing::warn!(target: "async_snmp::value", anomaly = "bounded_string_clamp", value_type = "octet_string", snmp.offset = decoder.offset(), declared_length = len, available_length = available, "clamped value length to enclosing varbind boundary");
                     available
                 } else {
                     len
@@ -1095,11 +1109,10 @@ impl Value {
             tag::application::OPAQUE => {
                 let available = decoder.remaining();
                 let len = if len > available {
-                    tracing::warn!(
-                        target: "async_snmp::value",
-                        { snmp.offset = %decoder.offset(), declared = len, available },
-                        "Opaque length exceeds varbind SEQUENCE boundary, clamping to available bytes"
-                    );
+                    if !decoder.compatibility_policy().clamp_bounded_strings {
+                        return Err(decoder.malformed());
+                    }
+                    tracing::warn!(target: "async_snmp::value", anomaly = "bounded_string_clamp", value_type = "opaque", snmp.offset = decoder.offset(), declared_length = len, available_length = available, "clamped value length to enclosing varbind boundary");
                     available
                 } else {
                     len
@@ -1120,22 +1133,13 @@ impl Value {
                 Ok(Value::UInteger32(value))
             }
             tag::context::NO_SUCH_OBJECT => {
-                if len != 0 {
-                    let _ = decoder.read_bytes(len)?;
-                }
-                Ok(Value::NoSuchObject)
+                Self::decode_exception(decoder, len, "no_such_object", Value::NoSuchObject)
             }
             tag::context::NO_SUCH_INSTANCE => {
-                if len != 0 {
-                    let _ = decoder.read_bytes(len)?;
-                }
-                Ok(Value::NoSuchInstance)
+                Self::decode_exception(decoder, len, "no_such_instance", Value::NoSuchInstance)
             }
             tag::context::END_OF_MIB_VIEW => {
-                if len != 0 {
-                    let _ = decoder.read_bytes(len)?;
-                }
-                Ok(Value::EndOfMibView)
+                Self::decode_exception(decoder, len, "end_of_mib_view", Value::EndOfMibView)
             }
             // Reject constructed OCTET STRING (0x24).
             // Net-snmp documents but does not parse constructed form; we follow suit.
@@ -1866,13 +1870,50 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_exception_with_content_accepted() {
-        // Per implementation, exceptions with non-zero length have content skipped
-        let data = Bytes::from_static(&[0x80, 0x01, 0xFF]); // NoSuchObject with 1 byte
-        let mut decoder = Decoder::new(data);
-        let result = Value::decode(&mut decoder);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Value::NoSuchObject);
+    fn malformed_exception_payload_policy_is_independent_and_defaults_strict() {
+        let cases = [
+            (0x80, Value::NoSuchObject),
+            (0x81, Value::NoSuchInstance),
+            (0x82, Value::EndOfMibView),
+        ];
+
+        for (tag, expected) in cases {
+            let malformed = Bytes::from(vec![tag, 0x01, 0xff]);
+            let mut default_decoder = Decoder::new(malformed.clone());
+            assert!(Value::decode(&mut default_decoder).is_err());
+
+            let mut strict_decoder = Decoder::new(malformed.clone())
+                .with_compatibility_policy(crate::CompatibilityPolicy::STRICT);
+            assert!(Value::decode(&mut strict_decoder).is_err());
+
+            let policy = crate::CompatibilityPolicy {
+                malformed_exception_payloads: true,
+                ..crate::CompatibilityPolicy::STRICT
+            };
+            let mut compatible_decoder = Decoder::new(malformed).with_compatibility_policy(policy);
+            assert_eq!(Value::decode(&mut compatible_decoder).unwrap(), expected);
+
+            let mut canonical = Decoder::from_slice(&[tag, 0x00])
+                .with_compatibility_policy(crate::CompatibilityPolicy::STRICT);
+            assert_eq!(Value::decode(&mut canonical).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn compatibility_policy_controls_bounded_string_clamping() {
+        let malformed = Bytes::from_static(&[0x04, 0x03, b'a', b'b']);
+        let mut compatible = Decoder::new(malformed.clone());
+        assert_eq!(
+            Value::decode(&mut compatible).unwrap(),
+            Value::OctetString(Bytes::from_static(b"ab"))
+        );
+
+        let policy = crate::CompatibilityPolicy {
+            clamp_bounded_strings: false,
+            ..crate::CompatibilityPolicy::DEFAULT
+        };
+        let mut strict = Decoder::new(malformed).with_compatibility_policy(policy);
+        assert!(Value::decode(&mut strict).is_err());
     }
 
     // ========================================================================

@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 use super::length::decode_length;
 use super::tag;
+use crate::compatibility::CompatibilityPolicy;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::oid::Oid;
@@ -16,6 +17,7 @@ pub struct Decoder {
     data: Bytes,
     offset: usize,
     target: Option<SocketAddr>,
+    compatibility: CompatibilityPolicy,
 }
 
 impl Decoder {
@@ -25,6 +27,7 @@ impl Decoder {
             data,
             offset: 0,
             target: None,
+            compatibility: CompatibilityPolicy::default(),
         }
     }
 
@@ -34,7 +37,21 @@ impl Decoder {
             data,
             offset: 0,
             target: Some(target),
+            compatibility: CompatibilityPolicy::default(),
         }
+    }
+
+    /// Apply an explicit malformed-input compatibility policy.
+    #[must_use]
+    pub fn with_compatibility_policy(mut self, compatibility: CompatibilityPolicy) -> Self {
+        self.compatibility = compatibility;
+        self
+    }
+
+    /// Return the malformed-input compatibility policy for this decoder.
+    #[must_use]
+    pub fn compatibility_policy(&self) -> CompatibilityPolicy {
+        self.compatibility
     }
 
     /// Create a decoder from a byte slice (copies the data).
@@ -173,10 +190,16 @@ impl Decoder {
 
     /// Read integer value given the length.
     pub fn read_integer_value(&mut self, len: usize) -> Result<i32> {
-        // The generic SNMP INTEGER path deliberately follows net-snmp's
-        // permissive truncation behavior. ASN.1 fields with narrower ranges
-        // must use `read_bounded_integer` instead.
-        Ok(self.read_signed_integer_value(len)? as i32)
+        // ASN.1 protocol fields with narrower ranges must use
+        // `read_bounded_integer`, which never consults compatibility policy.
+        let value = self.read_signed_integer_value(len)?;
+        if value < i64::from(i32::MIN) || value > i64::from(i32::MAX) {
+            if !self.compatibility.truncate_numeric_values {
+                return Err(self.malformed());
+            }
+            tracing::warn!(target: "async_snmp::ber", anomaly = "numeric_truncation", numeric_type = "integer", encoded_length = len, value, normalized = value as i32, "accepted out-of-range generic INTEGER");
+        }
+        Ok(value as i32)
     }
 
     /// Read the complete signed value of an INTEGER accepted by the generic
@@ -215,8 +238,10 @@ impl Decoder {
     /// Read 64-bit unsigned integer value given the length.
     pub fn read_integer64_value(&mut self, len: usize) -> Result<u64> {
         if len == 0 {
-            // Net-snmp accepts zero-length Counter64 silently (loop runs 0 times, value is 0).
-            tracing::warn!(target: "async_snmp::ber", { snmp.offset = %self.offset }, "zero-length Counter64; interpreting as 0");
+            if !self.compatibility.empty_counter64_as_zero {
+                return Err(self.malformed());
+            }
+            tracing::warn!(target: "async_snmp::ber", anomaly = "empty_counter64", snmp.offset = self.offset, normalized = 0_u64, "accepted zero-length Counter64");
             return Ok(0);
         }
         if len > 9 {
@@ -249,6 +274,28 @@ impl Decoder {
 
     /// Read unsigned 32-bit integer value given length.
     pub fn read_unsigned32_value(&mut self, len: usize) -> Result<u32> {
+        let value = self.read_unsigned_integer_value(len)?;
+        if value > u64::from(u32::MAX) {
+            if !self.compatibility.truncate_numeric_values {
+                return Err(self.malformed());
+            }
+            tracing::warn!(target: "async_snmp::ber", anomaly = "numeric_truncation", numeric_type = "unsigned32", encoded_length = len, value, normalized = value as u32, "accepted out-of-range generic Unsigned32");
+        }
+
+        Ok(value as u32)
+    }
+
+    /// Read a protocol Unsigned32 value without applying generic-value
+    /// truncation compatibility.
+    pub(crate) fn read_bounded_unsigned32_value(&mut self, len: usize) -> Result<u32> {
+        let value = self.read_unsigned_integer_value(len)?;
+        if value > u64::from(u32::MAX) {
+            return Err(self.malformed());
+        }
+        Ok(value as u32)
+    }
+
+    fn read_unsigned_integer_value(&mut self, len: usize) -> Result<u64> {
         if len == 0 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::ZeroLengthInteger }, "zero-length integer");
             return Err(self.malformed());
@@ -266,15 +313,11 @@ impl Decoder {
             return Err(self.malformed());
         }
 
-        // Accumulate into u64, then truncate to u32. Net-snmp does the same (CHECK_OVERFLOW_U)
-        // to stay compatible with devices that send oversized but otherwise valid encodings.
         let mut value: u64 = 0;
-
         for &byte in &bytes {
             value = (value << 8) | u64::from(byte);
         }
-
-        Ok(value as u32)
+        Ok(value)
     }
 
     /// Read an OCTET STRING.
@@ -296,12 +339,17 @@ impl Decoder {
     /// Read an OBJECT IDENTIFIER.
     pub fn read_oid(&mut self) -> Result<Oid> {
         let len = self.expect_tag(tag::universal::OBJECT_IDENTIFIER)?;
-        let bytes = self.read_bytes(len)?;
-        Oid::from_ber(&bytes).map_err(|_| self.malformed())
+        self.read_oid_value(len)
     }
 
     /// Read an OID given a pre-read length.
     pub fn read_oid_value(&mut self, len: usize) -> Result<Oid> {
+        if len == 0 {
+            if !self.compatibility.empty_object_identifier {
+                return Err(self.malformed());
+            }
+            tracing::warn!(target: "async_snmp::ber", anomaly = "empty_object_identifier", snmp.offset = self.offset, encoded_length = 0, "accepted zero-length OBJECT IDENTIFIER");
+        }
         let bytes = self.read_bytes(len)?;
         Oid::from_ber(&bytes).map_err(|_| self.malformed())
     }
@@ -319,6 +367,7 @@ impl Decoder {
             data: content,
             offset: 0,
             target: self.target,
+            compatibility: self.compatibility,
         })
     }
 
@@ -354,6 +403,7 @@ impl Decoder {
             data: content,
             offset: 0,
             target: self.target,
+            compatibility: self.compatibility,
         })
     }
 
@@ -496,6 +546,11 @@ mod tests {
             upper_bound.read_bounded_integer(0, i32::MAX).unwrap(),
             i32::MAX
         );
+
+        let mut generic_unsigned = Decoder::from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(generic_unsigned.read_unsigned32_value(5).unwrap(), 0);
+        let mut bounded_unsigned = Decoder::from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00]);
+        assert!(bounded_unsigned.read_bounded_unsigned32_value(5).is_err());
     }
 
     #[test]
@@ -522,12 +577,36 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_length_counter64_accepted() {
-        // Net-snmp accepts zero-length Counter64, producing 0. We match that.
-        let mut dec = Decoder::from_slice(&[0x46, 0x00]);
-        let result = dec.read_integer64(0x46);
-        assert!(result.is_ok(), "zero-length Counter64 should be accepted");
-        assert_eq!(result.unwrap(), 0);
+    fn compatibility_policy_controls_zero_length_counter64() {
+        let mut compatible = Decoder::from_slice(&[0x46, 0x00]);
+        assert_eq!(compatible.read_integer64(0x46).unwrap(), 0);
+
+        let policy = CompatibilityPolicy {
+            empty_counter64_as_zero: false,
+            ..CompatibilityPolicy::DEFAULT
+        };
+        let mut strict = Decoder::from_slice(&[0x46, 0x00]).with_compatibility_policy(policy);
+        assert!(strict.read_integer64(0x46).is_err());
+    }
+
+    #[test]
+    fn compatibility_policy_controls_numeric_truncation() {
+        let signed = [0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let unsigned = [0x42, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00];
+
+        let mut compatible_signed = Decoder::from_slice(&signed);
+        assert_eq!(compatible_signed.read_integer().unwrap(), 0);
+        let policy = CompatibilityPolicy {
+            truncate_numeric_values: false,
+            ..CompatibilityPolicy::DEFAULT
+        };
+        let mut strict_signed = Decoder::from_slice(&signed).with_compatibility_policy(policy);
+        assert!(strict_signed.read_integer().is_err());
+
+        let mut compatible_unsigned = Decoder::from_slice(&unsigned);
+        assert_eq!(compatible_unsigned.read_unsigned32(0x42).unwrap(), 0);
+        let mut strict_unsigned = Decoder::from_slice(&unsigned).with_compatibility_policy(policy);
+        assert!(strict_unsigned.read_unsigned32(0x42).is_err());
     }
 
     #[test]
