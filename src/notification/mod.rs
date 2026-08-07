@@ -114,6 +114,21 @@
 //! Response uses its current coherent boots/time rather than echoing the
 //! incoming tuple. Configuring any USM user therefore requires a persisted
 //! [`AuthoritativeEngine`].
+//!
+//! # Notification Varbind Validation
+//!
+//! SNMPv2c and SNMPv3 TrapV2 and Inform PDUs start with an uptime value and a
+//! trap OID value. By default, [`NotificationVarbindValidation::Tolerant`]
+//! accepts non-standard names for those two varbinds, but still requires at
+//! least two varbinds with `TimeTicks` then `ObjectIdentifier` values.
+//! [`NotificationVarbindValidation::Strict`] additionally requires the exact
+//! `sysUpTime.0` then `snmpTrapOID.0` names and order. Configure strict mode with
+//! [`NotificationReceiverBuilder::varbind_validation`].
+//!
+//! A notification that fails the selected validation is dropped and not
+//! returned by [`NotificationReceiver::recv`]. A rejected Inform is not
+//! acknowledged. This policy does not affect SNMPv1 traps, community or USM
+//! checks, SNMPv3 engine correlation, or outbound PDU construction.
 
 mod handlers;
 mod varbind;
@@ -141,7 +156,7 @@ use crate::version::Version;
 
 // Re-exports retained for compatibility with the original notification-local path.
 pub use crate::v3::{DerivedKeys, UsmConfig};
-pub use varbind::validate_notification_varbinds;
+pub use varbind::{NotificationVarbindValidation, validate_notification_varbinds};
 
 /// Maximum number of distinct remote authoritative engines whose timeliness
 /// state is retained for trap senders. A peer holding one USM credential can
@@ -243,16 +258,18 @@ pub mod oids {
 
 /// Builder for `NotificationReceiver`.
 ///
-/// Configures the bind address, optional community filtering for v1/v2c, and
-/// USM credentials for v3. Community filtering and USM users are independent
-/// and may be combined; a single receiver then handles all versions on one
-/// port. Any USM user also requires a persisted [`AuthoritativeEngine`]. See
-/// the [module docs](crate::notification#mixed-versions-on-one-port).
+/// Configures the bind address, optional community filtering for v1/v2c, the
+/// standard notification varbind validation policy, and USM credentials for
+/// v3. Community filtering and USM users are independent and may be combined;
+/// a single receiver then handles all versions on one port. Any USM user also
+/// requires a persisted [`AuthoritativeEngine`]. See the
+/// [module docs](crate::notification#mixed-versions-on-one-port).
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
     communities: Vec<Vec<u8>>,
     authoritative_engine: Option<AuthoritativeEngine>,
+    varbind_validation: NotificationVarbindValidation,
 }
 
 impl NotificationReceiverBuilder {
@@ -262,6 +279,7 @@ impl NotificationReceiverBuilder {
     /// - Bind address: `0.0.0.0:162` (UDP, standard SNMP trap port)
     /// - No USM users (v3 notifications rejected until users are added)
     /// - No authoritative engine (required when adding a USM user)
+    /// - Tolerant notification varbind validation
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -269,6 +287,7 @@ impl NotificationReceiverBuilder {
             usm_users: HashMap::new(),
             communities: Vec::new(),
             authoritative_engine: None,
+            varbind_validation: NotificationVarbindValidation::Tolerant,
         }
     }
 
@@ -278,6 +297,23 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
+        self
+    }
+
+    /// Set validation for the standard SNMPv2c/v3 notification varbind prefix.
+    ///
+    /// The default [`NotificationVarbindValidation::Tolerant`] mode accepts
+    /// arbitrary names when the first two values are `TimeTicks` then
+    /// `ObjectIdentifier`. [`NotificationVarbindValidation::Strict`] also
+    /// requires the exact `sysUpTime.0` then `snmpTrapOID.0` names and order.
+    /// In either mode, a failed notification is not returned from
+    /// [`NotificationReceiver::recv`], and a failed Inform is not acknowledged.
+    ///
+    /// This setting does not apply to SNMPv1 traps and does not change
+    /// authentication, SNMPv3 engine correlation, or outbound validation.
+    #[must_use]
+    pub fn varbind_validation(mut self, policy: NotificationVarbindValidation) -> Self {
+        self.varbind_validation = policy;
         self
     }
 
@@ -473,6 +509,7 @@ impl NotificationReceiverBuilder {
                 local_addr,
                 usm_users: self.usm_users,
                 communities: self.communities,
+                varbind_validation: self.varbind_validation,
                 engine_id,
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: engine_boots,
@@ -699,6 +736,8 @@ struct ReceiverInner {
     /// (community filtering is opt-in); otherwise a v1/v2c notification whose
     /// community matches none of these is dropped.
     communities: Vec<Vec<u8>>,
+    /// Validation policy for SNMPv2c/v3 standard notification varbind prefixes.
+    varbind_validation: NotificationVarbindValidation,
     /// Engine ID for V3 discovery responses
     engine_id: Bytes,
     /// Salt counter for privacy operations
@@ -737,7 +776,8 @@ impl ReceiverInner {
 impl NotificationReceiver {
     /// Create a builder for configuring the notification receiver.
     ///
-    /// Use this to configure USM credentials for V3 authentication.
+    /// Use this to configure varbind validation or USM credentials for V3
+    /// authentication.
     #[must_use]
     pub fn builder() -> NotificationReceiverBuilder {
         NotificationReceiverBuilder::new()
@@ -745,7 +785,9 @@ impl NotificationReceiver {
 
     /// Bind to a local address.
     ///
-    /// The standard SNMP notification port is 162.
+    /// The standard SNMP notification port is 162. This construction path uses
+    /// [`NotificationVarbindValidation::Tolerant`]; use the builder to select
+    /// strict validation.
     ///
     /// A receiver constructed this way handles v1 and v2c notifications
     /// only: it has no USM user table, so every v3 notification (including
@@ -795,6 +837,7 @@ impl NotificationReceiver {
                 local_addr,
                 usm_users: HashMap::new(),
                 communities: Vec::new(),
+                varbind_validation: NotificationVarbindValidation::Tolerant,
                 engine_id,
                 salt_counter: SaltCounter::new(),
                 engine_boots_base: 1,
@@ -1010,6 +1053,44 @@ mod tests {
         let builder = NotificationReceiverBuilder::new();
         assert_eq!(builder.bind_addr, "0.0.0.0:162");
         assert!(builder.usm_users.is_empty());
+        assert_eq!(
+            builder.varbind_validation,
+            NotificationVarbindValidation::Tolerant
+        );
+        assert_eq!(
+            NotificationVarbindValidation::default(),
+            NotificationVarbindValidation::Tolerant
+        );
+    }
+
+    #[test]
+    fn test_notification_receiver_builder_varbind_validation() {
+        let builder = NotificationReceiverBuilder::new()
+            .varbind_validation(NotificationVarbindValidation::Strict);
+        assert_eq!(
+            builder.varbind_validation,
+            NotificationVarbindValidation::Strict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notification_receiver_varbind_validation_construction_paths() {
+        let built = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .varbind_validation(NotificationVarbindValidation::Strict)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            built.inner.varbind_validation,
+            NotificationVarbindValidation::Strict
+        );
+
+        let bound = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            bound.inner.varbind_validation,
+            NotificationVarbindValidation::Tolerant
+        );
     }
 
     #[test]

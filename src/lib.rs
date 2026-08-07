@@ -503,7 +503,8 @@ pub use message_size::{
     ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
 };
 pub use notification::{
-    Notification, NotificationReceiver, NotificationReceiverBuilder, validate_notification_varbinds,
+    Notification, NotificationReceiver, NotificationReceiverBuilder, NotificationVarbindValidation,
+    validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};

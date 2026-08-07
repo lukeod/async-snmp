@@ -74,7 +74,8 @@ impl super::NotificationReceiver {
 
         match pdu.pdu_type {
             PduType::TrapV2 => {
-                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(pdu)?;
+                let (uptime, trap_oid, varbinds) =
+                    extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
                 Ok(Some(Notification::TrapV2c {
                     community: msg.community,
                     uptime,
@@ -84,7 +85,8 @@ impl super::NotificationReceiver {
                 }))
             }
             PduType::InformRequest => {
-                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(pdu)?;
+                let (uptime, trap_oid, varbinds) =
+                    extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
                 let request_id = pdu.request_id;
 
                 // Send response
@@ -185,7 +187,8 @@ impl super::NotificationReceiver {
 
         match pdu.pdu_type {
             PduType::TrapV2 => {
-                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(pdu)?;
+                let (uptime, trap_oid, varbinds) =
+                    extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
                 Ok(Some(Notification::TrapV3 {
                     username,
                     context_engine_id,
@@ -211,7 +214,8 @@ impl super::NotificationReceiver {
                     return Ok(None);
                 }
 
-                let (uptime, trap_oid, varbinds) = extract_notification_varbinds(pdu)?;
+                let (uptime, trap_oid, varbinds) =
+                    extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
                 let request_id = pdu.request_id;
 
                 // Build and send response with appropriate security level

@@ -1,11 +1,14 @@
 //! Integration tests for notification sending (trap/inform).
 
 use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
-use async_snmp::notification::{Notification, NotificationReceiver};
+use async_snmp::message::CommunityMessage;
+use async_snmp::notification::{Notification, NotificationReceiver, NotificationVarbindValidation};
 use async_snmp::v3::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
 use async_snmp::varbind::VarBind;
-use async_snmp::{Auth, Client, Pdu, Retry, Value, oid};
+use async_snmp::{Auth, Client, Pdu, PduType, Retry, Value, oid};
+use bytes::Bytes;
 use std::time::Duration;
+use tokio::net::UdpSocket;
 
 fn test_authoritative_engine(engine_id: Vec<u8>) -> AuthoritativeEngine {
     AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(())).unwrap()
@@ -69,6 +72,231 @@ fn pdu_trap_v2_empty_varbinds() {
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2); // warmStart
     let pdu = Pdu::trap_v2(1, 0, &trap_oid, vec![]);
     assert_eq!(pdu.varbinds.len(), 2);
+}
+
+fn encode_raw_v2c_notification(
+    pdu_type: PduType,
+    request_id: i32,
+    varbinds: Vec<VarBind>,
+) -> Bytes {
+    CommunityMessage::v2c(
+        "public",
+        Pdu {
+            pdu_type,
+            request_id,
+            error_status: 0,
+            error_index: 0,
+            varbinds,
+        },
+    )
+    .encode()
+    .unwrap()
+}
+
+fn nonstandard_name_varbinds(uptime: u32) -> Vec<VarBind> {
+    vec![
+        VarBind::new(oid!(1, 2, 3, 4), Value::TimeTicks(uptime)),
+        VarBind::new(
+            oid!(1, 2, 3, 5),
+            Value::ObjectIdentifier(oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3)),
+        ),
+    ]
+}
+
+fn valid_sentinel_trap(request_id: i32) -> Bytes {
+    CommunityMessage::v2c(
+        "public",
+        Pdu::trap_v2(request_id, 777, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), vec![]),
+    )
+    .encode()
+    .unwrap()
+}
+
+async fn assert_sentinel_received(
+    handle: tokio::task::JoinHandle<(Notification, std::net::SocketAddr)>,
+) {
+    let (notification, _) = handle.await.unwrap();
+    assert!(matches!(
+        notification,
+        Notification::TrapV2c {
+            uptime: 777,
+            request_id: 999,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn notification_varbind_validation_controls_trap_delivery() {
+    let tolerant = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let malformed =
+        encode_raw_v2c_notification(PduType::TrapV2, 41, nonstandard_name_varbinds(1234));
+    sender
+        .send_to(&malformed, tolerant.local_addr())
+        .await
+        .unwrap();
+
+    let (notification, _) = tokio::time::timeout(Duration::from_secs(5), tolerant.recv())
+        .await
+        .expect("timeout waiting for tolerant trap")
+        .unwrap();
+    assert!(matches!(
+        notification,
+        Notification::TrapV2c {
+            uptime: 1234,
+            request_id: 41,
+            ..
+        }
+    ));
+
+    let strict = NotificationReceiver::builder()
+        .bind("127.0.0.1:0")
+        .varbind_validation(NotificationVarbindValidation::Strict)
+        .build()
+        .await
+        .unwrap();
+    let strict_addr = strict.local_addr();
+    let mut recv_handle = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), strict.recv())
+            .await
+            .expect("timeout waiting for sentinel trap")
+            .unwrap()
+    });
+    sender.send_to(&malformed, strict_addr).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut recv_handle)
+            .await
+            .is_err(),
+        "strict receiver returned malformed-name Trap"
+    );
+    sender
+        .send_to(&valid_sentinel_trap(999), strict_addr)
+        .await
+        .unwrap();
+    assert_sentinel_received(recv_handle).await;
+}
+
+#[tokio::test]
+async fn notification_varbind_validation_controls_inform_acknowledgement() {
+    let tolerant = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let tolerant_addr = tolerant.local_addr();
+    let recv_handle = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), tolerant.recv())
+            .await
+            .expect("timeout waiting for tolerant inform")
+            .unwrap()
+    });
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let malformed =
+        encode_raw_v2c_notification(PduType::InformRequest, 42, nonstandard_name_varbinds(2345));
+    sender.send_to(&malformed, tolerant_addr).await.unwrap();
+
+    let mut response = [0u8; 2048];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(5), sender.recv_from(&mut response))
+        .await
+        .expect("timeout waiting for tolerant Inform acknowledgement")
+        .unwrap();
+    let response_msg = CommunityMessage::decode(Bytes::copy_from_slice(&response[..len])).unwrap();
+    let response_pdu = response_msg.into_pdu().unwrap();
+    assert_eq!(response_pdu.pdu_type, PduType::Response);
+    assert_eq!(response_pdu.request_id, 42);
+    let (notification, _) = recv_handle.await.unwrap();
+    assert!(matches!(
+        notification,
+        Notification::InformV2c {
+            uptime: 2345,
+            request_id: 42,
+            ..
+        }
+    ));
+
+    let strict = NotificationReceiver::builder()
+        .bind("127.0.0.1:0")
+        .varbind_validation(NotificationVarbindValidation::Strict)
+        .build()
+        .await
+        .unwrap();
+    let strict_addr = strict.local_addr();
+    let recv_handle = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), strict.recv())
+            .await
+            .expect("timeout waiting for sentinel trap")
+            .unwrap()
+    });
+    sender.send_to(&malformed, strict_addr).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), sender.recv_from(&mut response))
+            .await
+            .is_err(),
+        "strict receiver acknowledged malformed-name Inform"
+    );
+    sender
+        .send_to(&valid_sentinel_trap(999), strict_addr)
+        .await
+        .unwrap();
+    assert_sentinel_received(recv_handle).await;
+}
+
+#[tokio::test]
+async fn notification_varbind_validation_rejects_unusable_prefixes_without_acknowledgement() {
+    for policy in [
+        NotificationVarbindValidation::Tolerant,
+        NotificationVarbindValidation::Strict,
+    ] {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .varbind_validation(policy)
+            .build()
+            .await
+            .unwrap();
+        let receiver_addr = receiver.local_addr();
+        let recv_handle = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("timeout waiting for sentinel trap")
+                .unwrap()
+        });
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let unusable_prefixes = [
+            vec![],
+            vec![VarBind::new(
+                oid!(1, 3, 6, 1, 2, 1, 1, 3, 0),
+                Value::TimeTicks(1234),
+            )],
+            vec![
+                VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::Integer(1234)),
+                VarBind::new(
+                    oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0),
+                    Value::ObjectIdentifier(oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3)),
+                ),
+            ],
+            vec![
+                VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::TimeTicks(1234)),
+                VarBind::new(oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0), Value::Integer(3)),
+            ],
+        ];
+        let mut response = [0u8; 2048];
+        for (offset, varbinds) in unusable_prefixes.into_iter().enumerate() {
+            let malformed = encode_raw_v2c_notification(
+                PduType::InformRequest,
+                43 + i32::try_from(offset).unwrap(),
+                varbinds,
+            );
+            sender.send_to(&malformed, receiver_addr).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), sender.recv_from(&mut response))
+                    .await
+                    .is_err(),
+                "{policy:?} receiver acknowledged unusable-prefix Inform"
+            );
+        }
+        sender
+            .send_to(&valid_sentinel_trap(999), receiver_addr)
+            .await
+            .unwrap();
+        assert_sentinel_received(recv_handle).await;
+    }
 }
 
 // ============================================================================

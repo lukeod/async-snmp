@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Notification receivers now expose `NotificationVarbindValidation` through
+  `NotificationReceiverBuilder::varbind_validation()`. The default tolerant
+  policy accepts non-standard first/second varbind names when their values are
+  usable, while strict mode requires the RFC names and order; rejected Informs
+  are not acknowledged.
 - **Breaking:** Walk collectors no longer issue a scalar GET after an empty
   GETNEXT/GETBULK walk. Inherent `next`/`collect`, direct stream polling, and
   `StreamExt` consumers now observe the same walk results and request sequence;
