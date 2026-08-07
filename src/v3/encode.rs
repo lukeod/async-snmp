@@ -161,17 +161,18 @@ pub(crate) fn sign_v3_message(
 ///
 /// Shared by the agent and the notification receiver. `usm` carries the
 /// responder's engine ID/boots/time and echoes the requester's username;
-/// `msg_id` and `msg_max_size` echo the incoming message header. With
-/// `auth_key` the report is sent authenticated at authNoPriv, as RFC 3414
-/// Section 3.2 Step 7a requires for notInTimeWindows reports so the sender
-/// can authenticate the tuple and apply normal Step 7(b) timeliness
-/// processing. Otherwise it is noAuthNoPriv.
+/// `msg_id` correlates the incoming message, while `local_receive_capacity`
+/// advertises the Report sender's own receive capability. With `auth_key` the
+/// report is sent authenticated at authNoPriv, as RFC 3414 Section 3.2 Step 7a
+/// requires for notInTimeWindows reports so the sender can authenticate the
+/// tuple and apply normal Step 7(b) timeliness processing. Otherwise it is
+/// noAuthNoPriv.
 ///
 /// The reportableFlag check (whether a report may be sent at all) is the
 /// caller's responsibility.
 pub(crate) fn encode_v3_report(
     msg_id: i32,
-    msg_max_size: i32,
+    local_receive_capacity: i32,
     usm: UsmSecurityParams,
     report_oid: Oid,
     counter_value: u32,
@@ -196,7 +197,11 @@ pub(crate) fn encode_v3_report(
     } else {
         SecurityLevel::NoAuthNoPriv
     };
-    let global = MsgGlobalData::new(msg_id, msg_max_size, MsgFlags::new(security_level, false));
+    let global = MsgGlobalData::new(
+        msg_id,
+        local_receive_capacity,
+        MsgFlags::new(security_level, false),
+    );
 
     let scoped = ScopedPdu::new(usm.engine_id.clone(), Bytes::new(), report_pdu);
 

@@ -118,6 +118,7 @@ impl Agent {
             engine_id: &state.engine_id,
             engine_boots: state.engine_boots.load(Ordering::Relaxed),
             engine_time: state.engine_time.load(Ordering::Relaxed),
+            local_receive_capacity: state.local_receive_capacity,
             usm_users: &self.inner.usm_users,
             stats: &state.usm_stats,
             mpd: Some(MpdCounters {

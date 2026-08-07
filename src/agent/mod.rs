@@ -476,9 +476,12 @@ impl AgentBuilder {
     ///
     /// Default is 1472 octets (fits Ethernet MTU minus IP/UDP headers).
     /// GETBULK responses will be truncated to fit within this limit.
+    /// Values above the UDP receive capacity advertised by this agent (65507
+    /// octets) are rejected by [`AgentBuilder::build`].
     ///
     /// For `SNMPv3` requests, the agent uses the minimum of this value
-    /// and the msgMaxSize from the request.
+    /// and the msgMaxSize from the request. This outbound response limit is
+    /// independent of the local receive capacity advertised in V3 messages.
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
@@ -710,8 +713,21 @@ impl AgentBuilder {
     /// Build the agent.
     ///
     /// Returns a configuration error when USM users or V3 trap sinks are
-    /// configured without a persisted [`AuthoritativeEngine`].
+    /// configured without a persisted [`AuthoritativeEngine`], or when the
+    /// response-size limit exceeds the fixed UDP receive capacity.
     pub async fn build(mut self) -> Result<Agent> {
+        let max_udp_message_size = usize::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE)
+            .expect("default UDP message size must fit in usize");
+        if self.max_message_size > max_udp_message_size {
+            return Err(Error::Config(
+                format!("max_message_size must not exceed UDP capacity {max_udp_message_size}")
+                    .into(),
+            )
+            .boxed());
+        }
+        let local_receive_capacity = i32::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE)
+            .expect("default SNMPv3 message size must fit in i32");
+
         // Precompute master keys so the expensive password expansion runs once
         // here instead of on every inbound packet (CPU amplification).
         for config in self.usm_users.values_mut() {
@@ -795,6 +811,7 @@ impl AgentBuilder {
             engine_start: Instant::now(),
             engine_boots_base: engine_boots,
             max_message_size: self.max_message_size,
+            local_receive_capacity,
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(0),
             snmp_unknown_security_models: AtomicU32::new(0),
@@ -868,7 +885,10 @@ pub(crate) struct AgentState {
     pub(crate) engine_start: Instant,
     /// Initial `engine_boots` value at startup, used to compute overflow-adjusted boots.
     pub(crate) engine_boots_base: u32,
+    /// Configured upper bound for outbound response messages.
     pub(crate) max_message_size: usize,
+    /// Wire-valid `msgMaxSize` advertising this agent's UDP receive capacity.
+    pub(crate) local_receive_capacity: i32,
     /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
     /// their ASN.1 representation is invalid for the received SNMP version
     pub(crate) snmp_in_asn_parse_errs: AtomicU32,
@@ -3366,6 +3386,22 @@ mod tests {
 
         let err = result.err().expect("expected build to fail");
         assert!(matches!(*err, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn test_max_message_size_above_udp_capacity_rejected_before_bind() {
+        let max_udp_message_size = usize::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE).unwrap();
+        let result = Agent::builder()
+            .bind("not a socket address")
+            .max_message_size(max_udp_message_size + 1)
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        match *err {
+            Error::Config(message) => assert!(message.contains("max_message_size")),
+            other => panic!("expected max_message_size configuration error, got {other}"),
+        }
     }
 
     #[tokio::test]

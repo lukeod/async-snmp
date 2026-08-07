@@ -48,14 +48,12 @@ impl Agent {
         );
 
         // RFC 3412 Section 6.3: msgMaxSize advertises this agent's own receive
-        // capacity, not the requester's echoed value.
-        let advertised_max_size =
-            i32::try_from(self.inner.state.max_message_size).unwrap_or(i32::MAX);
-
+        // capacity, not the requester's echoed value or the outbound response
+        // size limit.
         encode_v3_response(
             response_pdu,
             incoming.msg_id,
-            advertised_max_size,
+            self.inner.state.local_receive_capacity,
             security_level,
             response_usm,
             context_engine_id,
@@ -294,9 +292,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Incoming message advertises a much larger msgMaxSize (65507).
-        let msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
-        assert_eq!(msg.msg_max_size, 65507);
+        // Keep the incoming value, local capacity, and response cap distinct.
+        let mut msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
+        msg.msg_max_size = 4096;
+        assert_eq!(agent.inner.state.max_message_size, 1400);
+        assert_eq!(agent.inner.state.local_receive_capacity, 65507);
         let usm = dummy_usm();
 
         let result = agent
@@ -313,8 +313,8 @@ mod tests {
 
         let decoded = V3Message::decode(result).unwrap();
         assert_eq!(
-            decoded.global_data.msg_max_size, 1400,
-            "response must advertise the agent's local receive capacity, not the requester's value"
+            decoded.global_data.msg_max_size, 65507,
+            "response must advertise local receive capacity, not the peer value or response cap"
         );
     }
 }

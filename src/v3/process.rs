@@ -116,6 +116,8 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) engine_id: &'a Bytes,
     pub(crate) engine_boots: u32,
     pub(crate) engine_time: u32,
+    /// Wire-valid `msgMaxSize` advertising this receiver's local capacity.
+    pub(crate) local_receive_capacity: i32,
     pub(crate) usm_users: &'a HashMap<Bytes, UsmConfig>,
     pub(crate) stats: &'a UsmStats,
     pub(crate) mpd: Option<MpdCounters<'a>>,
@@ -194,7 +196,7 @@ pub(crate) fn process_v3_inbound(
         let report = if msg.global_data.msg_flags.reportable {
             Some(encode_v3_report(
                 msg.global_data.msg_id,
-                msg.global_data.msg_max_size,
+                ctx.local_receive_capacity,
                 UsmSecurityParams::new(
                     ctx.engine_id.clone(),
                     ctx.engine_boots,
@@ -391,6 +393,7 @@ mod tests {
             engine_id,
             engine_boots: 7,
             engine_time: 1000,
+            local_receive_capacity: 8192,
             usm_users,
             stats,
             mpd,
@@ -503,6 +506,11 @@ mod tests {
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
         let data = V3Message::discovery_request(5).encode().unwrap();
+        let request = V3Message::decode(data.clone()).unwrap();
+        assert_ne!(
+            request.global_data.msg_max_size, ctx.local_receive_capacity,
+            "test requires distinct requester and local capacities"
+        );
         let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
 
         let V3Inbound::Failed { failure, report } = outcome else {
@@ -513,6 +521,10 @@ mod tests {
 
         let report = V3Message::decode(report.expect("reportable message gets a report")).unwrap();
         assert_eq!(report.global_data.msg_id, 5);
+        assert_eq!(
+            report.global_data.msg_max_size, 8192,
+            "Report must advertise the local receive capacity, not the requester's value"
+        );
         let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
         assert_eq!(report_usm.engine_id, engine_id);
         assert_eq!(report_usm.engine_boots, 7);

@@ -132,6 +132,8 @@ impl super::NotificationReceiver {
             engine_id: &self.inner.engine_id,
             engine_boots: our_boots,
             engine_time: our_time,
+            local_receive_capacity: i32::try_from(crate::v3::DEFAULT_MSG_MAX_SIZE)
+                .expect("default SNMPv3 message size must fit in i32"),
             usm_users: &self.inner.usm_users,
             stats: &self.inner.usm_stats,
             mpd: None,

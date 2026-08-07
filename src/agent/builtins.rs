@@ -53,7 +53,7 @@ impl SnmpEngineHandler {
             3 => Some(Value::Integer(
                 self.state.engine_time.load(Ordering::Relaxed) as i32,
             )),
-            4 => Some(Value::Integer(self.state.max_message_size as i32)),
+            4 => Some(Value::Integer(self.state.local_receive_capacity)),
             _ => None,
         }
     }
@@ -305,6 +305,7 @@ mod tests {
             engine_start: Instant::now(),
             engine_boots_base: 5,
             max_message_size: 1472,
+            local_receive_capacity: 65507,
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(10),
             snmp_unknown_security_models: AtomicU32::new(20),
@@ -398,7 +399,7 @@ mod tests {
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
             .await
             .unwrap();
-        assert!(matches!(result, GetResult::Value(Value::Integer(1472))));
+        assert!(matches!(result, GetResult::Value(Value::Integer(65507))));
     }
 
     #[tokio::test]
