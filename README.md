@@ -228,9 +228,17 @@ A shared socket uses one file descriptor and one recv loop for all targets, inst
 
 | Approach | When to use |
 |----------|-------------|
-| Shared socket (`build_with()`) | Multiple targets from one process. One FD, one recv loop. Responses are demuxed by request ID. |
+| Shared socket (`build_with()`) | Multiple targets from one process. One FD, one recv loop. V1/v2c responses are correlated by request ID, version, and community; v3 uses msgID plus authenticated client checks. |
 | Multiple shared sockets | High target counts (100k+), sharded by subnet or target group |
 | Per-client socket (`.connect()`) | Default for simple use. Each client gets its own socket and OS buffer. |
+
+UDP source checking is permissive by default for multihomed agents and proxy
+paths, while v1/v2c community matching remains exact. Proxies that rewrite the
+community can opt into `CommunityResponsePolicy::AllowMismatchFromTarget`.
+`AllowMismatchFromAnySource` also accepts an off-target rewritten response and
+therefore weakens spoof resistance. `strict_source(true)` is independent and
+always rejects off-target responses. Rejected packets increment the transport
+`unmatched` counter; accepted source or community anomalies emit warnings.
 
 ### Using from Synchronous Code
 

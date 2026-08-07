@@ -28,7 +28,8 @@
 //! A single background task reads all datagrams from the socket. Each incoming
 //! response is matched to its caller by extracting the request ID (or msgID for
 //! `SNMPv3`) from the packet header and looking up the corresponding pending
-//! request slot. The pending map is sharded (64 shards, keyed by request ID) to
+//! request slot. V1/v2c slots additionally enforce the registered version and
+//! community policy before consuming a response. The pending map is sharded (64 shards, keyed by request ID) to
 //! reduce lock contention under high concurrency.
 //!
 //! `connect()` creates a dedicated `UdpTransport` per client. `build_with()`
@@ -67,7 +68,7 @@
 
 pub use super::udp_core::TransportStats;
 use super::udp_core::UdpCore;
-use super::{Transport, extract_request_id};
+use super::{RequestRegistration, Transport, extract_request_id};
 use crate::error::{Error, Result};
 use crate::util::bind_udp_socket;
 use bytes::Bytes;
@@ -432,8 +433,7 @@ pub struct UdpHandle {
 impl UdpHandle {
     /// Require responses to originate from this handle's target address.
     ///
-    /// By default (false), responses are matched by request ID alone and a
-    /// source mismatch only logs a warning (see
+    /// By default (false), a source mismatch does not reject a response (see
     /// [`warn_on_source_mismatch`](UdpTransportBuilder::warn_on_source_mismatch)),
     /// because multihomed agents may legitimately reply from a different
     /// address. When enabled, a response from any other address is dropped
@@ -512,9 +512,10 @@ impl Transport for UdpHandle {
         false
     }
 
-    fn register_request(&self, request_id: i32, timeout: Duration) {
-        let expected = self.strict_source.then_some(self.target);
-        self.inner.core.register(request_id, timeout, expected);
+    fn register_request(&self, registration: RequestRegistration) {
+        self.inner
+            .core
+            .register(registration, self.target, self.strict_source);
     }
 
     fn register_request_alias(&self, alias_id: i32, primary_id: i32, timeout: Duration) {
@@ -527,6 +528,16 @@ impl Transport for UdpHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    trait TestRegister {
+        fn register_v3(&self, request_id: i32, timeout: Duration);
+    }
+
+    impl<T: Transport> TestRegister for T {
+        fn register_v3(&self, request_id: i32, timeout: Duration) {
+            Transport::register_request(self, RequestRegistration::v3(request_id, timeout));
+        }
+    }
 
     #[test]
     fn recv_error_backoff_starts_at_min_and_grows() {
@@ -632,7 +643,7 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         // Target port 9 (discard): no response will ever arrive.
         let handle = transport.handle("127.0.0.1:9".parse().unwrap());
-        handle.register_request(42, Duration::from_secs(30));
+        handle.register_v3(42, Duration::from_secs(30));
         let waiter = tokio::spawn(async move { handle.recv(42).await });
         // Let the waiter park on its notify before shutting down.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -692,7 +703,7 @@ mod tests {
         let handle = transport.handle("127.0.0.1:9".parse().unwrap());
 
         let request_id = 55;
-        handle.register_request(request_id, Duration::from_secs(30));
+        handle.register_v3(request_id, Duration::from_secs(30));
 
         // Payload beyond the maximum UDP datagram size; send_to returns EMSGSIZE.
         let oversized = vec![0u8; 70_000];
@@ -750,7 +761,7 @@ mod tests {
 
         // Default config: warn_on_source_mismatch is true.
         let handle = transport.handle(target);
-        handle.register_request(42, Duration::from_secs(5));
+        handle.register_v3(42, Duration::from_secs(5));
 
         let packet = response_packet(42);
         assert!(
@@ -781,7 +792,7 @@ mod tests {
         assert_ne!(target, mismatched);
 
         let handle = transport.handle(target);
-        handle.register_request(7, Duration::from_secs(5));
+        handle.register_v3(7, Duration::from_secs(5));
 
         let packet = response_packet(7);
         assert!(transport.inner.core.deliver(7, packet.clone(), mismatched));
@@ -820,7 +831,7 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
         let handle = transport.handle(target);
-        handle.register_request(7, Duration::from_secs(5));
+        handle.register_v3(7, Duration::from_secs(5));
 
         let packet = response_packet(7);
         assert!(transport.inner.core.deliver(7, packet.clone(), target));
@@ -862,7 +873,7 @@ mod tests {
     async fn cleanup_expired_counts_expired() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap());
-        handle.register_request(13, Duration::ZERO);
+        handle.register_v3(13, Duration::ZERO);
 
         transport.inner.core.cleanup_expired();
 
@@ -876,7 +887,7 @@ mod tests {
         let mismatched: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let handle = transport.handle(target).strict_source(true);
-        handle.register_request(21, Duration::from_secs(5));
+        handle.register_v3(21, Duration::from_secs(5));
 
         let packet = response_packet(21);
         assert!(
@@ -903,7 +914,7 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
         let handle = transport.handle(target).strict_source(true);
-        handle.register_request(22, Duration::from_secs(5));
+        handle.register_v3(22, Duration::from_secs(5));
 
         let packet = response_packet(22);
         assert!(transport.inner.core.deliver(22, packet.clone(), target));
@@ -923,7 +934,7 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
         let handle = transport.handle(target);
-        handle.register_request(99, Duration::from_secs(5));
+        handle.register_v3(99, Duration::from_secs(5));
 
         let packet = response_packet(99);
         assert!(transport.inner.core.deliver(99, packet.clone(), target));

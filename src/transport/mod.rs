@@ -22,6 +22,7 @@ pub use udp::*;
 
 use crate::ber::length::parse_ber_length;
 use crate::error::Result;
+use crate::version::Version;
 use bytes::Bytes;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -66,18 +67,139 @@ pub fn alloc_request_id() -> i32 {
     }
 }
 
+/// Policy for correlating SNMPv1/v2c responses whose community was rewritten.
+///
+/// Response versions always have to match. UDP strict-source checking is an
+/// independent control and, when enabled, rejects every off-target response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommunityResponsePolicy {
+    /// Require byte-for-byte equality with the request community.
+    #[default]
+    Exact,
+    /// Accept a rewritten community only from the configured target.
+    ///
+    /// An off-target response whose community matches exactly remains accepted
+    /// when UDP strict-source checking is disabled.
+    AllowMismatchFromTarget,
+    /// Accept a rewritten community from any source.
+    ///
+    /// With permissive UDP source checking this explicitly accepts both peer
+    /// and community mismatches and therefore weakens spoof resistance.
+    AllowMismatchFromAnySource,
+}
+
+/// Response identity supplied when registering an in-flight request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseCorrelation {
+    /// SNMPv1/v2c responses must match this version and community policy.
+    Community {
+        /// Expected SNMP version.
+        version: Version,
+        /// Community sent in the request.
+        community: Bytes,
+        /// Policy for safely accepting a rewritten community.
+        policy: CommunityResponsePolicy,
+    },
+    /// SNMPv3 correlation uses msgID and its existing authenticated checks.
+    V3,
+}
+
+/// Correlation metadata for an in-flight request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRegistration {
+    /// Request ID (v1/v2c) or msgID (v3).
+    pub request_id: i32,
+    /// Overall response deadline duration.
+    pub timeout: Duration,
+    /// Protocol-specific response identity.
+    pub correlation: ResponseCorrelation,
+}
+
+impl RequestRegistration {
+    /// Construct v1/v2c registration metadata.
+    #[must_use]
+    pub fn community(
+        request_id: i32,
+        timeout: Duration,
+        version: Version,
+        community: Bytes,
+        policy: CommunityResponsePolicy,
+    ) -> Self {
+        Self {
+            request_id,
+            timeout,
+            correlation: ResponseCorrelation::Community {
+                version,
+                community,
+                policy,
+            },
+        }
+    }
+
+    /// Construct SNMPv3 registration metadata.
+    #[must_use]
+    pub const fn v3(request_id: i32, timeout: Duration) -> Self {
+        Self {
+            request_id,
+            timeout,
+            correlation: ResponseCorrelation::V3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorrelationResult {
+    Match,
+    AcceptedCommunityMismatch,
+    Reject,
+}
+
+impl ResponseCorrelation {
+    pub(crate) fn evaluate(&self, data: &[u8], source_is_target: bool) -> CorrelationResult {
+        let Self::Community {
+            version,
+            community,
+            policy,
+        } = self
+        else {
+            return CorrelationResult::Match;
+        };
+
+        let Some((actual_version, actual_community)) = extract_community_identity(data) else {
+            return CorrelationResult::Reject;
+        };
+        if actual_version != *version {
+            return CorrelationResult::Reject;
+        }
+        if actual_community == community.as_ref() {
+            return CorrelationResult::Match;
+        }
+        match policy {
+            CommunityResponsePolicy::Exact => CorrelationResult::Reject,
+            CommunityResponsePolicy::AllowMismatchFromTarget if source_is_target => {
+                CorrelationResult::AcceptedCommunityMismatch
+            }
+            CommunityResponsePolicy::AllowMismatchFromAnySource => {
+                CorrelationResult::AcceptedCommunityMismatch
+            }
+            CommunityResponsePolicy::AllowMismatchFromTarget => CorrelationResult::Reject,
+        }
+    }
+}
+
 /// Client-side transport abstraction.
 ///
 /// All transports implement this trait uniformly. For shared transports,
-/// handles (not the pool itself) implement Transport.
+/// handles (not the pool itself) implement Transport. A response that fails the
+/// registered correlation metadata must be ignored without consuming the
+/// pending request or extending its deadline.
 pub trait Transport: Send + Sync {
     /// Send request data to the target.
     fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     /// Wait for response. Uses deadline set by `register_request()`.
     ///
-    /// For UDP transports, the deadline was stored during registration.
-    /// For TCP transports, uses the timeout parameter.
+    /// UDP and TCP transports use the deadline stored during registration.
     fn recv(&self, request_id: i32) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send;
 
     /// Send request data and wait for the correlated response as a single unit.
@@ -123,13 +245,11 @@ pub trait Transport: Send + Sync {
     /// When false (UDP/DTLS), Client retries on timeout.
     fn is_reliable(&self) -> bool;
 
-    /// Pre-register a request with timeout before sending.
+    /// Pre-register a request with its timeout and response identity.
     ///
-    /// UDP transports use this to create the response slot with deadline.
-    /// TCP transports ignore this (default no-op).
-    fn register_request(&self, _request_id: i32, _timeout: Duration) {
-        // Default: no-op for TCP and other transports that don't need pre-registration
-    }
+    /// Transports must leave the request pending, under its original deadline,
+    /// when a received packet fails the supplied correlation metadata.
+    fn register_request(&self, registration: RequestRegistration);
 
     /// Route responses addressed to `alias_id` (a prior transmission of the
     /// same operation) to the pending request registered under `primary_id`.
@@ -159,6 +279,57 @@ pub trait AgentTransport: Send + Sync {
 
     /// Local bind address.
     fn local_addr(&self) -> SocketAddr;
+}
+
+// ============================================================================
+// Correlation envelope extraction (shared between transports)
+// ============================================================================
+
+/// Extract a checked v1/v2c version and borrowed community without allocating.
+///
+/// All length arithmetic is checked and the outer BER frame must exactly cover
+/// the supplied packet. Malformed, truncated, v3, and overlong envelopes do not
+/// produce an identity match.
+pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])> {
+    if data.first().copied()? != 0x30 {
+        return None;
+    }
+    let (outer_len, outer_len_bytes) = parse_ber_length(data.get(1..)?)?;
+    let content_start = 1usize.checked_add(outer_len_bytes)?;
+    let content_end = content_start.checked_add(outer_len)?;
+    if content_end != data.len() {
+        return None;
+    }
+
+    let mut pos = content_start;
+    if *data.get(pos)? != 0x02 {
+        return None;
+    }
+    pos = pos.checked_add(1)?;
+    let (version_len, version_len_bytes) = parse_ber_length(data.get(pos..)?)?;
+    pos = pos.checked_add(version_len_bytes)?;
+    let version_end = pos.checked_add(version_len)?;
+    if version_end > content_end || version_len == 0 || version_len > 4 {
+        return None;
+    }
+    let version_num = decode_ber_signed_integer(data.get(pos..version_end)?);
+    let version = Version::from_i32(version_num)?;
+    if !matches!(version, Version::V1 | Version::V2c) {
+        return None;
+    }
+    pos = version_end;
+
+    if *data.get(pos)? != 0x04 {
+        return None;
+    }
+    pos = pos.checked_add(1)?;
+    let (community_len, community_len_bytes) = parse_ber_length(data.get(pos..)?)?;
+    pos = pos.checked_add(community_len_bytes)?;
+    let community_end = pos.checked_add(community_len)?;
+    if community_end > content_end {
+        return None;
+    }
+    Some((version, data.get(pos..community_end)?))
 }
 
 // ============================================================================

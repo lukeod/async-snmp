@@ -781,6 +781,8 @@ mod tests {
     }
 
     impl Transport for BulkTooBigTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
+
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
@@ -937,6 +939,8 @@ mod tests {
     }
 
     impl Transport for ScalarFallbackTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
+
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();

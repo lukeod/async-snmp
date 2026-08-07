@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::format::hex;
 use crate::message::{RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message};
 use crate::pdu::{Pdu, PduType};
-use crate::transport::Transport;
+use crate::transport::{RequestRegistration, Transport};
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
     classify_report,
@@ -171,7 +171,7 @@ impl<T: Transport> Client<T> {
 
             self.inner
                 .transport
-                .register_request(msg_id, self.inner.config.timeout);
+                .register_request(RequestRegistration::v3(msg_id, self.inner.config.timeout));
 
             match self.inner.transport.request(&discovery_data, msg_id).await {
                 Ok((data, source)) => {
@@ -643,7 +643,7 @@ impl<T: Transport> Client<T> {
             // Register (or re-register) with fresh deadline before sending
             self.inner
                 .transport
-                .register_request(msg_id, self.inner.config.timeout);
+                .register_request(RequestRegistration::v3(msg_id, self.inner.config.timeout));
             for &prior in &msg_id_window {
                 self.inner.transport.register_request_alias(
                     prior,
@@ -1139,6 +1139,8 @@ mod tests {
     }
 
     impl Transport for TestTransport {
+        fn register_request(&self, _registration: RequestRegistration) {}
+
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
@@ -1164,8 +1166,6 @@ mod tests {
         fn is_reliable(&self) -> bool {
             false
         }
-
-        fn register_request(&self, _request_id: i32, _timeout: Duration) {}
     }
 
     #[tokio::test]
@@ -1325,6 +1325,8 @@ mod tests {
     }
 
     impl Transport for RetryTestTransport {
+        fn register_request(&self, _registration: RequestRegistration) {}
+
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
@@ -1362,8 +1364,6 @@ mod tests {
         fn is_reliable(&self) -> bool {
             false
         }
-
-        fn register_request(&self, _request_id: i32, _timeout: Duration) {}
     }
 
     /// Build a minimal valid discovery response with the given engine ID.
@@ -1434,6 +1434,8 @@ mod tests {
             peer: SocketAddr,
         }
         impl Transport for AlwaysTimeoutTransport {
+            fn register_request(&self, _registration: RequestRegistration) {}
+
             fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
                 ready(Ok(()))
             }
@@ -1460,7 +1462,6 @@ mod tests {
             fn is_reliable(&self) -> bool {
                 false
             }
-            fn register_request(&self, _request_id: i32, _timeout: Duration) {}
         }
 
         let transport = AlwaysTimeoutTransport {
@@ -1517,6 +1518,8 @@ mod response_validation_tests {
     }
 
     impl Transport for CannedTransport {
+        fn register_request(&self, _registration: RequestRegistration) {}
+
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
@@ -1548,8 +1551,6 @@ mod response_validation_tests {
             // Canned responses in this module are intentionally built for ID 99.
             99
         }
-
-        fn register_request(&self, _request_id: i32, _timeout: Duration) {}
     }
 
     #[derive(Clone)]
@@ -1570,6 +1571,8 @@ mod response_validation_tests {
     }
 
     impl Transport for DeferredUpdateTransport {
+        fn register_request(&self, _registration: RequestRegistration) {}
+
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }

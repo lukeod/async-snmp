@@ -2,13 +2,13 @@
 //!
 //! This example demonstrates using a shared UdpTransport for polling many
 //! targets efficiently. A single UDP socket is shared across all clients
-//! using request-ID correlation, reducing file descriptor usage.
+//! using protocol-aware correlation, reducing file descriptor usage.
 //!
 //! Key concepts:
 //! - UdpTransport: A single UDP socket shared across multiple clients
 //! - `.build_with(&transport).await`: Creates a client using the shared transport
-//! - Correlation: Community responses use the PDU request-id; V3 uses the outer
-//!   msgID (the PDU request-id is distinct)
+//! - Correlation: Community responses use request-id, version, and community;
+//!   V3 uses the outer msgID (the PDU request-id is distinct)
 //! - Source policy: Opt-in strict matching is available through
 //!   `ClientBuilder::strict_source()` or `UdpHandle::strict_source()`
 //! - Engine cache: Share V3 target identities and trusted engine time
@@ -22,7 +22,8 @@
 
 use async_snmp::transport::UdpTransport;
 use async_snmp::{
-    Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, Retry, VarBind, oid,
+    Auth, AuthProtocol, Client, CommunityResponsePolicy, EngineCache, MasterKeys, PrivProtocol,
+    Retry, VarBind, oid,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
@@ -51,7 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Shared transport bound to {}", shared.local_addr());
 
     // Create clients for different targets - all use the same underlying socket
+    // Exact community matching is the default. For a known proxy that rewrites
+    // communities, retain target-source correlation for rewritten responses.
     let client1 = Client::builder(container_target, Auth::v2c("public"))
+        .community_response_policy(CommunityResponsePolicy::AllowMismatchFromTarget)
         .build_with(&shared)
         .await?;
     let client2 = Client::builder(("192.0.2.1", 161), Auth::v2c("public")) // TEST-NET-1 (unreachable)

@@ -171,6 +171,8 @@ pub struct ClientConfig {
     pub version: Version,
     /// Community string for v1/v2c (default: "public")
     pub community: Bytes,
+    /// Policy for correlating v1/v2c response communities (default: exact).
+    pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
     pub timeout: Duration,
     /// Retry configuration (default: 3 retries, 1-second delay)
@@ -212,6 +214,7 @@ impl Default for ClientConfig {
         Self {
             version: Version::V2c,
             community: Bytes::from_static(b"public"),
+            community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
             timeout: DEFAULT_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
@@ -335,9 +338,15 @@ impl<T: Transport> Client<T> {
             }
 
             // Register (or re-register) with fresh deadline before sending
-            self.inner
-                .transport
-                .register_request(request_id, self.inner.config.timeout);
+            self.inner.transport.register_request(
+                crate::transport::RequestRegistration::community(
+                    request_id,
+                    self.inner.config.timeout,
+                    self.inner.config.version,
+                    self.inner.config.community.clone(),
+                    self.inner.config.community_response_policy,
+                ),
+            );
 
             // Send request and wait for response as a single unit. Combining the
             // two lets reliable transports (TCP) own their stream lock for the
@@ -345,7 +354,7 @@ impl<T: Transport> Client<T> {
             // wedge later requests.
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = data.len() }, "sending request");
             match self.inner.transport.request(data, request_id).await {
-                Ok((response_data, _source)) => {
+                Ok((response_data, source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response");
 
                     // Decode response and extract PDU
@@ -362,13 +371,26 @@ impl<T: Transport> Client<T> {
                         .boxed());
                     }
 
-                    // Warn when the community does not echo the one we sent.
-                    // net-snmp accepts such responses (proxies and some
-                    // agents rewrite the community), so this is not a reject.
+                    // Defense in depth for custom transports that do not enforce
+                    // the non-consuming registration contract themselves.
                     if let Message::Community(ref m) = response
                         && m.community != self.inner.config.community
                     {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "community mismatch in response");
+                        let accepted = match self.inner.config.community_response_policy {
+                            crate::transport::CommunityResponsePolicy::Exact => false,
+                            crate::transport::CommunityResponsePolicy::AllowMismatchFromTarget => {
+                                source == self.peer_addr()
+                            }
+                            crate::transport::CommunityResponsePolicy::AllowMismatchFromAnySource => true,
+                        };
+                        if !accepted {
+                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "community mismatch in response rejected");
+                            return Err(Error::MalformedResponse {
+                                target: self.peer_addr(),
+                            }
+                            .boxed());
+                        }
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "accepted rewritten response community");
                     }
 
                     let Some(response_pdu) = response.into_pdu() else {
@@ -1136,6 +1158,8 @@ mod tests {
     }
 
     impl Transport for TruncatingTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
+
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             // Decode the sent request to extract the request_id.
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
@@ -1429,6 +1453,8 @@ mod tests {
     }
 
     impl Transport for TooBigTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
+
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             // Decode the message to count varbinds
@@ -1642,6 +1668,8 @@ mod tests {
     }
 
     impl Transport for AdversarialTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
+
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             self.pending.lock().unwrap().push_back(request_id);
@@ -1725,10 +1753,27 @@ mod tests {
         );
     }
 
-    /// A response whose community differs from the one sent is rejected.
+    /// A custom transport cannot bypass the exact-match default.
     #[tokio::test]
-    async fn response_validation_accepts_community_mismatch() {
+    async fn response_validation_rejects_community_mismatch() {
         let client = adversarial_client(PduType::Response, b"other", false);
+        let err = client
+            .get(&Oid::from_slice(&[1, 3, 6, 1, 1]))
+            .await
+            .unwrap_err();
+        assert!(matches!(*err, Error::MalformedResponse { .. }));
+    }
+
+    #[tokio::test]
+    async fn response_validation_accepts_explicit_any_source_rewrite() {
+        let transport = AdversarialTransport::new(PduType::Response, b"other", false);
+        let config = ClientConfig {
+            community_response_policy:
+                crate::transport::CommunityResponsePolicy::AllowMismatchFromAnySource,
+            retry: crate::client::retry::Retry::none(),
+            ..Default::default()
+        };
+        let client = Client::new(transport, config);
         let result = client.get(&Oid::from_slice(&[1, 3, 6, 1, 1])).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
     }

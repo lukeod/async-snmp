@@ -18,7 +18,7 @@ use crate::client::{
     DEFAULT_TIMEOUT,
 };
 use crate::error::{Error, Result};
-use crate::transport::{TcpTransport, Transport, UdpHandle, UdpTransport};
+use crate::transport::{CommunityResponsePolicy, TcpTransport, Transport, UdpHandle, UdpTransport};
 use crate::v3::{AuthoritativeEngine, EngineCache};
 use crate::version::Version;
 
@@ -148,6 +148,7 @@ pub struct ClientBuilder {
     max_walk_results: Option<usize>,
     engine_cache: Option<Arc<EngineCache>>,
     strict_source: bool,
+    community_response_policy: CommunityResponsePolicy,
     allow_unauthenticated_v3_time_correction: bool,
     local_authoritative_engine: Option<AuthoritativeEngine>,
 }
@@ -195,6 +196,7 @@ impl ClientBuilder {
             max_walk_results: None,
             engine_cache: None,
             strict_source: false,
+            community_response_policy: CommunityResponsePolicy::Exact,
             allow_unauthenticated_v3_time_correction: false,
             local_authoritative_engine: None,
         }
@@ -453,8 +455,8 @@ impl ClientBuilder {
 
     /// Require UDP responses to originate from the configured target.
     ///
-    /// By default, UDP responses are matched by request ID and a source
-    /// mismatch only logs a warning, which permits multihomed agents to reply
+    /// By default, a UDP source mismatch only logs a warning, which permits
+    /// multihomed agents to reply
     /// from another address. Enabling this option drops off-target datagrams
     /// while leaving the request pending for a response from the configured
     /// target. The policy applies to discovery and ordinary exchanges made by
@@ -465,6 +467,20 @@ impl ClientBuilder {
     #[must_use]
     pub fn strict_source(mut self, strict: bool) -> Self {
         self.strict_source = strict;
+        self
+    }
+
+    /// Set the v1/v2c response-community correlation policy.
+    ///
+    /// Exact byte matching is the default while UDP source checking remains
+    /// permissive. `AllowMismatchFromTarget` supports proxies that rewrite the
+    /// community but requires rewritten responses to come from the configured
+    /// target. `AllowMismatchFromAnySource` explicitly accepts both identity
+    /// mismatches and weakens spoof resistance. [`strict_source`](Self::strict_source)
+    /// remains independent and always rejects off-target UDP responses.
+    #[must_use]
+    pub fn community_response_policy(mut self, policy: CommunityResponsePolicy) -> Self {
+        self.community_response_policy = policy;
         self
     }
 
@@ -565,6 +581,7 @@ impl ClientBuilder {
                 ClientConfig {
                     version: snmp_version,
                     community: Bytes::copy_from_slice(community.as_bytes()),
+                    community_response_policy: self.community_response_policy,
                     timeout: self.timeout,
                     retry: self.retry.clone(),
                     max_oids_per_request: self.max_oids_per_request,
@@ -581,6 +598,7 @@ impl ClientBuilder {
             Auth::Usm(security) => ClientConfig {
                 version: Version::V3,
                 community: Bytes::new(),
+                community_response_policy: self.community_response_policy,
                 timeout: self.timeout,
                 retry: self.retry.clone(),
                 max_oids_per_request: self.max_oids_per_request,
@@ -762,6 +780,14 @@ mod tests {
         assert!(builder.max_walk_results.is_none());
         assert!(builder.engine_cache.is_none());
         assert!(!builder.strict_source);
+        assert_eq!(
+            builder.community_response_policy,
+            CommunityResponsePolicy::Exact
+        );
+        assert_eq!(
+            builder.build_config().community_response_policy,
+            ClientConfig::default().community_response_policy
+        );
         assert!(!builder.allow_unauthenticated_v3_time_correction);
     }
 
@@ -778,6 +804,7 @@ mod tests {
             .max_walk_results(1000)
             .engine_cache(cache.clone())
             .strict_source(true)
+            .community_response_policy(CommunityResponsePolicy::AllowMismatchFromTarget)
             .allow_unauthenticated_v3_time_correction(true);
 
         assert_eq!(builder.timeout, Duration::from_secs(10));
@@ -789,6 +816,10 @@ mod tests {
         assert_eq!(builder.max_walk_results, Some(1000));
         assert!(builder.engine_cache.is_some());
         assert!(builder.strict_source);
+        assert_eq!(
+            builder.community_response_policy,
+            CommunityResponsePolicy::AllowMismatchFromTarget
+        );
         assert!(builder.allow_unauthenticated_v3_time_correction);
         assert!(
             builder

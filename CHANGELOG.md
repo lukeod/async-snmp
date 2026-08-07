@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- SNMPv1/v2c responses now require byte-for-byte community equality by default,
+  even when UDP source checking is permissive. Rejected responses leave the
+  pending request and original deadline intact. Explicit target-only and
+  any-source community rewrite policies support proxy deployments; accepted
+  anomalies are warned and rejected packets count as unmatched.
+- The pre-1.0 `Transport::register_request` API now accepts
+  `RequestRegistration` correlation metadata. Custom transports must ignore a
+  failed correlation without consuming the pending request.
+
 ## [0.17.0] - 2026-08-06
 
 ### Added

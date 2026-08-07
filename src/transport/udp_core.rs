@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+use super::{CorrelationResult, RequestRegistration, ResponseCorrelation};
 use crate::error::{Error, Result};
 
 const SHARDS: usize = 64;
@@ -67,9 +68,11 @@ struct ResponseSlot {
     registered_at: Instant,
     deadline: Instant,
     notify: Arc<Notify>,
-    /// When set, only responses from exactly this address are delivered;
-    /// mismatched sources are rejected without consuming the slot.
-    expected_source: Option<SocketAddr>,
+    /// Configured target, used by conditional community rewrite policy.
+    target_source: SocketAddr,
+    /// When true, only responses from exactly the target are delivered.
+    strict_source: bool,
+    correlation: ResponseCorrelation,
 }
 
 enum PendingEntry {
@@ -134,31 +137,29 @@ impl UdpCore {
         &self.shards[request_id as usize % SHARDS]
     }
 
-    /// Register a pending request with a timeout.
-    ///
-    /// Creates a slot that will accept the response when it arrives. When
-    /// `expected_source` is `Some`, only responses from exactly that address
-    /// are delivered to the slot; others are counted as unmatched.
+    /// Register a pending request with its target and correlation metadata.
     pub fn register(
         &self,
-        request_id: i32,
-        timeout: Duration,
-        expected_source: Option<SocketAddr>,
+        registration: RequestRegistration,
+        target_source: SocketAddr,
+        strict_source: bool,
     ) {
-        let shard = self.shard(request_id);
+        let shard = self.shard(registration.request_id);
         let now = Instant::now();
         let slot = ResponseSlot {
             response: None,
             registered_at: now,
-            deadline: now + timeout,
+            deadline: now + registration.timeout,
             notify: Arc::new(Notify::new()),
-            expected_source,
+            target_source,
+            strict_source,
+            correlation: registration.correlation,
         };
         shard
             .pending
             .lock()
             .unwrap()
-            .insert(request_id, PendingEntry::Slot(slot));
+            .insert(registration.request_id, PendingEntry::Slot(slot));
     }
 
     /// Route future deliveries for `alias_id` to the slot registered under
@@ -215,13 +216,25 @@ impl UdpCore {
         let mut pending = shard.pending.lock().unwrap();
 
         if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&target_id) {
-            if let Some(expected) = slot.expected_source
-                && expected != source
-            {
-                // Leave the slot intact so the genuine response can still land.
+            let source_is_target = slot.target_source == source;
+            if slot.strict_source && !source_is_target {
+                // Leave the slot and original deadline intact.
                 drop(pending);
                 self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by strict source correlation");
                 return false;
+            }
+            match slot.correlation.evaluate(&data, source_is_target) {
+                CorrelationResult::Reject => {
+                    drop(pending);
+                    self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by community correlation");
+                    return false;
+                }
+                CorrelationResult::AcceptedCommunityMismatch => {
+                    tracing::warn!(target: "async_snmp::transport::udp", { request_id, %source }, "accepted rewritten response community");
+                }
+                CorrelationResult::Match => {}
             }
             if slot.response.is_some() {
                 // A response is already waiting to be consumed for this
@@ -373,6 +386,14 @@ mod tests {
         "127.0.0.1:161".parse().unwrap()
     }
 
+    fn register_v3(core: &UdpCore, request_id: i32, timeout: Duration, strict: bool) {
+        core.register(
+            RequestRegistration::v3(request_id, timeout),
+            test_addr(),
+            strict,
+        );
+    }
+
     // A timed-out wait reports elapsed based on the registration time, not a
     // hardcoded 1s offset from the deadline, and does not panic when the
     // deadline is close to the Instant epoch (short timeout).
@@ -381,7 +402,7 @@ mod tests {
         let core = UdpCore::new();
         let addr = test_addr();
         let timeout = Duration::from_millis(50);
-        core.register(1, timeout, None);
+        register_v3(&core, 1, timeout, false);
 
         let err = core.wait_for_response(1, addr).await.unwrap_err();
         match *err {
@@ -410,7 +431,7 @@ mod tests {
     async fn duplicate_delivery_is_ignored() {
         let core = UdpCore::new();
         let addr = test_addr();
-        core.register(7, Duration::from_secs(30), None);
+        register_v3(&core, 7, Duration::from_secs(30), false);
 
         let first = Bytes::from_static(b"first");
         let dup = Bytes::from_static(b"second");
@@ -431,7 +452,7 @@ mod tests {
     async fn alias_routes_delivery_to_primary_slot() {
         let core = UdpCore::new();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        core.register(2, Duration::from_secs(5), None);
+        register_v3(&core, 2, Duration::from_secs(5), false);
         core.register_alias(1, 2, Duration::from_secs(5));
         assert!(core.deliver(1, Bytes::from_static(b"late"), target));
         let (data, source) = core.wait_for_response(2, target).await.unwrap();
@@ -443,7 +464,7 @@ mod tests {
     async fn alias_replacement_repoints_to_newest_primary() {
         let core = UdpCore::new();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        core.register(3, Duration::from_secs(5), None);
+        register_v3(&core, 3, Duration::from_secs(5), false);
         core.register_alias(1, 2, Duration::from_secs(5));
         core.register_alias(1, 3, Duration::from_secs(5));
         core.register_alias(2, 3, Duration::from_secs(5));
@@ -465,7 +486,7 @@ mod tests {
     fn expired_alias_is_cleaned_up() {
         let core = UdpCore::new();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        core.register(2, Duration::from_secs(5), None);
+        register_v3(&core, 2, Duration::from_secs(5), false);
         core.register_alias(1, 2, Duration::ZERO);
         core.cleanup_expired();
         // The expired alias is gone, but the still-live primary slot is not
@@ -480,9 +501,9 @@ mod tests {
     async fn alias_registration_forwards_parked_response_to_primary() {
         let core = UdpCore::new();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        core.register(2, Duration::from_secs(5), None);
+        register_v3(&core, 2, Duration::from_secs(5), false);
         assert!(core.deliver(2, Bytes::from_static(b"parked"), target));
-        core.register(3, Duration::from_secs(5), None);
+        register_v3(&core, 3, Duration::from_secs(5), false);
         core.register_alias(2, 3, Duration::from_secs(5));
         let (data, _) = core.wait_for_response(3, target).await.unwrap();
         assert_eq!(data.as_ref(), b"parked");
@@ -495,7 +516,7 @@ mod tests {
     async fn alias_routes_delivery_to_primary_slot_same_shard() {
         let core = UdpCore::new();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        core.register(66, Duration::from_secs(5), None);
+        register_v3(&core, 66, Duration::from_secs(5), false);
         core.register_alias(2, 66, Duration::from_secs(5));
         assert!(core.deliver(2, Bytes::from_static(b"late"), target));
         let (data, source) = core.wait_for_response(66, target).await.unwrap();
@@ -503,12 +524,130 @@ mod tests {
         assert_eq!(source, target);
     }
 
+    fn community_packet(request_id: i32, community: &'static [u8]) -> Bytes {
+        use crate::message::CommunityMessage;
+        use crate::pdu::{Pdu, PduType};
+
+        CommunityMessage::v2c(
+            Bytes::from_static(community),
+            Pdu {
+                pdu_type: PduType::Response,
+                request_id,
+                error_status: 0,
+                error_index: 0,
+                varbinds: Vec::new(),
+            },
+        )
+        .encode()
+    }
+
+    #[tokio::test]
+    async fn community_policy_source_matrix_and_non_consuming_rejection() {
+        use super::super::CommunityResponsePolicy;
+
+        let target = test_addr();
+        let other: SocketAddr = "127.0.0.2:161".parse().unwrap();
+        let policies = [
+            CommunityResponsePolicy::Exact,
+            CommunityResponsePolicy::AllowMismatchFromTarget,
+            CommunityResponsePolicy::AllowMismatchFromAnySource,
+        ];
+        let mut request_id = 100;
+
+        for strict in [false, true] {
+            for policy in policies {
+                for source_is_target in [false, true] {
+                    for community_matches in [false, true] {
+                        request_id += 1;
+                        let core = UdpCore::new();
+                        core.register(
+                            RequestRegistration::community(
+                                request_id,
+                                Duration::from_secs(5),
+                                crate::Version::V2c,
+                                Bytes::from_static(b"public"),
+                                policy,
+                            ),
+                            target,
+                            strict,
+                        );
+                        let source = if source_is_target { target } else { other };
+                        let packet = community_packet(
+                            request_id,
+                            if community_matches {
+                                b"public"
+                            } else {
+                                b"rewritten"
+                            },
+                        );
+                        let expected = (!strict || source_is_target)
+                            && (community_matches
+                                || policy == CommunityResponsePolicy::AllowMismatchFromAnySource
+                                || (policy == CommunityResponsePolicy::AllowMismatchFromTarget
+                                    && source_is_target));
+                        assert_eq!(
+                            core.deliver(request_id, packet, source),
+                            expected,
+                            "strict={strict} policy={policy:?} source_is_target={source_is_target} community_matches={community_matches}"
+                        );
+                        assert_eq!(core.stats().delivered, u64::from(expected));
+                        assert_eq!(core.stats().unmatched, u64::from(!expected));
+                    }
+                }
+            }
+        }
+
+        let core = UdpCore::new();
+        let request_id = 500;
+        core.register(
+            RequestRegistration::community(
+                request_id,
+                Duration::from_secs(5),
+                crate::Version::V2c,
+                Bytes::from_static(b"public"),
+                CommunityResponsePolicy::Exact,
+            ),
+            target,
+            false,
+        );
+        let (notify, original_deadline) = {
+            let pending = core.shard(request_id).pending.lock().unwrap();
+            let PendingEntry::Slot(slot) = pending.get(&request_id).unwrap() else {
+                panic!("expected pending slot");
+            };
+            (slot.notify.clone(), slot.deadline)
+        };
+        assert!(!core.deliver(request_id, community_packet(request_id, b"wrong"), other,));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), notify.notified())
+                .await
+                .is_err(),
+            "rejection must not wake the waiter"
+        );
+        {
+            let pending = core.shard(request_id).pending.lock().unwrap();
+            let PendingEntry::Slot(slot) = pending.get(&request_id).unwrap() else {
+                panic!("expected retained pending slot");
+            };
+            assert_eq!(slot.deadline, original_deadline);
+            assert!(slot.response.is_none());
+        }
+        assert!(core.deliver(request_id, community_packet(request_id, b"public"), target,));
+        let (accepted, _) = core.wait_for_response(request_id, target).await.unwrap();
+        assert_eq!(
+            super::super::extract_community_identity(&accepted)
+                .unwrap()
+                .1,
+            b"public"
+        );
+    }
+
     #[test]
     fn alias_respects_primary_expected_source() {
         let core = UdpCore::new();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
         let other: SocketAddr = "127.0.0.2:161".parse().unwrap();
-        core.register(2, Duration::from_secs(5), Some(target));
+        register_v3(&core, 2, Duration::from_secs(5), true);
         core.register_alias(1, 2, Duration::from_secs(5));
         assert!(!core.deliver(1, Bytes::from_static(b"spoof"), other));
         assert!(core.deliver(1, Bytes::from_static(b"real"), target));

@@ -74,7 +74,7 @@
 //! # }
 //! ```
 
-use super::Transport;
+use super::{CorrelationResult, RequestRegistration, ResponseCorrelation, Transport};
 use crate::error::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
@@ -215,7 +215,7 @@ impl TcpTransportBuilder {
         Ok(TcpTransport {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                pending_timeouts: StdMutex::new(HashMap::new()),
+                pending_registrations: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
                 max_allocation_size: self.options.max_allocation_size,
@@ -283,14 +283,13 @@ pub struct TcpTransport {
 struct TcpTransportInner {
     /// The TCP stream, wrapped in Arc for owned guard pattern
     stream: Arc<Mutex<TcpStream>>,
-    /// Per-request receive timeouts, keyed by request ID.
+    /// Per-request timeout and correlation metadata, keyed by request ID.
     ///
-    /// [`register_request`](Transport::register_request) inserts the timeout for
-    /// a request ID; the matching `request`/`recv` removes and uses it. Keeping
-    /// the value keyed per request (rather than in a single shared field) means a
-    /// second client sharing this cloned transport cannot overwrite the receive
-    /// timeout of another client's in-flight request.
-    pending_timeouts: StdMutex<HashMap<i32, Duration>>,
+    /// [`register_request`](Transport::register_request) inserts the metadata;
+    /// the matching `request`/`recv` removes and uses it. Keeping the value keyed
+    /// per request means a second client sharing this cloned transport cannot
+    /// overwrite another client's in-flight request registration.
+    pending_registrations: StdMutex<HashMap<i32, RequestRegistration>>,
     target: SocketAddr,
     local_addr: SocketAddr,
     /// Maximum allocation size for incoming messages
@@ -315,18 +314,17 @@ impl TcpTransportInner {
         self.poisoned.load(Ordering::Acquire)
     }
 
-    /// Remove and return the receive timeout registered for `request_id`.
+    /// Remove and return the metadata registered for `request_id`.
     ///
-    /// Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when no entry was registered
-    /// (or it was already consumed). Taking the value here keeps it local to the
-    /// request that owns the stream guard, so a concurrent registration for a
-    /// different request cannot alter it.
-    fn take_timeout(&self, request_id: i32) -> Duration {
-        self.pending_timeouts
+    /// Falls back to a v3 registration with [`DEFAULT_REQUEST_TIMEOUT`] when no
+    /// entry was registered (or it was already consumed). Taking the value here
+    /// keeps it local to the request that owns the stream guard.
+    fn take_registration(&self, request_id: i32) -> RequestRegistration {
+        self.pending_registrations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&request_id)
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+            .unwrap_or_else(|| RequestRegistration::v3(request_id, DEFAULT_REQUEST_TIMEOUT))
     }
 
     /// Mark the stream unusable and best-effort close it.
@@ -419,7 +417,7 @@ impl TcpTransport {
         Ok(Self {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                pending_timeouts: StdMutex::new(HashMap::new()),
+                pending_registrations: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
                 max_allocation_size: options.max_allocation_size,
@@ -447,80 +445,53 @@ impl Transport for TcpTransport {
         Ok(())
     }
 
-    fn register_request(&self, request_id: i32, timeout: Duration) {
+    fn register_request(&self, registration: RequestRegistration) {
         self.inner
-            .pending_timeouts
+            .pending_registrations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(request_id, timeout);
+            .insert(registration.request_id, registration);
     }
 
     async fn recv(&self, request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        let recv_timeout = self.inner.take_timeout(request_id);
+        let registration = self.inner.take_registration(request_id);
+        let recv_timeout = registration.timeout;
         let target = self.inner.target;
-
-        // Acquire the stream lock for the duration of this read only. The guard
-        // is a local, so it is released on return or task cancellation.
         let mut stream = self.inner.stream.clone().lock_owned().await;
 
-        // Refuse to read from a stream whose framing was previously lost; the
-        // leftover bytes of the abandoned frame would be misparsed as a new
-        // message.
         if self.inner.is_poisoned() {
             return Err(Error::Closed { target }.boxed());
         }
 
-        // Read a complete BER-encoded message using the framing protocol.
-        let max_alloc = self.inner.max_allocation_size;
-        let result = timeout(
+        let result = read_correlated_message(
+            &mut stream,
+            target,
+            self.inner.max_allocation_size,
+            &registration.correlation,
             recv_timeout,
-            read_ber_message(&mut stream, target, max_alloc),
+            request_id,
         )
         .await;
-
-        match result {
-            Ok(Ok(data)) => Ok((data, target)),
-            Ok(Err(e)) => {
-                // A malformed/oversized/truncated frame leaves the stream at an
-                // unknown offset; abandon the connection.
-                self.inner.poison(&mut stream).await;
-                Err(e)
-            }
-            Err(_) => {
-                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
-                // A timeout mid-frame leaves unread content bytes buffered;
-                // abandon the connection.
-                self.inner.poison(&mut stream).await;
-                Err(Error::Timeout {
-                    target,
-                    elapsed: recv_timeout,
-                    retries: 0,
-                }
-                .boxed())
-            }
-        }
+        finish_correlated_read(
+            &self.inner,
+            &mut stream,
+            result,
+            target,
+            request_id,
+            recv_timeout,
+        )
+        .await
     }
 
     async fn request(&self, data: &[u8], request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        let recv_timeout = self.inner.take_timeout(request_id);
+        let registration = self.inner.take_registration(request_id);
+        let recv_timeout = registration.timeout;
         let target = self.inner.target;
-        let max_alloc = self.inner.max_allocation_size;
-
-        // Own the stream lock for the whole write+read exchange as a single
-        // unit. The guard is a local held by one future, so it serializes
-        // concurrent callers yet is released on return or cancellation. This
-        // avoids stashing the guard across independent await points, which would
-        // leak the lock (and permanently wedge later requests) if the caller's
-        // future were dropped between the send and the recv.
         let mut stream = self.inner.stream.clone().lock_owned().await;
 
-        // Refuse to reuse a stream whose framing was previously lost.
         if self.inner.is_poisoned() {
             return Err(Error::Closed { target }.boxed());
         }
-
-        // A write failure may have left a partial request on the wire, so the
-        // stream can no longer be trusted for framing; poison before returning.
         if let Err(e) = stream.write_all(data).await {
             self.inner.poison(&mut stream).await;
             return Err(Error::Network { target, source: e }.boxed());
@@ -530,33 +501,24 @@ impl Transport for TcpTransport {
             return Err(Error::Network { target, source: e }.boxed());
         }
 
-        let result = timeout(
+        let result = read_correlated_message(
+            &mut stream,
+            target,
+            self.inner.max_allocation_size,
+            &registration.correlation,
             recv_timeout,
-            read_ber_message(&mut stream, target, max_alloc),
+            request_id,
         )
         .await;
-
-        match result {
-            Ok(Ok(response)) => Ok((response, target)),
-            Ok(Err(e)) => {
-                // A malformed/oversized/truncated frame leaves the stream at an
-                // unknown offset; abandon the connection.
-                self.inner.poison(&mut stream).await;
-                Err(e)
-            }
-            Err(_) => {
-                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
-                // A timeout mid-frame leaves unread content bytes buffered;
-                // abandon the connection.
-                self.inner.poison(&mut stream).await;
-                Err(Error::Timeout {
-                    target,
-                    elapsed: recv_timeout,
-                    retries: 0,
-                }
-                .boxed())
-            }
-        }
+        finish_correlated_read(
+            &self.inner,
+            &mut stream,
+            result,
+            target,
+            request_id,
+            recv_timeout,
+        )
+        .await
     }
 
     fn peer_addr(&self) -> SocketAddr {
@@ -578,6 +540,69 @@ impl Transport for TcpTransport {
         // a peer to send a legitimate-but-oversized response that then gets
         // rejected. Clamp to the i32-encodable protocol maximum.
         self.inner.max_allocation_size.min(MAX_TCP_MESSAGE_SIZE) as u32
+    }
+}
+
+enum CorrelatedReadError {
+    Framing(Box<Error>),
+    Timeout,
+}
+
+async fn read_correlated_message(
+    stream: &mut TcpStream,
+    target: SocketAddr,
+    max_allocation_size: usize,
+    correlation: &ResponseCorrelation,
+    recv_timeout: Duration,
+    request_id: i32,
+) -> std::result::Result<Bytes, CorrelatedReadError> {
+    let deadline = tokio::time::Instant::now() + recv_timeout;
+    loop {
+        let frame = tokio::time::timeout_at(
+            deadline,
+            read_ber_message(stream, target, max_allocation_size),
+        )
+        .await
+        .map_err(|_| CorrelatedReadError::Timeout)?
+        .map_err(CorrelatedReadError::Framing)?;
+
+        match correlation.evaluate(&frame, true) {
+            CorrelationResult::Match => return Ok(frame),
+            CorrelationResult::AcceptedCommunityMismatch => {
+                tracing::warn!(target: "async_snmp::transport::tcp", { request_id, %target }, "accepted rewritten response community");
+                return Ok(frame);
+            }
+            CorrelationResult::Reject => {
+                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "response rejected by community correlation");
+            }
+        }
+    }
+}
+
+async fn finish_correlated_read(
+    inner: &TcpTransportInner,
+    stream: &mut TcpStream,
+    result: std::result::Result<Bytes, CorrelatedReadError>,
+    target: SocketAddr,
+    request_id: i32,
+    recv_timeout: Duration,
+) -> Result<(Bytes, SocketAddr)> {
+    match result {
+        Ok(data) => Ok((data, target)),
+        Err(CorrelatedReadError::Framing(error)) => {
+            inner.poison(stream).await;
+            Err(error)
+        }
+        Err(CorrelatedReadError::Timeout) => {
+            tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
+            inner.poison(stream).await;
+            Err(Error::Timeout {
+                target,
+                elapsed: recv_timeout,
+                retries: 0,
+            }
+            .boxed())
+        }
     }
 }
 
@@ -678,6 +703,16 @@ async fn read_ber_message(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    trait TestRegister {
+        fn register_v3(&self, request_id: i32, timeout: Duration);
+    }
+
+    impl<T: Transport> TestRegister for T {
+        fn register_v3(&self, request_id: i32, timeout: Duration) {
+            Transport::register_request(self, RequestRegistration::v3(request_id, timeout));
+        }
+    }
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -725,7 +760,7 @@ mod tests {
         transport.send(&request).await.unwrap();
 
         // Receive response
-        transport.register_request(1, Duration::from_secs(5));
+        transport.register_v3(1, Duration::from_secs(5));
         let (response, source) = transport.recv(1).await.unwrap();
 
         assert_eq!(source, server_addr);
@@ -757,7 +792,7 @@ mod tests {
         let transport = TcpTransport::connect(server_addr).await.unwrap();
         transport.send(&[0x00]).await.unwrap(); // Trigger server
 
-        transport.register_request(1, Duration::from_secs(5));
+        transport.register_v3(1, Duration::from_secs(5));
         let (response, _) = transport.recv(1).await.unwrap();
 
         // Verify: tag (1) + length field (2) + content (200) = 203 bytes
@@ -878,7 +913,7 @@ mod tests {
                 let request_id = i + 1;
                 let request = build_request_with_id(request_id);
 
-                transport.register_request(request_id, Duration::from_secs(5));
+                transport.register_v3(request_id, Duration::from_secs(5));
                 let (response, _) = transport.request(&request, request_id).await?;
 
                 // Verify we got a valid response
@@ -980,6 +1015,40 @@ mod tests {
         ]
     }
 
+    #[tokio::test]
+    async fn tcp_skips_mismatched_community_frame_under_original_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 31];
+            stream.read_exact(&mut request).await.unwrap();
+            let mut wrong = build_response_with_id(77);
+            wrong[7..13].copy_from_slice(b"other!");
+            stream.write_all(&wrong).await.unwrap();
+            stream.write_all(&build_response_with_id(77)).await.unwrap();
+        });
+
+        let transport = TcpTransport::connect(addr).await.unwrap();
+        Transport::register_request(
+            &transport,
+            RequestRegistration::community(
+                77,
+                Duration::from_secs(2),
+                crate::Version::V2c,
+                Bytes::from_static(b"public"),
+                super::super::CommunityResponsePolicy::Exact,
+            ),
+        );
+        let (response, _) = transport
+            .request(&build_request_with_id(77), 77)
+            .await
+            .unwrap();
+        assert_eq!(response.as_ref(), build_response_with_id(77));
+        assert!(!transport.inner.is_poisoned());
+        server.await.unwrap();
+    }
+
     /// Test that excessively large claimed message sizes are rejected early.
     ///
     /// A malicious client could send a BER length field claiming the message is
@@ -1020,7 +1089,7 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        transport.register_request(1, Duration::from_secs(5));
+        transport.register_v3(1, Duration::from_secs(5));
         let result = transport.recv(1).await;
 
         // Should reject the message without allocating 100MB
@@ -1244,7 +1313,7 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        transport.register_request(1, Duration::from_secs(5));
+        transport.register_v3(1, Duration::from_secs(5));
         let result = transport.recv(1).await;
 
         // Should reject 10KB message when limit is 1KB
@@ -1298,7 +1367,7 @@ mod tests {
 
         // First request: cancelled by the outer timeout before any response.
         let request = build_request_with_id(1);
-        transport.register_request(1, Duration::from_secs(30));
+        transport.register_v3(1, Duration::from_secs(30));
         let cancelled = timeout(Duration::from_millis(50), transport.request(&request, 1)).await;
         assert!(cancelled.is_err(), "outer timeout should elapse (cancel)");
 
@@ -1310,7 +1379,7 @@ mod tests {
 
         // The next request must succeed rather than deadlock.
         let request2 = build_request_with_id(2);
-        transport.register_request(2, Duration::from_secs(5));
+        transport.register_v3(2, Duration::from_secs(5));
         let result = timeout(Duration::from_secs(5), transport.request(&request2, 2))
             .await
             .expect("second request should not hang");
@@ -1359,7 +1428,7 @@ mod tests {
 
         // First request: the malformed reply is rejected and poisons the stream.
         let request = build_request_with_id(1);
-        transport.register_request(1, Duration::from_secs(5));
+        transport.register_v3(1, Duration::from_secs(5));
         let first = transport.request(&request, 1).await;
         let err = first.expect_err("malformed frame should error");
         assert!(
@@ -1376,7 +1445,7 @@ mod tests {
         // The next request must fail fast with Closed rather than read the
         // leftover bytes of the abandoned frame.
         let request2 = build_request_with_id(2);
-        transport.register_request(2, Duration::from_secs(5));
+        transport.register_v3(2, Duration::from_secs(5));
         let second = timeout(Duration::from_secs(5), transport.request(&request2, 2))
             .await
             .expect("second request should not hang");
@@ -1412,11 +1481,11 @@ mod tests {
         let transport_b = transport_a.clone();
 
         // Client A registers a short timeout for its request.
-        transport_a.register_request(1, Duration::from_millis(150));
+        transport_a.register_v3(1, Duration::from_millis(150));
         // Client B, sharing the same cloned transport, registers a long timeout
         // for a different request. With the old shared atomic this overwrote A's
         // value; per-request keying keeps them independent.
-        transport_b.register_request(2, Duration::from_secs(20));
+        transport_b.register_v3(2, Duration::from_secs(20));
 
         // A's recv must time out at ~150ms, not at B's 20s. Guard with a 5s
         // outer bound: if the bug regresses, A would wait 20s and this fails.
@@ -1468,7 +1537,7 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        transport.register_request(1, Duration::from_millis(100));
+        transport.register_v3(1, Duration::from_millis(100));
         let first = transport.recv(1).await;
         let err = first.expect_err("mid-frame read should time out");
         assert!(
@@ -1482,7 +1551,7 @@ mod tests {
         );
 
         // A later recv must fail fast rather than parse leftover content bytes.
-        transport.register_request(1, Duration::from_secs(5));
+        transport.register_v3(1, Duration::from_secs(5));
         let second = timeout(Duration::from_secs(5), transport.recv(1))
             .await
             .expect("second recv should not hang");

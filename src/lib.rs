@@ -495,7 +495,10 @@ pub use notification::{
 };
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};
-pub use transport::{MAX_UDP_PAYLOAD, TcpTransport, Transport, UdpHandle, UdpTransport};
+pub use transport::{
+    CommunityResponsePolicy, MAX_UDP_PAYLOAD, RequestRegistration, ResponseCorrelation,
+    TcpTransport, Transport, UdpHandle, UdpTransport,
+};
 #[cfg(feature = "crypto-fips")]
 pub use v3::AwsLcFipsProvider;
 #[cfg(feature = "crypto-rustcrypto")]

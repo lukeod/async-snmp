@@ -798,6 +798,8 @@ impl ScriptedTransport {
 }
 
 impl Transport for ScriptedTransport {
+    fn register_request(&self, _registration: async_snmp::RequestRegistration) {}
+
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         Ok(())
     }
