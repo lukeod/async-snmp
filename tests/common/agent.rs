@@ -302,7 +302,8 @@ mod tests {
             .await
             .expect("GET failed");
 
-        assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+        assert!(result.anomalies.is_empty());
+        assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
     }
 
     #[tokio::test]
@@ -322,7 +323,8 @@ mod tests {
             .await
             .expect("GET failed");
 
-        assert_eq!(result.value, Value::Integer(12345));
+        assert!(result.anomalies.is_empty());
+        assert_eq!(result.varbinds[0].value, Value::Integer(12345));
     }
 
     #[tokio::test]

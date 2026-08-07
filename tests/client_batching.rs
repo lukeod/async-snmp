@@ -31,11 +31,12 @@ async fn get_many_batches_large_requests() {
         .collect();
 
     let results = client.get_many(&oids).await.unwrap();
+    assert!(results.anomalies.is_empty());
 
     // Should get all 50 results
-    assert_eq!(results.len(), 50);
+    assert_eq!(results.varbinds.len(), 50);
 
-    for (i, result) in results.iter().enumerate() {
+    for (i, result) in results.varbinds.iter().enumerate() {
         assert_eq!(result.value, Value::Integer(i as i32));
     }
 }
@@ -63,9 +64,10 @@ async fn batching_preserves_order() {
         .collect();
 
     let results = client.get_many(&oids).await.unwrap();
+    assert!(results.anomalies.is_empty());
 
     // Results should be in request order
-    for (i, result) in results.iter().enumerate() {
+    for (i, result) in results.varbinds.iter().enumerate() {
         assert_eq!(result.oid, oids[i]);
         assert_eq!(result.value, Value::Integer((i * 10) as i32));
     }
@@ -84,7 +86,8 @@ async fn single_oid_no_batching() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// Empty request returns empty result.
@@ -99,5 +102,6 @@ async fn empty_request_returns_empty() {
 
     let results = client.get_many(&[]).await.unwrap();
 
-    assert!(results.is_empty());
+    assert!(results.varbinds.is_empty());
+    assert!(results.anomalies.is_empty());
 }

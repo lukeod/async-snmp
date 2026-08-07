@@ -111,16 +111,26 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
+        .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(5))
         .connect()
         .await?;
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-    println!("sysDescr: {:?}", result.value);
+    println!("sysDescr: {:?}", result.varbinds[0].value);
 
     Ok(())
 }
 ```
+
+Fixed-cardinality `get`, `get_next`, and `set` operations (including their
+`*_many` forms) return a `FixedCardinalityResponse`. Its `varbinds` field keeps
+every decoded binding in received order. By default, bounded response-shape
+problems are returned in `anomalies` rather than discarding data. Applications
+that require rejection can configure
+`.response_shape_policy(ResponseShapePolicy::Strict)`; the resulting
+`Error::ResponseShape` retains the same bindings and diagnostics. Count
+anomalies do not imply a positional request/response mapping.
 
 The target accepts a `(host, port)` tuple, a combined string, or a `SocketAddr`:
 
@@ -153,11 +163,12 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
             PrivProtocol::Aes128,
             "privpass123",
         ))
+        .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
         .connect()
         .await?;
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-    println!("sysDescr: {:?}", result.value);
+    println!("sysDescr: {:?}", result.varbinds[0].value);
 
     Ok(())
 }
@@ -202,6 +213,7 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
     let mut clients = Vec::new();
     for t in &targets {
         let client = Client::builder(*t, Auth::v2c("public"))
+            .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
             .build_with(&shared)
             .await?;
         clients.push(client);
@@ -215,7 +227,7 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
 
     for (client, result) in clients.iter().zip(results) {
         match result {
-            Ok(vb) => println!("{}: {:?}", client.peer_addr(), vb.value),
+            Ok(response) => println!("{}: {:?}", client.peer_addr(), response.varbinds[0].value),
             Err(e) => eprintln!("{}: {}", client.peer_addr(), e),
         }
     }
@@ -248,9 +260,10 @@ async-snmp doesn't require your whole application to be async. For CLI tools, sc
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
+        .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
         .connect().await?;
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-    println!("{:?}", result.value);
+    println!("{:?}", result.varbinds[0].value);
     Ok(())
 }
 ```
@@ -258,7 +271,10 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
 Or wrap async-snmp for use in a fully synchronous call chain with `block_on()`:
 
 ```rust
-fn snmp_get(target: (&str, u16), community: &str) -> Result<VarBind, Box<async_snmp::Error>> {
+fn snmp_get(
+    target: (&str, u16),
+    community: &str,
+) -> Result<async_snmp::FixedCardinalityResponse, Box<async_snmp::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -266,6 +282,7 @@ fn snmp_get(target: (&str, u16), community: &str) -> Result<VarBind, Box<async_s
 
     rt.block_on(async {
         let client = Client::builder(target, Auth::v2c(community))
+            .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
             .connect().await?;
         client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await
     })

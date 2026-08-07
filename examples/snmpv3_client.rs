@@ -11,7 +11,9 @@
 //!   docker build -t async-snmp-test:latest tests/containers/snmpd/
 //!   docker run -d -p 11161:161/udp async-snmp-test:latest
 
-use async_snmp::{Auth, AuthProtocol, Client, MasterKeys, PrivProtocol, Retry, oid};
+use async_snmp::{
+    Auth, AuthProtocol, Client, MasterKeys, PrivProtocol, ResponseShapePolicy, Retry, oid,
+};
 use std::time::Duration;
 
 #[tokio::main]
@@ -41,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let client = Client::builder(target, auth)
+        .response_shape_policy(ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(10))
         .retry(Retry::fixed(3, Duration::ZERO))
         .connect()
@@ -50,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Perform a GET request
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-    println!("sysDescr: {:?}\n", result.value);
+    println!("sysDescr: {:?}\n", result.varbinds[0].value);
 
     // =========================================================================
     // Example 2: authNoPriv (Authentication only, no encryption)
@@ -62,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // auth() selects authNoPriv.
 
     let client_auth = Client::builder(target, auth_only)
+        .response_shape_policy(ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(10))
         .connect()
         .await?;
@@ -69,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected with authNoPriv");
 
     match client_auth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
-        Ok(result) => println!("sysName: {:?}\n", result.value),
+        Ok(result) => println!("sysName: {:?}\n", result.varbinds[0].value),
         Err(e) => println!("Error: {e}\n"),
     }
 
@@ -83,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let no_auth = Auth::usm("noauth_user");
 
     let client_noauth = Client::builder(target, no_auth)
+        .response_shape_policy(ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(10))
         .connect()
         .await?;
@@ -90,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected with noAuthNoPriv");
 
     match client_noauth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-        Ok(result) => println!("sysUpTime: {:?}\n", result.value),
+        Ok(result) => println!("sysUpTime: {:?}\n", result.varbinds[0].value),
         Err(e) => println!("Error: {e}\n"),
     }
 

@@ -369,7 +369,7 @@ fn bench_concurrent(c: &mut Criterion) {
     group.bench_function("concurrent_10_gets", |b| {
         b.to_async(&rt).iter(|| async {
             let futures: Vec<_> = clients.iter().map(|client| client.get(&oid)).collect();
-            let results: Vec<async_snmp::Result<async_snmp::varbind::VarBind>> =
+            let results: Vec<async_snmp::Result<async_snmp::FixedCardinalityResponse>> =
                 futures::future::join_all(futures).await;
             for result in results {
                 black_box(result.unwrap());

@@ -109,7 +109,11 @@ async fn main() -> ExitCode {
     let elapsed = start.elapsed();
 
     match result {
-        Ok(varbinds) => {
+        Ok(response) => {
+            for anomaly in &response.anomalies {
+                eprintln!("Response shape anomaly: {anomaly:?}");
+            }
+            let varbinds = response.varbinds;
             // Verbose output: show response summary with varbind details
             if args.output.verbose {
                 write_verbose_response(&varbinds, elapsed, !args.output.no_hints);
@@ -145,7 +149,7 @@ async fn run_get(
     target: &str,
     args: &Args,
     oids: &[Oid],
-) -> async_snmp::Result<Vec<async_snmp::VarBind>> {
+) -> async_snmp::Result<async_snmp::FixedCardinalityResponse> {
     let auth = args
         .v3
         .auth(&args.common)

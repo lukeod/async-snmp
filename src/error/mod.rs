@@ -157,6 +157,16 @@ pub enum Error {
     #[error("malformed response from {target}")]
     MalformedResponse { target: SocketAddr },
 
+    /// A fixed-cardinality response violated the configured shape policy.
+    ///
+    /// The response retains every decoded binding and all structured anomaly
+    /// diagnostics so strict rejection remains observable.
+    #[error("response shape anomaly from {target}: {response:?}")]
+    ResponseShape {
+        target: SocketAddr,
+        response: crate::client::FixedCardinalityResponse,
+    },
+
     /// Walk aborted due to agent misbehavior.
     #[error("walk aborted for {target}: {reason}")]
     WalkAborted {

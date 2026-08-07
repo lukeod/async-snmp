@@ -287,7 +287,8 @@ proptest! {
                 .unwrap();
 
             let result = client.get(&test_oid).await.unwrap();
-            prop_assert_eq!(result.value, value);
+            prop_assert!(result.anomalies.is_empty());
+            prop_assert_eq!(&result.varbinds[0].value, &value);
             Ok(())
         })?;
     }
@@ -306,8 +307,9 @@ proptest! {
                 .unwrap();
 
             let result = client.get(&oid).await.unwrap();
-            prop_assert_eq!(result.oid, oid);
-            prop_assert_eq!(result.value, value);
+            prop_assert!(result.anomalies.is_empty());
+            prop_assert_eq!(&result.varbinds[0].oid, &oid);
+            prop_assert_eq!(&result.varbinds[0].value, &value);
             Ok(())
         })?;
     }
@@ -332,9 +334,10 @@ proptest! {
                 .unwrap();
 
             let results = client.get_many(&oids).await.unwrap();
+            prop_assert!(results.anomalies.is_empty());
 
-            prop_assert_eq!(results.len(), values.len());
-            for (result, expected) in results.iter().zip(&values) {
+            prop_assert_eq!(results.varbinds.len(), values.len());
+            for (result, expected) in results.varbinds.iter().zip(&values) {
                 prop_assert_eq!(&result.value, expected);
             }
             Ok(())
@@ -393,8 +396,9 @@ proptest! {
 
             client.set(&test_oid, value.clone()).await.unwrap();
             let result = client.get(&test_oid).await.unwrap();
+            prop_assert!(result.anomalies.is_empty());
 
-            prop_assert_eq!(result.value, value);
+            prop_assert_eq!(&result.varbinds[0].value, &value);
             Ok(())
         })?;
     }

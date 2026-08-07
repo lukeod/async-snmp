@@ -20,7 +20,8 @@ async fn get_returns_value() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// GET on missing OID returns `NoSuchInstance`.
@@ -35,7 +36,8 @@ async fn get_missing_oid_returns_no_such_instance() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 99, 99, 99)).await.unwrap();
 
-    assert_eq!(result.value, Value::NoSuchInstance);
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value, Value::NoSuchInstance);
 }
 
 /// GET multiple OIDs in single request.
@@ -56,10 +58,11 @@ async fn get_many_returns_all_values() {
 
     let results = client.get_many(&oids).await.unwrap();
 
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0].value.as_str(), Some("Test SNMP Agent"));
-    assert!(matches!(results[1].value, Value::TimeTicks(_)));
-    assert_eq!(results[2].value.as_str(), Some("test-agent"));
+    assert!(results.anomalies.is_empty());
+    assert_eq!(results.varbinds.len(), 3);
+    assert_eq!(results.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
+    assert!(matches!(results.varbinds[1].value, Value::TimeTicks(_)));
+    assert_eq!(results.varbinds[2].value.as_str(), Some("test-agent"));
 }
 
 /// GET with timeout when agent doesn't respond.
@@ -101,11 +104,13 @@ async fn set_modifies_value() {
         .await
         .unwrap();
 
-    assert_eq!(result.value, new_value);
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value, new_value);
 
     // Verify the change persisted
     let get_result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await.unwrap();
-    assert_eq!(get_result.value, new_value);
+    assert!(get_result.anomalies.is_empty());
+    assert_eq!(get_result.varbinds[0].value, new_value);
 }
 
 /// SET multiple values.
@@ -136,7 +141,8 @@ async fn set_many_modifies_values() {
     // Verify changes
     for (oid, expected) in &varbinds {
         let result = client.get(oid).await.unwrap();
-        assert_eq!(&result.value, expected);
+        assert!(result.anomalies.is_empty());
+        assert_eq!(&result.varbinds[0].value, expected);
     }
 }
 
@@ -188,7 +194,8 @@ async fn v1_get_works() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// GETNEXT returns lexicographically next OID.
@@ -207,7 +214,8 @@ async fn getnext_returns_next_oid() {
         .await
         .unwrap();
 
-    assert_eq!(result.oid, oid!(1, 3, 6, 1, 2, 1, 1, 2, 0));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 2, 0));
 }
 
 /// GETNEXT past end of MIB returns `EndOfMibView`.
@@ -226,7 +234,8 @@ async fn getnext_past_end_returns_end_of_mib_view() {
         .await
         .unwrap();
 
-    assert_eq!(result.value, Value::EndOfMibView);
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value, Value::EndOfMibView);
 }
 
 /// IPv6 shared transport can reach an IPv4 agent via address mapping.
@@ -245,5 +254,6 @@ async fn ipv6_transport_reaches_ipv4_agent() {
         .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }

@@ -205,6 +205,8 @@ async fn v2c_get_returns_value() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
     // sysDescr should be a non-empty string
+    assert!(result.anomalies.is_empty());
+    let result = &result.varbinds[0];
     assert!(matches!(result.value, Value::OctetString(_)));
     if let Value::OctetString(s) = &result.value {
         assert!(!s.is_empty());
@@ -226,7 +228,8 @@ async fn v1_get_returns_value() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 #[tokio::test]
@@ -247,7 +250,8 @@ async fn getnext_returns_next_oid() {
         .unwrap();
 
     // Should return an OID greater than the request
-    assert!(result.oid > oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+    assert!(result.anomalies.is_empty());
+    assert!(result.varbinds[0].oid > oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
 }
 
 #[tokio::test]
@@ -338,7 +342,8 @@ async fn v3_no_auth_no_priv() {
         .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 #[tokio::test]
@@ -358,7 +363,8 @@ async fn v3_auth_no_priv() {
     .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 #[tokio::test]
@@ -383,7 +389,8 @@ async fn v3_auth_priv() {
     .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 // ============================================================================
@@ -408,7 +415,8 @@ async fn v3_auth_md5() {
     .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 #[tokio::test]
@@ -428,7 +436,8 @@ async fn v3_auth_sha1() {
     .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 #[tokio::test]
@@ -448,7 +457,8 @@ async fn v3_auth_sha256() {
     .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 /// authNoPriv GET against net-snmp for a given RFC 7860 SHA-2 auth protocol.
@@ -463,7 +473,8 @@ async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
         .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 #[tokio::test]
@@ -511,7 +522,8 @@ async fn v3_priv_des() {
     .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 #[tokio::test]
@@ -536,7 +548,8 @@ async fn v3_priv_aes128() {
     .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result.value, Value::OctetString(_)));
+    assert!(result.anomalies.is_empty());
+    assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
 }
 
 // ============================================================================
@@ -558,8 +571,9 @@ async fn missing_oid_returns_no_such() {
     let result = client.get(&oid!(1, 3, 6, 1, 99, 99, 99, 99)).await.unwrap();
 
     // Should be NoSuchObject or NoSuchInstance
+    assert!(result.anomalies.is_empty());
     assert!(matches!(
-        result.value,
+        result.varbinds[0].value,
         Value::NoSuchObject | Value::NoSuchInstance
     ));
 }
@@ -611,10 +625,13 @@ async fn value_types_decode_correctly() {
         .await
         .unwrap();
 
-    assert!(matches!(results[0].value, Value::OctetString(_)));
-    assert!(matches!(results[1].value, Value::ObjectIdentifier(_)));
-    assert!(matches!(results[2].value, Value::TimeTicks(_)));
-    assert!(matches!(results[3].value, Value::Integer(_)));
+    assert!(matches!(results.varbinds[0].value, Value::OctetString(_)));
+    assert!(matches!(
+        results.varbinds[1].value,
+        Value::ObjectIdentifier(_)
+    ));
+    assert!(matches!(results.varbinds[2].value, Value::TimeTicks(_)));
+    assert!(matches!(results.varbinds[3].value, Value::Integer(_)));
 }
 
 // ============================================================================
@@ -637,9 +654,10 @@ async fn tcp_transport_get() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     match result {
-        Ok(vb) => {
-            assert_eq!(vb.oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
-            assert!(matches!(vb.value, Value::OctetString(_)));
+        Ok(response) => {
+            assert!(response.anomalies.is_empty());
+            assert_eq!(response.varbinds[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+            assert!(matches!(response.varbinds[0].value, Value::OctetString(_)));
         }
         Err(e) => panic!("TCP GET failed: {e}"),
     }
@@ -680,11 +698,13 @@ async fn shared_transport_multiple_clients() {
     let oid2 = oid!(1, 3, 6, 1, 2, 1, 1, 5, 0); // sysName
     let (result1, result2) = tokio::join!(client1.get(&oid1), client2.get(&oid2));
 
-    let vb1 = result1.expect("Client 1 GET failed");
-    let vb2 = result2.expect("Client 2 GET failed");
+    let response1 = result1.expect("Client 1 GET failed");
+    let response2 = result2.expect("Client 2 GET failed");
 
-    assert!(matches!(vb1.value, Value::OctetString(_)));
-    assert!(matches!(vb2.value, Value::OctetString(_)));
+    assert!(response1.anomalies.is_empty());
+    assert!(response2.anomalies.is_empty());
+    assert!(matches!(response1.varbinds[0].value, Value::OctetString(_)));
+    assert!(matches!(response2.varbinds[0].value, Value::OctetString(_)));
 }
 
 // ============================================================================
@@ -715,11 +735,13 @@ async fn v3_engine_discovery_and_request() {
 
     // First request triggers engine discovery
     let result1 = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert!(matches!(result1.value, Value::OctetString(_)));
+    assert!(result1.anomalies.is_empty());
+    assert!(matches!(result1.varbinds[0].value, Value::OctetString(_)));
 
     // Second request uses cached engine state
     let result2 = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await.unwrap();
-    assert!(matches!(result2.value, Value::OctetString(_)));
+    assert!(result2.anomalies.is_empty());
+    assert!(matches!(result2.varbinds[0].value, Value::OctetString(_)));
 }
 
 // ============================================================================
@@ -747,7 +769,9 @@ async fn set_writable_oid() {
         .await;
 
     match result {
-        Ok(vb) => {
+        Ok(response) => {
+            assert!(response.anomalies.is_empty());
+            let vb = &response.varbinds[0];
             assert_eq!(vb.oid, oid!(1, 3, 6, 1, 2, 1, 1, 4, 0));
             if let Value::OctetString(s) = &vb.value {
                 assert_eq!(s.as_ref(), b"admin@example.com");

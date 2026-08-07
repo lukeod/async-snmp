@@ -137,6 +137,7 @@ pub struct ClientBuilder {
     timeout: Duration,
     retry: Retry,
     max_oids_per_request: usize,
+    response_shape_policy: crate::client::ResponseShapePolicy,
     max_repetitions: u32,
     walk_mode: WalkMode,
     oid_ordering: OidOrdering,
@@ -185,6 +186,7 @@ impl ClientBuilder {
             timeout: DEFAULT_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
+            response_shape_policy: crate::client::ResponseShapePolicy::Compatible,
             max_repetitions: DEFAULT_MAX_REPETITIONS,
             walk_mode: WalkMode::Auto,
             oid_ordering: OidOrdering::Strict,
@@ -278,6 +280,17 @@ impl ClientBuilder {
     #[must_use]
     pub fn max_oids_per_request(mut self, max: usize) -> Self {
         self.max_oids_per_request = max;
+        self
+    }
+
+    /// Set fixed-cardinality response-shape handling (default: compatible).
+    ///
+    /// Compatible mode preserves every decoded binding and reports anomalies in
+    /// the successful outcome. Strict mode returns [`Error::ResponseShape`]
+    /// whenever the count, OID, GETNEXT successor, or SET echo shape is invalid.
+    #[must_use]
+    pub fn response_shape_policy(mut self, policy: crate::client::ResponseShapePolicy) -> Self {
+        self.response_shape_policy = policy;
         self
     }
 
@@ -549,6 +562,7 @@ impl ClientBuilder {
             timeout: self.timeout,
             retry: self.retry.clone(),
             max_oids_per_request: self.max_oids_per_request,
+            response_shape_policy: self.response_shape_policy,
             allow_unauthenticated_v3_time_correction: self.allow_unauthenticated_v3_time_correction,
             walk_mode: self.walk_mode,
             oid_ordering: self.oid_ordering,
@@ -746,6 +760,10 @@ mod tests {
         assert_eq!(builder.timeout, DEFAULT_TIMEOUT);
         assert_eq!(builder.retry.max_attempts, 3);
         assert_eq!(builder.max_oids_per_request, DEFAULT_MAX_OIDS_PER_REQUEST);
+        assert_eq!(
+            builder.response_shape_policy,
+            crate::client::ResponseShapePolicy::Compatible
+        );
         assert_eq!(builder.max_repetitions, DEFAULT_MAX_REPETITIONS);
         assert_eq!(builder.walk_mode, WalkMode::Auto);
         assert_eq!(builder.oid_ordering, OidOrdering::Strict);
@@ -770,6 +788,7 @@ mod tests {
             .timeout(Duration::from_secs(10))
             .retry(Retry::fixed(5, Duration::ZERO))
             .max_oids_per_request(20)
+            .response_shape_policy(crate::client::ResponseShapePolicy::Strict)
             .max_repetitions(50)
             .walk_mode(WalkMode::GetNext)
             .oid_ordering(OidOrdering::AllowNonIncreasing)
@@ -782,6 +801,10 @@ mod tests {
         assert_eq!(builder.timeout, Duration::from_secs(10));
         assert_eq!(builder.retry.max_attempts, 5);
         assert_eq!(builder.max_oids_per_request, 20);
+        assert_eq!(
+            builder.build_config().response_shape_policy,
+            crate::client::ResponseShapePolicy::Strict
+        );
         assert_eq!(builder.max_repetitions, 50);
         assert_eq!(builder.walk_mode, WalkMode::GetNext);
         assert_eq!(builder.oid_ordering, OidOrdering::AllowNonIncreasing);

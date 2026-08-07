@@ -10,7 +10,9 @@
 //!
 //! Run with: cargo run --example sync_wrapper
 
-use async_snmp::{Auth, Client, Error, Retry, Value, VarBind, oid};
+use async_snmp::{
+    Auth, Client, Error, FixedCardinalityResponse, ResponseShapePolicy, Retry, Value, VarBind, oid,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -18,7 +20,10 @@ use std::time::Duration;
 ///
 /// Good for CLI tools, scripts, or infrequent SNMP calls where you don't
 /// want to keep a runtime alive.
-fn oneshot_get(target: (&str, u16), community: &str) -> Result<VarBind, Box<Error>> {
+fn oneshot_get(
+    target: (&str, u16),
+    community: &str,
+) -> Result<FixedCardinalityResponse, Box<Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -26,6 +31,7 @@ fn oneshot_get(target: (&str, u16), community: &str) -> Result<VarBind, Box<Erro
 
     rt.block_on(async {
         let client = Client::builder(target, Auth::v2c(community))
+            .response_shape_policy(ResponseShapePolicy::Strict)
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
             .connect()
@@ -53,6 +59,7 @@ impl SyncSnmpClient {
 
         let client = rt.block_on(async {
             Client::builder(target, Auth::v2c(community))
+                .response_shape_policy(ResponseShapePolicy::Strict)
                 .timeout(Duration::from_secs(5))
                 .retry(Retry::fixed(2, Duration::ZERO))
                 .connect()
@@ -62,16 +69,20 @@ impl SyncSnmpClient {
         Ok(Self { rt, client })
     }
 
-    fn get(&self, oid: &async_snmp::Oid) -> Result<VarBind, Box<Error>> {
+    fn get(&self, oid: &async_snmp::Oid) -> Result<FixedCardinalityResponse, Box<Error>> {
         self.rt.block_on(self.client.get(oid))
     }
 
-    fn get_many(&self, oids: &[async_snmp::Oid]) -> Result<Vec<VarBind>, Box<Error>> {
+    fn get_many(&self, oids: &[async_snmp::Oid]) -> Result<FixedCardinalityResponse, Box<Error>> {
         self.rt.block_on(self.client.get_many(oids))
     }
 
     #[allow(dead_code)]
-    fn set(&self, oid: &async_snmp::Oid, value: Value) -> Result<VarBind, Box<Error>> {
+    fn set(
+        &self,
+        oid: &async_snmp::Oid,
+        value: Value,
+    ) -> Result<FixedCardinalityResponse, Box<Error>> {
         self.rt.block_on(self.client.set(oid, value))
     }
 
@@ -96,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- One-shot GET ---\n");
 
     match oneshot_get(target, "public") {
-        Ok(vb) => println!("sysDescr: {:?}", vb.value),
+        Ok(response) => println!("sysDescr: {:?}", response.varbinds[0].value),
         Err(e) => println!("Error: {e}"),
     }
 
@@ -109,15 +120,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected to {}", client.peer_addr());
 
     // GET
-    let vb = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))?;
-    println!("sysDescr: {:?}", vb.value);
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))?;
+    println!("sysDescr: {:?}", response.varbinds[0].value);
 
     // GET_MANY
     let vbs = client.get_many(&[
         oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), // sysUpTime
         oid!(1, 3, 6, 1, 2, 1, 1, 5, 0), // sysName
     ])?;
-    for vb in &vbs {
+    for vb in &vbs.varbinds {
         println!("  {}: {:?}", vb.oid, vb.value);
     }
 

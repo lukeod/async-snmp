@@ -44,10 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let results = client.get_many(&oids).await?;
+    for anomaly in &results.anomalies {
+        eprintln!("Response shape anomaly: {anomaly:?}");
+    }
 
     // Format results with MIB metadata
     println!();
-    for vb in &results {
+    for vb in &results.varbinds {
         println!("{}", mib_support::format_varbind(&mib, vb));
     }
 

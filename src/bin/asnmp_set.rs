@@ -9,7 +9,7 @@ use async_snmp::cli::output::{
     OperationType, OutputContext, RequestInfo, build_security_info, write_error,
     write_verbose_request, write_verbose_response,
 };
-use async_snmp::{Client, Oid, Value, VarBind};
+use async_snmp::{Client, Oid, Value};
 use clap::Parser;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -158,7 +158,11 @@ async fn main() -> ExitCode {
     let elapsed = start.elapsed();
 
     match result {
-        Ok(result_varbinds) => {
+        Ok(response) => {
+            for anomaly in &response.anomalies {
+                eprintln!("Response shape anomaly: {anomaly:?}");
+            }
+            let result_varbinds = response.varbinds;
             // Verbose output: show response summary with varbind details
             if args.output.verbose {
                 write_verbose_response(&result_varbinds, elapsed, !args.output.no_hints);
@@ -194,7 +198,7 @@ async fn run_set(
     target: &str,
     args: &Args,
     varbinds: Vec<SetVarbind>,
-) -> async_snmp::Result<Vec<VarBind>> {
+) -> async_snmp::Result<async_snmp::FixedCardinalityResponse> {
     let auth = args
         .v3
         .auth(&args.common)
@@ -211,7 +215,7 @@ async fn run_set(
 
     if pairs.len() == 1 {
         let (oid, value) = pairs.into_iter().next().unwrap();
-        client.set(&oid, value).await.map(|vb| vec![vb])
+        client.set(&oid, value).await
     } else {
         client.set_many(&pairs).await
     }

@@ -50,12 +50,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
     match client.get(&sys_descr).await {
-        Ok(varbind) => {
-            println!("OID: {}", varbind.oid);
-            println!("Value: {:?}", varbind.value);
+        Ok(response) => {
+            for anomaly in &response.anomalies {
+                eprintln!("Response shape anomaly: {anomaly:?}");
+            }
+            for varbind in &response.varbinds {
+                println!("OID: {}", varbind.oid);
+                println!("Value: {:?}", varbind.value);
+            }
 
-            // Extract string value if present
-            if let Some(s) = varbind.value.as_str() {
+            // Extract a singleton string only when correspondence is unambiguous.
+            if response.anomalies.is_empty()
+                && let [varbind] = response.varbinds.as_slice()
+                && let Some(s) = varbind.value.as_str()
+            {
                 println!("As string: {s}");
             }
         }
@@ -78,8 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     match client.get_many(&oids).await {
-        Ok(varbinds) => {
-            for vb in varbinds {
+        Ok(response) => {
+            for anomaly in &response.anomalies {
+                eprintln!("Response shape anomaly: {anomaly:?}");
+            }
+            for vb in response.varbinds {
                 println!("  {}: {:?}", vb.oid, vb.value);
             }
         }
@@ -97,9 +108,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let system_oid = oid!(1, 3, 6, 1, 2, 1, 1);
 
     match client.get_next(&system_oid).await {
-        Ok(varbind) => {
-            println!("Next OID after {}: {}", system_oid, varbind.oid);
-            println!("Value: {:?}", varbind.value);
+        Ok(response) => {
+            for anomaly in &response.anomalies {
+                eprintln!("Response shape anomaly: {anomaly:?}");
+            }
+            for varbind in response.varbinds {
+                println!("Next OID after {}: {}", system_oid, varbind.oid);
+                println!("Value: {:?}", varbind.value);
+            }
         }
         Err(e) => {
             handle_error("GETNEXT", &e);
@@ -122,9 +138,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let new_value = Value::from("admin@example.com");
 
     match write_client.set(&sys_contact, new_value).await {
-        Ok(varbind) => {
-            println!("Set successful!");
-            println!("  {}: {:?}", varbind.oid, varbind.value);
+        Ok(response) => {
+            for anomaly in &response.anomalies {
+                eprintln!("Response shape anomaly: {anomaly:?}");
+            }
+            for varbind in response.varbinds {
+                println!("Set response: {}: {:?}", varbind.oid, varbind.value);
+            }
         }
         Err(e) => {
             // SET operations commonly fail due to access control
@@ -138,8 +158,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Verify SET ---");
 
     match client.get(&sys_contact).await {
-        Ok(varbind) => {
-            println!("Current value: {:?}", varbind.value);
+        Ok(response) => {
+            for anomaly in &response.anomalies {
+                eprintln!("Response shape anomaly: {anomaly:?}");
+            }
+            for varbind in response.varbinds {
+                println!("Current value: {:?}", varbind.value);
+            }
         }
         Err(e) => {
             handle_error("GET (verify)", &e);

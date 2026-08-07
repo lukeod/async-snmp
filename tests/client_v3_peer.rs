@@ -139,7 +139,7 @@ async fn udp_success_at_level(level: SecurityLevel) {
     );
     let result =
         result.unwrap_or_else(|error| panic!("client failed: {error}; requests: {requests:#?}"));
-    assert_eq!(result.value.as_str(), Some("scripted response"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("scripted response"));
 
     assert_eq!(requests.len(), 2);
     assert!(requests[0].usm.engine_id.is_empty());
@@ -364,7 +364,7 @@ async fn v3_discovery_treats_reportable_flag_as_zero_on_report() {
     let client = custom_client(transport, level, None);
 
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(response.value.as_str(), Some("accepted"));
+    assert_eq!(response.varbinds[0].value.as_str(), Some("accepted"));
 }
 
 #[tokio::test]
@@ -397,7 +397,7 @@ async fn v3_udp_discovery_source_policy_is_builder_configurable() {
         .unwrap();
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(
-        response.value.as_str(),
+        response.varbinds[0].value.as_str(),
         Some("off-source discovery accepted")
     );
     peer.finish().await.unwrap();
@@ -461,13 +461,13 @@ async fn v3_established_identity_ignores_ordinary_discovery_traffic() {
     let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
     assert_eq!(
-        client.get(&oid).await.unwrap().value.as_str(),
+        client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("before")
     );
     let error = client.get(&oid).await.unwrap_err();
     assert!(matches!(*error, async_snmp::Error::Auth { .. }));
     assert_eq!(
-        client.get(&oid).await.unwrap().value.as_str(),
+        client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("after")
     );
 
@@ -525,7 +525,7 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
     let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
     assert_eq!(
-        client.get(&oid).await.unwrap().value.as_str(),
+        client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("before")
     );
     assert_eq!(
@@ -539,7 +539,7 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
         replacement_id.as_ref()
     );
     assert_eq!(
-        client.get(&oid).await.unwrap().value.as_str(),
+        client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("after")
     );
 
@@ -597,7 +597,7 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
     assert_eq!(
-        client.get(&oid).await.unwrap().value.as_str(),
+        client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("before")
     );
 
@@ -615,7 +615,7 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     // than being silently reloaded from a stale cache entry.
     cache.remove(&client.peer_addr());
     assert_eq!(
-        client.get(&oid).await.unwrap().value.as_str(),
+        client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("after")
     );
 
@@ -645,7 +645,7 @@ async fn v3_scripted_tcp_auth_priv_success() {
         .await
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("tcp response"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("tcp response"));
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -701,7 +701,10 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
         .await
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("corrected response"));
+    assert_eq!(
+        result.varbinds[0].value.as_str(),
+        Some("corrected response")
+    );
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -807,9 +810,15 @@ async fn v3_udp_unauthenticated_time_report_gets_packet_local_correction() {
         .await
         .unwrap();
     let first = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(first.value.as_str(), Some("compatibility response"));
+    assert_eq!(
+        first.varbinds[0].value.as_str(),
+        Some("compatibility response")
+    );
     let second = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(second.value.as_str(), Some("converged response"));
+    assert_eq!(
+        second.varbinds[0].value.as_str(),
+        Some("converged response")
+    );
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -915,7 +924,10 @@ async fn v3_tcp_unauthenticated_time_report_compatibility_succeeds() {
         .await
         .unwrap();
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(response.value.as_str(), Some("TCP compatibility response"));
+    assert_eq!(
+        response.varbinds[0].value.as_str(),
+        Some("TCP compatibility response")
+    );
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -958,7 +970,7 @@ async fn v3_reliable_custom_transport_allows_packet_local_compatibility() {
 
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(
-        response.value.as_str(),
+        response.varbinds[0].value.as_str(),
         Some("custom compatibility response")
     );
     let requests = log.snapshot();
@@ -1026,7 +1038,7 @@ async fn v3_failed_packet_local_correction_preserves_trusted_time() {
         async_snmp::Error::Timeout { retries: 0, .. }
     ));
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(response.value.as_str(), Some("state retained"));
+    assert_eq!(response.varbinds[0].value.as_str(), Some("state retained"));
 
     let requests = log.snapshot();
     assert_eq!(requests.len(), 5);
@@ -1209,7 +1221,10 @@ async fn v3_failed_authenticated_compatibility_reply_does_not_publish_time() {
             .await
             .unwrap_err();
         let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-        assert_eq!(response.value.as_str(), Some("prior state retained"));
+        assert_eq!(
+            response.varbinds[0].value.as_str(),
+            Some("prior state retained")
+        );
 
         let requests = log.snapshot();
         assert_eq!(requests.len(), 5, "unexpected request count for {case}");
@@ -1257,7 +1272,10 @@ async fn v3_tcp_time_window_report_gets_one_protocol_correction() {
         .await
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("TCP corrected response"));
+    assert_eq!(
+        result.varbinds[0].value.as_str(),
+        Some("TCP corrected response")
+    );
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -1303,7 +1321,10 @@ async fn v3_reliable_custom_transport_allows_protocol_correction() {
     let client = custom_client(transport, level, None);
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("custom corrected response"));
+    assert_eq!(
+        result.varbinds[0].value.as_str(),
+        Some("custom corrected response")
+    );
 
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
@@ -1355,7 +1376,10 @@ async fn v3_report_on_final_timeout_attempt_still_gets_correction() {
         .await
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("corrected after final attempt"));
+    assert_eq!(
+        result.varbinds[0].value.as_str(),
+        Some("corrected after final attempt")
+    );
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -1604,7 +1628,7 @@ async fn v3_failed_correction_preserves_authenticated_report_time() {
     ));
 
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(response.value.as_str(), Some("state retained"));
+    assert_eq!(response.varbinds[0].value.as_str(), Some("state retained"));
     let requests = log.snapshot();
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[3].usm.engine_boots, 8);
@@ -1712,7 +1736,7 @@ async fn v3_authenticated_wrong_username_does_not_mutate_time_or_retry() {
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("state preserved"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("state preserved"));
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -1816,7 +1840,7 @@ async fn v3_auth_no_priv_client_rejects_auth_priv_without_time_mutation() {
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("state preserved"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("state preserved"));
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -1878,7 +1902,7 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("state preserved"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("state preserved"));
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -1917,7 +1941,10 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
         .await
         .unwrap();
     let synchronized = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(synchronized.value.as_str(), Some("synchronized"));
+    assert_eq!(
+        synchronized.varbinds[0].value.as_str(),
+        Some("synchronized")
+    );
 
     let err = client
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
@@ -1929,7 +1956,7 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("state preserved"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("state preserved"));
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -2108,7 +2135,7 @@ async fn v3_reserved_flag_bits_in_reply_ignored_for_level() {
         .await
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("reserved bits ok"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("reserved bits ok"));
     peer.finish().await.unwrap();
 }
 
@@ -2135,7 +2162,7 @@ async fn v3_scripted_udp_timeout_retry_count() {
         .await
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("after retries"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("after retries"));
 
     peer.finish().await.unwrap();
     let requests = log.snapshot();
@@ -2421,7 +2448,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(
-        result.value.as_str(),
+        result.varbinds[0].value.as_str(),
         Some("state advanced before correlation")
     );
     let requests = log.snapshot();
@@ -2492,7 +2519,7 @@ async fn v3_custom_transport_accepts_matching_ids_and_context() {
     let client = custom_client(transport, level, Some("requested-context"));
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("custom response"));
+    assert_eq!(result.varbinds[0].value.as_str(), Some("custom response"));
 }
 
 #[tokio::test]
@@ -2774,7 +2801,7 @@ async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(
-        result.value.as_str(),
+        result.varbinds[0].value.as_str(),
         Some("corrected from windowed report")
     );
 
@@ -2841,7 +2868,7 @@ async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correcti
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(
-        result.value.as_str(),
+        result.varbinds[0].value.as_str(),
         Some("corrected from windowed compatibility report")
     );
 
@@ -2998,7 +3025,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
     .expect("valid client config");
 
     let first = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(first.value.as_str(), Some("operation one"));
+    assert_eq!(first.varbinds[0].value.as_str(), Some("operation one"));
 
     let err = client
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))

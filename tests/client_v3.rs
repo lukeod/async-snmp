@@ -30,7 +30,8 @@ async fn v3_no_auth_no_priv() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// V3 authNoPriv with SHA-256.
@@ -55,7 +56,8 @@ async fn v3_auth_sha256() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// End-to-end authNoPriv roundtrip for a given auth protocol.
@@ -79,7 +81,8 @@ async fn auth_only_roundtrip(protocol: AuthProtocol) {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// V3 authNoPriv with SHA-224 (RFC 7860).
@@ -161,7 +164,8 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .expect("client must use the canonical shared time generation");
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 
     assert_eq!(
         agent.agent().usm_not_in_time_windows(),
@@ -236,7 +240,8 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .expect("authPriv client must use the canonical shared time generation");
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 
     assert_eq!(agent.agent().usm_not_in_time_windows(), baseline_reports);
 }
@@ -270,7 +275,8 @@ async fn v3_auth_priv_sha256_aes128() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// V3 with MD5 auth (legacy support).
@@ -296,7 +302,8 @@ async fn v3_auth_md5() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// V3 with DES privacy (legacy support).
@@ -324,7 +331,8 @@ async fn v3_auth_priv_sha1_des() {
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
 /// Wrong password fails authentication.
@@ -448,11 +456,16 @@ async fn v3_engine_discovery() {
 
     // First request triggers discovery
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
-    assert_eq!(result.value.as_str(), Some("Test SNMP Agent"));
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 
     // Subsequent request should use cached engine info
     let result2 = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await.unwrap();
-    assert!(matches!(result2.value, async_snmp::Value::TimeTicks(_)));
+    assert!(result2.anomalies.is_empty());
+    assert!(matches!(
+        result2.varbinds[0].value,
+        async_snmp::Value::TimeTicks(_)
+    ));
 }
 
 /// Build a raw noAuthNoPriv V3 GET request with a given engine ID and username.

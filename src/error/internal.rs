@@ -87,8 +87,6 @@ pub(crate) enum DecodeErrorKind {
     LengthExceedsMax { length: usize, max: usize },
     /// Integer64 too long.
     Integer64TooLong { length: usize },
-    /// Empty response.
-    EmptyResponse,
     /// TLV extends past end of data.
     TlvOverflow,
     /// Insufficient data for read.
@@ -150,7 +148,6 @@ impl std::fmt::Display for DecodeErrorKind {
             Self::Integer64TooLong { length } => {
                 write!(f, "integer64 too long: {length} bytes")
             }
-            Self::EmptyResponse => write!(f, "empty response"),
             Self::TlvOverflow => write!(f, "TLV extends past end of data"),
             Self::InsufficientData { needed, available } => {
                 write!(f, "need {needed} bytes but only {available} remaining")

@@ -20,8 +20,8 @@
 //!   docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
 
 use async_snmp::{
-    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, Retry, TcpTransport, Transport,
-    VarBind, oid,
+    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, ResponseShapePolicy, Retry,
+    TcpTransport, Transport, oid,
 };
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Use connect_tcp() instead of connect()
     let client = Client::builder(target, Auth::v2c("public"))
+        .response_shape_policy(ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(10))
         // Timeout retries are ignored for TCP (is_reliable = true).
         // SNMPv3 protocol correction is a separate state transition.
@@ -56,8 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Perform GET request
     match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
-        Ok(vb) => {
-            println!("sysDescr: {:?}", vb.value);
+        Ok(response) => {
+            println!("sysDescr: {:?}", response.varbinds[0].value);
         }
         Err(e) => {
             println!("GET failed: {e}");
@@ -83,12 +84,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = ClientConfig {
                 auth: Auth::v2c("public"),
                 timeout: Duration::from_secs(10),
+                response_shape_policy: ResponseShapePolicy::Strict,
                 ..Default::default()
             };
             let client = Client::new(transport, config)?;
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
-                Ok(vb) => println!("sysName: {:?}", vb.value),
+                Ok(response) => println!("sysName: {:?}", response.varbinds[0].value),
                 Err(e) => println!("GET failed: {e}"),
             }
         }
@@ -144,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     match Client::builder(target, auth)
+        .response_shape_policy(ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(15))
         .connect_tcp()
         .await
@@ -152,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("SNMPv3 TCP client connected");
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
-                Ok(VarBind { oid: _, value }) => println!("sysDescr: {value:?}"),
+                Ok(response) => println!("sysDescr: {:?}", response.varbinds[0].value),
                 Err(e) => println!("GET failed: {e}"),
             }
         }
@@ -168,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // UDP client - retries on timeout
     let udp_client = Client::builder(target, Auth::v2c("public"))
+        .response_shape_policy(ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(2))
         .retry(Retry::fixed(3, Duration::ZERO)) // Will retry up to 3 times on timeout
         .connect()
@@ -179,6 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // TCP client - no timeout retransmissions
     let tcp_client = Client::builder(target, Auth::v2c("public"))
+        .response_shape_policy(ResponseShapePolicy::Strict)
         .timeout(Duration::from_secs(2))
         .retry(Retry::fixed(3, Duration::ZERO)) // Ignored for TCP!
         .connect_tcp()
@@ -191,14 +196,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Demonstrate both clients work the same way
     if let Ok(client) = udp_client {
         match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-            Ok(VarBind { oid: _, value }) => println!("\nUDP sysUpTime: {value:?}"),
+            Ok(response) => println!("\nUDP sysUpTime: {:?}", response.varbinds[0].value),
             Err(e) => println!("\nUDP error: {e}"),
         }
     }
 
     if let Ok(client) = tcp_client {
         match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-            Ok(VarBind { oid: _, value }) => println!("TCP sysUpTime: {value:?}"),
+            Ok(response) => println!("TCP sysUpTime: {:?}", response.varbinds[0].value),
             Err(e) => println!("TCP error: {e}"),
         }
     }

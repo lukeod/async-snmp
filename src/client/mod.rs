@@ -2,12 +2,16 @@
 
 mod auth;
 mod builder;
+mod response_shape;
 mod retry;
 mod v3;
 mod walk;
 
 pub use auth::{Auth, CommunityVersion};
 pub use builder::{ClientBuilder, Target};
+pub use response_shape::{
+    FixedCardinalityOperation, FixedCardinalityResponse, ResponseShapeAnomaly, ResponseShapePolicy,
+};
 pub use retry::{Backoff, Retry, RetryBuilder};
 
 // New unified entry point
@@ -43,7 +47,6 @@ impl Client<UdpHandle> {
         ClientBuilder::new(target, auth)
     }
 }
-use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
@@ -55,6 +58,7 @@ use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
 use bytes::Bytes;
+use response_shape::{RequestShape, classify};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -189,6 +193,8 @@ pub struct ClientConfig {
     pub retry: Retry,
     /// Maximum OIDs per request (default: 10)
     pub max_oids_per_request: usize,
+    /// Fixed-cardinality response-shape policy (default: compatible).
+    pub response_shape_policy: ResponseShapePolicy,
     /// Permit one packet-local correction from an unauthenticated
     /// `usmStatsNotInTimeWindows` Report on an authenticated V3 operation.
     ///
@@ -225,6 +231,7 @@ impl Default for ClientConfig {
             timeout: DEFAULT_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
+            response_shape_policy: ResponseShapePolicy::Compatible,
             allow_unauthenticated_v3_time_correction: false,
             walk_mode: WalkMode::Auto,
             oid_ordering: OidOrdering::Strict,
@@ -554,27 +561,45 @@ impl<T: Transport> Client<T> {
         Ok(response)
     }
 
+    fn apply_response_shape_policy(
+        &self,
+        response: FixedCardinalityResponse,
+    ) -> Result<FixedCardinalityResponse> {
+        if self.inner.config.response_shape_policy == ResponseShapePolicy::Strict
+            && !response.anomalies.is_empty()
+        {
+            return Err(Error::ResponseShape {
+                target: self.peer_addr(),
+                response,
+            }
+            .boxed());
+        }
+        Ok(response)
+    }
+
     /// GET a single OID.
+    ///
+    /// Compatible mode preserves every returned binding and describes empty,
+    /// excess, or renamed responses in `anomalies`.
     #[instrument(skip(self), err, fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
-    pub async fn get(&self, oid: &Oid) -> Result<VarBind> {
+    pub async fn get(&self, oid: &Oid) -> Result<FixedCardinalityResponse> {
         let request_id = self.next_request_id();
         let pdu = Pdu::get_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
-
-        response.varbinds.into_iter().next().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %DecodeErrorKind::EmptyResponse }, "empty GET response");
-            Error::MalformedResponse {
-                target: self.peer_addr(),
-            }
-            .boxed()
-        })
+        self.apply_response_shape_policy(classify(
+            RequestShape::Get(std::slice::from_ref(oid)),
+            response.varbinds,
+            0,
+            0,
+        ))
     }
 
     /// GET multiple OIDs.
     ///
     /// If the OID list exceeds `max_oids_per_request`, the request is
-    /// automatically split into multiple batches. Results are returned
-    /// in the same order as the input OIDs.
+    /// automatically split into multiple batches. Response bindings are retained
+    /// in received batch order; consult `anomalies` before assuming positional
+    /// correspondence with the input OIDs.
     ///
     /// # Example
     ///
@@ -591,32 +616,31 @@ impl<T: Transport> Client<T> {
     /// # }
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
-    pub async fn get_many(&self, oids: &[Oid]) -> Result<Vec<VarBind>> {
-        self.get_or_getnext_many(oids, "GET", Pdu::get_request)
+    pub async fn get_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse> {
+        self.get_or_getnext_many(oids, FixedCardinalityOperation::Get, Pdu::get_request)
             .await
     }
 
     /// GETNEXT for a single OID.
     #[instrument(skip(self), err, fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
-    pub async fn get_next(&self, oid: &Oid) -> Result<VarBind> {
+    pub async fn get_next(&self, oid: &Oid) -> Result<FixedCardinalityResponse> {
         let request_id = self.next_request_id();
         let pdu = Pdu::get_next_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
-
-        response.varbinds.into_iter().next().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %DecodeErrorKind::EmptyResponse }, "empty GETNEXT response");
-            Error::MalformedResponse {
-                target: self.peer_addr(),
-            }
-            .boxed()
-        })
+        self.apply_response_shape_policy(classify(
+            RequestShape::GetNext(std::slice::from_ref(oid)),
+            response.varbinds,
+            0,
+            0,
+        ))
     }
 
     /// GETNEXT for multiple OIDs.
     ///
     /// If the OID list exceeds `max_oids_per_request`, the request is
-    /// automatically split into multiple batches. Results are returned
-    /// in the same order as the input OIDs.
+    /// automatically split into multiple batches. Response bindings are retained
+    /// in received batch order; consult `anomalies` before assuming positional
+    /// correspondence with the input OIDs.
     ///
     /// # Example
     ///
@@ -632,67 +656,75 @@ impl<T: Transport> Client<T> {
     /// # }
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
-    pub async fn get_next_many(&self, oids: &[Oid]) -> Result<Vec<VarBind>> {
-        self.get_or_getnext_many(oids, "GETNEXT", Pdu::get_next_request)
-            .await
+    pub async fn get_next_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse> {
+        self.get_or_getnext_many(
+            oids,
+            FixedCardinalityOperation::GetNext,
+            Pdu::get_next_request,
+        )
+        .await
     }
 
     /// Shared implementation for GET-many and GETNEXT-many.
-    ///
-    /// `op` is the PDU constructor (`Pdu::get_request` or `Pdu::get_next_request`).
-    /// `op_name` is used only for log messages.
     async fn get_or_getnext_many(
         &self,
         oids: &[Oid],
-        op_name: &'static str,
+        operation: FixedCardinalityOperation,
         op: fn(i32, &[Oid]) -> Pdu,
-    ) -> Result<Vec<VarBind>> {
+    ) -> Result<FixedCardinalityResponse> {
         if oids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(FixedCardinalityResponse::empty(operation));
         }
 
         let max_per_request = self.inner.config.max_oids_per_request;
-        let mut all_results = Vec::with_capacity(oids.len());
+        let mut outcome = FixedCardinalityResponse::empty(operation);
+        let mut request_offset = 0;
 
         for chunk in oids.chunks(max_per_request) {
-            self.send_batch_with_bisect(chunk, op_name, op, &mut all_results)
+            self.send_batch_with_bisect(chunk, request_offset, operation, op, &mut outcome)
                 .await?;
+            request_offset += chunk.len();
         }
 
-        Ok(all_results)
+        Ok(outcome)
     }
 
     /// Send a batch of OIDs, automatically bisecting on tooBig errors.
-    ///
-    /// If the agent returns tooBig for a batch with more than one OID, the batch
-    /// is split in half and each half is retried. This repeats recursively until
-    /// batches succeed or a single-OID request fails (which is unrecoverable).
     fn send_batch_with_bisect<'a>(
         &'a self,
         oids: &'a [Oid],
-        op_name: &'static str,
+        request_offset: usize,
+        operation: FixedCardinalityOperation,
         op: fn(i32, &[Oid]) -> Pdu,
-        results: &'a mut Vec<VarBind>,
+        outcome: &'a mut FixedCardinalityResponse,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let request_id = self.next_request_id();
             let pdu = op(request_id, oids);
             match self.send_request(pdu).await {
                 Ok(response) => {
-                    if response.varbinds.len() > oids.len() {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has more varbinds than requested");
-                        return Err(Error::MalformedResponse {
+                    let response_offset = outcome.varbinds.len();
+                    let request = match operation {
+                        FixedCardinalityOperation::Get => RequestShape::Get(oids),
+                        FixedCardinalityOperation::GetNext => RequestShape::GetNext(oids),
+                        FixedCardinalityOperation::Set => unreachable!("SET is never batched"),
+                    };
+                    let batch =
+                        classify(request, response.varbinds, request_offset, response_offset);
+                    if self.inner.config.response_shape_policy == ResponseShapePolicy::Strict
+                        && !batch.anomalies.is_empty()
+                    {
+                        let mut strict_response = outcome.clone();
+                        strict_response.varbinds.extend(batch.varbinds);
+                        strict_response.anomalies.extend(batch.anomalies);
+                        return Err(Error::ResponseShape {
                             target: self.peer_addr(),
-                        }
-                        .boxed());
-                    } else if response.varbinds.len() < oids.len() {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = oids.len(), actual = response.varbinds.len(), snmp.op = op_name }, "response has fewer varbinds than requested");
-                        return Err(Error::MalformedResponse {
-                            target: self.peer_addr(),
+                            response: strict_response,
                         }
                         .boxed());
                     }
-                    results.extend(response.varbinds);
+                    outcome.varbinds.extend(batch.varbinds);
+                    outcome.anomalies.extend(batch.anomalies);
                     Ok(())
                 }
                 Err(e)
@@ -706,11 +738,23 @@ impl<T: Transport> Client<T> {
                         ) =>
                 {
                     let mid = oids.len() / 2;
-                    tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), snmp.batch_size = oids.len(), snmp.split_at = mid, snmp.op = op_name }, "tooBig response, bisecting batch");
-                    self.send_batch_with_bisect(&oids[..mid], op_name, op, results)
-                        .await?;
-                    self.send_batch_with_bisect(&oids[mid..], op_name, op, results)
-                        .await?;
+                    tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), snmp.batch_size = oids.len(), snmp.split_at = mid }, "tooBig response, bisecting batch");
+                    self.send_batch_with_bisect(
+                        &oids[..mid],
+                        request_offset,
+                        operation,
+                        op,
+                        outcome,
+                    )
+                    .await?;
+                    self.send_batch_with_bisect(
+                        &oids[mid..],
+                        request_offset + mid,
+                        operation,
+                        op,
+                        outcome,
+                    )
+                    .await?;
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -720,19 +764,20 @@ impl<T: Transport> Client<T> {
 
     /// SET a single OID.
     #[instrument(skip(self, value), err, fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
-    pub async fn set(&self, oid: &Oid, value: Value) -> Result<VarBind> {
+    pub async fn set(&self, oid: &Oid, value: Value) -> Result<FixedCardinalityResponse> {
         let request_id = self.next_request_id();
-        let varbind = VarBind::new(oid.clone(), value);
-        let pdu = Pdu::set_request(request_id, vec![varbind]);
+        let requested = [(oid.clone(), value)];
+        let pdu = Pdu::set_request(
+            request_id,
+            vec![VarBind::new(requested[0].0.clone(), requested[0].1.clone())],
+        );
         let response = self.send_request(pdu).await?;
-
-        response.varbinds.into_iter().next().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %DecodeErrorKind::EmptyResponse }, "empty SET response");
-            Error::MalformedResponse {
-                target: self.peer_addr(),
-            }
-            .boxed()
-        })
+        self.apply_response_shape_policy(classify(
+            RequestShape::Set(&requested),
+            response.varbinds,
+            0,
+            0,
+        ))
     }
 
     /// SET multiple OIDs in a single atomic PDU.
@@ -761,9 +806,11 @@ impl<T: Transport> Client<T> {
     /// # }
     /// ```
     #[instrument(skip(self, varbinds), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = varbinds.len()))]
-    pub async fn set_many(&self, varbinds: &[(Oid, Value)]) -> Result<Vec<VarBind>> {
+    pub async fn set_many(&self, varbinds: &[(Oid, Value)]) -> Result<FixedCardinalityResponse> {
         if varbinds.is_empty() {
-            return Ok(Vec::new());
+            return Ok(FixedCardinalityResponse::empty(
+                FixedCardinalityOperation::Set,
+            ));
         }
 
         let max_per_request = self.inner.config.max_oids_per_request;
@@ -786,19 +833,14 @@ impl<T: Transport> Client<T> {
             .iter()
             .map(|(oid, value)| VarBind::new(oid.clone(), value.clone()))
             .collect();
-        let expected_count = vbs.len();
         let pdu = Pdu::set_request(request_id, vbs);
         let response = self.send_request(pdu).await?;
-        if response.varbinds.len() > expected_count {
-            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response has more varbinds than requested");
-            return Err(Error::MalformedResponse {
-                target: self.peer_addr(),
-            }
-            .boxed());
-        } else if response.varbinds.len() < expected_count {
-            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected = expected_count, actual = response.varbinds.len() }, "SET response has fewer varbinds than requested");
-        }
-        Ok(response.varbinds)
+        self.apply_response_shape_policy(classify(
+            RequestShape::Set(varbinds),
+            response.varbinds,
+            0,
+            0,
+        ))
     }
 
     /// Send a trap (fire-and-forget).
@@ -1256,14 +1298,107 @@ mod tests {
     }
 
     fn make_client(response_varbind_count: usize) -> Client<TruncatingTransport> {
+        make_client_with_policy(response_varbind_count, ResponseShapePolicy::Compatible)
+    }
+
+    fn make_client_with_policy(
+        response_varbind_count: usize,
+        response_shape_policy: ResponseShapePolicy,
+    ) -> Client<TruncatingTransport> {
         let transport = TruncatingTransport::new(response_varbind_count);
         let config = ClientConfig {
             auth: crate::Auth::v2c("public"),
             max_oids_per_request: 10,
             retry: crate::client::retry::Retry::none(),
+            response_shape_policy,
             ..Default::default()
         };
         Client::new(transport, config).expect("valid client config")
+    }
+
+    /// Returns exact scripted response bindings, preserving their order and values.
+    #[derive(Clone)]
+    struct ScriptedResponseTransport {
+        responses: Arc<Mutex<VecDeque<Vec<VarBind>>>>,
+        pending: Arc<Mutex<VecDeque<i32>>>,
+    }
+
+    impl ScriptedResponseTransport {
+        fn new(responses: Vec<Vec<VarBind>>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into())),
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+    }
+
+    impl Transport for ScriptedResponseTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
+
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            self.pending.lock().unwrap().push_back(request_id);
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _request_id: i32,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let request_id = self.pending.lock().unwrap().pop_front().unwrap_or(1);
+            let varbinds = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("missing scripted response");
+            async move {
+                let pdu = Pdu {
+                    pdu_type: PduType::Response,
+                    request_id,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds,
+                };
+                let message = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                Ok((message.encode().unwrap(), "127.0.0.1:161".parse().unwrap()))
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    fn scripted_client(
+        responses: Vec<Vec<VarBind>>,
+        response_shape_policy: ResponseShapePolicy,
+    ) -> Client<ScriptedResponseTransport> {
+        Client::new(
+            ScriptedResponseTransport::new(responses),
+            ClientConfig {
+                auth: crate::Auth::v2c("public"),
+                retry: crate::client::retry::Retry::none(),
+                response_shape_policy,
+                ..Default::default()
+            },
+        )
+        .expect("valid client config")
+    }
+
+    fn response_shape_error(result: Result<FixedCardinalityResponse>) -> FixedCardinalityResponse {
+        match *result.expect_err("strict policy must reject the scripted anomaly") {
+            Error::ResponseShape { response, .. } => response,
+            ref other => panic!("expected ResponseShape, got {other:?}"),
+        }
     }
 
     #[derive(Clone)]
@@ -1279,11 +1414,8 @@ mod tests {
             async { Ok(()) }
         }
 
-        fn recv(
-            &self,
-            _request_id: i32,
-        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
-            async { panic!("receive must not be reached after encode failure") }
+        async fn recv(&self, _request_id: i32) -> Result<(Bytes, SocketAddr)> {
+            panic!("receive must not be reached after encode failure")
         }
 
         fn peer_addr(&self) -> SocketAddr {
@@ -1454,9 +1586,184 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_many_rejects_truncated_response() {
-        // Request 3 OIDs but the mock returns only 1 varbind - an under-count breaks
-        // positional correspondence and must be rejected (RFC 3416 4.2.1).
+    async fn single_operations_preserve_empty_and_excess_responses() {
+        let oid = Oid::from_slice(&[1, 3, 6, 1, 1]);
+
+        for response_count in [0, 2] {
+            let get = make_client(response_count).get(&oid).await.unwrap();
+            let get_next = make_client(response_count).get_next(&oid).await.unwrap();
+            let set = make_client(response_count)
+                .set(&oid, Value::Integer(1))
+                .await
+                .unwrap();
+
+            for response in [get, get_next, set] {
+                assert_eq!(response.varbinds.len(), response_count);
+                if response_count == 0 {
+                    assert!(matches!(
+                        response.anomalies[0],
+                        ResponseShapeAnomaly::Truncated { .. }
+                    ));
+                } else {
+                    assert!(matches!(
+                        response.anomalies[0],
+                        ResponseShapeAnomaly::Excess { .. }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_policy_returns_observable_shape_error() {
+        let oid = Oid::from_slice(&[1, 3, 6, 1, 1]);
+        let error = make_client_with_policy(2, ResponseShapePolicy::Strict)
+            .get(&oid)
+            .await
+            .unwrap_err();
+        match *error {
+            Error::ResponseShape { response, .. } => {
+                assert_eq!(response.varbinds.len(), 2);
+                assert!(matches!(
+                    response.anomalies[0],
+                    ResponseShapeAnomaly::Excess { .. }
+                ));
+            }
+            other => panic!("expected ResponseShape, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_policy_preserves_scripted_semantics_across_all_fixed_operations() {
+        let a = Oid::from_slice(&[1, 3, 6, 1, 1]);
+        let b = Oid::from_slice(&[1, 3, 6, 1, 2]);
+        let c = Oid::from_slice(&[1, 3, 6, 1, 3]);
+        let responses = vec![
+            vec![VarBind::new(c.clone(), Value::Integer(10))],
+            vec![
+                VarBind::new(b.clone(), Value::Integer(20)),
+                VarBind::new(a.clone(), Value::Integer(10)),
+            ],
+            vec![VarBind::new(a.clone(), Value::Integer(10))],
+            vec![
+                VarBind::new(b.clone(), Value::Integer(20)),
+                VarBind::new(b.clone(), Value::EndOfMibView),
+            ],
+            vec![VarBind::new(a.clone(), Value::Integer(2))],
+            vec![
+                VarBind::new(a.clone(), Value::Integer(1)),
+                VarBind::new(b.clone(), Value::Integer(3)),
+            ],
+        ];
+        let client = scripted_client(responses.clone(), ResponseShapePolicy::Compatible);
+
+        let get = client.get(&a).await.unwrap();
+        assert_eq!(get.varbinds, responses[0]);
+        assert!(matches!(
+            get.anomalies.as_slice(),
+            [ResponseShapeAnomaly::OidMismatch { .. }]
+        ));
+
+        let get_many = client.get_many(&[a.clone(), b.clone()]).await.unwrap();
+        assert_eq!(get_many.varbinds, responses[1]);
+        assert!(matches!(
+            get_many.anomalies.as_slice(),
+            [ResponseShapeAnomaly::Reordered { .. }]
+        ));
+
+        let get_next = client.get_next(&a).await.unwrap();
+        assert_eq!(get_next.varbinds, responses[2]);
+        assert!(matches!(
+            get_next.anomalies.as_slice(),
+            [ResponseShapeAnomaly::GetNextNotSuccessor { .. }]
+        ));
+
+        let get_next_many = client.get_next_many(&[a.clone(), b.clone()]).await.unwrap();
+        assert_eq!(get_next_many.varbinds, responses[3]);
+        assert!(get_next_many.anomalies.is_empty());
+
+        let set = client.set(&a, Value::Integer(1)).await.unwrap();
+        assert_eq!(set.varbinds, responses[4]);
+        assert!(matches!(
+            set.anomalies.as_slice(),
+            [ResponseShapeAnomaly::SetValueMismatch { .. }]
+        ));
+
+        let set_many = client
+            .set_many(&[
+                (a.clone(), Value::Integer(1)),
+                (b.clone(), Value::Integer(2)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(set_many.varbinds, responses[5]);
+        assert!(matches!(
+            set_many.anomalies.as_slice(),
+            [ResponseShapeAnomaly::SetValueMismatch { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_policy_retains_scripted_evidence_across_all_fixed_operations() {
+        let a = Oid::from_slice(&[1, 3, 6, 1, 1]);
+        let b = Oid::from_slice(&[1, 3, 6, 1, 2]);
+        let c = Oid::from_slice(&[1, 3, 6, 1, 3]);
+        let responses = vec![
+            vec![VarBind::new(c.clone(), Value::Integer(10))],
+            vec![
+                VarBind::new(b.clone(), Value::Integer(20)),
+                VarBind::new(a.clone(), Value::Integer(10)),
+            ],
+            vec![VarBind::new(a.clone(), Value::Integer(10))],
+            vec![
+                VarBind::new(b.clone(), Value::Integer(20)),
+                VarBind::new(c.clone(), Value::EndOfMibView),
+            ],
+            vec![VarBind::new(a.clone(), Value::Integer(2))],
+            vec![
+                VarBind::new(a.clone(), Value::Integer(1)),
+                VarBind::new(b.clone(), Value::Integer(3)),
+            ],
+        ];
+        let client = scripted_client(responses.clone(), ResponseShapePolicy::Strict);
+
+        let errors = [
+            response_shape_error(client.get(&a).await),
+            response_shape_error(client.get_many(&[a.clone(), b.clone()]).await),
+            response_shape_error(client.get_next(&a).await),
+            response_shape_error(client.get_next_many(&[a.clone(), b.clone()]).await),
+            response_shape_error(client.set(&a, Value::Integer(1)).await),
+            response_shape_error(
+                client
+                    .set_many(&[
+                        (a.clone(), Value::Integer(1)),
+                        (b.clone(), Value::Integer(2)),
+                    ])
+                    .await,
+            ),
+        ];
+
+        for (response, expected) in errors.iter().zip(responses) {
+            assert_eq!(response.varbinds, expected);
+            assert!(!response.anomalies.is_empty());
+        }
+        assert!(matches!(
+            errors[3].anomalies.as_slice(),
+            [ResponseShapeAnomaly::GetNextEndOfMibNameMismatch { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn walk_does_not_consume_an_anomalous_single_response() {
+        let oid = Oid::from_slice(&[1, 3, 6, 1, 1]);
+        let mut walk = make_client(2).walk_getnext(oid);
+        let error = walk.next().await.unwrap().unwrap_err();
+        assert!(matches!(*error, Error::ResponseShape { .. }));
+        assert!(walk.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_many_preserves_truncated_response() {
         let client = make_client(1);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
@@ -1464,16 +1771,16 @@ mod tests {
             Oid::from_slice(&[1, 3, 6, 1, 3]),
         ];
 
-        let err = client.get_many(&oids).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
-        );
+        let response = client.get_many(&oids).await.unwrap();
+        assert_eq!(response.varbinds.len(), 1);
+        assert!(matches!(
+            response.anomalies.as_slice(),
+            [ResponseShapeAnomaly::Truncated { .. }]
+        ));
     }
 
     #[tokio::test]
-    async fn get_many_rejects_inflated_response() {
-        // Request 3 OIDs but the mock returns 5 varbinds.
+    async fn get_many_preserves_inflated_response() {
         let client = make_client(5);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
@@ -1481,11 +1788,12 @@ mod tests {
             Oid::from_slice(&[1, 3, 6, 1, 3]),
         ];
 
-        let err = client.get_many(&oids).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
-        );
+        let response = client.get_many(&oids).await.unwrap();
+        assert_eq!(response.varbinds.len(), 5);
+        assert!(matches!(
+            response.anomalies.as_slice(),
+            [ResponseShapeAnomaly::Excess { .. }]
+        ));
     }
 
     #[tokio::test]
@@ -1500,13 +1808,11 @@ mod tests {
 
         let result = client.get_many(&oids).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        assert_eq!(result.unwrap().len(), 3);
+        assert_eq!(result.unwrap().varbinds.len(), 3);
     }
 
     #[tokio::test]
-    async fn get_next_many_rejects_truncated_response() {
-        // Request 3 OIDs but the mock returns only 1 varbind - an under-count breaks
-        // positional correspondence and must be rejected (RFC 3416 4.2.1).
+    async fn get_next_many_preserves_truncated_response() {
         let client = make_client(1);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
@@ -1514,16 +1820,16 @@ mod tests {
             Oid::from_slice(&[1, 3, 6, 1, 3]),
         ];
 
-        let err = client.get_next_many(&oids).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
-        );
+        let response = client.get_next_many(&oids).await.unwrap();
+        assert_eq!(response.varbinds.len(), 1);
+        assert!(matches!(
+            response.anomalies.as_slice(),
+            [ResponseShapeAnomaly::Truncated { .. }]
+        ));
     }
 
     #[tokio::test]
-    async fn get_next_many_rejects_inflated_response() {
-        // Request 3 OIDs but the mock returns 5 varbinds.
+    async fn get_next_many_preserves_inflated_response() {
         let client = make_client(5);
         let oids = [
             Oid::from_slice(&[1, 3, 6, 1, 1]),
@@ -1531,11 +1837,12 @@ mod tests {
             Oid::from_slice(&[1, 3, 6, 1, 3]),
         ];
 
-        let err = client.get_next_many(&oids).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
-        );
+        let response = client.get_next_many(&oids).await.unwrap();
+        assert_eq!(response.varbinds.len(), 5);
+        assert!(matches!(
+            response.anomalies.as_slice(),
+            [ResponseShapeAnomaly::Excess { .. }]
+        ));
     }
 
     #[tokio::test]
@@ -1550,12 +1857,12 @@ mod tests {
 
         let result = client.get_next_many(&oids).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        assert_eq!(result.unwrap().len(), 3);
+        assert_eq!(result.unwrap().varbinds.len(), 3);
     }
 
     #[tokio::test]
-    async fn set_many_warns_on_truncated_response() {
-        // Request 3 varbinds but the mock returns only 1 - should warn and return what we got.
+    async fn set_many_preserves_truncated_response() {
+        // Request 3 varbinds but the mock returns only 1.
         let client = make_client(1);
         let varbinds = [
             (
@@ -1574,11 +1881,11 @@ mod tests {
 
         let result = client.set_many(&varbinds).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(result.unwrap().varbinds.len(), 1);
     }
 
     #[tokio::test]
-    async fn set_many_rejects_inflated_response() {
+    async fn set_many_preserves_inflated_response() {
         // Request 3 varbinds but the mock returns 5.
         let client = make_client(5);
         let varbinds = [
@@ -1596,11 +1903,12 @@ mod tests {
             ),
         ];
 
-        let err = client.set_many(&varbinds).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
-        );
+        let response = client.set_many(&varbinds).await.unwrap();
+        assert_eq!(response.varbinds.len(), 5);
+        assert!(matches!(
+            response.anomalies.as_slice(),
+            [ResponseShapeAnomaly::Excess { .. }]
+        ));
     }
 
     #[tokio::test]
@@ -1624,7 +1932,7 @@ mod tests {
 
         let result = client.set_many(&varbinds).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        assert_eq!(result.unwrap().len(), 3);
+        assert_eq!(result.unwrap().varbinds.len(), 3);
     }
 
     // -------------------------------------------------------------------------
@@ -1740,7 +2048,7 @@ mod tests {
             .collect();
 
         let result = client.get_many(&oids).await.unwrap();
-        assert_eq!(result.len(), 8);
+        assert_eq!(result.varbinds.len(), 8);
     }
 
     #[tokio::test]
@@ -1786,15 +2094,14 @@ mod tests {
             .collect();
 
         let result = client.get_next_many(&oids).await.unwrap();
-        assert_eq!(result.len(), 8);
+        assert_eq!(result.varbinds.len(), 8);
     }
 
     // Batched path: get_many with more OIDs than max_per_request.
     #[tokio::test]
-    async fn get_many_batched_rejects_truncated_response() {
+    async fn get_many_batched_preserves_truncated_response_offsets() {
         // max_oids_per_request = 10, request 12 OIDs, mock returns 1 per batch.
-        // The first batch under-counts, breaking positional correspondence, and must
-        // be rejected (RFC 3416 4.2.1).
+        // Request and response ranges remain globally meaningful after each under-count.
         let transport = TruncatingTransport::new(1);
         let config = ClientConfig {
             auth: crate::Auth::v2c("public"),
@@ -1808,15 +2115,22 @@ mod tests {
             .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
             .collect();
 
-        let err = client.get_many(&oids).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
-        );
+        let response = client.get_many(&oids).await.unwrap();
+        assert_eq!(response.varbinds.len(), 2);
+        assert!(matches!(
+            response.anomalies.as_slice(),
+            [
+                ResponseShapeAnomaly::Truncated { request_range, response_range, .. },
+                ResponseShapeAnomaly::Truncated { request_range: second_request, response_range: second_response, .. }
+            ] if request_range == &(0..10)
+                && response_range == &(0..1)
+                && second_request == &(10..12)
+                && second_response == &(1..2)
+        ));
     }
 
     #[tokio::test]
-    async fn get_many_batched_rejects_inflated_response() {
+    async fn get_many_batched_preserves_inflated_response_offsets() {
         // max_oids_per_request = 10, request 12 OIDs, mock returns 12 per batch.
         let transport = TruncatingTransport::new(12);
         let config = ClientConfig {
@@ -1831,11 +2145,18 @@ mod tests {
             .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
             .collect();
 
-        let err = client.get_many(&oids).await.unwrap_err();
-        assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
-        );
+        let response = client.get_many(&oids).await.unwrap();
+        assert_eq!(response.varbinds.len(), 24);
+        assert!(matches!(
+            response.anomalies.as_slice(),
+            [
+                ResponseShapeAnomaly::Excess { request_range, response_range, .. },
+                ResponseShapeAnomaly::Excess { request_range: second_request, response_range: second_response, .. }
+            ] if request_range == &(0..10)
+                && response_range == &(0..12)
+                && second_request == &(10..12)
+                && second_response == &(12..24)
+        ));
     }
 
     // -------------------------------------------------------------------------

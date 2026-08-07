@@ -60,8 +60,9 @@ async fn wrong_community_does_not_consume_pending_udp_request() {
         .await
         .unwrap();
 
+    assert!(result.anomalies.is_empty());
     assert_eq!(
-        result.value,
+        result.varbinds[0].value,
         Value::OctetString(Bytes::from_static(b"legitimate"))
     );
     server.await.unwrap();

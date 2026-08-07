@@ -175,13 +175,19 @@ async fn walk_scalar_fallback<T: Transport + 'static>(
         return Ok(());
     }
     match client.get(base_oid).await {
-        // Real scalar value: return it.
-        Ok(vb) if !vb.value.is_exception() => {
-            results.push(vb);
+        Ok(response) if response.anomalies.is_empty() && response.varbinds.len() == 1 => {
+            let vb = response.varbinds.into_iter().next().unwrap();
+            if !vb.value.is_exception() {
+                results.push(vb);
+            }
             Ok(())
         }
-        // Genuine absence (v2c+): exception value in an otherwise-Ok response.
-        Ok(_) => Ok(()),
+        // Walk internals never select from an ambiguous compatible response.
+        Ok(response) => Err(Error::ResponseShape {
+            target: client.peer_addr(),
+            response,
+        }
+        .boxed()),
         // Genuine absence (v1): noSuchName error-status.
         Err(e)
             if matches!(
@@ -254,7 +260,14 @@ pub struct Walk<T: Transport> {
     /// Count of results returned so far.
     count: usize,
     done: bool,
-    pending: Option<Pin<Box<dyn std::future::Future<Output = Result<VarBind>> + Send>>>,
+    pending: Option<
+        Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::client::FixedCardinalityResponse>>
+                    + Send,
+            >,
+        >,
+    >,
 }
 
 impl<T: Transport> Walk<T> {
@@ -313,7 +326,10 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                 self.pending = None;
 
                 match result {
-                    Ok(vb) => {
+                    Ok(response)
+                        if response.anomalies.is_empty() && response.varbinds.len() == 1 =>
+                    {
+                        let vb = response.varbinds.into_iter().next().unwrap();
                         let target = self.client.peer_addr();
                         let base_oid = self.base_oid.clone();
                         match validate_walk_varbind(&vb, &base_oid, &mut self.oid_tracker, target) {
@@ -333,6 +349,14 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                         self.count += 1;
 
                         Poll::Ready(Some(Ok(vb)))
+                    }
+                    Ok(response) => {
+                        self.done = true;
+                        Poll::Ready(Some(Err(Error::ResponseShape {
+                            target: self.client.peer_addr(),
+                            response,
+                        }
+                        .boxed())))
                     }
                     Err(e) => {
                         if self.client.inner.config.version() == Version::V1
@@ -974,10 +998,7 @@ mod tests {
                         request_id,
                         error_status: 0,
                         error_index: 0,
-                        varbinds: vec![VarBind::new(
-                            oid!(1, 3, 6, 1, 2, 1, 99),
-                            Value::EndOfMibView,
-                        )],
+                        varbinds: vec![VarBind::new(base.clone(), Value::EndOfMibView)],
                     },
                     // Fallback GET on the base OID.
                     _ => match mode {

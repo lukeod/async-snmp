@@ -25,12 +25,13 @@
 //! async fn main() -> Result<(), Box<async_snmp::Error>> {
 //!     // SNMPv2c client - target accepts (host, port), a string, or a SocketAddr
 //!     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
+//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
 //!         .timeout(Duration::from_secs(5))
 //!         .connect()
 //!         .await?;
 //!
 //!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-//!     println!("sysDescr: {:?}", result.value);
+//!     println!("sysDescr: {:?}", result.varbinds[0].value);
 //!
 //!     Ok(())
 //! }
@@ -50,11 +51,12 @@
 //!             PrivProtocol::Aes128,
 //!             "privpass123",
 //!         ))
+//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
 //!         .connect()
 //!         .await?;
 //!
 //!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-//!     println!("sysDescr: {:?}", result.value);
+//!     println!("sysDescr: {:?}", result.varbinds[0].value);
 //!
 //!     Ok(())
 //! }
@@ -112,6 +114,7 @@
 //!
 //! async fn poll_device(addr: &str) -> Result<String, String> {
 //!     let client = Client::builder(addr, Auth::v2c("public"))
+//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
 //!         .timeout(Duration::from_secs(5))
 //!         .retry(Retry::fixed(2, Duration::ZERO))
 //!         .connect()
@@ -119,7 +122,7 @@
 //!         .map_err(|e| format!("Failed to connect: {}", e))?;
 //!
 //!     match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
-//!         Ok(vb) => Ok(vb.value.as_str().unwrap_or("(non-string)").to_string()),
+//!         Ok(response) => Ok(response.varbinds[0].value.as_str().unwrap_or("(non-string)").to_string()),
 //!         Err(e) => match *e {
 //!             Error::Timeout { retries, .. } => {
 //!                 Err(format!("Device unreachable after {} retries", retries))
@@ -194,6 +197,7 @@
 //!     let mut clients = Vec::new();
 //!     for t in &targets {
 //!         let client = Client::builder((*t, 161), Auth::v2c("public"))
+//!             .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
 //!             .build_with(&transport)
 //!             .await
 //!             .expect("failed to build client");
@@ -204,7 +208,7 @@
 //!     let results = join_all(
 //!         clients.iter().map(|c| async {
 //!             match c.get(&sys_descr).await {
-//!                 Ok(vb) => Ok(vb.value.to_string()),
+//!                 Ok(response) => Ok(response.varbinds[0].value.to_string()),
 //!                 Err(e) => Err(e.to_string()),
 //!             }
 //!         })
@@ -242,11 +246,12 @@
 //!     let auth = Auth::usm("snmpuser").with_master_keys(master_keys.clone());
 //!
 //!     let client = Client::builder(target, auth)
+//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
 //!         .engine_cache(engine_cache.clone())
 //!         .build_with(&transport).await?;
 //!
 //!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-//!     println!("{}: {:?}", target, result.value);
+//!     println!("{}: {:?}", target, result.varbinds[0].value);
 //! }
 //! # Ok(())
 //! # }
@@ -271,6 +276,7 @@
 //!     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 //! ) {
 //!     let client = Client::builder(addr, Auth::v2c("public"))
+//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
 //!         .connect()
 //!         .await
 //!         .expect("failed to connect");
@@ -286,7 +292,7 @@
 //!             }
 //!             _ = poll_interval.tick() => {
 //!                 match client.get(&sys_uptime).await {
-//!                     Ok(vb) => println!("Uptime: {:?}", vb.value),
+//!                     Ok(response) => println!("Uptime: {:?}", response.varbinds[0].value),
 //!                     Err(e) => eprintln!("Poll failed: {}", e),
 //!                 }
 //!             }
@@ -481,8 +487,9 @@ pub mod mib_support;
 pub use agent::{Agent, AgentBuilder, BuiltinMib, VacmBuilder, VacmConfig, View};
 pub use client::{
     Auth, Backoff, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
-    DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT, OidOrdering, Retry,
-    RetryBuilder, Target, Walk, WalkMode, WalkStream,
+    DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT,
+    FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering, ResponseShapeAnomaly,
+    ResponseShapePolicy, Retry, RetryBuilder, Target, Walk, WalkMode, WalkStream,
 };
 pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
 pub use handler::{

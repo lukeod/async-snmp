@@ -23,7 +23,7 @@
 use async_snmp::transport::UdpTransport;
 use async_snmp::{
     Auth, AuthProtocol, Client, CommunityResponsePolicy, EngineCache, MasterKeys, PrivProtocol,
-    Retry, VarBind, oid,
+    ResponseShapePolicy, Retry, oid,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for oid in &oids {
         let client = Client::builder(container_target, Auth::v2c("public"))
+            .response_shape_policy(ResponseShapePolicy::Strict)
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
             .build_with(&shared)
@@ -105,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some((oid, result)) = futures.next().await {
         match result {
-            Ok(VarBind { oid: _, value }) => println!("  {oid}: {value:?}"),
+            Ok(response) => println!("  {oid}: {:?}", response.varbinds[0].value),
             Err(e) => println!("  {oid}: {e}"),
         }
     }
@@ -144,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
 
         let client = Client::builder(container_target, auth)
+            .response_shape_policy(ResponseShapePolicy::Strict)
             .timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
             .engine_cache(engine_cache.clone())
@@ -151,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
         match client.get(oid).await {
-            Ok(VarBind { oid: _, value }) => println!("  {oid}: {value:?}"),
+            Ok(response) => println!("  {oid}: {:?}", response.varbinds[0].value),
             Err(e) => println!("  {oid}: {e}"),
         }
     }
@@ -175,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for target in &targets {
         let client = Client::builder(*target, Auth::v2c("public"))
+            .response_shape_policy(ResponseShapePolicy::Strict)
             .timeout(Duration::from_millis(500))
             .retry(Retry::none())
             .build_with(&shared)
@@ -191,9 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some((addr, result)) = futures.next().await {
         match result {
-            Ok(vb) => {
+            Ok(response) => {
                 success += 1;
-                println!("  {}: {:?}", addr, vb.value);
+                println!("  {}: {:?}", addr, response.varbinds[0].value);
             }
             Err(e) => match *e {
                 async_snmp::Error::Timeout { .. } => {
