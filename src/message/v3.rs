@@ -20,10 +20,12 @@
 //! - An encrypted OCTET STRING for authPriv (decrypts to `ScopedPDU`)
 
 use bytes::Bytes;
+use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
 use crate::message_size::{MESSAGE_SIZE_MINIMUM, MessageSize};
 use crate::pdu::Pdu;
 
@@ -219,29 +221,20 @@ impl MsgGlobalData {
         let flags_bytes = seq.read_octet_string()?;
         if flags_bytes.len() != 1 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), expected = 1, actual = flags_bytes.len() }, "invalid msgFlags length");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
-        let msg_flags = MsgFlags::from_byte(flags_bytes[0])?;
+        let msg_flags = MsgFlags::from_byte(flags_bytes[0]).map_err(|_| seq.malformed())?;
 
         let msg_security_model_raw = seq.read_bounded_integer(1, i32::MAX)?;
         // Reject unknown security models per RFC 3412 Section 7.2
         let msg_security_model =
             SecurityModel::from_i32(msg_security_model_raw).ok_or_else(|| {
                 tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), model = msg_security_model_raw, kind = %DecodeErrorKind::UnknownSecurityModel(msg_security_model_raw) }, "decode error");
-                Error::MalformedResponse {
-                    target: UNKNOWN_TARGET,
-                }
-                .boxed()
+                seq.malformed()
             })?;
 
         if !seq.is_empty() {
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
 
         Ok(Self {
@@ -314,10 +307,7 @@ impl ScopedPdu {
         let pdu = Pdu::decode(&mut seq)?;
 
         if !seq.is_empty() {
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
 
         Ok(Self {
@@ -437,28 +427,39 @@ impl V3Message {
         Ok(buf.finish())
     }
 
-    /// Decode from BER.
+    /// Decode from BER using the default compatible top-level policy.
     ///
     /// For encrypted messages, returns `V3MessageData::Encrypted` with the raw
     /// ciphertext. For plaintext messages this parses the scoped PDU without
     /// performing USM authentication. Receive paths handling untrusted input
     /// should use [`RawV3Message::decode`] so authentication and timeliness can
-    /// precede scoped-PDU parsing.
+    /// precede scoped-PDU parsing. A suffix after the complete message emits
+    /// the stable `async_snmp::message` `trailing_bytes` anomaly event; use
+    /// [`Self::decode_with_policy`] to retain the anomaly metadata.
     pub fn decode(data: Bytes) -> Result<Self> {
+        Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
+    }
+
+    /// Decode using an explicit top-level consumption policy and retain any
+    /// compatible-mode trailing-byte anomaly.
+    pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
         let mut decoder = Decoder::new(data);
         let mut seq = decoder.read_sequence()?;
 
-        // Version
         let version = seq.read_bounded_integer(0, i32::MAX)?;
         if version != 3 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), version, kind = %DecodeErrorKind::UnknownVersion(version) }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
 
-        Self::decode_from_sequence(&mut seq)
+        let value = Self::decode_from_sequence(&mut seq)?;
+        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
+        Ok(DecodeOutcome { value, anomaly })
+    }
+
+    /// Decode while requiring the input to contain exactly one message TLV.
+    pub fn decode_strict(data: Bytes) -> Result<Self> {
+        Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
 
     /// Decode from a sequence decoder where version has already been read.
@@ -540,35 +541,47 @@ pub enum RawMsgData {
 }
 
 impl RawV3Message {
-    /// Decode the outer envelope from BER without touching the scoped PDU.
+    /// Decode the outer envelope using the default compatible top-level policy.
     ///
     /// The received security level is derived from the message's own flags;
     /// invalid flag combinations (privacy without authentication) are
-    /// rejected here, before any authentication or PDU processing.
+    /// rejected here, before any authentication or PDU processing. A suffix
+    /// after the complete message emits the stable `async_snmp::message`
+    /// `trailing_bytes` anomaly event; use [`Self::decode_with_policy`] to
+    /// retain the anomaly metadata.
     pub fn decode(data: Bytes) -> Result<Self> {
-        let input_len = data.len();
-        Self::decode_bounded(data, input_len)
+        Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
     }
 
-    /// Decode raw V3 fields under a caller-supplied total input bound.
-    pub(crate) fn decode_bounded(data: Bytes, maximum: usize) -> Result<Self> {
+    /// Decode using an explicit top-level consumption policy and retain any
+    /// compatible-mode trailing-byte anomaly.
+    pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
+        let input_len = data.len();
+        Self::decode_bounded_with_target(data, input_len, UNKNOWN_TARGET, policy)
+    }
+
+    /// Decode while requiring the input to contain exactly one message TLV.
+    pub fn decode_strict(data: Bytes) -> Result<Self> {
+        Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
+    }
+
+    pub(crate) fn decode_bounded_with_target(
+        data: Bytes,
+        maximum: usize,
+        target: SocketAddr,
+        policy: DecodePolicy,
+    ) -> Result<DecodeOutcome<Self>> {
         if data.len() > maximum {
-            tracing::debug!(target: "async_snmp::v3", { received_size = data.len(), maximum }, "message exceeds receive limit");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            tracing::debug!(target: "async_snmp::v3", { received_size = data.len(), maximum, peer = %target }, "message exceeds receive limit");
+            return Err(Error::MalformedResponse { target }.boxed());
         }
-        let mut decoder = Decoder::new(data);
+        let mut decoder = Decoder::with_target(data, target);
         let mut seq = decoder.read_sequence()?;
 
         let version = seq.read_bounded_integer(0, i32::MAX)?;
         if version != 3 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), version, kind = %DecodeErrorKind::UnknownVersion(version) }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
 
         let global_data = MsgGlobalData::decode(&mut seq)?;
@@ -583,18 +596,13 @@ impl RawV3Message {
             RawMsgData::Plaintext(seq.as_bytes().slice(start..seq.offset()))
         };
 
-        if !seq.is_empty() || !decoder.is_empty() {
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
-        }
-
-        Ok(Self {
+        let value = Self {
             global_data,
             security_params,
             msg_data,
-        })
+        };
+        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
+        Ok(DecodeOutcome { value, anomaly })
     }
 
     /// Get the decoded global header.
@@ -984,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_decode_rejects_trailing_envelope_fields() {
+    fn v3_decoders_share_envelope_and_root_suffix_policy() {
         let global = MsgGlobalData::new(
             17,
             crate::MessageSize::new(1472).unwrap(),
@@ -1001,7 +1009,10 @@ mod tests {
             global.encode(buf);
             buf.push_integer(3);
         });
-        assert!(RawV3Message::decode(with_outer_field.finish()).is_err());
+        let with_outer_field = with_outer_field.finish();
+        assert!(RawV3Message::decode(with_outer_field.clone()).is_err());
+        assert!(V3Message::decode(with_outer_field.clone()).is_err());
+        assert!(crate::message::Message::decode(with_outer_field).is_err());
 
         // Encode an extra INTEGER inside msgGlobalData.
         let mut with_global_field = EncodeBuf::new();
@@ -1017,13 +1028,56 @@ mod tests {
             });
             buf.push_integer(3);
         });
-        assert!(RawV3Message::decode(with_global_field.finish()).is_err());
+        let with_global_field = with_global_field.finish();
+        assert!(RawV3Message::decode(with_global_field.clone()).is_err());
+        assert!(V3Message::decode(with_global_field.clone()).is_err());
+        assert!(crate::message::Message::decode(with_global_field).is_err());
 
         // Append another top-level TLV after an otherwise complete message.
         let message = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
-        let mut with_root_trailing = message.encode().unwrap().to_vec();
+        let valid = message.encode().unwrap();
+        assert_eq!(
+            RawV3Message::decode_with_policy(valid.clone(), DecodePolicy::Compatible)
+                .unwrap()
+                .anomaly,
+            None
+        );
+        assert_eq!(
+            V3Message::decode_with_policy(valid.clone(), DecodePolicy::Strict)
+                .unwrap()
+                .anomaly,
+            None
+        );
+        assert_eq!(
+            crate::message::Message::decode_with_policy(valid.clone(), DecodePolicy::Strict)
+                .unwrap()
+                .anomaly,
+            None
+        );
+        let mut with_root_trailing = valid.to_vec();
         with_root_trailing.extend_from_slice(&[0x05, 0]);
-        assert!(RawV3Message::decode(Bytes::from(with_root_trailing)).is_err());
+        let with_root_trailing = Bytes::from(with_root_trailing);
+
+        for anomaly in [
+            RawV3Message::decode_with_policy(with_root_trailing.clone(), DecodePolicy::Compatible)
+                .unwrap()
+                .anomaly,
+            V3Message::decode_with_policy(with_root_trailing.clone(), DecodePolicy::Compatible)
+                .unwrap()
+                .anomaly,
+            crate::message::Message::decode_with_policy(
+                with_root_trailing.clone(),
+                DecodePolicy::Compatible,
+            )
+            .unwrap()
+            .anomaly,
+        ] {
+            assert_eq!(anomaly.unwrap().trailing_bytes, 2);
+        }
+
+        assert!(RawV3Message::decode_strict(with_root_trailing.clone()).is_err());
+        assert!(V3Message::decode_strict(with_root_trailing.clone()).is_err());
+        assert!(crate::message::Message::decode_strict(with_root_trailing).is_err());
     }
 
     #[test]

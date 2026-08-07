@@ -2398,9 +2398,8 @@ async fn v3_custom_transport_rejects_future_discovery_msg_id() {
 }
 
 /// RFC 3412 Section 7.2 processes the Security Model before parsing the
-/// scopedPDU and correlating an Internal-class Report by msgID. The unknown
-/// target on this error distinguishes USM engine-ID validation from the later
-/// peer-bound parse/correlation failures.
+/// scopedPDU and correlating an Internal-class Report by msgID. Peer context is
+/// retained while entering the USM security-parameter decoder.
 #[tokio::test]
 async fn v3_discovery_usm_processing_precedes_parse_and_correlation() {
     let level = SecurityLevel::NoAuthNoPriv;
@@ -2429,7 +2428,7 @@ async fn v3_discovery_usm_processing_precedes_parse_and_correlation() {
         .unwrap_err();
     match *err {
         async_snmp::Error::MalformedResponse { target } => {
-            assert_eq!(target, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            assert_eq!(target, std::net::SocketAddr::from(([127, 0, 0, 1], 161)));
         }
         _ => panic!("invalid discovery USM parameters must be rejected first: {err}"),
     }

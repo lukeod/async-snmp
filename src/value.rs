@@ -3,8 +3,8 @@
 //! The `Value` enum represents all SNMP data types including exceptions.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
+use crate::error::Result;
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::format::hex;
 use crate::oid::Oid;
 use bytes::Bytes;
@@ -1064,10 +1064,7 @@ impl Value {
             tag::universal::NULL => {
                 if len != 0 {
                     tracing::debug!(target: "async_snmp::value", { offset = decoder.offset(), kind = %DecodeErrorKind::InvalidNull }, "decode error");
-                    return Err(Error::MalformedResponse {
-                        target: UNKNOWN_TARGET,
-                    }
-                    .boxed());
+                    return Err(decoder.malformed());
                 }
                 Ok(Value::Null)
             }
@@ -1078,10 +1075,7 @@ impl Value {
             tag::application::IP_ADDRESS => {
                 if len != 4 {
                     tracing::debug!(target: "async_snmp::value", { offset = decoder.offset(), length = len, kind = %DecodeErrorKind::InvalidIpAddressLength { length: len } }, "decode error");
-                    return Err(Error::MalformedResponse {
-                        target: UNKNOWN_TARGET,
-                    }
-                    .boxed());
+                    return Err(decoder.malformed());
                 }
                 let data = decoder.read_bytes(4)?;
                 Ok(Value::IpAddress([data[0], data[1], data[2], data[3]]))
@@ -1147,10 +1141,7 @@ impl Value {
             // Net-snmp documents but does not parse constructed form; we follow suit.
             tag::universal::OCTET_STRING_CONSTRUCTED => {
                 tracing::debug!(target: "async_snmp::value", { offset = decoder.offset(), kind = %DecodeErrorKind::ConstructedOctetString }, "decode error");
-                Err(Error::MalformedResponse {
-                    target: UNKNOWN_TARGET,
-                }
-                .boxed())
+                Err(decoder.malformed())
             }
             _ => {
                 // Unknown tag - preserve for forward compatibility
@@ -1328,6 +1319,24 @@ mod tests {
             matches!(&*err, crate::Error::MalformedResponse { .. }),
             "expected MalformedResponse error, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn malformed_value_errors_retain_decoder_target() {
+        let peer = "192.0.2.44:161".parse().unwrap();
+        let malformed_values = [
+            Bytes::from_static(&[0x05, 0x01, 0x00]),
+            Bytes::from_static(&[0x40, 0x03, 0x01, 0x02, 0x03]),
+            Bytes::from_static(&[0x24, 0x00]),
+        ];
+
+        for value in malformed_values {
+            let mut decoder = Decoder::with_target(value, peer);
+            let error = Value::decode(&mut decoder).unwrap_err();
+            assert!(
+                matches!(&*error, crate::Error::MalformedResponse { target } if *target == peer)
+            );
+        }
     }
 
     #[test]

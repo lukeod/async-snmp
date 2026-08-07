@@ -37,7 +37,7 @@ impl Agent {
         source: SocketAddr,
         version: Version,
     ) -> Result<Option<Bytes>> {
-        let msg = CommunityMessage::decode(data)?;
+        let msg = CommunityMessage::decode_with_target(data, source)?;
 
         // Validate community
         if !self.validate_community(&msg.community) {

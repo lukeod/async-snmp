@@ -44,12 +44,12 @@ impl Decoder {
     }
 
     /// Get the target address for error context.
-    fn target(&self) -> SocketAddr {
+    pub(crate) fn target(&self) -> SocketAddr {
         self.target.unwrap_or(UNKNOWN_TARGET)
     }
 
     /// Return a boxed `MalformedResponse` error for the current target.
-    fn malformed(&self) -> Box<crate::error::Error> {
+    pub(crate) fn malformed(&self) -> Box<crate::error::Error> {
         Error::MalformedResponse {
             target: self.target(),
         }
@@ -297,13 +297,13 @@ impl Decoder {
     pub fn read_oid(&mut self) -> Result<Oid> {
         let len = self.expect_tag(tag::universal::OBJECT_IDENTIFIER)?;
         let bytes = self.read_bytes(len)?;
-        Oid::from_ber(&bytes)
+        Oid::from_ber(&bytes).map_err(|_| self.malformed())
     }
 
     /// Read an OID given a pre-read length.
     pub fn read_oid_value(&mut self, len: usize) -> Result<Oid> {
         let bytes = self.read_bytes(len)?;
-        Oid::from_ber(&bytes)
+        Oid::from_ber(&bytes).map_err(|_| self.malformed())
     }
 
     /// Read a SEQUENCE, returning a decoder for its contents.
@@ -409,6 +409,19 @@ mod tests {
         let mut dec = Decoder::from_slice(&[0x06, 0x03, 0x2B, 0x06, 0x01]);
         let oid = dec.read_oid().unwrap();
         assert_eq!(oid.arcs(), &[1, 3, 6, 1]);
+    }
+
+    #[test]
+    fn malformed_oid_errors_retain_decoder_target() {
+        let peer = "192.0.2.44:161".parse().unwrap();
+
+        let mut tagged = Decoder::with_target(Bytes::from_static(&[0x06, 0x01, 0x80]), peer);
+        let error = tagged.read_oid().unwrap_err();
+        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
+
+        let mut value = Decoder::with_target(Bytes::from_static(&[0x80]), peer);
+        let error = value.read_oid_value(1).unwrap_err();
+        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
     }
 
     #[test]

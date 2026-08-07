@@ -166,8 +166,13 @@ pub(crate) fn process_v3_inbound(
 ) -> Result<V3Inbound> {
     let source = ctx.source;
 
-    let msg = match RawV3Message::decode_bounded(data.clone(), ctx.accepted_receive_size) {
-        Ok(msg) => msg,
+    let msg = match RawV3Message::decode_bounded_with_target(
+        data.clone(),
+        ctx.accepted_receive_size,
+        source,
+        crate::message::DecodePolicy::Compatible,
+    ) {
+        Ok(outcome) => outcome.value,
         Err(e) => {
             // RFC 3412 Section 7.2.4/7.2.7: invalid msgFlags and unknown
             // security models are counted before the message is discarded.
@@ -186,7 +191,7 @@ pub(crate) fn process_v3_inbound(
         }
     };
     let security_level = msg.global_data.msg_flags.security_level;
-    let usm_params = UsmSecurityParams::decode(msg.security_params.clone())?;
+    let usm_params = UsmSecurityParams::decode_with_target(msg.security_params.clone(), source)?;
 
     // Encodes the Report for `failure` (counting it first), unauthenticated
     // unless `auth_key` is given (notInTimeWindows, RFC 3414 3.2 Step 7a).

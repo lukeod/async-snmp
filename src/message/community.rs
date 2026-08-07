@@ -8,11 +8,13 @@
 //! and are represented by the `CommunityPdu::TrapV1` variant.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
+use crate::error::Result;
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
 use crate::pdu::{GetBulkPdu, Pdu, PduType, TrapV1Pdu};
 use crate::version::Version;
 use bytes::Bytes;
+use std::net::SocketAddr;
 
 /// PDU carried inside a community (v1/v2c) message.
 ///
@@ -163,38 +165,53 @@ impl CommunityMessage {
         Ok(buf.finish())
     }
 
-    /// Decode from BER.
+    /// Decode using the default compatible top-level policy.
     ///
-    /// Returns the message with the version parsed from the data.
+    /// Suffix acceptance emits the stable `async_snmp::message`
+    /// `trailing_bytes` anomaly event. Use [`Self::decode_with_policy`] to
+    /// retain the anomaly metadata.
     pub fn decode(data: Bytes) -> Result<Self> {
-        let mut decoder = Decoder::new(data);
-        Self::decode_from(&mut decoder)
+        Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
     }
 
-    /// Decode from an existing decoder (used by Message dispatcher).
-    pub(crate) fn decode_from(decoder: &mut Decoder) -> Result<Self> {
+    /// Decode using an explicit top-level consumption policy.
+    pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
+        Self::decode_with_target_and_policy(data, crate::error::UNKNOWN_TARGET, policy)
+    }
+
+    /// Decode while requiring the input to contain exactly one message TLV.
+    pub fn decode_strict(data: Bytes) -> Result<Self> {
+        Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
+    }
+
+    pub(crate) fn decode_with_target(data: Bytes, target: SocketAddr) -> Result<Self> {
+        Ok(Self::decode_with_target_and_policy(data, target, DecodePolicy::Compatible)?.value)
+    }
+
+    fn decode_with_target_and_policy(
+        data: Bytes,
+        target: SocketAddr,
+        policy: DecodePolicy,
+    ) -> Result<DecodeOutcome<Self>> {
+        let mut decoder = Decoder::with_target(data, target);
         let mut seq = decoder.read_sequence()?;
 
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(version_num) }, "decode error");
-            Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed()
+            seq.malformed()
         })?;
 
-        Self::decode_from_sequence(&mut seq, version)
+        let value = Self::decode_from_sequence(&mut seq, version)?;
+        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
+        Ok(DecodeOutcome { value, anomaly })
     }
 
     /// Decode from a sequence decoder where version has already been read.
     pub(crate) fn decode_from_sequence(seq: &mut Decoder, version: Version) -> Result<Self> {
         if version == Version::V3 {
             tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(3) }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
 
         let community = seq.read_octet_string()?;
@@ -202,10 +219,7 @@ impl CommunityMessage {
         // Peek at the PDU tag to dispatch between standard and TrapV1 layouts.
         let pdu_tag = seq.peek_tag().ok_or_else(|| {
             tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::TruncatedData }, "truncated community message");
-            Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed()
+            seq.malformed()
         })?;
 
         let pdu = if pdu_tag == tag::pdu::TRAP_V1 {
@@ -214,10 +228,7 @@ impl CommunityMessage {
             // (tag 0xA7) instead. Reject a v1 Trap carried in a v2c message.
             if version != Version::V1 {
                 tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), version = ?version }, "v1 Trap PDU (0xA4) not valid in this version");
-                return Err(Error::MalformedResponse {
-                    target: UNKNOWN_TARGET,
-                }
-                .boxed());
+                return Err(seq.malformed());
             }
             CommunityPdu::TrapV1(TrapV1Pdu::decode(seq)?)
         } else {
@@ -227,10 +238,7 @@ impl CommunityMessage {
             // in an SNMPv1 message (RFC 1157).
             if !pdu_type_valid_for_version(pdu.pdu_type, version) {
                 tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), version = ?version, pdu_type = %pdu.pdu_type }, "PDU type not valid for SNMP version");
-                return Err(Error::MalformedResponse {
-                    target: UNKNOWN_TARGET,
-                }
-                .boxed());
+                return Err(seq.malformed());
             }
             CommunityPdu::Standard(pdu)
         };
@@ -284,6 +292,7 @@ impl CommunityMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     #[test]
     fn encode_rejects_invalid_oid() {

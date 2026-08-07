@@ -198,7 +198,7 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let (response_data, _source, expected_msg_id) = response_data_opt.ok_or_else(|| {
+        let (response_data, source, expected_msg_id) = response_data_opt.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
                 Error::Timeout {
                     target: self.peer_addr(),
@@ -213,11 +213,14 @@ impl<T: Transport> Client<T> {
         // Message Processing Model correlation (RFC 3412 Section 7.2), then
         // require the exact RFC 3414 discovery Report shape before adopting an
         // unauthenticated engine-ID candidate.
-        let response = RawV3Message::decode_bounded(
+        let response = RawV3Message::decode_bounded_with_target(
             response_data,
             self.inner.transport.receive_limits().accepted(),
-        )?;
-        let engine_state = self.validate_discovery_response(&response, expected_msg_id)?;
+            source,
+            crate::message::DecodePolicy::Compatible,
+        )?
+        .value;
+        let engine_state = self.validate_discovery_response(&response, expected_msg_id, source)?;
         tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size.as_usize() }, "discovered engine identity");
 
         let security = self
@@ -294,13 +297,9 @@ impl<T: Transport> Client<T> {
         &self,
         response: &RawV3Message,
         expected_msg_id: i32,
+        source: std::net::SocketAddr,
     ) -> Result<EngineState> {
-        let malformed = || {
-            Error::MalformedResponse {
-                target: self.peer_addr(),
-            }
-            .boxed()
-        };
+        let malformed = || Error::MalformedResponse { target: source }.boxed();
 
         // Discovery is deliberately unauthenticated. Authenticated or private
         // messages are not an alternative discovery response shape. RFC 3412
@@ -313,12 +312,13 @@ impl<T: Transport> Client<T> {
         // Decode and validate the candidate before parsing the plaintext PDU,
         // preserving USM-before-scoped-PDU processing order. Boots/time are
         // syntactically decoded but discarded as unauthenticated input.
-        let usm = UsmSecurityParams::decode(response.security_params.clone())?;
+        let usm = UsmSecurityParams::decode_with_target(response.security_params.clone(), source)?;
         let engine_state = crate::v3::parse_discovery_response_with_limits(
             &response.security_params,
             response.global_data.msg_max_size,
             self.inner.transport.receive_limits().advertised(),
-        )?;
+        )
+        .map_err(|_| malformed())?;
         if !usm.username.is_empty() || !usm.auth_params.is_empty() || !usm.priv_params.is_empty() {
             return Err(malformed());
         }
@@ -326,7 +326,7 @@ impl<T: Transport> Client<T> {
         let RawMsgData::Plaintext(bytes) = &response.msg_data else {
             return Err(malformed());
         };
-        let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
+        let mut decoder = Decoder::with_target(bytes.clone(), source);
         let scoped_pdu = ScopedPdu::decode(&mut decoder)?;
 
         // Bind the Internal-class Report to the exact outstanding discovery
@@ -549,6 +549,7 @@ impl<T: Transport> Client<T> {
         &self,
         ciphertext: &Bytes,
         usm_params: &UsmSecurityParams,
+        source: std::net::SocketAddr,
     ) -> Result<ScopedPdu> {
         tracing::trace!(target: "async_snmp::client", { ciphertext_len = ciphertext.len() }, "decrypting response");
 
@@ -585,7 +586,7 @@ impl<T: Transport> Client<T> {
 
         tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
 
-        let mut decoder = Decoder::with_target(plaintext, self.peer_addr());
+        let mut decoder = Decoder::with_target(plaintext, source);
         ScopedPdu::decode(&mut decoder)
     }
 
@@ -661,7 +662,7 @@ impl<T: Transport> Client<T> {
                 .request(&request.data, registration)
                 .await
             {
-                Ok((response_data, _source)) => {
+                Ok((response_data, source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received V3 response");
 
                     // RFC 3412 Section 7.2: decode only the envelope and
@@ -669,12 +670,16 @@ impl<T: Transport> Client<T> {
                     // Invalid flag combinations (privacy without
                     // authentication) are rejected inside the decode, before
                     // any authentication work.
-                    let raw = RawV3Message::decode_bounded(
+                    let raw = RawV3Message::decode_bounded_with_target(
                         response_data.clone(),
                         self.inner.transport.receive_limits().accepted(),
-                    )?;
+                        source,
+                        crate::message::DecodePolicy::Compatible,
+                    )?
+                    .value;
                     let received_level = raw.security_level();
-                    let response_usm = UsmSecurityParams::decode(raw.security_params.clone())?;
+                    let response_usm =
+                        UsmSecurityParams::decode_with_target(raw.security_params.clone(), source)?;
 
                     // RFC 3414 Steps 3-6: bind the received engine ID and
                     // security name to the cached localized keys, validate
@@ -775,11 +780,11 @@ impl<T: Transport> Client<T> {
                     // received level) and parse the scoped PDU.
                     let scoped_pdu = match &raw.msg_data {
                         RawMsgData::Plaintext(bytes) => {
-                            let mut decoder = Decoder::with_target(bytes.clone(), self.peer_addr());
+                            let mut decoder = Decoder::with_target(bytes.clone(), source);
                             ScopedPdu::decode(&mut decoder)?
                         }
                         RawMsgData::Encrypted(ciphertext) => {
-                            self.decrypt_scoped_pdu(ciphertext, &response_usm)?
+                            self.decrypt_scoped_pdu(ciphertext, &response_usm, source)?
                         }
                     };
 

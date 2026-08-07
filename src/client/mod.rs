@@ -399,10 +399,13 @@ impl<T: Transport> Client<T> {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response");
 
                     // Decode response and extract PDU
-                    let response = Message::decode_bounded(
+                    let response = Message::decode_bounded_with_target(
                         response_data,
                         self.inner.transport.receive_limits().accepted(),
-                    )?;
+                        source,
+                        crate::message::DecodePolicy::Compatible,
+                    )?
+                    .value;
 
                     // Validate response version matches request version
                     let response_version = response.version();

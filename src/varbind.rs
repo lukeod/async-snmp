@@ -3,7 +3,7 @@
 //! A `VarBind` pairs an OID with a value.
 
 use crate::ber::{Decoder, EncodeBuf};
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::Result;
 use crate::oid::Oid;
 use crate::value::Value;
 
@@ -61,10 +61,7 @@ impl VarBind {
         let oid = seq.read_oid()?;
         let value = Value::decode(&mut seq)?;
         if !seq.is_empty() {
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
         Ok(VarBind { oid, value })
     }
@@ -127,6 +124,7 @@ pub fn encode_null_varbinds(buf: &mut EncodeBuf, oids: &[Oid]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
     use crate::oid;
     use bytes::Bytes;
 
@@ -153,6 +151,22 @@ mod tests {
         let decoded = VarBind::decode(&mut decoder).unwrap();
 
         assert_eq!(vb, decoded);
+    }
+
+    #[test]
+    fn extra_field_error_retains_decoder_target() {
+        let peer = "192.0.2.44:161".parse().unwrap();
+        let bytes = Bytes::from_static(&[
+            0x30, 0x07, // VarBind SEQUENCE
+            0x06, 0x01, 0x2b, // OID 1.3
+            0x05, 0x00, // NULL value
+            0x05, 0x00, // unexpected field
+        ]);
+        let mut decoder = Decoder::with_target(bytes, peer);
+
+        let error = VarBind::decode(&mut decoder).unwrap_err();
+
+        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
     }
 
     #[test]

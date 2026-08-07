@@ -7,11 +7,9 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
-use crate::ber::{Decoder, tag};
-use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
 use crate::message::{CommunityMessage, MsgGlobalData};
-use crate::pdu::{Pdu, PduType, TrapV1Pdu};
+use crate::pdu::{Pdu, PduType};
 use crate::v3::UsmSecurityParams;
 use crate::v3::encode::encode_v3_response;
 use crate::v3::process::{UsmFailure, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
@@ -27,30 +25,19 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        // For v1, we need to check if it's a Trap PDU (has different structure)
-        let mut decoder = Decoder::with_target(data, source);
-        let mut seq = decoder.read_sequence()?;
+        let msg = CommunityMessage::decode_with_target(data, source)?;
 
-        let _version = seq.read_integer()?;
-        let community = seq.read_octet_string()?;
-
-        if !super::community_allowed(&self.inner.communities, &community) {
+        if !super::community_allowed(&self.inner.communities, &msg.community) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v1 notification with unaccepted community");
             return Ok(None);
         }
 
-        // Peek at PDU tag
-        let pdu_tag = seq.peek_tag().ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::notification", { source = %source, kind = %DecodeErrorKind::TruncatedData }, "truncated notification data");
-            Error::MalformedResponse { target: source }.boxed()
-        })?;
-
-        if pdu_tag == tag::pdu::TRAP_V1 {
-            let trap = TrapV1Pdu::decode(&mut seq)?;
-            Ok(Some(Notification::TrapV1 { community, trap }))
-        } else {
-            // Not a trap, ignore (could be a v1 request which we don't handle)
-            Ok(None)
+        match msg.pdu {
+            crate::message::CommunityPdu::TrapV1(trap) => Ok(Some(Notification::TrapV1 {
+                community: msg.community,
+                trap,
+            })),
+            crate::message::CommunityPdu::Standard(_) => Ok(None),
         }
     }
 
@@ -60,7 +47,7 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        let msg = CommunityMessage::decode(data)?;
+        let msg = CommunityMessage::decode_with_target(data, source)?;
 
         if !super::community_allowed(&self.inner.communities, &msg.community) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v2c notification with unaccepted community");

@@ -15,10 +15,11 @@
 //! ```
 
 use bytes::Bytes;
+use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::{Result, UNKNOWN_TARGET};
 
 /// Maximum length of `msgUserName`, per RFC 3414 Section 2.4 (SIZE(0..32)).
 const MAX_USER_NAME_LEN: usize = 32;
@@ -117,13 +118,14 @@ impl UsmSecurityParams {
 
     /// Decode from BER bytes.
     pub fn decode(data: Bytes) -> Result<Self> {
-        let mut decoder = Decoder::new(data);
+        Self::decode_with_target(data, UNKNOWN_TARGET)
+    }
+
+    pub(crate) fn decode_with_target(data: Bytes, target: SocketAddr) -> Result<Self> {
+        let mut decoder = Decoder::with_target(data, target);
         let params = Self::decode_from(&mut decoder)?;
         if !decoder.is_empty() {
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(decoder.malformed());
         }
         Ok(params)
     }
@@ -146,19 +148,13 @@ impl UsmSecurityParams {
         let username = seq.read_octet_string()?;
         if username.len() > MAX_USER_NAME_LEN {
             tracing::debug!(target: "async_snmp::usm", { offset = seq.offset(), length = username.len(), kind = %DecodeErrorKind::InvalidUserNameLength { length: username.len() } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
 
         let auth_params = seq.read_octet_string()?;
         let priv_params = seq.read_octet_string()?;
         if !seq.is_empty() {
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(seq.malformed());
         }
 
         Ok(Self {
@@ -228,6 +224,7 @@ impl UsmSecurityParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     fn push_integer_content(buf: &mut EncodeBuf, content: &[u8]) {
         buf.push_bytes(content);

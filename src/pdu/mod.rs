@@ -4,7 +4,7 @@
 
 use crate::ber::{Decoder, EncodeBuf, tag};
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, ErrorStatus, Result, UNKNOWN_TARGET};
+use crate::error::{Error, ErrorStatus, Result};
 use crate::oid::Oid;
 use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
 
@@ -258,10 +258,7 @@ impl Pdu {
         let tag = decoder.read_tag()?;
         let pdu_type = PduType::from_tag(tag).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::pdu", { offset = decoder.offset(), tag = tag, kind = %DecodeErrorKind::UnknownPduType(tag) }, "decode error");
-            Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed()
+            decoder.malformed()
         })?;
 
         // The SNMPv1 Trap PDU (tag 0xA4) has a distinct wire layout (RFC 1157
@@ -271,10 +268,7 @@ impl Pdu {
         // v1 Trap tag, which is rejected.
         if pdu_type == PduType::TrapV1 {
             tracing::debug!(target: "async_snmp::pdu", { offset = decoder.offset(), tag = tag }, "TrapV1 PDU tag not valid in generic PDU context");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(decoder.malformed());
         }
 
         let len = decoder.read_length()?;
@@ -285,10 +279,7 @@ impl Pdu {
         let mut error_index = pdu_decoder.read_integer()?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
         if !pdu_decoder.is_empty() {
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(pdu_decoder.malformed());
         }
 
         // For GETBULK, error_status/error_index overload as non-repeaters and
@@ -750,18 +741,12 @@ impl TrapV1Pdu {
                     expected: 0x40,
                     actual: agent_tag,
                 } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(pdu.malformed());
         }
         let agent_len = pdu.read_length()?;
         if agent_len != 4 {
             tracing::debug!(target: "async_snmp::pdu", { offset = pdu.offset(), length = agent_len, kind = %DecodeErrorKind::InvalidIpAddressLength { length: agent_len } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(pdu.malformed());
         }
         let agent_bytes = pdu.read_bytes(4)?;
         let agent_addr = [
@@ -784,16 +769,16 @@ impl TrapV1Pdu {
                     expected: 0x43,
                     actual: ts_tag,
                 } }, "decode error");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(pdu.malformed());
         }
         let ts_len = pdu.read_length()?;
         let time_stamp = pdu.read_unsigned32_value(ts_len)?;
 
         // variable-bindings
         let varbinds = decode_varbind_list(&mut pdu)?;
+        if !pdu.is_empty() {
+            return Err(pdu.malformed());
+        }
 
         Ok(TrapV1Pdu {
             enterprise,
@@ -856,10 +841,7 @@ impl GetBulkPdu {
 
         if pdu.pdu_type != PduType::GetBulkRequest {
             tracing::debug!(target: "async_snmp::pdu", { pdu_type = ?pdu.pdu_type }, "expected GETBULK PDU");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(decoder.malformed());
         }
 
         Ok(GetBulkPdu {
@@ -1013,6 +995,28 @@ mod tests {
         assert_eq!(decoded.specific_trap, 0);
         assert_eq!(decoded.time_stamp, 1234_5678);
         assert_eq!(decoded.varbinds.len(), 1);
+    }
+
+    #[test]
+    fn trap_v1_decode_rejects_unconsumed_constructed_body() {
+        let trap = TrapV1Pdu::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999),
+            [192, 0, 2, 1],
+            GenericTrap::ColdStart,
+            0,
+            1,
+            vec![],
+        );
+        let mut buf = EncodeBuf::new();
+        trap.encode(&mut buf).unwrap();
+        let mut encoded = buf.finish().to_vec();
+        assert_eq!(encoded[0], tag::pdu::TRAP_V1);
+        assert!(encoded[1] < 0x80, "fixture uses short-form length");
+        encoded[1] += 2;
+        encoded.extend_from_slice(&[tag::universal::NULL, 0]);
+
+        let mut decoder = Decoder::new(bytes::Bytes::from(encoded));
+        assert!(TrapV1Pdu::decode(&mut decoder).is_err());
     }
 
     #[test]

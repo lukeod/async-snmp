@@ -23,6 +23,62 @@ use crate::error::{Error, Result, UNKNOWN_TARGET};
 use crate::pdu::Pdu;
 use crate::version::Version;
 use bytes::Bytes;
+use std::net::SocketAddr;
+
+/// Policy for bytes following a complete top-level SNMP message TLV.
+///
+/// Both policies reject unconsumed fields inside the message's declared outer
+/// SEQUENCE. [`DecodePolicy::Compatible`] accepts a packet suffix and reports
+/// its exact size as a [`DecodeAnomaly`]; [`DecodePolicy::Strict`] rejects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodePolicy {
+    /// Preserve interoperability with transports that deliver a valid SNMP TLV
+    /// followed by unrelated bytes. This is the default used by `decode` APIs.
+    Compatible,
+    /// Require the complete input to contain exactly one SNMP message TLV.
+    Strict,
+}
+
+/// Observable non-canonical input accepted by compatible decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeAnomaly {
+    /// Number of bytes following the fully consumed top-level message TLV.
+    pub trailing_bytes: usize,
+}
+
+/// A decoded value together with compatible-mode anomaly metadata.
+#[derive(Debug)]
+pub struct DecodeOutcome<T> {
+    /// Decoded value.
+    pub value: T,
+    /// Input anomaly, if compatible decoding accepted a packet suffix.
+    pub anomaly: Option<DecodeAnomaly>,
+}
+
+pub(crate) fn finalize_envelope(
+    sequence: &Decoder,
+    root: &Decoder,
+    policy: DecodePolicy,
+) -> Result<Option<DecodeAnomaly>> {
+    if !sequence.is_empty() {
+        tracing::debug!(target: "async_snmp::message", { remaining = sequence.remaining() }, "unconsumed field inside SNMP message envelope");
+        return Err(sequence.malformed());
+    }
+
+    let trailing_bytes = root.remaining();
+    if trailing_bytes == 0 {
+        return Ok(None);
+    }
+    if policy == DecodePolicy::Strict {
+        tracing::debug!(target: "async_snmp::message", { trailing_bytes }, "bytes follow SNMP message envelope");
+        return Err(root.malformed());
+    }
+
+    // Stable event and field names let callers observe anomalies even when
+    // using the legacy value-only `decode` convenience methods.
+    tracing::warn!(target: "async_snmp::message", anomaly = "trailing_bytes", trailing_bytes, peer = %root.target(), "accepted trailing bytes after SNMP message");
+    Ok(Some(DecodeAnomaly { trailing_bytes }))
+}
 
 /// Decoded SNMP message (any version).
 ///
@@ -68,47 +124,54 @@ impl Message {
         }
     }
 
-    /// Decode a message from bytes.
+    /// Decode using the default compatible top-level policy.
     ///
-    /// Automatically detects the SNMP version and parses accordingly.
+    /// The complete declared message SEQUENCE is always required. A suffix
+    /// after that SEQUENCE is accepted and emits the stable
+    /// `async_snmp::message` `trailing_bytes` anomaly event. Use
+    /// [`Message::decode_with_policy`] to retain anomaly metadata.
     pub fn decode(data: Bytes) -> Result<Self> {
-        let input_len = data.len();
-        Self::decode_bounded(data, input_len)
+        Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
     }
 
-    /// Decode while enforcing a caller-supplied total input bound.
-    pub(crate) fn decode_bounded(data: Bytes, maximum: usize) -> Result<Self> {
+    /// Decode using an explicit top-level consumption policy.
+    pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
+        let input_len = data.len();
+        Self::decode_bounded_with_target(data, input_len, UNKNOWN_TARGET, policy)
+    }
+
+    /// Decode while requiring the input to contain exactly one message TLV.
+    pub fn decode_strict(data: Bytes) -> Result<Self> {
+        Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
+    }
+
+    pub(crate) fn decode_bounded_with_target(
+        data: Bytes,
+        maximum: usize,
+        target: SocketAddr,
+        policy: DecodePolicy,
+    ) -> Result<DecodeOutcome<Self>> {
         if data.len() > maximum {
-            tracing::debug!(target: "async_snmp::message", { received_size = data.len(), maximum }, "message exceeds receive limit");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            tracing::debug!(target: "async_snmp::message", { received_size = data.len(), maximum, peer = %target }, "message exceeds receive limit");
+            return Err(Error::MalformedResponse { target }.boxed());
         }
-        let mut decoder = Decoder::new(data);
+        let mut decoder = Decoder::with_target(data, target);
         let mut seq = decoder.read_sequence()?;
 
-        // Read version to determine message type
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::message", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(version_num) }, "decode error");
-            Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed()
+            seq.malformed()
         })?;
 
-        // Decode remainder using version-specific handler
-        match version {
+        let value = match version {
             Version::V1 | Version::V2c => {
-                let msg = CommunityMessage::decode_from_sequence(&mut seq, version)?;
-                Ok(Message::Community(msg))
+                Message::Community(CommunityMessage::decode_from_sequence(&mut seq, version)?)
             }
-            Version::V3 => {
-                let msg = V3Message::decode_from_sequence(&mut seq)?;
-                Ok(Message::V3(msg))
-            }
-        }
+            Version::V3 => Message::V3(V3Message::decode_from_sequence(&mut seq)?),
+        };
+        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
+        Ok(DecodeOutcome { value, anomaly })
     }
 }
 
@@ -152,7 +215,153 @@ mod tests {
         let encoded = message.encode().unwrap();
         let encoded_len = encoded.len();
 
-        assert!(Message::decode_bounded(encoded.clone(), encoded_len).is_ok());
-        assert!(Message::decode_bounded(encoded, encoded_len - 1).is_err());
+        assert!(
+            Message::decode_bounded_with_target(
+                encoded.clone(),
+                encoded_len,
+                UNKNOWN_TARGET,
+                DecodePolicy::Compatible,
+            )
+            .is_ok()
+        );
+        assert!(
+            Message::decode_bounded_with_target(
+                encoded,
+                encoded_len - 1,
+                UNKNOWN_TARGET,
+                DecodePolicy::Compatible,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn community_decoders_share_envelope_and_root_suffix_policy() {
+        let encoded = CommunityMessage::v2c("public", Pdu::get_request(1, &[]))
+            .encode()
+            .unwrap();
+
+        assert_eq!(
+            Message::decode_with_policy(encoded.clone(), DecodePolicy::Compatible)
+                .unwrap()
+                .anomaly,
+            None
+        );
+        assert_eq!(
+            CommunityMessage::decode_with_policy(encoded.clone(), DecodePolicy::Strict)
+                .unwrap()
+                .anomaly,
+            None
+        );
+
+        let mut suffix = encoded.to_vec();
+        suffix.extend_from_slice(&[0x05, 0x00, 0x05, 0x00]);
+        let suffix = Bytes::from(suffix);
+        assert_eq!(
+            Message::decode_with_policy(suffix.clone(), DecodePolicy::Compatible)
+                .unwrap()
+                .anomaly
+                .unwrap()
+                .trailing_bytes,
+            4
+        );
+        assert_eq!(
+            CommunityMessage::decode_with_policy(suffix.clone(), DecodePolicy::Compatible)
+                .unwrap()
+                .anomaly
+                .unwrap()
+                .trailing_bytes,
+            4
+        );
+        assert!(Message::decode_strict(suffix.clone()).is_err());
+        assert!(CommunityMessage::decode_strict(suffix).is_err());
+
+        // Move an extra NULL inside the declared outer SEQUENCE. Compatible
+        // mode is permissive only after the root TLV, never inside it.
+        let mut inner_extra = encoded.to_vec();
+        assert!(inner_extra[1] < 0x80, "fixture uses short-form length");
+        inner_extra[1] += 2;
+        inner_extra.extend_from_slice(&[0x05, 0x00]);
+        let inner_extra = Bytes::from(inner_extra);
+        assert!(Message::decode(inner_extra.clone()).is_err());
+        assert!(CommunityMessage::decode(inner_extra).is_err());
+    }
+
+    #[test]
+    fn peer_target_survives_nested_pdu_decoder_errors() {
+        let mut encoded = CommunityMessage::v2c("public", Pdu::get_request(1, &[]))
+            .encode()
+            .unwrap()
+            .to_vec();
+        let pdu_start = encoded
+            .iter()
+            .position(|byte| *byte == crate::ber::tag::pdu::GET_REQUEST)
+            .unwrap();
+        assert!(encoded[1] < 0x80 && encoded[pdu_start + 1] < 0x80);
+        let pdu_end = pdu_start + 2 + usize::from(encoded[pdu_start + 1]);
+        encoded[1] += 2;
+        encoded[pdu_start + 1] += 2;
+        encoded.splice(pdu_end..pdu_end, [0x05, 0x00]);
+
+        assert_peer_target(encoded);
+    }
+
+    #[test]
+    fn peer_target_survives_nested_varbind_and_value_errors() {
+        let encoded = CommunityMessage::v2c(
+            "public",
+            Pdu::get_request(1, &[crate::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]),
+        )
+        .encode()
+        .unwrap()
+        .to_vec();
+        let oid_tlv = [0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00];
+        let oid_start = encoded
+            .windows(oid_tlv.len())
+            .position(|window| window == oid_tlv)
+            .unwrap();
+        let varbind_start = oid_start - 2;
+        let varbind_list_start = varbind_start - 2;
+        let pdu_start = encoded
+            .iter()
+            .position(|byte| *byte == crate::ber::tag::pdu::GET_REQUEST)
+            .unwrap();
+        let null_start = oid_start + oid_tlv.len();
+        assert_eq!(&encoded[null_start..null_start + 2], &[0x05, 0x00]);
+        for length_offset in [1, pdu_start + 1, varbind_list_start + 1, varbind_start + 1] {
+            assert!(
+                encoded[length_offset] < 0x80,
+                "fixture uses short-form lengths"
+            );
+        }
+
+        let mut extra_varbind_field = encoded.clone();
+        let varbind_end = varbind_start + 2 + usize::from(extra_varbind_field[varbind_start + 1]);
+        for length_offset in [1, pdu_start + 1, varbind_list_start + 1, varbind_start + 1] {
+            extra_varbind_field[length_offset] += 2;
+        }
+        extra_varbind_field.splice(varbind_end..varbind_end, [0x05, 0x00]);
+        assert_peer_target(extra_varbind_field);
+
+        let mut malformed_oid = encoded.clone();
+        malformed_oid[oid_start + oid_tlv.len() - 1] = 0x80;
+        assert_peer_target(malformed_oid);
+
+        let mut constructed_octet_string = encoded;
+        constructed_octet_string[null_start] = crate::ber::tag::universal::OCTET_STRING_CONSTRUCTED;
+        assert_peer_target(constructed_octet_string);
+    }
+
+    fn assert_peer_target(encoded: Vec<u8>) {
+        let peer: SocketAddr = "192.0.2.44:161".parse().unwrap();
+        let len = encoded.len();
+        let error = Message::decode_bounded_with_target(
+            Bytes::from(encoded),
+            len,
+            peer,
+            DecodePolicy::Compatible,
+        )
+        .unwrap_err();
+        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
     }
 }
