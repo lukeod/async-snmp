@@ -101,31 +101,34 @@ async fn walk_empty_subtree_returns_nothing() {
     assert!(results.is_empty());
 }
 
-/// WALK on a scalar OID falls back to GET when walk yields no results.
+/// WALK on a scalar instance OID returns no results.
 ///
-/// Walking sysDescr.0 (a scalar instance) returns empty because GETNEXT moves
-/// past it. The fallback GET retrieves the scalar value.
+/// GETNEXT/GETBULK moves past the scalar instance, so scalar retrieval remains
+/// an explicit GET operation rather than a consumer-dependent walk fallback.
 #[tokio::test]
-async fn walk_scalar_oid_falls_back_to_get() {
+async fn walk_scalar_oid_returns_nothing() {
     let agent = TestAgent::new().await;
 
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
         .connect()
         .await
         .unwrap();
+    let scalar_oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
-    // sysDescr.0 is a scalar instance OID - walk would normally return empty
     let results = client
-        .walk(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .walk(scalar_oid.clone())
         .unwrap()
         .collect()
         .await
         .unwrap();
+    assert!(results.is_empty());
 
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+    let response = client.get(&scalar_oid).await.unwrap();
+    assert!(response.anomalies.is_empty());
+    assert_eq!(response.varbinds.len(), 1);
+    assert_eq!(response.varbinds[0].oid, scalar_oid);
     assert_eq!(
-        results[0].value,
+        response.varbinds[0].value,
         Value::OctetString("Test SNMP Agent".into())
     );
 }

@@ -1044,7 +1044,9 @@ impl<T: Transport> Client<T> {
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
     /// The walk terminates when an OID outside the subtree is encountered or
-    /// when `EndOfMibView` is returned.
+    /// when `EndOfMibView` is returned. All consumption methods observe this same
+    /// GETNEXT/GETBULK sequence. A scalar instance OID is not retrieved as a
+    /// fallback; use [`get()`](Self::get) to retrieve a scalar value.
     ///
     /// Uses the client's configured `oid_ordering`, `max_walk_results`, and
     /// `max_repetitions` (for GETBULK) settings.
@@ -1089,7 +1091,9 @@ impl<T: Transport> Client<T> {
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
     /// The walk terminates when an OID outside the subtree is encountered or
-    /// when `EndOfMibView` is returned.
+    /// when `EndOfMibView` is returned. All consumption methods observe this same
+    /// GETNEXT sequence. A scalar instance OID is not retrieved as a fallback;
+    /// use [`get()`](Self::get) to retrieve a scalar value.
     ///
     /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
     ///
@@ -1118,7 +1122,9 @@ impl<T: Transport> Client<T> {
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
     /// Uses GETBULK internally with `non_repeaters=0`, fetching `max_repetitions`
-    /// values per request for efficient table traversal.
+    /// values per request for efficient table traversal. All consumption methods
+    /// observe this same GETBULK sequence. A scalar instance OID is not retrieved
+    /// as a fallback; use [`get()`](Self::get) to retrieve a scalar value.
     ///
     /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
     ///
@@ -1150,6 +1156,9 @@ impl<T: Transport> Client<T> {
     }
 
     /// Walk an OID subtree using the client's configured `max_repetitions`.
+    ///
+    /// Like [`bulk_walk()`](Self::bulk_walk), this yields only GETBULK walk results
+    /// and does not retrieve a scalar instance OID with a fallback GET.
     ///
     /// This is a convenience method that uses the client's `max_repetitions` setting
     /// (default: 25) instead of requiring it as a parameter.

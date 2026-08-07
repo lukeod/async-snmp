@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Walk collectors no longer issue a scalar GET after an empty
+  GETNEXT/GETBULK walk. Inherent `next`/`collect`, direct stream polling, and
+  `StreamExt` consumers now observe the same walk results and request sequence;
+  callers retrieving a scalar instance OID must use `Client::get` explicitly.
 - **Breaking:** `Agent::send_trap()` and `Agent::send_inform()` now return a
   `NotificationOutcome` with a `SinkStatus` for every configured sink. Inform
   sinks using SNMPv1 are reported as explicitly skipped, so an all-skipped send

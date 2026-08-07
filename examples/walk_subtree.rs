@@ -6,6 +6,8 @@
 //! - bulk_walk(): Uses GETBULK for efficiency (SNMPv2c/v3 only)
 //!
 //! The examples also show how to use futures::StreamExt for stream processing.
+//! Inherent and `StreamExt` consumers observe the same GETNEXT/GETBULK sequence;
+//! use `Client::get` when retrieving a scalar instance OID.
 //!
 //! Run with: cargo run --example walk_subtree
 
@@ -39,7 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // walk() returns a Result<WalkStream> because GETBULK mode can fail on V1
     let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;
 
-    // Use the inherent collect() method to gather all results
+    // Use the inherent collect() method to gather the same items that next()
+    // or StreamExt consumers would observe.
     let results = walk.collect().await?;
 
     println!("Found {} OIDs in system subtree:", results.len());
@@ -83,7 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Walk system subtree and filter for string values only
     let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;
 
-    // Use StreamExt methods for functional-style processing
+    // Use StreamExt methods for functional-style processing. These consume the
+    // same walk sequence as the inherent next() and collect() helpers.
     let strings: Vec<_> = walk
         .filter_map(|result| async move {
             match result {
