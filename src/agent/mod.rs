@@ -795,6 +795,7 @@ impl AgentBuilder {
             engine_start: Instant::now(),
             engine_boots_base: engine_boots,
             max_message_size: self.max_message_size,
+            snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(0),
             snmp_unknown_security_models: AtomicU32::new(0),
             snmp_silent_drops: AtomicU32::new(0),
@@ -868,6 +869,9 @@ pub(crate) struct AgentState {
     /// Initial `engine_boots` value at startup, used to compute overflow-adjusted boots.
     pub(crate) engine_boots_base: u32,
     pub(crate) max_message_size: usize,
+    /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
+    /// their ASN.1 representation is invalid for the received SNMP version
+    pub(crate) snmp_in_asn_parse_errs: AtomicU32,
     // RFC 3412 statistics counters
     /// snmpInvalidMsgs (1.3.6.1.6.3.11.2.1.2) - messages with invalid msgFlags
     /// (e.g., privacy without authentication)
@@ -993,6 +997,20 @@ impl Agent {
     #[must_use]
     pub fn cancel(&self) -> CancellationToken {
         self.inner.cancel.clone()
+    }
+
+    /// Get the snmpInASNParseErrs counter value.
+    ///
+    /// This counter tracks authenticated SNMPv1 requests rejected because a
+    /// varbind carries the SNMPv2-only Counter64 type.
+    ///
+    /// OID: 1.3.6.1.2.1.11.6.0
+    #[must_use]
+    pub fn snmp_in_asn_parse_errs(&self) -> u32 {
+        self.inner
+            .state
+            .snmp_in_asn_parse_errs
+            .load(Ordering::Relaxed)
     }
 
     /// Get the snmpInvalidMsgs counter value.

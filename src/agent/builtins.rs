@@ -305,6 +305,7 @@ mod tests {
             engine_start: Instant::now(),
             engine_boots_base: 5,
             max_message_size: 1472,
+            snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(10),
             snmp_unknown_security_models: AtomicU32::new(20),
             snmp_silent_drops: AtomicU32::new(30),

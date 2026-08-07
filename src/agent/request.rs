@@ -8,6 +8,7 @@ use crate::handler::{RequestContext, SecurityModel};
 use crate::message::{CommunityMessage, SecurityLevel};
 use crate::pdu::PduType;
 use crate::v3::process::{MpdCounters, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
+use crate::value::Value;
 use crate::version::Version;
 
 use std::sync::atomic::Ordering;
@@ -49,6 +50,28 @@ impl Agent {
             Some(p) if is_request_pdu(p.pdu_type) => p,
             _ => return Ok(None),
         };
+
+        // Counter64 is not part of the SNMPv1 data types. Decode it so the
+        // receive path remains bounded and unambiguous, then silently drop the
+        // authenticated request before VACM resolution or handler dispatch.
+        if version == Version::V1
+            && pdu
+                .varbinds
+                .iter()
+                .any(|vb| matches!(vb.value, Value::Counter64(_)))
+        {
+            self.inner
+                .state
+                .snmp_in_asn_parse_errs
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "async_snmp::agent",
+                source = %source,
+                pdu_type = ?pdu.pdu_type,
+                "dropping SNMPv1 request containing Counter64"
+            );
+            return Ok(None);
+        }
 
         let security_model = match version {
             Version::V1 => SecurityModel::V1,
@@ -255,11 +278,109 @@ pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::{
+        BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, SetResult,
+    };
     use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+    use crate::oid;
+    use crate::oid::Oid;
     use crate::pdu::Pdu;
     use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
-    use crate::value::Value;
+    use crate::varbind::VarBind;
     use bytes::Bytes;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Default)]
+    struct CallbackCounts {
+        get: AtomicU32,
+        get_next: AtomicU32,
+        test_set: AtomicU32,
+        commit_set: AtomicU32,
+    }
+
+    impl MibHandler for CallbackCounts {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            self.get.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(GetResult::Value(Value::Integer(7))) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            self.get_next.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Ok(GetNextResult::Value(VarBind::new(
+                    oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
+                    Value::Integer(8),
+                )))
+            })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetResult> {
+            self.test_set.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { SetResult::Ok })
+        }
+
+        fn commit_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetResult> {
+            self.commit_set.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { SetResult::Ok })
+        }
+    }
+
+    fn community_request(
+        version: Version,
+        pdu_type: PduType,
+        community: &'static [u8],
+        value: Value,
+    ) -> Bytes {
+        CommunityMessage::new(
+            version,
+            Bytes::from_static(community),
+            Pdu {
+                pdu_type,
+                request_id: 41,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), value)],
+            },
+        )
+        .encode()
+        .unwrap()
+    }
+
+    async fn community_test_agent(callbacks: Arc<CallbackCounts>) -> Agent {
+        Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    fn assert_no_callbacks(callbacks: &CallbackCounts) {
+        assert_eq!(callbacks.get.load(Ordering::Relaxed), 0);
+        assert_eq!(callbacks.get_next.load(Ordering::Relaxed), 0);
+        assert_eq!(callbacks.test_set.load(Ordering::Relaxed), 0);
+        assert_eq!(callbacks.commit_set.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn test_is_request_pdu() {
@@ -270,6 +391,116 @@ mod tests {
         assert!(is_request_pdu(PduType::InformRequest));
         assert!(!is_request_pdu(PduType::Response));
         assert!(!is_request_pdu(PduType::TrapV2));
+    }
+
+    #[tokio::test]
+    async fn test_v1_counter64_requests_are_dropped_before_dispatch() {
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        for (index, pdu_type) in [
+            PduType::GetRequest,
+            PduType::GetNextRequest,
+            PduType::SetRequest,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = community_request(
+                Version::V1,
+                pdu_type,
+                b"public",
+                Value::Counter64(1_u64 << 40),
+            );
+            assert!(agent.handle_v1(request, source).await.unwrap().is_none());
+            assert_eq!(agent.snmp_in_asn_parse_errs(), index as u32 + 1);
+            assert_no_callbacks(&callbacks);
+        }
+
+        let multiple_counter64s = CommunityMessage::v1(
+            Bytes::from_static(b"public"),
+            Pdu {
+                pdu_type: PduType::SetRequest,
+                request_id: 42,
+                error_status: 0,
+                error_index: 0,
+                varbinds: vec![
+                    VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Counter64(1)),
+                    VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0), Value::Counter64(2)),
+                ],
+            },
+        )
+        .encode()
+        .unwrap();
+        assert!(
+            agent
+                .handle_v1(multiple_counter64s, source)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 4);
+        assert_no_callbacks(&callbacks);
+    }
+
+    #[tokio::test]
+    async fn test_v1_non_counter64_request_is_dispatched() {
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let request = community_request(Version::V1, PduType::GetRequest, b"public", Value::Null);
+
+        let response = agent
+            .handle_v1(request, source)
+            .await
+            .unwrap()
+            .expect("ordinary SNMPv1 GET should produce a response");
+        let decoded = CommunityMessage::decode(response).unwrap();
+        assert_eq!(decoded.pdu.pdu_type(), PduType::Response);
+        assert_eq!(callbacks.get.load(Ordering::Relaxed), 1);
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_v2c_counter64_set_is_dispatched() {
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let request = community_request(
+            Version::V2c,
+            PduType::SetRequest,
+            b"public",
+            Value::Counter64(1_u64 << 40),
+        );
+
+        let response = agent
+            .handle_v2c(request, source)
+            .await
+            .unwrap()
+            .expect("SNMPv2c Counter64 SET should produce a response");
+        let decoded = CommunityMessage::decode(response).unwrap();
+        assert_eq!(decoded.pdu.pdu_type(), PduType::Response);
+        assert_eq!(callbacks.test_set.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.commit_set.load(Ordering::Relaxed), 1);
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_community_counter64_is_not_counted() {
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let request = community_request(
+            Version::V1,
+            PduType::SetRequest,
+            b"private",
+            Value::Counter64(1_u64 << 40),
+        );
+
+        assert!(agent.handle_v1(request, source).await.unwrap().is_none());
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
+        assert_no_callbacks(&callbacks);
     }
 
     /// Build an authPriv V3 message for `username` whose HMAC is computed with

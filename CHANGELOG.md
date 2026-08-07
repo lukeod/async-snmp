@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Authenticated SNMPv1 GET, GETNEXT, and SET requests carrying Counter64 values
+  are now silently dropped and counted by `Agent::snmp_in_asn_parse_errs()`.
 - SET commit failure now undoes every attempted binding, including the failed
   attempt, and frees later tested reservations whose commit was not attempted.
   Cleanup continues after an undo failure.
