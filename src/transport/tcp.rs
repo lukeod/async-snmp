@@ -69,7 +69,7 @@
 //!     Duration::from_secs(5)
 //! ).await?;
 //!
-//! let client = Client::new(transport, ClientConfig::default());
+//! let client = Client::new(transport, ClientConfig::default())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -271,7 +271,7 @@ impl Default for TcpTransportBuilder {
 ///     Duration::from_secs(5)
 /// ).await?;
 ///
-/// let client = Client::new(transport, ClientConfig::default());
+/// let client = Client::new(transport, ClientConfig::default())?;
 /// # Ok(())
 /// # }
 /// ```

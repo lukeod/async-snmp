@@ -26,6 +26,7 @@ use crate::version::Version;
 /// to a specific target.
 pub(crate) struct TrapSink {
     pub(crate) dest: SocketAddr,
+    auth: Auth,
     pub(crate) version: Version,
     pub(crate) community: Bytes,
     pub(crate) v3_security: Option<UsmConfig>,
@@ -48,6 +49,7 @@ impl TrapSink {
         inform_timeout: Duration,
         inform_retry: Retry,
     ) -> Self {
+        let sink_auth = auth.clone();
         match auth {
             Auth::Community { version, community } => {
                 let snmp_version = match version {
@@ -56,6 +58,7 @@ impl TrapSink {
                 };
                 TrapSink {
                     dest,
+                    auth: sink_auth,
                     version: snmp_version,
                     community: Bytes::copy_from_slice(community.as_bytes()),
                     v3_security: None,
@@ -67,6 +70,7 @@ impl TrapSink {
             }
             Auth::Usm(security) => TrapSink {
                 dest,
+                auth: sink_auth,
                 version: Version::V3,
                 community: Bytes::new(),
                 v3_security: Some(security),
@@ -113,24 +117,14 @@ impl TrapSink {
             return Ok(client.clone());
         }
 
-        let config = match self.version {
-            Version::V1 => unreachable!("v1 does not support informs"),
-            Version::V2c => ClientConfig {
-                version: Version::V2c,
-                community: self.community.clone(),
-                timeout: self.inform_timeout,
-                retry: self.inform_retry.clone(),
-                v3_security: None,
-                ..ClientConfig::default()
-            },
-            Version::V3 => ClientConfig {
-                version: Version::V3,
-                community: Bytes::new(),
-                timeout: self.inform_timeout,
-                retry: self.inform_retry.clone(),
-                v3_security: self.v3_security.clone(),
-                ..ClientConfig::default()
-            },
+        if self.version == Version::V1 {
+            unreachable!("v1 does not support informs");
+        }
+        let config = ClientConfig {
+            auth: self.auth.clone(),
+            timeout: self.inform_timeout,
+            retry: self.inform_retry.clone(),
+            ..ClientConfig::default()
         };
 
         let bind_addr = if self.dest.is_ipv6() {
@@ -140,7 +134,7 @@ impl TrapSink {
         };
         let transport = UdpTransport::bind(bind_addr).await?;
         let handle = transport.handle(self.dest);
-        let client = Client::new(handle, config);
+        let client = Client::new(handle, config)?;
         *guard = Some((transport, client.clone()));
         Ok(client)
     }

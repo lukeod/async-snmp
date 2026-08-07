@@ -81,10 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Use Client::new for manual transport construction
             let config = ClientConfig {
+                auth: Auth::v2c("public"),
                 timeout: Duration::from_secs(10),
                 ..Default::default()
             };
-            let client = Client::new(transport, config);
+            let client = Client::new(transport, config)?;
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
                 Ok(vb) => println!("sysName: {:?}", vb.value),
@@ -109,10 +110,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Connected with {}s timeout", connect_timeout.as_secs());
 
             let config = ClientConfig {
+                auth: Auth::v2c("public"),
                 timeout: Duration::from_secs(10),
                 ..Default::default()
             };
-            let client = Client::new(transport, config);
+            let client = Client::new(transport, config)?;
 
             // Walk system subtree over TCP
             let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;

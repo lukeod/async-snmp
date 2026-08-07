@@ -6,8 +6,7 @@ use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
 use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
-    Auth, Client, ClientConfig, EngineCache, MasterKeys, Retry, UsmConfig, Value, VarBind, Version,
-    oid,
+    Auth, Client, ClientConfig, EngineCache, MasterKeys, Retry, UsmConfig, Value, VarBind, oid,
 };
 use bytes::Bytes;
 use common::v3::{
@@ -103,14 +102,14 @@ fn custom_client_with_compatibility(
     Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(security),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::none(),
-            v3_security: Some(security),
             allow_unauthenticated_v3_time_correction,
             ..ClientConfig::default()
         },
     )
+    .expect("valid client config")
 }
 
 async fn udp_success_at_level(level: SecurityLevel) {
@@ -515,14 +514,14 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
     let client = Client::with_engine_cache(
         transport.clone(),
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::none(),
-            v3_security: Some(user_for(level)),
             ..ClientConfig::default()
         },
         cache.clone(),
-    );
+    )
+    .expect("valid client config");
     let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
     assert_eq!(
@@ -587,14 +586,14 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     let client = Client::with_engine_cache(
         transport.clone(),
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::none(),
-            v3_security: Some(user_for(level)),
             ..ClientConfig::default()
         },
         cache.clone(),
-    );
+    )
+    .expect("valid client config");
     let oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
     assert_eq!(
@@ -1008,14 +1007,14 @@ async fn v3_failed_packet_local_correction_preserves_trusted_time() {
     let client = Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::fixed(3, Duration::ZERO),
-            v3_security: Some(user_for(level)),
             allow_unauthenticated_v3_time_correction: true,
             ..ClientConfig::default()
         },
-    );
+    )
+    .expect("valid client config");
 
     client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     let err = client
@@ -1416,13 +1415,13 @@ async fn v3_repeated_time_window_report_is_typed_and_bounded() {
     let client = Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::fixed(5, Duration::ZERO),
-            v3_security: Some(user_for(level)),
             ..ClientConfig::default()
         },
-    );
+    )
+    .expect("valid client config");
 
     let err = client
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
@@ -2398,13 +2397,13 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
     let client = Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(security),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::fixed(1, Duration::ZERO),
-            v3_security: Some(security),
             ..ClientConfig::default()
         },
-    );
+    )
+    .expect("valid client config");
 
     let err = client
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
@@ -2652,13 +2651,13 @@ async fn v3_custom_transport_accepts_late_response_to_prior_attempt() {
     let client = Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::fixed(1, Duration::ZERO),
-            v3_security: Some(user_for(level)),
             ..ClientConfig::default()
         },
-    );
+    )
+    .expect("valid client config");
 
     client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
 
@@ -2713,13 +2712,13 @@ async fn v3_pre_correction_msg_id_rejected_after_correction() {
     let client = Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::fixed(1, Duration::ZERO),
-            v3_security: Some(user_for(level)),
             ..ClientConfig::default()
         },
-    );
+    )
+    .expect("valid client config");
 
     let err = client
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
@@ -2922,13 +2921,13 @@ async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
     let client = Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::fixed(1, Duration::ZERO),
-            v3_security: Some(user_for(level)),
             ..ClientConfig::default()
         },
-    );
+    )
+    .expect("valid client config");
 
     let err = client
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
@@ -2990,13 +2989,13 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
     let client = Client::new(
         transport,
         ClientConfig {
-            version: Version::V3,
+            auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
             retry: Retry::fixed(1, Duration::ZERO),
-            v3_security: Some(user_for(level)),
             ..ClientConfig::default()
         },
-    );
+    )
+    .expect("valid client config");
 
     let first = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(first.value.as_str(), Some("operation one"));

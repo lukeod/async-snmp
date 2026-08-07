@@ -165,12 +165,22 @@ struct ClientInner<T: Transport> {
 /// Client configuration.
 ///
 /// Most users should use [`ClientBuilder`] rather than constructing this directly.
+/// Authentication selects the protocol version, so contradictory configurations
+/// such as an SNMPv3 version without USM credentials are not representable.
+///
+/// ```compile_fail
+/// use async_snmp::{ClientConfig, Version};
+///
+/// let _ = ClientConfig {
+///     version: Version::V3,
+///     v3_security: None,
+///     ..ClientConfig::default()
+/// };
+/// ```
 #[derive(Clone)]
 pub struct ClientConfig {
-    /// SNMP version (default: V2c)
-    pub version: Version,
-    /// Community string for v1/v2c (default: "public")
-    pub community: Bytes,
+    /// Authentication and corresponding SNMP version (default: V2c "public").
+    pub auth: Auth,
     /// Policy for correlating v1/v2c response communities (default: exact).
     pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
@@ -179,8 +189,6 @@ pub struct ClientConfig {
     pub retry: Retry,
     /// Maximum OIDs per request (default: 10)
     pub max_oids_per_request: usize,
-    /// `SNMPv3` security configuration (default: None)
-    pub v3_security: Option<UsmConfig>,
     /// Permit one packet-local correction from an unauthenticated
     /// `usmStatsNotInTimeWindows` Report on an authenticated V3 operation.
     ///
@@ -212,13 +220,11 @@ impl Default for ClientConfig {
     /// See field documentation for all default values.
     fn default() -> Self {
         Self {
-            version: Version::V2c,
-            community: Bytes::from_static(b"public"),
+            auth: Auth::default(),
             community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
             timeout: DEFAULT_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
-            v3_security: None,
             allow_unauthenticated_v3_time_correction: false,
             walk_mode: WalkMode::Auto,
             oid_ordering: OidOrdering::Strict,
@@ -230,19 +236,40 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
-    /// Return a copy of this config with invalid values clamped to safe defaults.
-    ///
-    /// [`Client::new`] and [`Client::with_engine_cache`] accept a raw
-    /// [`ClientConfig`], bypassing the [`ClientBuilder`](crate::ClientBuilder)
-    /// validation. This guards against values that would otherwise panic at
-    /// request time, such as `max_oids_per_request == 0` reaching
-    /// [`slice::chunks`], which panics on a chunk size of 0.
-    #[must_use]
-    fn sanitized(mut self) -> Self {
+    fn version(&self) -> Version {
+        self.auth.version()
+    }
+
+    fn community(&self) -> Result<Bytes> {
+        self.auth
+            .community()
+            .map(|community| Bytes::copy_from_slice(community.as_bytes()))
+            .ok_or_else(|| Error::Config("community authentication required".into()).boxed())
+    }
+
+    fn usm_config(&self) -> Option<&UsmConfig> {
+        self.auth.usm_config()
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
         if self.max_oids_per_request == 0 {
-            self.max_oids_per_request = DEFAULT_MAX_OIDS_PER_REQUEST;
+            return Err(
+                Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
+            );
         }
-        self
+
+        if self.version() == Version::V1 && self.walk_mode == WalkMode::GetBulk {
+            return Err(Error::Config("GETBULK not supported in SNMPv1".into()).boxed());
+        }
+
+        if self.oid_ordering == OidOrdering::AllowNonIncreasing && self.max_walk_results.is_none() {
+            return Err(Error::Config(
+                "AllowNonIncreasing requires max_walk_results to bound memory usage".into(),
+            )
+            .boxed());
+        }
+
+        Ok(())
     }
 }
 
@@ -253,41 +280,48 @@ impl<T: Transport> Client<T> {
     /// ergonomic API. Use this constructor when you need fine-grained control
     /// over transport configuration (e.g., TCP connection timeout, keepalive
     /// settings) or when using a custom [`Transport`] implementation.
-    pub fn new(transport: T, config: ClientConfig) -> Self {
-        Self {
-            inner: Arc::new(ClientInner {
-                transport,
-                config: config.sanitized(),
-                engine: RwLock::new(None),
-                salt_counter: SaltCounter::new(),
-                engine_cache: None,
-                discovery_lock: AsyncMutex::new(()),
-                local_derived_keys: RwLock::new(None),
-                #[cfg(test)]
-                deferred_authenticated_update_hook: RwLock::new(None),
-            }),
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the configuration violates a client
+    /// invariant.
+    pub fn new(transport: T, config: ClientConfig) -> Result<Self> {
+        Self::with_optional_engine_cache(transport, config, None)
     }
 
     /// Create a new V3 client with a shared engine cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the configuration violates a client
+    /// invariant.
     pub fn with_engine_cache(
         transport: T,
         config: ClientConfig,
         engine_cache: Arc<EngineCache>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Self::with_optional_engine_cache(transport, config, Some(engine_cache))
+    }
+
+    fn with_optional_engine_cache(
+        transport: T,
+        config: ClientConfig,
+        engine_cache: Option<Arc<EngineCache>>,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
             inner: Arc::new(ClientInner {
                 transport,
-                config: config.sanitized(),
+                config,
                 engine: RwLock::new(None),
                 salt_counter: SaltCounter::new(),
-                engine_cache: Some(engine_cache),
+                engine_cache,
                 discovery_lock: AsyncMutex::new(()),
                 local_derived_keys: RwLock::new(None),
                 #[cfg(test)]
                 deferred_authenticated_update_hook: RwLock::new(None),
             }),
-        }
+        })
     }
 
     /// Get the peer (target) address.
@@ -308,7 +342,7 @@ impl<T: Transport> Client<T> {
 
     /// Check if using V3 with authentication/encryption configured.
     fn is_v3(&self) -> bool {
-        self.inner.config.version == Version::V3 && self.inner.config.v3_security.is_some()
+        matches!(self.inner.config.auth, Auth::Usm(_))
     }
 
     /// Send a request and wait for response (internal helper with pre-encoded data).
@@ -338,12 +372,14 @@ impl<T: Transport> Client<T> {
             }
 
             // Register (or re-register) with fresh deadline before sending
+            let version = self.inner.config.version();
+            let community = self.inner.config.community()?;
             self.inner.transport.register_request(
                 crate::transport::RequestRegistration::community(
                     request_id,
                     self.inner.config.timeout,
-                    self.inner.config.version,
-                    self.inner.config.community.clone(),
+                    version,
+                    community.clone(),
                     self.inner.config.community_response_policy,
                 ),
             );
@@ -362,7 +398,7 @@ impl<T: Transport> Client<T> {
 
                     // Validate response version matches request version
                     let response_version = response.version();
-                    let expected_version = self.inner.config.version;
+                    let expected_version = version;
                     if response_version != expected_version {
                         tracing::warn!(target: "async_snmp::client", { ?expected_version, ?response_version, peer = %self.peer_addr() }, "version mismatch in response");
                         return Err(Error::MalformedResponse {
@@ -374,7 +410,7 @@ impl<T: Transport> Client<T> {
                     // Defense in depth for custom transports that do not enforce
                     // the non-consuming registration contract themselves.
                     if let Message::Community(ref m) = response
-                        && m.community != self.inner.config.community
+                        && m.community != community
                     {
                         let accepted = match self.inner.config.community_response_policy {
                             crate::transport::CommunityResponsePolicy::Exact => false,
@@ -477,8 +513,8 @@ impl<T: Transport> Client<T> {
 
         let request_id = pdu.request_id;
         let message = CommunityMessage::new(
-            self.inner.config.version,
-            self.inner.config.community.clone(),
+            self.inner.config.version(),
+            self.inner.config.community()?,
             pdu,
         );
         let data = message.encode()?;
@@ -507,8 +543,8 @@ impl<T: Transport> Client<T> {
 
         let request_id = pdu.request_id;
         let data = CommunityMessage::encode_bulk(
-            self.inner.config.version,
-            self.inner.config.community.clone(),
+            self.inner.config.version(),
+            self.inner.config.community()?,
             &pdu,
         )?;
         let response = self.send_and_recv(request_id, &data).await?;
@@ -791,7 +827,7 @@ impl<T: Transport> Client<T> {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> Result<()> {
-        if self.inner.config.version == Version::V1 {
+        if self.inner.config.version() == Version::V1 {
             // Build a v2-style PDU and convert to v1.
             // Per RFC 3584 Section 3, use the local IPv4 address as agent_addr.
             let local_ip = match self.inner.transport.local_addr().ip() {
@@ -818,8 +854,8 @@ impl<T: Transport> Client<T> {
             self.inner.transport.send(&data).await?;
         } else {
             let message = CommunityMessage::new(
-                self.inner.config.version,
-                self.inner.config.community.clone(),
+                self.inner.config.version(),
+                self.inner.config.community()?,
                 pdu,
             );
             let data = message.encode()?;
@@ -861,11 +897,11 @@ impl<T: Transport> Client<T> {
     /// ```
     #[instrument(skip(self, trap), err, fields(snmp.target = %self.peer_addr(), snmp.generic_trap = %trap.generic_trap))]
     pub async fn send_v1_trap(&self, trap: TrapV1Pdu) -> Result<()> {
-        if self.inner.config.version != Version::V1 {
+        if self.inner.config.version() != Version::V1 {
             return Err(Error::Config("send_v1_trap requires a V1 client".into()).boxed());
         }
 
-        let message = CommunityMessage::v1_trap(self.inner.config.community.clone(), trap);
+        let message = CommunityMessage::v1_trap(self.inner.config.community()?, trap);
         let data = message.encode()?;
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
         self.inner.transport.send(&data).await?;
@@ -894,7 +930,7 @@ impl<T: Transport> Client<T> {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> Result<()> {
-        if self.inner.config.version == Version::V1 {
+        if self.inner.config.version() == Version::V1 {
             return Err(Error::Config("v1 inform sending not supported".into()).boxed());
         }
 
@@ -988,7 +1024,7 @@ impl<T: Transport> Client<T> {
         let max_results = self.inner.config.max_walk_results;
         let walk_mode = self.inner.config.walk_mode;
         let max_repetitions = max_repetitions_to_wire(self.inner.config.max_repetitions);
-        let version = self.inner.config.version;
+        let version = self.inner.config.version();
 
         WalkStream::new(
             self.clone(),
@@ -1104,7 +1140,6 @@ mod tests {
     use crate::oid::Oid;
     use crate::pdu::{Pdu, PduType};
     use crate::varbind::VarBind;
-    use crate::version::Version;
     use bytes::Bytes;
     use std::collections::VecDeque;
     use std::net::SocketAddr;
@@ -1223,12 +1258,12 @@ mod tests {
     fn make_client(response_varbind_count: usize) -> Client<TruncatingTransport> {
         let transport = TruncatingTransport::new(response_varbind_count);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             max_oids_per_request: 10,
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        Client::new(transport, config)
+        Client::new(transport, config).expect("valid client config")
     }
 
     #[derive(Clone)]
@@ -1280,11 +1315,12 @@ mod tests {
         let client = Client::new(
             transport.clone(),
             ClientConfig {
-                version: Version::V2c,
+                auth: crate::Auth::v2c("public"),
                 retry: crate::client::retry::Retry::none(),
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid client config");
         let invalid = Oid::empty();
         let valid = Oid::from_slice(&[1, 3, 6, 1]);
 
@@ -1308,11 +1344,12 @@ mod tests {
         let v1_client = Client::new(
             transport.clone(),
             ClientConfig {
-                version: Version::V1,
+                auth: crate::Auth::v1("public"),
                 retry: crate::client::retry::Retry::none(),
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid client config");
         let trap = TrapV1Pdu::new(
             invalid.clone(),
             [127, 0, 0, 1],
@@ -1328,12 +1365,12 @@ mod tests {
         let v3_client = Client::new(
             transport,
             ClientConfig {
-                version: Version::V3,
-                v3_security: Some(crate::v3::UsmConfig::new("user")),
+                auth: crate::Auth::Usm(crate::v3::UsmConfig::new("user")),
                 retry: crate::client::retry::Retry::none(),
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid client config");
         assert_invalid(v3_client.get(&invalid).await);
         assert_invalid(v3_client.get_next(&invalid).await);
         assert_invalid(
@@ -1352,32 +1389,68 @@ mod tests {
         assert_eq!(sends.load(Ordering::Relaxed), 0);
     }
 
-    #[tokio::test]
-    async fn new_clamps_zero_max_oids_per_request() {
-        // Client::new bypasses builder validation; a raw config with
-        // max_oids_per_request == 0 must be clamped so slice::chunks(0) is
-        // never reached (which would panic).
-        let transport = TruncatingTransport::new(3);
-        let config = ClientConfig {
-            version: Version::V2c,
-            max_oids_per_request: 0,
-            retry: crate::client::retry::Retry::none(),
-            ..Default::default()
-        };
-        let client = Client::new(transport, config);
-        assert_eq!(
-            client.inner.config.max_oids_per_request,
-            DEFAULT_MAX_OIDS_PER_REQUEST
-        );
+    #[test]
+    fn client_config_validation() {
+        fn assert_config_error<T: Transport>(result: Result<Client<T>>) {
+            match result {
+                Err(error) => assert!(matches!(*error, Error::Config(_))),
+                Ok(_) => panic!("invalid client configuration was accepted"),
+            }
+        }
 
-        let oids = [
-            Oid::from_slice(&[1, 3, 6, 1, 1]),
-            Oid::from_slice(&[1, 3, 6, 1, 2]),
-            Oid::from_slice(&[1, 3, 6, 1, 3]),
-        ];
-        // Must not panic on chunks(0).
-        let result = client.get_many(&oids).await;
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let transport = CountingTransport {
+            sends: Arc::clone(&sends),
+        };
+
+        assert_config_error(Client::new(
+            transport.clone(),
+            ClientConfig {
+                max_oids_per_request: 0,
+                ..ClientConfig::default()
+            },
+        ));
+        assert_config_error(Client::new(
+            transport.clone(),
+            ClientConfig {
+                auth: Auth::v1("public"),
+                walk_mode: WalkMode::GetBulk,
+                ..ClientConfig::default()
+            },
+        ));
+        assert_config_error(Client::new(
+            transport.clone(),
+            ClientConfig {
+                oid_ordering: OidOrdering::AllowNonIncreasing,
+                max_walk_results: None,
+                ..ClientConfig::default()
+            },
+        ));
+        assert_config_error(Client::with_engine_cache(
+            transport.clone(),
+            ClientConfig {
+                max_oids_per_request: 0,
+                ..ClientConfig::default()
+            },
+            Arc::new(EngineCache::new()),
+        ));
+
+        for auth in [
+            Auth::v1("public"),
+            Auth::v2c("public"),
+            Auth::Usm(UsmConfig::new("user")),
+        ] {
+            Client::new(
+                transport.clone(),
+                ClientConfig {
+                    auth,
+                    ..ClientConfig::default()
+                },
+            )
+            .expect("valid v1, v2c, and v3 configs must construct");
+        }
+
+        assert_eq!(sends.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1655,12 +1728,12 @@ mod tests {
         // triggers tooBig, then bisects to 2+2+2+2 which all succeed.
         let transport = TooBigTransport::new(3);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             max_oids_per_request: 10,
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let oids: Vec<Oid> = (0..8u32)
             .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
@@ -1675,12 +1748,12 @@ mod tests {
         // Agent returns tooBig even for a single OID - can't bisect further.
         let transport = TooBigTransport::new(0);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             max_oids_per_request: 10,
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let oids = [Oid::from_slice(&[1, 3, 6, 1, 1])];
         let err = client.get_many(&oids).await.unwrap_err();
@@ -1701,12 +1774,12 @@ mod tests {
         // Same as get_many test but for GETNEXT.
         let transport = TooBigTransport::new(3);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             max_oids_per_request: 10,
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let oids: Vec<Oid> = (0..8u32)
             .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
@@ -1724,12 +1797,12 @@ mod tests {
         // be rejected (RFC 3416 4.2.1).
         let transport = TruncatingTransport::new(1);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             max_oids_per_request: 10,
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let oids: Vec<Oid> = (0..12u32)
             .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
@@ -1747,12 +1820,12 @@ mod tests {
         // max_oids_per_request = 10, request 12 OIDs, mock returns 12 per batch.
         let transport = TruncatingTransport::new(12);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             max_oids_per_request: 10,
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let oids: Vec<Oid> = (0..12u32)
             .map(|i| Oid::from_slice(&[1, 3, 6, 1, i]))
@@ -1844,11 +1917,11 @@ mod tests {
     ) -> Client<AdversarialTransport> {
         let transport = AdversarialTransport::new(pdu_type, community, respond_as_v1);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        Client::new(transport, config)
+        Client::new(transport, config).expect("valid client config")
     }
 
     /// Control: the adversarial transport is otherwise well-formed, so a
@@ -1895,7 +1968,7 @@ mod tests {
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
         let result = client.get(&Oid::from_slice(&[1, 3, 6, 1, 1])).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
     }

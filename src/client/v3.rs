@@ -130,8 +130,7 @@ impl<T: Transport> Client<T> {
             let security = self
                 .inner
                 .config
-                .v3_security
-                .as_ref()
+                .usm_config()
                 .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
             let derived_keys = security
                 .derive_keys(&cached_state.engine_id)
@@ -215,8 +214,7 @@ impl<T: Transport> Client<T> {
         let security = self
             .inner
             .config
-            .v3_security
-            .as_ref()
+            .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         // Prepare replacement keys before changing either the live generation
@@ -376,8 +374,7 @@ impl<T: Transport> Client<T> {
         let security = self
             .inner
             .config
-            .v3_security
-            .as_ref()
+            .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         self.refresh_engine_from_cache()?;
@@ -445,8 +442,7 @@ impl<T: Transport> Client<T> {
         let security = self
             .inner
             .config
-            .v3_security
-            .as_ref()
+            .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         if response_usm.username != security.username() {
@@ -591,7 +587,7 @@ impl<T: Transport> Client<T> {
         fields(
             snmp.target = %self.peer_addr(),
             snmp.request_id = pdu.request_id,
-            snmp.security_level = ?self.inner.config.v3_security.as_ref().map(crate::UsmConfig::security_level),
+            snmp.security_level = ?self.inner.config.usm_config().map(crate::UsmConfig::security_level),
             snmp.attempt = tracing::field::Empty,
             snmp.protocol_correction = tracing::field::Empty,
             snmp.elapsed_ms = tracing::field::Empty,
@@ -611,8 +607,7 @@ impl<T: Transport> Client<T> {
         let security = self
             .inner
             .config
-            .v3_security
-            .as_ref()
+            .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
         let security_level = security.security_level();
 
@@ -1046,8 +1041,7 @@ impl<T: Transport> Client<T> {
         let security = self
             .inner
             .config
-            .v3_security
-            .as_ref()
+            .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         let keys = security
@@ -1086,8 +1080,7 @@ impl<T: Transport> Client<T> {
         let security = self
             .inner
             .config
-            .v3_security
-            .as_ref()
+            .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         let local_engine = self.local_engine_for_trap()?;
@@ -1176,11 +1169,10 @@ mod tests {
     #[tokio::test]
     async fn direct_config_requires_authoritative_state_before_sending_v3_trap() {
         let config = ClientConfig {
-            version: crate::Version::V3,
-            v3_security: Some(UsmConfig::new("trapuser")),
+            auth: crate::Auth::Usm(UsmConfig::new("trapuser")),
             ..ClientConfig::default()
         };
-        let client = Client::new(TestTransport::new(), config);
+        let client = Client::new(TestTransport::new(), config).expect("valid client config");
 
         let err = client
             .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
@@ -1245,14 +1237,13 @@ mod tests {
     fn test_build_v3_message_uses_configured_context_name() {
         let transport = TestTransport::new();
         let config = ClientConfig {
-            version: crate::version::Version::V3,
-            v3_security: Some(UsmConfig::new("user").context_name("ctx")),
+            auth: crate::Auth::Usm(UsmConfig::new("user").context_name("ctx")),
             ..ClientConfig::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         {
-            let security = client.inner.config.v3_security.as_ref().unwrap();
+            let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
             let derived_keys = security.derive_keys(&state.engine_id).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") = Some(ClientEngine {
@@ -1280,14 +1271,13 @@ mod tests {
     fn test_packet_local_time_rejects_changed_engine_generation() {
         let transport = TestTransport::new();
         let config = ClientConfig {
-            version: crate::version::Version::V3,
-            v3_security: Some(UsmConfig::new("user")),
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
             ..ClientConfig::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         {
-            let security = client.inner.config.v3_security.as_ref().unwrap();
+            let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine-a"), 1, 42);
             let derived_keys = security.derive_keys(&state.engine_id).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") = Some(ClientEngine {
@@ -1410,12 +1400,11 @@ mod tests {
         let recv_count = transport.recv_count.clone();
 
         let config = ClientConfig {
-            version: crate::version::Version::V3,
-            v3_security: Some(UsmConfig::new("user")),
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
             retry: crate::client::Retry::fixed(1, Duration::ZERO),
             ..ClientConfig::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         client
             .ensure_engine_discovered()
@@ -1475,12 +1464,11 @@ mod tests {
             peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
         };
         let config = ClientConfig {
-            version: crate::version::Version::V3,
-            v3_security: Some(UsmConfig::new("user")),
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
             retry: crate::client::Retry::fixed(2, Duration::ZERO),
             ..ClientConfig::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let result = client.ensure_engine_discovered().await;
         assert!(
@@ -1751,11 +1739,11 @@ mod response_validation_tests {
         security: UsmConfig,
     ) -> Client<CannedTransport> {
         let config = ClientConfig {
-            version: crate::version::Version::V3,
-            v3_security: Some(security.clone()),
+            auth: crate::Auth::Usm(security.clone()),
             ..ClientConfig::default()
         };
-        let client = Client::new(CannedTransport::new(response), config);
+        let client =
+            Client::new(CannedTransport::new(response), config).expect("valid client config");
         {
             let state = EngineState::new(Bytes::from_static(ENGINE_ID), engine_boots, engine_time);
             let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
@@ -1773,13 +1761,13 @@ mod response_validation_tests {
         let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
         let cache = Arc::new(EngineCache::new());
         let config = ClientConfig {
-            version: crate::version::Version::V3,
+            auth: crate::Auth::Usm(security.clone()),
             retry: crate::client::Retry::none(),
-            v3_security: Some(security.clone()),
             allow_unauthenticated_v3_time_correction: true,
             ..ClientConfig::default()
         };
-        let client = Client::with_engine_cache(transport, config, cache.clone());
+        let client = Client::with_engine_cache(transport, config, cache.clone())
+            .expect("valid client config");
         let state = EngineState::new(Bytes::from_static(ENGINE_ID), 1, 1000);
         let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
         cache.insert(client.peer_addr(), state.clone());
@@ -1855,11 +1843,10 @@ mod response_validation_tests {
             max_size: 1400,
         };
         let config = ClientConfig {
-            version: crate::version::Version::V3,
-            v3_security: Some(security.clone()),
+            auth: crate::Auth::Usm(security.clone()),
             ..ClientConfig::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
         {
             // Cached remote capacity differs from the local transport limit.
             let state =

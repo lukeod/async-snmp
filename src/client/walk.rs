@@ -335,7 +335,7 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                         Poll::Ready(Some(Ok(vb)))
                     }
                     Err(e) => {
-                        if self.client.inner.config.version == Version::V1
+                        if self.client.inner.config.version() == Version::V1
                             && matches!(
                                 &*e,
                                 Error::Snmp {
@@ -856,11 +856,11 @@ mod tests {
         let transport = BulkTooBigTransport::new(4);
         let too_big_count = transport.too_big_count.clone();
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let results = client
             .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 25)
@@ -881,11 +881,11 @@ mod tests {
         // and the error is surfaced.
         let transport = BulkTooBigTransport::new(0);
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             retry: crate::client::retry::Retry::none(),
             ..Default::default()
         };
-        let client = Client::new(transport, config);
+        let client = Client::new(transport, config).expect("valid client config");
 
         let err = client
             .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 8)
@@ -1027,12 +1027,12 @@ mod tests {
         max_walk_results: Option<usize>,
     ) -> Client<ScalarFallbackTransport> {
         let config = ClientConfig {
-            version: Version::V2c,
+            auth: crate::Auth::v2c("public"),
             retry: crate::client::retry::Retry::none(),
             max_walk_results,
             ..Default::default()
         };
-        Client::new(ScalarFallbackTransport::new(mode), config)
+        Client::new(ScalarFallbackTransport::new(mode), config).expect("valid client config")
     }
 
     #[tokio::test]

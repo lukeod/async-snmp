@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `ClientConfig` now uses one authoritative `auth: Auth` field
+  instead of independent `version`, `community`, and `v3_security` fields.
+  `Client::new` and `Client::with_engine_cache` now return `Result` and reject
+  zero request batch sizes, SNMPv1 forced GETBULK walks, and unbounded relaxed
+  OID ordering before I/O. `ClientBuilder::build_with_transport` constructs a
+  validated client around a custom or preconfigured transport; shared UDP
+  sockets continue to use `build_with`.
 - SNMPv1/v2c responses now require byte-for-byte community equality by default,
   even when UDP source checking is permissive. Rejected responses leave the
   pending request and original deadline intact. Explicit target-only and

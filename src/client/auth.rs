@@ -23,6 +23,7 @@
 //! ```
 
 use crate::v3::UsmConfig;
+use crate::version::Version;
 
 /// SNMP version for community-based authentication.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -136,6 +137,34 @@ impl Auth {
     /// ```
     pub fn usm(username: impl Into<String>) -> UsmConfig {
         UsmConfig::new(bytes::Bytes::from(username.into()))
+    }
+
+    pub(crate) fn version(&self) -> Version {
+        match self {
+            Auth::Community {
+                version: CommunityVersion::V1,
+                ..
+            } => Version::V1,
+            Auth::Community {
+                version: CommunityVersion::V2c,
+                ..
+            } => Version::V2c,
+            Auth::Usm(_) => Version::V3,
+        }
+    }
+
+    pub(crate) fn community(&self) -> Option<&str> {
+        match self {
+            Auth::Community { community, .. } => Some(community),
+            Auth::Usm(_) => None,
+        }
+    }
+
+    pub(crate) fn usm_config(&self) -> Option<&UsmConfig> {
+        match self {
+            Auth::Usm(config) => Some(config),
+            Auth::Community { .. } => None,
+        }
     }
 }
 

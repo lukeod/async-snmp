@@ -9,20 +9,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-
+use super::Client;
 use crate::client::retry::Retry;
 use crate::client::walk::{OidOrdering, WalkMode};
 use crate::client::{
-    Auth, ClientConfig, CommunityVersion, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_TIMEOUT,
+    Auth, ClientConfig, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT,
 };
 use crate::error::{Error, Result};
 use crate::transport::{CommunityResponsePolicy, TcpTransport, Transport, UdpHandle, UdpTransport};
 use crate::v3::{AuthoritativeEngine, EngineCache};
-use crate::version::Version;
-
-use super::Client;
 
 /// Target address for an SNMP client.
 ///
@@ -505,33 +500,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Validate the configuration.
+    /// Validate the configuration using the same checks as raw construction.
     fn validate(&self) -> Result<()> {
-        if self.max_oids_per_request == 0 {
-            return Err(
-                Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
-            );
-        }
-
-        // Validate walk mode for v1
-        if let Auth::Community {
-            version: CommunityVersion::V1,
-            ..
-        } = &self.auth
-            && self.walk_mode == WalkMode::GetBulk
-        {
-            return Err(Error::Config("GETBULK not supported in SNMPv1".into()).boxed());
-        }
-
-        // AllowNonIncreasing uses O(n) memory for cycle detection; require a bound
-        if self.oid_ordering == OidOrdering::AllowNonIncreasing && self.max_walk_results.is_none() {
-            return Err(Error::Config(
-                "AllowNonIncreasing requires max_walk_results to bound memory usage".into(),
-            )
-            .boxed());
-        }
-
-        Ok(())
+        self.build_config().validate()
     }
 
     /// Resolve target address to `SocketAddr`, defaulting to port 161.
@@ -572,50 +543,23 @@ impl ClientBuilder {
 
     /// Build `ClientConfig` from the builder settings.
     fn build_config(&self) -> ClientConfig {
-        match &self.auth {
-            Auth::Community { version, community } => {
-                let snmp_version = match version {
-                    CommunityVersion::V1 => Version::V1,
-                    CommunityVersion::V2c => Version::V2c,
-                };
-                ClientConfig {
-                    version: snmp_version,
-                    community: Bytes::copy_from_slice(community.as_bytes()),
-                    community_response_policy: self.community_response_policy,
-                    timeout: self.timeout,
-                    retry: self.retry.clone(),
-                    max_oids_per_request: self.max_oids_per_request,
-                    v3_security: None,
-                    allow_unauthenticated_v3_time_correction: self
-                        .allow_unauthenticated_v3_time_correction,
-                    walk_mode: self.walk_mode,
-                    oid_ordering: self.oid_ordering,
-                    max_walk_results: self.max_walk_results,
-                    max_repetitions: self.max_repetitions,
-                    local_authoritative_engine: self.local_authoritative_engine.clone(),
-                }
-            }
-            Auth::Usm(security) => ClientConfig {
-                version: Version::V3,
-                community: Bytes::new(),
-                community_response_policy: self.community_response_policy,
-                timeout: self.timeout,
-                retry: self.retry.clone(),
-                max_oids_per_request: self.max_oids_per_request,
-                v3_security: Some(security.clone()),
-                allow_unauthenticated_v3_time_correction: self
-                    .allow_unauthenticated_v3_time_correction,
-                walk_mode: self.walk_mode,
-                oid_ordering: self.oid_ordering,
-                max_walk_results: self.max_walk_results,
-                max_repetitions: self.max_repetitions,
-                local_authoritative_engine: self.local_authoritative_engine.clone(),
-            },
+        ClientConfig {
+            auth: self.auth.clone(),
+            community_response_policy: self.community_response_policy,
+            timeout: self.timeout,
+            retry: self.retry.clone(),
+            max_oids_per_request: self.max_oids_per_request,
+            allow_unauthenticated_v3_time_correction: self.allow_unauthenticated_v3_time_correction,
+            walk_mode: self.walk_mode,
+            oid_ordering: self.oid_ordering,
+            max_walk_results: self.max_walk_results,
+            max_repetitions: self.max_repetitions,
+            local_authoritative_engine: self.local_authoritative_engine.clone(),
         }
     }
 
     /// Build the client with the given transport.
-    fn build_inner<T: Transport>(self, transport: T) -> Client<T> {
+    fn build_inner<T: Transport>(self, transport: T) -> Result<Client<T>> {
         let config = self.build_config();
 
         if let Some(cache) = self.engine_cache {
@@ -662,7 +606,7 @@ impl ClientBuilder {
         };
         let transport = UdpTransport::bind(bind_addr).await?;
         let handle = transport.handle(addr).strict_source(self.strict_source);
-        Ok(self.build_inner(handle))
+        self.build_inner(handle)
     }
 
     /// Build a client using a shared UDP transport.
@@ -690,7 +634,35 @@ impl ClientBuilder {
         self.validate()?;
         let addr = self.resolve_target().await?;
         let handle = transport.handle(addr).strict_source(self.strict_source);
-        Ok(self.build_inner(handle))
+        self.build_inner(handle)
+    }
+
+    /// Build a client around an already-created transport.
+    ///
+    /// The supplied transport owns its peer address and any source-validation
+    /// policy. The builder target and [`strict_source`](Self::strict_source)
+    /// setting are not applied, and this method does not resolve an address or
+    /// create a socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client configuration is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::{Auth, ClientBuilder};
+    /// use async_snmp::transport::TcpTransport;
+    ///
+    /// # async fn example() -> async_snmp::Result<()> {
+    /// let transport = TcpTransport::connect("192.168.1.1:161".parse().unwrap()).await?;
+    /// let client = ClientBuilder::new("unused.invalid", Auth::v2c("public"))
+    ///     .build_with_transport(transport)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build_with_transport<T: Transport>(self, transport: T) -> Result<Client<T>> {
+        self.build_inner(transport)
     }
 
     /// Connect via TCP.
@@ -726,7 +698,7 @@ impl ClientBuilder {
         self.validate()?;
         let addr = self.resolve_target().await?;
         let transport = TcpTransport::connect(addr).await?;
-        Ok(self.build_inner(transport))
+        self.build_inner(transport)
     }
 }
 
@@ -845,6 +817,89 @@ mod tests {
         ));
     }
 
+    #[derive(Clone)]
+    struct CustomTransport {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Transport for CustomTransport {
+        fn register_request(&self, _registration: crate::transport::RequestRegistration) {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn recv(&self, _request_id: i32) -> Result<(bytes::Bytes, std::net::SocketAddr)> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(Error::Config("unexpected custom transport receive".into()).boxed())
+        }
+
+        fn peer_addr(&self) -> std::net::SocketAddr {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> std::net::SocketAddr {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_build_with_transport() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = CustomTransport {
+            calls: Arc::clone(&calls),
+        };
+        let client = ClientBuilder::new("unused.invalid", Auth::v2c("private"))
+            .timeout(Duration::from_secs(9))
+            .retry(Retry::none())
+            .max_oids_per_request(7)
+            .walk_mode(WalkMode::GetNext)
+            .oid_ordering(OidOrdering::AllowNonIncreasing)
+            .max_walk_results(99)
+            .max_repetitions(11)
+            .build_with_transport(transport.clone())
+            .expect("valid custom-transport client");
+
+        assert_eq!(client.inner.config.timeout, Duration::from_secs(9));
+        assert_eq!(client.inner.config.retry.max_attempts, 0);
+        assert_eq!(client.inner.config.max_oids_per_request, 7);
+        assert_eq!(client.inner.config.walk_mode, WalkMode::GetNext);
+        assert_eq!(
+            client.inner.config.oid_ordering,
+            OidOrdering::AllowNonIncreasing
+        );
+        assert_eq!(client.inner.config.max_walk_results, Some(99));
+        assert_eq!(client.inner.config.max_repetitions, 11);
+        assert!(matches!(
+            &client.inner.config.auth,
+            Auth::Community {
+                version: crate::CommunityVersion::V2c,
+                community,
+            } if community == "private"
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let invalid = ClientBuilder::new("unused.invalid", Auth::v2c("public"))
+            .max_oids_per_request(0)
+            .build_with_transport(transport);
+        assert!(matches!(invalid, Err(ref error) if matches!(&**error, Error::Config(_))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn test_validate_local_authoritative_engine() {
         let engine = AuthoritativeEngine::install(b"valid-engine".to_vec(), |_| {
@@ -924,9 +979,9 @@ mod tests {
         );
 
         let config = builder.build_config();
-        let security = config
-            .v3_security
-            .expect("expected v3 security config to be built");
+        let Auth::Usm(security) = config.auth else {
+            panic!("expected v3 security config to be built");
+        };
 
         assert_eq!(security.configured_context_name().as_ref(), b"vlan100");
     }
