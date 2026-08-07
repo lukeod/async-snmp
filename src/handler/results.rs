@@ -124,10 +124,17 @@ pub type HandlerResult<T> = Result<T, HandlerError>;
 /// Result of a SET operation phase (RFC 3416).
 ///
 /// This enum is used by the multi-phase SET protocol:
-/// - [`MibHandler::test_set`](super::MibHandler::test_set): Returns `Ok` if the SET would succeed
-/// - [`MibHandler::commit_set`](super::MibHandler::commit_set): Returns `Ok` if the change was applied
-/// - [`MibHandler::undo_set`](super::MibHandler::undo_set): Returns `Ok` on successful rollback
-/// - [`MibHandler::free_set`](super::MibHandler::free_set): Returns `()` (cleanup is best-effort)
+/// - [`MibHandler::test_set`](super::MibHandler::test_set): `Ok` enters pending state;
+///   a non-`Ok` result must leave no resources for framework cleanup
+/// - [`MibHandler::commit_set`](super::MibHandler::commit_set): `Ok` means the change
+///   and reservation were finalized; failure may follow partial mutation
+/// - [`MibHandler::undo_set`](super::MibHandler::undo_set): terminal rollback and
+///   reservation cleanup for every commit-attempted binding, including a failed attempt
+/// - [`MibHandler::free_set`](super::MibHandler::free_set): terminal cleanup for a
+///   successful test whose commit was never attempted
+///
+/// After commit failure, undo and free cleanup is best-effort. An undo failure
+/// selects `undoFailed` but does not stop the remaining callbacks.
 ///
 /// # Choosing the Right Error
 ///
@@ -202,8 +209,11 @@ pub enum SetResult {
     /// Resource unavailable (memory, locks, etc.).
     ResourceUnavailable,
     /// Commit failed (internal error during apply).
+    ///
+    /// The operation may have partially mutated state before returning this;
+    /// the framework calls `undo_set` for the failed attempt.
     CommitFailed,
-    /// Undo failed (internal error during rollback).
+    /// Undo failed (internal error during rollback or reservation cleanup).
     UndoFailed,
     /// Row name is inconsistent with existing data.
     InconsistentName,

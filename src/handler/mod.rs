@@ -59,13 +59,16 @@
 //! after net-snmp's RESERVE/ACTION/COMMIT/FREE/UNDO phases:
 //!
 //! 1. **Test Phase**: [`MibHandler::test_set`] is called for ALL varbinds before any
-//!    commits. If any test fails, [`MibHandler::free_set`] is called for all previously
-//!    successful varbinds (in reverse order) to release resources, then the error is
-//!    returned.
+//!    commits. Only successful tests enter pending state. If a test fails,
+//!    [`MibHandler::free_set`] releases earlier successful reservations in reverse
+//!    order; a failing test must not leave resources for framework cleanup.
 //!
 //! 2. **Commit Phase**: [`MibHandler::commit_set`] is called for each varbind in order.
-//!    If a commit fails, [`MibHandler::undo_set`] is called for all previously committed
-//!    varbinds in reverse order.
+//!    A failed commit may have partially mutated state, so [`MibHandler::undo_set`]
+//!    is called in reverse order for every attempted binding, including the failed
+//!    attempt. Later successfully tested bindings whose commit was never attempted
+//!    receive [`MibHandler::free_set`] in reverse order. Undo owns rollback and
+//!    reservation cleanup for attempted bindings, and cleanup continues if undo fails.
 //!
 //! By default, handlers are read-only (returning [`SetResult::NotWritable`]).
 //! See [`MibHandler`] documentation for implementation details.

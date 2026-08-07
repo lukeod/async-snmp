@@ -3,10 +3,12 @@
 //! Demonstrates a MibHandler that supports SET operations using the
 //! two-phase commit protocol (RFC 3416):
 //!
-//! 1. **test_set** - Validate the value without modifying state
-//! 2. **commit_set** - Apply the change
-//! 3. **undo_set** - Roll back on partial failure
-//! 4. **free_set** - Release resources if test_set is abandoned
+//! 1. **test_set** - Validate and optionally reserve resources
+//! 2. **commit_set** - Apply the change; failure may be partially mutating
+//! 3. **undo_set** - Roll back and release resources for every attempted commit,
+//!    including the failed attempt
+//! 4. **free_set** - Release resources for successful tests whose commit was
+//!    never attempted
 //!
 //! The example exposes a small configuration subtree under a private
 //! enterprise OID with two writable scalars (a string and an integer)
@@ -169,8 +171,9 @@ impl MibHandler for ConfigHandler {
         _value: &'a Value,
     ) -> BoxFuture<'a, SetResult> {
         // A production handler would save the previous value in test_set
-        // (e.g., in a per-request map keyed by request ID) and restore it here.
-        // This example logs the rollback for demonstration purposes.
+        // (e.g., in a per-request map keyed by request ID), then restore it and
+        // release that reservation here. This callback may follow this binding's
+        // own failed commit. This example only logs the rollback.
         Box::pin(async move {
             tracing::warn!(oid = %oid, "rolling back SET (previous value not tracked in this example)");
             SetResult::Ok

@@ -43,8 +43,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// - [`test_set`](MibHandler::test_set): Validate SET operations (default: read-only)
 /// - [`commit_set`](MibHandler::commit_set): Apply SET operations (default: read-only)
-/// - [`undo_set`](MibHandler::undo_set): Rollback failed SET operations
-/// - [`free_set`](MibHandler::free_set): Cleanup resources on test failure
+/// - [`undo_set`](MibHandler::undo_set): Roll back attempted SET operations
+/// - [`free_set`](MibHandler::free_set): Release uncommitted test-phase resources
 /// - [`handles`](MibHandler::handles): Custom OID matching logic
 ///
 /// # GET Implementation
@@ -83,13 +83,16 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// RESERVE1/RESERVE2/ACTION/COMMIT/FREE/UNDO phases:
 ///
 /// 1. **Test phase**: [`test_set`](MibHandler::test_set) is called for ALL varbinds
-///    before any commits. If any test fails, [`free_set`](MibHandler::free_set)
-///    is called for all previously successful varbinds (in reverse order) to
-///    release resources allocated during the test phase.
+///    before any commits. Only a successful test enters pending state. If a test
+///    fails, [`free_set`](MibHandler::free_set) is called in reverse order for
+///    earlier successful tests. The failing test receives no cleanup callback.
 ///
 /// 2. **Commit phase**: [`commit_set`](MibHandler::commit_set) is called for each
-///    varbind in order. If a commit fails, [`undo_set`](MibHandler::undo_set) is
-///    called for all previously committed varbinds (in reverse order).
+///    varbind in order. A failed commit may have partially mutated state. On
+///    failure, [`undo_set`](MibHandler::undo_set) is called in reverse order for
+///    every attempted commit, including the failed attempt. Later bindings that
+///    passed testing but were never attempted receive [`free_set`](MibHandler::free_set)
+///    in reverse order. Cleanup continues if an `undo_set` call fails.
 ///
 /// By default, handlers are read-only and return [`SetResult::NotWritable`].
 ///
@@ -284,9 +287,10 @@ pub trait MibHandler: Send + Sync + 'static {
 
     /// Test if a SET operation would succeed (phase 1 of two-phase commit).
     ///
-    /// Called for ALL varbinds before any commits. Must NOT modify state.
-    /// Return `SetResult::Ok` if the SET would succeed, or an appropriate
-    /// error otherwise.
+    /// Called for ALL varbinds before any commits. Must NOT modify persistent
+    /// state. It may reserve locks or temporary resources when returning
+    /// `SetResult::Ok`. A non-`Ok` result must not leave resources for the
+    /// framework to release because only successful tests enter pending state.
     ///
     /// Default implementation returns `NotWritable` (read-only handler).
     fn test_set<'a>(
@@ -300,9 +304,11 @@ pub trait MibHandler: Send + Sync + 'static {
 
     /// Commit a SET operation (phase 2 of two-phase commit).
     ///
-    /// Only called after ALL `test_set` calls succeed. Should apply the change.
-    /// If this fails, `undo_set` will be called for all previously committed
-    /// varbinds in this request.
+    /// Only called after ALL `test_set` calls succeed. Should apply the change
+    /// and finalize any test-phase reservation on success. A non-`Ok` result
+    /// may follow partial mutation; `undo_set` will be called for this binding
+    /// and every earlier attempted binding in reverse order. Later tested
+    /// bindings whose commit was never attempted receive `free_set` instead.
     ///
     /// Default implementation returns `NotWritable` (read-only handler).
     fn commit_set<'a>(
@@ -314,12 +320,16 @@ pub trait MibHandler: Send + Sync + 'static {
         Box::pin(async { SetResult::NotWritable })
     }
 
-    /// Undo a committed SET operation (rollback on partial failure).
+    /// Undo an attempted SET operation (rollback on partial failure).
     ///
-    /// Called if a later `commit_set` fails. Should restore the previous value.
-    /// This is best-effort: if undo fails, log a warning but continue.
+    /// Called after a `commit_set` failure for each binding whose commit was
+    /// attempted, including the binding that returned the failure. This is the
+    /// binding's terminal failure callback: restore the previous value and
+    /// release its test-phase resources. `free_set` will not also be called for
+    /// this binding. Cleanup is best-effort and continues in reverse attempt
+    /// order after an undo failure.
     ///
-    /// Default implementation does nothing (no rollback support).
+    /// Default implementation reports successful cleanup without doing work.
     fn undo_set<'a>(
         &'a self,
         _ctx: &'a RequestContext,
@@ -329,13 +339,15 @@ pub trait MibHandler: Send + Sync + 'static {
         Box::pin(async { SetResult::Ok })
     }
 
-    /// Free resources allocated during `test_set` (cleanup on test failure).
+    /// Free resources allocated during `test_set` when commit was not attempted.
     ///
-    /// Called for varbinds whose `test_set` succeeded when a later varbind's
-    /// `test_set` fails. This allows handlers to release any resources
-    /// (locks, temporary allocations) acquired during the test phase.
+    /// Called for successful tests when a later test fails, or for bindings
+    /// after a failed commit whose own commit was never attempted. This is the
+    /// binding's terminal failure callback and must release its test-phase
+    /// resources; it must not assume `commit_set` ran. Bindings whose commit was
+    /// attempted receive `undo_set` instead, never both callbacks.
     ///
-    /// Called in reverse order, matching the `undo_set` convention.
+    /// Called in reverse binding order.
     ///
     /// Default implementation does nothing.
     fn free_set<'a>(

@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RequestRegistration` correlation metadata. Custom transports must ignore a
   failed correlation without consuming the pending request.
 
+### Fixed
+
+- SET commit failure now undoes every attempted binding, including the failed
+  attempt, and frees later tested reservations whose commit was not attempted.
+  Cleanup continues after an undo failure.
+
 ## [0.17.0] - 2026-08-06
 
 ### Added
