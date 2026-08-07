@@ -171,11 +171,14 @@ impl<T: Transport> Client<T> {
             );
             let discovery_data = discovery_msg.encode()?;
 
-            self.inner
-                .transport
-                .register_request(RequestRegistration::v3(msg_id, self.inner.config.timeout));
+            let registration = RequestRegistration::v3(msg_id, self.inner.config.timeout);
 
-            match self.inner.transport.request(&discovery_data, msg_id).await {
+            match self
+                .inner
+                .transport
+                .request(&discovery_data, registration)
+                .await
+            {
                 Ok((data, source)) => {
                     response_data_opt = Some((data, source, msg_id));
                     break 'discovery;
@@ -646,22 +649,18 @@ impl<T: Transport> Client<T> {
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type, snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type);
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
 
-            // Register (or re-register) with fresh deadline before sending
-            self.inner
-                .transport
-                .register_request(RequestRegistration::v3(msg_id, self.inner.config.timeout));
-            for &prior in &msg_id_window {
-                self.inner.transport.register_request_alias(
-                    prior,
-                    msg_id,
-                    self.inner.config.timeout,
-                );
-            }
+            let registration = RequestRegistration::v3(msg_id, self.inner.config.timeout)
+                .with_aliases(msg_id_window.iter().copied());
             msg_id_window.push(msg_id);
 
             // Send request and wait for response as a single unit so reliable
             // transports own their stream lock for the whole exchange.
-            match self.inner.transport.request(&request.data, msg_id).await {
+            match self
+                .inner
+                .transport
+                .request(&request.data, registration)
+                .await
+            {
                 Ok((response_data, _source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received V3 response");
 
@@ -1146,15 +1145,13 @@ mod tests {
     }
 
     impl Transport for TestTransport {
-        fn register_request(&self, _registration: RequestRegistration) {}
-
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             ready(Err(Error::Config(
                 "test transport does not receive data".into(),
@@ -1329,16 +1326,15 @@ mod tests {
     }
 
     impl Transport for RetryTestTransport {
-        fn register_request(&self, _registration: RequestRegistration) {}
-
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
 
         fn recv(
             &self,
-            request_id: i32,
+            registration: RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let request_id = registration.request_id;
             let count = self.recv_count.fetch_add(1, Ordering::Relaxed);
             let peer = self.peer;
             let engine_id = self.engine_id.clone();
@@ -1439,14 +1435,12 @@ mod tests {
             peer: SocketAddr,
         }
         impl Transport for AlwaysTimeoutTransport {
-            fn register_request(&self, _registration: RequestRegistration) {}
-
             fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
                 ready(Ok(()))
             }
             fn recv(
                 &self,
-                _request_id: i32,
+                _registration: RequestRegistration,
             ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
                 let peer = self.peer;
                 async move {
@@ -1522,8 +1516,6 @@ mod response_validation_tests {
     }
 
     impl Transport for CannedTransport {
-        fn register_request(&self, _registration: RequestRegistration) {}
-
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
@@ -1534,7 +1526,7 @@ mod response_validation_tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             ready(Ok((self.response.clone(), self.peer)))
         }
@@ -1575,17 +1567,19 @@ mod response_validation_tests {
     }
 
     impl Transport for DeferredUpdateTransport {
-        fn register_request(&self, _registration: RequestRegistration) {}
-
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
 
-        async fn recv(&self, _request_id: i32) -> Result<(Bytes, SocketAddr)> {
+        async fn recv(&self, _registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
             Err(Error::Config("DeferredUpdateTransport uses request()".into()).boxed())
         }
 
-        async fn request(&self, data: &[u8], _request_id: i32) -> Result<(Bytes, SocketAddr)> {
+        async fn request(
+            &self,
+            data: &[u8],
+            _registration: RequestRegistration,
+        ) -> Result<(Bytes, SocketAddr)> {
             let response_number = self.response_number.fetch_add(1, Ordering::SeqCst);
             let response = build_deferred_update_response(data, response_number);
             Ok((response, self.peer))

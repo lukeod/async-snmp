@@ -78,10 +78,9 @@ use super::{CorrelationResult, RequestRegistration, ResponseCorrelation, Transpo
 use crate::error::{Error, Result};
 use crate::message_size::ReceiveLimits;
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -97,11 +96,6 @@ use tokio::time::timeout;
 /// 10MB is generous for SNMP - even large table walks rarely exceed a few MB.
 /// Real-world SNMP messages typically range from a few hundred bytes to a few KB.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
-
-/// Fallback receive timeout used when a request/recv is invoked without a
-/// prior [`register_request`] (or after its per-request entry was already
-/// consumed).
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration options for [`TcpTransport`].
 ///
@@ -211,7 +205,6 @@ impl TcpTransportBuilder {
         Ok(TcpTransport {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                pending_registrations: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
                 receive_limits,
@@ -279,13 +272,6 @@ pub struct TcpTransport {
 struct TcpTransportInner {
     /// The TCP stream, wrapped in Arc for owned guard pattern
     stream: Arc<Mutex<TcpStream>>,
-    /// Per-request timeout and correlation metadata, keyed by request ID.
-    ///
-    /// [`register_request`](Transport::register_request) inserts the metadata;
-    /// the matching `request`/`recv` removes and uses it. Keeping the value keyed
-    /// per request means a second client sharing this cloned transport cannot
-    /// overwrite another client's in-flight request registration.
-    pending_registrations: StdMutex<HashMap<i32, RequestRegistration>>,
     target: SocketAddr,
     local_addr: SocketAddr,
     /// One total-message bound shared by framing, decoding, and advertisement.
@@ -308,19 +294,6 @@ impl TcpTransportInner {
     /// Report whether the stream framing has been marked lost.
     fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
-    }
-
-    /// Remove and return the metadata registered for `request_id`.
-    ///
-    /// Falls back to a v3 registration with [`DEFAULT_REQUEST_TIMEOUT`] when no
-    /// entry was registered (or it was already consumed). Taking the value here
-    /// keeps it local to the request that owns the stream guard.
-    fn take_registration(&self, request_id: i32) -> RequestRegistration {
-        self.pending_registrations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&request_id)
-            .unwrap_or_else(|| RequestRegistration::v3(request_id, DEFAULT_REQUEST_TIMEOUT))
     }
 
     /// Mark the stream unusable and best-effort close it.
@@ -415,7 +388,6 @@ impl TcpTransport {
         Ok(Self {
             inner: Arc::new(TcpTransportInner {
                 stream: Arc::new(Mutex::new(stream)),
-                pending_registrations: StdMutex::new(HashMap::new()),
                 target,
                 local_addr,
                 receive_limits,
@@ -443,16 +415,8 @@ impl Transport for TcpTransport {
         Ok(())
     }
 
-    fn register_request(&self, registration: RequestRegistration) {
-        self.inner
-            .pending_registrations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(registration.request_id, registration);
-    }
-
-    async fn recv(&self, request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        let registration = self.inner.take_registration(request_id);
+    async fn recv(&self, registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
+        let request_id = registration.request_id;
         let recv_timeout = registration.timeout;
         let target = self.inner.target;
         let mut stream = self.inner.stream.clone().lock_owned().await;
@@ -481,8 +445,12 @@ impl Transport for TcpTransport {
         .await
     }
 
-    async fn request(&self, data: &[u8], request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        let registration = self.inner.take_registration(request_id);
+    async fn request(
+        &self,
+        data: &[u8],
+        registration: RequestRegistration,
+    ) -> Result<(Bytes, SocketAddr)> {
+        let request_id = registration.request_id;
         let recv_timeout = registration.timeout;
         let target = self.inner.target;
         let mut stream = self.inner.stream.clone().lock_owned().await;
@@ -697,15 +665,6 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
-    trait TestRegister {
-        fn register_v3(&self, request_id: i32, timeout: Duration);
-    }
-
-    impl<T: Transport> TestRegister for T {
-        fn register_v3(&self, request_id: i32, timeout: Duration) {
-            Transport::register_request(self, RequestRegistration::v3(request_id, timeout));
-        }
-    }
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -753,8 +712,8 @@ mod tests {
         transport.send(&request).await.unwrap();
 
         // Receive response
-        transport.register_v3(1, Duration::from_secs(5));
-        let (response, source) = transport.recv(1).await.unwrap();
+        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let (response, source) = transport.recv(registration).await.unwrap();
 
         assert_eq!(source, server_addr);
         assert_eq!(response[0], 0x30); // SEQUENCE tag
@@ -785,8 +744,8 @@ mod tests {
         let transport = TcpTransport::connect(server_addr).await.unwrap();
         transport.send(&[0x00]).await.unwrap(); // Trigger server
 
-        transport.register_v3(1, Duration::from_secs(5));
-        let (response, _) = transport.recv(1).await.unwrap();
+        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let (response, _) = transport.recv(registration).await.unwrap();
 
         // Verify: tag (1) + length field (2) + content (200) = 203 bytes
         assert_eq!(response.len(), 203);
@@ -906,8 +865,8 @@ mod tests {
                 let request_id = i + 1;
                 let request = build_request_with_id(request_id);
 
-                transport.register_v3(request_id, Duration::from_secs(5));
-                let (response, _) = transport.request(&request, request_id).await?;
+                let registration = RequestRegistration::v3(request_id, Duration::from_secs(5));
+                let (response, _) = transport.request(&request, registration).await?;
 
                 // Verify we got a valid response
                 assert_eq!(response[0], 0x30, "Response should be SEQUENCE");
@@ -1023,18 +982,15 @@ mod tests {
         });
 
         let transport = TcpTransport::connect(addr).await.unwrap();
-        Transport::register_request(
-            &transport,
-            RequestRegistration::community(
-                77,
-                Duration::from_secs(2),
-                crate::Version::V2c,
-                Bytes::from_static(b"public"),
-                super::super::CommunityResponsePolicy::Exact,
-            ),
+        let registration = RequestRegistration::community(
+            77,
+            Duration::from_secs(2),
+            crate::Version::V2c,
+            Bytes::from_static(b"public"),
+            super::super::CommunityResponsePolicy::Exact,
         );
         let (response, _) = transport
-            .request(&build_request_with_id(77), 77)
+            .request(&build_request_with_id(77), registration)
             .await
             .unwrap();
         assert_eq!(response.as_ref(), build_response_with_id(77));
@@ -1082,8 +1038,8 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        transport.register_v3(1, Duration::from_secs(5));
-        let result = transport.recv(1).await;
+        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let result = transport.recv(registration).await;
 
         // Should reject the message without allocating 100MB
         assert!(result.is_err(), "Should reject excessive claimed size");
@@ -1359,8 +1315,8 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        transport.register_v3(1, Duration::from_secs(5));
-        let result = transport.recv(1).await;
+        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let result = transport.recv(registration).await;
 
         // Should reject 10KB message when limit is 1KB
         assert!(
@@ -1413,8 +1369,12 @@ mod tests {
 
         // First request: cancelled by the outer timeout before any response.
         let request = build_request_with_id(1);
-        transport.register_v3(1, Duration::from_secs(30));
-        let cancelled = timeout(Duration::from_millis(50), transport.request(&request, 1)).await;
+        let registration = RequestRegistration::v3(1, Duration::from_secs(30));
+        let cancelled = timeout(
+            Duration::from_millis(50),
+            transport.request(&request, registration),
+        )
+        .await;
         assert!(cancelled.is_err(), "outer timeout should elapse (cancel)");
 
         // The stream lock must be free after the cancelled request.
@@ -1425,10 +1385,13 @@ mod tests {
 
         // The next request must succeed rather than deadlock.
         let request2 = build_request_with_id(2);
-        transport.register_v3(2, Duration::from_secs(5));
-        let result = timeout(Duration::from_secs(5), transport.request(&request2, 2))
-            .await
-            .expect("second request should not hang");
+        let registration = RequestRegistration::v3(2, Duration::from_secs(5));
+        let result = timeout(
+            Duration::from_secs(5),
+            transport.request(&request2, registration),
+        )
+        .await
+        .expect("second request should not hang");
         let (response, _) = result.expect("second request should succeed");
         assert_eq!(response[0], 0x30);
 
@@ -1474,8 +1437,8 @@ mod tests {
 
         // First request: the malformed reply is rejected and poisons the stream.
         let request = build_request_with_id(1);
-        transport.register_v3(1, Duration::from_secs(5));
-        let first = transport.request(&request, 1).await;
+        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let first = transport.request(&request, registration).await;
         let err = first.expect_err("malformed frame should error");
         assert!(
             matches!(*err, Error::MalformedResponse { .. }),
@@ -1491,10 +1454,13 @@ mod tests {
         // The next request must fail fast with Closed rather than read the
         // leftover bytes of the abandoned frame.
         let request2 = build_request_with_id(2);
-        transport.register_v3(2, Duration::from_secs(5));
-        let second = timeout(Duration::from_secs(5), transport.request(&request2, 2))
-            .await
-            .expect("second request should not hang");
+        let registration = RequestRegistration::v3(2, Duration::from_secs(5));
+        let second = timeout(
+            Duration::from_secs(5),
+            transport.request(&request2, registration),
+        )
+        .await
+        .expect("second request should not hang");
         let err2 = second.expect_err("poisoned stream should reject the next request");
         assert!(
             matches!(*err2, Error::Closed { .. }),
@@ -1507,13 +1473,10 @@ mod tests {
     /// Regression test: a second client sharing a cloned transport must not be
     /// able to overwrite the receive timeout of another client's request.
     ///
-    /// Previously the timeout lived in a single shared `AtomicU64`, so client
-    /// B's `register_request` (with a long timeout) would clobber the value
-    /// client A registered (a short timeout) before A's `recv` read it. A's
-    /// `recv` would then wait for B's long timeout. Timeouts are now keyed per
-    /// request ID, so A's `recv` uses exactly the timeout A registered.
+    /// Registration metadata is owned by the receive future, so its timeout is
+    /// used directly without shared mutable registration state.
     #[tokio::test]
-    async fn test_tcp_per_request_timeout_not_overwritten_by_clone() {
+    async fn test_tcp_receive_uses_owned_registration_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
 
@@ -1523,22 +1486,13 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let transport_a = TcpTransport::connect(server_addr).await.unwrap();
-        let transport_b = transport_a.clone();
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+        let registration = RequestRegistration::v3(1, Duration::from_millis(150));
 
-        // Client A registers a short timeout for its request.
-        transport_a.register_v3(1, Duration::from_millis(150));
-        // Client B, sharing the same cloned transport, registers a long timeout
-        // for a different request. With the old shared atomic this overwrote A's
-        // value; per-request keying keeps them independent.
-        transport_b.register_v3(2, Duration::from_secs(20));
-
-        // A's recv must time out at ~150ms, not at B's 20s. Guard with a 5s
-        // outer bound: if the bug regresses, A would wait 20s and this fails.
         let start = std::time::Instant::now();
-        let result = timeout(Duration::from_secs(5), transport_a.recv(1))
+        let result = timeout(Duration::from_secs(5), transport.recv(registration))
             .await
-            .expect("recv should honor A's short timeout, not B's long one");
+            .expect("recv should honor the owned short timeout");
         let elapsed = start.elapsed();
 
         let err = result.expect_err("recv should time out");
@@ -1583,8 +1537,8 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        transport.register_v3(1, Duration::from_millis(100));
-        let first = transport.recv(1).await;
+        let registration = RequestRegistration::v3(1, Duration::from_millis(100));
+        let first = transport.recv(registration).await;
         let err = first.expect_err("mid-frame read should time out");
         assert!(
             matches!(*err, Error::Timeout { .. }),
@@ -1597,8 +1551,8 @@ mod tests {
         );
 
         // A later recv must fail fast rather than parse leftover content bytes.
-        transport.register_v3(1, Duration::from_secs(5));
-        let second = timeout(Duration::from_secs(5), transport.recv(1))
+        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let second = timeout(Duration::from_secs(5), transport.recv(registration))
             .await
             .expect("second recv should not hang");
         let err2 = second.expect_err("poisoned stream should reject the next recv");

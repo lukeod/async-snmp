@@ -108,6 +108,8 @@ pub struct RequestRegistration {
     pub timeout: Duration,
     /// Protocol-specific response identity.
     pub correlation: ResponseCorrelation,
+    /// Prior transmission IDs that may still receive a response for this operation.
+    aliases: Vec<i32>,
 }
 
 impl RequestRegistration {
@@ -128,6 +130,7 @@ impl RequestRegistration {
                 community,
                 policy,
             },
+            aliases: Vec::new(),
         }
     }
 
@@ -138,7 +141,24 @@ impl RequestRegistration {
             request_id,
             timeout,
             correlation: ResponseCorrelation::V3,
+            aliases: Vec::new(),
         }
+    }
+
+    /// Attach prior transmission IDs to this registration.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = i32>) -> Self {
+        self.aliases = aliases
+            .into_iter()
+            .filter(|alias| *alias != self.request_id)
+            .collect();
+        self
+    }
+
+    /// Prior transmission IDs accepted for this operation.
+    #[must_use]
+    pub fn aliases(&self) -> &[i32] {
+        &self.aliases
     }
 }
 
@@ -192,10 +212,15 @@ pub trait Transport: Send + Sync {
     /// Send request data to the target.
     fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
-    /// Wait for response. Uses deadline set by `register_request()`.
+    /// Wait for a response using the supplied correlation metadata and deadline.
     ///
-    /// UDP and TCP transports use the deadline stored during registration.
-    fn recv(&self, request_id: i32) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send;
+    /// Transports with out-of-band demultiplexing must install the registration
+    /// as part of this future and remove it whenever the future completes or is
+    /// dropped.
+    fn recv(
+        &self,
+        registration: RequestRegistration,
+    ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send;
 
     /// Send request data and wait for the correlated response as a single unit.
     ///
@@ -208,16 +233,17 @@ pub trait Transport: Send + Sync {
     /// across independent await points and leaks, permanently wedging later
     /// requests.
     ///
-    /// Callers should invoke [`register_request`](Self::register_request) before
-    /// this, exactly as they would before a bare `send`/`recv` pair.
+    /// The registration is owned by the returned future. Transports with
+    /// out-of-band demultiplexing must install it before sending and remove it
+    /// whenever the future completes or is dropped.
     fn request(
         &self,
         data: &[u8],
-        request_id: i32,
+        registration: RequestRegistration,
     ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send {
         async move {
             self.send(data).await?;
-            self.recv(request_id).await
+            self.recv(registration).await
         }
     }
 
@@ -239,18 +265,6 @@ pub trait Transport: Send + Sync {
     /// When true, Client skips retries (transport guarantees delivery or failure).
     /// When false (UDP/DTLS), Client retries on timeout.
     fn is_reliable(&self) -> bool;
-
-    /// Pre-register a request with its timeout and response identity.
-    ///
-    /// Transports must leave the request pending, under its original deadline,
-    /// when a received packet fails the supplied correlation metadata.
-    fn register_request(&self, registration: RequestRegistration);
-
-    /// Route responses addressed to `alias_id` (a prior transmission of the
-    /// same operation) to the pending request registered under `primary_id`.
-    /// Transports without out-of-band demultiplexing ignore this; the client
-    /// still accepts windowed IDs in its own correlation check.
-    fn register_request_alias(&self, _alias_id: i32, _primary_id: i32, _timeout: Duration) {}
 
     /// Validated local receive limits for this transport.
     ///

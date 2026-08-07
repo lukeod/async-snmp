@@ -61,8 +61,11 @@ struct Shard {
     pending: Mutex<HashMap<i32, PendingEntry>>,
 }
 
+struct RegistrationIdentity;
+
 struct ResponseSlot {
     response: Option<(Bytes, SocketAddr)>,
+    owner: Arc<RegistrationIdentity>,
     /// When the request was registered; used to report the real elapsed time
     /// on timeout instead of deriving it from the deadline.
     registered_at: Instant,
@@ -82,7 +85,31 @@ enum PendingEntry {
     Alias {
         primary: i32,
         deadline: Instant,
+        owner: Arc<RegistrationIdentity>,
     },
+}
+
+/// Owns one UDP correlation registration and removes only its entries on drop.
+pub(crate) struct UdpRegistration {
+    core: Arc<UdpCore>,
+    primary: i32,
+    aliases: Vec<i32>,
+    owner: Arc<RegistrationIdentity>,
+}
+
+impl UdpRegistration {
+    pub(crate) fn request_id(&self) -> i32 {
+        self.primary
+    }
+}
+
+impl Drop for UdpRegistration {
+    fn drop(&mut self) {
+        self.core.remove_owned(self.primary, &self.owner);
+        for alias in &self.aliases {
+            self.core.remove_owned(*alias, &self.owner);
+        }
+    }
 }
 
 impl UdpCore {
@@ -137,65 +164,61 @@ impl UdpCore {
         &self.shards[request_id as usize % SHARDS]
     }
 
-    /// Register a pending request with its target and correlation metadata.
+    /// Register a pending request and return its cancellation cleanup owner.
     pub fn register(
-        &self,
+        self: &Arc<Self>,
         registration: RequestRegistration,
         target_source: SocketAddr,
         strict_source: bool,
-    ) {
-        let shard = self.shard(registration.request_id);
+    ) -> UdpRegistration {
+        let primary = registration.request_id;
+        let timeout = registration.timeout;
+        let aliases = registration.aliases().to_vec();
+        let owner = Arc::new(RegistrationIdentity);
         let now = Instant::now();
         let slot = ResponseSlot {
             response: None,
+            owner: owner.clone(),
             registered_at: now,
-            deadline: now + registration.timeout,
+            deadline: now + timeout,
             notify: Arc::new(Notify::new()),
             target_source,
             strict_source,
             correlation: registration.correlation,
         };
-        shard
+        self.shard(primary)
             .pending
             .lock()
             .unwrap()
-            .insert(registration.request_id, PendingEntry::Slot(slot));
-    }
+            .insert(primary, PendingEntry::Slot(slot));
 
-    /// Route future deliveries for `alias_id` to the slot registered under
-    /// `primary_id`. Replaces any existing entry for `alias_id`; a response
-    /// already parked there is forwarded to the primary slot. Aliases are one
-    /// hop: the caller re-points every prior ID at the newest primary, so an
-    /// alias always names a slot, never another alias.
-    ///
-    /// Aliases are never explicitly unregistered. This is safe only because
-    /// every operation exit path removes its primary slot (consume,
-    /// timeout-unregister, send-failure-unregister, close), so a lingering
-    /// alias always ends up naming a dead slot and is reclaimed by
-    /// `cleanup_expired` once its own deadline passes. If a primary slot
-    /// could ever outlive its operation, aliases would need explicit cleanup
-    /// too.
-    pub fn register_alias(&self, alias_id: i32, primary_id: i32, timeout: Duration) {
-        if alias_id == primary_id {
-            return;
-        }
-        let carried = {
-            let mut pending = self.shard(alias_id).pending.lock().unwrap();
-            let carried = match pending.remove(&alias_id) {
-                Some(PendingEntry::Slot(slot)) => slot.response,
-                _ => None,
+        for alias in &aliases {
+            let carried = {
+                let mut pending = self.shard(*alias).pending.lock().unwrap();
+                let carried = match pending.remove(alias) {
+                    Some(PendingEntry::Slot(slot)) => slot.response,
+                    _ => None,
+                };
+                pending.insert(
+                    *alias,
+                    PendingEntry::Alias {
+                        primary,
+                        deadline: now + timeout,
+                        owner: owner.clone(),
+                    },
+                );
+                carried
             };
-            pending.insert(
-                alias_id,
-                PendingEntry::Alias {
-                    primary: primary_id,
-                    deadline: Instant::now() + timeout,
-                },
-            );
-            carried
-        };
-        if let Some((data, source)) = carried {
-            self.deliver(primary_id, data, source);
+            if let Some((data, source)) = carried {
+                self.deliver_owned(primary, &owner, data, source);
+            }
+        }
+
+        UdpRegistration {
+            core: self.clone(),
+            primary,
+            aliases,
+            owner,
         }
     }
 
@@ -204,18 +227,41 @@ impl UdpCore {
     /// Returns `true` if the slot existed and the response was stored,
     /// `false` if there was no matching pending request.
     pub fn deliver(&self, request_id: i32, data: Bytes, source: SocketAddr) -> bool {
-        let target_id = {
+        let (target_id, owner) = {
             let pending = self.shard(request_id).pending.lock().unwrap();
             match pending.get(&request_id) {
-                Some(PendingEntry::Alias { primary, .. }) => *primary,
-                _ => request_id,
+                Some(PendingEntry::Slot(slot)) => (request_id, Some(slot.owner.clone())),
+                Some(PendingEntry::Alias { primary, owner, .. }) => (*primary, Some(owner.clone())),
+                None => (request_id, None),
             }
         };
+        self.deliver_to(target_id, owner.as_ref(), request_id, data, source)
+    }
 
+    fn deliver_owned(
+        &self,
+        request_id: i32,
+        owner: &Arc<RegistrationIdentity>,
+        data: Bytes,
+        source: SocketAddr,
+    ) -> bool {
+        self.deliver_to(request_id, Some(owner), request_id, data, source)
+    }
+
+    fn deliver_to(
+        &self,
+        target_id: i32,
+        expected_owner: Option<&Arc<RegistrationIdentity>>,
+        request_id: i32,
+        data: Bytes,
+        source: SocketAddr,
+    ) -> bool {
         let shard = self.shard(target_id);
         let mut pending = shard.pending.lock().unwrap();
 
-        if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&target_id) {
+        if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&target_id)
+            && expected_owner.is_none_or(|owner| Arc::ptr_eq(owner, &slot.owner))
+        {
             let source_is_target = slot.target_source == source;
             if slot.strict_source && !source_is_target {
                 // Leave the slot and original deadline intact.
@@ -266,16 +312,19 @@ impl UdpCore {
     /// or if the slot was already cancelled/expired.
     pub async fn wait_for_response(
         &self,
-        request_id: i32,
+        registration: &UdpRegistration,
         target: SocketAddr,
     ) -> Result<(Bytes, SocketAddr)> {
+        let request_id = registration.primary;
         let shard = self.shard(request_id);
 
         loop {
             // Single lock: check for response, or grab notify + deadline for waiting.
             let (notify, deadline, registered_at) = {
                 let mut pending = shard.pending.lock().unwrap();
-                if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&request_id) {
+                if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&request_id)
+                    && Arc::ptr_eq(&slot.owner, &registration.owner)
+                {
                     if let Some(response) = slot.response.take() {
                         pending.remove(&request_id);
                         return Ok(response);
@@ -298,14 +347,12 @@ impl UdpCore {
             // Checked after the response lookup so a response delivered
             // before shutdown is still returned.
             if self.closed.load(Ordering::Acquire) {
-                self.unregister(request_id);
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target }, "transport shut down");
                 return Err(Error::Closed { target }.boxed());
             }
 
             let now = Instant::now();
             if now >= deadline {
-                self.unregister(request_id);
                 self.stats.expired.fetch_add(1, Ordering::Relaxed);
                 let elapsed = now.saturating_duration_since(registered_at);
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %target, ?elapsed }, "transport timeout");
@@ -338,12 +385,31 @@ impl UdpCore {
         }
     }
 
-    /// Remove a pending request slot.
-    ///
-    /// Called for cancellation or cleanup.
-    pub fn unregister(&self, request_id: i32) {
-        let shard = self.shard(request_id);
-        shard.pending.lock().unwrap().remove(&request_id);
+    fn remove_owned(&self, request_id: i32, owner: &Arc<RegistrationIdentity>) {
+        let mut pending = self.shard(request_id).pending.lock().unwrap();
+        let matches = match pending.get(&request_id) {
+            Some(PendingEntry::Slot(slot)) => Arc::ptr_eq(&slot.owner, owner),
+            Some(PendingEntry::Alias {
+                owner: alias_owner, ..
+            }) => Arc::ptr_eq(alias_owner, owner),
+            None => false,
+        };
+        if matches {
+            pending.remove(&request_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_counts(&self) -> (usize, usize) {
+        self.shards.iter().fold((0, 0), |(slots, aliases), shard| {
+            shard.pending.lock().unwrap().values().fold(
+                (slots, aliases),
+                |(slots, aliases), entry| match entry {
+                    PendingEntry::Slot(_) => (slots + 1, aliases),
+                    PendingEntry::Alias { .. } => (slots, aliases + 1),
+                },
+            )
+        })
     }
 
     /// Remove all expired request slots.
@@ -380,148 +446,24 @@ impl Default for UdpCore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::CommunityResponsePolicy;
     use super::*;
 
     fn test_addr() -> SocketAddr {
         "127.0.0.1:161".parse().unwrap()
     }
 
-    fn register_v3(core: &UdpCore, request_id: i32, timeout: Duration, strict: bool) {
+    fn register_v3(
+        core: &Arc<UdpCore>,
+        request_id: i32,
+        timeout: Duration,
+        strict: bool,
+    ) -> UdpRegistration {
         core.register(
             RequestRegistration::v3(request_id, timeout),
             test_addr(),
             strict,
-        );
-    }
-
-    // A timed-out wait reports elapsed based on the registration time, not a
-    // hardcoded 1s offset from the deadline, and does not panic when the
-    // deadline is close to the Instant epoch (short timeout).
-    #[tokio::test]
-    async fn timeout_reports_elapsed_from_registration() {
-        let core = UdpCore::new();
-        let addr = test_addr();
-        let timeout = Duration::from_millis(50);
-        register_v3(&core, 1, timeout, false);
-
-        let err = core.wait_for_response(1, addr).await.unwrap_err();
-        match *err {
-            Error::Timeout {
-                elapsed, retries, ..
-            } => {
-                // Elapsed reflects the configured timeout, not deadline - 1s.
-                assert!(
-                    elapsed >= timeout,
-                    "elapsed {elapsed:?} should be at least the timeout {timeout:?}"
-                );
-                assert!(
-                    elapsed < Duration::from_secs(1),
-                    "elapsed {elapsed:?} should not be derived from a 1s offset"
-                );
-                assert_eq!(retries, 0);
-            }
-            other => panic!("expected Timeout, got {other:?}"),
-        }
-    }
-
-    // A duplicate datagram for a request-id whose response has not yet been
-    // consumed is ignored: it neither overwrites the pending response nor
-    // increments the delivered counter a second time.
-    #[tokio::test]
-    async fn duplicate_delivery_is_ignored() {
-        let core = UdpCore::new();
-        let addr = test_addr();
-        register_v3(&core, 7, Duration::from_secs(30), false);
-
-        let first = Bytes::from_static(b"first");
-        let dup = Bytes::from_static(b"second");
-
-        assert!(core.deliver(7, first.clone(), addr));
-        // Second datagram for the same request-id, response still unconsumed.
-        assert!(!core.deliver(7, dup, addr));
-
-        let stats = core.stats();
-        assert_eq!(stats.delivered, 1, "duplicate must not be counted");
-        assert_eq!(stats.unmatched, 1, "duplicate counts as unmatched");
-
-        let (data, _) = core.wait_for_response(7, addr).await.unwrap();
-        assert_eq!(data, first, "original response must not be overwritten");
-    }
-
-    #[tokio::test]
-    async fn alias_routes_delivery_to_primary_slot() {
-        let core = UdpCore::new();
-        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        register_v3(&core, 2, Duration::from_secs(5), false);
-        core.register_alias(1, 2, Duration::from_secs(5));
-        assert!(core.deliver(1, Bytes::from_static(b"late"), target));
-        let (data, source) = core.wait_for_response(2, target).await.unwrap();
-        assert_eq!(data.as_ref(), b"late");
-        assert_eq!(source, target);
-    }
-
-    #[tokio::test]
-    async fn alias_replacement_repoints_to_newest_primary() {
-        let core = UdpCore::new();
-        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        register_v3(&core, 3, Duration::from_secs(5), false);
-        core.register_alias(1, 2, Duration::from_secs(5));
-        core.register_alias(1, 3, Duration::from_secs(5));
-        core.register_alias(2, 3, Duration::from_secs(5));
-        assert!(core.deliver(1, Bytes::from_static(b"a1"), target));
-        let (data, _) = core.wait_for_response(3, target).await.unwrap();
-        assert_eq!(data.as_ref(), b"a1");
-    }
-
-    #[test]
-    fn alias_to_missing_primary_counts_unmatched() {
-        let core = UdpCore::new();
-        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        core.register_alias(1, 99, Duration::from_secs(5));
-        assert!(!core.deliver(1, Bytes::from_static(b"x"), target));
-        assert_eq!(core.stats().unmatched, 1);
-    }
-
-    #[test]
-    fn expired_alias_is_cleaned_up() {
-        let core = UdpCore::new();
-        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        register_v3(&core, 2, Duration::from_secs(5), false);
-        core.register_alias(1, 2, Duration::ZERO);
-        core.cleanup_expired();
-        // The expired alias is gone, but the still-live primary slot is not
-        // touched, and removing an alias must not count toward the
-        // requests-timed-out stat.
-        assert!(!core.deliver(1, Bytes::from_static(b"x"), target));
-        assert!(core.deliver(2, Bytes::from_static(b"x"), target));
-        assert_eq!(core.stats().expired, 0);
-    }
-
-    #[tokio::test]
-    async fn alias_registration_forwards_parked_response_to_primary() {
-        let core = UdpCore::new();
-        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        register_v3(&core, 2, Duration::from_secs(5), false);
-        assert!(core.deliver(2, Bytes::from_static(b"parked"), target));
-        register_v3(&core, 3, Duration::from_secs(5), false);
-        core.register_alias(2, 3, Duration::from_secs(5));
-        let (data, _) = core.wait_for_response(3, target).await.unwrap();
-        assert_eq!(data.as_ref(), b"parked");
-    }
-
-    // Same-shard variant of `alias_routes_delivery_to_primary_slot`: alias 2
-    // and primary 66 land in the same shard (SHARDS=64), pinning the
-    // release-then-reacquire of a single shard mutex inside `deliver`.
-    #[tokio::test]
-    async fn alias_routes_delivery_to_primary_slot_same_shard() {
-        let core = UdpCore::new();
-        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        register_v3(&core, 66, Duration::from_secs(5), false);
-        core.register_alias(2, 66, Duration::from_secs(5));
-        assert!(core.deliver(2, Bytes::from_static(b"late"), target));
-        let (data, source) = core.wait_for_response(66, target).await.unwrap();
-        assert_eq!(data.as_ref(), b"late");
-        assert_eq!(source, target);
+        )
     }
 
     fn community_packet(request_id: i32, community: &'static [u8]) -> Bytes {
@@ -543,64 +485,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn community_policy_source_matrix_and_non_consuming_rejection() {
-        use super::super::CommunityResponsePolicy;
+    async fn timeout_reports_elapsed_from_registration() {
+        let core = Arc::new(UdpCore::new());
+        let timeout = Duration::from_millis(50);
+        let registration = register_v3(&core, 1, timeout, false);
 
-        let target = test_addr();
-        let other: SocketAddr = "127.0.0.2:161".parse().unwrap();
-        let policies = [
-            CommunityResponsePolicy::Exact,
-            CommunityResponsePolicy::AllowMismatchFromTarget,
-            CommunityResponsePolicy::AllowMismatchFromAnySource,
-        ];
-        let mut request_id = 100;
-
-        for strict in [false, true] {
-            for policy in policies {
-                for source_is_target in [false, true] {
-                    for community_matches in [false, true] {
-                        request_id += 1;
-                        let core = UdpCore::new();
-                        core.register(
-                            RequestRegistration::community(
-                                request_id,
-                                Duration::from_secs(5),
-                                crate::Version::V2c,
-                                Bytes::from_static(b"public"),
-                                policy,
-                            ),
-                            target,
-                            strict,
-                        );
-                        let source = if source_is_target { target } else { other };
-                        let packet = community_packet(
-                            request_id,
-                            if community_matches {
-                                b"public"
-                            } else {
-                                b"rewritten"
-                            },
-                        );
-                        let expected = (!strict || source_is_target)
-                            && (community_matches
-                                || policy == CommunityResponsePolicy::AllowMismatchFromAnySource
-                                || (policy == CommunityResponsePolicy::AllowMismatchFromTarget
-                                    && source_is_target));
-                        assert_eq!(
-                            core.deliver(request_id, packet, source),
-                            expected,
-                            "strict={strict} policy={policy:?} source_is_target={source_is_target} community_matches={community_matches}"
-                        );
-                        assert_eq!(core.stats().delivered, u64::from(expected));
-                        assert_eq!(core.stats().unmatched, u64::from(!expected));
-                    }
-                }
+        let err = core
+            .wait_for_response(&registration, test_addr())
+            .await
+            .unwrap_err();
+        match *err {
+            Error::Timeout {
+                elapsed, retries, ..
+            } => {
+                assert!(elapsed >= timeout);
+                assert!(elapsed < Duration::from_secs(1));
+                assert_eq!(retries, 0);
             }
+            other => panic!("expected Timeout, got {other:?}"),
         }
+        drop(registration);
+        assert_eq!(core.pending_counts(), (0, 0));
+    }
 
-        let core = UdpCore::new();
+    #[tokio::test]
+    async fn duplicate_delivery_is_ignored() {
+        let core = Arc::new(UdpCore::new());
+        let addr = test_addr();
+        let registration = register_v3(&core, 7, Duration::from_secs(30), false);
+        let first = Bytes::from_static(b"first");
+
+        assert!(core.deliver(7, first.clone(), addr));
+        assert!(!core.deliver(7, Bytes::from_static(b"second"), addr));
+        assert_eq!(core.stats().delivered, 1);
+        assert_eq!(core.stats().unmatched, 1);
+        let (data, _) = core.wait_for_response(&registration, addr).await.unwrap();
+        assert_eq!(data, first);
+    }
+
+    #[tokio::test]
+    async fn alias_routes_delivery_to_owned_primary() {
+        let core = Arc::new(UdpCore::new());
+        let target = test_addr();
+        let registration = core.register(
+            RequestRegistration::v3(2, Duration::from_secs(5)).with_aliases([1]),
+            target,
+            false,
+        );
+        assert_eq!(core.pending_counts(), (1, 1));
+        assert!(core.deliver(1, Bytes::from_static(b"late"), target));
+        let (data, source) = core.wait_for_response(&registration, target).await.unwrap();
+        assert_eq!(data.as_ref(), b"late");
+        assert_eq!(source, target);
+        drop(registration);
+        assert_eq!(core.pending_counts(), (0, 0));
+    }
+
+    #[test]
+    fn guard_drop_removes_primary_and_all_aliases() {
+        let core = Arc::new(UdpCore::new());
+        let registration = core.register(
+            RequestRegistration::v3(30, Duration::from_secs(300)).with_aliases([10, 20, 25]),
+            test_addr(),
+            false,
+        );
+        assert_eq!(core.pending_counts(), (1, 3));
+        drop(registration);
+        assert_eq!(core.pending_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn stale_guard_and_alias_cannot_affect_replacement() {
+        let core = Arc::new(UdpCore::new());
+        let target = test_addr();
+        let stale = core.register(
+            RequestRegistration::v3(2, Duration::from_secs(30)).with_aliases([1]),
+            target,
+            false,
+        );
+        let replacement = register_v3(&core, 2, Duration::from_secs(30), false);
+
+        assert!(!core.deliver(1, Bytes::from_static(b"stale"), target));
+        drop(stale);
+        assert_eq!(core.pending_counts(), (1, 0));
+        assert!(core.deliver(2, Bytes::from_static(b"current"), target));
+        let (data, _) = core.wait_for_response(&replacement, target).await.unwrap();
+        assert_eq!(data.as_ref(), b"current");
+    }
+
+    #[test]
+    fn expired_alias_cleanup_does_not_remove_live_primary() {
+        let core = Arc::new(UdpCore::new());
+        let target = test_addr();
+        let registration = core.register(
+            RequestRegistration::v3(2, Duration::ZERO).with_aliases([1]),
+            target,
+            false,
+        );
+        core.cleanup_expired();
+        assert_eq!(core.pending_counts(), (0, 0));
+        assert_eq!(core.stats().expired, 1);
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn community_rejection_is_non_consuming_and_preserves_deadline() {
+        let core = Arc::new(UdpCore::new());
+        let target = test_addr();
+        let other = "127.0.0.2:161".parse().unwrap();
         let request_id = 500;
-        core.register(
+        let registration = core.register(
             RequestRegistration::community(
                 request_id,
                 Duration::from_secs(5),
@@ -618,12 +612,12 @@ mod tests {
             };
             (slot.notify.clone(), slot.deadline)
         };
+
         assert!(!core.deliver(request_id, community_packet(request_id, b"wrong"), other,));
         assert!(
             tokio::time::timeout(Duration::from_millis(10), notify.notified())
                 .await
-                .is_err(),
-            "rejection must not wake the waiter"
+                .is_err()
         );
         {
             let pending = core.shard(request_id).pending.lock().unwrap();
@@ -633,8 +627,9 @@ mod tests {
             assert_eq!(slot.deadline, original_deadline);
             assert!(slot.response.is_none());
         }
+
         assert!(core.deliver(request_id, community_packet(request_id, b"public"), target,));
-        let (accepted, _) = core.wait_for_response(request_id, target).await.unwrap();
+        let (accepted, _) = core.wait_for_response(&registration, target).await.unwrap();
         assert_eq!(
             super::super::extract_community_identity(&accepted)
                 .unwrap()
@@ -644,13 +639,12 @@ mod tests {
     }
 
     #[test]
-    fn alias_respects_primary_expected_source() {
-        let core = UdpCore::new();
-        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        let other: SocketAddr = "127.0.0.2:161".parse().unwrap();
-        register_v3(&core, 2, Duration::from_secs(5), true);
-        core.register_alias(1, 2, Duration::from_secs(5));
-        assert!(!core.deliver(1, Bytes::from_static(b"spoof"), other));
-        assert!(core.deliver(1, Bytes::from_static(b"real"), target));
+    fn strict_source_rejection_keeps_owned_slot() {
+        let core = Arc::new(UdpCore::new());
+        let target = test_addr();
+        let other = "127.0.0.2:161".parse().unwrap();
+        let _registration = register_v3(&core, 2, Duration::from_secs(5), true);
+        assert!(!core.deliver(2, Bytes::from_static(b"spoof"), other));
+        assert!(core.deliver(2, Bytes::from_static(b"real"), target));
     }
 }

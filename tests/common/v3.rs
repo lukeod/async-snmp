@@ -818,21 +818,23 @@ impl ScriptedTransport {
 }
 
 impl Transport for ScriptedTransport {
-    fn register_request(&self, _registration: async_snmp::RequestRegistration) {}
-
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         Ok(())
     }
 
-    async fn recv(&self, _request_id: i32) -> async_snmp::Result<(Bytes, SocketAddr)> {
+    async fn recv(
+        &self,
+        _registration: async_snmp::RequestRegistration,
+    ) -> async_snmp::Result<(Bytes, SocketAddr)> {
         Err(Error::Config("ScriptedTransport uses request()".into()).boxed())
     }
 
     async fn request(
         &self,
         data: &[u8],
-        request_id: i32,
+        registration: async_snmp::RequestRegistration,
     ) -> async_snmp::Result<(Bytes, SocketAddr)> {
+        let request_id = registration.request_id;
         let (request, step) = self
             .0
             .state

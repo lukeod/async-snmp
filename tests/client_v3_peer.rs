@@ -2581,7 +2581,13 @@ async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
     );
     let log = transport.log();
 
-    let (actual, _) = Transport::request(&transport, &request, 999).await.unwrap();
+    let (actual, _) = Transport::request(
+        &transport,
+        &request,
+        async_snmp::RequestRegistration::v3(999, Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(actual, expected);
     assert_eq!(transport.remaining_steps(), 0);
@@ -2601,7 +2607,13 @@ async fn report_builder_uses_reporting_engine_context() {
         .encode()
         .unwrap();
 
-    let (response, _) = Transport::request(&transport, &request, 41).await.unwrap();
+    let (response, _) = Transport::request(
+        &transport,
+        &request,
+        async_snmp::RequestRegistration::v3(41, Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
     let response = V3Message::decode(response).unwrap();
     let V3MessageData::Plaintext(scoped) = response.data else {
         panic!("Report must have a plaintext scopedPDU");

@@ -761,8 +761,6 @@ mod tests {
     }
 
     impl Transport for BulkTooBigTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
-
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
@@ -778,7 +776,7 @@ mod tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: crate::transport::RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let (request_id, max_rep) = self.pending.lock().unwrap().pop_front().unwrap_or((1, 0));
             let threshold = self.max_repetitions;
@@ -913,8 +911,6 @@ mod tests {
     }
 
     impl Transport for EmptyWalkTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
-
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
@@ -929,7 +925,7 @@ mod tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: crate::transport::RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let (request_id, _) = self.pending.lock().unwrap().pop_front().unwrap();
             let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();

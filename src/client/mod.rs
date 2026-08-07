@@ -381,14 +381,12 @@ impl<T: Transport> Client<T> {
             // Register (or re-register) with fresh deadline before sending
             let version = self.inner.config.version();
             let community = self.inner.config.community()?;
-            self.inner.transport.register_request(
-                crate::transport::RequestRegistration::community(
-                    request_id,
-                    self.inner.config.timeout,
-                    version,
-                    community.clone(),
-                    self.inner.config.community_response_policy,
-                ),
+            let registration = crate::transport::RequestRegistration::community(
+                request_id,
+                self.inner.config.timeout,
+                version,
+                community.clone(),
+                self.inner.config.community_response_policy,
             );
 
             // Send request and wait for response as a single unit. Combining the
@@ -396,7 +394,7 @@ impl<T: Transport> Client<T> {
             // whole exchange, so a cancelled request cannot leak the lock and
             // wedge later requests.
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = data.len() }, "sending request");
-            match self.inner.transport.request(data, request_id).await {
+            match self.inner.transport.request(data, registration).await {
                 Ok((response_data, source)) => {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response");
 
@@ -1248,8 +1246,6 @@ mod tests {
     }
 
     impl Transport for TruncatingTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
-
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             // Decode the sent request to extract the request_id.
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
@@ -1262,7 +1258,7 @@ mod tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: crate::transport::RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let request_id = {
                 let mut q = self.pending.lock().unwrap();
@@ -1345,8 +1341,6 @@ mod tests {
     }
 
     impl Transport for ScriptedResponseTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
-
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             self.pending.lock().unwrap().push_back(request_id);
@@ -1355,7 +1349,7 @@ mod tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: crate::transport::RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let request_id = self.pending.lock().unwrap().pop_front().unwrap_or(1);
             let varbinds = self
@@ -1419,14 +1413,15 @@ mod tests {
     }
 
     impl Transport for CountingTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
-
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             async { Ok(()) }
         }
 
-        async fn recv(&self, _request_id: i32) -> Result<(Bytes, SocketAddr)> {
+        async fn recv(
+            &self,
+            _registration: crate::transport::RequestRegistration,
+        ) -> Result<(Bytes, SocketAddr)> {
             panic!("receive must not be reached after encode failure")
         }
 
@@ -1968,8 +1963,6 @@ mod tests {
     }
 
     impl Transport for TooBigTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
-
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             // Decode the message to count varbinds
@@ -1984,7 +1977,7 @@ mod tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: crate::transport::RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let (request_id, varbind_count) = {
                 let mut q = self.pending.lock().unwrap();
@@ -2196,8 +2189,6 @@ mod tests {
     }
 
     impl Transport for AdversarialTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {}
-
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             self.pending.lock().unwrap().push_back(request_id);
@@ -2206,7 +2197,7 @@ mod tests {
 
         fn recv(
             &self,
-            _request_id: i32,
+            _registration: crate::transport::RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let request_id = self.pending.lock().unwrap().pop_front().unwrap_or(1);
             let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();

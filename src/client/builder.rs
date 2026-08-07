@@ -846,18 +846,16 @@ mod tests {
     }
 
     impl Transport for CustomTransport {
-        fn register_request(&self, _registration: crate::transport::RequestRegistration) {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
         async fn send(&self, _data: &[u8]) -> Result<()> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
 
-        async fn recv(&self, _request_id: i32) -> Result<(bytes::Bytes, std::net::SocketAddr)> {
+        async fn recv(
+            &self,
+            _registration: crate::transport::RequestRegistration,
+        ) -> Result<(bytes::Bytes, std::net::SocketAddr)> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(Error::Config("unexpected custom transport receive".into()).boxed())

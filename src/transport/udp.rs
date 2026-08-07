@@ -465,40 +465,28 @@ impl Transport for UdpHandle {
         Ok(())
     }
 
-    async fn request(&self, data: &[u8], request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        // If the send fails, reclaim the pending slot immediately rather than
-        // leaving it to expire at its deadline or be swept by the periodic
-        // cleanup. The slot was created by register_request before this call.
-        if let Err(e) = self.send(data).await {
-            self.inner.core.unregister(request_id);
-            return Err(e);
-        }
-        self.recv(request_id).await
-    }
-
-    async fn recv(&self, request_id: i32) -> Result<(Bytes, SocketAddr)> {
-        tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv waiting");
-
-        let result = self
+    async fn request(
+        &self,
+        data: &[u8],
+        registration: RequestRegistration,
+    ) -> Result<(Bytes, SocketAddr)> {
+        // Registration is the first work performed when this future is polled,
+        // before a datagram can be sent. The guard owns primary and alias cleanup
+        // across both awaits, including cancellation and send failure.
+        let registration = self
             .inner
             .core
-            .wait_for_response(request_id, self.target)
-            .await;
+            .register(registration, self.target, self.strict_source);
+        self.send(data).await?;
+        self.recv_registered(&registration).await
+    }
 
-        match &result {
-            Ok((data, source)) => {
-                // Warn on source mismatch
-                if self.inner.config.warn_on_source_mismatch && *source != self.target {
-                    tracing::warn!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.target = %self.target, snmp.source = %source }, "response source address mismatch");
-                }
-                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.source = %source, snmp.bytes = data.len() }, "UDP recv complete");
-            }
-            Err(_) => {
-                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv failed");
-            }
-        }
-
-        result
+    async fn recv(&self, registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
+        let registration = self
+            .inner
+            .core
+            .register(registration, self.target, self.strict_source);
+        self.recv_registered(&registration).await
     }
 
     fn peer_addr(&self) -> SocketAddr {
@@ -516,17 +504,35 @@ impl Transport for UdpHandle {
     fn is_reliable(&self) -> bool {
         false
     }
+}
 
-    fn register_request(&self, registration: RequestRegistration) {
-        self.inner
-            .core
-            .register(registration, self.target, self.strict_source);
-    }
+impl UdpHandle {
+    async fn recv_registered(
+        &self,
+        registration: &super::udp_core::UdpRegistration,
+    ) -> Result<(Bytes, SocketAddr)> {
+        let request_id = registration.request_id();
+        tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv waiting");
 
-    fn register_request_alias(&self, alias_id: i32, primary_id: i32, timeout: Duration) {
-        self.inner
+        let result = self
+            .inner
             .core
-            .register_alias(alias_id, primary_id, timeout);
+            .wait_for_response(registration, self.target)
+            .await;
+
+        match &result {
+            Ok((data, source)) => {
+                if self.inner.config.warn_on_source_mismatch && *source != self.target {
+                    tracing::warn!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.target = %self.target, snmp.source = %source }, "response source address mismatch");
+                }
+                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.source = %source, snmp.bytes = data.len() }, "UDP recv complete");
+            }
+            Err(_) => {
+                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv failed");
+            }
+        }
+
+        result
     }
 }
 
@@ -534,14 +540,16 @@ impl Transport for UdpHandle {
 mod tests {
     use super::*;
 
-    trait TestRegister {
-        fn register_v3(&self, request_id: i32, timeout: Duration);
-    }
-
-    impl<T: Transport> TestRegister for T {
-        fn register_v3(&self, request_id: i32, timeout: Duration) {
-            Transport::register_request(self, RequestRegistration::v3(request_id, timeout));
-        }
+    fn register_v3(
+        handle: &UdpHandle,
+        request_id: i32,
+        timeout: Duration,
+    ) -> super::super::udp_core::UdpRegistration {
+        handle.inner.core.register(
+            RequestRegistration::v3(request_id, timeout),
+            handle.target,
+            handle.strict_source,
+        )
     }
 
     #[test]
@@ -666,8 +674,11 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         // Target port 9 (discard): no response will ever arrive.
         let handle = transport.handle("127.0.0.1:9".parse().unwrap());
-        handle.register_v3(42, Duration::from_secs(30));
-        let waiter = tokio::spawn(async move { handle.recv(42).await });
+        let waiter = tokio::spawn(async move {
+            handle
+                .recv(RequestRegistration::v3(42, Duration::from_secs(30)))
+                .await
+        });
         // Let the waiter park on its notify before shutting down.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -692,7 +703,7 @@ mod tests {
         transport.shutdown().await;
 
         let err = handle
-            .recv(42)
+            .recv(RequestRegistration::v3(42, Duration::from_secs(30)))
             .await
             .expect_err("recv on closed transport should fail");
         assert!(
@@ -702,22 +713,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_unregistered_id_on_open_transport_returns_timeout() {
+    async fn recv_zero_deadline_on_open_transport_returns_timeout() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap());
 
         let err = handle
-            .recv(42)
+            .recv(RequestRegistration::v3(42, Duration::ZERO))
             .await
-            .expect_err("recv without register should fail");
+            .expect_err("zero-deadline receive should fail");
         assert!(
             matches!(*err, Error::Timeout { .. }),
             "expected Error::Timeout, got {err:?}"
         );
     }
 
-    // A send failure after register_request must reclaim the pending slot
-    // immediately rather than leaving it to expire at its deadline or be swept
+    // A send failure after registration must reclaim the pending entries
+    // immediately rather than leaving them to expire or be swept
     // by the periodic cleanup. An oversized datagram (larger than the maximum
     // UDP payload) makes send_to fail synchronously, exercising that path.
     #[tokio::test]
@@ -726,12 +737,13 @@ mod tests {
         let handle = transport.handle("127.0.0.1:9".parse().unwrap());
 
         let request_id = 55;
-        handle.register_v3(request_id, Duration::from_secs(30));
+        let registration =
+            RequestRegistration::v3(request_id, Duration::from_secs(30)).with_aliases([53, 54]);
 
         // Payload beyond the maximum UDP datagram size; send_to returns EMSGSIZE.
         let oversized = vec![0u8; 70_000];
         let err = handle
-            .request(&oversized, request_id)
+            .request(&oversized, registration)
             .await
             .expect_err("oversized send should fail");
         assert!(
@@ -748,6 +760,50 @@ mod tests {
                 .deliver(request_id, packet, handle.peer_addr()),
             "pending slot should have been reclaimed on send failure"
         );
+        assert_eq!(transport.inner.core.pending_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_request_does_not_register() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        let registration =
+            RequestRegistration::v3(70, Duration::from_secs(300)).with_aliases([68, 69]);
+
+        let request = handle.request(b"request", registration);
+        assert_eq!(transport.inner.core.pending_counts(), (0, 0));
+        drop(request);
+        assert_eq!(transport.inner.core.pending_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn repeated_cancellation_after_send_cleans_primary_and_aliases() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle(target);
+        let mut datagram = [0u8; 16];
+
+        for iteration in 0..20 {
+            let request_id = 1_000 + iteration;
+            let registration = RequestRegistration::v3(request_id, Duration::from_secs(300))
+                .with_aliases([2_000 + iteration * 2, 2_001 + iteration * 2]);
+            let request_handle = handle.clone();
+            let task =
+                tokio::spawn(async move { request_handle.request(b"request", registration).await });
+
+            listener.recv_from(&mut datagram).await.unwrap();
+            assert_eq!(transport.inner.core.pending_counts(), (1, 2));
+
+            task.abort();
+            let error = task.await.expect_err("request task should be cancelled");
+            assert!(error.is_cancelled());
+            assert_eq!(
+                transport.inner.core.pending_counts(),
+                (0, 0),
+                "iteration {iteration} retained UDP correlation state"
+            );
+        }
     }
 
     #[tokio::test]
@@ -784,7 +840,7 @@ mod tests {
 
         // Default config: warn_on_source_mismatch is true.
         let handle = transport.handle(target);
-        handle.register_v3(42, Duration::from_secs(5));
+        let registration = register_v3(&handle, 42, Duration::from_secs(5));
 
         let packet = response_packet(42);
         assert!(
@@ -792,10 +848,13 @@ mod tests {
             "deliver should find the registered request"
         );
 
-        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(42))
-            .await
-            .expect("recv timed out")
-            .expect("mismatched-source response must still be accepted");
+        let (data, source) = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.recv_registered(&registration),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("mismatched-source response must still be accepted");
 
         assert_eq!(data, packet);
         assert_eq!(source, mismatched);
@@ -815,17 +874,20 @@ mod tests {
         assert_ne!(target, mismatched);
 
         let handle = transport.handle(target);
-        handle.register_v3(7, Duration::from_secs(5));
+        let registration = register_v3(&handle, 7, Duration::from_secs(5));
 
         let packet = response_packet(7);
         assert!(transport.inner.core.deliver(7, packet.clone(), mismatched));
 
         // Acceptance must not depend on warn_on_source_mismatch: the flag
         // only controls whether a warning is logged, never rejection.
-        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(7))
-            .await
-            .expect("recv timed out")
-            .expect("mismatched-source response must be accepted regardless of warn flag");
+        let (data, source) = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.recv_registered(&registration),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("mismatched-source response must be accepted regardless of warn flag");
 
         assert_eq!(data, packet);
         assert_eq!(source, mismatched);
@@ -854,14 +916,17 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
         let handle = transport.handle(target);
-        handle.register_v3(7, Duration::from_secs(5));
+        let registration = register_v3(&handle, 7, Duration::from_secs(5));
 
         let packet = response_packet(7);
         assert!(transport.inner.core.deliver(7, packet.clone(), target));
-        tokio::time::timeout(Duration::from_secs(1), handle.recv(7))
-            .await
-            .expect("recv timed out")
-            .expect("first response must be delivered");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.recv_registered(&registration),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("first response must be delivered");
 
         // Slot consumed by recv: a duplicate is unmatched.
         assert!(!transport.inner.core.deliver(7, packet, target));
@@ -896,7 +961,7 @@ mod tests {
     async fn cleanup_expired_counts_expired() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap());
-        handle.register_v3(13, Duration::ZERO);
+        let _registration = register_v3(&handle, 13, Duration::ZERO);
 
         transport.inner.core.cleanup_expired();
 
@@ -910,7 +975,7 @@ mod tests {
         let mismatched: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let handle = transport.handle(target).strict_source(true);
-        handle.register_v3(21, Duration::from_secs(5));
+        let registration = register_v3(&handle, 21, Duration::from_secs(5));
 
         let packet = response_packet(21);
         assert!(
@@ -922,10 +987,13 @@ mod tests {
         // The slot must survive rejection so the genuine response still lands.
         assert!(transport.inner.core.deliver(21, packet.clone(), target));
 
-        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(21))
-            .await
-            .expect("recv timed out")
-            .expect("matching-source response must be delivered after a rejected one");
+        let (data, source) = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.recv_registered(&registration),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("matching-source response must be delivered after a rejected one");
 
         assert_eq!(data, packet);
         assert_eq!(source, target);
@@ -937,15 +1005,18 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
         let handle = transport.handle(target).strict_source(true);
-        handle.register_v3(22, Duration::from_secs(5));
+        let registration = register_v3(&handle, 22, Duration::from_secs(5));
 
         let packet = response_packet(22);
         assert!(transport.inner.core.deliver(22, packet.clone(), target));
 
-        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(22))
-            .await
-            .expect("recv timed out")
-            .expect("matching-source response must be accepted by a strict handle");
+        let (data, source) = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.recv_registered(&registration),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("matching-source response must be accepted by a strict handle");
 
         assert_eq!(data, packet);
         assert_eq!(source, target);
@@ -957,15 +1028,18 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
         let handle = transport.handle(target);
-        handle.register_v3(99, Duration::from_secs(5));
+        let registration = register_v3(&handle, 99, Duration::from_secs(5));
 
         let packet = response_packet(99);
         assert!(transport.inner.core.deliver(99, packet.clone(), target));
 
-        let (data, source) = tokio::time::timeout(Duration::from_secs(1), handle.recv(99))
-            .await
-            .expect("recv timed out")
-            .expect("matching-source response must be accepted");
+        let (data, source) = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.recv_registered(&registration),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("matching-source response must be accepted");
 
         assert_eq!(data, packet);
         assert_eq!(source, target);
