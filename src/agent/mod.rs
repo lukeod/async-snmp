@@ -78,6 +78,7 @@ pub use notification::{NotificationOutcome, SinkOutcome, SinkSkipReason, SinkSta
 pub use vacm::{SecurityModel, VacmBuilder, VacmConfig, View, ViewCheckResult, ViewSubtree};
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -87,6 +88,7 @@ use bytes::Bytes;
 use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
@@ -134,6 +136,53 @@ const V3_PRIV_OVERHEAD: usize = 20;
 /// lookups per step, a CPU-DoS shape. When the cap is hit the scan for that
 /// varbind ends rather than continuing to probe.
 const MAX_VACM_SKIP_ITERATIONS: usize = 1000;
+
+/// Request tasks owned by one [`Agent::run`] invocation.
+///
+/// Tokio's [`JoinSet`] aborts its tasks when dropped. If the `run` future is
+/// dropped or aborted, detach dispatched requests instead so their handler
+/// lifecycles and response attempts can finish. The cancellation token only
+/// stops tasks that have not crossed the pre-dispatch boundary.
+struct RequestTasks {
+    tasks: JoinSet<()>,
+    cancel: CancellationToken,
+}
+
+impl RequestTasks {
+    fn new(cancel: CancellationToken) -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            cancel,
+        }
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks.spawn(task);
+    }
+
+    async fn join_next(&mut self) -> Option<std::result::Result<(), JoinError>> {
+        self.tasks.join_next().await
+    }
+}
+
+impl Drop for RequestTasks {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.tasks.detach_all();
+    }
+}
 
 /// RFC 2576 Section 4.1.2.3: SNMPv1 has no Counter64 type, so a Counter64
 /// value cannot be carried in a v1 response varbind. GET responds with
@@ -1201,18 +1250,50 @@ impl Agent {
     /// Requests are processed in parallel up to the configured
     /// `max_concurrent_requests` limit (default: 1000). This method runs
     /// until the cancellation token is triggered.
+    ///
+    /// Cancellation stops receiving datagrams and waiting for concurrency
+    /// permits. A received request whose task has not started request handling
+    /// may be dropped. Once request handling starts, including SET processing,
+    /// it is allowed to finish through its response attempt before this method
+    /// returns. There is no forced shutdown timeout, so a user handler that
+    /// never returns can cause shutdown to wait indefinitely. Dropping or
+    /// aborting the `run` future cannot provide that completion guarantee;
+    /// already-dispatched requests are detached to finish in the background
+    /// rather than being forcibly aborted. For orderly shutdown, cancel the
+    /// configured token and await this method.
+    ///
+    /// Only one active call to `run` is supported for an agent. Cloned handles
+    /// may still be used for other agent operations while that call is active.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn run(&self) -> Result<()> {
         let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
+        let mut request_tasks = RequestTasks::new(self.inner.cancel.child_token());
 
-        loop {
-            let recv_meta = tokio::select! {
-                result = self.recv_packet(&mut buf) => {
-                    result?
-                }
-                () = self.inner.cancel.cancelled() => {
-                    tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
-                    return Ok(());
+        let log_task_result = |result: std::result::Result<(), JoinError>| {
+            if let Err(error) = result {
+                tracing::error!(target: "async_snmp::agent", %error, "request task failed");
+            }
+        };
+
+        let run_result = 'service: loop {
+            let recv_meta = loop {
+                tokio::select! {
+                    biased;
+                    () = self.inner.cancel.cancelled() => {
+                        tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
+                        break 'service Ok(());
+                    }
+                    result = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                        if let Some(result) = result {
+                            log_task_result(result);
+                        }
+                    }
+                    result = self.recv_packet(&mut buf) => {
+                        match result {
+                            Ok(recv_meta) => break recv_meta,
+                            Err(error) => break 'service Err(error),
+                        }
+                    }
                 }
             };
 
@@ -1223,20 +1304,38 @@ impl Agent {
             let agent = self.clone();
 
             let permit = if let Some(ref sem) = self.inner.concurrency_limit {
-                tokio::select! {
-                    result = sem.clone().acquire_owned() => {
-                        Some(result.expect("semaphore closed"))
-                    }
-                    () = self.inner.cancel.cancelled() => {
-                        tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
-                        return Ok(());
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = self.inner.cancel.cancelled() => {
+                            tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
+                            break 'service Ok(());
+                        }
+                        result = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                            if let Some(result) = result {
+                                log_task_result(result);
+                            }
+                        }
+                        result = sem.clone().acquire_owned() => {
+                            break Some(result.expect("semaphore closed"));
+                        }
                     }
                 }
             } else {
                 None
             };
 
-            tokio::spawn(async move {
+            let task_cancel = request_tasks.cancellation_token();
+            request_tasks.spawn(async move {
+                let _permit = permit;
+
+                // This is the only cooperative cancellation boundary. Once
+                // handle_request is entered, its handler lifecycle and response
+                // attempt must run to completion and must never be aborted.
+                if task_cancel.is_cancelled() {
+                    return;
+                }
+
                 if let Err(error) = agent.update_engine_time() {
                     tracing::warn!(target: "async_snmp::agent", %error, "could not persist authoritative engine time transition");
                 }
@@ -1267,10 +1366,15 @@ impl Agent {
                         tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "error handling request");
                     }
                 }
-
-                drop(permit);
             });
+        };
+
+        request_tasks.cancel();
+        while let Some(result) = request_tasks.join_next().await {
+            log_task_result(result);
         }
+
+        run_result
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> Result<RecvMeta> {
