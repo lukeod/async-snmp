@@ -206,9 +206,11 @@ async fn walk_scalar_fallback<T: Transport + 'static>(
 }
 
 impl OidTracker {
-    fn new(ordering: OidOrdering) -> Self {
+    fn new(ordering: OidOrdering, cursor: &Oid) -> Self {
         match ordering {
-            OidOrdering::Strict => OidTracker::Strict { last: None },
+            OidOrdering::Strict => OidTracker::Strict {
+                last: Some(cursor.clone()),
+            },
             OidOrdering::AllowNonIncreasing => OidTracker::Relaxed {
                 seen: HashSet::new(),
             },
@@ -277,11 +279,12 @@ impl<T: Transport> Walk<T> {
         ordering: OidOrdering,
         max_results: Option<usize>,
     ) -> Self {
+        let oid_tracker = OidTracker::new(ordering, &oid);
         Self {
             client,
             base_oid: oid.clone(),
             current_oid: oid,
-            oid_tracker: OidTracker::new(ordering),
+            oid_tracker,
             max_results,
             count: 0,
             done: false,
@@ -409,12 +412,13 @@ impl<T: Transport> BulkWalk<T> {
         ordering: OidOrdering,
         max_results: Option<usize>,
     ) -> Self {
+        let oid_tracker = OidTracker::new(ordering, &oid);
         Self {
             client,
             base_oid: oid.clone(),
             current_oid: oid,
             max_repetitions,
-            oid_tracker: OidTracker::new(ordering),
+            oid_tracker,
             max_results,
             count: 0,
             done: false,
@@ -635,7 +639,7 @@ mod tests {
     #[test]
     fn test_walk_terminates_on_no_such_object() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let mut tracker = OidTracker::new(OidOrdering::Strict, &base);
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::NoSuchObject);
         assert!(matches!(
             validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
@@ -646,7 +650,7 @@ mod tests {
     #[test]
     fn test_walk_terminates_on_no_such_instance() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let mut tracker = OidTracker::new(OidOrdering::Strict, &base);
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::NoSuchInstance);
         assert!(matches!(
             validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
@@ -657,7 +661,7 @@ mod tests {
     #[test]
     fn test_walk_terminates_on_end_of_mib_view() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let mut tracker = OidTracker::new(OidOrdering::Strict, &base);
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::EndOfMibView);
         assert!(matches!(
             validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
@@ -668,7 +672,7 @@ mod tests {
     #[test]
     fn test_walk_yields_normal_value() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let mut tracker = OidTracker::new(OidOrdering::Strict, &base);
         let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Integer(42));
         assert!(matches!(
             validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
@@ -677,9 +681,48 @@ mod tests {
     }
 
     #[test]
+    fn test_walk_strict_rejects_equal_first_result() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::Strict, &base);
+        let vb = VarBind::new(base.clone(), Value::Integer(1));
+
+        match validate_walk_varbind(&vb, &base, &mut tracker, target_addr()) {
+            VarbindOutcome::Abort(e) => match *e {
+                Error::WalkAborted { reason, .. } => {
+                    assert_eq!(reason, WalkAbortReason::NonIncreasing);
+                }
+                other => panic!("expected WalkAborted, got {other:?}"),
+            },
+            _ => panic!("expected Abort outcome"),
+        }
+    }
+
+    #[test]
+    fn test_walk_relaxed_allows_equal_first_result_then_detects_cycle() {
+        let base = oid!(1, 3, 6, 1, 2, 1, 1);
+        let mut tracker = OidTracker::new(OidOrdering::AllowNonIncreasing, &base);
+        let vb = VarBind::new(base.clone(), Value::Integer(1));
+
+        assert!(matches!(
+            validate_walk_varbind(&vb, &base, &mut tracker, target_addr()),
+            VarbindOutcome::Yield
+        ));
+
+        match validate_walk_varbind(&vb, &base, &mut tracker, target_addr()) {
+            VarbindOutcome::Abort(e) => match *e {
+                Error::WalkAborted { reason, .. } => {
+                    assert_eq!(reason, WalkAbortReason::Cycle);
+                }
+                other => panic!("expected WalkAborted, got {other:?}"),
+            },
+            _ => panic!("expected Abort outcome"),
+        }
+    }
+
+    #[test]
     fn test_walk_strict_aborts_on_non_increasing_oid() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let mut tracker = OidTracker::new(OidOrdering::Strict, &base);
 
         let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
         assert!(matches!(
@@ -703,7 +746,7 @@ mod tests {
     #[test]
     fn test_walk_strict_aborts_on_equal_oid() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::Strict);
+        let mut tracker = OidTracker::new(OidOrdering::Strict, &base);
 
         let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
         assert!(matches!(
@@ -727,7 +770,7 @@ mod tests {
     #[test]
     fn test_walk_relaxed_aborts_on_duplicate_oid_cycle() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::AllowNonIncreasing);
+        let mut tracker = OidTracker::new(OidOrdering::AllowNonIncreasing, &base);
 
         let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 2, 0), Value::Integer(1));
         assert!(matches!(
@@ -751,7 +794,7 @@ mod tests {
     #[test]
     fn test_walk_relaxed_allows_non_increasing_distinct_oid() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1);
-        let mut tracker = OidTracker::new(OidOrdering::AllowNonIncreasing);
+        let mut tracker = OidTracker::new(OidOrdering::AllowNonIncreasing, &base);
 
         // Higher OID first.
         let vb1 = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::Integer(1));
