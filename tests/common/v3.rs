@@ -162,23 +162,26 @@ impl V3RequestLog {
 }
 
 fn encode_raw_scoped_pdu(scoped: &ScopedPdu) -> Result<Bytes, String> {
+    let (tag, first_field, second_field) = match scoped.pdu.body {
+        PduBody::Standard {
+            pdu_type,
+            error_status,
+            error_index,
+        } => (pdu_type.pdu_type().tag(), error_status, error_index),
+        PduBody::GetBulk {
+            non_repeaters,
+            max_repetitions,
+        } => (
+            PduType::GetBulkRequest.tag(),
+            i32::try_from(non_repeaters)
+                .map_err(|_| "GETBULK non_repeaters exceeds i32::MAX".to_owned())?,
+            i32::try_from(max_repetitions)
+                .map_err(|_| "GETBULK max_repetitions exceeds i32::MAX".to_owned())?,
+        ),
+    };
+
     let mut buf = EncodeBuf::new();
     buf.try_push_sequence(|buf| {
-        let (tag, first_field, second_field) = match scoped.pdu.body {
-            PduBody::Standard {
-                pdu_type,
-                error_status,
-                error_index,
-            } => (pdu_type.pdu_type().tag(), error_status, error_index),
-            PduBody::GetBulk {
-                non_repeaters,
-                max_repetitions,
-            } => (
-                PduType::GetBulkRequest.tag(),
-                non_repeaters,
-                max_repetitions,
-            ),
-        };
         buf.try_push_constructed(tag, |buf| {
             buf.try_push_sequence(|buf| {
                 for varbind in scoped.pdu.varbinds.iter().rev() {

@@ -309,6 +309,7 @@ impl ClientBuilder {
     ///
     /// The default of 25 is conservative. For local/reliable networks with
     /// capable agents, values of 50-100 can significantly speed up large walks.
+    /// Values above `i32::MAX` are rejected when the client is built or connected.
     ///
     /// # Example
     ///

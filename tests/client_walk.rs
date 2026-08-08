@@ -167,6 +167,7 @@ async fn bulkwalk_iterates_subtree() {
 
     let results = client
         .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 25)
+        .unwrap()
         .collect()
         .await
         .unwrap();
@@ -195,6 +196,7 @@ async fn bulkwalk_respects_max_repetitions() {
     // This should still work, just with smaller batches
     let results = client
         .bulk_walk_default(oid!(1, 3, 6, 1, 2, 1, 2))
+        .unwrap()
         .collect()
         .await
         .unwrap();

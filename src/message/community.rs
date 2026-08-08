@@ -358,7 +358,7 @@ mod tests {
 
     fn standard_pdu(pdu_type: PduType, varbinds: Vec<VarBind>) -> Pdu {
         if pdu_type == PduType::GetBulkRequest {
-            Pdu::get_bulk(1, 0, 0, varbinds)
+            Pdu::get_bulk(1, 0, 0, varbinds).unwrap()
         } else {
             Pdu::standard(
                 crate::pdu::StandardPduType::try_from(pdu_type).unwrap(),
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn get_bulk_uses_ordinary_message_path_and_requires_v2c() {
-        let bulk = Pdu::get_bulk(7, 0, 10, vec![]);
+        let bulk = Pdu::get_bulk(7, 0, 10, vec![]).unwrap();
         assert_invalid_message(CommunityMessage::v1("public", bulk.clone()));
         assert_invalid_message(CommunityMessage::new(Version::V3, "public", bulk.clone()));
 
@@ -557,7 +557,14 @@ mod tests {
     fn pdu_and_message_envelopes_reject_the_same_malformed_objects_without_mutation() {
         let name = oid!(1, 3, 6, 1);
         let malformed = [
-            Pdu::get_bulk(7, -1, -5, vec![VarBind::null(name.clone())]),
+            Pdu {
+                request_id: 7,
+                body: crate::pdu::PduBody::GetBulk {
+                    non_repeaters: crate::pdu::MAX_GET_BULK_VALUE + 1,
+                    max_repetitions: 0,
+                },
+                varbinds: vec![VarBind::null(name.clone())],
+            },
             Pdu::standard(
                 crate::pdu::StandardPduType::GetRequest,
                 7,

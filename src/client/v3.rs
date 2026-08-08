@@ -1201,7 +1201,14 @@ mod tests {
         let client = Client::new(TestTransport::new(), config).expect("valid client config");
         let name = oid!(1, 3, 6, 1);
         let malformed = [
-            Pdu::get_bulk(7, -1, 10, vec![VarBind::null(name.clone())]),
+            Pdu {
+                request_id: 7,
+                body: crate::pdu::PduBody::GetBulk {
+                    non_repeaters: crate::pdu::MAX_GET_BULK_VALUE + 1,
+                    max_repetitions: 10,
+                },
+                varbinds: vec![VarBind::null(name.clone())],
+            },
             Pdu::standard(
                 crate::pdu::StandardPduType::GetRequest,
                 7,

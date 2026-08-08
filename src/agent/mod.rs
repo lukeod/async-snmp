@@ -2249,7 +2249,8 @@ mod tests {
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null),
             ],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
@@ -2332,7 +2333,8 @@ mod tests {
             0,
             10,
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -2388,7 +2390,8 @@ mod tests {
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 4, 0), Value::Null),
             ],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -2638,7 +2641,8 @@ mod tests {
             0,
             10,
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -2678,7 +2682,8 @@ mod tests {
             0,
             10,
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(
@@ -2819,7 +2824,8 @@ mod tests {
             0,
             10,
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        );
+        )
+        .unwrap();
 
         let full_response = agent.dispatch_request(&ctx_unlimited, &pdu).await.unwrap();
         let full_count = full_response
@@ -2951,7 +2957,8 @@ mod tests {
             0,
             10,
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        );
+        )
+        .unwrap();
 
         // A limit large enough to expose the difference: v2c fits more varbinds
         // than authPriv because authPriv's overhead is larger.
@@ -3085,7 +3092,8 @@ mod tests {
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9), Value::Null),
             ],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -3142,7 +3150,8 @@ mod tests {
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9), Value::Null),
             ],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -3183,7 +3192,8 @@ mod tests {
             0,
             5,
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null)],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -3214,7 +3224,8 @@ mod tests {
             0,
             10,
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        );
+        )
+        .unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         let data_count = response

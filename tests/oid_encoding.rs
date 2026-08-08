@@ -35,7 +35,7 @@ fn assert_invalid_message<T>(result: async_snmp::Result<T>) {
 
 fn pdu_with(pdu_type: PduType, varbind: VarBind) -> Pdu {
     if pdu_type == PduType::GetBulkRequest {
-        Pdu::get_bulk(7, 0, 10, vec![varbind])
+        Pdu::get_bulk(7, 0, 10, vec![varbind]).unwrap()
     } else {
         Pdu::standard(
             async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap(),

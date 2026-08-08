@@ -222,12 +222,12 @@ fn arb_pdu() -> impl Strategy<Value = Pdu> {
 fn arb_getbulk_pdu() -> impl Strategy<Value = Pdu> {
     (
         any::<i32>(),
-        0i32..=100,
-        0i32..=1000,
+        0u32..=100,
+        0u32..=1000,
         arb_outbound_varbinds(),
     )
         .prop_map(|(request_id, non_repeaters, max_repetitions, varbinds)| {
-            Pdu::get_bulk(request_id, non_repeaters, max_repetitions, varbinds)
+            Pdu::get_bulk(request_id, non_repeaters, max_repetitions, varbinds).unwrap()
         })
 }
 
@@ -1265,7 +1265,14 @@ fn arb_pdu_full_range() -> impl Strategy<Value = Pdu> {
         .prop_map(
             |(pdu_type, request_id, first_field, second_field, varbinds)| {
                 if pdu_type == PduType::GetBulkRequest {
-                    Pdu::get_bulk(request_id, first_field, second_field, varbinds)
+                    Pdu {
+                        request_id,
+                        body: async_snmp::pdu::PduBody::GetBulk {
+                            non_repeaters: first_field as u32,
+                            max_repetitions: second_field as u32,
+                        },
+                        varbinds,
+                    }
                 } else {
                     Pdu::standard(
                         StandardPduType::try_from(pdu_type).unwrap(),

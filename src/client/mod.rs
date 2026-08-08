@@ -77,18 +77,6 @@ pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 // Shared helpers
 // ============================================================================
 
-/// Convert a configured `u32` `max_repetitions` to the `i32` GETBULK wire
-/// field, saturating instead of wrapping.
-///
-/// RFC 3416 Section 4.2.3 specifies `max-repetitions` as `INTEGER
-/// (0..2147483647)`. `ClientBuilder::max_repetitions` takes a `u32`, so a
-/// configured value above `i32::MAX` would wrap to a negative number under a
-/// plain `as i32` cast; this saturates to `i32::MAX` instead, which
-/// the PDU encoder would otherwise normalize to `0` (disabling repetitions).
-pub(crate) fn max_repetitions_to_wire(max_repetitions: u32) -> i32 {
-    i32::try_from(max_repetitions).unwrap_or(i32::MAX)
-}
-
 /// Extract an SNMP-level error from a PDU and convert it to an `Error::Snmp`.
 ///
 /// Returns `Some(err)` if the PDU carries an SNMP error status, `None` otherwise.
@@ -212,7 +200,9 @@ pub struct ClientConfig {
     pub oid_ordering: OidOrdering,
     /// Maximum results from a single walk operation (default: None/unlimited)
     pub max_walk_results: Option<usize>,
-    /// Max-repetitions for GETBULK operations (default: 25)
+    /// Max-repetitions for GETBULK operations (default: 25).
+    ///
+    /// Values above `i32::MAX` are rejected during client construction.
     pub max_repetitions: u32,
     /// Local authoritative engine state for V3 trap sending (default: None).
     ///
@@ -267,6 +257,10 @@ impl ClientConfig {
             return Err(
                 Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
             );
+        }
+
+        if self.max_repetitions > crate::pdu::MAX_GET_BULK_VALUE {
+            return Err(Error::Config("max_repetitions exceeds i32::MAX".into()).boxed());
         }
 
         if self.version() == Version::V1 && self.walk_mode == WalkMode::GetBulk {
@@ -956,6 +950,11 @@ impl<T: Transport> Client<T> {
     /// * `non_repeaters` - How many OIDs (from the start) are non-repeating
     /// * `max_repetitions` - Maximum rows to return for each repeating OID
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] when either GETBULK parameter exceeds
+    /// `i32::MAX`.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -981,16 +980,17 @@ impl<T: Transport> Client<T> {
     pub async fn get_bulk(
         &self,
         oids: &[Oid],
-        non_repeaters: i32,
-        max_repetitions: i32,
+        non_repeaters: u32,
+        max_repetitions: u32,
     ) -> Result<Vec<VarBind>> {
+        Pdu::checked_get_bulk_fields(non_repeaters, max_repetitions)?;
         let request_id = self.next_request_id();
         let pdu = Pdu::get_bulk(
             request_id,
             non_repeaters,
             max_repetitions,
             oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
-        );
+        )?;
         let response = self.send_request(pdu).await?;
         Ok(response.varbinds)
     }
@@ -1030,7 +1030,7 @@ impl<T: Transport> Client<T> {
         let ordering = self.inner.config.oid_ordering;
         let max_results = self.inner.config.max_walk_results;
         let walk_mode = self.inner.config.walk_mode;
-        let max_repetitions = max_repetitions_to_wire(self.inner.config.max_repetitions);
+        let max_repetitions = self.inner.config.max_repetitions;
         let version = self.inner.config.version();
 
         WalkStream::new(
@@ -1093,6 +1093,11 @@ impl<T: Transport> Client<T> {
     /// * `oid` - The base OID of the subtree to walk
     /// * `max_repetitions` - How many OIDs to fetch per request
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] when `max_repetitions` exceeds
+    /// `i32::MAX`.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -1100,16 +1105,17 @@ impl<T: Transport> Client<T> {
     /// # async fn example() -> async_snmp::Result<()> {
     /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// // Walk the interfaces table efficiently
-    /// let walk = client.bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2, 2), 25);
+    /// let walk = client.bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2, 2), 25)?;
     /// // Process with futures StreamExt
     /// # Ok(())
     /// # }
     /// ```
     #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid, snmp.max_repetitions = max_repetitions))]
-    pub fn bulk_walk(&self, oid: Oid, max_repetitions: i32) -> BulkWalk<T>
+    pub fn bulk_walk(&self, oid: Oid, max_repetitions: u32) -> Result<BulkWalk<T>>
     where
         T: 'static,
     {
+        Pdu::checked_get_bulk_fields(0, max_repetitions)?;
         let ordering = self.inner.config.oid_ordering;
         let max_results = self.inner.config.max_walk_results;
         BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
@@ -1123,6 +1129,13 @@ impl<T: Transport> Client<T> {
     /// This is a convenience method that uses the client's `max_repetitions` setting
     /// (default: 25) instead of requiring it as a parameter.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] if the configured value cannot be
+    /// represented as an RFC 3416 GETBULK field. Client construction validates
+    /// this invariant, so this can occur only if an invalid client is introduced
+    /// through future internal changes.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -1130,20 +1143,25 @@ impl<T: Transport> Client<T> {
     /// # async fn example() -> async_snmp::Result<()> {
     /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// // Walk using configured max_repetitions
-    /// let walk = client.bulk_walk_default(oid!(1, 3, 6, 1, 2, 1, 2, 2));
+    /// let walk = client.bulk_walk_default(oid!(1, 3, 6, 1, 2, 1, 2, 2))?;
     /// // Process with futures StreamExt
     /// # Ok(())
     /// # }
     /// ```
     #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
-    pub fn bulk_walk_default(&self, oid: Oid) -> BulkWalk<T>
+    pub fn bulk_walk_default(&self, oid: Oid) -> Result<BulkWalk<T>>
     where
         T: 'static,
     {
         let ordering = self.inner.config.oid_ordering;
         let max_results = self.inner.config.max_walk_results;
-        let max_repetitions = max_repetitions_to_wire(self.inner.config.max_repetitions);
-        BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
+        BulkWalk::new(
+            self.clone(),
+            oid,
+            self.inner.config.max_repetitions,
+            ordering,
+            max_results,
+        )
     }
 }
 
@@ -1159,30 +1177,6 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-
-    // -------------------------------------------------------------------------
-    // max_repetitions_to_wire: saturating u32 -> i32 conversion used by
-    // `walk()` and `bulk_walk_default()` so a configured `max_repetitions`
-    // above `i32::MAX` cannot wrap to a negative GETBULK field (C7).
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_max_repetitions_to_wire_saturates_above_i32_max() {
-        // A plain `as i32` cast would wrap this to a negative number.
-        assert_eq!(max_repetitions_to_wire(u32::MAX), i32::MAX);
-        assert_eq!(
-            max_repetitions_to_wire(i32::MAX as u32 + 1),
-            i32::MAX,
-            "one past i32::MAX must saturate, not wrap negative"
-        );
-    }
-
-    #[test]
-    fn test_max_repetitions_to_wire_passes_through_in_range_values() {
-        assert_eq!(max_repetitions_to_wire(0), 0);
-        assert_eq!(max_repetitions_to_wire(25), 25);
-        assert_eq!(max_repetitions_to_wire(i32::MAX as u32), i32::MAX);
-    }
 
     // -------------------------------------------------------------------------
     // Mock transport that returns a response with a configurable number of
@@ -1360,6 +1354,7 @@ mod tests {
     #[derive(Clone)]
     struct CountingTransport {
         sends: Arc<AtomicUsize>,
+        allocations: Arc<AtomicUsize>,
     }
 
     impl Transport for CountingTransport {
@@ -1383,9 +1378,86 @@ mod tests {
             "127.0.0.1:0".parse().unwrap()
         }
 
+        fn alloc_request_id(&self) -> i32 {
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+
         fn is_reliable(&self) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn get_bulk_parameter_ranges_are_checked_before_request_side_effects() {
+        let client = make_client(0);
+        for (non_repeaters, max_repetitions) in [
+            (0, 0),
+            (crate::pdu::MAX_GET_BULK_VALUE, 0),
+            (0, crate::pdu::MAX_GET_BULK_VALUE),
+        ] {
+            assert!(
+                client
+                    .get_bulk(&[], non_repeaters, max_repetitions)
+                    .await
+                    .is_ok()
+            );
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let allocations = Arc::new(AtomicUsize::new(0));
+        let transport = CountingTransport {
+            sends: Arc::clone(&sends),
+            allocations: Arc::clone(&allocations),
+        };
+        let client = Client::new(
+            transport,
+            ClientConfig {
+                auth: crate::Auth::v2c("public"),
+                retry: crate::client::retry::Retry::none(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        for (non_repeaters, max_repetitions) in [
+            (crate::pdu::MAX_GET_BULK_VALUE + 1, 0),
+            (0, crate::pdu::MAX_GET_BULK_VALUE + 1),
+        ] {
+            let error = client
+                .get_bulk(&[], non_repeaters, max_repetitions)
+                .await
+                .unwrap_err();
+            assert!(matches!(*error, Error::InvalidMessage(_)));
+        }
+        assert_eq!(allocations.load(Ordering::Relaxed), 0);
+        assert_eq!(sends.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn bulk_walk_parameter_range_is_checked_before_stream_construction() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let allocations = Arc::new(AtomicUsize::new(0));
+        let transport = CountingTransport {
+            sends: Arc::clone(&sends),
+            allocations: Arc::clone(&allocations),
+        };
+        let client = Client::new(transport, ClientConfig::default()).unwrap();
+        let base = Oid::from_slice(&[1, 3, 6, 1]);
+
+        assert!(client.bulk_walk(base.clone(), 0).is_ok());
+        assert!(
+            client
+                .bulk_walk(base.clone(), crate::pdu::MAX_GET_BULK_VALUE)
+                .is_ok()
+        );
+        let error = client
+            .bulk_walk(base, crate::pdu::MAX_GET_BULK_VALUE + 1)
+            .err()
+            .expect("out-of-range bulk walk must not return a stream");
+        assert!(matches!(*error, Error::InvalidMessage(_)));
+        assert_eq!(allocations.load(Ordering::Relaxed), 0);
+        assert_eq!(sends.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1400,6 +1472,7 @@ mod tests {
         let sends = Arc::new(AtomicUsize::new(0));
         let transport = CountingTransport {
             sends: Arc::clone(&sends),
+            allocations: Arc::new(AtomicUsize::new(0)),
         };
         let client = Client::new(
             transport.clone(),
@@ -1490,6 +1563,7 @@ mod tests {
         let sends = Arc::new(AtomicUsize::new(0));
         let transport = CountingTransport {
             sends: Arc::clone(&sends),
+            allocations: Arc::new(AtomicUsize::new(0)),
         };
 
         assert_config_error(Client::new(
@@ -1503,6 +1577,13 @@ mod tests {
             transport.clone(),
             ClientConfig {
                 max_oids_per_request: 0,
+                ..ClientConfig::default()
+            },
+        ));
+        assert_config_error(Client::new(
+            transport.clone(),
+            ClientConfig {
+                max_repetitions: crate::pdu::MAX_GET_BULK_VALUE + 1,
                 ..ClientConfig::default()
             },
         ));

@@ -17,13 +17,13 @@ pub enum OperationType {
     Get,
     GetNext,
     GetBulk {
-        non_repeaters: i32,
-        max_repetitions: i32,
+        non_repeaters: u32,
+        max_repetitions: u32,
     },
     Set,
     Walk,
     BulkWalk {
-        max_repetitions: i32,
+        max_repetitions: u32,
     },
 }
 

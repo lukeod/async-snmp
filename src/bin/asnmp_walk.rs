@@ -98,7 +98,7 @@ async fn main() -> ExitCode {
             OperationType::Walk
         } else {
             OperationType::BulkWalk {
-                max_repetitions: args.walk.max_repetitions as i32,
+                max_repetitions: args.walk.max_repetitions,
             }
         };
 

@@ -933,7 +933,14 @@ mod tests {
 
     #[test]
     fn encode_rejects_malformed_pdu_without_mutating_it() {
-        let pdu = Pdu::get_bulk(1, -1, -5, vec![]);
+        let pdu = Pdu {
+            request_id: 1,
+            body: crate::pdu::PduBody::GetBulk {
+                non_repeaters: crate::pdu::MAX_GET_BULK_VALUE + 1,
+                max_repetitions: 0,
+            },
+            varbinds: vec![],
+        };
         let original = pdu.clone();
         let scoped = ScopedPdu::with_empty_context(pdu.clone());
         let global = MsgGlobalData::new(

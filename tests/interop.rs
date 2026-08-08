@@ -323,6 +323,7 @@ async fn bulk_walk_interfaces() {
 
     let results = client
         .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 25)
+        .unwrap()
         .collect()
         .await
         .expect("bulk_walk failed");

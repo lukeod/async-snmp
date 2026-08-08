@@ -37,6 +37,7 @@ use futures_core::Stream;
 
 use crate::error::{Error, Result, WalkAbortReason};
 use crate::oid::Oid;
+use crate::pdu::Pdu;
 use crate::transport::Transport;
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -320,7 +321,7 @@ pub struct BulkWalk<T: Transport> {
     client: Client<T>,
     base_oid: Oid,
     current_oid: Oid,
-    max_repetitions: i32,
+    max_repetitions: u32,
     /// OID tracker for ordering validation.
     oid_tracker: OidTracker,
     /// Maximum number of results to return (None = unlimited).
@@ -337,12 +338,13 @@ impl<T: Transport> BulkWalk<T> {
     pub(crate) fn new(
         client: Client<T>,
         oid: Oid,
-        max_repetitions: i32,
+        max_repetitions: u32,
         ordering: OidOrdering,
         max_results: Option<usize>,
-    ) -> Self {
+    ) -> Result<Self> {
+        Pdu::checked_get_bulk_fields(0, max_repetitions)?;
         let oid_tracker = OidTracker::new(ordering, &oid);
-        Self {
+        Ok(Self {
             client,
             base_oid: oid.clone(),
             current_oid: oid,
@@ -353,7 +355,7 @@ impl<T: Transport> BulkWalk<T> {
             done: false,
             buffer: VecDeque::new(),
             pending: None,
-        }
+        })
     }
 }
 
@@ -484,7 +486,7 @@ impl<T: Transport> WalkStream<T> {
         walk_mode: WalkMode,
         ordering: OidOrdering,
         max_results: Option<usize>,
-        max_repetitions: i32,
+        max_repetitions: u32,
     ) -> Result<Self> {
         let use_bulk = match walk_mode {
             WalkMode::Auto => version != Version::V1,
@@ -504,7 +506,7 @@ impl<T: Transport> WalkStream<T> {
                 max_repetitions,
                 ordering,
                 max_results,
-            ))
+            )?)
         } else {
             WalkStream::GetNext(Walk::new(client, oid, ordering, max_results))
         })
@@ -743,15 +745,15 @@ mod tests {
     #[derive(Clone)]
     struct BulkTooBigTransport {
         /// Highest max-repetitions the agent will accept; larger requests return tooBig.
-        max_repetitions: i32,
+        max_repetitions: u32,
         /// Records (request_id, max_repetitions) seen by `send`, drained by `recv`.
-        pending: Arc<Mutex<VecDeque<(i32, i32)>>>,
+        pending: Arc<Mutex<VecDeque<(i32, u32)>>>,
         /// Total number of tooBig responses emitted.
         too_big_count: Arc<Mutex<usize>>,
     }
 
     impl BulkTooBigTransport {
-        fn new(max_repetitions: i32) -> Self {
+        fn new(max_repetitions: u32) -> Self {
             Self {
                 max_repetitions,
                 pending: Arc::new(Mutex::new(VecDeque::new())),
@@ -831,6 +833,7 @@ mod tests {
 
         let results = client
             .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 25)
+            .unwrap()
             .collect()
             .await
             .unwrap();
@@ -856,6 +859,7 @@ mod tests {
 
         let err = client
             .bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2), 8)
+            .unwrap()
             .collect()
             .await
             .unwrap_err();
@@ -971,6 +975,39 @@ mod tests {
         items.into_iter().collect()
     }
 
+    #[test]
+    fn bulk_walk_constructor_checks_max_repetitions_before_stream_creation() {
+        let base = oid!(1, 3, 6, 1);
+
+        for max_repetitions in [0, crate::pdu::MAX_GET_BULK_VALUE] {
+            let (client, requests) = empty_walk_client(None);
+            assert!(
+                BulkWalk::new(
+                    client,
+                    base.clone(),
+                    max_repetitions,
+                    OidOrdering::Strict,
+                    None,
+                )
+                .is_ok()
+            );
+            assert_requests(&requests, &[]);
+        }
+
+        let (client, requests) = empty_walk_client(None);
+        let error = BulkWalk::new(
+            client,
+            base,
+            crate::pdu::MAX_GET_BULK_VALUE + 1,
+            OidOrdering::Strict,
+            None,
+        )
+        .err()
+        .expect("out-of-range value must not construct a stream");
+        assert!(matches!(*error, Error::InvalidMessage(_)));
+        assert_requests(&requests, &[]);
+    }
+
     #[tokio::test]
     async fn walk_consumers_share_empty_sequence_and_request_pattern() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
@@ -1008,28 +1045,33 @@ mod tests {
         let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
         let (client, requests) = empty_walk_client(None);
-        let mut walk = client.bulk_walk(base.clone(), 10);
+        let mut walk = client.bulk_walk(base.clone(), 10).unwrap();
         assert!(walk.next().await.is_none());
         assert_requests(&requests, &[PduType::GetBulkRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let results = client.bulk_walk(base.clone(), 10).collect().await.unwrap();
+        let results = client
+            .bulk_walk(base.clone(), 10)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert!(results.is_empty());
         assert_requests(&requests, &[PduType::GetBulkRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let mut walk = client.bulk_walk(base.clone(), 10);
+        let mut walk = client.bulk_walk(base.clone(), 10).unwrap();
         assert!(futures::StreamExt::next(&mut walk).await.is_none());
         assert_requests(&requests, &[PduType::GetBulkRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let walk = client.bulk_walk(base.clone(), 10);
+        let walk = client.bulk_walk(base.clone(), 10).unwrap();
         let items: Vec<Result<VarBind>> = futures::StreamExt::collect(walk).await;
         assert!(normalize(items).unwrap().is_empty());
         assert_requests(&requests, &[PduType::GetBulkRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let mut walk = client.bulk_walk(base, 10);
+        let mut walk = client.bulk_walk(base, 10).unwrap();
         let item = std::future::poll_fn(|cx| Stream::poll_next(Pin::new(&mut walk), cx)).await;
         assert!(item.is_none());
         assert_requests(&requests, &[PduType::GetBulkRequest]);
@@ -1086,6 +1128,7 @@ mod tests {
         assert!(
             client
                 .bulk_walk(base.clone(), 10)
+                .unwrap()
                 .collect()
                 .await
                 .unwrap()

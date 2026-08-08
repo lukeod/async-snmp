@@ -240,6 +240,7 @@ fn bench_walk(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let results = client
                 .bulk_walk(system_oid.clone(), 10)
+                .unwrap()
                 .collect()
                 .await
                 .unwrap();

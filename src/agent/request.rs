@@ -566,7 +566,8 @@ mod tests {
                 non_repeaters,
                 max_repetitions,
                 vec![VarBind::null(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0))],
-            );
+            )
+            .unwrap();
             let candidate_pdu = Pdu::response(41, 0, 0, vec![next_vb.clone()]);
             let candidate = CommunityMessage::v2c(Bytes::from_static(b"public"), candidate_pdu)
                 .unwrap()

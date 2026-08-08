@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- BULKWALK with max_repetitions=50 ---\n");
 
     // bulk_walk allows specifying max_repetitions for efficiency
-    let walk = client.bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2, 2), 50);
+    let walk = client.bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2, 2), 50)?;
 
     let results = walk.collect().await?;
     println!("BULKWALK found {} OIDs", results.len());

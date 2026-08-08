@@ -417,7 +417,7 @@
 //! | `empty_counter64_as_zero` | on | Decode a zero-length Counter64 as zero. |
 //! | `empty_object_identifier` | on | Decode a zero-length OBJECT IDENTIFIER as [`Oid::empty`]. |
 //! | `clamp_bounded_strings` | on | Clamp an over-declared OCTET STRING or Opaque length to its enclosing varbind; it cannot consume the next varbind. |
-//! | `normalize_negative_get_bulk_fields` | on | Normalize negative GETBULK non-repeaters and max-repetitions to zero while decoding. Outbound encoding rejects them. |
+//! | `normalize_negative_get_bulk_fields` | on | Normalize negative GETBULK non-repeaters and max-repetitions to zero while decoding; strict receive policy rejects them. Canonical fields are unsigned. |
 //! | `malformed_exception_payloads` | **off** | When enabled, discard non-empty payloads on exception values; the default rejects them. |
 //!
 //! These controls do not govern bytes after a complete top-level message. That

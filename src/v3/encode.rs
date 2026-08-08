@@ -319,7 +319,14 @@ mod tests {
 
     #[test]
     fn shared_v3_request_encoder_rejects_malformed_pdu_without_mutation() {
-        let pdu = Pdu::get_bulk(7, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let pdu = Pdu {
+            request_id: 7,
+            body: crate::pdu::PduBody::GetBulk {
+                non_repeaters: crate::pdu::MAX_GET_BULK_VALUE + 1,
+                max_repetitions: 0,
+            },
+            varbinds: vec![VarBind::null(oid!(1, 3, 6, 1))],
+        };
         let original = pdu.clone();
         let security = UsmConfig::new("user");
         let salt = SaltCounter::from_value(1);

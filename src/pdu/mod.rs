@@ -212,13 +212,19 @@ pub enum PduBody {
         error_index: i32,
     },
     /// GETBULK-specific body fields.
+    ///
+    /// Encoding rejects either field above the RFC 3416 `Integer32` maximum.
+    /// Use [`Pdu::get_bulk`] for checked construction.
     GetBulk {
         /// Number of non-repeating OIDs.
-        non_repeaters: i32,
+        non_repeaters: u32,
         /// Maximum repetitions for repeating OIDs.
-        max_repetitions: i32,
+        max_repetitions: u32,
     },
 }
+
+/// Largest valid value for either GETBULK parameter.
+pub(crate) const MAX_GET_BULK_VALUE: u32 = i32::MAX as u32;
 
 /// Canonical PDU representation for standard and GETBULK operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,22 +359,38 @@ impl Pdu {
 
     /// Create a GETBULK request PDU.
     ///
-    /// Encoding rejects negative field values without changing this PDU.
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`](crate::Error::InvalidMessage) when
+    /// either GETBULK parameter exceeds the RFC 3416 `Integer32` maximum.
     pub fn get_bulk(
         request_id: i32,
-        non_repeaters: i32,
-        max_repetitions: i32,
+        non_repeaters: u32,
+        max_repetitions: u32,
         varbinds: Vec<VarBind>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Self::checked_get_bulk_fields(non_repeaters, max_repetitions)?;
+        Ok(Self {
             request_id,
             body: PduBody::GetBulk {
                 non_repeaters,
                 max_repetitions,
             },
             varbinds,
-        }
+        })
+    }
+
+    pub(crate) fn checked_get_bulk_fields(non_repeaters: u32, max_repetitions: u32) -> Result<()> {
+        Self::get_bulk_fields_for_wire(non_repeaters, max_repetitions)?;
+        Ok(())
+    }
+
+    fn get_bulk_fields_for_wire(non_repeaters: u32, max_repetitions: u32) -> Result<(i32, i32)> {
+        let non_repeaters = i32::try_from(non_repeaters)
+            .map_err(|_| invalid_outbound("GETBULK non_repeaters exceeds i32::MAX"))?;
+        let max_repetitions = i32::try_from(max_repetitions)
+            .map_err(|_| invalid_outbound("GETBULK max_repetitions exceeds i32::MAX"))?;
+        Ok((non_repeaters, max_repetitions))
     }
 
     pub(crate) fn outbound_direction(&self) -> PduDirection {
@@ -412,12 +434,7 @@ impl Pdu {
                 non_repeaters,
                 max_repetitions,
             } => {
-                if non_repeaters < 0 {
-                    return Err(invalid_outbound("negative GETBULK non_repeaters"));
-                }
-                if max_repetitions < 0 {
-                    return Err(invalid_outbound("negative GETBULK max_repetitions"));
-                }
+                Self::get_bulk_fields_for_wire(non_repeaters, max_repetitions)?;
             }
             PduBody::Standard {
                 pdu_type: StandardPduType::Response,
@@ -487,7 +504,11 @@ impl Pdu {
             PduBody::GetBulk {
                 non_repeaters,
                 max_repetitions,
-            } => (PduType::GetBulkRequest, non_repeaters, max_repetitions),
+            } => {
+                let (non_repeaters, max_repetitions) =
+                    Self::get_bulk_fields_for_wire(non_repeaters, max_repetitions)?;
+                (PduType::GetBulkRequest, non_repeaters, max_repetitions)
+            }
         };
 
         buf.try_push_constructed(pdu_type.tag(), |buf| {
@@ -558,9 +579,12 @@ impl Pdu {
                     *value = 0;
                 }
             }
+            let non_repeaters = u32::try_from(first_field).map_err(|_| pdu_decoder.malformed())?;
+            let max_repetitions =
+                u32::try_from(second_field).map_err(|_| pdu_decoder.malformed())?;
             PduBody::GetBulk {
-                non_repeaters: first_field,
-                max_repetitions: second_field,
+                non_repeaters,
+                max_repetitions,
             }
         } else {
             let standard_type =
@@ -603,9 +627,9 @@ impl Pdu {
         }
     }
 
-    /// Return GETBULK fields, if this is a GETBULK PDU.
+    /// Return the unsigned GETBULK fields, if this is a GETBULK PDU.
     #[must_use]
-    pub fn get_bulk_fields(&self) -> Option<(i32, i32)> {
+    pub fn get_bulk_fields(&self) -> Option<(u32, u32)> {
         match self.body {
             PduBody::GetBulk {
                 non_repeaters,
@@ -1245,7 +1269,8 @@ mod tests {
 
     #[test]
     fn test_getbulk_roundtrip() {
-        let pdu = Pdu::get_bulk(12345, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))]);
+        let pdu =
+            Pdu::get_bulk(12345, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))]).unwrap();
 
         let mut buf = EncodeBuf::new();
         pdu.encode(&mut buf).unwrap();
@@ -1256,6 +1281,28 @@ mod tests {
 
         assert_eq!(decoded.request_id, 12345);
         assert_eq!(decoded.get_bulk_fields(), Some((0, 10)));
+    }
+
+    #[test]
+    fn get_bulk_constructor_checks_both_parameter_ranges() {
+        let varbinds = || vec![VarBind::null(oid!(1, 3, 6, 1))];
+
+        for (non_repeaters, max_repetitions) in
+            [(0, 0), (MAX_GET_BULK_VALUE, 0), (0, MAX_GET_BULK_VALUE)]
+        {
+            let pdu = Pdu::get_bulk(1, non_repeaters, max_repetitions, varbinds()).unwrap();
+            assert_eq!(
+                pdu.get_bulk_fields(),
+                Some((non_repeaters, max_repetitions))
+            );
+        }
+
+        for (non_repeaters, max_repetitions) in
+            [(MAX_GET_BULK_VALUE + 1, 0), (0, MAX_GET_BULK_VALUE + 1)]
+        {
+            let error = Pdu::get_bulk(1, non_repeaters, max_repetitions, varbinds()).unwrap_err();
+            assert!(matches!(*error, Error::InvalidMessage(_)));
+        }
     }
 
     #[test]
@@ -1570,7 +1617,8 @@ mod tests {
 
         let mut strict = Decoder::new(encoded)
             .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
-        assert!(Pdu::decode(&mut strict).is_err());
+        let error = Pdu::decode(&mut strict).unwrap_err();
+        assert!(matches!(*error, Error::MalformedResponse { .. }));
     }
 
     #[test]
@@ -1584,7 +1632,8 @@ mod tests {
 
         let mut strict = Decoder::new(encoded)
             .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
-        assert!(Pdu::decode(&mut strict).is_err());
+        let error = Pdu::decode(&mut strict).unwrap_err();
+        assert!(matches!(*error, Error::MalformedResponse { .. }));
     }
 
     #[test]
@@ -1623,19 +1672,30 @@ mod tests {
     }
 
     #[test]
-    fn encode_rejects_negative_get_bulk_fields_without_mutation() {
-        let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
-        let original = pdu.clone();
-        let mut buf = EncodeBuf::new();
+    fn encode_rejects_out_of_range_get_bulk_fields_without_mutation() {
+        for (non_repeaters, max_repetitions) in
+            [(MAX_GET_BULK_VALUE + 1, 0), (0, MAX_GET_BULK_VALUE + 1)]
+        {
+            let pdu = Pdu {
+                request_id: 1,
+                body: PduBody::GetBulk {
+                    non_repeaters,
+                    max_repetitions,
+                },
+                varbinds: vec![VarBind::null(oid!(1, 3, 6, 1))],
+            };
+            let original = pdu.clone();
+            let mut buf = EncodeBuf::new();
 
-        assert!(pdu.encode(&mut buf).is_err());
-        assert!(buf.is_empty());
-        assert_eq!(pdu, original);
+            assert!(pdu.encode(&mut buf).is_err());
+            assert!(buf.is_empty());
+            assert_eq!(pdu, original);
+        }
     }
 
     #[test]
     fn test_encode_leaves_non_negative_non_repeaters_and_max_repetitions_unchanged() {
-        let pdu = Pdu::get_bulk(1, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let pdu = Pdu::get_bulk(1, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]).unwrap();
 
         let mut buf = EncodeBuf::new();
         pdu.encode(&mut buf).unwrap();
@@ -1647,14 +1707,17 @@ mod tests {
     }
 
     #[test]
-    fn compatible_decode_does_not_enable_malformed_encode() {
+    fn compatible_decode_constructs_encodable_canonical_body() {
         let raw = RawBulkWirePdu::new(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let mut decoder = Decoder::new(raw.encode());
         let decoded = Pdu::decode(&mut decoder).unwrap();
         assert_eq!(decoded.get_bulk_fields(), Some((0, 0)));
 
-        let malformed = Pdu::get_bulk(1, -1, -5, vec![]);
-        assert!(malformed.encode(&mut EncodeBuf::new()).is_err());
+        let mut buf = EncodeBuf::new();
+        decoded.encode(&mut buf).unwrap();
+        let mut roundtrip_decoder = Decoder::new(buf.finish());
+        let roundtrip = Pdu::decode(&mut roundtrip_decoder).unwrap();
+        assert_eq!(roundtrip.get_bulk_fields(), Some((0, 0)));
     }
 
     #[test]
@@ -1690,7 +1753,8 @@ mod tests {
                 VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1)),
                 VarBind::null(oid!(1, 3, 6, 1, 2, 1, 2)),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(!pdu.is_error());
     }
