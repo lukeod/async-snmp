@@ -36,19 +36,28 @@ use std::time::Duration;
 /// let retry = Retry::exponential(5)
 ///     .max_delay(Duration::from_secs(5))
 ///     .jitter(0.25)
-///     .build();
+///     .build()
+///     .expect("valid retry configuration");
 /// ```
 #[derive(Clone, Debug)]
 pub struct Retry {
     /// Maximum number of retry attempts (0 = no retries, request sent once)
-    pub max_attempts: u32,
+    max_attempts: u32,
     /// Backoff strategy between retries
-    pub backoff: Backoff,
+    backoff: Backoff,
+}
+
+/// Error returned when a retry configuration is invalid.
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+pub enum RetryConfigError {
+    /// The jitter factor is not finite or lies outside the supported range.
+    #[error("jitter must be finite and between 0.0 and 1.0 (got {0})")]
+    InvalidJitter(f64),
 }
 
 /// Backoff strategy between retry attempts.
 #[derive(Clone, Copy, Debug, Default)]
-pub enum Backoff {
+enum Backoff {
     /// No delay between retries (immediate retry on timeout).
     #[default]
     None,
@@ -126,7 +135,8 @@ impl Retry {
     /// let retry = Retry::exponential(5)
     ///     .max_delay(Duration::from_secs(5))
     ///     .jitter(0.25)
-    ///     .build();
+    ///     .build()
+    ///     .expect("valid retry configuration");
     /// ```
     #[must_use]
     pub fn exponential(attempts: u32) -> RetryBuilder {
@@ -136,9 +146,15 @@ impl Retry {
         }
     }
 
+    /// Return the maximum number of retry attempts.
+    #[must_use]
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
     /// Compute the delay before the next retry attempt.
     ///
-    /// Returns `Duration::ZERO` for `Backoff::None`.
+    /// Returns `Duration::ZERO` when no delay is configured.
     #[must_use]
     pub fn compute_delay(&self, attempt: u32) -> Duration {
         match &self.backoff {
@@ -156,9 +172,11 @@ impl Retry {
                 let base = initial.saturating_mul(multiplier);
                 let capped = base.min(*max);
 
-                // Apply jitter
+                // Apply jitter. A valid jitter can still push Duration::MAX
+                // beyond the representable range, so preserve the existing
+                // saturating backoff behavior at the conversion boundary.
                 let factor = jitter_factor(*jitter);
-                Duration::from_secs_f64(capped.as_secs_f64() * factor)
+                Duration::try_from_secs_f64(capped.as_secs_f64() * factor).unwrap_or(Duration::MAX)
             }
         }
     }
@@ -204,30 +222,39 @@ impl RetryBuilder {
     /// Jitter helps prevent synchronized retries when multiple clients
     /// experience timeouts simultaneously.
     ///
-    /// The value is clamped to [0.0, 1.0].
+    /// The value is validated by [`RetryBuilder::build`].
     #[must_use]
     pub fn jitter(mut self, jitter: f64) -> Self {
-        self.jitter = jitter.clamp(0.0, 1.0);
+        self.jitter = jitter;
         self
     }
 
     /// Build the [`Retry`] configuration.
-    #[must_use]
-    pub fn build(self) -> Retry {
-        Retry {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetryConfigError::InvalidJitter`] when jitter is NaN,
+    /// infinite, or outside `0.0..=1.0`.
+    pub fn build(self) -> Result<Retry, RetryConfigError> {
+        Retry::validate_jitter(self.jitter)?;
+        Ok(Retry {
             max_attempts: self.max_attempts,
             backoff: Backoff::Exponential {
                 initial: self.initial,
                 max: self.max,
                 jitter: self.jitter,
             },
-        }
+        })
     }
 }
 
-impl From<RetryBuilder> for Retry {
-    fn from(builder: RetryBuilder) -> Self {
-        builder.build()
+impl Retry {
+    pub(crate) fn validate_jitter(jitter: f64) -> Result<(), RetryConfigError> {
+        if jitter.is_finite() && (0.0..=1.0).contains(&jitter) {
+            Ok(())
+        } else {
+            Err(RetryConfigError::InvalidJitter(jitter))
+        }
     }
 }
 
@@ -263,64 +290,52 @@ mod tests {
     #[test]
     fn test_retry_none() {
         let retry = Retry::none();
-        assert_eq!(retry.max_attempts, 0);
-        assert!(matches!(retry.backoff, Backoff::None));
+        assert_eq!(retry.max_attempts(), 0);
+        assert_eq!(retry.compute_delay(0), Duration::ZERO);
     }
 
     #[test]
     fn test_retry_default() {
         let retry = Retry::default();
-        assert_eq!(retry.max_attempts, 3);
-        assert!(
-            matches!(retry.backoff, Backoff::Fixed { delay } if delay == Duration::from_secs(1))
-        );
+        assert_eq!(retry.max_attempts(), 3);
+        assert_eq!(retry.compute_delay(0), Duration::from_secs(1));
     }
 
     #[test]
     fn test_retry_fixed() {
         let retry = Retry::fixed(5, Duration::from_millis(200));
-        assert_eq!(retry.max_attempts, 5);
-        assert!(
-            matches!(retry.backoff, Backoff::Fixed { delay } if delay == Duration::from_millis(200))
-        );
+        assert_eq!(retry.max_attempts(), 5);
+        assert_eq!(retry.compute_delay(0), Duration::from_millis(200));
     }
 
     #[test]
     fn test_retry_exponential_builder() {
         let retry = Retry::exponential(4)
             .initial_delay(Duration::from_millis(50))
-            .max_delay(Duration::from_secs(1))
-            .jitter(0.1)
-            .build();
+            .max_delay(Duration::from_millis(75))
+            .jitter(0.0)
+            .build()
+            .unwrap();
 
-        assert_eq!(retry.max_attempts, 4);
-        match retry.backoff {
-            Backoff::Exponential {
-                initial,
-                max,
-                jitter,
-            } => {
-                assert_eq!(initial, Duration::from_millis(50));
-                assert_eq!(max, Duration::from_secs(1));
-                assert!((jitter - 0.1).abs() < f64::EPSILON);
-            }
-            _ => panic!("expected Exponential"),
+        assert_eq!(retry.max_attempts(), 4);
+        assert_eq!(retry.compute_delay(0), Duration::from_millis(50));
+        assert_eq!(retry.compute_delay(1), Duration::from_millis(75));
+    }
+
+    #[test]
+    fn test_builder_rejects_invalid_jitter() {
+        for jitter in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                Retry::exponential(1).jitter(jitter).build(),
+                Err(RetryConfigError::InvalidJitter(value)) if value.to_bits() == jitter.to_bits()
+            ));
         }
     }
 
     #[test]
-    fn test_jitter_clamped() {
-        let retry = Retry::exponential(1).jitter(-0.5).build();
-        match retry.backoff {
-            Backoff::Exponential { jitter, .. } => assert_eq!(jitter, 0.0),
-            _ => panic!("expected Exponential"),
-        }
-
-        let retry = Retry::exponential(1).jitter(2.0).build();
-        match retry.backoff {
-            Backoff::Exponential { jitter, .. } => assert_eq!(jitter, 1.0),
-            _ => panic!("expected Exponential"),
-        }
+    fn test_builder_accepts_jitter_endpoints() {
+        assert!(Retry::exponential(1).jitter(0.0).build().is_ok());
+        assert!(Retry::exponential(1).jitter(1.0).build().is_ok());
     }
 
     #[test]
@@ -351,7 +366,8 @@ mod tests {
             .initial_delay(Duration::from_millis(100))
             .max_delay(Duration::from_secs(10))
             .jitter(0.0)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(retry.compute_delay(0), Duration::from_millis(100));
         assert_eq!(retry.compute_delay(1), Duration::from_millis(200));
@@ -365,7 +381,8 @@ mod tests {
             .initial_delay(Duration::from_millis(100))
             .max_delay(Duration::from_millis(500))
             .jitter(0.0)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(retry.compute_delay(0), Duration::from_millis(100));
         assert_eq!(retry.compute_delay(1), Duration::from_millis(200));
@@ -381,7 +398,8 @@ mod tests {
             .initial_delay(Duration::from_millis(100))
             .max_delay(Duration::from_secs(1))
             .jitter(0.25)
-            .build();
+            .build()
+            .unwrap();
 
         // With jitter, delay should be in [75ms, 125ms] for attempt 0
         // Run multiple times to verify it's in range
@@ -408,9 +426,29 @@ mod tests {
     }
 
     #[test]
-    fn test_from_builder() {
-        let builder = Retry::exponential(2).initial_delay(Duration::from_millis(50));
-        let retry: Retry = builder.into();
-        assert_eq!(retry.max_attempts, 2);
+    fn test_public_retry_configurations_compute_delays_without_panicking() {
+        let configurations = [
+            Retry::none(),
+            Retry::default(),
+            Retry::fixed(2, Duration::MAX),
+            Retry::exponential(2)
+                .initial_delay(Duration::MAX)
+                .max_delay(Duration::MAX)
+                .jitter(0.0)
+                .build()
+                .unwrap(),
+            Retry::exponential(2)
+                .initial_delay(Duration::MAX)
+                .max_delay(Duration::MAX)
+                .jitter(1.0)
+                .build()
+                .unwrap(),
+        ];
+
+        for retry in configurations {
+            for attempt in [0, 1, u32::MAX] {
+                let _ = retry.compute_delay(attempt);
+            }
+        }
     }
 }

@@ -6,7 +6,7 @@ use clap::{Parser, ValueEnum};
 use std::time::Duration;
 
 use crate::Version;
-use crate::client::{Auth, Backoff, Retry};
+use crate::client::{Auth, Retry, RetryConfigError};
 use crate::format::hex;
 use crate::v3::{AuthProtocol, PrivProtocol};
 
@@ -59,6 +59,28 @@ pub enum BackoffStrategy {
     Exponential,
 }
 
+fn timeout_from_secs(value: f64) -> Result<Duration, String> {
+    Duration::try_from_secs_f64(value).map_err(|_| {
+        "timeout must be a non-negative finite value representable as a duration".to_string()
+    })
+}
+
+fn parse_timeout(value: &str) -> Result<f64, String> {
+    let timeout = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid timeout value: {value}"))?;
+    timeout_from_secs(timeout)?;
+    Ok(timeout)
+}
+
+fn parse_jitter(value: &str) -> Result<f64, String> {
+    let jitter = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid jitter value: {value}"))?;
+    Retry::validate_jitter(jitter).map_err(|error| error.to_string())?;
+    Ok(jitter)
+}
+
 /// Common arguments shared across all CLI tools.
 #[derive(Debug, Parser)]
 pub struct CommonArgs {
@@ -75,7 +97,12 @@ pub struct CommonArgs {
     pub community: String,
 
     /// Request timeout in seconds.
-    #[arg(short = 't', long = "timeout", default_value = "5")]
+    #[arg(
+        short = 't',
+        long = "timeout",
+        default_value = "5",
+        value_parser = parse_timeout
+    )]
     pub timeout: f64,
 
     /// Retry count.
@@ -95,14 +122,23 @@ pub struct CommonArgs {
     pub backoff_max: u64,
 
     /// Jitter factor for exponential backoff (0.0-1.0, e.g., 0.25 means +/-25%).
-    #[arg(long = "backoff-jitter", default_value = "0.25")]
+    #[arg(
+        long = "backoff-jitter",
+        default_value = "0.25",
+        value_parser = parse_jitter
+    )]
     pub backoff_jitter: f64,
 }
 
 impl CommonArgs {
     /// Get the timeout as a Duration.
-    pub fn timeout_duration(&self) -> Duration {
-        Duration::from_secs_f64(self.timeout)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the timeout is negative, non-finite, or not
+    /// representable as a [`Duration`].
+    pub fn timeout_duration(&self) -> Result<Duration, String> {
+        timeout_from_secs(self.timeout)
     }
 
     /// Resolve the effective SNMP version, upgrading to V3 when a username is set.
@@ -115,21 +151,24 @@ impl CommonArgs {
     }
 
     /// Build a Retry configuration from the CLI arguments.
-    pub fn retry_config(&self) -> Retry {
-        let backoff = match self.backoff {
-            BackoffStrategy::None => Backoff::None,
-            BackoffStrategy::Fixed => Backoff::Fixed {
-                delay: Duration::from_millis(self.backoff_delay),
-            },
-            BackoffStrategy::Exponential => Backoff::Exponential {
-                initial: Duration::from_millis(self.backoff_delay),
-                max: Duration::from_millis(self.backoff_max),
-                jitter: self.backoff_jitter.clamp(0.0, 1.0),
-            },
-        };
-        Retry {
-            max_attempts: self.retries,
-            backoff,
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the jitter factor is not finite or outside
+    /// `0.0..=1.0`.
+    pub fn retry_config(&self) -> Result<Retry, RetryConfigError> {
+        Retry::validate_jitter(self.backoff_jitter)?;
+        match self.backoff {
+            BackoffStrategy::None => Ok(Retry::fixed(self.retries, Duration::ZERO)),
+            BackoffStrategy::Fixed => Ok(Retry::fixed(
+                self.retries,
+                Duration::from_millis(self.backoff_delay),
+            )),
+            BackoffStrategy::Exponential => Retry::exponential(self.retries)
+                .initial_delay(Duration::from_millis(self.backoff_delay))
+                .max_delay(Duration::from_millis(self.backoff_max))
+                .jitter(self.backoff_jitter)
+                .build(),
         }
     }
 }
@@ -454,6 +493,69 @@ mod tests {
         }
     }
 
+    fn assert_value_validation_error(arguments: &[&str]) {
+        let error = CommonArgs::try_parse_from(arguments).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn test_timeout_parser_rejects_invalid_values() {
+        for timeout in ["-1", "NaN", "inf", "1.7976931348623157e308"] {
+            assert_value_validation_error(&["test", "127.0.0.1", &format!("--timeout={timeout}")]);
+        }
+    }
+
+    #[test]
+    fn test_timeout_parser_accepts_representable_values() {
+        for timeout in ["0", "5.25"] {
+            let args =
+                CommonArgs::try_parse_from(["test", "127.0.0.1", &format!("--timeout={timeout}")])
+                    .unwrap();
+            assert_eq!(args.timeout, timeout.parse::<f64>().unwrap());
+            assert!(args.timeout_duration().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_jitter_parser_rejects_invalid_values() {
+        for jitter in ["-0.1", "1.1", "NaN", "inf", "-inf"] {
+            assert_value_validation_error(&[
+                "test",
+                "127.0.0.1",
+                &format!("--backoff-jitter={jitter}"),
+            ]);
+        }
+    }
+
+    #[test]
+    fn test_jitter_parser_accepts_endpoints() {
+        for jitter in ["0", "1"] {
+            let args = CommonArgs::try_parse_from([
+                "test",
+                "127.0.0.1",
+                &format!("--backoff-jitter={jitter}"),
+            ])
+            .unwrap();
+            assert_eq!(args.backoff_jitter, jitter.parse::<f64>().unwrap());
+            assert!(args.retry_config().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_direct_common_args_conversion_rejects_invalid_floats() {
+        let mut args = common_args();
+        args.timeout = f64::NAN;
+        assert!(args.timeout_duration().is_err());
+
+        args.timeout = 5.0;
+        args.backoff_jitter = f64::INFINITY;
+        assert!(matches!(
+            args.retry_config(),
+            Err(RetryConfigError::InvalidJitter(value)) if value.is_infinite()
+        ));
+    }
+
     #[test]
     fn test_retry_config_none() {
         let args = CommonArgs {
@@ -467,9 +569,9 @@ mod tests {
             backoff_max: 5000,
             backoff_jitter: 0.25,
         };
-        let retry = args.retry_config();
-        assert_eq!(retry.max_attempts, 3);
-        assert!(matches!(retry.backoff, Backoff::None));
+        let retry = args.retry_config().unwrap();
+        assert_eq!(retry.max_attempts(), 3);
+        assert_eq!(retry.compute_delay(0), Duration::ZERO);
     }
 
     #[test]
@@ -485,12 +587,9 @@ mod tests {
             backoff_max: 5000,
             backoff_jitter: 0.25,
         };
-        let retry = args.retry_config();
-        assert_eq!(retry.max_attempts, 5);
-        assert!(matches!(
-            retry.backoff,
-            Backoff::Fixed { delay } if delay == Duration::from_millis(200)
-        ));
+        let retry = args.retry_config().unwrap();
+        assert_eq!(retry.max_attempts(), 5);
+        assert_eq!(retry.compute_delay(0), Duration::from_millis(200));
     }
 
     #[test]
@@ -504,22 +603,12 @@ mod tests {
             backoff: BackoffStrategy::Exponential,
             backoff_delay: 50,
             backoff_max: 2000,
-            backoff_jitter: 0.1,
+            backoff_jitter: 0.0,
         };
-        let retry = args.retry_config();
-        assert_eq!(retry.max_attempts, 4);
-        match retry.backoff {
-            Backoff::Exponential {
-                initial,
-                max,
-                jitter,
-            } => {
-                assert_eq!(initial, Duration::from_millis(50));
-                assert_eq!(max, Duration::from_millis(2000));
-                assert!((jitter - 0.1).abs() < f64::EPSILON);
-            }
-            _ => panic!("expected Exponential"),
-        }
+        let retry = args.retry_config().unwrap();
+        assert_eq!(retry.max_attempts(), 4);
+        assert_eq!(retry.compute_delay(0), Duration::from_millis(50));
+        assert_eq!(retry.compute_delay(10), Duration::from_millis(2000));
     }
 
     #[test]

@@ -160,7 +160,9 @@
 //! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
 //!     .retry(Retry::exponential(5)
 //!         .max_delay(Duration::from_secs(5))
-//!         .jitter(0.25))  // ±25% randomization
+//!         .jitter(0.25)
+//!         .build()
+//!         .expect("valid retry configuration"))  // ±25% randomization
 //!     .connect().await?;
 //! # Ok(())
 //! # }
@@ -493,10 +495,10 @@ pub use agent::{
     Agent, AgentBuilder, BuiltinMib, VacmBuilder, VacmConfig, VacmSecurityModel, View,
 };
 pub use client::{
-    Auth, Backoff, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
+    Auth, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
     DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT,
     FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering, ResponseShapeAnomaly,
-    ResponseShapePolicy, Retry, RetryBuilder, Target, Walk, WalkMode, WalkStream,
+    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk, WalkMode, WalkStream,
 };
 pub use compatibility::CompatibilityPolicy;
 pub use error::{Error, ErrorStatus, Result, WalkAbortReason};

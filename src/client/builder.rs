@@ -249,7 +249,9 @@ impl ClientBuilder {
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
     ///     .retry(Retry::exponential(5)
     ///         .max_delay(Duration::from_secs(5))
-    ///         .jitter(0.25));
+    ///         .jitter(0.25)
+    ///         .build()
+    ///         .expect("valid retry configuration"));
     /// ```
     #[must_use]
     pub fn retry(mut self, retry: impl Into<Retry>) -> Self {
@@ -766,7 +768,7 @@ mod tests {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::default());
         assert!(matches!(builder.target, Target::Address(ref s) if s == "192.168.1.1:161"));
         assert_eq!(builder.timeout, DEFAULT_TIMEOUT);
-        assert_eq!(builder.retry.max_attempts, 3);
+        assert_eq!(builder.retry.max_attempts(), 3);
         assert_eq!(builder.max_oids_per_request, DEFAULT_MAX_OIDS_PER_REQUEST);
         assert_eq!(
             builder.response_shape_policy,
@@ -807,7 +809,7 @@ mod tests {
             .allow_unauthenticated_v3_time_correction(true);
 
         assert_eq!(builder.timeout, Duration::from_secs(10));
-        assert_eq!(builder.retry.max_attempts, 5);
+        assert_eq!(builder.retry.max_attempts(), 5);
         assert_eq!(builder.max_oids_per_request, 20);
         assert_eq!(
             builder.build_config().response_shape_policy,
@@ -904,7 +906,7 @@ mod tests {
             .expect("valid custom-transport client");
 
         assert_eq!(client.inner.config.timeout, Duration::from_secs(9));
-        assert_eq!(client.inner.config.retry.max_attempts, 0);
+        assert_eq!(client.inner.config.retry.max_attempts(), 0);
         assert_eq!(client.inner.config.max_oids_per_request, 7);
         assert_eq!(client.inner.config.walk_mode, WalkMode::GetNext);
         assert_eq!(

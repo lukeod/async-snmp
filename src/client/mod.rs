@@ -12,7 +12,7 @@ pub use builder::{ClientBuilder, Target};
 pub use response_shape::{
     FixedCardinalityOperation, FixedCardinalityResponse, ResponseShapeAnomaly, ResponseShapePolicy,
 };
-pub use retry::{Backoff, Retry, RetryBuilder};
+pub use retry::{Retry, RetryBuilder, RetryConfigError};
 
 // New unified entry point
 impl Client<UdpHandle> {
@@ -385,7 +385,7 @@ impl<T: Transport> Client<T> {
         let max_attempts = if self.inner.transport.is_reliable() {
             0
         } else {
-            self.inner.config.retry.max_attempts
+            self.inner.config.retry.max_attempts()
         };
 
         for attempt in 0..=max_attempts {

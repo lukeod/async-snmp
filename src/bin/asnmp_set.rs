@@ -204,9 +204,18 @@ async fn run_set(
         .auth(&args.common)
         .map_err(|e| async_snmp::Error::Config(e.to_string().into()))?;
 
+    let timeout = args
+        .common
+        .timeout_duration()
+        .map_err(|error| async_snmp::Error::Config(error.into()))?;
+    let retry = args
+        .common
+        .retry_config()
+        .map_err(|error| async_snmp::Error::Config(error.to_string().into()))?;
+
     let client = Client::builder(target, auth)
-        .timeout(args.common.timeout_duration())
-        .retry(args.common.retry_config())
+        .timeout(timeout)
+        .retry(retry)
         .connect()
         .await?;
 

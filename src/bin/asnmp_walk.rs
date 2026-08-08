@@ -163,9 +163,18 @@ async fn run_walk(
         WalkMode::GetBulk
     };
 
+    let timeout = args
+        .common
+        .timeout_duration()
+        .map_err(|error| async_snmp::Error::Config(error.into()))?;
+    let retry = args
+        .common
+        .retry_config()
+        .map_err(|error| async_snmp::Error::Config(error.to_string().into()))?;
+
     let client = Client::builder(target, auth)
-        .timeout(args.common.timeout_duration())
-        .retry(args.common.retry_config())
+        .timeout(timeout)
+        .retry(retry)
         .walk_mode(walk_mode)
         .max_repetitions(args.walk.max_repetitions)
         .connect()

@@ -153,7 +153,7 @@ impl<T: Transport> Client<T> {
         let max_attempts = if self.inner.transport.is_reliable() {
             0
         } else {
-            self.inner.config.retry.max_attempts
+            self.inner.config.retry.max_attempts()
         };
 
         let mut last_error: Option<Box<Error>> = None;
@@ -624,7 +624,7 @@ impl<T: Transport> Client<T> {
         let max_timeout_retries = if self.inner.transport.is_reliable() {
             0
         } else {
-            self.inner.config.retry.max_attempts
+            self.inner.config.retry.max_attempts()
         };
         let mut timeout_retries = 0;
         let mut correction_used = false;
