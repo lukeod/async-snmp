@@ -61,7 +61,7 @@ impl SharedEnv {
 /// OID constraints per X.690 Section 8.19:
 /// - arc1 must be 0, 1, or 2
 /// - arc2 must be <= 39 when arc1 is 0 or 1
-/// - arc2 can be any value when arc1 is 2 (but limited to avoid overflow)
+/// - arc2 can use the full u32 range when arc1 is 2
 /// - BER encoding combines first two arcs as (arc1 * 40) + arc2, so single-arc
 ///   OIDs cannot round-trip (they become 2-arc OIDs on decode)
 /// - Wire OIDs contain 2..=128 arcs
@@ -72,7 +72,7 @@ fn arb_oid() -> impl Strategy<Value = Oid> {
             let arc2 = if arc1 < 2 {
                 remaining_arcs[0] % 40
             } else {
-                remaining_arcs[0] % (u32::MAX - 79)
+                remaining_arcs[0]
             };
 
             let mut arcs = vec![arc1, arc2];
@@ -624,13 +624,14 @@ fn oid_max_arc2_values() {
     let decoded = Oid::from_ber(&encoded).unwrap();
     assert_eq!(oid, decoded);
 
-    // arc1=2, arc2=large value (but not so large it overflows arc1*40 + arc2)
-    // Maximum safe arc2 when arc1=2: u32::MAX - 80
-    let oid = Oid::from_slice(&[2, u32::MAX - 80]);
-    assert!(oid.validate().is_ok());
-    let encoded = oid.to_ber().unwrap();
-    let decoded = Oid::from_ber(&encoded).unwrap();
-    assert_eq!(oid, decoded);
+    // arc1=2 permits the full u32 range for arc2.
+    for arc2 in [u32::MAX - 80, u32::MAX - 79, u32::MAX] {
+        let oid = Oid::from_slice(&[2, arc2]);
+        assert!(oid.validate().is_ok());
+        let encoded = oid.to_ber().unwrap();
+        let decoded = Oid::from_ber(&encoded).unwrap();
+        assert_eq!(oid, decoded);
+    }
 }
 
 #[test]

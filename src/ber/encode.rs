@@ -357,7 +357,6 @@ mod tests {
             crate::oid::Oid::from_slice(&[3, 0]),
             crate::oid::Oid::from_slice(&[0, 40]),
             crate::oid::Oid::from_slice(&[1, 40]),
-            crate::oid::Oid::from_slice(&[2, u32::MAX]),
         ];
 
         for oid in invalid {

@@ -16,7 +16,6 @@ fn invalid_oids() -> Vec<Oid> {
         Oid::from_slice(&[3, 0]),
         Oid::from_slice(&[0, 40]),
         Oid::from_slice(&[1, 40]),
-        Oid::from_slice(&[2, u32::MAX]),
     ]
 }
 
@@ -138,6 +137,8 @@ fn valid_oid_boundaries_preserve_identity() {
         Oid::from_slice(&[0, 0]),
         Oid::from_slice(&[1, 39]),
         Oid::from_slice(&[2, u32::MAX - 80]),
+        Oid::from_slice(&[2, u32::MAX - 79]),
+        Oid::from_slice(&[2, u32::MAX]),
         Oid::new(at_limit),
     ];
 
@@ -153,6 +154,52 @@ fn valid_oid_boundaries_preserve_identity() {
         let decoded = CommunityMessage::decode(bytes).unwrap();
         assert_eq!(decoded.into_pdu().unwrap().varbinds[0].oid, oid);
     }
+}
+
+#[test]
+fn root_two_u32_arc_boundaries_have_exact_ber_encodings() {
+    let cases: &[(u32, &[u8])] = &[
+        (u32::MAX - 80, &[0x8f, 0xff, 0xff, 0xff, 0x7f]),
+        (u32::MAX - 79, &[0x90, 0x80, 0x80, 0x80, 0x00]),
+        (u32::MAX, &[0x90, 0x80, 0x80, 0x80, 0x4f]),
+    ];
+
+    for &(arc2, expected) in cases {
+        let oid = Oid::from_slice(&[2, arc2]);
+        assert_eq!(oid.to_ber().unwrap(), expected);
+        assert_eq!(oid.to_ber_checked().unwrap(), expected);
+        assert_eq!(Oid::from_ber(expected).unwrap(), oid);
+
+        let pdu = Pdu::get_request(7, std::slice::from_ref(&oid));
+        let encoded = CommunityMessage::v2c("public", pdu)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let expected_tlv = [&[0x06, expected.len() as u8][..], expected].concat();
+        assert!(
+            encoded
+                .windows(expected_tlv.len())
+                .any(|window| window == expected_tlv),
+            "structured message omitted exact BER for {oid}"
+        );
+        let decoded = CommunityMessage::decode(encoded).unwrap();
+        assert_eq!(decoded.into_pdu().unwrap().varbinds[0].oid, oid);
+    }
+}
+
+#[test]
+fn combined_first_subidentifier_overflow_is_rejected_without_wrapping() {
+    // u32::MAX + 81, one above the largest combined value (80 + u32::MAX).
+    let above_limit = [0x90, 0x80, 0x80, 0x80, 0x50];
+    assert!(Oid::from_ber(&above_limit).is_err());
+
+    // Receive-side compatibility permits a non-minimal leading zero group, but
+    // it must not let the same overflow value wrap into the accepted range.
+    let non_minimal_above_limit = [0x80, 0x90, 0x80, 0x80, 0x80, 0x50];
+    assert!(Oid::from_ber(&non_minimal_above_limit).is_err());
+
+    // A value far beyond u64 also fails during accumulation rather than wrapping.
+    assert!(Oid::from_ber(&[0xff; 11]).is_err());
 }
 
 #[test]

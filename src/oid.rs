@@ -320,7 +320,7 @@ impl Oid {
     ///
     /// - arc1 must be 0, 1, or 2
     /// - arc2 must be <= 39 when arc1 is 0 or 1
-    /// - arc2 must not cause overflow when computing first subidentifier (arc1*40 + arc2)
+    /// - arc2 may use the full `u32` range when arc1 is 2
     ///
     /// # Examples
     ///
@@ -339,8 +339,8 @@ impl Oid {
     /// let invalid = Oid::from_slice(&[0, 40]);
     /// assert!(invalid.validate().is_err());
     ///
-    /// // arc2 can be large when arc1 is 2, but must not overflow
-    /// let valid = Oid::from_slice(&[2, 999]);
+    /// // arc2 can use the full u32 range when arc1 is 2
+    /// let valid = Oid::from_slice(&[2, u32::MAX]);
     /// assert!(valid.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<()> {
@@ -380,15 +380,6 @@ impl Oid {
                 format!("second arc must be <= 39 when first arc is {arc1}, got {arc2}").into(),
             )
             .boxed());
-        }
-
-        // Check that first subidentifier (arc1*40 + arc2) won't overflow u32.
-        // Max valid arc2 = u32::MAX - arc1*40
-        let base = arc1 * 40;
-        if arc2 > u32::MAX - base {
-            return Err(
-                Error::InvalidOid("subidentifier overflow in first two arcs".into()).boxed(),
-            );
         }
 
         Ok(())
@@ -464,9 +455,9 @@ impl Oid {
             return bytes;
         }
 
-        // First two arcs combined into first subidentifier.
-        // Uses base-128 encoding because arc2 can be > 127 when arc1=2.
-        encode_subidentifier_smallvec(&mut bytes, first_subidentifier(&self.arcs));
+        // The combined first subidentifier can exceed u32::MAX by up to 80.
+        // Later subidentifiers remain u32 values.
+        encode_first_subidentifier(&mut bytes, first_subidentifier(&self.arcs));
 
         // Remaining arcs
         for &arc in self.arcs.iter().skip(2) {
@@ -486,10 +477,10 @@ impl Oid {
         Ok(self.to_ber_smallvec().to_vec())
     }
 
-    /// Encode to BER format with validation.
+    /// Compatibility alias for [`to_ber()`](Self::to_ber).
     ///
-    /// This is the strict, wire-safe encode entry point. It rejects OIDs that do
-    /// not have a well-formed, round-trippable BER encoding:
+    /// This published alias retains the same strict, wire-safe behavior. It
+    /// rejects OIDs that do not have a well-formed, round-trippable BER encoding:
     ///
     /// - empty OIDs (no arcs): BER content would be zero bytes, which is not a
     ///   valid OBJECT IDENTIFIER value (X.690 Section 8.19.4 requires at least one
@@ -516,8 +507,8 @@ impl Oid {
 
         let mut len = 0;
 
-        // First subidentifier (arc1*40 + arc2)
-        len += base128_len(first_subidentifier(&self.arcs));
+        // The combined first subidentifier can exceed u32::MAX by up to 80.
+        len += base128_len_u64(first_subidentifier(&self.arcs));
 
         // Remaining arcs
         for &arc in self.arcs.iter().skip(2) {
@@ -545,21 +536,25 @@ impl Oid {
 
         let mut arcs = SmallVec::new();
 
-        // Decode first subidentifier (which encodes arc1*40 + arc2)
-        // This may be multi-byte for large arc2 values (when arc1=2)
-        let (first_subid, consumed) = decode_subidentifier(data)?;
+        // Decode the combined first subidentifier with its wider valid range.
+        let (first_subid, consumed) = decode_first_subidentifier(data)?;
 
-        // Decode first two arcs from the first subidentifier
-        if first_subid < 40 {
-            arcs.push(0);
-            arcs.push(first_subid);
+        // Split the combined value back into u32 arcs.
+        let (arc1, arc2) = if first_subid < 40 {
+            (0, first_subid)
         } else if first_subid < 80 {
-            arcs.push(1);
-            arcs.push(first_subid - 40);
+            (1, first_subid - 40)
         } else {
-            arcs.push(2);
-            arcs.push(first_subid - 80);
-        }
+            (2, first_subid - 80)
+        };
+        let arc2 = u32::try_from(arc2).map_err(|_| {
+            Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed()
+        })?;
+        arcs.push(arc1);
+        arcs.push(arc2);
 
         // Decode remaining arcs
         let mut i = consumed;
@@ -585,28 +580,36 @@ impl Oid {
 /// Compute the first OID subidentifier value from an arc slice.
 ///
 /// Per X.690 Section 8.19: the first two arcs are encoded as `arc1 * 40 + arc2`.
-/// If there is only one arc, it is encoded as `arc1 * 40`.
-///
-/// Uses saturating arithmetic defensively. All production callers validate via
-/// [`Oid::validate_for_wire`] before reaching this internal arithmetic helper.
+/// The combined value needs a `u64` because the valid `2.4294967295` boundary
+/// encodes as 4294967375. Individual arcs remain `u32`.
 #[inline]
-fn first_subidentifier(arcs: &SmallVec<[u32; 16]>) -> u32 {
+fn first_subidentifier(arcs: &SmallVec<[u32; 16]>) -> u64 {
     if arcs.len() >= 2 {
-        arcs[0].saturating_mul(40).saturating_add(arcs[1])
+        u64::from(arcs[0]) * 40 + u64::from(arcs[1])
     } else {
-        arcs[0].saturating_mul(40)
+        u64::from(arcs[0]) * 40
     }
 }
 
-/// Encode a subidentifier in base-128 variable length into a `SmallVec`.
+/// Return the base-128 length of the combined first subidentifier.
 #[inline]
-fn encode_subidentifier_smallvec(bytes: &mut SmallVec<[u8; 64]>, value: u32) {
+fn base128_len_u64(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        len += 1;
+        value >>= 7;
+    }
+    len
+}
+
+/// Encode the combined first subidentifier in base-128 variable length.
+#[inline]
+fn encode_first_subidentifier(bytes: &mut SmallVec<[u8; 64]>, value: u64) {
     if value == 0 {
         bytes.push(0);
         return;
     }
 
-    // Count how many 7-bit groups we need
     let mut temp = value;
     let mut count = 0;
     while temp > 0 {
@@ -614,17 +617,75 @@ fn encode_subidentifier_smallvec(bytes: &mut SmallVec<[u8; 64]>, value: u32) {
         temp >>= 7;
     }
 
-    // Encode from MSB to LSB
     for i in (0..count).rev() {
         let mut byte = ((value >> (i * 7)) & 0x7F) as u8;
         if i > 0 {
-            byte |= 0x80; // Continuation bit
+            byte |= 0x80;
         }
         bytes.push(byte);
     }
 }
 
-/// Decode a subidentifier, returning (value, `bytes_consumed`).
+/// Encode a later u32 subidentifier in base-128 variable length.
+#[inline]
+fn encode_subidentifier_smallvec(bytes: &mut SmallVec<[u8; 64]>, value: u32) {
+    if value == 0 {
+        bytes.push(0);
+        return;
+    }
+
+    let mut temp = value;
+    let mut count = 0;
+    while temp > 0 {
+        count += 1;
+        temp >>= 7;
+    }
+
+    for i in (0..count).rev() {
+        let mut byte = ((value >> (i * 7)) & 0x7F) as u8;
+        if i > 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+    }
+}
+
+/// Decode the combined first subidentifier, returning (value, `bytes_consumed`).
+fn decode_first_subidentifier(data: &[u8]) -> Result<(u64, usize)> {
+    const MAX_FIRST_SUBIDENTIFIER: u64 = u32::MAX as u64 + 80;
+
+    let mut value = 0u64;
+    let mut i = 0;
+
+    loop {
+        if i >= data.len() {
+            tracing::debug!(target: "async_snmp::oid", { snmp.offset = %i, kind = %DecodeErrorKind::TruncatedData }, "unexpected end of data in OID subidentifier");
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
+
+        let byte = data[i];
+        i += 1;
+        let payload = u64::from(byte & 0x7F);
+
+        if value > (MAX_FIRST_SUBIDENTIFIER - payload) >> 7 {
+            tracing::debug!(target: "async_snmp::oid", { snmp.offset = %i, kind = %DecodeErrorKind::IntegerOverflow }, "combined first OID subidentifier overflow");
+            return Err(Error::MalformedResponse {
+                target: UNKNOWN_TARGET,
+            }
+            .boxed());
+        }
+
+        value = (value << 7) | payload;
+        if byte & 0x80 == 0 {
+            return Ok((value, i));
+        }
+    }
+}
+
+/// Decode a later u32 subidentifier, returning (value, `bytes_consumed`).
 fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
     let mut value: u32 = 0;
     let mut i = 0;
@@ -1175,43 +1236,13 @@ mod tests {
         assert!("1.3.-6.1".parse::<Oid>().is_err());
     }
 
-    // Test for first subidentifier overflow (arc1*40 + arc2 must fit in u32)
-    // When arc1=2, arc2 cannot exceed u32::MAX - 80
     #[test]
-    fn test_validate_arc2_overflow_when_arc1_is_2() {
-        // Maximum valid arc2 when arc1=2: u32::MAX - 80 = 4294967215
-        let max_valid_arc2 = u32::MAX - 80;
-        let oid = Oid::from_slice(&[2, max_valid_arc2]);
-        assert!(
-            oid.validate().is_ok(),
-            "arc2={max_valid_arc2} with arc1=2 should be valid (max that fits)"
-        );
-
-        // One more than max should fail validation
-        let overflow_arc2 = u32::MAX - 79; // 2*40 + this = u32::MAX + 1
-        let oid = Oid::from_slice(&[2, overflow_arc2]);
-        assert!(
-            oid.validate().is_err(),
-            "arc2={overflow_arc2} with arc1=2 should be invalid (would overflow first subidentifier)"
-        );
-
-        // Also test arc2 = u32::MAX should definitely fail
-        let oid = Oid::from_slice(&[2, u32::MAX]);
-        assert!(
-            oid.validate().is_err(),
-            "arc2=u32::MAX with arc1=2 should be invalid"
-        );
-    }
-
-    #[test]
-    fn test_to_ber_checked_rejects_overflow() {
-        // Encoding an OID that would overflow should fail via to_ber_checked
-        let oid = Oid::from_slice(&[2, u32::MAX]);
-        let result = oid.to_ber_checked();
-        assert!(
-            result.is_err(),
-            "to_ber_checked should reject OID that would overflow"
-        );
+    fn test_validate_accepts_full_root_two_arc_range() {
+        for arc2 in [u32::MAX - 80, u32::MAX - 79, u32::MAX] {
+            let oid = Oid::from_slice(&[2, arc2]);
+            assert!(oid.validate().is_ok(), "arc2={arc2} should be valid");
+            assert_eq!(oid.to_ber_checked().unwrap(), oid.to_ber().unwrap());
+        }
     }
 
     #[test]
@@ -1323,14 +1354,6 @@ mod tests {
             sum += arc;
         }
         assert_eq!(sum, 10);
-    }
-
-    #[test]
-    fn to_ber_rejects_first_subidentifier_overflow() {
-        let oid = Oid::from_slice(&[2, u32::MAX]);
-        assert!(oid.validate().is_err());
-        assert!(oid.to_ber().is_err());
-        assert!(oid.to_ber_checked().is_err());
     }
 
     #[test]
