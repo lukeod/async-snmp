@@ -135,7 +135,7 @@ mod varbind;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -248,6 +248,7 @@ pub struct NotificationReceiverBuilder {
     communities: Vec<Vec<u8>>,
     authoritative_engine: Option<AuthoritativeEngine>,
     varbind_validation: NotificationVarbindValidation,
+    max_message_size: usize,
 }
 
 impl NotificationReceiverBuilder {
@@ -266,6 +267,7 @@ impl NotificationReceiverBuilder {
             communities: Vec::new(),
             authoritative_engine: None,
             varbind_validation: NotificationVarbindValidation::Tolerant,
+            max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
         }
     }
 
@@ -292,6 +294,18 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn varbind_validation(mut self, policy: NotificationVarbindValidation) -> Self {
         self.varbind_validation = policy;
+        self
+    }
+
+    /// Set the local upper bound for automatic Inform responses and V3 Reports.
+    ///
+    /// The default is the maximum UDP payload. Values below the SNMPv3
+    /// advertisement minimum are permitted as response/drop policy and are not
+    /// copied into outgoing V3 `msgMaxSize`, which remains this receiver's local
+    /// receive capacity.
+    #[must_use]
+    pub fn max_message_size(mut self, size: usize) -> Self {
+        self.max_message_size = size;
         self
     }
 
@@ -442,6 +456,17 @@ impl NotificationReceiverBuilder {
     /// Returns a configuration error when USM credentials are invalid or a
     /// USM user is configured without a persisted [`AuthoritativeEngine`].
     pub async fn build(self) -> Result<NotificationReceiver> {
+        if self.max_message_size > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
+            return Err(Error::Config(
+                format!(
+                    "max_message_size must not exceed UDP capacity {}",
+                    crate::UDP_RECEIVE_LIMITS.advertised()
+                )
+                .into(),
+            )
+            .boxed());
+        }
+
         let requires_authoritative_engine = !self.usm_users.is_empty();
         let PreparedAuthoritativeUsm {
             users: usm_users,
@@ -486,6 +511,8 @@ impl NotificationReceiverBuilder {
                 engine_start: Instant::now(),
                 usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(HashMap::new()),
+                max_message_size: self.max_message_size,
+                snmp_silent_drops: AtomicU32::new(0),
             }),
         })
     }
@@ -725,6 +752,10 @@ struct ReceiverInner {
     /// least-recently-updated eviction so a credential holder cannot grow it
     /// without limit by fabricating engine IDs.
     remote_engines: Mutex<HashMap<Bytes, EngineState>>,
+    /// Local outbound response policy limit.
+    max_message_size: usize,
+    /// Confirmed notifications dropped because even the alternate Response did not fit.
+    snmp_silent_drops: AtomicU32,
 }
 
 impl ReceiverInner {
@@ -751,6 +782,17 @@ impl NotificationReceiver {
     #[must_use]
     pub fn builder() -> NotificationReceiverBuilder {
         NotificationReceiverBuilder::new()
+    }
+
+    /// Return the receiver's `snmpSilentDrops` value.
+    ///
+    /// This counter changes only when a confirmed Inform response is oversized
+    /// and its exact empty-varbind `tooBig` alternate also exceeds the effective
+    /// local/originator limit. Authentication, engine-boots, and unrelated
+    /// receive failures do not affect it.
+    #[must_use]
+    pub fn snmp_silent_drops(&self) -> u32 {
+        self.inner.snmp_silent_drops.load(Ordering::Relaxed)
     }
 
     /// Bind to a local address.
@@ -814,6 +856,8 @@ impl NotificationReceiver {
                 engine_start: Instant::now(),
                 usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(HashMap::new()),
+                max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
+                snmp_silent_drops: AtomicU32::new(0),
             }),
         })
     }
@@ -961,9 +1005,13 @@ impl Clone for NotificationReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    use crate::Value;
     use crate::message::SecurityLevel;
     use crate::oid;
     use crate::pdu::GenericTrap;
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    use crate::pdu::Pdu;
     use crate::util::{EmptyCommunityPolicy, community_matches};
     use crate::v3::AuthProtocol;
 
@@ -1330,6 +1378,62 @@ mod tests {
         }
 
         Bytes::from(msg_bytes)
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    fn inform_security(level: SecurityLevel, username: &[u8]) -> crate::v3::UsmConfig {
+        use crate::v3::PrivProtocol;
+
+        let username = Bytes::copy_from_slice(username);
+        match level {
+            SecurityLevel::NoAuthNoPriv => crate::v3::UsmConfig::new(username),
+            SecurityLevel::AuthNoPriv => crate::v3::UsmConfig::new(username)
+                .auth(AuthProtocol::Sha256, b"inform-auth-password"),
+            SecurityLevel::AuthPriv => crate::v3::UsmConfig::new(username).auth_priv(
+                AuthProtocol::Sha256,
+                b"inform-auth-password",
+                PrivProtocol::Aes128,
+                b"inform-priv-password",
+            ),
+        }
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    fn build_v3_inform_at_level(
+        engine_id: &[u8],
+        username: &[u8],
+        level: SecurityLevel,
+        msg_max_size: crate::MessageSize,
+    ) -> (Bytes, Pdu, crate::v3::DerivedKeys) {
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::InformRequest,
+            1,
+            0,
+            0,
+            vec![
+                VarBind::new(oids::sys_uptime(), Value::TimeTicks(1000)),
+                VarBind::new(
+                    oids::snmp_trap_oid(),
+                    Value::ObjectIdentifier(oids::cold_start()),
+                ),
+            ],
+        );
+        let config = inform_security(level, username);
+        let keys = config.derive_keys(engine_id).unwrap();
+        let encoded = crate::v3::encode::encode_v3_message(
+            &pdu,
+            1,
+            engine_id,
+            1,
+            0,
+            &config,
+            Some(&keys),
+            &crate::v3::SaltCounter::new(),
+            true,
+            msg_max_size,
+        )
+        .unwrap();
+        (Bytes::from(encoded), pdu, keys)
     }
 
     /// Build an authenticated V3 `InformRequest` message with the given
@@ -1947,6 +2051,114 @@ mod tests {
             crate::UDP_RECEIVE_LIMITS.advertised(),
             "ack must advertise the receiver's local receive capacity, not the sender's 1400"
         );
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn v3_inform_direct_fallback_and_drop_at_all_security_levels() {
+        use crate::v3::UsmSecurityParams;
+        use crate::v3::encode::encode_v3_response;
+
+        let engine_id = Bytes::from_static(b"\x80\x00\x00\x00\x01informrecv");
+        let username = Bytes::from_static(b"informuser");
+
+        for level in [
+            SecurityLevel::NoAuthNoPriv,
+            SecurityLevel::AuthNoPriv,
+            SecurityLevel::AuthPriv,
+        ] {
+            let (message, inform_pdu, keys) = build_v3_inform_at_level(
+                &engine_id,
+                &username,
+                level,
+                crate::UDP_RECEIVE_LIMITS.advertised(),
+            );
+            let encode = |pdu| {
+                encode_v3_response(
+                    pdu,
+                    1,
+                    crate::UDP_RECEIVE_LIMITS.advertised(),
+                    level,
+                    UsmSecurityParams::new(engine_id.clone(), 1, 0, username.clone()),
+                    engine_id.clone(),
+                    Bytes::new(),
+                    Some(&keys),
+                    &SaltCounter::new(),
+                    "127.0.0.1:9999".parse().unwrap(),
+                )
+            };
+            let candidate_len = encode(inform_pdu.to_response()).unwrap().len();
+            let alternate_len = encode(Pdu::response(
+                inform_pdu.request_id,
+                crate::ErrorStatus::TooBig.as_i32(),
+                0,
+                Vec::new(),
+            ))
+            .unwrap()
+            .len();
+            assert!(alternate_len < candidate_len);
+
+            let config = inform_security(level, &username);
+            let receiver = NotificationReceiver::builder()
+                .bind("127.0.0.1:0")
+                .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
+                .usm_user(username.clone(), move |_| config)
+                .max_message_size(candidate_len - 1)
+                .build()
+                .await
+                .unwrap();
+            let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client_addr = client.local_addr().unwrap();
+            let notification = receiver
+                .handle_v3(message.clone(), client_addr)
+                .await
+                .unwrap();
+            assert!(matches!(notification, Some(Notification::InformV3 { .. })));
+            let mut buf = vec![0_u8; 4096];
+            let (len, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.recv_from(&mut buf),
+            )
+            .await
+            .expect("tooBig acknowledgement should be sent")
+            .unwrap();
+            assert_eq!(len, alternate_len);
+            let ack =
+                crate::message::V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+            assert_eq!(
+                ack.global_data.msg_max_size,
+                crate::UDP_RECEIVE_LIMITS.advertised()
+            );
+            assert_eq!(receiver.snmp_silent_drops(), 0);
+
+            let config = inform_security(level, &username);
+            let receiver = NotificationReceiver::builder()
+                .bind("127.0.0.1:0")
+                .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
+                .usm_user(username.clone(), move |_| config)
+                .max_message_size(1)
+                .build()
+                .await
+                .unwrap();
+            let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client_addr = client.local_addr().unwrap();
+            let notification = receiver
+                .handle_v3(message.clone(), client_addr)
+                .await
+                .unwrap();
+            assert!(matches!(notification, Some(Notification::InformV3 { .. })));
+            assert_eq!(receiver.snmp_silent_drops(), 1);
+            let mut buf = [0_u8; 1];
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    client.recv_from(&mut buf),
+                )
+                .await
+                .is_err(),
+                "final-drop path must not send an acknowledgement"
+            );
+        }
     }
 
     /// RFC 3414 Section 3.1 Steps 1(a) and 6: an Inform Response is generated
@@ -2602,6 +2814,24 @@ mod tests {
             .unwrap()
     }
 
+    fn build_oversized_v2c_inform(community: &[u8]) -> Bytes {
+        use crate::message::CommunityMessage;
+        use crate::pdu::Pdu;
+        let pdu = Pdu::inform_request(
+            1,
+            100,
+            &oids::cold_start(),
+            vec![VarBind::new(
+                crate::oid!(1, 3, 6, 1, 4, 1, 99999, 1),
+                crate::Value::OctetString(Bytes::from(vec![0x44; 512])),
+            )],
+        );
+        CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu)
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
     fn build_v1_trap(community: &[u8]) -> Bytes {
         use crate::message::CommunityMessage;
         use crate::pdu::GenericTrap;
@@ -2749,5 +2979,67 @@ mod tests {
         .expect("a matching inform must be acknowledged")
         .unwrap();
         assert!(len > 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_v2c_inform_uses_fitting_toobig_without_counting_drop() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .max_message_size(80)
+            .build()
+            .await
+            .unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let notification = receiver
+            .handle_v2c(
+                build_oversized_v2c_inform(b"public"),
+                client.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(notification, Some(Notification::InformV2c { .. })));
+
+        let mut buf = vec![0; 1024];
+        let (len, _) = client.recv_from(&mut buf).await.unwrap();
+        let response =
+            crate::message::CommunityMessage::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let pdu = response.pdu().standard().unwrap();
+        assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
+        assert!(pdu.varbinds.is_empty());
+        assert_eq!(receiver.snmp_silent_drops(), 0);
+    }
+
+    #[tokio::test]
+    async fn inform_counts_only_when_toobig_alternate_cannot_fit() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .max_message_size(1)
+            .build()
+            .await
+            .unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        receiver
+            .handle_v2c(
+                build_oversized_v2c_inform(b"public"),
+                client.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receiver.snmp_silent_drops(), 1);
+
+        let mut buf = [0; 64];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), client.recv(&mut buf))
+                .await
+                .is_err()
+        );
+
+        receiver
+            .handle_v2c(build_v2c_trap(b"public"), client.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(receiver.snmp_silent_drops(), 1);
     }
 }

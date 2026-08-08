@@ -529,6 +529,7 @@ pub mod notification;
 pub mod oid;
 pub mod pdu;
 pub mod prelude;
+mod response_finalizer;
 pub mod transport;
 #[cfg_attr(
     not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),

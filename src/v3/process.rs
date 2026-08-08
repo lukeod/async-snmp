@@ -154,6 +154,8 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) local_receive_capacity: MessageSize,
     /// Hard total-message bound for inbound decoding.
     pub(crate) accepted_receive_size: usize,
+    /// Local policy bound for outbound responses and Reports.
+    pub(crate) outbound_limit: usize,
     pub(crate) usm_users: &'a HashMap<Bytes, UsmConfig>,
     pub(crate) stats: &'a UsmStats,
     pub(crate) mpd: Option<MpdCounters<'a>>,
@@ -235,7 +237,7 @@ pub(crate) fn process_v3_inbound(
         // (the case here: the message failed USM processing), when the
         // reportableFlag is set.
         let report = if msg.global_data.msg_flags.reportable {
-            Some(encode_v3_report(
+            let encoded = encode_v3_report(
                 msg.global_data.msg_id,
                 ctx.local_receive_capacity,
                 UsmSecurityParams::new(
@@ -248,7 +250,12 @@ pub(crate) fn process_v3_inbound(
                 count,
                 auth_key,
                 source,
-            )?)
+            )?;
+            crate::response_finalizer::finalize_report(
+                encoded,
+                ctx.outbound_limit,
+                Some(msg.global_data.msg_max_size.as_usize()),
+            )
         } else {
             None
         };
@@ -433,6 +440,7 @@ mod tests {
             engine_time: 1000,
             local_receive_capacity: MessageSize::new(8192).unwrap(),
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
+            outbound_limit: 8192,
             usm_users,
             stats,
             mpd,
@@ -572,6 +580,44 @@ mod tests {
         let pdu = report.pdu().unwrap();
         assert_eq!(pdu.pdu_type(), PduType::Report);
         assert_eq!(pdu.varbinds[0].oid, report_oids::unknown_engine_ids());
+    }
+
+    #[test]
+    fn report_exact_limit_minus_one_limit_and_plus_one() {
+        let engine_id = local_engine_id();
+        let users = HashMap::new();
+
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let outcome =
+            process_v3_inbound(build_msg(b"", b"", true), &ctx, &V3Role::Authoritative).unwrap();
+        let V3Inbound::Failed {
+            report: Some(report),
+            ..
+        } = outcome
+        else {
+            panic!("discovery must produce a Report with the unrestricted limit");
+        };
+        let exact = report.len();
+
+        for (limit, report_fits) in [(exact - 1, false), (exact, true), (exact + 1, true)] {
+            let stats = UsmStats::default();
+            let mut ctx = test_ctx(&engine_id, &users, &stats, None);
+            ctx.outbound_limit = limit;
+            let outcome =
+                process_v3_inbound(build_msg(b"", b"", true), &ctx, &V3Role::Authoritative)
+                    .unwrap();
+            let V3Inbound::Failed { failure, report } = outcome else {
+                panic!("discovery must fail USM processing");
+            };
+            assert_eq!(failure, UsmFailure::UnknownEngineIds);
+            assert_eq!(
+                report.is_some(),
+                report_fits,
+                "limit {limit}, exact {exact}"
+            );
+            assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 1);
+        }
     }
 
     /// RFC 3412 Section 7.1 Step 3: with reportable=false the counter is

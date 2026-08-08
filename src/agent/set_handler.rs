@@ -38,16 +38,8 @@ impl Agent {
     /// Response, before the test or commit phases run, so an oversized SET is
     /// never applied.
     pub(super) async fn handle_set(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
-        // RFC 3416 Section 4.2.5 step (1): the SET Response echoes the request
-        // varbinds. If that Response would not fit, return tooBig without running
-        // the test or commit phases (prevents a retrying manager re-applying it).
-        if !Self::response_fits(
-            &pdu.varbinds,
-            self.response_overhead(ctx),
-            self.effective_max_size(ctx),
-        ) {
-            return Ok(Self::too_big_response(ctx.version, pdu));
-        }
+        // The message-envelope path performs an exact preflight encoding before
+        // dispatch, so an oversized SET never reaches the test/commit phases.
 
         // Track which handlers we need to commit/undo
         struct PendingSet<'a> {
@@ -408,16 +400,14 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .max_message_size(150)
+            .max_message_size(80)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
             .build()
             .await
             .unwrap();
 
-        let ctx = test_ctx();
-
-        // The echoed Response for five varbinds exceeds the 150-byte limit.
+        // The echoed Response for five varbinds exceeds the 80-byte limit.
         // RFC 3416 Section 4.2.5 requires returning tooBig before any commit.
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
@@ -427,7 +417,17 @@ mod tests {
             five_set_varbinds(),
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let request = crate::message::CommunityMessage::v2c(b"public".as_slice(), pdu)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let response = agent
+            .handle_v2c(request, "127.0.0.1:161".parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = crate::message::CommunityMessage::decode(response).unwrap();
+        let response = response.pdu().standard().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
         assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());

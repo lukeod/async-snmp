@@ -84,21 +84,29 @@ impl super::NotificationReceiver {
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
                 let request_id = pdu.request_id;
 
-                // Send response
-                let response = pdu.to_response();
-                let response_msg = CommunityMessage::v2c(msg.community().clone(), response)?;
-                let response_bytes = response_msg.encode()?;
+                let finalized = crate::response_finalizer::finalize_response(
+                    crate::Version::V2c,
+                    pdu,
+                    pdu.to_response(),
+                    self.inner.max_message_size,
+                    None,
+                    &self.inner.snmp_silent_drops,
+                    |response| CommunityMessage::v2c(msg.community().clone(), response)?.encode(),
+                )?;
 
-                self.inner
-                    .socket
-                    .send_to(&response_bytes, source)
-                    .await
-                    .map_err(|e| Error::Network {
-                        target: source,
-                        source: e,
-                    })?;
-
-                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
+                if let Some(response_bytes) = finalized.into_bytes() {
+                    self.inner
+                        .socket
+                        .send_to(&response_bytes, source)
+                        .await
+                        .map_err(|e| Error::Network {
+                            target: source,
+                            source: e,
+                        })?;
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
+                } else {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "Inform response and tooBig alternate exceed max message size");
+                }
 
                 Ok(Some(Notification::InformV2c {
                     community: msg.community().clone(),
@@ -131,6 +139,7 @@ impl super::NotificationReceiver {
             engine_time: our_time,
             local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
+            outbound_limit: self.inner.max_message_size,
             usm_users: &self.inner.usm_users,
             stats: &self.inner.usm_stats,
             mpd: None,
@@ -213,29 +222,39 @@ impl super::NotificationReceiver {
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
                 let request_id = pdu.request_id;
 
-                // Build and send response with appropriate security level
-                let response_pdu = pdu.to_response();
-
-                let response_bytes = build_v3_response(
-                    &self.inner,
-                    global_data,
-                    usm_params,
-                    response_pdu,
-                    context_engine_id.clone(),
-                    context_name.clone(),
-                    Some(&inbound.derived_keys),
+                let finalized = crate::response_finalizer::finalize_response(
+                    crate::Version::V3,
+                    pdu,
+                    pdu.to_response(),
+                    self.inner.max_message_size,
+                    Some(global_data.msg_max_size.as_usize()),
+                    &self.inner.snmp_silent_drops,
+                    |response_pdu| {
+                        build_v3_response(
+                            &self.inner,
+                            global_data,
+                            usm_params,
+                            response_pdu,
+                            context_engine_id.clone(),
+                            context_name.clone(),
+                            Some(&inbound.derived_keys),
+                        )
+                    },
                 )?;
 
-                self.inner
-                    .socket
-                    .send_to(&response_bytes, source)
-                    .await
-                    .map_err(|e| Error::Network {
-                        target: source,
-                        source: e,
-                    })?;
-
-                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "sent V3 Inform response");
+                if let Some(response_bytes) = finalized.into_bytes() {
+                    self.inner
+                        .socket
+                        .send_to(&response_bytes, source)
+                        .await
+                        .map_err(|e| Error::Network {
+                            target: source,
+                            source: e,
+                        })?;
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "sent V3 Inform response");
+                } else {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "V3 Inform response and tooBig alternate exceed max message size");
+                }
 
                 Ok(Some(Notification::InformV3 {
                     username,

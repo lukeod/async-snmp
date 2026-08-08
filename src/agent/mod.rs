@@ -868,6 +868,8 @@ impl AgentBuilder {
             engine_time: AtomicU32::new(0),
             engine_start: Instant::now(),
             engine_boots_base: engine_boots,
+            #[cfg(test)]
+            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
             max_message_size: self.max_message_size,
             local_receive_capacity,
             snmp_in_asn_parse_errs: AtomicU32::new(0),
@@ -943,6 +945,8 @@ pub(crate) struct AgentState {
     pub(crate) engine_start: Instant,
     /// Initial `engine_boots` value at startup, used to compute overflow-adjusted boots.
     pub(crate) engine_boots_base: u32,
+    #[cfg(test)]
+    authoritative_elapsed_override: std::sync::atomic::AtomicU64,
     /// Configured upper bound for outbound response messages.
     pub(crate) max_message_size: usize,
     /// Wire-valid `msgMaxSize` advertising this agent's UDP receive capacity.
@@ -970,16 +974,39 @@ pub(crate) struct AgentState {
 impl AgentState {
     /// Return one coherent authoritative boots/time pair for the current instant.
     pub(crate) fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
-        let pair = match &self.authoritative_engine {
-            Some(engine) => engine.current_boots_time()?,
-            None => {
-                let total_secs = self.engine_start.elapsed().as_secs();
-                compute_engine_boots_time(self.engine_boots_base, total_secs)
-            }
+        #[cfg(test)]
+        let override_elapsed = self.authoritative_elapsed_override.load(Ordering::Relaxed);
+        #[cfg(test)]
+        let pair = if override_elapsed != u64::MAX {
+            compute_engine_boots_time(self.engine_boots_base, override_elapsed)
+        } else {
+            self.sample_authoritative_boots_time()?
         };
+        #[cfg(not(test))]
+        let pair = self.sample_authoritative_boots_time()?;
+
         self.engine_boots.store(pair.0, Ordering::Relaxed);
         self.engine_time.store(pair.1, Ordering::Relaxed);
         Ok(pair)
+    }
+
+    fn sample_authoritative_boots_time(&self) -> Result<(u32, u32)> {
+        match &self.authoritative_engine {
+            Some(engine) => engine.current_boots_time(),
+            None => {
+                let total_secs = self.engine_start.elapsed().as_secs();
+                Ok(compute_engine_boots_time(
+                    self.engine_boots_base,
+                    total_secs,
+                ))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_authoritative_elapsed_for_test(&self, elapsed: u64) {
+        self.authoritative_elapsed_override
+            .store(elapsed, Ordering::Relaxed);
     }
 }
 
@@ -1350,22 +1377,7 @@ impl Agent {
 
                 match agent.handle_request(data, recv_meta.addr).await {
                     Ok(Some(response_bytes)) => {
-                        // Per RFC 3416 Section 4.2 the GET/GETNEXT/SET handlers
-                        // already emit a tooBig Response when their result would
-                        // not fit (and GETBULK Section 4.2.3 truncates or emits
-                        // tooBig). This drop is the final fallback for when even
-                        // that empty tooBig Response still exceeds the limit; the
-                        // packet is then silently dropped (snmpSilentDrops).
-                        if response_bytes.len() > agent.inner.state.max_message_size {
-                            agent
-                                .inner
-                                .state
-                                .snmp_silent_drops
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, response_size = response_bytes.len(), max_size = agent.inner.state.max_message_size }, "response exceeds max message size, silently dropped");
-                        } else if let Err(e) =
-                            agent.send_response(&response_bytes, &recv_meta).await
-                        {
+                        if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
                             tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "failed to send response");
                         }
                     }
@@ -1522,23 +1534,9 @@ impl Agent {
     /// the RFC 3413 architecture informs are addressed to notification
     /// receivers, not command responders; applications that want to consume
     /// informs should use [`crate::notification::NotificationReceiver`].
-    fn handle_inform(&self, ctx: &RequestContext, pdu: &Pdu) -> Pdu {
-        // Acknowledge by echoing the same varbinds in a Response.
-        //
-        // RFC 3416 Section 4.2.7: an InformRequest is a confirmed-class PDU. If
-        // the echoed Response would exceed the message-size limit, return a
-        // tooBig Response with an empty variable-bindings list rather than
-        // letting the oversized Response be silently dropped. A confirmed-class
-        // sender that never receives a fitting acknowledgement would otherwise
-        // retry indefinitely.
-        if !Self::response_fits(
-            &pdu.varbinds,
-            self.response_overhead(ctx),
-            self.effective_max_size(ctx),
-        ) {
-            return Self::too_big_response(ctx.version, pdu);
-        }
-
+    fn handle_inform(&self, _ctx: &RequestContext, pdu: &Pdu) -> Pdu {
+        // Exact sizing and the empty-varbind tooBig fallback are applied at the
+        // shared message-envelope finalizer after the response is encoded.
         pdu.to_response()
     }
 
@@ -1561,11 +1559,10 @@ impl Agent {
     /// security level, so the v3 estimate adds the engine ID (carried twice, as
     /// the authoritative engine ID in the security parameters and the context
     /// engine ID in the scopedPDU), the user name, the context name, and the
-    /// auth/priv material. The result is deliberately a conservative upper
-    /// bound: a slight over-estimate only trims a varbind or two, whereas an
-    /// under-estimate would let a Response exceed the client's msgMaxSize (sent
-    /// anyway) or the agent limit (silently dropped) instead of returning
-    /// tooBig.
+    /// auth/priv material. The result is deliberately a conservative work
+    /// budget that may trim later varbinds. It never selects `tooBig`: the first
+    /// candidate and the final response are authoritatively decided by exact
+    /// message-envelope encoding.
     fn response_overhead(&self, ctx: &RequestContext) -> usize {
         if ctx.version != Version::V3 {
             // v1/v2c echo the request's community string in the response
@@ -1585,30 +1582,6 @@ impl Agent {
             overhead += V3_PRIV_OVERHEAD;
         }
         overhead
-    }
-
-    /// Estimate whether a Response carrying `varbinds` fits within `max_size`,
-    /// using the same estimate as GETBULK: `overhead` (from
-    /// [`Agent::response_overhead`]) plus the encoded size of each varbind.
-    fn response_fits(varbinds: &[VarBind], overhead: usize, max_size: usize) -> bool {
-        let size = overhead + varbinds.iter().map(VarBind::encoded_size).sum::<usize>();
-        size <= max_size
-    }
-
-    /// Build the `tooBig` Response for `pdu`: error-status `tooBig`, error-index
-    /// zero, per RFC 3416 Section 4.2.
-    ///
-    /// RFC 3416 clears the variable-bindings field for v2c/v3. SNMPv1 predates
-    /// that rule: RFC 1157 Sections 4.1.2-4.1.4 specify that on a tooBig error
-    /// the Response echoes the original request's variable bindings unchanged,
-    /// so v1 tooBig Responses carry the request varbinds.
-    pub(super) fn too_big_response(version: Version, pdu: &Pdu) -> Pdu {
-        let varbinds = if version == Version::V1 {
-            pdu.varbinds.clone()
-        } else {
-            Vec::new()
-        };
-        Pdu::response(pdu.request_id, ErrorStatus::TooBig.as_i32(), 0, varbinds)
     }
 
     /// Handle GET request.
@@ -1680,16 +1653,6 @@ impl Agent {
             response_varbinds.push(VarBind::new(vb.oid.clone(), response_value));
         }
 
-        // RFC 3416 Section 4.2.1: if the Response would exceed the message-size
-        // limit, return a tooBig Response with an empty variable-bindings list.
-        if !Self::response_fits(
-            &response_varbinds,
-            self.response_overhead(ctx),
-            self.effective_max_size(ctx),
-        ) {
-            return Ok(Self::too_big_response(ctx.version, pdu));
-        }
-
         Ok(Pdu::response(pdu.request_id, 0, 0, response_varbinds))
     }
 
@@ -1723,16 +1686,6 @@ impl Agent {
                 }
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
             }
-        }
-
-        // RFC 3416 Section 4.2.2: if the Response would exceed the message-size
-        // limit, return a tooBig Response with an empty variable-bindings list.
-        if !Self::response_fits(
-            &response_varbinds,
-            self.response_overhead(ctx),
-            self.effective_max_size(ctx),
-        ) {
-            return Ok(Self::too_big_response(ctx.version, pdu));
         }
 
         Ok(Pdu::response(pdu.request_id, 0, 0, response_varbinds))
@@ -1785,9 +1738,12 @@ impl Agent {
             };
 
             if !can_add(&next_vb, current_size) {
-                // Can't fit even non-repeaters, return tooBig if we have nothing
                 if response_varbinds.is_empty() {
-                    return Ok(Self::too_big_response(ctx.version, pdu));
+                    // The budget is deliberately conservative and therefore
+                    // cannot authoritatively select tooBig. Return the first
+                    // candidate to the message-envelope finalizer, which will
+                    // encode it exactly before choosing the protocol fallback.
+                    response_varbinds.push(next_vb);
                 }
                 // RFC 3416 Section 4.2.3: truncation removes variable bindings
                 // from the END of the positional set. All repeaters are
@@ -1845,20 +1801,14 @@ impl Agent {
                         }
                     };
 
-                    // Check size before adding
+                    // Check the conservative work budget before adding. If this
+                    // is the first binding, retain it so the exact envelope
+                    // finalizer—not this estimate—decides between the candidate,
+                    // tooBig, and a silent drop.
                     if !can_add(&next_vb, current_size) {
-                        // RFC 3416 Section 4.2.3 / net-snmp: if nothing has fit
-                        // yet (common non_repeaters == 0 shape where the first
-                        // repeater varbind is oversized), return tooBig with
-                        // empty varbinds. Mirrors the non-repeater tooBig guard
-                        // above; a bare noError+empty response is
-                        // indistinguishable from end-of-MIB and silently ends a
-                        // manager's walk instead of prompting a retry with a
-                        // smaller max-repetitions.
                         if response_varbinds.is_empty() {
-                            return Ok(Self::too_big_response(ctx.version, pdu));
+                            response_varbinds.push(next_vb);
                         }
-                        // Some varbinds already fit: truncate (partial response).
                         break 'outer;
                     }
 
@@ -2969,9 +2919,7 @@ mod tests {
             .unwrap();
 
         // A long, operator-configured community is echoed in the v1/v2c
-        // response wrapper and must be reflected in the overhead estimate so
-        // response_fits does not accept a Response that then exceeds the size
-        // limit (silent drop) instead of returning tooBig.
+        // response wrapper and must be reflected in GETBULK's early budget.
         let short = test_ctx();
         let mut long = test_ctx();
         long.security_name = Bytes::from(vec![b'x'; 200]);
@@ -2980,21 +2928,6 @@ mod tests {
             agent.response_overhead(&long) - agent.response_overhead(&short),
             long.security_name.len() - short.security_name.len()
         );
-
-        // With a single varbind sized to fit only when the community length is
-        // ignored, the long community must flip response_fits to false.
-        let vb = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Integer(0));
-        let max = RESPONSE_OVERHEAD + short.security_name.len() + vb.encoded_size();
-        assert!(Agent::response_fits(
-            std::slice::from_ref(&vb),
-            agent.response_overhead(&short),
-            max
-        ));
-        assert!(!Agent::response_fits(
-            std::slice::from_ref(&vb),
-            agent.response_overhead(&long),
-            max
-        ));
     }
 
     #[tokio::test]
@@ -3182,9 +3115,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_getbulk_too_big_has_empty_varbinds() {
-        // RFC 3416 Section 4.2: a tooBig Response has an empty variable-bindings
-        // field. When not even the first GETBULK varbind fits, respond tooBig.
+    async fn test_getbulk_first_non_repeater_survives_conservative_budget() {
+        // The dispatch-layer budget is only an optimization. Its first
+        // candidate must survive for exact message-envelope finalization.
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
@@ -3213,22 +3146,14 @@ mod tests {
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
-        assert!(
-            response.varbinds.is_empty(),
-            "tooBig Response must have empty varbinds, got {}",
-            response.varbinds.len()
-        );
+        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.varbinds.len(), 1);
     }
 
     #[tokio::test]
-    async fn test_getbulk_too_big_zero_non_repeaters_first_repeater_oversized() {
-        // RFC 3416 Section 4.2.3 / net-snmp: for the common GETBULK shape
-        // non_repeaters == 0, when the FIRST repeater varbind does not fit the
-        // size limit, respond tooBig with empty varbinds (not a bare
-        // noError+empty response, which a manager cannot distinguish from
-        // end-of-MIB). Regression test for the repeater-loop `break 'outer`
-        // path that returned error_status 0 with empty varbinds.
+    async fn test_getbulk_first_repeater_survives_conservative_budget() {
+        // The first repeater candidate likewise reaches exact envelope
+        // finalization rather than letting the estimate select tooBig.
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
@@ -3262,16 +3187,8 @@ mod tests {
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        assert_eq!(
-            response.error_status(),
-            ErrorStatus::TooBig.as_i32(),
-            "first oversized repeater varbind (non_repeaters == 0) must yield tooBig"
-        );
-        assert!(
-            response.varbinds.is_empty(),
-            "tooBig Response must have empty varbinds, got {}",
-            response.varbinds.len()
-        );
+        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.varbinds.len(), 1);
     }
 
     #[tokio::test]
@@ -3741,7 +3658,7 @@ mod tests {
         Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .max_message_size(150)
+            .max_message_size(80)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .without_builtin_handlers()
             .build()
@@ -3755,10 +3672,37 @@ mod tests {
             .collect()
     }
 
+    async fn finalized_community_response(agent: &Agent, version: Version, pdu: Pdu) -> Pdu {
+        let request = crate::message::CommunityMessage::new(version, b"public".as_slice(), pdu)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let bytes = match version {
+            Version::V1 => {
+                agent
+                    .handle_v1(request, "127.0.0.1:161".parse().unwrap())
+                    .await
+            }
+            Version::V2c => {
+                agent
+                    .handle_v2c(request, "127.0.0.1:161".parse().unwrap())
+                    .await
+            }
+            Version::V3 => unreachable!(),
+        }
+        .unwrap()
+        .unwrap();
+        crate::message::CommunityMessage::decode(bytes)
+            .unwrap()
+            .pdu()
+            .standard()
+            .unwrap()
+            .clone()
+    }
+
     #[tokio::test]
     async fn test_get_too_big_returns_toobig_response() {
         let agent = small_limit_agent().await;
-        let ctx = test_ctx();
 
         // GET for all five OIDs; the response cannot fit within the 150-byte
         // effective limit, so RFC 3416 Section 4.2.1 requires a tooBig Response.
@@ -3770,22 +3714,26 @@ mod tests {
             five_varbinds(),
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = finalized_community_response(&agent, Version::V2c, pdu).await;
         assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
         assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());
     }
 
     #[tokio::test]
-    async fn test_get_too_big_v1_echoes_request_varbinds() {
-        let agent = small_limit_agent().await;
+    async fn test_v1_exact_size_overrides_conservative_estimate() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .max_message_size(150)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
 
-        // SNMPv1 (RFC 1157 Sections 4.1.2-4.1.4): a tooBig Response echoes the
-        // original request's variable bindings, unlike v2c/v3 which clear them.
-        let mut ctx = test_ctx();
-        ctx.version = Version::V1;
-        ctx.security_model = SecurityModel::V1;
-
+        // The old conservative estimate selected tooBig here. Exact envelope
+        // encoding shows that the normal response fits.
         let request_varbinds = five_varbinds();
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetRequest,
@@ -3795,15 +3743,13 @@ mod tests {
             request_varbinds.clone(),
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index(), 0);
-        assert_eq!(response.varbinds, request_varbinds);
+        let response = finalized_community_response(&agent, Version::V1, pdu.clone()).await;
+        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.varbinds.len(), request_varbinds.len());
 
-        // The same oversized request under v2c must still clear the varbinds.
-        let v2c_response = agent.dispatch_request(&test_ctx(), &pdu).await.unwrap();
-        assert_eq!(v2c_response.error_status(), ErrorStatus::TooBig.as_i32());
-        assert!(v2c_response.varbinds.is_empty());
+        let v2c_response = finalized_community_response(&agent, Version::V2c, pdu).await;
+        assert_eq!(v2c_response.error_status(), 0);
+        assert_eq!(v2c_response.varbinds.len(), request_varbinds.len());
     }
 
     #[tokio::test]
@@ -3832,8 +3778,6 @@ mod tests {
     #[tokio::test]
     async fn test_getnext_too_big_returns_toobig_response() {
         let agent = small_limit_agent().await;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetNextRequest;
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetNextRequest,
@@ -3843,7 +3787,7 @@ mod tests {
             five_varbinds(),
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = finalized_community_response(&agent, Version::V2c, pdu).await;
         assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
         assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());
@@ -3852,8 +3796,6 @@ mod tests {
     #[tokio::test]
     async fn test_inform_too_big_returns_toobig_response() {
         let agent = small_limit_agent().await;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::InformRequest;
 
         // An InformRequest whose echoed Response would exceed the 150-byte
         // effective limit. RFC 3416 Section 4.2.7 (confirmed-class) requires a
@@ -3869,7 +3811,7 @@ mod tests {
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), big)],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = finalized_community_response(&agent, Version::V2c, pdu).await;
         assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
         assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());

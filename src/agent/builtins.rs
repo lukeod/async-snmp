@@ -304,6 +304,7 @@ mod tests {
             engine_time: AtomicU32::new(12345),
             engine_start: Instant::now(),
             engine_boots_base: 5,
+            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
             max_message_size: 1472,
             local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             snmp_in_asn_parse_errs: AtomicU32::new(0),

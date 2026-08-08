@@ -1,28 +1,28 @@
 //! V3 response building for the SNMP agent.
 
-use bytes::Bytes;
-use std::sync::atomic::Ordering;
-
 use crate::error::Result;
 use crate::message::MsgGlobalData;
 use crate::pdu::Pdu;
 use crate::v3::DerivedKeys;
 use crate::v3::encode::encode_v3_response;
 use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
+use bytes::Bytes;
 
 use super::Agent;
 
 impl Agent {
     /// Build a V3 response message with appropriate security.
-    pub(super) fn build_v3_response(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finalize_v3_response(
         &self,
         incoming: &MsgGlobalData,
         incoming_usm: &UsmSecurityParams,
+        request_pdu: &Pdu,
         response_pdu: Pdu,
         context_engine_id: Bytes,
         context_name: Bytes,
         derived_keys: Option<&DerivedKeys>,
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<crate::response_finalizer::FinalizedResponse> {
         let security_level = incoming.msg_flags.security_level;
         // Handlers are asynchronous and may run long after the receive task's
         // cached time refresh. Derive both fields from one elapsed-time sample
@@ -33,11 +33,7 @@ impl Agent {
         // RFC 3414 Section 2.3: refuse authenticated messages when boots latched
         if security_level.requires_auth() && engine_boots == MAX_ENGINE_TIME {
             tracing::warn!(target: "async_snmp::agent", "engine boots at maximum, refusing authenticated response");
-            self.inner
-                .state
-                .snmp_silent_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
+            return Ok(crate::response_finalizer::FinalizedResponse::Dropped);
         }
 
         let response_usm = UsmSecurityParams::new(
@@ -50,19 +46,56 @@ impl Agent {
         // RFC 3412 Section 6.3: msgMaxSize advertises this agent's own receive
         // capacity, not the requester's echoed value or the outbound response
         // size limit.
-        encode_v3_response(
+        crate::response_finalizer::finalize_response(
+            crate::Version::V3,
+            request_pdu,
             response_pdu,
-            incoming.msg_id,
-            self.inner.state.local_receive_capacity,
-            security_level,
-            response_usm,
+            self.inner.state.max_message_size,
+            Some(incoming.msg_max_size.as_usize()),
+            &self.inner.state.snmp_silent_drops,
+            |response_pdu| {
+                encode_v3_response(
+                    response_pdu,
+                    incoming.msg_id,
+                    self.inner.state.local_receive_capacity,
+                    security_level,
+                    response_usm.clone(),
+                    context_engine_id.clone(),
+                    context_name.clone(),
+                    derived_keys,
+                    &self.inner.salt_counter,
+                    self.inner.local_addr,
+                )
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn build_v3_response(
+        &self,
+        incoming: &MsgGlobalData,
+        incoming_usm: &UsmSecurityParams,
+        response_pdu: Pdu,
+        context_engine_id: Bytes,
+        context_name: Bytes,
+        derived_keys: Option<&DerivedKeys>,
+    ) -> Result<crate::response_finalizer::FinalizedResponse> {
+        let request = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            response_pdu.request_id,
+            0,
+            0,
+            Vec::new(),
+        );
+        self.finalize_v3_response(
+            incoming,
+            incoming_usm,
+            &request,
+            response_pdu,
             context_engine_id,
             context_name,
             derived_keys,
-            &self.inner.salt_counter,
-            self.inner.local_addr,
         )
-        .map(Some)
     }
 }
 
@@ -177,8 +210,8 @@ mod tests {
         );
         assert_eq!(
             agent.inner.state.snmp_silent_drops.load(Ordering::Relaxed),
-            1,
-            "snmpSilentDrops should be incremented"
+            0,
+            "max-engine-boots refusal is not a size-related silent drop"
         );
     }
 
