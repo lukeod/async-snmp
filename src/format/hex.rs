@@ -60,8 +60,8 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 ///
 /// Accepts formats like "de:ad:be:ef", "de-ad-be-ef", or "de ad be ef".
 ///
-/// Returns an error if the stripped input has an odd number of hex digits or
-/// contains invalid hex characters.
+/// Returns an error if the input contains any other characters or if the
+/// remaining input has an odd number of hex digits.
 ///
 /// # Examples
 ///
@@ -74,7 +74,14 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 /// assert!(decode_relaxed("a").is_err()); // one hex digit is odd-length
 /// ```
 pub fn decode_relaxed(s: &str) -> Result<Vec<u8>, DecodeError> {
-    let clean: String = s.chars().filter(char::is_ascii_hexdigit).collect();
+    let mut clean = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            c if c.is_ascii_hexdigit() => clean.push(c),
+            ' ' | ':' | '-' => {}
+            _ => return Err(DecodeError::InvalidChar),
+        }
+    }
     decode(&clean)
 }
 
@@ -258,10 +265,18 @@ mod tests {
 
     #[test]
     fn test_decode_relaxed_errors() {
-        // One hex digit after stripping non-hex chars
-        assert!(decode_relaxed("a").is_err());
-        // Three hex digits - odd after stripping
-        assert!(decode_relaxed("a:b:c").is_err());
+        assert_eq!(decode_relaxed("a"), Err(DecodeError::OddLength));
+        assert_eq!(decode_relaxed("a:b:c"), Err(DecodeError::OddLength));
+        assert_eq!(decode_relaxed("gg"), Err(DecodeError::InvalidChar));
+        assert_eq!(decode_relaxed("de.ad"), Err(DecodeError::InvalidChar));
+        assert_eq!(decode_relaxed("de:ag"), Err(DecodeError::InvalidChar));
+        assert_eq!(decode_relaxed("é"), Err(DecodeError::InvalidChar));
+    }
+
+    #[test]
+    fn test_decode_relaxed_empty() {
+        assert_eq!(decode_relaxed("").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_relaxed(" --:: ").unwrap(), Vec::<u8>::new());
     }
 
     #[test]

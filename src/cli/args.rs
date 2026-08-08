@@ -432,8 +432,14 @@ impl ValueType {
             }
             ValueType::String => Ok(Value::OctetString(s.as_bytes().to_vec().into())),
             ValueType::HexString => {
-                let bytes = hex::decode_relaxed(s)
-                    .map_err(|_| "hex string must have even number of hex digits".to_string())?;
+                let bytes = hex::decode_relaxed(s).map_err(|error| match error {
+                    hex::DecodeError::OddLength => {
+                        "hex string must have even number of hex digits".to_string()
+                    }
+                    hex::DecodeError::InvalidChar => {
+                        "hex string contains invalid character".to_string()
+                    }
+                })?;
                 Ok(Value::OctetString(bytes.into()))
             }
             ValueType::Oid => {
@@ -801,6 +807,11 @@ mod tests {
 
         // Odd number of digits
         assert!(ValueType::HexString.parse_value("001").is_err());
+
+        assert_eq!(
+            ValueType::HexString.parse_value("00.gg").unwrap_err(),
+            "hex string contains invalid character"
+        );
     }
 
     #[test]
