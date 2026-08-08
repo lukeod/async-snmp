@@ -22,7 +22,7 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 - **Trap and inform sending**: Agent-based (multi-sink) and client-based notification sending with V1/V2c/V3 support
 - **Trap and inform receiving**: V1/V2c/V3 notification receiver with optional community filtering and per-notification security-level reporting
 - **SNMP agent**: Async handler framework with two-phase SET commit, VACM access control, and built-in MIB handlers for engine/USM/MPD statistics
-- **SNMPv3 security**: MD5/SHA-1/SHA-2 authentication, DES/3DES/AES-128/192/256 privacy, with pluggable crypto backends including a FIPS 140-3 option
+- **SNMPv3 security**: MD5/SHA-1/SHA-2 authentication, DES/3DES/AES-128/192/256 privacy, with compile-time RustCrypto or FIPS 140-3 backend selection
 - **Automatic tooBig recovery**: GET/GETNEXT batches are automatically bisected when an agent returns a tooBig error
 - **Multiple transports**: UDP (per-client or shared), TCP
 - **Zero-copy decoding**: Minimal allocations using `bytes` crate
@@ -47,9 +47,14 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 
 **Privacy:** DES, 3DES, AES-128, AES-192, AES-256
 
-**Crypto backends:** Pluggable via the `CryptoProvider` trait. Two built-in providers:
+**Crypto backends:** Select exactly one backend for the whole build with mutually
+exclusive Cargo features; runtime custom-provider injection is not supported:
 - `crypto-rustcrypto` (default) - RustCrypto crates, supports all protocols
 - `crypto-fips` - aws-lc-rs for FIPS 140-3 compliance (rejects MD5, DES, 3DES)
+
+Plaintext authentication and privacy passwords shorter than 8 octets are
+rejected with `CryptoError::PasswordTooShort`. Constructors that accept
+pre-derived key material are unaffected.
 
 ### Authoritative Engine Persistence
 

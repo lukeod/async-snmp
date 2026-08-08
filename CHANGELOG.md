@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** The internal `CryptoProvider` abstraction and concrete backend
+  provider types are no longer exported. Applications select exactly one
+  backend for the whole build with the mutually exclusive `crypto-rustcrypto`
+  or `crypto-fips` features; runtime custom-provider injection is not supported.
+  `CryptoError` gains `InvalidHmacTruncationLength` for invalid primitive output
+  requests.
 - Notification receivers now expose `NotificationVarbindValidation` through
   `NotificationReceiverBuilder::varbind_validation()`. The default tolerant
   policy accepts non-standard first/second varbind names when their values are
@@ -49,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Built-in HMAC operations now reject truncation lengths greater than the
+  selected digest length instead of panicking while slicing the generated tag.
 - Authenticated SNMPv1 GET, GETNEXT, and SET requests carrying Counter64 values
   are now silently dropped and counted by `Agent::snmp_in_asn_parse_errs()`.
 - SET commit failure now undoes every attempted binding, including the failed
@@ -278,7 +286,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** `Notification::TrapV3` and `Notification::InformV3` gained a `security_level: SecurityLevel` field. The `Notification` enum is not `#[non_exhaustive]`, so code that constructs these variants or matches them exhaustively must account for the new field (add `security_level` or use `..`).
-- **Breaking:** `CryptoProvider::encrypt`'s `data` parameter changed from `&mut [u8]` to `&mut Vec<u8>`. Block ciphers (DES, 3DES) now pad unaligned plaintext to the next 8-byte boundary inside the provider (per RFC 3414 Section 8.1.1.2) rather than requiring the caller to pre-pad; the built-in `PrivKey` DES/3DES paths no longer pad before calling the provider. Custom `CryptoProvider` implementations must update the `encrypt` signature. Wire output for the built-in RustCrypto and FIPS providers is unchanged.
+- The internal backend encryption operation's `data` parameter changed from `&mut [u8]` to `&mut Vec<u8>`. Block ciphers (DES, 3DES) now pad unaligned plaintext to the next 8-byte boundary inside the selected backend (per RFC 3414 Section 8.1.1.2) rather than requiring the caller to pre-pad; the built-in `PrivKey` DES/3DES paths no longer pad before dispatch. Wire output for the RustCrypto and FIPS backends is unchanged.
 - A notification receiver configured without USM users now drops all v3 notifications at every security level, per RFC 3414 Section 3.2 Step 4; `bind()` and module docs updated to reflect this.
 - Additional trait derives: `Auth`, `UsmAuth`, `MasterKey`, and `MasterKeys` now derive `PartialEq`, `Eq`, `PartialOrd`, `Ord`, and `Hash`; `CommunityVersion`, `OidOrdering`, `AuthProtocol`, and `PrivProtocol` additionally derive `PartialOrd`, `Ord`, and `Hash`.
 - Bumped the RustCrypto dependencies for the `crypto-rustcrypto` backend to the `cipher` 0.5 / `digest` 0.11 generation: `aes` 0.9, `cbc` 0.2, `cfb-mode` 0.9, `des` 0.9, `digest` 0.11, `hmac` 0.13, `md-5` 0.11, `sha1` 0.11, `sha2` 0.11. Provider internals migrated to the new trait/module names; wire output is unchanged.
@@ -313,12 +321,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Socket buffer size configuration on `UdpTransportBuilder`
 - `UdpTransport::stats()` returning `TransportStats` with delivered/expired request counters
 - Decode historic BER types: NSAP (tag 0x45) as OctetString, UInteger32 (tag 0x47) as Gauge32
-- Pluggable crypto backend via the `CryptoProvider` trait for SNMPv3 USM operations
+- Mutually exclusive compile-time crypto backend selection for SNMPv3 USM operations
 - `crypto-rustcrypto` feature (default) backed by RustCrypto crates, supporting all auth and privacy protocols
 - `crypto-fips` feature backed by aws-lc-rs for FIPS 140-3 compliance; rejects MD5, DES, and 3DES at runtime with `CryptoError::UnsupportedAlgorithm`
-- `CryptoProvider` trait, `CryptoError` enum, and `CryptoResult` type alias exported from crate root
-- `RustCryptoProvider` and `AwsLcFipsProvider` concrete provider types (feature-gated)
-- Security requirements documentation on `CryptoProvider` trait for custom implementations
+- `CryptoError` enum and `CryptoResult` type alias exported from the crate root for fallible key and USM operations
 - Trait impls across public types: `TryFrom<i32>` for `Version`/`RowStatus`/`StorageType`, `TryFrom<u8>`/`Into<u8>` for `SecurityLevel`, `From<Vec<u32>>` for `Oid`, `Hash` for `PduType`/`GenericTrap`/`ErrorStatus`/`WalkAbortReason`, `PartialEq`/`Eq` for `UsmSecurityParams` and message types, `AsRef` for `Oid`/`MasterKey`/`LocalizedKey`, `IntoIterator` for `Oid`/`OidTable`, `Copy` for `Backoff`/`DecodeError`, `Debug` for `DerivedKeys`/`VarBindInfo`
 - `ClientBuilder`, `UsmBuilder`, `RetryBuilder`, `TcpTransportBuilder` now derive `Debug`; `RetryBuilder` also derives `Clone`
 - `Auth`, `ClientBuilder`, and `Retry` re-exported from the prelude

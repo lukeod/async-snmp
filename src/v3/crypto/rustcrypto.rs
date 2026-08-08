@@ -5,7 +5,7 @@ use crate::v3::{AuthProtocol, PrivProtocol};
 ///
 /// This is a stateless unit struct that dispatches to the appropriate
 /// `RustCrypto` implementations based on the protocol enum values.
-pub struct RustCryptoProvider;
+pub(crate) struct RustCryptoProvider;
 
 // --- Dispatch macro for auth protocol -> concrete hash type ---
 
@@ -61,6 +61,14 @@ impl CryptoProvider for RustCryptoProvider {
         slices: &[&[u8]],
         truncate_len: usize,
     ) -> CryptoResult<Vec<u8>> {
+        let digest_length = protocol.digest_len();
+        if truncate_len > digest_length {
+            return Err(CryptoError::InvalidHmacTruncationLength {
+                requested: truncate_len,
+                digest_length,
+            });
+        }
+
         Ok(dispatch_auth!(
             protocol,
             compute_hmac_impl,
@@ -330,6 +338,35 @@ fn decrypt_aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmac_truncation_boundaries_for_all_digests() {
+        let provider = RustCryptoProvider;
+        let protocols = [
+            AuthProtocol::Md5,
+            AuthProtocol::Sha1,
+            AuthProtocol::Sha224,
+            AuthProtocol::Sha256,
+            AuthProtocol::Sha384,
+            AuthProtocol::Sha512,
+        ];
+
+        for protocol in protocols {
+            let digest_length = protocol.digest_len();
+            let exact = provider
+                .compute_hmac(protocol, b"key", &[b"message"], digest_length)
+                .expect("exact digest-length truncation must succeed");
+            assert_eq!(exact.len(), digest_length);
+
+            assert_eq!(
+                provider.compute_hmac(protocol, b"key", &[b"message"], digest_length + 1),
+                Err(CryptoError::InvalidHmacTruncationLength {
+                    requested: digest_length + 1,
+                    digest_length,
+                })
+            );
+        }
+    }
 
     /// RFC 3414 §8.1.1.2: "if [the length] is not [a multiple of 8], the data
     /// is padded at the end as necessary." The encrypt operation must handle

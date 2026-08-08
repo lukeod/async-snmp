@@ -9,7 +9,7 @@
 //! - Privacy (DES-CBC, 3DES-EDE-CBC, AES-128/192/256-CFB)
 //! - Engine discovery and time synchronization
 //! - Validated, increment-before-use authoritative engine startup state
-//! - Pluggable cryptographic backends via the [`CryptoProvider`] trait
+//! - Mutually exclusive compile-time cryptographic backends
 //!
 //! Discovery is unauthenticated and establishes only a remote identity
 //! candidate and message-size limit. Boots/time becomes trusted only after
@@ -17,9 +17,9 @@
 //! roles use [`AuthoritativeEngine`] so a stable engine ID and every boots
 //! increment are persisted before protocol use.
 //!
-//! The crypto backend is selected at compile time via the `crypto-rustcrypto`
-//! (default) or `crypto-fips` feature flags. See [`CryptoProvider`] and
-//! the crate-level documentation for details.
+//! The crypto backend is selected for the whole crate build via the mutually
+//! exclusive `crypto-rustcrypto` (default) or `crypto-fips` feature flags.
+//! Runtime custom-provider injection is not supported.
 
 pub mod auth;
 mod authoritative;
@@ -35,11 +35,7 @@ mod usm;
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
 pub use authoritative::{AuthoritativeEngine, PersistedAuthoritativeEngine};
 pub use config::{DerivedKeys, UsmConfig};
-#[cfg(feature = "crypto-fips")]
-pub use crypto::AwsLcFipsProvider;
-#[cfg(feature = "crypto-rustcrypto")]
-pub use crypto::RustCryptoProvider;
-pub use crypto::{CryptoError, CryptoProvider, CryptoResult};
+pub use crypto::{CryptoError, CryptoResult};
 pub use engine::report_oids;
 pub use engine::{
     EngineCache, EngineState, MAX_ENGINE_ID_LEN, MAX_ENGINE_TIME, MIN_ENGINE_ID_LEN, TIME_WINDOW,

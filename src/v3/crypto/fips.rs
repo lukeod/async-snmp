@@ -15,7 +15,7 @@ use crate::v3::{AuthProtocol, PrivProtocol};
 /// method with `AuthProtocol::Md5` returns
 /// [`CryptoError::UnsupportedAlgorithm`]. DES and 3DES are similarly
 /// unsupported.
-pub struct AwsLcFipsProvider;
+pub(crate) struct AwsLcFipsProvider;
 
 fn digest_algorithm(protocol: AuthProtocol) -> CryptoResult<&'static digest::Algorithm> {
     match protocol {
@@ -94,6 +94,14 @@ impl CryptoProvider for AwsLcFipsProvider {
         truncate_len: usize,
     ) -> CryptoResult<Vec<u8>> {
         let alg = hmac_algorithm(protocol)?;
+        let digest_length = protocol.digest_len();
+        if truncate_len > digest_length {
+            return Err(CryptoError::InvalidHmacTruncationLength {
+                requested: truncate_len,
+                digest_length,
+            });
+        }
+
         let hmac_key = hmac::Key::new(alg, key);
         let mut ctx = hmac::Context::with_key(&hmac_key);
         for slice in slices {
@@ -206,4 +214,33 @@ fn decrypt_aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8]) -> CryptoResult<()> {
         CryptoError::CipherError
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hmac_truncation_boundaries() {
+        let provider = AwsLcFipsProvider;
+        let digest_length = AuthProtocol::Sha256.digest_len();
+
+        let exact = provider
+            .compute_hmac(AuthProtocol::Sha256, b"key", &[b"message"], digest_length)
+            .expect("exact digest-length truncation must succeed");
+        assert_eq!(exact.len(), digest_length);
+
+        assert_eq!(
+            provider.compute_hmac(
+                AuthProtocol::Sha256,
+                b"key",
+                &[b"message"],
+                digest_length + 1,
+            ),
+            Err(CryptoError::InvalidHmacTruncationLength {
+                requested: digest_length + 1,
+                digest_length,
+            })
+        );
+    }
 }

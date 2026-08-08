@@ -452,9 +452,10 @@
 //! - `tls` - (Placeholder) SNMP over TLS per RFC 6353
 //! - `dtls` - (Placeholder) SNMP over DTLS per RFC 6353
 //!
-//! **Note:** `crypto-rustcrypto` and `crypto-fips` are mutually exclusive.
-//! Exactly one must be enabled. Using `--all-features` will not compile;
-//! specify features explicitly instead.
+//! The crypto backend is selected for the whole crate at compile time; runtime
+//! custom-provider injection is not supported. `crypto-rustcrypto` and
+//! `crypto-fips` are mutually exclusive. Exactly one must be enabled. Using
+//! `--all-features` will not compile; specify features explicitly instead.
 
 #[cfg(feature = "agent")]
 pub mod agent;
@@ -514,14 +515,10 @@ pub use transport::{
     CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport, Transport,
     UdpHandle, UdpTransport,
 };
-#[cfg(feature = "crypto-fips")]
-pub use v3::AwsLcFipsProvider;
-#[cfg(feature = "crypto-rustcrypto")]
-pub use v3::RustCryptoProvider;
 pub use v3::{
-    AuthProtocol, AuthoritativeEngine, CryptoError, CryptoProvider, CryptoResult, EngineCache,
-    LocalizedKey, MasterKey, MasterKeys, ParseProtocolError, PersistedAuthoritativeEngine,
-    PrivProtocol, UsmConfig, generate_engine_id,
+    AuthProtocol, AuthoritativeEngine, CryptoError, CryptoResult, EngineCache, LocalizedKey,
+    MasterKey, MasterKeys, ParseProtocolError, PersistedAuthoritativeEngine, PrivProtocol,
+    UsmConfig, generate_engine_id,
 };
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;

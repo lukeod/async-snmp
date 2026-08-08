@@ -1,17 +1,15 @@
-//! Pluggable cryptographic provider for `SNMPv3` security operations.
+//! Cryptographic backends for `SNMPv3` security operations.
 //!
-//! This module defines the [`CryptoProvider`] trait that captures the primitive
-//! cryptographic operations needed by the USM layer, and provides two built-in
-//! implementations:
+//! The active backend is selected at compile time through mutually exclusive
+//! feature flags:
 //!
-//! - [`RustCryptoProvider`] (feature `crypto-rustcrypto`, **default**) - backed by
-//!   the `RustCrypto` crate ecosystem. Supports all auth and privacy protocols.
-//! - [`AwsLcFipsProvider`] (feature `crypto-fips`) - backed by aws-lc-rs for
-//!   FIPS 140-3 compliance. Rejects MD5, DES, and 3DES as non-FIPS algorithms.
+//! - `crypto-rustcrypto` (**default**) uses the `RustCrypto` crate ecosystem and
+//!   supports all authentication and privacy protocols.
+//! - `crypto-fips` uses aws-lc-rs for FIPS 140-3 compliance and rejects MD5,
+//!   DES, and 3DES as non-FIPS algorithms.
 //!
-//! The active provider is selected at compile time via mutually exclusive feature
-//! flags. Only one provider can be active per build. See the crate-level
-//! documentation for usage.
+//! Backend dispatch is internal; applications select one backend for the whole
+//! crate build rather than supplying a provider at runtime.
 
 use super::{AuthProtocol, PrivProtocol};
 
@@ -31,6 +29,13 @@ pub enum CryptoError {
     InvalidKeyLength,
     /// The cipher operation failed internally.
     CipherError,
+    /// The requested HMAC truncation exceeds the full digest length.
+    InvalidHmacTruncationLength {
+        /// Requested output length in octets.
+        requested: usize,
+        /// Maximum output length for the selected authentication protocol.
+        digest_length: usize,
+    },
     /// The OS random source is unavailable.
     RandomSource,
     /// The supplied password is shorter than the RFC 3414 minimum (8 octets).
@@ -48,6 +53,13 @@ impl std::fmt::Display for CryptoError {
             }
             Self::InvalidKeyLength => write!(f, "invalid key length"),
             Self::CipherError => write!(f, "cipher operation failed"),
+            Self::InvalidHmacTruncationLength {
+                requested,
+                digest_length,
+            } => write!(
+                f,
+                "invalid HMAC truncation length {requested}; maximum is {digest_length} octets"
+            ),
             Self::RandomSource => write!(f, "OS random source unavailable"),
             Self::PasswordTooShort => write!(
                 f,
@@ -75,53 +87,24 @@ compile_error!(
 #[cfg(feature = "crypto-rustcrypto")]
 mod rustcrypto;
 #[cfg(feature = "crypto-rustcrypto")]
-pub use rustcrypto::RustCryptoProvider;
+pub(crate) use rustcrypto::RustCryptoProvider;
 
 #[cfg(feature = "crypto-fips")]
 mod fips;
 #[cfg(feature = "crypto-fips")]
-pub use fips::AwsLcFipsProvider;
+pub(crate) use fips::AwsLcFipsProvider;
 
-/// Trait defining the cryptographic primitives needed by the `SNMPv3` USM layer.
+/// Internal interface implemented by each compile-time cryptographic backend.
 ///
-/// This trait captures the six core operations that vary between crypto backends:
-/// hashing, password-to-key derivation, key localization, HMAC computation, and
-/// symmetric encryption/decryption.
-///
-/// # Implementors
-///
-/// Methods take `&self` to allow stateful providers (HSM handles, FFI contexts).
-/// The default [`RustCryptoProvider`] is a stateless unit struct.
-///
-/// # Thread Safety
-///
-/// Implementations must be `Send + Sync + 'static` to support use across
-/// async tasks and threads.
-///
-/// # Security Requirements
-///
-/// Implementations must uphold the following properties for correct and secure
-/// `SNMPv3` operation:
-///
-/// - **Constant-time HMAC comparison.** The caller (`verify_message`) performs
-///   the constant-time comparison, but `compute_hmac` must not short-circuit
-///   or leak timing information about intermediate state.
-/// - **IV/salt uniqueness.** Encryption callers supply the IV, but if your
-///   provider wraps a stateful cipher context that generates IVs internally,
-///   it must guarantee uniqueness across calls (RFC 3826 Section 3.1.4.1).
-/// - **Key material hygiene.** Intermediate key material (e.g., expanded
-///   password hashes) should be zeroized after use. Implementations backed
-///   by HSMs or FIPS modules should keep keys in hardware where possible.
-/// - **Algorithm support errors.** Return [`CryptoError::UnsupportedAlgorithm`]
-///   rather than panicking when asked to perform an operation the backend
-///   does not support.
-pub trait CryptoProvider: Send + Sync + 'static {
+/// This keeps auth and privacy operations independent of backend APIs without
+/// promising runtime provider injection as part of the public API.
+pub(crate) trait CryptoProvider: Send + Sync + 'static {
     /// Derive a master key from a password using the RFC 3414 Section A.2.1 algorithm.
     ///
     /// Expands the password to 1MB by repetition and hashes it with the protocol's
     /// hash function. Returns the raw digest bytes.
     ///
-    /// Empty passwords should return an all-zero key of the protocol's digest length.
+    /// Passwords shorter than eight octets return [`CryptoError::PasswordTooShort`].
     ///
     /// Returns [`CryptoError::UnsupportedAlgorithm`] if the backend does not
     /// support the requested authentication protocol.
@@ -146,7 +129,10 @@ pub trait CryptoProvider: Send + Sync + 'static {
     /// non-contiguous data (e.g., message verification with zeroed auth params).
     ///
     /// Returns [`CryptoError::UnsupportedAlgorithm`] if the backend does not
-    /// support the requested authentication protocol.
+    /// support the requested authentication protocol, or
+    /// [`CryptoError::InvalidHmacTruncationLength`] if `truncate_len` exceeds
+    /// the selected protocol's full digest length. Lengths from zero through
+    /// the full digest length are valid.
     fn compute_hmac(
         &self,
         protocol: AuthProtocol,
@@ -189,8 +175,7 @@ pub trait CryptoProvider: Send + Sync + 'static {
 
 /// Returns the active crypto provider.
 ///
-/// The provider is selected at compile time. The default uses [`RustCryptoProvider`].
-/// Alternative backends can be feature-gated here.
+/// The provider is selected at compile time. The default uses RustCrypto.
 #[cfg(feature = "crypto-rustcrypto")]
 pub(crate) fn provider() -> &'static RustCryptoProvider {
     &RustCryptoProvider

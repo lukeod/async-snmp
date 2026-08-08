@@ -689,18 +689,18 @@ fn test_fips_rejects_md5_password_to_key() {
     );
 }
 
-/// FIPS provider rejects MD5 for password_to_key even with empty password.
+/// Password validation precedes backend algorithm selection.
 #[cfg(feature = "crypto-fips")]
 #[test]
-fn test_fips_rejects_md5_empty_password() {
+fn test_fips_rejects_empty_password_before_md5_selection() {
     let result = LocalizedKey::from_password(
         AuthProtocol::Md5,
         b"",
         &decode("000000000000000000000002").unwrap(),
     );
     assert!(
-        matches!(result, Err(CryptoError::UnsupportedAlgorithm("MD5"))),
-        "FIPS provider should reject MD5 even for empty password: got {:?}",
+        matches!(result, Err(CryptoError::PasswordTooShort)),
+        "passwords shorter than 8 octets should be rejected before backend selection: got {:?}",
         result
     );
 }
