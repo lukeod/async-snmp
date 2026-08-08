@@ -287,7 +287,7 @@ mod tests {
                     17,
                     crate::UDP_RECEIVE_LIMITS.advertised(),
                     level,
-                    UsmSecurityParams::new(engine_id.clone(), 7, 11, username.clone()),
+                    UsmSecurityParams::new(engine_id.clone(), 7, 11, username.clone()).unwrap(),
                     engine_id.clone(),
                     context_name.clone(),
                     Some(&keys),

@@ -84,13 +84,13 @@ impl CapturedV3Request {
         engine: &TestV3Engine,
     ) -> Result<Self, String> {
         let message = V3Message::decode(raw.clone()).map_err(|error| error.to_string())?;
-        let usm = UsmSecurityParams::decode(message.security_params.clone())
+        let usm = UsmSecurityParams::decode(message.security_params().clone())
             .map_err(|error| error.to_string())?;
-        let level = message.global_data.msg_flags.security_level;
+        let level = message.global_data().msg_flags().security_level;
 
         let keys = engine
-            .user_for(&usm.username)
-            .map(|user| user.derive_keys(&usm.engine_id))
+            .user_for(usm.username())
+            .map(|user| user.derive_keys(usm.engine_id()))
             .transpose()
             .map_err(|error| error.to_string())?;
 
@@ -110,7 +110,7 @@ impl CapturedV3Request {
             None
         };
 
-        let scoped_pdu = match &message.data {
+        let scoped_pdu = match message.data() {
             V3MessageData::Plaintext(scoped) => Some(scoped.clone()),
             V3MessageData::Encrypted(ciphertext) => {
                 let priv_key = keys
@@ -120,9 +120,9 @@ impl CapturedV3Request {
                 let plaintext = priv_key
                     .decrypt(
                         ciphertext,
-                        usm.engine_boots,
-                        usm.engine_time,
-                        &usm.priv_params,
+                        usm.engine_boots(),
+                        usm.engine_time(),
+                        usm.priv_params(),
                     )
                     .map_err(|error| error.to_string())?;
                 let mut decoder = Decoder::new(plaintext);
@@ -134,9 +134,9 @@ impl CapturedV3Request {
             raw,
             source,
             transport_request_id,
-            global_data: message.global_data,
+            global_data: message.global_data().clone(),
             usm,
-            wire_data: message.data,
+            wire_data: message.data().clone(),
             scoped_pdu,
             authentication_valid,
         })
@@ -199,6 +199,26 @@ fn encode_raw_scoped_pdu(scoped: &ScopedPdu) -> Result<Bytes, String> {
     Ok(buf.finish())
 }
 
+fn encode_raw_usm(
+    engine_id: &[u8],
+    engine_boots: u32,
+    engine_time: u32,
+    username: &[u8],
+    auth_params: &[u8],
+    priv_params: &[u8],
+) -> Bytes {
+    let mut buf = EncodeBuf::new();
+    buf.push_sequence(|buf| {
+        buf.push_octet_string(priv_params);
+        buf.push_octet_string(auth_params);
+        buf.push_octet_string(username);
+        buf.push_unsigned32(async_snmp::ber::tag::universal::INTEGER, engine_time);
+        buf.push_unsigned32(async_snmp::ber::tag::universal::INTEGER, engine_boots);
+        buf.push_octet_string(engine_id);
+    });
+    buf.finish()
+}
+
 fn encode_raw_plaintext_message(
     global: &MsgGlobalData,
     security_params: &[u8],
@@ -206,12 +226,31 @@ fn encode_raw_plaintext_message(
 ) -> Result<Vec<u8>, String> {
     let scoped = encode_raw_scoped_pdu(scoped)?;
     let mut buf = EncodeBuf::new();
-    buf.push_sequence(|buf| {
+    buf.try_push_sequence(|buf| {
         buf.push_bytes(&scoped);
         buf.push_octet_string(security_params);
-        global.encode(buf);
+        global.encode(buf)?;
         buf.push_integer(3);
-    });
+        Ok(())
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(buf.finish().to_vec())
+}
+
+fn encode_raw_encrypted_message(
+    global: &MsgGlobalData,
+    security_params: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut buf = EncodeBuf::new();
+    buf.try_push_sequence(|buf| {
+        buf.push_octet_string(ciphertext);
+        buf.push_octet_string(security_params);
+        global.encode(buf)?;
+        buf.push_integer(3);
+        Ok(())
+    })
+    .map_err(|error| error.to_string())?;
     Ok(buf.finish().to_vec())
 }
 
@@ -246,18 +285,18 @@ impl V3ReplyBuilder {
             .as_ref()
             .expect("response requires a decoded request scopedPDU");
         Self {
-            msg_id: request.global_data.msg_id,
+            msg_id: request.global_data.msg_id(),
             msg_max_size: engine.msg_max_size,
-            security_level: request.global_data.msg_flags.security_level,
+            security_level: request.global_data.msg_flags().security_level,
             reportable: false,
             raw_msg_flags: None,
             engine_id: engine.engine_id.clone(),
             engine_boots: engine.engine_boots,
             engine_time: engine.engine_time,
-            username: request.usm.username.clone(),
+            username: request.usm.username().clone(),
             auth_params_override: None,
             priv_params_override: None,
-            signing_user: engine.user_for(&request.usm.username).cloned(),
+            signing_user: engine.user_for(request.usm.username()).cloned(),
             key_engine_id: None,
             ciphertext_override: None,
             context_engine_id: scoped.context_engine_id.clone(),
@@ -415,19 +454,9 @@ impl V3ReplyBuilder {
             .transpose()
             .map_err(|error| error.to_string())?;
 
-        let mut usm = UsmSecurityParams::new(
-            self.engine_id,
-            self.engine_boots,
-            self.engine_time,
-            self.username,
-        );
-        if let Some(auth_params) = self.auth_params_override {
-            usm = usm.with_auth_params(auth_params);
-        }
-        if let Some(priv_params) = self.priv_params_override {
-            usm = usm.with_priv_params(priv_params);
-        }
         let scoped = ScopedPdu::new(self.context_engine_id, self.context_name, self.pdu);
+        let mut auth_params = self.auth_params_override.unwrap_or_default();
+        let mut priv_params = self.priv_params_override.unwrap_or_default();
 
         let msg_max_size = async_snmp::MessageSize::from_i32(self.msg_max_size)
             .map_err(|error| error.to_string())?;
@@ -435,14 +464,15 @@ impl V3ReplyBuilder {
             self.msg_id,
             msg_max_size,
             MsgFlags::new(self.security_level, self.reportable),
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let mut encoded = if self.security_level.requires_priv() {
             let priv_key = keys
                 .as_ref()
                 .and_then(|keys| keys.priv_key.as_ref())
                 .ok_or_else(|| "no privacy key configured for encrypted reply".to_string())?;
             let scoped_bytes = encode_raw_scoped_pdu(&scoped)?;
-            let (ciphertext, priv_params) = priv_key
+            let (ciphertext, generated_priv_params) = priv_key
                 .encrypt(
                     &scoped_bytes,
                     self.engine_boots,
@@ -451,14 +481,19 @@ impl V3ReplyBuilder {
                 )
                 .map_err(|error| error.to_string())?;
             let ciphertext = self.ciphertext_override.unwrap_or(ciphertext);
-            usm = usm.with_priv_params(priv_params);
+            priv_params = generated_priv_params;
             if let Some(auth_key) = keys.as_ref().and_then(|keys| keys.auth_key.as_ref()) {
-                usm = usm.with_auth_placeholder(auth_key.mac_len());
+                auth_params = Bytes::from(vec![0; auth_key.mac_len()]);
             }
-            V3Message::new_encrypted(global, usm.encode(), ciphertext)
-                .encode()
-                .map_err(|error| error.to_string())?
-                .to_vec()
+            let usm = encode_raw_usm(
+                &self.engine_id,
+                self.engine_boots,
+                self.engine_time,
+                &self.username,
+                &auth_params,
+                &priv_params,
+            );
+            encode_raw_encrypted_message(&global, &usm, &ciphertext)?
         } else {
             if self.security_level.requires_auth() {
                 let auth_key = keys
@@ -467,9 +502,17 @@ impl V3ReplyBuilder {
                     .ok_or_else(|| {
                         "no authentication key configured for signed reply".to_string()
                     })?;
-                usm = usm.with_auth_placeholder(auth_key.mac_len());
+                auth_params = Bytes::from(vec![0; auth_key.mac_len()]);
             }
-            encode_raw_plaintext_message(&global, &usm.encode(), &scoped)?
+            let usm = encode_raw_usm(
+                &self.engine_id,
+                self.engine_boots,
+                self.engine_time,
+                &self.username,
+                &auth_params,
+                &priv_params,
+            );
+            encode_raw_plaintext_message(&global, &usm, &scoped)?
         };
         if let Some(flags) = self.raw_msg_flags {
             raw_ber::patch_msg_flags(&mut encoded, flags)?;
@@ -632,7 +675,7 @@ impl ScriptedV3Peer {
                     None => {
                         task_state.set_error("received more requests than the script defines");
                         Ok(ScriptOutput::Replies(vec![correlated_malformed_reply(
-                            request.global_data.msg_id,
+                            request.global_data.msg_id(),
                         )]))
                     }
                 };
@@ -669,12 +712,12 @@ impl ScriptedV3Peer {
                         task_state.set_error(format!(
                             "transport-only script error used by UDP peer: {error}"
                         ));
-                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let reply = correlated_malformed_reply(request.global_data.msg_id());
                         let _ = socket.send_to(&reply, source).await;
                     }
                     Err(error) => {
                         task_state.set_error(format!("reply build failed: {error}"));
-                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let reply = correlated_malformed_reply(request.global_data.msg_id());
                         let _ = socket.send_to(&reply, source).await;
                     }
                 }
@@ -731,7 +774,7 @@ impl ScriptedV3Peer {
                     None => {
                         task_state.set_error("received more requests than the script defines");
                         Ok(ScriptOutput::Replies(vec![correlated_malformed_reply(
-                            request.global_data.msg_id,
+                            request.global_data.msg_id(),
                         )]))
                     }
                 };
@@ -759,7 +802,7 @@ impl ScriptedV3Peer {
                         task_state.set_error(format!(
                             "transport-only script error used by TCP peer: {error}"
                         ));
-                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let reply = correlated_malformed_reply(request.global_data.msg_id());
                         let _ = tokio::select! {
                             _ = task_cancel.cancelled() => return,
                             result = stream.write_all(&reply) => result,
@@ -767,7 +810,7 @@ impl ScriptedV3Peer {
                     }
                     Err(error) => {
                         task_state.set_error(format!("reply build failed: {error}"));
-                        let reply = correlated_malformed_reply(request.global_data.msg_id);
+                        let reply = correlated_malformed_reply(request.global_data.msg_id());
                         let _ = tokio::select! {
                             _ = task_cancel.cancelled() => return,
                             result = stream.write_all(&reply) => result,

@@ -145,15 +145,18 @@ async fn udp_success_at_level(level: SecurityLevel) {
     assert_eq!(result.varbinds[0].value.as_str(), Some("scripted response"));
 
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].usm.engine_id.is_empty());
-    assert!(requests[0].usm.username.is_empty());
-    assert_eq!(requests[1].usm.engine_id.as_ref(), ENGINE_ID);
+    assert!(requests[0].usm.engine_id().is_empty());
+    assert!(requests[0].usm.username().is_empty());
+    assert_eq!(requests[1].usm.engine_id().as_ref(), ENGINE_ID);
     assert_eq!(
-        (requests[1].usm.engine_boots, requests[1].usm.engine_time),
+        (
+            requests[1].usm.engine_boots(),
+            requests[1].usm.engine_time()
+        ),
         (0, 0),
         "unauthenticated discovery must not seed trusted time"
     );
-    assert_eq!(requests[1].global_data.msg_flags.security_level, level);
+    assert_eq!(requests[1].global_data.msg_flags().security_level, level);
     assert!(requests[1].scoped_pdu.is_some());
     assert_eq!(
         requests[1].authentication_valid,
@@ -323,12 +326,12 @@ async fn v3_discovery_advertises_active_transport_receive_limit() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[0].global_data.msg_max_size,
+        requests[0].global_data.msg_max_size(),
         receive_limits.advertised(),
         "discovery must advertise the active transport capacity"
     );
     assert_eq!(
-        requests[1].global_data.msg_max_size,
+        requests[1].global_data.msg_max_size(),
         receive_limits.advertised(),
         "established requests must use the same transport capacity"
     );
@@ -482,7 +485,7 @@ async fn v3_discovery_rejects_trailing_usm_security_parameter_data() {
         .encode_to_bytes()
         .unwrap();
         Ok(raw_ber::v3_message(
-            &raw_ber::signed_integer_content(request.global_data.msg_id),
+            &raw_ber::signed_integer_content(request.global_data.msg_id()),
             &raw_ber::signed_integer_content(reply_engine.msg_max_size),
             &[0],
             &[3],
@@ -635,9 +638,9 @@ async fn v3_established_identity_ignores_ordinary_discovery_traffic() {
 
     let requests = transport.log().snapshot();
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[1].usm.engine_id.as_ref(), ENGINE_ID);
-    assert_eq!(requests[2].usm.engine_id.as_ref(), ENGINE_ID);
-    assert_eq!(requests[3].usm.engine_id.as_ref(), ENGINE_ID);
+    assert_eq!(requests[1].usm.engine_id().as_ref(), ENGINE_ID);
+    assert_eq!(requests[2].usm.engine_id().as_ref(), ENGINE_ID);
+    assert_eq!(requests[3].usm.engine_id().as_ref(), ENGINE_ID);
 }
 
 #[tokio::test]
@@ -710,10 +713,10 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
 
     let requests = transport.log().snapshot();
     assert_eq!(requests.len(), 4);
-    assert!(requests[0].usm.engine_id.is_empty());
-    assert_eq!(requests[1].usm.engine_id.as_ref(), ENGINE_ID);
-    assert!(requests[2].usm.engine_id.is_empty());
-    assert_eq!(requests[3].usm.engine_id, replacement_id);
+    assert!(requests[0].usm.engine_id().is_empty());
+    assert_eq!(requests[1].usm.engine_id().as_ref(), ENGINE_ID);
+    assert!(requests[2].usm.engine_id().is_empty());
+    assert_eq!(requests[3].usm.engine_id(), &replacement_id);
 }
 
 #[tokio::test]
@@ -786,8 +789,8 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
 
     let requests = transport.log().snapshot();
     assert_eq!(requests.len(), 4);
-    assert!(requests[2].usm.engine_id.is_empty());
-    assert_eq!(requests[3].usm.engine_id.as_ref(), ENGINE_ID);
+    assert!(requests[2].usm.engine_id().is_empty());
+    assert_eq!(requests[3].usm.engine_id().as_ref(), ENGINE_ID);
 }
 
 #[tokio::test]
@@ -877,27 +880,27 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
     let first = &requests[1];
     let corrected = &requests[2];
     assert_ne!(
-        (first.usm.engine_boots, first.usm.engine_time),
-        (corrected.usm.engine_boots, corrected.usm.engine_time),
+        (first.usm.engine_boots(), first.usm.engine_time()),
+        (corrected.usm.engine_boots(), corrected.usm.engine_time()),
         "the Report must change the tuple used by the corrected request"
     );
     assert_eq!(
-        first.global_data.msg_flags.security_level,
+        first.global_data.msg_flags().security_level,
         SecurityLevel::AuthPriv
     );
     assert_eq!(
-        corrected.global_data.msg_flags.security_level,
+        corrected.global_data.msg_flags().security_level,
         SecurityLevel::AuthPriv
     );
     assert_eq!(first.authentication_valid, Some(true));
     assert_eq!(corrected.authentication_valid, Some(true));
-    assert_ne!(first.global_data.msg_id, corrected.global_data.msg_id);
+    assert_ne!(first.global_data.msg_id(), corrected.global_data.msg_id());
     assert_ne!(
         first.scoped_pdu.as_ref().unwrap().pdu.request_id,
         corrected.scoped_pdu.as_ref().unwrap().pdu.request_id
     );
     assert_eq!(
-        (corrected.usm.engine_boots, corrected.usm.engine_time),
+        (corrected.usm.engine_boots(), corrected.usm.engine_time()),
         (8, 10)
     );
 }
@@ -989,29 +992,35 @@ async fn v3_udp_unauthenticated_time_report_gets_packet_local_correction() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 4);
     assert_eq!(
-        (requests[1].usm.engine_boots, requests[1].usm.engine_time),
+        (
+            requests[1].usm.engine_boots(),
+            requests[1].usm.engine_time()
+        ),
         (0, 0)
     );
     assert_eq!(
-        (requests[2].usm.engine_boots, requests[2].usm.engine_time),
+        (
+            requests[2].usm.engine_boots(),
+            requests[2].usm.engine_time()
+        ),
         (7, 100),
         "the unauthenticated tuple applies to the corrected packet"
     );
     assert_eq!(requests[2].authentication_valid, Some(true));
     assert_eq!(
-        requests[2].global_data.msg_flags.security_level,
+        requests[2].global_data.msg_flags().security_level,
         SecurityLevel::AuthPriv
     );
     assert_ne!(
-        requests[1].global_data.msg_id,
-        requests[2].global_data.msg_id
+        requests[1].global_data.msg_id(),
+        requests[2].global_data.msg_id()
     );
     assert_ne!(
         requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
         requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
     );
-    assert_eq!(requests[3].usm.engine_boots, 7);
-    assert!(requests[3].usm.engine_time >= 100);
+    assert_eq!(requests[3].usm.engine_boots(), 7);
+    assert!(requests[3].usm.engine_time() >= 100);
 }
 
 #[tokio::test]
@@ -1098,7 +1107,10 @@ async fn v3_tcp_unauthenticated_time_report_compatibility_succeeds() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_eq!(
-        (requests[2].usm.engine_boots, requests[2].usm.engine_time),
+        (
+            requests[2].usm.engine_boots(),
+            requests[2].usm.engine_time()
+        ),
         (7, 100)
     );
     assert_eq!(requests[2].authentication_valid, Some(true));
@@ -1141,14 +1153,17 @@ async fn v3_reliable_custom_transport_allows_packet_local_compatibility() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_eq!(
-        (requests[2].usm.engine_boots, requests[2].usm.engine_time),
+        (
+            requests[2].usm.engine_boots(),
+            requests[2].usm.engine_time()
+        ),
         (7, 100)
     );
     assert_eq!(requests[2].authentication_valid, Some(true));
     for request in requests {
         assert_eq!(
             request.transport_request_id,
-            Some(request.global_data.msg_id)
+            Some(request.global_data.msg_id())
         );
     }
 }
@@ -1208,14 +1223,17 @@ async fn v3_failed_packet_local_correction_preserves_trusted_time() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 5);
     assert_eq!(
-        (requests[3].usm.engine_boots, requests[3].usm.engine_time),
+        (
+            requests[3].usm.engine_boots(),
+            requests[3].usm.engine_time()
+        ),
         (1, 2),
         "the spoofable tuple may affect one packet"
     );
     assert_eq!(requests[3].authentication_valid, Some(true));
-    assert_eq!(requests[4].usm.engine_boots, 7);
+    assert_eq!(requests[4].usm.engine_boots(), 7);
     assert!(
-        requests[4].usm.engine_time >= 100,
+        requests[4].usm.engine_time() >= 100,
         "the lower unauthenticated tuple must not enter trusted state"
     );
 }
@@ -1394,11 +1412,12 @@ async fn v3_failed_authenticated_compatibility_reply_does_not_publish_time() {
         let requests = log.snapshot();
         assert_eq!(requests.len(), 5, "unexpected request count for {case}");
         assert_eq!(
-            requests[4].usm.engine_boots, 7,
+            requests[4].usm.engine_boots(),
+            7,
             "{case} must not publish the authenticated tuple"
         );
-        assert!(requests[4].usm.engine_time >= 100);
-        assert!(requests[4].usm.engine_time < 300);
+        assert!(requests[4].usm.engine_time() >= 100);
+        assert!(requests[4].usm.engine_time() < 300);
     }
 }
 
@@ -1446,8 +1465,8 @@ async fn v3_tcp_time_window_report_gets_one_protocol_correction() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_ne!(
-        requests[1].global_data.msg_id,
-        requests[2].global_data.msg_id
+        requests[1].global_data.msg_id(),
+        requests[2].global_data.msg_id()
     );
     assert_ne!(
         requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
@@ -1496,7 +1515,7 @@ async fn v3_reliable_custom_transport_allows_protocol_correction() {
     for request in &requests {
         assert_eq!(
             request.transport_request_id,
-            Some(request.global_data.msg_id)
+            Some(request.global_data.msg_id())
         );
     }
     assert_ne!(
@@ -1796,8 +1815,8 @@ async fn v3_failed_correction_preserves_authenticated_report_time() {
     assert_eq!(response.varbinds[0].value.as_str(), Some("state retained"));
     let requests = log.snapshot();
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[3].usm.engine_boots, 8);
-    assert!(requests[3].usm.engine_time >= 70);
+    assert_eq!(requests[3].usm.engine_boots(), 8);
+    assert!(requests[3].usm.engine_time() >= 70);
 }
 
 /// A client configured without authentication cannot verify a received
@@ -1907,7 +1926,8 @@ async fn v3_authenticated_wrong_username_does_not_mutate_time_or_retry() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3, "the invalid Report must not add a retry");
     assert_eq!(
-        requests[2].usm.engine_boots, 0,
+        requests[2].usm.engine_boots(),
+        0,
         "wrong-user authentication must not establish trusted engine time"
     );
 }
@@ -2011,7 +2031,8 @@ async fn v3_auth_no_priv_client_rejects_auth_priv_without_time_mutation() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_eq!(
-        requests[2].usm.engine_boots, 0,
+        requests[2].usm.engine_boots(),
+        0,
         "unsupported privacy must not establish trusted engine time"
     );
 }
@@ -2037,7 +2058,7 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
                     &[],
                 );
                 Ok(raw_ber::v3_message(
-                    &raw_ber::signed_integer_content(request.global_data.msg_id),
+                    &raw_ber::signed_integer_content(request.global_data.msg_id()),
                     &[0x00, 0xff, 0xe3],
                     &[0x01],
                     &[3],
@@ -2072,7 +2093,7 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
     peer.finish().await.unwrap();
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2].usm.engine_boots, 0);
+    assert_eq!(requests[2].usm.engine_boots(), 0);
 }
 
 /// Timeliness processing must reject authenticated stale authPriv input before
@@ -2127,11 +2148,11 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 4);
     assert_eq!(
-        requests[3].usm.engine_id.as_ref(),
+        requests[3].usm.engine_id().as_ref(),
         ENGINE_ID,
         "timeliness rejection must not clear an established identity"
     );
-    assert_eq!(requests[3].usm.engine_boots, 7);
+    assert_eq!(requests[3].usm.engine_boots(), 7);
 }
 
 /// An authenticated session must not accept an unauthenticated reply
@@ -2334,12 +2355,12 @@ async fn v3_scripted_udp_timeout_retry_count() {
     assert_eq!(requests.len(), 4);
     let attempts = &requests[1..];
     assert_ne!(
-        attempts[0].global_data.msg_id,
-        attempts[1].global_data.msg_id
+        attempts[0].global_data.msg_id(),
+        attempts[1].global_data.msg_id()
     );
     assert_ne!(
-        attempts[1].global_data.msg_id,
-        attempts[2].global_data.msg_id
+        attempts[1].global_data.msg_id(),
+        attempts[2].global_data.msg_id()
     );
     assert_eq!(
         attempts[0].scoped_pdu.as_ref().unwrap().pdu.request_id,
@@ -2362,10 +2383,10 @@ async fn v3_udp_pending_map_ignores_wrong_ids_before_correlated_response() {
             discovery_step(engine),
             ScriptStep::replies(move |request| {
                 let stale = V3ReplyBuilder::response_to(request, &response_engine)
-                    .msg_id(request.global_data.msg_id - 1)
+                    .msg_id(request.global_data.msg_id() - 1)
                     .build()?;
                 let future = V3ReplyBuilder::response_to(request, &response_engine)
-                    .msg_id(request.global_data.msg_id + 1)
+                    .msg_id(request.global_data.msg_id() + 1)
                     .build()?;
                 let matching = V3ReplyBuilder::response_to(request, &response_engine).build()?;
                 Ok(vec![stale, future, matching])
@@ -2395,7 +2416,7 @@ async fn v3_tcp_skips_wrong_response_msg_id_until_timeout() {
             discovery_step(engine),
             ScriptStep::reply(move |request| {
                 V3ReplyBuilder::response_to(request, &response_engine)
-                    .msg_id(request.global_data.msg_id + 1)
+                    .msg_id(request.global_data.msg_id() + 1)
                     .build()
             }),
         ],
@@ -2432,7 +2453,7 @@ async fn v3_tcp_skips_wrong_discovery_msg_id_until_timeout() {
                 report_oids::unknown_engine_ids(),
                 1,
             )
-            .msg_id(request.global_data.msg_id - 1)
+            .msg_id(request.global_data.msg_id() - 1)
             .build()
         })],
     )
@@ -2462,7 +2483,7 @@ async fn v3_custom_transport_rejects_prior_attempt_msg_id() {
             discovery_step(engine),
             ScriptStep::reply(move |request| {
                 V3ReplyBuilder::response_to(request, &response_engine)
-                    .msg_id(request.global_data.msg_id - 1)
+                    .msg_id(request.global_data.msg_id() - 1)
                     .build()
             }),
         ],
@@ -2483,8 +2504,8 @@ async fn v3_custom_transport_rejects_prior_attempt_msg_id() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[0].global_data.msg_id + 1,
-        requests[1].global_data.msg_id
+        requests[0].global_data.msg_id() + 1,
+        requests[1].global_data.msg_id()
     );
 }
 
@@ -2502,7 +2523,7 @@ async fn v3_custom_transport_rejects_future_discovery_msg_id() {
                 report_oids::unknown_engine_ids(),
                 1,
             )
-            .msg_id(request.global_data.msg_id + 1)
+            .msg_id(request.global_data.msg_id() + 1)
             .build()
         })],
         100,
@@ -2529,7 +2550,7 @@ async fn v3_discovery_usm_processing_precedes_parse_and_correlation() {
         vec![ScriptStep::reply(move |request| {
             let invalid_usm = raw_ber::usm_security_params(&[], &[0], &[0], &[], &[], &[]);
             Ok(raw_ber::v3_message(
-                &raw_ber::signed_integer_content(request.global_data.msg_id + 1),
+                &raw_ber::signed_integer_content(request.global_data.msg_id() + 1),
                 &[0x00, 0xff, 0xe3],
                 &[0],
                 &[3],
@@ -2574,7 +2595,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
                 .security_level(level)
                 .engine_boots(8)
                 .engine_time(10)
-                .msg_id(request.global_data.msg_id - 1)
+                .msg_id(request.global_data.msg_id() - 1)
                 .build()
             }),
             response_step(valid_response_engine, "state unchanged after rejection"),
@@ -2618,10 +2639,11 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_eq!(
-        requests[2].usm.engine_boots, 0,
+        requests[2].usm.engine_boots(),
+        0,
         "a wrong-ID Report must not publish its candidate timeliness state"
     );
-    assert_eq!(requests[2].usm.engine_time, 0);
+    assert_eq!(requests[2].usm.engine_time(), 0);
 }
 
 #[tokio::test]
@@ -2692,6 +2714,7 @@ async fn v3_custom_transport_accepts_matching_ids_and_context() {
 #[tokio::test]
 async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
     let request = V3Message::discovery_request(41, async_snmp::UDP_RECEIVE_LIMITS.advertised())
+        .unwrap()
         .encode()
         .unwrap();
     let expected = Bytes::from_static(b"arbitrary response bytes");
@@ -2715,7 +2738,7 @@ async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
     assert_eq!(transport.remaining_steps(), 0);
     let requests = log.snapshot();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].global_data.msg_id, 41);
+    assert_eq!(requests[0].global_data.msg_id(), 41);
     assert_eq!(requests[0].transport_request_id, Some(999));
 }
 
@@ -2726,6 +2749,7 @@ async fn report_builder_uses_reporting_engine_context() {
     let transport =
         ScriptedTransport::new(engine.clone(), vec![discovery_step(engine)], 100, false);
     let request = V3Message::discovery_request(41, async_snmp::UDP_RECEIVE_LIMITS.advertised())
+        .unwrap()
         .encode()
         .unwrap();
 
@@ -2737,7 +2761,7 @@ async fn report_builder_uses_reporting_engine_context() {
     .await
     .unwrap();
     let response = V3Message::decode(response).unwrap();
-    let V3MessageData::Plaintext(scoped) = response.data else {
+    let V3MessageData::Plaintext(scoped) = response.data() else {
         panic!("Report must have a plaintext scopedPDU");
     };
 
@@ -2748,6 +2772,7 @@ async fn report_builder_uses_reporting_engine_context() {
 #[test]
 fn raw_ber_targets_invalid_flags_and_oversized_msg_ids() {
     let original = V3Message::discovery_request(7, async_snmp::UDP_RECEIVE_LIMITS.advertised())
+        .unwrap()
         .encode()
         .unwrap()
         .to_vec();
@@ -2802,7 +2827,7 @@ async fn v3_udp_accepts_late_response_to_prior_attempt() {
         vec![
             discovery_step(engine),
             ScriptStep::silence_with(move |request| {
-                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
             }),
             ScriptStep::reply(move |request| {
                 let prior = first_attempt.lock().unwrap().take().unwrap();
@@ -2827,8 +2852,8 @@ async fn v3_udp_accepts_late_response_to_prior_attempt() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_ne!(
-        requests[1].global_data.msg_id,
-        requests[2].global_data.msg_id
+        requests[1].global_data.msg_id(),
+        requests[2].global_data.msg_id()
     );
     assert_eq!(
         requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
@@ -2848,7 +2873,7 @@ async fn v3_custom_transport_accepts_late_response_to_prior_attempt() {
         vec![
             discovery_step(engine),
             ScriptStep::silence_with(move |request| {
-                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
             }),
             ScriptStep::reply(move |request| {
                 let prior = first_attempt.lock().unwrap().take().unwrap();
@@ -2877,8 +2902,8 @@ async fn v3_custom_transport_accepts_late_response_to_prior_attempt() {
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
     assert_ne!(
-        requests[1].global_data.msg_id,
-        requests[2].global_data.msg_id
+        requests[1].global_data.msg_id(),
+        requests[2].global_data.msg_id()
     );
     assert_eq!(
         requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
@@ -2899,7 +2924,7 @@ async fn v3_pre_correction_msg_id_rejected_after_correction() {
         vec![
             discovery_step(engine),
             ScriptStep::reply(move |request| {
-                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
                 V3ReplyBuilder::report_to(
                     request,
                     &report_engine,
@@ -2957,7 +2982,7 @@ async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
         vec![
             discovery_step(engine),
             ScriptStep::silence_with(move |request| {
-                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
             }),
             ScriptStep::reply(move |request| {
                 let prior = first_attempt.lock().unwrap().take().unwrap();
@@ -2994,8 +3019,8 @@ async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
     peer.finish().await.unwrap();
     let requests = log.snapshot();
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[3].usm.engine_boots, 8);
-    assert!(requests[3].usm.engine_time >= 10);
+    assert_eq!(requests[3].usm.engine_boots(), 8);
+    assert!(requests[3].usm.engine_time() >= 10);
     assert_eq!(
         requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
         requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
@@ -3021,7 +3046,7 @@ async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correcti
         vec![
             discovery_step(engine),
             ScriptStep::silence_with(move |request| {
-                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
             }),
             ScriptStep::reply(move |request| {
                 let prior = first_attempt.lock().unwrap().take().unwrap();
@@ -3062,7 +3087,8 @@ async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correcti
     let requests = log.snapshot();
     assert_eq!(requests.len(), 4);
     assert_ne!(
-        requests[1].global_data.msg_id, requests[2].global_data.msg_id,
+        requests[1].global_data.msg_id(),
+        requests[2].global_data.msg_id(),
         "timeout retransmission receives a fresh msgID"
     );
     assert_eq!(
@@ -3076,13 +3102,16 @@ async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correcti
         "protocol correction receives a fresh PDU request ID"
     );
     assert_eq!(
-        (requests[3].usm.engine_boots, requests[3].usm.engine_time),
+        (
+            requests[3].usm.engine_boots(),
+            requests[3].usm.engine_time()
+        ),
         (7, 100),
         "the earlier attempt's unauthenticated tuple applies to the corrected packet"
     );
     assert_eq!(requests[3].authentication_valid, Some(true));
     assert_eq!(
-        requests[3].global_data.msg_flags.security_level,
+        requests[3].global_data.msg_flags().security_level,
         SecurityLevel::AuthPriv
     );
 }
@@ -3100,7 +3129,7 @@ async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
         vec![
             discovery_step(engine),
             ScriptStep::reply(move |request| {
-                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
                 V3ReplyBuilder::report_to(
                     request,
                     &first_report_engine,
@@ -3170,7 +3199,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
         vec![
             discovery_step(engine),
             ScriptStep::reply(move |request| {
-                *capture.lock().unwrap() = Some(request.global_data.msg_id);
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
                 let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
                     .oid
                     .clone();

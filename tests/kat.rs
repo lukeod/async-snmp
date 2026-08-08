@@ -514,21 +514,24 @@ fn test_rfc3414_a4_usm_encoding() {
         257, // time (0x0101)
         Bytes::from_static(b"bert"),
     )
+    .unwrap()
     .with_auth_params(Bytes::from(decode("0123456789abcdeffedcba98").unwrap()))
-    .with_priv_params(Bytes::from(decode("0123456789abcdef").unwrap()));
+    .unwrap()
+    .with_priv_params(Bytes::from(decode("0123456789abcdef").unwrap()))
+    .unwrap();
 
-    let encoded = params.encode();
+    let encoded = params.encode().unwrap();
 
     // Verify it's a valid SEQUENCE
     assert_eq!(encoded[0], 0x30, "Should start with SEQUENCE tag");
 
     // Decode it back and verify fields
     let decoded = UsmSecurityParams::decode(encoded.clone()).unwrap();
-    assert_eq!(decoded.engine_boots, 1);
-    assert_eq!(decoded.engine_time, 257);
-    assert_eq!(decoded.username.as_ref(), b"bert");
-    assert_eq!(decoded.auth_params.len(), 12);
-    assert_eq!(decoded.priv_params.len(), 8);
+    assert_eq!(decoded.engine_boots(), 1);
+    assert_eq!(decoded.engine_time(), 257);
+    assert_eq!(decoded.username().as_ref(), b"bert");
+    assert_eq!(decoded.auth_params().len(), 12);
+    assert_eq!(decoded.priv_params().len(), 8);
 }
 
 /// Verify MAC length matches protocol specification (MD5).

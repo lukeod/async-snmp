@@ -293,7 +293,7 @@ fn build_v3_response(
         engine_boots,
         engine_time,
         incoming_usm.username.clone(),
-    );
+    )?;
 
     encode_v3_response(
         response_pdu,

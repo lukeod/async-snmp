@@ -41,7 +41,7 @@ impl Agent {
             engine_boots,
             engine_time,
             incoming_usm.username.clone(),
-        );
+        )?;
 
         // RFC 3412 Section 6.3: msgMaxSize advertises this agent's own receive
         // capacity, not the requester's echoed value or the outbound response
@@ -152,6 +152,7 @@ mod tests {
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(security_level, true),
         )
+        .unwrap()
     }
 
     fn dummy_usm() -> UsmSecurityParams {
@@ -161,6 +162,7 @@ mod tests {
             100,
             Bytes::from_static(b"testuser"),
         )
+        .unwrap()
     }
 
     fn dummy_response_pdu() -> Pdu {

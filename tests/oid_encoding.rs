@@ -2,6 +2,7 @@ use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message,
 };
+use async_snmp::v3::UsmSecurityParams;
 use async_snmp::{
     CompatibilityPolicy, Error, GenericTrap, Oid, Pdu, PduType, TrapV1Pdu, Value, VarBind,
 };
@@ -102,8 +103,14 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
                 11,
                 async_snmp::MessageSize::new(65_507).unwrap(),
                 MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+            )
+            .unwrap();
+            let security_params = UsmSecurityParams::discovery().encode().unwrap();
+            assert_invalid(
+                V3Message::new(global, security_params, scoped)
+                    .unwrap()
+                    .encode(),
             );
-            assert_invalid(V3Message::new(global, Bytes::new(), scoped).encode());
         }
 
         let trap = TrapV1Pdu::new(

@@ -11,7 +11,7 @@ mod community;
 mod v3;
 
 pub use community::{CommunityMessage, CommunityPdu};
-pub(crate) use v3::{MpdFailure, classify_mpd_failure};
+pub(crate) use v3::{MpdFailure, classify_mpd_failure, decode_scoped_pdu_with_consumption};
 pub use v3::{
     MsgFlags, MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message,
     V3MessageData, V3SecurityModel,

@@ -15,15 +15,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bytes::Bytes;
 
 use super::{DerivedKeys, UsmConfig};
-use crate::ber::Decoder;
 use crate::error::{Error, Result};
-use crate::message::{MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel};
+use crate::message::{
+    MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel,
+    decode_scoped_pdu_with_consumption,
+};
 use crate::message_size::MessageSize;
 use crate::oid::Oid;
 use crate::v3::auth::verify_message;
 use crate::v3::encode::encode_v3_report;
 use crate::v3::{
     EngineState, LocalizedKey, UsmSecurityParams, in_authoritative_time_window, report_oids,
+    validate_engine_id,
 };
 
 /// RFC 3414 usmStats counters, shared by every receiving role.
@@ -245,7 +248,7 @@ pub(crate) fn process_v3_inbound(
                     ctx.engine_boots,
                     ctx.engine_time,
                     usm_params.username.clone(),
-                ),
+                )?,
                 failure.report_oid(),
                 count,
                 auth_key,
@@ -266,8 +269,14 @@ pub(crate) fn process_v3_inbound(
     // a discovery request (RFC 3414 Section 4); both cases answer with
     // usmStatsUnknownEngineIDs.
     if usm_params.engine_id.is_empty() {
+        usm_params.validate_for_security_level(security_level)?;
         return fail(UsmFailure::UnknownEngineIds, None);
     }
+    if validate_engine_id(&usm_params.engine_id).is_err() {
+        tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, length = usm_params.engine_id.len() }, "invalid engine ID");
+        return fail(UsmFailure::UnknownEngineIds, None);
+    }
+    usm_params.validate_for_security_level(security_level)?;
     let engine_is_local = usm_params.engine_id == *ctx.engine_id;
     if role.is_authoritative() && !engine_is_local {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "engine ID mismatch");
@@ -400,12 +409,10 @@ pub(crate) fn process_v3_inbound(
                 }
             };
 
-            let mut decoder = Decoder::with_target(decrypted, source);
-            ScopedPdu::decode(&mut decoder)?
+            decode_scoped_pdu_with_consumption(decrypted, source, Some(priv_key.protocol()))?
         }
         RawMsgData::Plaintext(raw) => {
-            let mut decoder = Decoder::with_target(raw.clone(), source);
-            ScopedPdu::decode(&mut decoder)?
+            decode_scoped_pdu_with_consumption(raw.clone(), source, None)?
         }
     };
 
@@ -454,19 +461,26 @@ mod tests {
             1,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, reportable),
-        );
-        let usm = UsmSecurityParams::new(
-            Bytes::copy_from_slice(engine_id),
-            7,
-            1000,
-            Bytes::copy_from_slice(username),
-        );
+        )
+        .unwrap();
+        let usm = if engine_id.is_empty() {
+            UsmSecurityParams::discovery()
+        } else {
+            UsmSecurityParams::new(
+                Bytes::copy_from_slice(engine_id),
+                7,
+                1000,
+                Bytes::copy_from_slice(username),
+            )
+            .unwrap()
+        };
         let scoped = ScopedPdu::new(
             Bytes::copy_from_slice(engine_id),
             Bytes::new(),
             Pdu::get_request(42, &[]),
         );
-        V3Message::new(global, usm.encode(), scoped)
+        V3Message::new(global, usm.encode().unwrap(), scoped)
+            .unwrap()
             .encode()
             .unwrap()
     }
@@ -553,6 +567,7 @@ mod tests {
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
         let data = V3Message::discovery_request(5, crate::UDP_RECEIVE_LIMITS.advertised())
+            .unwrap()
             .encode()
             .unwrap();
         let request = V3Message::decode(data.clone()).unwrap();
@@ -664,20 +679,24 @@ mod tests {
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
         let usm = UsmSecurityParams::new(engine_id.clone(), 7, 1000, Bytes::from_static(b"user"))
-            .with_auth_params(vec![0xAA; 12]); // not a valid HMAC
+            .unwrap()
+            .with_auth_params(vec![0xAA; 12])
+            .unwrap(); // not a valid HMAC
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             // msgData: SEQUENCE TLV wrapping garbage, not a parsable ScopedPDU
             buf.push_sequence(|buf| {
                 buf.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]);
             });
-            buf.push_octet_string(&usm.encode());
+            buf.push_octet_string(&usm.encode().unwrap());
             crate::message::MsgGlobalData::new(
                 1,
                 crate::MessageSize::new(65507).unwrap(),
                 MsgFlags::new(SecurityLevel::AuthNoPriv, true),
             )
-            .encode(buf);
+            .unwrap()
+            .encode(buf)
+            .unwrap();
             buf.push_integer(3);
         });
         let data = buf.finish();
@@ -689,6 +708,71 @@ mod tests {
         assert_eq!(failure, UsmFailure::WrongDigests);
         assert!(report.is_some(), "reportable message gets a report");
         assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 1);
+    }
+
+    fn build_raw_msg_with_engine_id(engine_id: &[u8]) -> Bytes {
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        )
+        .unwrap();
+        let scoped = ScopedPdu::new(
+            Bytes::copy_from_slice(engine_id),
+            Bytes::new(),
+            Pdu::get_request(42, &[]),
+        )
+        .encode_to_bytes()
+        .unwrap();
+        let mut usm = crate::ber::EncodeBuf::new();
+        usm.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(b"user");
+            buf.push_integer(0);
+            buf.push_integer(0);
+            buf.push_octet_string(engine_id);
+        });
+        let mut message = crate::ber::EncodeBuf::new();
+        message.push_sequence(|buf| {
+            buf.push_bytes(&scoped);
+            buf.push_octet_string(&usm.finish());
+            global.encode(buf).unwrap();
+            buf.push_integer(3);
+        });
+        message.finish()
+    }
+
+    #[test]
+    fn invalid_engine_ids_are_rejected_before_role_lookup_or_state() {
+        let engine_id = local_engine_id();
+        let users = HashMap::new();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let remote_engines = Mutex::new(HashMap::new());
+        let receiver = V3Role::Receiver {
+            remote_engines: &remote_engines,
+            max_remote_engines: 16,
+        };
+
+        for invalid in [
+            b"abcd".as_slice(),
+            [0_u8; 8].as_slice(),
+            [0xff_u8; 8].as_slice(),
+            [1_u8; 33].as_slice(),
+        ] {
+            for role in [&V3Role::Authoritative, &receiver] {
+                let outcome =
+                    process_v3_inbound(build_raw_msg_with_engine_id(invalid), &ctx, role).unwrap();
+                let V3Inbound::Failed { failure, .. } = outcome else {
+                    panic!("invalid engine ID must fail before role processing");
+                };
+                assert_eq!(failure, UsmFailure::UnknownEngineIds);
+            }
+        }
+        assert!(remote_engines.lock().unwrap().is_empty());
+        assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 8);
     }
 
     /// RFC 3414 Section 3.2 Step 3: the authoritative role rejects messages

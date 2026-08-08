@@ -98,29 +98,29 @@ pub fn encode_v3_message(
         engine_boots,
         engine_time,
         security.username().clone(),
-    );
+    )?;
 
     if let Some(key) = &auth_key {
-        usm_params = usm_params.with_auth_placeholder(key.mac_len());
+        usm_params = usm_params.with_auth_placeholder(key.mac_len())?;
     }
 
     if security_level.requires_priv() {
-        usm_params = usm_params.with_priv_params(priv_params);
+        usm_params = usm_params.with_priv_params(priv_params)?;
     }
 
-    let usm_encoded = usm_params.encode();
+    let usm_encoded = usm_params.encode()?;
 
     // Build global data
     let msg_flags = MsgFlags::new(security_level, reportable);
-    let global_data = MsgGlobalData::new(msg_id, msg_max_size, msg_flags);
+    let global_data = MsgGlobalData::new(msg_id, msg_max_size, msg_flags)?;
 
     // Build complete message
     let msg = match msg_data {
         V3MessageData::Plaintext(scoped_pdu) => {
-            V3Message::new(global_data, usm_encoded, scoped_pdu)
+            V3Message::new(global_data, usm_encoded, scoped_pdu)?
         }
         V3MessageData::Encrypted(ciphertext) => {
-            V3Message::new_encrypted(global_data, usm_encoded, ciphertext)
+            V3Message::new_encrypted(global_data, usm_encoded, ciphertext)?
         }
     };
 
@@ -202,15 +202,15 @@ pub(crate) fn encode_v3_report(
         msg_id,
         local_receive_capacity,
         MsgFlags::new(security_level, false),
-    );
+    )?;
 
     let scoped = ScopedPdu::new(usm.engine_id.clone(), Bytes::new(), report_pdu);
 
     let usm = match auth_key {
-        Some(key) => usm.with_auth_placeholder(key.mac_len()),
+        Some(key) => usm.with_auth_placeholder(key.mac_len())?,
         None => usm,
     };
-    let msg = V3Message::new(global, usm.encode(), scoped);
+    let msg = V3Message::new(global, usm.encode()?, scoped)?;
 
     match auth_key {
         Some(key) => {
@@ -245,15 +245,15 @@ pub(crate) fn encode_v3_response(
     response_pdu.validate_outbound(crate::Version::V3, crate::pdu::PduDirection::Response)?;
 
     // Same security level as the request, but reportable=false
-    let global = MsgGlobalData::new(msg_id, msg_max_size, MsgFlags::new(security_level, false));
+    let global = MsgGlobalData::new(msg_id, msg_max_size, MsgFlags::new(security_level, false))?;
     let scoped = ScopedPdu::new(context_engine_id, context_name, response_pdu);
 
     match security_level {
-        SecurityLevel::NoAuthNoPriv => V3Message::new(global, usm.encode(), scoped).encode(),
+        SecurityLevel::NoAuthNoPriv => V3Message::new(global, usm.encode()?, scoped)?.encode(),
         SecurityLevel::AuthNoPriv => {
             let (_, auth_key) = require_auth_key(derived_keys, target)?;
-            let usm = usm.with_auth_placeholder(auth_key.mac_len());
-            let mut bytes = V3Message::new(global, usm.encode(), scoped)
+            let usm = usm.with_auth_placeholder(auth_key.mac_len())?;
+            let mut bytes = V3Message::new(global, usm.encode()?, scoped)?
                 .encode()?
                 .to_vec();
             sign_v3_message(auth_key, &mut bytes, target)?;
@@ -280,9 +280,9 @@ pub(crate) fn encode_v3_response(
                 })?;
 
             let usm = usm
-                .with_auth_placeholder(auth_key.mac_len())
-                .with_priv_params(priv_params);
-            let mut bytes = V3Message::new_encrypted(global, usm.encode(), encrypted)
+                .with_auth_placeholder(auth_key.mac_len())?
+                .with_priv_params(priv_params)?;
+            let mut bytes = V3Message::new_encrypted(global, usm.encode()?, encrypted)?
                 .encode()?
                 .to_vec();
             sign_v3_message(auth_key, &mut bytes, target)?;
@@ -377,7 +377,8 @@ mod tests {
             1,
             1,
             Bytes::from_static(b"user"),
-        );
+        )
+        .unwrap();
         let salt = SaltCounter::from_value(1);
 
         let result = encode_v3_response(

@@ -3,16 +3,19 @@
 //! This module contains V3 security configuration, key derivation, engine discovery,
 //! and V3 message building/handling.
 
-use crate::ber::{Decoder, EncodeBuf};
+use crate::ber::EncodeBuf;
 use crate::error::internal::{AuthErrorKind, CryptoErrorKind};
 use crate::error::{Error, Result};
 use crate::format::hex;
-use crate::message::{RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message};
+use crate::message::{
+    RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message,
+    decode_scoped_pdu_with_consumption,
+};
 use crate::pdu::{Pdu, PduType};
 use crate::transport::{Candidate, RequestRegistration, Transport};
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
-    classify_report,
+    classify_report, validate_engine_id,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -175,7 +178,7 @@ impl<T: Transport> Client<T> {
             let discovery_msg = V3Message::discovery_request(
                 msg_id,
                 self.inner.transport.receive_limits().advertised(),
-            );
+            )?;
             let discovery_data = discovery_msg.encode()?;
 
             let registration = RequestRegistration::v3(msg_id, self.inner.config.timeout);
@@ -333,8 +336,7 @@ impl<T: Transport> Client<T> {
         let RawMsgData::Plaintext(bytes) = &response.msg_data else {
             return Err(malformed());
         };
-        let mut decoder = Decoder::with_target(bytes.clone(), source);
-        let scoped_pdu = ScopedPdu::decode(&mut decoder)?;
+        let scoped_pdu = decode_scoped_pdu_with_consumption(bytes.clone(), source, None)?;
 
         // Bind the Internal-class Report to the exact outstanding discovery
         // attempt only after Security Model processing and scoped-PDU parsing.
@@ -460,6 +462,21 @@ impl<T: Transport> Client<T> {
             .config
             .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+
+        validate_engine_id(&response_usm.engine_id).map_err(|_| {
+            Error::Auth {
+                target: self.peer_addr(),
+            }
+            .boxed()
+        })?;
+        response_usm
+            .validate_for_security_level(received_level)
+            .map_err(|_| {
+                Error::Auth {
+                    target: self.peer_addr(),
+                }
+                .boxed()
+            })?;
 
         if response_usm.username != security.username() {
             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "USM security name does not select the configured user");
@@ -593,8 +610,7 @@ impl<T: Transport> Client<T> {
 
         tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
 
-        let mut decoder = Decoder::with_target(plaintext, source);
-        ScopedPdu::decode(&mut decoder)
+        decode_scoped_pdu_with_consumption(plaintext, source, Some(priv_key.protocol()))
     }
 
     fn validate_v3_candidate(
@@ -667,8 +683,7 @@ impl<T: Transport> Client<T> {
 
         let scoped_pdu = match &raw.msg_data {
             RawMsgData::Plaintext(bytes) => {
-                let mut decoder = Decoder::with_target(bytes.clone(), source);
-                match ScopedPdu::decode(&mut decoder) {
+                match decode_scoped_pdu_with_consumption(bytes.clone(), source, None) {
                     Ok(scoped) => scoped,
                     Err(_) => return Ok(Candidate::Reject),
                 }
@@ -1438,11 +1453,14 @@ mod tests {
             msg_id,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(crate::message::SecurityLevel::NoAuthNoPriv, false),
-        );
-        let usm = UsmSecurityParams::new(Bytes::copy_from_slice(engine_id), 1, 100, Bytes::new());
+        )
+        .unwrap();
+        let usm = UsmSecurityParams::new(Bytes::copy_from_slice(engine_id), 1, 100, Bytes::new())
+            .unwrap();
         let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), report_pdu);
 
-        V3Message::new(global, usm.encode(), scoped)
+        V3Message::new(global, usm.encode().unwrap(), scoped)
+            .unwrap()
             .encode()
             .unwrap()
     }
@@ -1685,18 +1703,20 @@ mod response_validation_tests {
             99,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(security_level, false),
-        );
+        )
+        .unwrap();
         let mut usm = UsmSecurityParams::new(
             Bytes::from_static(ENGINE_ID),
             engine_boots,
             engine_time,
             Bytes::from_static(b"user"),
-        );
+        )
+        .unwrap();
         let auth_key = auth_password.map(|password| {
             LocalizedKey::from_password(AuthProtocol::Sha1, password, ENGINE_ID).unwrap()
         });
         if let Some(key) = &auth_key {
-            usm = usm.with_auth_placeholder(key.mac_len());
+            usm = usm.with_auth_placeholder(key.mac_len()).unwrap();
         }
         let scoped = ScopedPdu::new(
             Bytes::from_static(ENGINE_ID),
@@ -1709,7 +1729,7 @@ mod response_validation_tests {
                 vec![],
             ),
         );
-        let msg = V3Message::new(global, usm.encode(), scoped);
+        let msg = V3Message::new(global, usm.encode().unwrap(), scoped).unwrap();
         match auth_key {
             Some(key) => {
                 let mut bytes = msg.encode().unwrap().to_vec();
@@ -1758,7 +1778,8 @@ mod response_validation_tests {
             request.global_data.msg_id,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(level, false),
-        );
+        )
+        .unwrap();
         let auth_key = (level == SecurityLevel::AuthNoPriv).then(|| {
             LocalizedKey::from_password(AuthProtocol::Sha1, b"authpass12345678", ENGINE_ID).unwrap()
         });
@@ -1767,16 +1788,18 @@ mod response_validation_tests {
             1,
             engine_time,
             Bytes::from_static(b"user"),
-        );
+        )
+        .unwrap();
         if let Some(key) = &auth_key {
-            usm = usm.with_auth_placeholder(key.mac_len());
+            usm = usm.with_auth_placeholder(key.mac_len()).unwrap();
         }
         let scoped = ScopedPdu::new(
             scoped_request.context_engine_id,
             scoped_request.context_name,
             pdu,
         );
-        let mut response = V3Message::new(global, usm.encode(), scoped)
+        let mut response = V3Message::new(global, usm.encode().unwrap(), scoped)
+            .unwrap()
             .encode()
             .unwrap()
             .to_vec();

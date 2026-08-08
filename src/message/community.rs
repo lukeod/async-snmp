@@ -603,8 +603,14 @@ mod tests {
                 11,
                 crate::MessageSize::new(65_507).unwrap(),
                 MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+            )
+            .unwrap();
+            let security_params = crate::v3::UsmSecurityParams::discovery().encode().unwrap();
+            assert_invalid_message(
+                V3Message::new(global, security_params, scoped)
+                    .unwrap()
+                    .encode(),
             );
-            assert_invalid_message(V3Message::new(global, Bytes::new(), scoped).encode());
             assert_eq!(pdu, original);
         }
     }

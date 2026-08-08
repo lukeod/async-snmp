@@ -1513,8 +1513,8 @@ mod usm_params_boundary {
     fn usm_max_values_accepted() {
         let encoded = encode_usm_with_boots_time(i32::MAX, i32::MAX);
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
-        assert_eq!(decoded.engine_boots, i32::MAX as u32);
-        assert_eq!(decoded.engine_time, i32::MAX as u32);
+        assert_eq!(decoded.engine_boots(), i32::MAX as u32);
+        assert_eq!(decoded.engine_time(), i32::MAX as u32);
     }
 }
 
@@ -1540,8 +1540,8 @@ proptest! {
             prop_assert!(result.is_err());
         } else {
             let decoded = result.unwrap();
-            prop_assert_eq!(decoded.engine_boots, boots as u32);
-            prop_assert_eq!(decoded.engine_time, time as u32);
+            prop_assert_eq!(decoded.engine_boots(), boots as u32);
+            prop_assert_eq!(decoded.engine_time(), time as u32);
         }
     }
 }

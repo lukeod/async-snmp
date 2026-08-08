@@ -171,29 +171,63 @@ impl MsgFlags {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsgGlobalData {
     /// Message identifier for request/response correlation
-    pub msg_id: i32,
+    pub(crate) msg_id: i32,
     /// Maximum message size the sender can accept
-    pub msg_max_size: MessageSize,
+    pub(crate) msg_max_size: MessageSize,
     /// Message flags (security level + reportable)
-    pub msg_flags: MsgFlags,
+    pub(crate) msg_flags: MsgFlags,
     /// Security model (always USM=3 for our implementation)
-    pub msg_security_model: V3SecurityModel,
+    pub(crate) msg_security_model: V3SecurityModel,
 }
 
 impl MsgGlobalData {
-    /// Create new global data.
-    #[must_use]
-    pub fn new(msg_id: i32, msg_max_size: MessageSize, msg_flags: MsgFlags) -> Self {
-        Self {
+    /// Create validated global data.
+    pub fn new(msg_id: i32, msg_max_size: MessageSize, msg_flags: MsgFlags) -> Result<Self> {
+        if msg_id < 0 {
+            return Err(Error::Config("SNMPv3 msgID must be in 0..=i32::MAX".into()).boxed());
+        }
+        Ok(Self {
             msg_id,
             msg_max_size,
             msg_flags,
             msg_security_model: V3SecurityModel::Usm,
-        }
+        })
     }
 
-    /// Encode to buffer.
-    pub fn encode(&self, buf: &mut EncodeBuf) {
+    /// Return the message identifier.
+    #[must_use]
+    pub fn msg_id(&self) -> i32 {
+        self.msg_id
+    }
+
+    /// Return the sender's accepted maximum message size.
+    #[must_use]
+    pub fn msg_max_size(&self) -> MessageSize {
+        self.msg_max_size
+    }
+
+    /// Return the message flags.
+    #[must_use]
+    pub fn msg_flags(&self) -> MsgFlags {
+        self.msg_flags
+    }
+
+    /// Return the selected security model.
+    #[must_use]
+    pub fn msg_security_model(&self) -> V3SecurityModel {
+        self.msg_security_model
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.msg_id < 0 || self.msg_security_model != V3SecurityModel::Usm {
+            return Err(Error::Config("invalid SNMPv3 global data".into()).boxed());
+        }
+        Ok(())
+    }
+
+    /// Encode to buffer after revalidating all construction invariants.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.validate()?;
         buf.push_sequence(|buf| {
             buf.push_integer(self.msg_security_model.as_i32());
             // msgFlags is a 1-byte OCTET STRING
@@ -201,6 +235,7 @@ impl MsgGlobalData {
             buf.push_integer(self.msg_max_size.as_i32());
             buf.push_integer(self.msg_id);
         });
+        Ok(())
     }
 
     /// Decode from decoder.
@@ -320,15 +355,41 @@ impl ScopedPdu {
     }
 }
 
+/// Decode one captured or decrypted scoped-PDU TLV and validate its suffix.
+///
+/// Plaintext and AES-CFB data must end exactly after the TLV. DES and 3DES
+/// may carry at most seven padding octets from their eight-octet CBC block.
+pub(crate) fn decode_scoped_pdu_with_consumption(
+    data: Bytes,
+    source: SocketAddr,
+    privacy: Option<crate::v3::PrivProtocol>,
+) -> Result<ScopedPdu> {
+    let mut decoder = Decoder::with_target(data, source);
+    let scoped = ScopedPdu::decode(&mut decoder)?;
+    let maximum_suffix = match privacy {
+        Some(crate::v3::PrivProtocol::Des | crate::v3::PrivProtocol::Des3) => 7,
+        Some(
+            crate::v3::PrivProtocol::Aes128
+            | crate::v3::PrivProtocol::Aes192
+            | crate::v3::PrivProtocol::Aes256,
+        )
+        | None => 0,
+    };
+    if decoder.remaining() > maximum_suffix {
+        return Err(decoder.malformed());
+    }
+    Ok(scoped)
+}
+
 /// `SNMPv3` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V3Message {
     /// Global data (header)
-    pub global_data: MsgGlobalData,
+    pub(crate) global_data: MsgGlobalData,
     /// Security parameters (opaque, USM-encoded)
-    pub security_params: Bytes,
+    pub(crate) security_params: Bytes,
     /// Message data - either plaintext `ScopedPdu` or encrypted bytes
-    pub data: V3MessageData,
+    pub(crate) data: V3MessageData,
 }
 
 /// Message data payload.
@@ -341,26 +402,65 @@ pub enum V3MessageData {
 }
 
 impl V3Message {
-    /// Create a new V3 message with plaintext data.
-    pub fn new(global_data: MsgGlobalData, security_params: Bytes, scoped_pdu: ScopedPdu) -> Self {
-        Self {
+    /// Create a validated V3 message with plaintext scoped data.
+    pub fn new(
+        global_data: MsgGlobalData,
+        security_params: Bytes,
+        scoped_pdu: ScopedPdu,
+    ) -> Result<Self> {
+        let value = Self {
             global_data,
             security_params,
             data: V3MessageData::Plaintext(scoped_pdu),
-        }
+        };
+        value.validate()?;
+        Ok(value)
     }
 
-    /// Create a new V3 message with encrypted data.
+    /// Create a validated V3 message with encrypted scoped data.
     pub fn new_encrypted(
         global_data: MsgGlobalData,
         security_params: Bytes,
         encrypted: Bytes,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let value = Self {
             global_data,
             security_params,
             data: V3MessageData::Encrypted(encrypted),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Return the global header.
+    #[must_use]
+    pub fn global_data(&self) -> &MsgGlobalData {
+        &self.global_data
+    }
+
+    /// Return the opaque encoded USM security parameters.
+    #[must_use]
+    pub fn security_params(&self) -> &Bytes {
+        &self.security_params
+    }
+
+    /// Return the message data.
+    #[must_use]
+    pub fn data(&self) -> &V3MessageData {
+        &self.data
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.global_data.validate()?;
+        let level = self.global_data.msg_flags.security_level;
+        if level.requires_priv() != matches!(self.data, V3MessageData::Encrypted(_)) {
+            return Err(Error::Config(
+                "SNMPv3 privacy flag contradicts the msgData representation".into(),
+            )
+            .boxed());
         }
+        let usm = crate::v3::UsmSecurityParams::decode(self.security_params.clone())?;
+        usm.validate_for_security_level(level)
     }
 
     /// Get the scoped PDU if available (plaintext only).
@@ -406,6 +506,7 @@ impl V3Message {
     /// 2. Compute HMAC over the entire encoded message
     /// 3. Replace the placeholder with the actual HMAC
     pub fn encode(&self) -> Result<Bytes> {
+        self.validate()?;
         let mut buf = EncodeBuf::new();
 
         buf.try_push_sequence(|buf| {
@@ -419,7 +520,7 @@ impl V3Message {
             buf.push_octet_string(&self.security_params);
 
             // msgGlobalData
-            self.global_data.encode(buf);
+            self.global_data.encode(buf)?;
 
             // version
             buf.push_integer(3);
@@ -500,11 +601,13 @@ impl V3Message {
             V3MessageData::Plaintext(scoped_pdu)
         };
 
-        Ok(Self {
+        let value = Self {
             global_data,
             security_params,
             data,
-        })
+        };
+        value.validate().map_err(|_| seq.malformed())?;
+        Ok(value)
     }
 
     /// Create a discovery request message.
@@ -514,16 +617,15 @@ impl V3Message {
     /// establish trusted time; authenticated communication performs that step.
     /// Uses empty security parameters and no authentication. The supplied local
     /// receive capacity is advertised to the remote engine.
-    #[must_use]
-    pub fn discovery_request(msg_id: i32, local_receive_capacity: MessageSize) -> Self {
+    pub fn discovery_request(msg_id: i32, local_receive_capacity: MessageSize) -> Result<Self> {
         let global_data = MsgGlobalData::new(
             msg_id,
             local_receive_capacity,
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )?;
 
         // Empty USM security parameters for discovery
-        let security_params = crate::v3::UsmSecurityParams::empty().encode();
+        let security_params = crate::v3::UsmSecurityParams::discovery().encode()?;
 
         // Empty scoped PDU with Report request
         let pdu = Pdu::get_request(0, &[]);
@@ -701,6 +803,134 @@ mod tests {
     use super::*;
     use crate::oid;
 
+    fn valid_scoped_bytes() -> Bytes {
+        ScopedPdu::with_empty_context(Pdu::get_request(1, &[]))
+            .encode_to_bytes()
+            .unwrap()
+    }
+
+    fn no_auth_security_params() -> Bytes {
+        crate::v3::UsmSecurityParams::new(b"engine".as_slice(), 0, 0, Bytes::new())
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    fn auth_security_params(with_privacy: bool) -> Bytes {
+        let params =
+            crate::v3::UsmSecurityParams::new(b"engine".as_slice(), 0, 0, b"user".as_slice())
+                .unwrap()
+                .with_auth_params([0_u8; 12].as_slice())
+                .unwrap();
+        let params = if with_privacy {
+            params.with_priv_params([0_u8; 8].as_slice()).unwrap()
+        } else {
+            params
+        };
+        params.encode().unwrap()
+    }
+
+    #[test]
+    fn public_v3_constructors_and_encode_recheck_invariants() {
+        let size = crate::MessageSize::new(65_507).unwrap();
+        assert!(
+            MsgGlobalData::new(-1, size, MsgFlags::new(SecurityLevel::NoAuthNoPriv, false))
+                .is_err()
+        );
+        assert!(
+            MsgGlobalData::new(0, size, MsgFlags::new(SecurityLevel::NoAuthNoPriv, false)).is_ok()
+        );
+        assert!(
+            MsgGlobalData::new(
+                i32::MAX,
+                size,
+                MsgFlags::new(SecurityLevel::NoAuthNoPriv, false)
+            )
+            .is_ok()
+        );
+
+        let mut global =
+            MsgGlobalData::new(1, size, MsgFlags::new(SecurityLevel::NoAuthNoPriv, false)).unwrap();
+        global.msg_id = -1;
+        let mut buf = EncodeBuf::new();
+        assert!(global.encode(&mut buf).is_err());
+
+        let no_auth = crate::v3::UsmSecurityParams::new(b"engine".as_slice(), 0, 0, Bytes::new())
+            .unwrap()
+            .encode()
+            .unwrap();
+        let scoped = ScopedPdu::with_empty_context(Pdu::get_request(1, &[]));
+        let private =
+            MsgGlobalData::new(1, size, MsgFlags::new(SecurityLevel::AuthPriv, false)).unwrap();
+        assert!(V3Message::new(private.clone(), no_auth.clone(), scoped.clone()).is_err());
+        assert!(
+            V3Message::new_encrypted(private, no_auth, Bytes::from_static(b"ciphertext")).is_err()
+        );
+
+        let mut message = V3Message::discovery_request(1, size).unwrap();
+        message.global_data.msg_flags = MsgFlags::new(SecurityLevel::AuthPriv, true);
+        assert!(message.encode().is_err());
+    }
+
+    #[test]
+    fn scoped_pdu_suffix_rules_match_privacy_protocols() {
+        let source = UNKNOWN_TARGET;
+        for suffix in 0..=8 {
+            let mut bytes = valid_scoped_bytes().to_vec();
+            bytes.extend(std::iter::repeat_n(0, suffix));
+            let bytes = Bytes::from(bytes);
+            assert_eq!(
+                decode_scoped_pdu_with_consumption(
+                    bytes.clone(),
+                    source,
+                    Some(crate::v3::PrivProtocol::Des)
+                )
+                .is_ok(),
+                suffix <= 7
+            );
+            assert_eq!(
+                decode_scoped_pdu_with_consumption(
+                    bytes.clone(),
+                    source,
+                    Some(crate::v3::PrivProtocol::Des3)
+                )
+                .is_ok(),
+                suffix <= 7
+            );
+            assert_eq!(
+                decode_scoped_pdu_with_consumption(
+                    bytes.clone(),
+                    source,
+                    Some(crate::v3::PrivProtocol::Aes128)
+                )
+                .is_ok(),
+                suffix == 0
+            );
+            assert_eq!(
+                decode_scoped_pdu_with_consumption(
+                    bytes.clone(),
+                    source,
+                    Some(crate::v3::PrivProtocol::Aes192)
+                )
+                .is_ok(),
+                suffix == 0
+            );
+            assert_eq!(
+                decode_scoped_pdu_with_consumption(
+                    bytes.clone(),
+                    source,
+                    Some(crate::v3::PrivProtocol::Aes256)
+                )
+                .is_ok(),
+                suffix == 0
+            );
+            assert_eq!(
+                decode_scoped_pdu_with_consumption(bytes, source, None).is_ok(),
+                suffix == 0
+            );
+        }
+    }
+
     #[test]
     fn encode_rejects_malformed_pdu_without_mutating_it() {
         let pdu = Pdu::get_bulk(1, -1, -5, vec![]);
@@ -710,8 +940,9 @@ mod tests {
             1,
             crate::MessageSize::new(65_507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
-        );
-        let message = V3Message::new(global, Bytes::new(), scoped);
+        )
+        .unwrap();
+        let message = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
 
         assert!(message.encode().is_err());
         assert_eq!(pdu, original);
@@ -725,8 +956,9 @@ mod tests {
             1,
             crate::MessageSize::new(65_507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
-        );
-        let message = V3Message::new(global, Bytes::new(), scoped);
+        )
+        .unwrap();
+        let message = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
         assert!(matches!(
             &*message.encode().unwrap_err(),
             Error::InvalidOid(_)
@@ -819,15 +1051,22 @@ mod tests {
             1,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
-        let usm =
-            UsmSecurityParams::new(Bytes::from_static(b"eid"), 0, 0, Bytes::from_static(b"u"));
+        )
+        .unwrap();
+        let usm = UsmSecurityParams::new(
+            Bytes::from_static(b"engine"),
+            0,
+            0,
+            Bytes::from_static(b"u"),
+        )
+        .unwrap();
         let scoped = ScopedPdu::new(
-            Bytes::from_static(b"eid"),
+            Bytes::from_static(b"engine"),
             Bytes::new(),
             Pdu::get_request(42, &[]),
         );
-        let base = V3Message::new(global, usm.encode(), scoped)
+        let base = V3Message::new(global, usm.encode().unwrap(), scoped)
+            .unwrap()
             .encode()
             .unwrap();
 
@@ -874,7 +1113,9 @@ mod tests {
                 crate::MessageSize::new(65507).unwrap(),
                 MsgFlags::new(SecurityLevel::AuthNoPriv, false),
             )
-            .encode(buf);
+            .unwrap()
+            .encode(buf)
+            .unwrap();
             buf.push_integer(3);
         });
         let encoded = buf.finish();
@@ -900,15 +1141,16 @@ mod tests {
             7,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )
+        .unwrap();
         let scoped = ScopedPdu::with_empty_context(Pdu::get_request(42, &[]));
-        let security_params = crate::v3::UsmSecurityParams::empty().encode();
+        let security_params = crate::v3::UsmSecurityParams::discovery().encode().unwrap();
 
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             scoped.encode(buf).unwrap();
             buf.push_octet_string(&security_params);
-            global.encode(buf);
+            global.encode(buf).unwrap();
             // 2^32 + 3 previously narrowed to the accepted v3 value.
             push_integer_content(buf, &[0x01, 0x00, 0x00, 0x00, 0x03]);
         });
@@ -927,10 +1169,11 @@ mod tests {
             9,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )
+        .unwrap();
         let pdu = Pdu::get_request(42, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
-        let scoped = ScopedPdu::new(b"eng".as_slice(), b"ctx".as_slice(), pdu);
-        let msg = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
+        let scoped = ScopedPdu::new(b"engine".as_slice(), b"ctx".as_slice(), pdu);
+        let msg = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
 
         let raw = RawV3Message::decode(msg.encode().unwrap()).unwrap();
         let RawMsgData::Plaintext(bytes) = raw.msg_data else {
@@ -938,7 +1181,7 @@ mod tests {
         };
         let mut decoder = Decoder::new(bytes);
         let reparsed = ScopedPdu::decode(&mut decoder).unwrap();
-        assert_eq!(reparsed.context_engine_id.as_ref(), b"eng");
+        assert_eq!(reparsed.context_engine_id.as_ref(), b"engine");
         assert_eq!(reparsed.context_name.as_ref(), b"ctx");
         assert_eq!(reparsed.pdu.request_id, 42);
     }
@@ -950,12 +1193,14 @@ mod tests {
             200,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::AuthPriv, false),
-        );
+        )
+        .unwrap();
         let msg = V3Message::new_encrypted(
             global,
-            Bytes::from_static(b"usm-params"),
+            auth_security_params(true),
             Bytes::from_static(b"encrypted-data"),
-        );
+        )
+        .unwrap();
 
         let raw = RawV3Message::decode(msg.encode().unwrap()).unwrap();
         assert_eq!(raw.security_level(), SecurityLevel::AuthPriv);
@@ -973,13 +1218,15 @@ mod tests {
             1,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )
+        .unwrap();
         let pdu = Pdu::get_request(1, &[]);
         let msg = V3Message::new(
             global,
-            Bytes::from_static(b"usm"),
+            no_auth_security_params(),
             ScopedPdu::with_empty_context(pdu),
-        );
+        )
+        .unwrap();
         let mut bytes = msg.encode().unwrap().to_vec();
         // Locate the single-byte msgFlags OCTET STRING (0x04 0x01 0x04) and
         // patch it to priv-without-auth (0x02).
@@ -1006,13 +1253,15 @@ mod tests {
             1,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::AuthNoPriv, false),
-        );
+        )
+        .unwrap();
         let pdu = Pdu::get_request(1, &[]);
         let msg = V3Message::new(
             global,
-            Bytes::from_static(b"usm"),
+            auth_security_params(false),
             ScopedPdu::with_empty_context(pdu),
-        );
+        )
+        .unwrap();
         let mut bytes = msg.encode().unwrap().to_vec();
         let pos = bytes
             .windows(3)
@@ -1032,7 +1281,8 @@ mod tests {
             17,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
-        );
+        )
+        .unwrap();
         let scoped = ScopedPdu::with_empty_context(Pdu::get_request(23, &[]));
 
         // Encode an extra INTEGER after msgData inside the outer sequence.
@@ -1040,8 +1290,8 @@ mod tests {
         with_outer_field.push_sequence(|buf| {
             buf.push_integer(99);
             scoped.encode(buf).unwrap();
-            buf.push_octet_string(b"usm");
-            global.encode(buf);
+            buf.push_octet_string(&no_auth_security_params());
+            global.encode(buf).unwrap();
             buf.push_integer(3);
         });
         let with_outer_field = with_outer_field.finish();
@@ -1053,7 +1303,7 @@ mod tests {
         let mut with_global_field = EncodeBuf::new();
         with_global_field.push_sequence(|buf| {
             scoped.encode(buf).unwrap();
-            buf.push_octet_string(b"usm");
+            buf.push_octet_string(&no_auth_security_params());
             buf.push_sequence(|buf| {
                 buf.push_integer(99);
                 buf.push_integer(V3SecurityModel::Usm.as_i32());
@@ -1069,7 +1319,7 @@ mod tests {
         assert!(crate::message::Message::decode(with_global_field).is_err());
 
         // Append another top-level TLV after an otherwise complete message.
-        let message = V3Message::new(global, Bytes::from_static(b"usm"), scoped);
+        let message = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
         let valid = message.encode().unwrap();
         assert_eq!(
             RawV3Message::decode_with_policy(valid.clone(), DecodePolicy::Compatible)
@@ -1121,10 +1371,11 @@ mod tests {
             12345,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::AuthNoPriv, true),
-        );
+        )
+        .unwrap();
 
         let mut buf = EncodeBuf::new();
-        global.encode(&mut buf);
+        global.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -1175,17 +1426,18 @@ mod tests {
             100,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )
+        .unwrap();
         let pdu = Pdu::get_request(42, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
         let scoped = ScopedPdu::with_empty_context(pdu);
-        let msg = V3Message::new(global, Bytes::from_static(b"usm-params"), scoped);
+        let msg = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
 
         let encoded = msg.encode().unwrap();
         let decoded = V3Message::decode(encoded).unwrap();
 
         assert_eq!(decoded.global_data.msg_id, 100);
         assert_eq!(decoded.security_level(), SecurityLevel::NoAuthNoPriv);
-        assert_eq!(decoded.security_params.as_ref(), b"usm-params");
+        assert_eq!(decoded.security_params, no_auth_security_params());
 
         let scoped_pdu = decoded.scoped_pdu().unwrap();
         assert_eq!(scoped_pdu.pdu.request_id, 42);
@@ -1197,12 +1449,14 @@ mod tests {
             200,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::AuthPriv, false),
-        );
+        )
+        .unwrap();
         let msg = V3Message::new_encrypted(
             global,
-            Bytes::from_static(b"usm-params"),
+            auth_security_params(true),
             Bytes::from_static(b"encrypted-data"),
-        );
+        )
+        .unwrap();
 
         let encoded = msg.encode().unwrap();
         let decoded = V3Message::decode(encoded).unwrap();
@@ -1248,10 +1502,11 @@ mod tests {
             100,
             crate::MessageSize::new(484).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )
+        .unwrap();
 
         let mut buf = EncodeBuf::new();
-        global.encode(&mut buf);
+        global.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -1380,10 +1635,11 @@ mod tests {
             100,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )
+        .unwrap();
 
         let mut buf = EncodeBuf::new();
-        global.encode(&mut buf);
+        global.encode(&mut buf).unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);

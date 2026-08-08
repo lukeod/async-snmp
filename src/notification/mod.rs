@@ -1354,20 +1354,22 @@ mod tests {
             1,
             crate::MessageSize::from_i32(msg_max_size).unwrap(),
             MsgFlags::new(level, reportable),
-        );
+        )
+        .unwrap();
 
         let mut usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             engine_boots,
             engine_time,
             Bytes::copy_from_slice(username),
-        );
+        )
+        .unwrap();
         if let Some(key) = &auth_key {
-            usm_params = usm_params.with_auth_placeholder(key.mac_len());
+            usm_params = usm_params.with_auth_placeholder(key.mac_len()).unwrap();
         }
 
         let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), pdu);
-        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        let msg = V3Message::new(global, usm_params.encode().unwrap(), scoped).unwrap();
         let mut msg_bytes = msg.encode().unwrap().to_vec();
 
         // Compute and insert HMAC
@@ -1832,17 +1834,13 @@ mod tests {
             msg_id,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, reportable),
-        );
+        )
+        .unwrap();
 
-        let usm_params = UsmSecurityParams::new(
-            Bytes::new(), // empty engine ID = discovery
-            0,
-            0,
-            Bytes::new(), // empty username
-        );
+        let usm_params = UsmSecurityParams::discovery();
 
         let scoped = ScopedPdu::new(Bytes::new(), Bytes::new(), pdu);
-        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        let msg = V3Message::new(global, usm_params.encode().unwrap(), scoped).unwrap();
         msg.encode().unwrap()
     }
 
@@ -2079,7 +2077,7 @@ mod tests {
                     1,
                     crate::UDP_RECEIVE_LIMITS.advertised(),
                     level,
-                    UsmSecurityParams::new(engine_id.clone(), 1, 0, username.clone()),
+                    UsmSecurityParams::new(engine_id.clone(), 1, 0, username.clone()).unwrap(),
                     engine_id.clone(),
                     Bytes::new(),
                     Some(&keys),
@@ -2465,21 +2463,26 @@ mod tests {
             1,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::AuthPriv, false),
-        );
+        )
+        .unwrap();
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             7,
             123_456,
             Bytes::copy_from_slice(username),
         )
+        .unwrap()
         .with_auth_placeholder(auth_key.mac_len())
-        .with_priv_params(Bytes::from_static(b"bad"));
+        .unwrap()
+        .with_priv_params(Bytes::from_static(b"bad"))
+        .unwrap();
 
         let msg = V3Message::new_encrypted(
             global,
-            usm_params.encode(),
+            usm_params.encode().unwrap(),
             Bytes::from_static(b"not-a-valid-ciphertext"),
-        );
+        )
+        .unwrap();
         let mut msg_bytes = msg.encode().unwrap().to_vec();
         let (auth_offset, auth_len) =
             UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();

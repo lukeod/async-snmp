@@ -473,7 +473,11 @@ async fn v3_engine_discovery() {
 
 /// Build a raw noAuthNoPriv V3 GET request with a given engine ID and username.
 fn build_raw_v3_get(engine_id: Bytes, username: Bytes) -> Bytes {
-    let usm = UsmSecurityParams::new(engine_id, 0, 0, username);
+    let usm = if engine_id.is_empty() && username.is_empty() {
+        UsmSecurityParams::discovery()
+    } else {
+        UsmSecurityParams::new(engine_id, 0, 0, username).unwrap()
+    };
     let pdu = Pdu::standard(
         async_snmp::pdu::StandardPduType::GetRequest,
         1,
@@ -486,8 +490,10 @@ fn build_raw_v3_get(engine_id: Bytes, username: Bytes) -> Bytes {
         1,
         async_snmp::MessageSize::new(65507).unwrap(),
         MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-    );
-    V3Message::new(global, usm.encode(), scoped)
+    )
+    .unwrap();
+    V3Message::new(global, usm.encode().unwrap(), scoped)
+        .unwrap()
         .encode()
         .unwrap()
 }

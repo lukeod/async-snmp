@@ -672,21 +672,26 @@ mod tests {
             1,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::AuthPriv, true),
-        );
+        )
+        .unwrap();
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             7,
             123_456,
             Bytes::copy_from_slice(username),
         )
+        .unwrap()
         .with_auth_placeholder(auth_key.mac_len())
-        .with_priv_params(Bytes::from_static(b"bad"));
+        .unwrap()
+        .with_priv_params(Bytes::from_static(b"bad"))
+        .unwrap();
 
         let msg = V3Message::new_encrypted(
             global,
-            usm_params.encode(),
+            usm_params.encode().unwrap(),
             Bytes::from_static(b"not-a-valid-ciphertext"),
-        );
+        )
+        .unwrap();
         let mut msg_bytes = msg.encode().unwrap().to_vec();
         let (auth_offset, auth_len) =
             UsmSecurityParams::find_auth_params_offset(&msg_bytes).unwrap();
@@ -703,21 +708,24 @@ mod tests {
             1,
             crate::MessageSize::new(65507).unwrap(),
             MsgFlags::new(SecurityLevel::AuthNoPriv, true),
-        );
+        )
+        .unwrap();
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             7,
             123_456,
             Bytes::copy_from_slice(username),
         )
-        .with_auth_params(Bytes::from_static(&[0u8; 12]));
+        .unwrap()
+        .with_auth_params(Bytes::from_static(&[0u8; 12]))
+        .unwrap();
 
         let scoped = ScopedPdu::new(
             Bytes::copy_from_slice(engine_id),
             Bytes::new(),
             Pdu::standard(crate::pdu::StandardPduType::GetRequest, 99, 0, 0, vec![]),
         );
-        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        let msg = V3Message::new(global, usm_params.encode().unwrap(), scoped).unwrap();
         msg.encode().unwrap()
     }
 
@@ -749,15 +757,18 @@ mod tests {
             1,
             crate::MessageSize::from_i32(msg_max_size).unwrap(),
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
-        );
+        )
+        .unwrap();
         let usm_params = UsmSecurityParams::new(
             Bytes::copy_from_slice(engine_id),
             engine_boots,
             engine_time,
             Bytes::copy_from_slice(username),
-        );
+        )
+        .unwrap();
         let scoped = ScopedPdu::new(Bytes::copy_from_slice(context_engine_id), Bytes::new(), pdu);
-        V3Message::new(global, usm_params.encode(), scoped)
+        V3Message::new(global, usm_params.encode().unwrap(), scoped)
+            .unwrap()
             .encode()
             .unwrap()
     }
@@ -897,7 +908,7 @@ mod tests {
             1,
             crate::UDP_RECEIVE_LIMITS.advertised(),
             SecurityLevel::NoAuthNoPriv,
-            UsmSecurityParams::new(engine_id.clone(), 1, 127, username.clone()),
+            UsmSecurityParams::new(engine_id.clone(), 1, 127, username.clone()).unwrap(),
             engine_id.clone(),
             Bytes::new(),
             None,

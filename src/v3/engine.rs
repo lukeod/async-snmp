@@ -1591,10 +1591,24 @@ mod tests {
         assert!(cache.get(&addr3).is_some());
     }
 
+    fn raw_usm_with_engine_id(engine_id: &[u8]) -> Bytes {
+        let mut buf = crate::ber::EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[]);
+            buf.push_integer(1);
+            buf.push_integer(1);
+            buf.push_octet_string(engine_id);
+        });
+        buf.finish()
+    }
+
     #[test]
     fn test_parse_discovery_response() {
-        let usm = UsmSecurityParams::new(b"test-engine-id".as_slice(), 42, 12345, b"".as_slice());
-        let encoded = usm.encode();
+        let usm = UsmSecurityParams::new(b"test-engine-id".as_slice(), 42, 12345, b"".as_slice())
+            .unwrap();
+        let encoded = usm.encode().unwrap();
 
         let state = parse_discovery_response(&encoded).unwrap();
         assert_eq!(state.engine_id.as_ref(), b"test-engine-id");
@@ -1604,8 +1618,8 @@ mod tests {
 
     #[test]
     fn test_parse_discovery_response_empty_engine_id() {
-        let usm = UsmSecurityParams::empty();
-        let encoded = usm.encode();
+        let usm = UsmSecurityParams::discovery();
+        let encoded = usm.encode().unwrap();
 
         let result = parse_discovery_response(&encoded);
         assert!(matches!(
@@ -1616,26 +1630,17 @@ mod tests {
 
     #[test]
     fn test_parse_discovery_response_rejects_invalid_engine_id() {
-        // Too short (< 5 octets).
-        let usm = UsmSecurityParams::new(b"abcd".as_slice(), 1, 1, b"".as_slice());
-        assert!(matches!(
-            *parse_discovery_response(&usm.encode()).unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
-
-        // All-zero engine ID of otherwise valid length.
-        let usm = UsmSecurityParams::new([0u8; 8].as_slice(), 1, 1, b"".as_slice());
-        assert!(matches!(
-            *parse_discovery_response(&usm.encode()).unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
-
-        // All-0xff engine ID of otherwise valid length.
-        let usm = UsmSecurityParams::new([0xffu8; 8].as_slice(), 1, 1, b"".as_slice());
-        assert!(matches!(
-            *parse_discovery_response(&usm.encode()).unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        for engine_id in [
+            b"abcd".as_slice(),
+            [0_u8; 8].as_slice(),
+            [0xff_u8; 8].as_slice(),
+            [1_u8; 33].as_slice(),
+        ] {
+            assert!(matches!(
+                *parse_discovery_response(&raw_usm_with_engine_id(engine_id)).unwrap_err(),
+                Error::MalformedResponse { .. }
+            ));
+        }
     }
 
     // ========================================================================

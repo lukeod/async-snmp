@@ -19,7 +19,9 @@ use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Result, UNKNOWN_TARGET};
+use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::message::SecurityLevel;
+use crate::v3::validate_engine_id;
 
 /// Maximum length of `msgUserName`, per RFC 3414 Section 2.4 (SIZE(0..32)).
 const MAX_USER_NAME_LEN: usize = 32;
@@ -28,40 +30,49 @@ const MAX_USER_NAME_LEN: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsmSecurityParams {
     /// Authoritative engine ID
-    pub engine_id: Bytes,
+    pub(crate) engine_id: Bytes,
     /// Engine boot count
-    pub engine_boots: u32,
+    pub(crate) engine_boots: u32,
     /// Engine time (seconds since last boot)
-    pub engine_time: u32,
+    pub(crate) engine_time: u32,
     /// Username
-    pub username: Bytes,
+    pub(crate) username: Bytes,
     /// Authentication parameters (HMAC digest, or empty)
-    pub auth_params: Bytes,
+    pub(crate) auth_params: Bytes,
     /// Privacy parameters (salt/IV, or empty)
-    pub priv_params: Bytes,
+    pub(crate) priv_params: Bytes,
+    /// Whether this value was constructed or decoded as explicit discovery parameters.
+    discovery: bool,
 }
 
 impl UsmSecurityParams {
-    /// Create new USM security parameters.
+    /// Create normal (non-discovery) USM security parameters.
+    ///
+    /// The authoritative engine ID must satisfy RFC 3411's 5..=32-octet
+    /// constraints. Authentication and privacy parameters can then be added
+    /// with the fallible builder methods.
     pub fn new(
         engine_id: impl Into<Bytes>,
         engine_boots: u32,
         engine_time: u32,
         username: impl Into<Bytes>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let value = Self {
             engine_id: engine_id.into(),
             engine_boots,
             engine_time,
             username: username.into(),
             auth_params: Bytes::new(),
             priv_params: Bytes::new(),
-        }
+            discovery: false,
+        };
+        value.validate_common()?;
+        Ok(value)
     }
 
-    /// Create empty security parameters for discovery.
+    /// Create the empty USM parameters used only by engine discovery.
     #[must_use]
-    pub fn empty() -> Self {
+    pub fn discovery() -> Self {
         Self {
             engine_id: Bytes::new(),
             engine_boots: 0,
@@ -69,43 +80,144 @@ impl UsmSecurityParams {
             username: Bytes::new(),
             auth_params: Bytes::new(),
             priv_params: Bytes::new(),
+            discovery: true,
         }
     }
 
-    /// Set authentication parameters.
+    /// Return the authoritative engine ID.
     #[must_use]
-    pub fn with_auth_params(mut self, auth_params: impl Into<Bytes>) -> Self {
+    pub fn engine_id(&self) -> &Bytes {
+        &self.engine_id
+    }
+
+    /// Return the authoritative engine boots value.
+    #[must_use]
+    pub fn engine_boots(&self) -> u32 {
+        self.engine_boots
+    }
+
+    /// Return the authoritative engine time.
+    #[must_use]
+    pub fn engine_time(&self) -> u32 {
+        self.engine_time
+    }
+
+    /// Return the USM username.
+    #[must_use]
+    pub fn username(&self) -> &Bytes {
+        &self.username
+    }
+
+    /// Return the authentication parameters.
+    #[must_use]
+    pub fn auth_params(&self) -> &Bytes {
+        &self.auth_params
+    }
+
+    /// Return the privacy parameters.
+    #[must_use]
+    pub fn priv_params(&self) -> &Bytes {
+        &self.priv_params
+    }
+
+    /// Set non-empty authentication parameters.
+    pub fn with_auth_params(mut self, auth_params: impl Into<Bytes>) -> Result<Self> {
         self.auth_params = auth_params.into();
-        self
+        if self.auth_params.is_empty() {
+            return Err(
+                Error::Config("USM authentication parameters must be non-empty".into()).boxed(),
+            );
+        }
+        self.validate_common()?;
+        Ok(self)
     }
 
-    /// Set privacy parameters.
-    #[must_use]
-    pub fn with_priv_params(mut self, priv_params: impl Into<Bytes>) -> Self {
+    /// Set non-empty privacy parameters on authenticated parameters.
+    pub fn with_priv_params(mut self, priv_params: impl Into<Bytes>) -> Result<Self> {
         self.priv_params = priv_params.into();
-        self
+        if self.priv_params.is_empty() {
+            return Err(Error::Config("USM privacy parameters must be non-empty".into()).boxed());
+        }
+        self.validate_common()?;
+        Ok(self)
     }
 
-    /// Create placeholder auth params for HMAC computation.
-    ///
-    /// For authenticated messages, the auth params field is filled with zeros
-    /// during encoding, then the HMAC is computed over the entire message,
-    /// and finally the zeros are replaced with the actual HMAC.
-    #[must_use]
-    pub fn with_auth_placeholder(mut self, mac_len: usize) -> Self {
-        self.auth_params = Bytes::from(vec![0u8; mac_len]);
-        self
+    /// Create non-empty placeholder auth params for HMAC computation.
+    pub fn with_auth_placeholder(self, mac_len: usize) -> Result<Self> {
+        self.with_auth_params(Bytes::from(vec![0u8; mac_len]))
     }
 
-    /// Encode to BER bytes.
-    pub fn encode(&self) -> Bytes {
+    fn validate_common(&self) -> Result<()> {
+        if self.engine_boots > i32::MAX as u32 || self.engine_time > i32::MAX as u32 {
+            return Err(Error::Config("USM engine boots/time exceed i32::MAX".into()).boxed());
+        }
+        if self.username.len() > MAX_USER_NAME_LEN {
+            return Err(Error::Config(
+                format!("USM username exceeds {MAX_USER_NAME_LEN} octets").into(),
+            )
+            .boxed());
+        }
+        if self.engine_id.is_empty() {
+            if !self.discovery
+                || self.engine_boots != 0
+                || self.engine_time != 0
+                || !self.username.is_empty()
+                || !self.auth_params.is_empty()
+                || !self.priv_params.is_empty()
+            {
+                return Err(Error::Config(
+                    "empty engine ID is reserved for explicit discovery parameters".into(),
+                )
+                .boxed());
+            }
+        } else {
+            validate_engine_id(&self.engine_id)?;
+        }
+        self.validate_field_relationships()
+    }
+
+    fn validate_field_relationships(&self) -> Result<()> {
+        if self.auth_params.is_empty() && !self.priv_params.is_empty() {
+            return Err(Error::Config(
+                "USM privacy parameters require authentication parameters".into(),
+            )
+            .boxed());
+        }
+        Ok(())
+    }
+
+    /// Validate the authentication/privacy fields against the message level.
+    pub fn validate_for_security_level(&self, level: SecurityLevel) -> Result<()> {
+        self.validate_common()?;
+        let valid = match level {
+            SecurityLevel::NoAuthNoPriv => {
+                self.auth_params.is_empty() && self.priv_params.is_empty()
+            }
+            SecurityLevel::AuthNoPriv => {
+                !self.auth_params.is_empty() && self.priv_params.is_empty()
+            }
+            SecurityLevel::AuthPriv => !self.auth_params.is_empty() && !self.priv_params.is_empty(),
+        };
+        if !valid {
+            return Err(Error::Config(
+                "USM authentication/privacy fields contradict the security level".into(),
+            )
+            .boxed());
+        }
+        Ok(())
+    }
+
+    /// Encode to BER bytes after revalidating all construction invariants.
+    pub fn encode(&self) -> Result<Bytes> {
+        self.validate_common()?;
         let mut buf = EncodeBuf::new();
-        self.encode_to_buf(&mut buf);
-        buf.finish()
+        self.encode_to_buf(&mut buf)?;
+        Ok(buf.finish())
     }
 
-    /// Encode to an existing buffer.
-    pub fn encode_to_buf(&self, buf: &mut EncodeBuf) {
+    /// Encode to an existing buffer after revalidating all invariants.
+    pub fn encode_to_buf(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.validate_common()?;
         buf.push_sequence(|buf| {
             buf.push_octet_string(&self.priv_params);
             buf.push_octet_string(&self.auth_params);
@@ -114,6 +226,7 @@ impl UsmSecurityParams {
             buf.push_unsigned32(crate::ber::tag::universal::INTEGER, self.engine_boots);
             buf.push_octet_string(&self.engine_id);
         });
+        Ok(())
     }
 
     /// Decode from BER bytes.
@@ -156,6 +269,7 @@ impl UsmSecurityParams {
         if !seq.is_empty() {
             return Err(seq.malformed());
         }
+        let discovery = engine_id.is_empty();
 
         Ok(Self {
             engine_id,
@@ -164,6 +278,7 @@ impl UsmSecurityParams {
             username,
             auth_params,
             priv_params,
+            discovery,
         })
     }
 
@@ -246,9 +361,86 @@ mod tests {
     }
 
     #[test]
+    fn constructors_enforce_public_usm_invariants_and_encode_rechecks() {
+        assert!(UsmSecurityParams::new(Bytes::new(), 0, 0, Bytes::new()).is_err());
+        assert!(UsmSecurityParams::new(b"abcd".as_slice(), 0, 0, Bytes::new()).is_err());
+        assert!(UsmSecurityParams::new([0_u8; 8].as_slice(), 0, 0, Bytes::new()).is_err());
+        assert!(UsmSecurityParams::new([0xff_u8; 8].as_slice(), 0, 0, Bytes::new()).is_err());
+        assert!(
+            UsmSecurityParams::new(
+                b"engine".as_slice(),
+                i32::MAX as u32,
+                i32::MAX as u32,
+                [b'u'; 32].as_slice()
+            )
+            .is_ok()
+        );
+        assert!(
+            UsmSecurityParams::new(b"engine".as_slice(), i32::MAX as u32 + 1, 0, Bytes::new())
+                .is_err()
+        );
+        assert!(
+            UsmSecurityParams::new(b"engine".as_slice(), 0, i32::MAX as u32 + 1, Bytes::new())
+                .is_err()
+        );
+        assert!(UsmSecurityParams::new(b"engine".as_slice(), 0, 0, [b'u'; 33].as_slice()).is_err());
+
+        let mut params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, Bytes::new()).unwrap();
+        params.engine_time = i32::MAX as u32 + 1;
+        assert!(params.encode().is_err());
+
+        let mut non_discovery =
+            UsmSecurityParams::new(b"engine".as_slice(), 0, 0, Bytes::new()).unwrap();
+        non_discovery.engine_id = Bytes::new();
+        assert!(non_discovery.encode().is_err());
+
+        let discovery = UsmSecurityParams::discovery();
+        assert!(discovery.encode().is_ok());
+        assert!(
+            discovery
+                .validate_for_security_level(SecurityLevel::NoAuthNoPriv)
+                .is_ok()
+        );
+        assert!(
+            UsmSecurityParams::discovery()
+                .with_auth_params([0_u8; 12].as_slice())
+                .is_err()
+        );
+        assert!(
+            UsmSecurityParams::discovery()
+                .with_auth_placeholder(12)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn security_level_rejects_auth_priv_field_contradictions() {
+        let base = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, b"user".as_slice()).unwrap();
+        assert!(
+            base.validate_for_security_level(SecurityLevel::AuthNoPriv)
+                .is_err()
+        );
+        let auth = base.with_auth_params([0_u8; 12].as_slice()).unwrap();
+        assert!(
+            auth.validate_for_security_level(SecurityLevel::NoAuthNoPriv)
+                .is_err()
+        );
+        assert!(
+            auth.validate_for_security_level(SecurityLevel::AuthPriv)
+                .is_err()
+        );
+        assert!(
+            UsmSecurityParams::new(b"engine".as_slice(), 0, 0, b"user".as_slice())
+                .unwrap()
+                .with_priv_params([0_u8; 8].as_slice())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_usm_params_empty_roundtrip() {
-        let params = UsmSecurityParams::empty();
-        let encoded = params.encode();
+        let params = UsmSecurityParams::discovery();
+        let encoded = params.encode().unwrap();
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
 
         assert!(decoded.engine_id.is_empty());
@@ -263,10 +455,13 @@ mod tests {
     fn test_usm_params_roundtrip() {
         let params =
             UsmSecurityParams::new(b"engine-id".as_slice(), 1234, 5678, b"admin".as_slice())
-                .with_auth_params(b"auth123456789012".as_slice()) // 12 bytes for HMAC-96
-                .with_priv_params(b"priv1234".as_slice()); // 8 bytes for salt
+                .unwrap()
+                .with_auth_params(b"auth123456789012".as_slice())
+                .unwrap() // 12 bytes for HMAC-96
+                .with_priv_params(b"priv1234".as_slice())
+                .unwrap(); // 8 bytes for salt
 
-        let encoded = params.encode();
+        let encoded = params.encode().unwrap();
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
 
         assert_eq!(decoded.engine_id.as_ref(), b"engine-id");
@@ -279,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_usm_params_rejects_extra_fields_and_trailing_data() {
-        let encoded = UsmSecurityParams::empty().encode();
+        let encoded = UsmSecurityParams::discovery().encode().unwrap();
 
         let mut trailing = encoded.to_vec();
         trailing.extend_from_slice(&[0x05, 0x00]);
@@ -296,7 +491,9 @@ mod tests {
     #[test]
     fn test_usm_params_with_placeholder() {
         let params = UsmSecurityParams::new(b"engine".as_slice(), 100, 200, b"user".as_slice())
-            .with_auth_placeholder(12); // HMAC-MD5-96 / HMAC-SHA-96
+            .unwrap()
+            .with_auth_placeholder(12)
+            .unwrap(); // HMAC-MD5-96 / HMAC-SHA-96
 
         assert_eq!(params.auth_params.len(), 12);
         assert!(params.auth_params.iter().all(|&b| b == 0));
@@ -313,15 +510,18 @@ mod tests {
             12345,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::AuthNoPriv, true),
-        );
+        )
+        .unwrap();
 
         let usm_params =
             UsmSecurityParams::new(b"engine123".as_slice(), 100, 200, b"testuser".as_slice())
-                .with_auth_placeholder(12);
+                .unwrap()
+                .with_auth_placeholder(12)
+                .unwrap();
 
         let pdu = Pdu::get_request(42, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
         let scoped = ScopedPdu::with_empty_context(pdu);
-        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        let msg = V3Message::new(global, usm_params.encode().unwrap(), scoped).unwrap();
 
         let encoded = msg.encode().unwrap();
 
@@ -488,12 +688,15 @@ mod tests {
             1,
             crate::MessageSize::new(1472).unwrap(),
             MsgFlags::new(SecurityLevel::AuthNoPriv, true),
-        );
-        let usm_params = UsmSecurityParams::new(b"eng".as_slice(), 1, 1, b"u".as_slice())
-            .with_auth_placeholder(12);
+        )
+        .unwrap();
+        let usm_params = UsmSecurityParams::new(b"engine".as_slice(), 1, 1, b"u".as_slice())
+            .unwrap()
+            .with_auth_placeholder(12)
+            .unwrap();
         let pdu = Pdu::get_request(1, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
         let scoped = ScopedPdu::with_empty_context(pdu);
-        let msg = V3Message::new(global, usm_params.encode(), scoped);
+        let msg = V3Message::new(global, usm_params.encode().unwrap(), scoped).unwrap();
         let encoded_bytes = msg.encode().unwrap();
         let mut encoded: Vec<u8> = encoded_bytes.to_vec();
 
@@ -538,32 +741,32 @@ mod tests {
     #[test]
     fn test_usm_params_accepts_username_exactly_32_octets() {
         let username = vec![b'u'; 32];
-        let params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, username.clone());
+        let params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, username.clone()).unwrap();
 
-        let encoded = params.encode();
+        let encoded = params.encode().unwrap();
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
         assert_eq!(decoded.username.as_ref(), username.as_slice());
     }
 
     #[test]
     fn test_usm_params_accepts_short_username() {
-        let params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, b"admin".as_slice());
+        let params =
+            UsmSecurityParams::new(b"engine".as_slice(), 0, 0, b"admin".as_slice()).unwrap();
 
-        let encoded = params.encode();
+        let encoded = params.encode().unwrap();
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
         assert_eq!(decoded.username.as_ref(), b"admin");
     }
 
     #[test]
     fn usm_security_params_equality() {
-        let a = UsmSecurityParams {
-            engine_id: Bytes::from_static(b"\x80\x00\x01"),
-            engine_boots: 1,
-            engine_time: 100,
-            username: Bytes::from_static(b"user"),
-            auth_params: Bytes::new(),
-            priv_params: Bytes::new(),
-        };
+        let a = UsmSecurityParams::new(
+            Bytes::from_static(b"engine"),
+            1,
+            100,
+            Bytes::from_static(b"user"),
+        )
+        .unwrap();
         let b = a.clone();
         assert_eq!(a, b);
     }
