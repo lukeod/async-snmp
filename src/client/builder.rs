@@ -513,9 +513,17 @@ impl ClientBuilder {
         self
     }
 
-    /// Validate the configuration using the same checks as raw construction.
+    /// Validate non-credential configuration without preparing credentials.
+    #[cfg(test)]
     fn validate(&self) -> Result<()> {
         self.build_config().validate()
+    }
+
+    fn validate_and_precompute(&mut self) -> Result<()> {
+        let mut config = self.build_config();
+        config.validate_and_precompute()?;
+        self.auth = config.auth;
+        Ok(())
     }
 
     /// Resolve target address to `SocketAddr`, defaulting to port 161.
@@ -607,8 +615,8 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect(self) -> Result<Client<UdpHandle>> {
-        self.validate()?;
+    pub async fn connect(mut self) -> Result<Client<UdpHandle>> {
+        self.validate_and_precompute()?;
         let addr = self.resolve_target().await?;
         // Match bind address to target address family for cross-platform
         // compatibility. Dual-stack ([::]:0) only works reliably on Linux;
@@ -644,8 +652,8 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
-        self.validate()?;
+    pub async fn build_with(mut self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
+        self.validate_and_precompute()?;
         let addr = self.resolve_target().await?;
         let handle = transport.handle(addr).strict_source(self.strict_source);
         self.build_inner(handle)
@@ -708,8 +716,8 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect_tcp(self) -> Result<Client<TcpTransport>> {
-        self.validate()?;
+    pub async fn connect_tcp(mut self) -> Result<Client<TcpTransport>> {
+        self.validate_and_precompute()?;
         let addr = self.resolve_target().await?;
         let transport = TcpTransport::connect(addr).await?;
         self.build_inner(transport)
@@ -751,7 +759,7 @@ fn split_host_port(target: &str) -> (&str, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol};
+    use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol, UsmConfig};
 
     #[test]
     fn test_builder_defaults() {
@@ -916,8 +924,20 @@ mod tests {
 
         let invalid = ClientBuilder::new("unused.invalid", Auth::v2c("public"))
             .max_oids_per_request(0)
-            .build_with_transport(transport);
+            .build_with_transport(transport.clone());
         assert!(matches!(invalid, Err(ref error) if matches!(&**error, Error::Config(_))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let invalid_usm = ClientBuilder::new(
+            "unused.invalid",
+            Auth::Usm(UsmConfig::new("").auth(AuthProtocol::Sha256, b"password")),
+        )
+        .build_with_transport(transport);
+        assert!(matches!(
+            invalid_usm,
+            Err(ref error)
+                if matches!(&**error, Error::Config(message) if message.contains("USM username"))
+        ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 

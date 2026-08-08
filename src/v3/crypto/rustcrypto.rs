@@ -23,6 +23,14 @@ macro_rules! dispatch_auth {
 }
 
 impl CryptoProvider for RustCryptoProvider {
+    fn validate_auth_protocol(&self, _protocol: AuthProtocol) -> CryptoResult<()> {
+        Ok(())
+    }
+
+    fn validate_priv_protocol(&self, _protocol: PrivProtocol) -> CryptoResult<()> {
+        Ok(())
+    }
+
     fn hash(&self, protocol: AuthProtocol, data: &[u8]) -> CryptoResult<Vec<u8>> {
         Ok(dispatch_auth!(protocol, hash_impl, data))
     }

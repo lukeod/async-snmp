@@ -285,6 +285,16 @@ impl ClientConfig {
 
         Ok(())
     }
+
+    fn validate_and_precompute(&mut self) -> Result<()> {
+        self.validate()?;
+        if let Auth::Usm(config) = &mut self.auth {
+            config.validate_and_precompute().map_err(|error| {
+                Error::Config(format!("invalid USM configuration: {error}").into()).boxed()
+            })?;
+        }
+        Ok(())
+    }
 }
 
 impl<T: Transport> Client<T> {
@@ -319,10 +329,10 @@ impl<T: Transport> Client<T> {
 
     fn with_optional_engine_cache(
         transport: T,
-        config: ClientConfig,
+        mut config: ClientConfig,
         engine_cache: Option<Arc<EngineCache>>,
     ) -> Result<Self> {
-        config.validate()?;
+        config.validate_and_precompute()?;
         Ok(Self {
             inner: Arc::new(ClientInner {
                 transport,

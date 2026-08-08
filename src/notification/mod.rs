@@ -466,13 +466,15 @@ impl NotificationReceiverBuilder {
 
     /// Build the notification receiver.
     ///
-    /// Returns a configuration error when a USM user is configured without a
-    /// persisted [`AuthoritativeEngine`].
+    /// Returns a configuration error when USM credentials are invalid or a
+    /// USM user is configured without a persisted [`AuthoritativeEngine`].
     pub async fn build(mut self) -> Result<NotificationReceiver> {
-        // Precompute master keys so the expensive password expansion runs once
-        // here instead of on every inbound packet (CPU amplification).
+        // Validate before binding and cache master keys so password expansion
+        // never occurs on the inbound packet path.
         for config in self.usm_users.values_mut() {
-            config.precompute_master_keys();
+            config.validate_and_precompute().map_err(|error| {
+                Error::Config(format!("invalid USM user configuration: {error}").into()).boxed()
+            })?;
         }
 
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
@@ -1124,6 +1126,21 @@ mod tests {
 
         let err = result.err().expect("expected build to fail");
         assert!(matches!(*err, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_usm_user_is_rejected_before_bind() {
+        let result = NotificationReceiver::builder()
+            .bind("not a socket address")
+            .usm_user("", |user| user)
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(matches!(
+            *err,
+            Error::Config(ref message) if message.contains("USM username")
+        ));
     }
 
     #[test]

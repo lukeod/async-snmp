@@ -40,6 +40,18 @@ fn hmac_algorithm(protocol: AuthProtocol) -> CryptoResult<hmac::Algorithm> {
 }
 
 impl CryptoProvider for AwsLcFipsProvider {
+    fn validate_auth_protocol(&self, protocol: AuthProtocol) -> CryptoResult<()> {
+        digest_algorithm(protocol).map(|_| ())
+    }
+
+    fn validate_priv_protocol(&self, protocol: PrivProtocol) -> CryptoResult<()> {
+        match protocol {
+            PrivProtocol::Des => Err(CryptoError::UnsupportedAlgorithm("DES")),
+            PrivProtocol::Des3 => Err(CryptoError::UnsupportedAlgorithm("3DES")),
+            PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => Ok(()),
+        }
+    }
+
     fn hash(&self, protocol: AuthProtocol, data: &[u8]) -> CryptoResult<Vec<u8>> {
         let alg = digest_algorithm(protocol)?;
         Ok(digest::digest(alg, data).as_ref().to_vec())

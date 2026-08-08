@@ -39,6 +39,11 @@ pub enum CryptoError {
     /// RFC 3414 Section 11.2 requires passwords of at least 8 octets, and
     /// net-snmp rejects shorter passwords with `USM_PASSWORDTOOSHORT`.
     PasswordTooShort,
+    /// The USM username is outside the RFC 3414 range of 1 through 32 octets.
+    InvalidUsmUsernameLength {
+        /// Supplied username length in octets.
+        length: usize,
+    },
 }
 
 impl std::fmt::Display for CryptoError {
@@ -60,6 +65,10 @@ impl std::fmt::Display for CryptoError {
             Self::PasswordTooShort => write!(
                 f,
                 "password is shorter than the RFC 3414 minimum of 8 octets"
+            ),
+            Self::InvalidUsmUsernameLength { length } => write!(
+                f,
+                "USM username must contain 1 through 32 octets (got {length})"
             ),
         }
     }
@@ -85,6 +94,12 @@ pub(crate) use fips::AwsLcFipsProvider;
 /// This keeps auth and privacy operations independent of backend APIs without
 /// promising runtime provider injection as part of the public API.
 pub(crate) trait CryptoProvider: Send + Sync + 'static {
+    /// Validate that this provider supports an authentication protocol.
+    fn validate_auth_protocol(&self, protocol: AuthProtocol) -> CryptoResult<()>;
+
+    /// Validate that this provider supports a privacy protocol.
+    fn validate_priv_protocol(&self, protocol: PrivProtocol) -> CryptoResult<()>;
+
     /// Derive a master key from a password using the RFC 3414 Section A.2.1 algorithm.
     ///
     /// Expands the password to 1MB by repetition and hashes it with the protocol's
@@ -194,6 +209,28 @@ impl CryptoBackend {
     #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
     fn unavailable() -> CryptoError {
         CryptoError::UnsupportedAlgorithm("no crypto backend is enabled")
+    }
+
+    pub(crate) fn validate_auth_protocol(self, _protocol: AuthProtocol) -> CryptoResult<()> {
+        match self {
+            #[cfg(feature = "crypto-rustcrypto")]
+            Self::RustCrypto => RustCryptoProvider.validate_auth_protocol(_protocol),
+            #[cfg(feature = "crypto-fips")]
+            Self::AwsLcFips => AwsLcFipsProvider.validate_auth_protocol(_protocol),
+            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+            Self::Unavailable => Err(Self::unavailable()),
+        }
+    }
+
+    pub(crate) fn validate_priv_protocol(self, _protocol: PrivProtocol) -> CryptoResult<()> {
+        match self {
+            #[cfg(feature = "crypto-rustcrypto")]
+            Self::RustCrypto => RustCryptoProvider.validate_priv_protocol(_protocol),
+            #[cfg(feature = "crypto-fips")]
+            Self::AwsLcFips => AwsLcFipsProvider.validate_priv_protocol(_protocol),
+            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+            Self::Unavailable => Err(Self::unavailable()),
+        }
     }
 
     pub(crate) fn password_to_key(

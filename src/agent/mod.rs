@@ -764,9 +764,10 @@ impl AgentBuilder {
 
     /// Build the agent.
     ///
-    /// Returns a configuration error when USM users or V3 trap sinks are
-    /// configured without a persisted [`AuthoritativeEngine`], or when the
-    /// response-size limit exceeds the fixed UDP receive capacity.
+    /// Returns a configuration error when USM credentials are invalid, USM
+    /// users or V3 trap sinks are configured without a persisted
+    /// [`AuthoritativeEngine`], or the response-size limit exceeds the fixed
+    /// UDP receive capacity.
     pub async fn build(mut self) -> Result<Agent> {
         let max_udp_message_size = UDP_RECEIVE_LIMITS.advertised().as_usize();
         if self.max_message_size > max_udp_message_size {
@@ -778,10 +779,20 @@ impl AgentBuilder {
         }
         let local_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
 
-        // Precompute master keys so the expensive password expansion runs once
-        // here instead of on every inbound packet (CPU amplification).
+        // Validate before binding and cache master keys so password expansion
+        // never occurs on the inbound packet path.
         for config in self.usm_users.values_mut() {
-            config.precompute_master_keys();
+            config.validate_and_precompute().map_err(|error| {
+                Error::Config(format!("invalid USM user configuration: {error}").into()).boxed()
+            })?;
+        }
+        for (_, auth) in &mut self.trap_sinks {
+            if let crate::client::Auth::Usm(config) = auth {
+                config.validate_and_precompute().map_err(|error| {
+                    Error::Config(format!("invalid trap sink USM configuration: {error}").into())
+                        .boxed()
+                })?;
+            }
         }
 
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
@@ -3494,6 +3505,21 @@ mod tests {
 
         let err = result.err().expect("expected build to fail");
         assert!(matches!(*err, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_usm_user_is_rejected_before_bind() {
+        let result = Agent::builder()
+            .bind("not a socket address")
+            .usm_user("", |user| user)
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(matches!(
+            *err,
+            Error::Config(ref message) if message.contains("USM username")
+        ));
     }
 
     #[tokio::test]

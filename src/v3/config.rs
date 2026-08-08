@@ -7,7 +7,9 @@ use bytes::Bytes;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::message::SecurityLevel;
-use crate::v3::{AuthProtocol, CryptoBackend, LocalizedKey, PrivKey, PrivProtocol};
+use crate::v3::{
+    AuthProtocol, CryptoBackend, CryptoError, CryptoResult, LocalizedKey, PrivKey, PrivProtocol,
+};
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Password(Vec<u8>);
@@ -177,37 +179,62 @@ impl UsmConfig {
         }
     }
 
-    /// Precompute and cache master keys from configured passwords.
+    /// Validate credentials and precompute password-backed master keys.
     ///
-    /// On success, the password-backed state is replaced so plaintext passwords
-    /// are no longer retained. On failure, the original password state remains
-    /// available so later key derivation reports the original crypto error.
-    pub(crate) fn precompute_master_keys(&mut self) {
-        let UsmCredentials::Passwords { auth, privacy } = &self.credentials else {
-            return;
-        };
-        let (auth_protocol, auth_password) = auth;
-        let master_keys = match crate::v3::MasterKeys::new_with_backend(
-            *auth_protocol,
-            auth_password.as_ref(),
-            self.crypto_backend,
-        ) {
-            Ok(master_keys) => master_keys,
-            Err(_) => return,
-        };
-        let master_keys = match privacy {
-            Some((priv_protocol, priv_password)) if priv_password == auth_password => {
-                master_keys.with_privacy_same_password(*priv_protocol)
-            }
-            Some((priv_protocol, priv_password)) => {
-                match master_keys.with_privacy(*priv_protocol, priv_password.as_ref()) {
-                    Ok(master_keys) => master_keys,
-                    Err(_) => return,
+    /// Validation uses raw octet lengths and the selected cryptographic backend.
+    /// Password-backed credentials are replaced only after all requested key
+    /// derivations succeed, so an error never leaves partially updated state.
+    pub(crate) fn validate_and_precompute(&mut self) -> CryptoResult<()> {
+        if !(1..=32).contains(&self.username.len()) {
+            return Err(CryptoError::InvalidUsmUsernameLength {
+                length: self.username.len(),
+            });
+        }
+
+        match &self.credentials {
+            UsmCredentials::NoAuthNoPriv => Ok(()),
+            UsmCredentials::MasterKeys(master_keys) => {
+                self.crypto_backend
+                    .validate_auth_protocol(master_keys.auth_protocol())?;
+                if let Some(protocol) = master_keys.priv_protocol() {
+                    self.crypto_backend.validate_priv_protocol(protocol)?;
                 }
+                Ok(())
             }
-            None => master_keys,
-        };
-        self.credentials = UsmCredentials::MasterKeys(master_keys);
+            UsmCredentials::Passwords { auth, privacy } => {
+                let (auth_protocol, auth_password) = auth;
+                if auth_password.as_ref().len() < crate::v3::auth::MIN_PASSWORD_LENGTH {
+                    return Err(CryptoError::PasswordTooShort);
+                }
+                if privacy.as_ref().is_some_and(|(_, password)| {
+                    password.as_ref().len() < crate::v3::auth::MIN_PASSWORD_LENGTH
+                }) {
+                    return Err(CryptoError::PasswordTooShort);
+                }
+
+                self.crypto_backend.validate_auth_protocol(*auth_protocol)?;
+                if let Some((protocol, _)) = privacy {
+                    self.crypto_backend.validate_priv_protocol(*protocol)?;
+                }
+
+                let master_keys = crate::v3::MasterKeys::new_with_backend(
+                    *auth_protocol,
+                    auth_password.as_ref(),
+                    self.crypto_backend,
+                )?;
+                let master_keys = match privacy {
+                    Some((priv_protocol, priv_password)) if priv_password == auth_password => {
+                        master_keys.with_privacy_same_password(*priv_protocol)
+                    }
+                    Some((priv_protocol, priv_password)) => {
+                        master_keys.with_privacy(*priv_protocol, priv_password.as_ref())?
+                    }
+                    None => master_keys,
+                };
+                self.credentials = UsmCredentials::MasterKeys(master_keys);
+                Ok(())
+            }
+        }
     }
 
     /// Derive localized keys for a specific engine ID.
@@ -461,11 +488,11 @@ mod tests {
             b"privpass",
         );
 
-        config.precompute_master_keys();
+        config.validate_and_precompute().unwrap();
         assert!(matches!(config.credentials, UsmCredentials::MasterKeys(_)));
 
         // Idempotent: a second call is a no-op and keeps the cache.
-        config.precompute_master_keys();
+        config.validate_and_precompute().unwrap();
         assert!(matches!(config.credentials, UsmCredentials::MasterKeys(_)));
     }
 
@@ -479,7 +506,7 @@ mod tests {
         let uncached =
             UsmConfig::new(Bytes::from_static(b"u")).auth(AuthProtocol::Sha256, b"authpass");
         let mut cached = uncached.clone();
-        cached.precompute_master_keys();
+        cached.validate_and_precompute().unwrap();
         let a = uncached.derive_keys(engine_id).unwrap();
         let b = cached.derive_keys(engine_id).unwrap();
         assert_eq!(
@@ -496,7 +523,7 @@ mod tests {
             b"privpassword",
         );
         let mut cached = uncached.clone();
-        cached.precompute_master_keys();
+        cached.validate_and_precompute().unwrap();
         let a = uncached.derive_keys(engine_id).unwrap();
         let b = cached.derive_keys(engine_id).unwrap();
         assert_eq!(
@@ -516,7 +543,7 @@ mod tests {
             b"sharedpassword",
         );
         let mut cached = uncached.clone();
-        cached.precompute_master_keys();
+        cached.validate_and_precompute().unwrap();
         let a = uncached.derive_keys(engine_id).unwrap();
         let b = cached.derive_keys(engine_id).unwrap();
         assert_eq!(
@@ -529,16 +556,129 @@ mod tests {
         assert_eq!(a_priv.encryption_key(), b_priv.encryption_key());
     }
 
-    /// A password too short for the crypto backend leaves the config on the
-    /// original password path (no silent success, error preserved for later).
     #[test]
-    fn test_precompute_master_keys_short_password_is_noop() {
-        let mut config =
-            UsmConfig::new(Bytes::from_static(b"u")).auth(AuthProtocol::Sha256, b"short");
-        config.precompute_master_keys();
-        assert!(
-            matches!(config.credentials, UsmCredentials::Passwords { .. }),
-            "a rejected password must preserve the password-backed state"
+    fn validate_username_octet_boundaries() {
+        for username in [vec![0xff], vec![b'u'; 32]] {
+            let mut config = UsmConfig::new(Bytes::from(username));
+            assert!(config.validate_and_precompute().is_ok());
+        }
+
+        for username in [Vec::new(), vec![b'u'; 33]] {
+            let expected = username.len();
+            let mut config = UsmConfig::new(Bytes::from(username));
+            assert_eq!(
+                config.validate_and_precompute(),
+                Err(CryptoError::InvalidUsmUsernameLength { length: expected })
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_each_short_password_atomically() {
+        let mut short_auth = UsmConfig::new("user").auth(AuthProtocol::Sha256, b"1234567");
+        assert_eq!(
+            short_auth.validate_and_precompute(),
+            Err(CryptoError::PasswordTooShort)
+        );
+        assert!(matches!(
+            short_auth.credentials,
+            UsmCredentials::Passwords { .. }
+        ));
+
+        let mut short_priv = UsmConfig::new("user").auth_priv(
+            AuthProtocol::Sha256,
+            b"12345678",
+            PrivProtocol::Aes128,
+            b"1234567",
+        );
+        assert_eq!(
+            short_priv.validate_and_precompute(),
+            Err(CryptoError::PasswordTooShort)
+        );
+        assert!(matches!(
+            short_priv.credentials,
+            UsmCredentials::Passwords { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_eight_octet_passwords() {
+        let mut config = UsmConfig::new("user").auth_priv(
+            AuthProtocol::Sha256,
+            b"12345678",
+            PrivProtocol::Aes128,
+            b"abcdefgh",
+        );
+        config.validate_and_precompute().unwrap();
+        assert!(matches!(config.credentials, UsmCredentials::MasterKeys(_)));
+    }
+
+    #[cfg(feature = "crypto-fips")]
+    #[test]
+    fn selected_fips_backend_rejects_unsupported_password_protocols() {
+        let mut auth = UsmConfig::new("user")
+            .auth(AuthProtocol::Md5, b"password")
+            .with_crypto_backend(CryptoBackend::AwsLcFips);
+        assert_eq!(
+            auth.validate_and_precompute(),
+            Err(CryptoError::UnsupportedAlgorithm("MD5"))
+        );
+        assert!(matches!(auth.credentials, UsmCredentials::Passwords { .. }));
+
+        let mut privacy = UsmConfig::new("user")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                b"password",
+                PrivProtocol::Des,
+                b"password",
+            )
+            .with_crypto_backend(CryptoBackend::AwsLcFips);
+        assert_eq!(
+            privacy.validate_and_precompute(),
+            Err(CryptoError::UnsupportedAlgorithm("DES"))
+        );
+        assert!(matches!(
+            privacy.credentials,
+            UsmCredentials::Passwords { .. }
+        ));
+    }
+
+    #[cfg(feature = "crypto-fips")]
+    #[test]
+    fn selected_fips_backend_rejects_unsupported_master_key_privacy() {
+        let master_keys = crate::v3::MasterKeys::new_with_backend(
+            AuthProtocol::Sha256,
+            b"password",
+            CryptoBackend::AwsLcFips,
+        )
+        .unwrap()
+        .with_privacy_same_password(PrivProtocol::Des);
+        let mut config = UsmConfig::new("user")
+            .with_crypto_backend(CryptoBackend::AwsLcFips)
+            .with_master_keys(master_keys);
+
+        assert_eq!(
+            config.validate_and_precompute(),
+            Err(CryptoError::UnsupportedAlgorithm("DES"))
+        );
+    }
+
+    #[cfg(all(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn selected_fips_backend_rejects_unsupported_master_key_auth() {
+        let master_keys = crate::v3::MasterKeys::new_with_backend(
+            AuthProtocol::Md5,
+            b"password",
+            CryptoBackend::RustCrypto,
+        )
+        .unwrap();
+        let mut config = UsmConfig::new("user")
+            .with_master_keys(master_keys)
+            .with_crypto_backend(CryptoBackend::AwsLcFips);
+
+        assert_eq!(
+            config.validate_and_precompute(),
+            Err(CryptoError::UnsupportedAlgorithm("MD5"))
         );
     }
 }
