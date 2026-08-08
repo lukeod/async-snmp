@@ -140,7 +140,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
-use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tracing::instrument;
 
@@ -148,7 +147,7 @@ use crate::error::{Error, Result};
 use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
-use crate::util::bind_udp_socket;
+use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, prepare_authoritative_usm};
 use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, EngineState, SaltCounter};
 use crate::varbind::VarBind;
@@ -163,26 +162,6 @@ pub use varbind::{NotificationVarbindValidation, validate_notification_varbinds}
 /// localized per engine ID), so the table is bounded and the
 /// least-recently-updated engine is evicted when full.
 const MAX_REMOTE_ENGINES: usize = 8192;
-
-/// Decide whether a v1/v2c notification carrying `community` is accepted.
-///
-/// An empty `configured` list accepts any community (filtering is opt-in).
-/// Otherwise the community must equal one of the configured strings. The
-/// comparison runs against every configured entry without early-out and uses
-/// constant-time equality (mirroring `Agent::validate_community`) so a timing
-/// side channel cannot be used to recover a valid community byte by byte.
-pub(super) fn community_allowed(configured: &[Vec<u8>], community: &[u8]) -> bool {
-    if configured.is_empty() {
-        return true;
-    }
-    let mut valid = false;
-    for candidate in configured {
-        if candidate.len() == community.len() && bool::from(candidate.as_slice().ct_eq(community)) {
-            valid = true;
-        }
-    }
-    valid
-}
 
 /// Well-known OIDs for notification varbinds.
 pub mod oids {
@@ -462,14 +441,20 @@ impl NotificationReceiverBuilder {
     ///
     /// Returns a configuration error when USM credentials are invalid or a
     /// USM user is configured without a persisted [`AuthoritativeEngine`].
-    pub async fn build(mut self) -> Result<NotificationReceiver> {
-        // Validate before binding and cache master keys so password expansion
-        // never occurs on the inbound packet path.
-        for config in self.usm_users.values_mut() {
-            config.validate_and_precompute().map_err(|error| {
-                Error::Config(format!("invalid USM user configuration: {error}").into()).boxed()
-            })?;
-        }
+    pub async fn build(self) -> Result<NotificationReceiver> {
+        let requires_authoritative_engine = !self.usm_users.is_empty();
+        let PreparedAuthoritativeUsm {
+            users: usm_users,
+            authoritative_engine,
+            engine_id,
+            engine_boots,
+        } = prepare_authoritative_usm(
+            self.usm_users,
+            self.authoritative_engine,
+            requires_authoritative_engine,
+            "invalid USM user configuration",
+            "authoritative engine state is required for SNMPv3 notification receiving",
+        )?;
 
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
@@ -487,28 +472,12 @@ impl NotificationReceiverBuilder {
             source: e,
         })?;
 
-        let (authoritative_engine, engine_id, engine_boots) = match self.authoritative_engine {
-            Some(engine) => {
-                let (engine_boots, _) = engine.current_boots_time()?;
-                let engine_id = Bytes::copy_from_slice(engine.engine_id());
-                (Some(engine), engine_id, engine_boots)
-            }
-            None if !self.usm_users.is_empty() => {
-                return Err(Error::Config(
-                    "authoritative engine state is required for SNMPv3 notification receiving"
-                        .into(),
-                )
-                .boxed());
-            }
-            None => (None, crate::v3::generate_engine_id(), 1),
-        };
-
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {
                 authoritative_engine,
                 socket,
                 local_addr,
-                usm_users: self.usm_users,
+                usm_users,
                 communities: self.communities,
                 varbind_validation: self.varbind_validation,
                 engine_id,
@@ -995,6 +964,7 @@ mod tests {
     use crate::message::SecurityLevel;
     use crate::oid;
     use crate::pdu::GenericTrap;
+    use crate::util::{EmptyCommunityPolicy, community_matches};
     use crate::v3::AuthProtocol;
 
     #[test]
@@ -1111,15 +1081,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v3_receiver_requires_authoritative_engine() {
+    async fn test_v3_receiver_requires_authoritative_engine_before_bind() {
         let result = NotificationReceiver::builder()
-            .bind("127.0.0.1:0")
+            .bind("not a socket address")
             .usm_user("user", |user| user)
             .build()
             .await;
 
         let err = result.err().expect("expected build to fail");
-        assert!(matches!(*err, Error::Config(_)));
+        assert!(matches!(
+            *err,
+            Error::Config(ref message)
+                if message.contains("authoritative engine state is required")
+        ));
     }
 
     #[tokio::test]
@@ -1135,6 +1109,21 @@ mod tests {
             *err,
             Error::Config(ref message) if message.contains("USM username")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_receiver_authoritative_engine_persistence_failure_precedes_bind() {
+        let engine = AuthoritativeEngine::with_rollover_persistence_failure_for_test(
+            b"test-receiver-engine".to_vec(),
+        );
+        let result = NotificationReceiver::builder()
+            .bind("not a socket address")
+            .authoritative_engine(engine)
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(err.to_string().contains("storage unavailable"));
     }
 
     #[test]
@@ -2527,19 +2516,34 @@ mod tests {
     }
 
     #[test]
-    fn test_community_allowed() {
+    fn test_receiver_community_matching_preserves_allow_empty_policy() {
         // Empty allowlist accepts any community (opt-in filtering).
-        assert!(community_allowed(&[], b"public"));
-        assert!(community_allowed(&[], b""));
+        assert!(community_matches(
+            &[],
+            b"public",
+            EmptyCommunityPolicy::Allow
+        ));
+        assert!(community_matches(&[], b"", EmptyCommunityPolicy::Allow));
 
         let configured = vec![b"public".to_vec(), b"monitor".to_vec()];
-        assert!(community_allowed(&configured, b"public"));
-        assert!(community_allowed(&configured, b"monitor"));
+        assert!(community_matches(
+            &configured,
+            b"public",
+            EmptyCommunityPolicy::Allow
+        ));
+        assert!(community_matches(
+            &configured,
+            b"monitor",
+            EmptyCommunityPolicy::Allow
+        ));
         // Non-matching, prefix, and length-mismatch are all rejected.
-        assert!(!community_allowed(&configured, b"private"));
-        assert!(!community_allowed(&configured, b"pub"));
-        assert!(!community_allowed(&configured, b"publicx"));
-        assert!(!community_allowed(&configured, b""));
+        for community in [b"private".as_slice(), b"pub", b"publicx", b""] {
+            assert!(!community_matches(
+                &configured,
+                community,
+                EmptyCommunityPolicy::Allow
+            ));
+        }
     }
 
     fn build_v2c_trap(community: &[u8]) -> Bytes {

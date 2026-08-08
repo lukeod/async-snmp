@@ -85,7 +85,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
@@ -102,7 +101,10 @@ use crate::message_size::{MessageSize, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMI
 use crate::oid;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduBody, PduType};
-use crate::util::bind_udp_socket;
+use crate::util::{
+    EmptyCommunityPolicy, PreparedAuthoritativeUsm, bind_udp_socket, community_matches,
+    prepare_authoritative_usm,
+};
 use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, UsmConfig};
 use crate::v3::{SaltCounter, compute_engine_boots_time};
@@ -779,13 +781,9 @@ impl AgentBuilder {
         }
         let local_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
 
-        // Validate before binding and cache master keys so password expansion
-        // never occurs on the inbound packet path.
-        for config in self.usm_users.values_mut() {
-            config.validate_and_precompute().map_err(|error| {
-                Error::Config(format!("invalid USM user configuration: {error}").into()).boxed()
-            })?;
-        }
+        // Keep trap-sink credential validation local because outbound sinks
+        // are agent-specific, but prepare inbound USM and engine state through
+        // the same path used by notification receivers.
         for (_, auth) in &mut self.trap_sinks {
             if let crate::client::Auth::Usm(config) = auth {
                 config.validate_and_precompute().map_err(|error| {
@@ -794,6 +792,23 @@ impl AgentBuilder {
                 })?;
             }
         }
+        let requires_authoritative_engine = !self.usm_users.is_empty()
+            || self
+                .trap_sinks
+                .iter()
+                .any(|(_, auth)| matches!(auth, crate::client::Auth::Usm(_)));
+        let PreparedAuthoritativeUsm {
+            users: usm_users,
+            authoritative_engine,
+            engine_id,
+            engine_boots,
+        } = prepare_authoritative_usm(
+            self.usm_users,
+            self.authoritative_engine,
+            requires_authoritative_engine,
+            "invalid USM user configuration",
+            "authoritative engine state is required for SNMPv3 agent roles",
+        )?;
 
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
@@ -816,26 +831,6 @@ impl AgentBuilder {
                 target: bind_addr,
                 source: e,
             })?;
-
-        let requires_authoritative_engine = !self.usm_users.is_empty()
-            || self
-                .trap_sinks
-                .iter()
-                .any(|(_, auth)| matches!(auth, crate::client::Auth::Usm(_)));
-        let (authoritative_engine, engine_id, engine_boots) = match self.authoritative_engine {
-            Some(engine) => {
-                let (engine_boots, _) = engine.current_boots_time()?;
-                let engine_id = Bytes::copy_from_slice(engine.engine_id());
-                (Some(engine), engine_id, engine_boots)
-            }
-            None if requires_authoritative_engine => {
-                return Err(Error::Config(
-                    "authoritative engine state is required for SNMPv3 agent roles".into(),
-                )
-                .boxed());
-            }
-            None => (None, crate::v3::generate_engine_id(), 1),
-        };
 
         let cancel = self.cancel.unwrap_or_default();
 
@@ -917,7 +912,7 @@ impl AgentBuilder {
                 socket_state,
                 local_addr,
                 communities: self.communities,
-                usm_users: self.usm_users,
+                usm_users,
                 handlers: self.handlers,
                 state,
                 salt_counter: SaltCounter::new(),
@@ -1487,23 +1482,11 @@ impl Agent {
     /// Uses constant-time comparison to prevent timing attacks that could
     /// be used to guess valid community strings character by character.
     pub(crate) fn validate_community(&self, community: &[u8]) -> bool {
-        if self.inner.communities.is_empty() {
-            // No communities configured = reject all
-            return false;
-        }
-        // Use constant-time comparison for each community string.
-        // We compare against all configured communities regardless of
-        // early matches to maintain constant-time behavior.
-        let mut valid = false;
-        for configured in &self.inner.communities {
-            // ct_eq returns a Choice, which we convert to bool after comparison
-            if configured.len() == community.len()
-                && bool::from(configured.as_slice().ct_eq(community))
-            {
-                valid = true;
-            }
-        }
-        valid
+        community_matches(
+            &self.inner.communities,
+            community,
+            EmptyCommunityPolicy::Deny,
+        )
     }
 
     /// Dispatch a request to the appropriate handler.
@@ -3461,15 +3444,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v3_agent_requires_authoritative_engine() {
+    async fn test_v3_agent_requires_authoritative_engine_before_bind() {
         let result = Agent::builder()
-            .bind("127.0.0.1:0")
+            .bind("not a socket address")
             .usm_user("user", |user| user)
             .build()
             .await;
 
         let err = result.err().expect("expected build to fail");
-        assert!(matches!(*err, Error::Config(_)));
+        assert!(matches!(
+            *err,
+            Error::Config(ref message)
+                if message.contains("authoritative engine state is required")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_v3_trap_sink_requires_authoritative_engine_before_bind() {
+        let result = Agent::builder()
+            .bind("not a socket address")
+            .trap_sink("127.0.0.1:162", crate::Auth::usm("trapuser"))
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(matches!(
+            *err,
+            Error::Config(ref message)
+                if message.contains("authoritative engine state is required")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_engine_persistence_failure_precedes_bind() {
+        let engine = AuthoritativeEngine::with_rollover_persistence_failure_for_test(
+            b"test-agent-engine".to_vec(),
+        );
+        let result = Agent::builder()
+            .bind("not a socket address")
+            .community(b"public")
+            .authoritative_engine(engine)
+            .build()
+            .await;
+
+        let err = result.err().expect("expected build to fail");
+        assert!(err.to_string().contains("storage unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_community_matching_preserves_deny_empty_policy() {
+        let empty = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
+        assert!(!empty.validate_community(b"public"));
+        assert!(!empty.validate_community(b""));
+
+        let configured = Agent::builder()
+            .bind("127.0.0.1:0")
+            .communities([b"public".as_slice(), b"monitor"])
+            .build()
+            .await
+            .unwrap();
+        assert!(configured.validate_community(b"public"));
+        assert!(configured.validate_community(b"monitor"));
+        for community in [b"private".as_slice(), b"pub", b"publicx", b""] {
+            assert!(!configured.validate_community(community));
+        }
     }
 
     #[tokio::test]

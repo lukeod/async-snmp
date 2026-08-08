@@ -1,10 +1,85 @@
 //! Internal utilities.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 
+use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
+use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
+
+use crate::error::{Error, Result};
+use crate::v3::{AuthoritativeEngine, UsmConfig};
+
+/// Behavior when no community strings are configured for an inbound role.
+#[derive(Clone, Copy)]
+pub(crate) enum EmptyCommunityPolicy {
+    Allow,
+    #[cfg(feature = "agent")]
+    Deny,
+}
+
+/// Compare a community against every configured value without early return.
+pub(crate) fn community_matches(
+    configured: &[Vec<u8>],
+    community: &[u8],
+    empty_policy: EmptyCommunityPolicy,
+) -> bool {
+    if configured.is_empty() {
+        return matches!(empty_policy, EmptyCommunityPolicy::Allow);
+    }
+
+    let mut valid = false;
+    for candidate in configured {
+        if candidate.len() == community.len() && bool::from(candidate.as_slice().ct_eq(community)) {
+            valid = true;
+        }
+    }
+    valid
+}
+
+/// Prepared USM users and authoritative engine state for an inbound role.
+pub(crate) struct PreparedAuthoritativeUsm {
+    pub(crate) users: HashMap<Bytes, UsmConfig>,
+    pub(crate) authoritative_engine: Option<AuthoritativeEngine>,
+    pub(crate) engine_id: Bytes,
+    pub(crate) engine_boots: u32,
+}
+
+/// Validate inbound USM users and prepare the local authoritative engine seed.
+pub(crate) fn prepare_authoritative_usm(
+    mut users: HashMap<Bytes, UsmConfig>,
+    authoritative_engine: Option<AuthoritativeEngine>,
+    requires_engine: bool,
+    invalid_user_context: &str,
+    missing_engine_context: &str,
+) -> Result<PreparedAuthoritativeUsm> {
+    for config in users.values_mut() {
+        config.validate_and_precompute().map_err(|error| {
+            Error::Config(format!("{invalid_user_context}: {error}").into()).boxed()
+        })?;
+    }
+
+    let (authoritative_engine, engine_id, engine_boots) = match authoritative_engine {
+        Some(engine) => {
+            let (engine_boots, _) = engine.current_boots_time()?;
+            let engine_id = Bytes::copy_from_slice(engine.engine_id());
+            (Some(engine), engine_id, engine_boots)
+        }
+        None if requires_engine => {
+            return Err(Error::Config(missing_engine_context.into()).boxed());
+        }
+        None => (None, crate::v3::generate_engine_id(), 1),
+    };
+
+    Ok(PreparedAuthoritativeUsm {
+        users,
+        authoritative_engine,
+        engine_id,
+        engine_boots,
+    })
+}
 
 /// Create and bind a UDP socket with optional buffer sizes.
 ///

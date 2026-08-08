@@ -27,7 +27,11 @@ impl super::NotificationReceiver {
     ) -> Result<Option<Notification>> {
         let msg = CommunityMessage::decode_with_target(data, source)?;
 
-        if !super::community_allowed(&self.inner.communities, msg.community()) {
+        if !crate::util::community_matches(
+            &self.inner.communities,
+            msg.community(),
+            crate::util::EmptyCommunityPolicy::Allow,
+        ) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v1 notification with unaccepted community");
             return Ok(None);
         }
@@ -49,7 +53,11 @@ impl super::NotificationReceiver {
     ) -> Result<Option<Notification>> {
         let msg = CommunityMessage::decode_with_target(data, source)?;
 
-        if !super::community_allowed(&self.inner.communities, msg.community()) {
+        if !crate::util::community_matches(
+            &self.inner.communities,
+            msg.community(),
+            crate::util::EmptyCommunityPolicy::Allow,
+        ) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v2c notification with unaccepted community");
             return Ok(None);
         }

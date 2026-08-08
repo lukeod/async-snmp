@@ -71,6 +71,8 @@ struct AuthoritativeEngineInner {
     startup_boots: u32,
     persisted_boots: AtomicU32,
     engine_start: Instant,
+    #[cfg(test)]
+    elapsed_override: Option<u64>,
     persist: Mutex<PersistCallback>,
 }
 
@@ -132,6 +134,8 @@ impl AuthoritativeEngine {
                 startup_boots: engine_boots,
                 persisted_boots: AtomicU32::new(engine_boots),
                 engine_start: Instant::now(),
+                #[cfg(test)]
+                elapsed_override: None,
                 persist: Mutex::new(Box::new(move |state| persist_state(state, &mut persist))),
             }),
         })
@@ -164,7 +168,13 @@ impl AuthoritativeEngine {
     /// before it is returned for protocol use. All clones share this clock and
     /// persistence state.
     pub(crate) fn current_boots_time(&self) -> Result<(u32, u32)> {
+        #[cfg(not(test))]
         let elapsed = self.inner.engine_start.elapsed().as_secs();
+        #[cfg(test)]
+        let elapsed = self
+            .inner
+            .elapsed_override
+            .unwrap_or_else(|| self.inner.engine_start.elapsed().as_secs());
         self.current_boots_time_at(elapsed)
     }
 
@@ -192,6 +202,22 @@ impl AuthoritativeEngine {
     pub(crate) fn for_test(engine_id: impl Into<Bytes>, engine_boots: u32) -> Self {
         let persisted = PersistedAuthoritativeEngine::new(engine_id, engine_boots).unwrap();
         Self::start(persisted, |_| Ok::<(), std::convert::Infallible>(())).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rollover_persistence_failure_for_test(engine_id: impl Into<Bytes>) -> Self {
+        let mut first_persist = true;
+        let mut engine = Self::install(engine_id, move |_| {
+            if std::mem::replace(&mut first_persist, false) {
+                Ok(())
+            } else {
+                Err("storage unavailable")
+            }
+        })
+        .unwrap();
+        Arc::get_mut(&mut engine.inner).unwrap().elapsed_override =
+            Some(u64::from(MAX_ENGINE_TIME) + 1);
+        engine
     }
 }
 
