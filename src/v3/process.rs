@@ -101,6 +101,7 @@ pub(crate) enum V3Role<'a> {
     /// Authoritative engine (agent): only messages under its own engine ID
     /// are accepted (RFC 3414 Section 3.2 Step 3), timeliness is Step 7a
     /// against its own boots/time.
+    #[cfg(any(feature = "agent", test))]
     Authoritative,
     /// Non-authoritative receiver (notification receiver): messages under
     /// its own engine ID (informs) use Step 7a; messages under a remote
@@ -110,6 +111,38 @@ pub(crate) enum V3Role<'a> {
         remote_engines: &'a Mutex<HashMap<Bytes, EngineState>>,
         max_remote_engines: usize,
     },
+}
+
+impl V3Role<'_> {
+    #[cfg(any(feature = "agent", test))]
+    fn is_authoritative(&self) -> bool {
+        matches!(self, Self::Authoritative)
+    }
+
+    #[cfg(not(any(feature = "agent", test)))]
+    fn is_authoritative(&self) -> bool {
+        false
+    }
+
+    fn receiver_config(&self) -> (&Mutex<HashMap<Bytes, EngineState>>, usize) {
+        #[cfg(any(feature = "agent", test))]
+        match self {
+            Self::Authoritative => unreachable!("authoritative role rejected a foreign engine ID"),
+            Self::Receiver {
+                remote_engines,
+                max_remote_engines,
+            } => (remote_engines, *max_remote_engines),
+        }
+
+        #[cfg(not(any(feature = "agent", test)))]
+        {
+            let Self::Receiver {
+                remote_engines,
+                max_remote_engines,
+            } = self;
+            (remote_engines, *max_remote_engines)
+        }
+    }
 }
 
 /// Local engine identity, user table, and counters for USM processing.
@@ -229,7 +262,7 @@ pub(crate) fn process_v3_inbound(
         return fail(UsmFailure::UnknownEngineIds, None);
     }
     let engine_is_local = usm_params.engine_id == *ctx.engine_id;
-    if matches!(role, V3Role::Authoritative) && !engine_is_local {
+    if role.is_authoritative() && !engine_is_local {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "engine ID mismatch");
         return fail(UsmFailure::UnknownEngineIds, None);
     }
@@ -295,11 +328,8 @@ pub(crate) fn process_v3_inbound(
                 // the tuple and apply normal Step 7(b) timeliness processing.
                 return fail(UsmFailure::NotInTimeWindows, Some(auth_key));
             }
-        } else if let V3Role::Receiver {
-            remote_engines,
-            max_remote_engines,
-        } = role
-        {
+        } else {
+            let (remote_engines, max_remote_engines) = role.receiver_config();
             // Step 7b: the sender is the authoritative engine (traps sent
             // under the sender's engine ID), checked against per-engine
             // state seeded from the first authenticated message.
@@ -316,7 +346,7 @@ pub(crate) fn process_v3_inbound(
                 // IDs, so evict the least-recently-updated engine when
                 // full before seeding a new one.
                 if !engines.contains_key(&engine_key)
-                    && engines.len() >= *max_remote_engines
+                    && engines.len() >= max_remote_engines
                     && let Some(oldest) = engines
                         .iter()
                         .min_by_key(|(_, state)| state.last_trusted_update_at())

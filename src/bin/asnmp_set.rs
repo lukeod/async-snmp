@@ -168,11 +168,15 @@ async fn main() -> ExitCode {
                 write_verbose_response(&result_varbinds, elapsed, !args.output.no_hints);
             }
 
-            let mut output_ctx = OutputContext::from_args(&args.output);
+            let output_ctx = OutputContext::from_args(&args.output);
             #[cfg(feature = "mib")]
-            if let Some(m) = &mib {
-                output_ctx.formatter = Some(m as &dyn VarBindFormatter);
-            }
+            let output_ctx = {
+                let mut output_ctx = output_ctx;
+                if let Some(m) = &mib {
+                    output_ctx.formatter = Some(m as &dyn VarBindFormatter);
+                }
+                output_ctx
+            };
 
             if let Err(e) = output_ctx.write_results(
                 target.as_str(),

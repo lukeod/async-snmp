@@ -58,7 +58,7 @@ jobs:
       - name: Run tests
         run: |
           cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --lib
-          cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --test client_get --test client_batching --test client_walk --test client_v3 --test client_retry --test proptest --test kat
+          cargo test --tests --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
 
   publish:
     name: Publish to crates.io

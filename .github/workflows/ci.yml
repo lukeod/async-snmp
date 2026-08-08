@@ -34,6 +34,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  clippy-fips:
+    name: Clippy (FIPS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --no-default-features --features agent,crypto-fips -- -D warnings
+
+  clippy-cli:
+    name: Clippy (CLI without MIB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --no-default-features --features agent,cli,crypto-rustcrypto -- -D warnings
+
   feature-checks:
     name: Feature combination checks
     runs-on: ubuntu-latest
@@ -43,8 +65,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --lib --no-default-features
       - run: cargo check --no-default-features --features v3
-      - run: cargo test --no-default-features --features crypto-rustcrypto
-      - run: cargo test --no-default-features --features crypto-fips
+      - run: cargo test --no-default-features --features crypto-rustcrypto --test kat
+      - run: cargo test --no-default-features --features crypto-fips --test kat
       - run: cargo check --all-features
 
   test:
@@ -64,7 +86,7 @@ jobs:
       - name: Run tests
         run: |
           cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --lib
-          cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --test client_get --test client_batching --test client_walk --test client_v3 --test client_retry --test proptest --test kat
+          cargo test --tests --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
 
   docs:
     name: Documentation
@@ -112,4 +134,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Run container tests
-        run: cargo test --test interop --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
+        run: cargo test --test interop --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread -- --ignored

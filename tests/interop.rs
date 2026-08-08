@@ -4,7 +4,7 @@
 //! serving as the firewall against correlated bugs where both
 //! Client and Agent might have the same flaw.
 //!
-//! Run with: cargo test --test interop
+//! Run with: cargo test --test interop --all-features -- --ignored
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;
@@ -190,6 +190,7 @@ mod users {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v2c_get_returns_value() {
     require_container_runtime!();
 
@@ -214,6 +215,7 @@ async fn v2c_get_returns_value() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v1_get_returns_value() {
     require_container_runtime!();
 
@@ -233,6 +235,7 @@ async fn v1_get_returns_value() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn getnext_returns_next_oid() {
     require_container_runtime!();
 
@@ -255,6 +258,7 @@ async fn getnext_returns_next_oid() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn getbulk_returns_multiple() {
     require_container_runtime!();
 
@@ -279,6 +283,7 @@ async fn getbulk_returns_multiple() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn walk_system_mib() {
     require_container_runtime!();
 
@@ -304,6 +309,7 @@ async fn walk_system_mib() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn bulk_walk_interfaces() {
     require_container_runtime!();
 
@@ -329,6 +335,7 @@ async fn bulk_walk_interfaces() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_no_auth_no_priv() {
     require_container_runtime!();
 
@@ -347,6 +354,7 @@ async fn v3_no_auth_no_priv() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_no_priv() {
     require_container_runtime!();
 
@@ -368,6 +376,7 @@ async fn v3_auth_no_priv() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_priv() {
     require_container_runtime!();
 
@@ -399,6 +408,7 @@ async fn v3_auth_priv() {
 
 #[cfg(feature = "crypto-rustcrypto")]
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_md5() {
     require_container_runtime!();
 
@@ -420,6 +430,7 @@ async fn v3_auth_md5() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_sha1() {
     require_container_runtime!();
 
@@ -441,6 +452,7 @@ async fn v3_auth_sha1() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_sha256() {
     require_container_runtime!();
 
@@ -478,18 +490,21 @@ async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_sha224() {
     require_container_runtime!();
     v3_auth_interop(users::AUTHSHA224_USER, AuthProtocol::Sha224).await;
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_sha384() {
     require_container_runtime!();
     v3_auth_interop(users::AUTHSHA384_USER, AuthProtocol::Sha384).await;
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_auth_sha512() {
     require_container_runtime!();
     v3_auth_interop(users::AUTHSHA512_USER, AuthProtocol::Sha512).await;
@@ -501,6 +516,7 @@ async fn v3_auth_sha512() {
 
 #[cfg(feature = "crypto-rustcrypto")]
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_priv_des() {
     require_container_runtime!();
 
@@ -527,6 +543,7 @@ async fn v3_priv_des() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_priv_aes128() {
     require_container_runtime!();
 
@@ -557,6 +574,7 @@ async fn v3_priv_aes128() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn missing_oid_returns_no_such() {
     require_container_runtime!();
 
@@ -579,6 +597,7 @@ async fn missing_oid_returns_no_such() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn wrong_community_fails() {
     require_container_runtime!();
 
@@ -603,6 +622,7 @@ async fn wrong_community_fails() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn value_types_decode_correctly() {
     require_container_runtime!();
 
@@ -639,6 +659,7 @@ async fn value_types_decode_correctly() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn tcp_transport_get() {
     require_container_runtime!();
 
@@ -664,6 +685,7 @@ async fn tcp_transport_get() {
 }
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn shared_transport_multiple_clients() {
     require_container_runtime!();
 
@@ -712,6 +734,7 @@ async fn shared_transport_multiple_clients() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn v3_engine_discovery_and_request() {
     require_container_runtime!();
 
@@ -749,6 +772,7 @@ async fn v3_engine_discovery_and_request() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires the net-snmp interoperability container"]
 async fn set_writable_oid() {
     require_container_runtime!();
 
