@@ -242,6 +242,8 @@ pub(crate) fn encode_v3_response(
     salt_counter: &SaltCounter,
     target: SocketAddr,
 ) -> Result<Bytes> {
+    response_pdu.validate_outbound(crate::Version::V3, crate::pdu::PduDirection::Response)?;
+
     // Same security level as the request, but reportable=false
     let global = MsgGlobalData::new(msg_id, msg_max_size, MsgFlags::new(security_level, false));
     let scoped = ScopedPdu::new(context_engine_id, context_name, response_pdu);
@@ -303,4 +305,94 @@ fn require_auth_key(
         Error::Auth { target }.boxed()
     })?;
     Ok((keys, auth_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oid;
+    use crate::varbind::VarBind;
+
+    fn message_size() -> MessageSize {
+        MessageSize::new(65_507).unwrap()
+    }
+
+    #[test]
+    fn shared_v3_request_encoder_rejects_malformed_pdu_without_mutation() {
+        let pdu = Pdu::get_bulk(7, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let original = pdu.clone();
+        let security = UsmConfig::new("user");
+        let salt = SaltCounter::from_value(1);
+
+        let result = encode_v3_message(
+            &pdu,
+            11,
+            b"engine-id",
+            1,
+            1,
+            &security,
+            None,
+            &salt,
+            true,
+            message_size(),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(pdu, original);
+    }
+
+    #[test]
+    fn shared_v3_notification_encoder_rejects_exception_values() {
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            7,
+            0,
+            0,
+            vec![VarBind::new(oid!(1, 3, 6, 1), Value::EndOfMibView)],
+        );
+        let security = UsmConfig::new("user");
+        let salt = SaltCounter::from_value(1);
+
+        let result = encode_v3_message(
+            &pdu,
+            11,
+            b"engine-id",
+            1,
+            1,
+            &security,
+            None,
+            &salt,
+            false,
+            message_size(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn shared_agent_response_encoder_rejects_invalid_response_fields() {
+        let pdu = Pdu::response(7, 0, 1, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let usm = UsmSecurityParams::new(
+            Bytes::from_static(b"engine-id"),
+            1,
+            1,
+            Bytes::from_static(b"user"),
+        );
+        let salt = SaltCounter::from_value(1);
+
+        let result = encode_v3_response(
+            pdu,
+            11,
+            message_size(),
+            SecurityLevel::NoAuthNoPriv,
+            usm,
+            Bytes::from_static(b"engine-id"),
+            Bytes::new(),
+            None,
+            &salt,
+            "127.0.0.1:161".parse().unwrap(),
+        );
+
+        assert!(result.is_err());
+    }
 }

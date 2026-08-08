@@ -57,15 +57,11 @@ impl CommunityPdu {
         }
     }
 
-    /// Encode to BER.
-    pub(crate) fn encode_with_compatibility_policy(
-        &self,
-        buf: &mut EncodeBuf,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<()> {
+    /// Encode to BER for a community message version.
+    pub(crate) fn encode(&self, buf: &mut EncodeBuf, version: Version) -> Result<()> {
         match self {
-            Self::Standard(p) => p.encode_with_compatibility_policy(buf, compatibility),
-            Self::TrapV1(t) => t.encode(buf),
+            Self::Standard(pdu) => pdu.encode_for(buf, version, pdu.outbound_direction()),
+            Self::TrapV1(trap) => trap.encode(buf),
         }
     }
 }
@@ -82,28 +78,6 @@ impl From<TrapV1Pdu> for CommunityPdu {
     }
 }
 
-/// Check whether a standard PDU type is valid in a community message of the
-/// given version.
-///
-/// SNMPv1 (RFC 1157) defines GetRequest, GetNextRequest, Response, SetRequest,
-/// and the v1 Trap. GETBULK, InformRequest, SNMPv2-Trap, and Report are SNMPv2
-/// constructs (RFC 3416) and are not valid in an SNMPv1 message. The v1 Trap PDU
-/// is handled separately via its distinct wire tag and is never a `Standard` PDU
-/// here, so it is not represented in this check.
-fn pdu_type_valid_for_version(pdu_type: PduType, version: Version) -> bool {
-    match version {
-        Version::V1 => matches!(
-            pdu_type,
-            PduType::GetRequest | PduType::GetNextRequest | PduType::Response | PduType::SetRequest
-        ),
-        // V2c permits the full SNMPv2 PDU set. TrapV1 is dispatched by tag before
-        // reaching this check, so it can never appear as a Standard PDU.
-        Version::V2c => pdu_type != PduType::TrapV1,
-        // V3 messages are not decoded through this path.
-        Version::V3 => false,
-    }
-}
-
 fn invalid_message(reason: impl Into<Box<str>>) -> Box<Error> {
     Error::InvalidMessage(reason.into()).boxed()
 }
@@ -117,32 +91,13 @@ fn validate_community_message(version: Version, pdu: &CommunityPdu) -> Result<()
 
     match pdu {
         CommunityPdu::Standard(pdu) => {
-            if !pdu_type_valid_for_version(pdu.pdu_type(), version) {
-                return Err(invalid_message(format!(
-                    "{} PDU is not valid for {version:?}",
-                    pdu.pdu_type()
-                )));
-            }
-            if version == Version::V1
-                && pdu
-                    .varbinds
-                    .iter()
-                    .any(|varbind| matches!(varbind.value, crate::value::Value::Counter64(_)))
-            {
-                return Err(invalid_message("Counter64 is not valid in SNMPv1"));
-            }
+            pdu.validate_outbound(version, pdu.outbound_direction())?;
         }
         CommunityPdu::TrapV1(trap) => {
             if version != Version::V1 {
                 return Err(invalid_message("TrapV1 PDU is only valid in SNMPv1"));
             }
-            if trap
-                .varbinds
-                .iter()
-                .any(|varbind| matches!(varbind.value, crate::value::Value::Counter64(_)))
-            {
-                return Err(invalid_message("Counter64 is not valid in SNMPv1"));
-            }
+            trap.validate_outbound()?;
         }
     }
 
@@ -243,22 +198,13 @@ impl CommunityMessage {
         (self.version, self.community, self.pdu)
     }
 
-    /// Encode to BER using the default malformed-input compatibility policy.
+    /// Encode to BER after validating the complete outbound envelope.
     pub fn encode(&self) -> Result<Bytes> {
-        self.encode_with_compatibility_policy(CompatibilityPolicy::default())
-    }
-
-    /// Encode to BER using an explicit compatibility policy.
-    pub fn encode_with_compatibility_policy(
-        &self,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<Bytes> {
         self.validate()?;
         let mut buf = EncodeBuf::new();
 
         buf.try_push_sequence(|buf| {
-            self.pdu
-                .encode_with_compatibility_policy(buf, compatibility)?;
+            self.pdu.encode(buf, self.version)?;
             buf.push_octet_string(&self.community);
             buf.push_integer(self.version.as_i32());
             Ok(())
@@ -370,7 +316,7 @@ impl CommunityMessage {
             // Enforce version<->PDU-type compatibility. GETBULK, InformRequest,
             // and SNMPv2-Trap are SNMPv2 constructs (RFC 3416) and are not valid
             // in an SNMPv1 message (RFC 1157).
-            if !pdu_type_valid_for_version(pdu.pdu_type(), version) {
+            if !crate::pdu::pdu_type_valid_for_version(pdu.pdu_type(), version) {
                 tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), version = ?version, pdu_type = %pdu.pdu_type() }, "PDU type not valid for SNMP version");
                 return Err(seq.malformed());
             }
@@ -404,7 +350,7 @@ impl CommunityMessage {
 mod tests {
     use super::*;
     use crate::error::Error;
-    use crate::message::ScopedPdu;
+    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
     use crate::oid;
     use crate::pdu::GenericTrap;
     use crate::value::Value;
@@ -502,6 +448,10 @@ mod tests {
             ));
         }
 
+        assert_invalid_message(CommunityMessage::v2c(
+            "public",
+            standard_pdu(PduType::Report, vec![]),
+        ));
         assert_invalid_message(CommunityMessage::new(
             Version::V3,
             "public",
@@ -582,9 +532,6 @@ mod tests {
 
         for message in invalid_messages {
             assert_invalid_message(message.encode());
-            assert_invalid_message(
-                message.encode_with_compatibility_policy(CompatibilityPolicy::STRICT),
-            );
         }
     }
 
@@ -607,45 +554,59 @@ mod tests {
     }
 
     #[test]
-    fn v2c_and_v3_embed_identical_get_bulk_tlv_with_explicit_policy() {
-        let pdu = Pdu::get_bulk(7, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
-        let compatibility = CompatibilityPolicy::DEFAULT;
+    fn pdu_and_message_envelopes_reject_the_same_malformed_objects_without_mutation() {
+        let name = oid!(1, 3, 6, 1);
+        let malformed = [
+            Pdu::get_bulk(7, -1, -5, vec![VarBind::null(name.clone())]),
+            Pdu::standard(
+                crate::pdu::StandardPduType::GetRequest,
+                7,
+                1,
+                0,
+                vec![VarBind::null(name.clone())],
+            ),
+            Pdu::response(7, 0, 1, vec![VarBind::null(name.clone())]),
+            Pdu::standard(
+                crate::pdu::StandardPduType::GetRequest,
+                7,
+                0,
+                0,
+                vec![VarBind::new(name.clone(), Value::NoSuchObject)],
+            ),
+            Pdu::set_request(
+                7,
+                vec![VarBind::new(
+                    name,
+                    Value::Unknown {
+                        tag: 0x48,
+                        data: Bytes::from_static(b"raw"),
+                    },
+                )],
+            ),
+        ];
 
-        let mut canonical = EncodeBuf::new();
-        pdu.encode_with_compatibility_policy(&mut canonical, compatibility)
-            .unwrap();
-        let canonical = canonical.finish();
+        for pdu in malformed {
+            let original = pdu.clone();
 
-        let community = CommunityMessage::v2c("public", pdu.clone())
-            .unwrap()
-            .encode_with_compatibility_policy(compatibility)
-            .unwrap();
-        let mut scoped_buf = EncodeBuf::new();
-        ScopedPdu::with_empty_context(pdu.clone())
-            .encode_with_compatibility_policy(&mut scoped_buf, compatibility)
-            .unwrap();
-        let scoped = scoped_buf.finish();
+            let mut pdu_buf = EncodeBuf::new();
+            assert_invalid_message(pdu.encode(&mut pdu_buf));
+            assert!(pdu_buf.is_empty());
 
-        assert!(community.ends_with(&canonical));
-        assert!(scoped.ends_with(&canonical));
-        assert_eq!(
-            &community[community.len() - canonical.len()..],
-            &scoped[scoped.len() - canonical.len()..]
-        );
+            assert_invalid_message(CommunityMessage::v2c("public", pdu.clone()));
 
-        assert!(
-            CommunityMessage::v2c("public", pdu.clone())
-                .unwrap()
-                .encode_with_compatibility_policy(CompatibilityPolicy::STRICT)
-                .is_err()
-        );
-        let mut strict_scoped = EncodeBuf::new();
-        assert!(
-            ScopedPdu::with_empty_context(pdu)
-                .encode_with_compatibility_policy(&mut strict_scoped, CompatibilityPolicy::STRICT,)
-                .is_err()
-        );
-        assert!(strict_scoped.is_empty());
+            let scoped = ScopedPdu::with_empty_context(pdu.clone());
+            let mut scoped_buf = EncodeBuf::new();
+            assert_invalid_message(scoped.encode(&mut scoped_buf));
+            assert!(scoped_buf.is_empty());
+
+            let global = MsgGlobalData::new(
+                11,
+                crate::MessageSize::new(65_507).unwrap(),
+                MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+            );
+            assert_invalid_message(V3Message::new(global, Bytes::new(), scoped).encode());
+            assert_eq!(pdu, original);
+        }
     }
 
     #[test]

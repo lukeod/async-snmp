@@ -26,6 +26,13 @@ fn assert_invalid<T>(result: async_snmp::Result<T>) {
     }
 }
 
+fn assert_invalid_message<T>(result: async_snmp::Result<T>) {
+    match result {
+        Err(error) => assert!(matches!(&*error, Error::InvalidMessage(_))),
+        Ok(_) => panic!("invalid message envelope was accepted"),
+    }
+}
+
 fn pdu_with(pdu_type: PduType, varbind: VarBind) -> Pdu {
     if pdu_type == PduType::GetBulkRequest {
         Pdu::get_bulk(7, 0, 10, vec![varbind])
@@ -78,11 +85,17 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             assert_invalid(pdu.encode(&mut buf));
             assert!(buf.is_empty());
 
-            assert_invalid(
-                CommunityMessage::v2c("public", pdu.clone())
-                    .unwrap()
-                    .encode(),
-            );
+            if pdu_type == PduType::Report {
+                // Report is not a valid v2c PDU, so envelope validation
+                // intentionally takes precedence over the nested invalid OID.
+                assert_invalid_message(CommunityMessage::v2c("public", pdu.clone()));
+            } else {
+                assert_invalid(
+                    CommunityMessage::v2c("public", pdu.clone())
+                        .unwrap()
+                        .encode(),
+                );
+            }
 
             let scoped = ScopedPdu::new(Bytes::new(), Bytes::new(), pdu);
             let global = MsgGlobalData::new(

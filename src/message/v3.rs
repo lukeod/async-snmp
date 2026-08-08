@@ -282,20 +282,11 @@ impl ScopedPdu {
         }
     }
 
-    /// Encode to buffer using the default malformed-input compatibility policy.
+    /// Encode to buffer after applying SNMPv3 outbound PDU validation.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
-        self.encode_with_compatibility_policy(buf, CompatibilityPolicy::default())
-    }
-
-    /// Encode to buffer using an explicit compatibility policy.
-    pub fn encode_with_compatibility_policy(
-        &self,
-        buf: &mut EncodeBuf,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<()> {
         buf.try_push_sequence(|buf| {
             self.pdu
-                .encode_with_compatibility_policy(buf, compatibility)?;
+                .encode_for(buf, crate::Version::V3, self.pdu.outbound_direction())?;
             buf.push_octet_string(&self.context_name);
             buf.push_octet_string(&self.context_engine_id);
             Ok(())
@@ -415,22 +406,12 @@ impl V3Message {
     /// 2. Compute HMAC over the entire encoded message
     /// 3. Replace the placeholder with the actual HMAC
     pub fn encode(&self) -> Result<Bytes> {
-        self.encode_with_compatibility_policy(CompatibilityPolicy::default())
-    }
-
-    /// Encode using an explicit malformed-input compatibility policy.
-    pub fn encode_with_compatibility_policy(
-        &self,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<Bytes> {
         let mut buf = EncodeBuf::new();
 
         buf.try_push_sequence(|buf| {
             // msgData
             match &self.data {
-                V3MessageData::Plaintext(scoped_pdu) => {
-                    scoped_pdu.encode_with_compatibility_policy(buf, compatibility)?
-                }
+                V3MessageData::Plaintext(scoped_pdu) => scoped_pdu.encode(buf)?,
                 V3MessageData::Encrypted(ciphertext) => buf.push_octet_string(ciphertext),
             }
 
@@ -719,6 +700,22 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
 mod tests {
     use super::*;
     use crate::oid;
+
+    #[test]
+    fn encode_rejects_malformed_pdu_without_mutating_it() {
+        let pdu = Pdu::get_bulk(1, -1, -5, vec![]);
+        let original = pdu.clone();
+        let scoped = ScopedPdu::with_empty_context(pdu.clone());
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65_507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+        );
+        let message = V3Message::new(global, Bytes::new(), scoped);
+
+        assert!(message.encode().is_err());
+        assert_eq!(pdu, original);
+    }
 
     #[test]
     fn encode_rejects_invalid_oid() {

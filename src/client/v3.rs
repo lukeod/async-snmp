@@ -727,7 +727,11 @@ impl<T: Transport> Client<T> {
         // may perform network I/O. The PDU is encoded again after discovery
         // once the authoritative engine details are available.
         let mut validation_buf = EncodeBuf::new();
-        pdu.encode(&mut validation_buf)?;
+        pdu.encode_for(
+            &mut validation_buf,
+            crate::Version::V3,
+            crate::pdu::PduDirection::Request,
+        )?;
 
         self.ensure_engine_discovered().await?;
 
@@ -1123,6 +1127,8 @@ mod tests {
     use crate::message::V3MessageData;
     use crate::oid;
     use crate::transport::Transport;
+    use crate::value::Value;
+    use crate::varbind::VarBind;
     use bytes::Bytes;
     use std::future::ready;
     use std::net::{Ipv4Addr, SocketAddr};
@@ -1168,6 +1174,50 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             false
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_client_rejects_malformed_requests_before_discovery() {
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(TestTransport::new(), config).expect("valid client config");
+        let name = oid!(1, 3, 6, 1);
+        let malformed = [
+            Pdu::get_bulk(7, -1, 10, vec![VarBind::null(name.clone())]),
+            Pdu::standard(
+                crate::pdu::StandardPduType::GetRequest,
+                7,
+                1,
+                0,
+                vec![VarBind::null(name.clone())],
+            ),
+            Pdu::standard(
+                crate::pdu::StandardPduType::GetRequest,
+                7,
+                0,
+                0,
+                vec![VarBind::new(name.clone(), Value::NoSuchObject)],
+            ),
+            Pdu::set_request(
+                7,
+                vec![VarBind::new(
+                    name,
+                    Value::Unknown {
+                        tag: 0x48,
+                        data: Bytes::from_static(b"raw"),
+                    },
+                )],
+            ),
+        ];
+
+        for pdu in malformed {
+            let original = pdu.clone();
+            let error = client.send_v3_and_recv(pdu.clone()).await.unwrap_err();
+            assert!(matches!(&*error, Error::InvalidMessage(_)));
+            assert_eq!(pdu, original);
         }
     }
 

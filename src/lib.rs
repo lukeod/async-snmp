@@ -402,7 +402,8 @@
 //! "permissive" mode. Defaults either preserve a bounded, unambiguous value or
 //! narrowly accommodate common agent behavior. Security-sensitive relaxations
 //! are off by default. [`CompatibilityPolicy`] is supplied to low-level message
-//! encode/decode calls; it is **not** a client-wide or receiver-wide setting.
+//! decode calls; it is **not** a client-wide or receiver-wide setting. Outbound
+//! structured encoders always require canonical protocol data.
 //!
 //! ### Malformed BER and value normalization
 //!
@@ -416,12 +417,13 @@
 //! | `empty_counter64_as_zero` | on | Decode a zero-length Counter64 as zero. |
 //! | `empty_object_identifier` | on | Decode a zero-length OBJECT IDENTIFIER as [`Oid::empty`]. |
 //! | `clamp_bounded_strings` | on | Clamp an over-declared OCTET STRING or Opaque length to its enclosing varbind; it cannot consume the next varbind. |
-//! | `normalize_negative_get_bulk_fields` | on | Normalize negative GETBULK non-repeaters and max-repetitions to zero during both encoding and decoding. |
+//! | `normalize_negative_get_bulk_fields` | on | Normalize negative GETBULK non-repeaters and max-repetitions to zero while decoding. Outbound encoding rejects them. |
 //! | `malformed_exception_payloads` | **off** | When enabled, discard non-empty payloads on exception values; the default rejects them. |
 //!
 //! These controls do not govern bytes after a complete top-level message. That
 //! separate envelope policy is described below. Unknown BER value tags remain
-//! preserved as [`Value::Unknown`] for forward compatibility.
+//! preserved as [`Value::Unknown`] for receive compatibility, but structured
+//! encoders reject that receive-only variant.
 //!
 //! ### Other policy layers
 //!

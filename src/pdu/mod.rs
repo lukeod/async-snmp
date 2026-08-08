@@ -3,25 +3,80 @@
 //! PDUs represent the different SNMP operations.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
-use crate::compatibility::CompatibilityPolicy;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, ErrorStatus, Result};
 use crate::oid::Oid;
+use crate::value::Value;
 use crate::varbind::{VarBind, decode_varbind_list, encode_varbind_list};
+use crate::version::Version;
 
-fn encode_bulk_field(
-    value: i32,
-    field: &'static str,
-    compatibility: CompatibilityPolicy,
-) -> Result<i32> {
-    if value >= 0 {
-        return Ok(value);
+fn invalid_outbound(reason: impl Into<Box<str>>) -> Box<Error> {
+    Error::InvalidMessage(reason.into()).boxed()
+}
+
+/// The protocol role of an outbound PDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PduDirection {
+    Request,
+    Response,
+    Notification,
+}
+
+pub(crate) fn pdu_type_valid_for_version(pdu_type: PduType, version: Version) -> bool {
+    match version {
+        Version::V1 => matches!(
+            pdu_type,
+            PduType::GetRequest | PduType::GetNextRequest | PduType::Response | PduType::SetRequest
+        ),
+        Version::V2c => matches!(
+            pdu_type,
+            PduType::GetRequest
+                | PduType::GetNextRequest
+                | PduType::Response
+                | PduType::SetRequest
+                | PduType::GetBulkRequest
+                | PduType::InformRequest
+                | PduType::TrapV2
+        ),
+        Version::V3 => pdu_type != PduType::TrapV1,
     }
-    if !compatibility.normalize_negative_get_bulk_fields {
-        return Err(Error::Config(format!("negative GETBULK {field}").into_boxed_str()).boxed());
+}
+
+fn validate_outbound_values(
+    version: Version,
+    direction: PduDirection,
+    varbinds: &[VarBind],
+) -> Result<()> {
+    for varbind in varbinds {
+        let value = &varbind.value;
+        if matches!(value, Value::Unknown { .. }) {
+            return Err(invalid_outbound(
+                "Value::Unknown cannot be encoded by structured encoders",
+            ));
+        }
+        if matches!(value, Value::UInteger32(_) | Value::Nsap(_)) {
+            return Err(invalid_outbound(
+                "historic receive-only value type cannot be encoded",
+            ));
+        }
+        if version == Version::V1
+            && matches!(
+                value,
+                Value::Counter64(_)
+                    | Value::NoSuchObject
+                    | Value::NoSuchInstance
+                    | Value::EndOfMibView
+            )
+        {
+            return Err(invalid_outbound("value type is not valid in SNMPv1"));
+        }
+        if direction != PduDirection::Response && value.is_exception() {
+            return Err(invalid_outbound(
+                "exception values are only valid in response PDUs",
+            ));
+        }
     }
-    tracing::warn!(target: "async_snmp::pdu", anomaly = "negative_get_bulk_field", direction = "encode", field, value, normalized = 0, "normalized negative GETBULK field");
-    Ok(0)
+    Ok(())
 }
 
 /// PDU type tag.
@@ -298,8 +353,7 @@ impl Pdu {
 
     /// Create a GETBULK request PDU.
     ///
-    /// The encode choke point applies the selected compatibility policy before
-    /// either field reaches the wire.
+    /// Encoding rejects negative field values without changing this PDU.
     #[must_use]
     pub fn get_bulk(
         request_id: i32,
@@ -317,17 +371,113 @@ impl Pdu {
         }
     }
 
-    /// Encode to BER using the default malformed-input compatibility policy.
-    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
-        self.encode_with_compatibility_policy(buf, CompatibilityPolicy::default())
+    pub(crate) fn outbound_direction(&self) -> PduDirection {
+        match self.pdu_type() {
+            PduType::Response | PduType::Report => PduDirection::Response,
+            PduType::TrapV1 | PduType::TrapV2 => PduDirection::Notification,
+            PduType::GetRequest
+            | PduType::GetNextRequest
+            | PduType::SetRequest
+            | PduType::GetBulkRequest
+            | PduType::InformRequest => PduDirection::Request,
+        }
     }
 
-    /// Encode to BER using an explicit compatibility policy.
-    pub fn encode_with_compatibility_policy(
+    fn inferred_encode_version(&self) -> Version {
+        match self.pdu_type() {
+            PduType::Report => Version::V3,
+            _ => Version::V2c,
+        }
+    }
+
+    pub(crate) fn validate_outbound(
+        &self,
+        version: Version,
+        direction: PduDirection,
+    ) -> Result<()> {
+        let pdu_type = self.pdu_type();
+        if !pdu_type_valid_for_version(pdu_type, version) {
+            return Err(invalid_outbound(format!(
+                "{pdu_type} PDU is not valid for {version:?}"
+            )));
+        }
+        if self.outbound_direction() != direction {
+            return Err(invalid_outbound(format!(
+                "{pdu_type} PDU is not valid in the {direction:?} direction"
+            )));
+        }
+
+        match self.body {
+            PduBody::GetBulk {
+                non_repeaters,
+                max_repetitions,
+            } => {
+                if non_repeaters < 0 {
+                    return Err(invalid_outbound("negative GETBULK non_repeaters"));
+                }
+                if max_repetitions < 0 {
+                    return Err(invalid_outbound("negative GETBULK max_repetitions"));
+                }
+            }
+            PduBody::Standard {
+                pdu_type: StandardPduType::Response,
+                error_status,
+                error_index,
+            } => {
+                let maximum_status = if version == Version::V1 { 5 } else { 18 };
+                if !(0..=maximum_status).contains(&error_status) {
+                    return Err(invalid_outbound(
+                        "Response error_status is not valid for the SNMP version",
+                    ));
+                }
+                if error_index < 0
+                    || usize::try_from(error_index)
+                        .ok()
+                        .is_none_or(|index| index > self.varbinds.len())
+                {
+                    return Err(invalid_outbound(
+                        "Response error_index does not identify a variable binding",
+                    ));
+                }
+                if matches!(error_status, 0 | 1 | 15) {
+                    if error_index != 0 {
+                        return Err(invalid_outbound(
+                            "noError, tooBig, and undoFailed Responses require error_index zero",
+                        ));
+                    }
+                } else if error_index == 0 {
+                    return Err(invalid_outbound(
+                        "this Response error_status requires a nonzero error_index",
+                    ));
+                }
+            }
+            PduBody::Standard {
+                error_status,
+                error_index,
+                ..
+            } => {
+                if error_status != 0 || error_index != 0 {
+                    return Err(invalid_outbound(
+                        "request and notification PDUs require zero error fields",
+                    ));
+                }
+            }
+        }
+
+        validate_outbound_values(version, direction, &self.varbinds)
+    }
+
+    pub(crate) fn encode_for(
         &self,
         buf: &mut EncodeBuf,
-        compatibility: CompatibilityPolicy,
+        version: Version,
+        direction: PduDirection,
     ) -> Result<()> {
+        self.validate_outbound(version, direction)?;
+        self.encode_validated(buf)
+    }
+
+    fn encode_validated(&self, buf: &mut EncodeBuf) -> Result<()> {
         let (pdu_type, first_field, second_field) = match self.body {
             PduBody::Standard {
                 pdu_type,
@@ -337,11 +487,7 @@ impl Pdu {
             PduBody::GetBulk {
                 non_repeaters,
                 max_repetitions,
-            } => (
-                PduType::GetBulkRequest,
-                encode_bulk_field(non_repeaters, "non_repeaters", compatibility)?,
-                encode_bulk_field(max_repetitions, "max_repetitions", compatibility)?,
-            ),
+            } => (PduType::GetBulkRequest, non_repeaters, max_repetitions),
         };
 
         buf.try_push_constructed(pdu_type.tag(), |buf| {
@@ -351,6 +497,18 @@ impl Pdu {
             buf.push_integer(self.request_id);
             Ok(())
         })
+    }
+
+    /// Encode a structurally valid PDU to BER.
+    ///
+    /// Version-specific validation is repeated when the PDU is placed in a
+    /// community or SNMPv3 message envelope.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.encode_for(
+            buf,
+            self.inferred_encode_version(),
+            self.outbound_direction(),
+        )
     }
 
     /// Decode from BER (after tag has been peeked).
@@ -897,8 +1055,13 @@ impl TrapV1Pdu {
         Ok(Pdu::standard(StandardPduType::TrapV2, 0, 0, 0, varbinds))
     }
 
+    pub(crate) fn validate_outbound(&self) -> Result<()> {
+        validate_outbound_values(Version::V1, PduDirection::Notification, &self.varbinds)
+    }
+
     /// Encode to BER.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.validate_outbound()?;
         buf.try_push_constructed(tag::pdu::TRAP_V1, |buf| {
             encode_varbind_list(buf, &self.varbinds)?;
             buf.push_unsigned32(tag::application::TIMETICKS, self.time_stamp);
@@ -979,6 +1142,7 @@ impl TrapV1Pdu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CompatibilityPolicy;
     use crate::oid;
 
     fn compatibility_without_negative_bulk_normalization() -> CompatibilityPolicy {
@@ -1459,36 +1623,14 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_clamps_negative_non_repeaters_and_max_repetitions() {
-        // RFC 3416 Section 4.2.3: non-repeaters and max-repetitions are
-        // INTEGER (0..2147483647). Pdu::encode normalizes negative values
-        // to 0 before writing, so even a PDU built with negative fields
-        // (e.g. via a raw i32 passed to Client::get_bulk) round-trips through
-        // decode instead of producing a malformed request on the wire.
+    fn encode_rejects_negative_get_bulk_fields_without_mutation() {
         let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
-
-        let mut strict_buf = EncodeBuf::new();
-        assert!(
-            pdu.encode_with_compatibility_policy(
-                &mut strict_buf,
-                compatibility_without_negative_bulk_normalization(),
-            )
-            .is_err()
-        );
-        assert!(strict_buf.is_empty());
-
+        let original = pdu.clone();
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf).unwrap();
-        let bytes = buf.finish();
 
-        let mut decoder = Decoder::new(bytes);
-        let result = Pdu::decode(&mut decoder);
-        assert!(
-            result.is_ok(),
-            "encoded negative non_repeaters/max_repetitions should decode after clamping, got {result:?}"
-        );
-        let decoded = result.unwrap();
-        assert_eq!(decoded.get_bulk_fields(), Some((0, 0)));
+        assert!(pdu.encode(&mut buf).is_err());
+        assert!(buf.is_empty());
+        assert_eq!(pdu, original);
     }
 
     #[test]
@@ -1505,55 +1647,14 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_pdu_get_bulk_clamps_negative_fields() {
-        // The shared encoder must apply the RFC 3416 (0..max-bindings) policy so a negative
-        // passed to Client::get_bulk on a v3 client never reaches the wire.
-        let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
-        assert_eq!(pdu.get_bulk_fields(), Some((-1, -5)));
-
-        let mut strict_buf = EncodeBuf::new();
-        assert!(
-            pdu.encode_with_compatibility_policy(
-                &mut strict_buf,
-                compatibility_without_negative_bulk_normalization(),
-            )
-            .is_err()
-        );
-        assert!(strict_buf.is_empty());
-
-        let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf).unwrap();
-        let bytes = buf.finish();
-
-        let mut decoder = Decoder::new(bytes);
-        let decoded = Pdu::decode(&mut decoder)
-            .expect("clamped canonical GETBULK encode should decode as valid");
+    fn compatible_decode_does_not_enable_malformed_encode() {
+        let raw = RawBulkWirePdu::new(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let mut decoder = Decoder::new(raw.encode());
+        let decoded = Pdu::decode(&mut decoder).unwrap();
         assert_eq!(decoded.get_bulk_fields(), Some((0, 0)));
-    }
 
-    #[test]
-    fn test_directly_constructed_getbulk_pdu_encode_clamps_negative_fields() {
-        // The typed fields let a caller build a GETBULK PDU directly. The default
-        // encode policy must normalize negative fields to 0 so the PDU cannot
-        // emit a negative on the wire.
-        let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
-
-        let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf).unwrap();
-        let bytes = buf.finish();
-
-        // Read the raw wire integers directly rather than via Pdu::decode,
-        // which would re-clamp on the decode side (F06) and mask a broken encoder.
-        let mut decoder = Decoder::new(bytes);
-        let tag = decoder.read_tag().expect("read pdu tag");
-        assert_eq!(tag, PduType::GetBulkRequest.tag());
-        let len = decoder.read_length().expect("read pdu length");
-        let mut inner = decoder.sub_decoder(len).expect("pdu sub-decoder");
-        let _request_id = inner.read_integer().expect("read request_id");
-        let non_repeaters = inner.read_integer().expect("read non_repeaters");
-        let max_repetitions = inner.read_integer().expect("read max_repetitions");
-        assert_eq!(non_repeaters, 0);
-        assert_eq!(max_repetitions, 0);
+        let malformed = Pdu::get_bulk(1, -1, -5, vec![]);
+        assert!(malformed.encode(&mut EncodeBuf::new()).is_err());
     }
 
     #[test]
@@ -1604,6 +1705,89 @@ mod tests {
         );
 
         assert!(pdu.is_error());
+    }
+
+    #[test]
+    fn outbound_validation_rejects_nonzero_request_error_fields() {
+        for (status, index) in [(1, 0), (0, 1), (1, 1)] {
+            let pdu = Pdu::standard(
+                StandardPduType::GetRequest,
+                1,
+                status,
+                index,
+                vec![VarBind::null(oid!(1, 3, 6, 1))],
+            );
+            assert!(pdu.encode(&mut EncodeBuf::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn outbound_validation_checks_response_status_and_index_combinations() {
+        let varbinds = vec![VarBind::null(oid!(1, 3, 6, 1))];
+        for (status, index) in [
+            (0, 1),
+            (1, 1),
+            (-1, 0),
+            (19, 0),
+            (5, -1),
+            (5, 0),
+            (5, 2),
+            (ErrorStatus::UndoFailed.as_i32(), 1),
+        ] {
+            let pdu = Pdu::response(1, status, index, varbinds.clone());
+            assert!(
+                pdu.encode(&mut EncodeBuf::new()).is_err(),
+                "{status}/{index}"
+            );
+        }
+
+        let gen_err = Pdu::response(1, ErrorStatus::GenErr.as_i32(), 1, varbinds.clone());
+        assert!(gen_err.encode(&mut EncodeBuf::new()).is_ok());
+        let undo_failed = Pdu::response(1, ErrorStatus::UndoFailed.as_i32(), 0, varbinds.clone());
+        assert!(undo_failed.encode(&mut EncodeBuf::new()).is_ok());
+        assert!(
+            undo_failed
+                .encode_for(&mut EncodeBuf::new(), Version::V1, PduDirection::Response,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn outbound_validation_allows_exceptions_only_in_v2_or_v3_responses() {
+        let varbinds = vec![VarBind::new(oid!(1, 3, 6, 1), Value::NoSuchObject)];
+        let request = Pdu::get_request(1, &[]);
+        let mut request = Pdu {
+            varbinds: varbinds.clone(),
+            ..request
+        };
+        let original = request.clone();
+        assert!(request.encode(&mut EncodeBuf::new()).is_err());
+        assert_eq!(request, original);
+
+        request.set_standard_pdu_type(StandardPduType::Response);
+        assert!(request.encode(&mut EncodeBuf::new()).is_ok());
+        assert!(
+            request
+                .encode_for(&mut EncodeBuf::new(), Version::V1, PduDirection::Response,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn outbound_validation_rejects_receive_only_values_without_mutation() {
+        for value in [
+            Value::UInteger32(1),
+            Value::Nsap(bytes::Bytes::from_static(b"nsap")),
+            Value::Unknown {
+                tag: 0x48,
+                data: bytes::Bytes::from_static(b"raw"),
+            },
+        ] {
+            let pdu = Pdu::set_request(1, vec![VarBind::new(oid!(1, 3, 6, 1), value)]);
+            let original = pdu.clone();
+            assert!(pdu.encode(&mut EncodeBuf::new()).is_err());
+            assert_eq!(pdu, original);
+        }
     }
 
     #[test]

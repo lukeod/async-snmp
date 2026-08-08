@@ -498,7 +498,39 @@ impl super::Agent {
 
 #[cfg(test)]
 mod tests {
+    use super::SinkStatus;
     use crate::agent::Agent;
+    use crate::{Auth, Error, Value, VarBind, oid};
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn public_agent_notification_path_rejects_receive_only_values() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .trap_sink("127.0.0.1:9", Auth::v2c("public"))
+            .build()
+            .await
+            .unwrap();
+        let malformed = VarBind::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999, 1),
+            Value::Unknown {
+                tag: 0x48,
+                data: Bytes::from_static(b"raw"),
+            },
+        );
+
+        let outcome = agent
+            .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![malformed])
+            .await;
+        assert_eq!(outcome.len(), 1);
+        match &outcome.sinks()[0].status {
+            SinkStatus::Failed(error) => {
+                assert!(matches!(&**error, Error::InvalidMessage(_)));
+            }
+            status => panic!("expected outbound validation failure, got {status:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn test_notification_ids_are_per_agent() {

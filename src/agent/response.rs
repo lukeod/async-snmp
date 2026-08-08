@@ -135,6 +135,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_response_path_rejects_invalid_response_fields() {
+        let agent = test_agent().await;
+        let response = Pdu::response(1, 0, 1, vec![crate::VarBind::null(oid!(1, 3, 6, 1))]);
+
+        let error = agent
+            .build_v3_response(
+                &dummy_v3_msg(SecurityLevel::NoAuthNoPriv),
+                &dummy_usm(),
+                response,
+                Bytes::from_static(b"engine"),
+                Bytes::new(),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(&*error, crate::Error::InvalidMessage(_)));
+    }
+
+    #[tokio::test]
     async fn test_boots_latched_drops_auth_nopriv_response() {
         let agent = test_agent_with_boots(MAX_ENGINE_TIME).await;
 

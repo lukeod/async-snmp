@@ -160,9 +160,24 @@ fn arb_varbind() -> impl Strategy<Value = VarBind> {
     (arb_oid(), arb_value_with_exceptions()).prop_map(|(oid, value)| VarBind::new(oid, value))
 }
 
-/// Strategy for generating a vector of `VarBinds`.
+/// Strategy for generating a vector of receive-side `VarBinds`.
 fn arb_varbinds() -> impl Strategy<Value = Vec<VarBind>> {
     prop::collection::vec(arb_varbind(), 0..=10)
+}
+
+fn arb_outbound_varbinds() -> impl Strategy<Value = Vec<VarBind>> {
+    prop::collection::vec(
+        (arb_oid(), arb_value()).prop_map(|(oid, value)| VarBind::new(oid, value)),
+        0..=10,
+    )
+}
+
+fn arb_v1_varbinds() -> impl Strategy<Value = Vec<VarBind>> {
+    arb_outbound_varbinds().prop_filter("SNMPv1 does not carry Counter64", |varbinds| {
+        !varbinds
+            .iter()
+            .any(|varbind| matches!(varbind.value, Value::Counter64(_)))
+    })
 }
 
 /// Strategy for generating PDU types (excluding `TrapV1` which has different structure).
@@ -179,56 +194,41 @@ fn arb_pdu_type() -> impl Strategy<Value = PduType> {
     ]
 }
 
-/// Strategy for generating canonical PDUs.
+/// Strategy for generating canonical outbound PDUs.
 fn arb_pdu() -> impl Strategy<Value = Pdu> {
-    (arb_pdu_type(), any::<i32>(), any::<i32>(), arb_varbinds())
-        .prop_flat_map(|(pdu_type, request_id, error_status, varbinds)| {
-            // GETBULK fields are constrained to non-negative values so they round-trip.
-            let is_bulk = pdu_type == PduType::GetBulkRequest;
-            let error_status = if is_bulk {
-                error_status.max(0)
-            } else {
-                error_status
-            };
-            let max_error_index = if is_bulk {
-                i32::MAX
-            } else if varbinds.is_empty() {
-                0
-            } else {
-                varbinds.len() as i32
-            };
-            (
-                Just(pdu_type),
-                Just(request_id),
-                Just(error_status),
-                0..=max_error_index,
-                Just(varbinds),
-            )
-        })
-        .prop_map(
-            |(pdu_type, request_id, first_field, second_field, varbinds)| {
-                if pdu_type == PduType::GetBulkRequest {
-                    Pdu::get_bulk(request_id, first_field, second_field, varbinds)
-                } else {
-                    Pdu::standard(
-                        StandardPduType::try_from(pdu_type).unwrap(),
-                        request_id,
-                        first_field,
-                        second_field,
-                        varbinds,
-                    )
-                }
-            },
+    prop_oneof![
+        (
+            prop_oneof![
+                Just(StandardPduType::GetRequest),
+                Just(StandardPduType::GetNextRequest),
+                Just(StandardPduType::SetRequest),
+                Just(StandardPduType::InformRequest),
+                Just(StandardPduType::TrapV2),
+                Just(StandardPduType::Report),
+            ],
+            any::<i32>(),
+            arb_outbound_varbinds(),
         )
+            .prop_map(|(pdu_type, request_id, varbinds)| {
+                Pdu::standard(pdu_type, request_id, 0, 0, varbinds)
+            }),
+        (any::<i32>(), arb_varbinds())
+            .prop_map(|(request_id, varbinds)| Pdu::response(request_id, 0, 0, varbinds)),
+        arb_getbulk_pdu(),
+    ]
 }
 
 /// Strategy for generating typed GETBULK PDUs.
 fn arb_getbulk_pdu() -> impl Strategy<Value = Pdu> {
-    (any::<i32>(), 0i32..=100, 0i32..=1000, arb_varbinds()).prop_map(
-        |(request_id, non_repeaters, max_repetitions, varbinds)| {
-            Pdu::get_bulk(request_id, non_repeaters, max_repetitions, varbinds)
-        },
+    (
+        any::<i32>(),
+        0i32..=100,
+        0i32..=1000,
+        arb_outbound_varbinds(),
     )
+        .prop_map(|(request_id, non_repeaters, max_repetitions, varbinds)| {
+            Pdu::get_bulk(request_id, non_repeaters, max_repetitions, varbinds)
+        })
 }
 
 /// Strategy for generating `TrapV1` PDUs.
@@ -239,7 +239,7 @@ fn arb_trap_v1_pdu() -> impl Strategy<Value = TrapV1Pdu> {
         0i32..=6,
         any::<i32>(),
         any::<u32>(),
-        arb_varbinds(),
+        arb_v1_varbinds(),
     )
         .prop_map(
             |(enterprise, agent_addr, generic_trap_raw, specific_trap, time_stamp, varbinds)| {

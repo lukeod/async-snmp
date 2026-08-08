@@ -1,13 +1,13 @@
 //! Explicit controls for accepting known malformed SNMP encodings.
 //!
-//! These controls are carried by each decoder or encoder invocation. They do
-//! not modify process-global state, and each interoperability deviation can be
-//! enabled independently.
+//! These controls are carried by each decoder invocation. They do not modify
+//! process-global state, and each interoperability deviation can be enabled
+//! independently. Structured outbound encoders always require canonical data.
 
 /// Policy for known, unambiguous interoperability deviations.
 ///
-/// [`Default`] preserves the established receive and encode behavior except
-/// that exception values with non-empty payloads are rejected. Every accepted
+/// [`Default`] preserves the established receive behavior except that
+/// exception values with non-empty payloads are rejected. Every accepted
 /// deviation emits a warning with a stable `anomaly` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompatibilityPolicy {
@@ -23,7 +23,7 @@ pub struct CompatibilityPolicy {
     /// varbind boundary. Default: enabled.
     pub clamp_bounded_strings: bool,
     /// Normalize negative GETBULK non-repeaters/max-repetitions fields to zero
-    /// while decoding or encoding. Default: enabled.
+    /// while decoding. Default: enabled.
     pub normalize_negative_get_bulk_fields: bool,
     /// Accept and discard non-empty payloads on SNMP exception values.
     /// Default: disabled; canonical exception values have zero-length content.

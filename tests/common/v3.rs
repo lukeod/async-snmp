@@ -1,10 +1,10 @@
 //! Scripted SNMPv3 peers and packet builders for adversarial client tests.
 
-use async_snmp::ber::Decoder;
+use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::message::{
     MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
-use async_snmp::pdu::{Pdu, PduType};
+use async_snmp::pdu::{Pdu, PduBody, PduType};
 use async_snmp::transport::Transport;
 use async_snmp::v3::auth::{authenticate_message, verify_message};
 use async_snmp::v3::{SaltCounter, UsmSecurityParams};
@@ -161,8 +161,63 @@ impl V3RequestLog {
     }
 }
 
+fn encode_raw_scoped_pdu(scoped: &ScopedPdu) -> Result<Bytes, String> {
+    let mut buf = EncodeBuf::new();
+    buf.try_push_sequence(|buf| {
+        let (tag, first_field, second_field) = match scoped.pdu.body {
+            PduBody::Standard {
+                pdu_type,
+                error_status,
+                error_index,
+            } => (pdu_type.pdu_type().tag(), error_status, error_index),
+            PduBody::GetBulk {
+                non_repeaters,
+                max_repetitions,
+            } => (
+                PduType::GetBulkRequest.tag(),
+                non_repeaters,
+                max_repetitions,
+            ),
+        };
+        buf.try_push_constructed(tag, |buf| {
+            buf.try_push_sequence(|buf| {
+                for varbind in scoped.pdu.varbinds.iter().rev() {
+                    varbind.encode(buf)?;
+                }
+                Ok(())
+            })?;
+            buf.push_integer(second_field);
+            buf.push_integer(first_field);
+            buf.push_integer(scoped.pdu.request_id);
+            Ok(())
+        })?;
+        buf.push_octet_string(&scoped.context_name);
+        buf.push_octet_string(&scoped.context_engine_id);
+        Ok(())
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(buf.finish())
+}
+
+fn encode_raw_plaintext_message(
+    global: &MsgGlobalData,
+    security_params: &[u8],
+    scoped: &ScopedPdu,
+) -> Result<Vec<u8>, String> {
+    let scoped = encode_raw_scoped_pdu(scoped)?;
+    let mut buf = EncodeBuf::new();
+    buf.push_sequence(|buf| {
+        buf.push_bytes(&scoped);
+        buf.push_octet_string(security_params);
+        global.encode(buf);
+        buf.push_integer(3);
+    });
+    Ok(buf.finish().to_vec())
+}
+
 /// Builder for a valid response whose individual correlation/security fields
-/// can be changed independently.
+/// can be changed independently. Adversarial field combinations use a test-only
+/// raw encoder so production structured encoders remain canonical.
 pub struct V3ReplyBuilder {
     msg_id: i32,
     msg_max_size: i32,
@@ -381,14 +436,15 @@ impl V3ReplyBuilder {
             msg_max_size,
             MsgFlags::new(self.security_level, self.reportable),
         );
-        let message = if self.security_level.requires_priv() {
+        let mut encoded = if self.security_level.requires_priv() {
             let priv_key = keys
                 .as_ref()
                 .and_then(|keys| keys.priv_key.as_ref())
                 .ok_or_else(|| "no privacy key configured for encrypted reply".to_string())?;
+            let scoped_bytes = encode_raw_scoped_pdu(&scoped)?;
             let (ciphertext, priv_params) = priv_key
                 .encrypt(
-                    &scoped.encode_to_bytes().unwrap(),
+                    &scoped_bytes,
                     self.engine_boots,
                     self.engine_time,
                     Some(&self.salt),
@@ -400,6 +456,9 @@ impl V3ReplyBuilder {
                 usm = usm.with_auth_placeholder(auth_key.mac_len());
             }
             V3Message::new_encrypted(global, usm.encode(), ciphertext)
+                .encode()
+                .map_err(|error| error.to_string())?
+                .to_vec()
         } else {
             if self.security_level.requires_auth() {
                 let auth_key = keys
@@ -410,10 +469,8 @@ impl V3ReplyBuilder {
                     })?;
                 usm = usm.with_auth_placeholder(auth_key.mac_len());
             }
-            V3Message::new(global, usm.encode(), scoped)
+            encode_raw_plaintext_message(&global, &usm.encode(), &scoped)?
         };
-
-        let mut encoded = message.encode().unwrap().to_vec();
         if let Some(flags) = self.raw_msg_flags {
             raw_ber::patch_msg_flags(&mut encoded, flags)?;
         }

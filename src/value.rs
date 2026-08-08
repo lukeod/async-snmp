@@ -3,8 +3,8 @@
 //! The `Value` enum represents all SNMP data types including exceptions.
 
 use crate::ber::{Decoder, EncodeBuf, tag};
-use crate::error::Result;
 use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result};
 use crate::format::hex;
 use crate::oid::Oid;
 use bytes::Bytes;
@@ -217,10 +217,9 @@ pub enum Value {
 
     /// `UInteger32` (unsigned 32-bit, wire tag 0x47).
     ///
-    /// Historic `SMIv1` type. Semantically identical to Gauge32/Unsigned32 at
-    /// every accessor, but carries a distinct APPLICATION tag (0x47 vs Gauge32's
-    /// 0x42) on the wire. Kept as its own variant so decode -> encode round-trips
-    /// the original tag rather than collapsing to Gauge32.
+    /// Historic receive-only type. Semantically identical to
+    /// Gauge32/Unsigned32 at every accessor, but preserves its distinct
+    /// APPLICATION tag (0x47) in the decoded representation.
     UInteger32(u32),
 
     /// `TimeTicks` (hundredths of seconds since epoch)
@@ -231,11 +230,9 @@ pub enum Value {
 
     /// NSAP address (wire tag 0x45).
     ///
-    /// Historic type from early SMI drafts. Semantically identical to
-    /// [`Value::OctetString`] at every byte/str accessor, but carries a distinct
-    /// APPLICATION tag (0x45) on the wire. Kept as its own variant so
-    /// decode -> encode round-trips the original tag rather than collapsing to
-    /// OctetString.
+    /// Historic receive-only type from early SMI drafts. Semantically identical
+    /// to [`Value::OctetString`] at every byte/str accessor, but preserves its
+    /// distinct APPLICATION tag (0x45) in the decoded representation.
     Nsap(Bytes),
 
     /// Counter64 (unsigned 64-bit, wrapping).
@@ -308,13 +305,10 @@ pub enum Value {
     /// ```
     EndOfMibView,
 
-    /// Unknown/unrecognized value type (for forward compatibility).
+    /// Unknown/unrecognized receive-only value type (for forward compatibility).
     ///
-    /// Invariant: `tag` is always a single-byte identifier (`tag & 0x1F != 0x1F`).
-    /// Decode never produces a multi-byte (high-tag-number) form — `read_tag`
-    /// rejects those before this variant is constructed — and `encode` assumes a
-    /// single-byte tag. Hand-constructing an `Unknown` with a multi-byte tag would
-    /// emit a form that cannot be re-decoded.
+    /// Structured encoding rejects this variant. Decode only produces a
+    /// single-byte identifier (`tag & 0x1F != 0x1F`).
     Unknown { tag: u8, data: Bytes },
 }
 
@@ -998,17 +992,22 @@ impl Value {
             Value::IpAddress(addr) => buf.push_ip_address(*addr),
             Value::Counter32(v) => buf.push_unsigned32(tag::application::COUNTER32, *v),
             Value::Gauge32(v) => buf.push_unsigned32(tag::application::GAUGE32, *v),
-            Value::UInteger32(v) => buf.push_unsigned32(tag::application::UINTEGER32, *v),
+            Value::UInteger32(_) => {
+                return Err(Error::InvalidMessage(
+                    "UInteger32 is a receive-only value type".into(),
+                )
+                .boxed());
+            }
             Value::TimeTicks(v) => buf.push_unsigned32(tag::application::TIMETICKS, *v),
             Value::Opaque(data) => {
                 buf.push_bytes(data);
                 buf.push_length(data.len());
                 buf.push_tag(tag::application::OPAQUE);
             }
-            Value::Nsap(data) => {
-                buf.push_bytes(data);
-                buf.push_length(data.len());
-                buf.push_tag(tag::application::NSAP);
+            Value::Nsap(_) => {
+                return Err(
+                    Error::InvalidMessage("Nsap is a receive-only value type".into()).boxed(),
+                );
             }
             Value::Counter64(v) => buf.push_integer64(*v),
             Value::NoSuchObject => {
@@ -1023,10 +1022,11 @@ impl Value {
                 buf.push_length(0);
                 buf.push_tag(tag::context::END_OF_MIB_VIEW);
             }
-            Value::Unknown { tag: t, data } => {
-                buf.push_bytes(data);
-                buf.push_length(data.len());
-                buf.push_tag(*t);
+            Value::Unknown { .. } => {
+                return Err(Error::InvalidMessage(
+                    "Value::Unknown cannot be encoded by structured encoders".into(),
+                )
+                .boxed());
             }
         }
         Ok(())
@@ -1550,8 +1550,13 @@ mod tests {
             _ => panic!("expected Unknown variant"),
         }
 
-        // Roundtrip should preserve
-        assert_eq!(roundtrip(&value), value);
+        // Unknown values are receive-only through structured encoders.
+        let mut buf = EncodeBuf::new();
+        assert!(matches!(
+            &*value.encode(&mut buf).unwrap_err(),
+            Error::InvalidMessage(_)
+        ));
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -1573,27 +1578,19 @@ mod tests {
     }
 
     #[test]
-    fn test_nsap_roundtrip_preserves_tag() {
-        // decode -> encode must round-trip the 0x45 tag, not collapse to 0x04
-        let bytes = Bytes::from_static(&[0x45, 0x03, 0x01, 0x02, 0x03]);
-        let mut decoder = Decoder::new(bytes.clone());
-        let value = Value::decode(&mut decoder).unwrap();
-        assert_eq!(value, Value::Nsap(Bytes::from_static(&[0x01, 0x02, 0x03])));
-        let mut buf = EncodeBuf::new();
-        value.encode(&mut buf).unwrap();
-        assert_eq!(&buf.finish()[..], &bytes[..]);
-    }
-
-    #[test]
-    fn test_uinteger32_roundtrip_preserves_tag() {
-        // decode -> encode must round-trip the 0x47 tag, not collapse to 0x42
-        let bytes = Bytes::from_static(&[0x47, 0x01, 0x2a]);
-        let mut decoder = Decoder::new(bytes.clone());
-        let value = Value::decode(&mut decoder).unwrap();
-        assert_eq!(value, Value::UInteger32(42));
-        let mut buf = EncodeBuf::new();
-        value.encode(&mut buf).unwrap();
-        assert_eq!(&buf.finish()[..], &bytes[..]);
+    fn historic_values_decode_but_structured_encode_rejects_them() {
+        for bytes in [
+            Bytes::from_static(&[0x45, 0x03, 0x01, 0x02, 0x03]),
+            Bytes::from_static(&[0x47, 0x01, 0x2a]),
+        ] {
+            let mut decoder = Decoder::new(bytes);
+            let value = Value::decode(&mut decoder).unwrap();
+            let original = value.clone();
+            let mut buf = EncodeBuf::new();
+            assert!(value.encode(&mut buf).is_err());
+            assert!(buf.is_empty());
+            assert_eq!(value, original);
+        }
     }
 
     // ========================================================================
