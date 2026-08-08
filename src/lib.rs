@@ -489,7 +489,9 @@ pub mod mib_support;
 
 // Re-exports for convenience
 #[cfg(feature = "agent")]
-pub use agent::{Agent, AgentBuilder, BuiltinMib, VacmBuilder, VacmConfig, View};
+pub use agent::{
+    Agent, AgentBuilder, BuiltinMib, VacmBuilder, VacmConfig, VacmSecurityModel, View,
+};
 pub use client::{
     Auth, Backoff, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
     DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT,

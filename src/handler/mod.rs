@@ -124,19 +124,35 @@ pub use oid_table::OidTable;
 pub use results::{GetNextResult, GetResult, HandlerError, HandlerResult, Response, SetResult};
 pub use traits::{BoxFuture, MibHandler};
 
-/// Security model identifiers (RFC 3411).
-///
-/// Used to specify which SNMP version/security mechanism a mapping applies to.
+/// Concrete security model used to authenticate an SNMP request (RFC 3411).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SecurityModel {
-    /// Wildcard for VACM matching (matches any model).
-    ///
-    /// Use this when the same mapping should apply regardless of SNMP version.
-    Any = 0,
-    /// `SNMPv1`.
+    /// `SNMPv1` community-based security.
     V1 = 1,
-    /// `SNMPv2c`.
+    /// `SNMPv2c` community-based security.
     V2c = 2,
     /// `SNMPv3` User-based Security Model.
     Usm = 3,
+}
+
+impl From<crate::message::V3SecurityModel> for SecurityModel {
+    fn from(model: crate::message::V3SecurityModel) -> Self {
+        match model {
+            crate::message::V3SecurityModel::Usm => Self::Usm,
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_model_tests {
+    use super::SecurityModel;
+    use crate::message::V3SecurityModel;
+
+    #[test]
+    fn v3_wire_model_converts_to_concrete_request_model() {
+        assert_eq!(
+            SecurityModel::from(V3SecurityModel::Usm),
+            SecurityModel::Usm
+        );
+    }
 }

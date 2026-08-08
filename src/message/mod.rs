@@ -13,8 +13,8 @@ mod v3;
 pub use community::{CommunityMessage, CommunityPdu};
 pub(crate) use v3::{MpdFailure, classify_mpd_failure};
 pub use v3::{
-    MsgFlags, MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, SecurityModel,
-    V3Message, V3MessageData,
+    MsgFlags, MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message,
+    V3MessageData, V3SecurityModel,
 };
 
 use crate::ber::Decoder;

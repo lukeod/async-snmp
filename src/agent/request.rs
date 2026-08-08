@@ -197,7 +197,7 @@ impl Agent {
         let mut ctx = RequestContext {
             source,
             version: Version::V3,
-            security_model: SecurityModel::Usm,
+            security_model: SecurityModel::from(global_data.msg_security_model),
             security_name: usm_params.username.clone(),
             security_level,
             context_name: scoped_pdu.context_name.clone(),

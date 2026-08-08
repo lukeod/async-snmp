@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** The SNMPv3 wire enum is now `message::V3SecurityModel`, while
+  `handler::SecurityModel` represents only concrete V1, V2c, and USM request
+  identities. VACM wildcard selectors now use
+  `VacmSecurityModel::{Any, Exact(SecurityModel)}`; VACM builders accept a
+  concrete `SecurityModel` directly for exact matches.
 - **Breaking:** Removed the unimplemented `tls` and `dtls` features and the
   speculative `AgentTransport` trait. `UdpTransportConfig` is now private;
   configure UDP transports through `UdpTransportBuilder`. Handler APIs are now

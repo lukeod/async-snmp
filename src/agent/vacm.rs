@@ -171,6 +171,47 @@ use crate::oid::Oid;
 
 pub use crate::handler::SecurityModel;
 
+/// Security model selector used by VACM mappings and access entries.
+///
+/// A concrete [`SecurityModel`] converts to [`VacmSecurityModel::Exact`], so
+/// builders accept concrete request models directly. Use [`Self::Any`] only
+/// where a mapping should match every concrete request model.
+///
+/// ```rust
+/// use async_snmp::agent::{SecurityModel, VacmSecurityModel};
+///
+/// let exact = VacmSecurityModel::from(SecurityModel::Usm);
+/// assert_eq!(exact, VacmSecurityModel::Exact(SecurityModel::Usm));
+/// assert_eq!(VacmSecurityModel::default(), VacmSecurityModel::Any);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VacmSecurityModel {
+    /// Match every concrete request security model.
+    #[default]
+    Any,
+    /// Match one concrete request security model.
+    Exact(SecurityModel),
+}
+
+impl From<SecurityModel> for VacmSecurityModel {
+    fn from(model: SecurityModel) -> Self {
+        Self::Exact(model)
+    }
+}
+
+impl VacmSecurityModel {
+    fn matches(self, model: SecurityModel) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(exact) => exact == model,
+        }
+    }
+
+    fn is_exact(self, model: SecurityModel) -> bool {
+        self == Self::Exact(model)
+    }
+}
+
 /// Context matching mode for access entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ContextMatch {
@@ -530,8 +571,8 @@ pub struct VacmAccessEntry {
     pub group_name: Bytes,
     /// Context prefix for matching.
     pub context_prefix: Bytes,
-    /// Security model (or Any for wildcard).
-    pub security_model: SecurityModel,
+    /// Security model selector.
+    pub security_model: VacmSecurityModel,
     /// Minimum security level required.
     pub security_level: SecurityLevel,
     /// Context matching mode.
@@ -572,7 +613,7 @@ pub struct VacmAccessEntry {
 pub struct AccessEntryBuilder {
     group_name: Bytes,
     context_prefix: Bytes,
-    security_model: SecurityModel,
+    security_model: VacmSecurityModel,
     security_level: SecurityLevel,
     context_match: ContextMatch,
     read_view: Bytes,
@@ -586,7 +627,7 @@ impl AccessEntryBuilder {
         Self {
             group_name: group_name.into(),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::new(),
@@ -607,10 +648,10 @@ impl AccessEntryBuilder {
 
     /// Set the security model this entry applies to.
     ///
-    /// Default is [`SecurityModel::Any`] which matches all models.
+    /// Default is [`VacmSecurityModel::Any`] which matches all models.
     #[must_use]
-    pub fn security_model(mut self, model: SecurityModel) -> Self {
-        self.security_model = model;
+    pub fn security_model(mut self, model: impl Into<VacmSecurityModel>) -> Self {
+        self.security_model = model.into();
         self
     }
 
@@ -700,8 +741,8 @@ impl AccessEntryBuilder {
 /// VACM configuration.
 #[derive(Debug, Clone, Default)]
 pub struct VacmConfig {
-    /// (securityModel, securityName) → groupName
-    security_to_group: HashMap<(SecurityModel, Bytes), Bytes>,
+    /// (securityModel selector, securityName) → groupName
+    security_to_group: HashMap<(VacmSecurityModel, Bytes), Bytes>,
     /// Access table entries.
     access_entries: Vec<VacmAccessEntry>,
     /// viewName → View
@@ -715,15 +756,20 @@ impl VacmConfig {
         Self::default()
     }
 
-    /// Map a security name to a group for a specific security model.
+    /// Map a security name to a group for a security model selector.
+    ///
+    /// Concrete [`SecurityModel`] values create exact mappings; pass
+    /// [`VacmSecurityModel::Any`] for a wildcard mapping.
     pub fn add_group(
         &mut self,
         security_name: impl Into<Bytes>,
-        security_model: SecurityModel,
+        security_model: impl Into<VacmSecurityModel>,
         group_name: impl Into<Bytes>,
     ) {
-        self.security_to_group
-            .insert((security_model, security_name.into()), group_name.into());
+        self.security_to_group.insert(
+            (security_model.into(), security_name.into()),
+            group_name.into(),
+        );
     }
 
     /// Add an access entry.
@@ -744,9 +790,9 @@ impl VacmConfig {
         let mut any_match = None;
         for ((entry_model, entry_name), group) in &self.security_to_group {
             if entry_name.as_ref() == name {
-                if *entry_model == model {
+                if entry_model.is_exact(model) {
                     return Some(group);
-                } else if *entry_model == SecurityModel::Any {
+                } else if *entry_model == VacmSecurityModel::Any {
                     any_match = Some(group);
                 }
             }
@@ -775,12 +821,12 @@ impl VacmConfig {
             .filter(|e| {
                 e.group_name.as_ref() == group
                     && self.context_matches(&e.context_prefix, context, e.context_match)
-                    && (e.security_model == model || e.security_model == SecurityModel::Any)
+                    && e.security_model.matches(model)
                     && level >= e.security_level
             })
             .max_by_key(|e| {
                 // RFC 3415 Section 4 preference order (tuple comparison is lexicographic)
-                let model_score: u8 = u8::from(e.security_model == model);
+                let model_score: u8 = u8::from(e.security_model.is_exact(model));
                 let match_score: u8 = u8::from(e.context_match == ContextMatch::Exact);
                 let prefix_len = e.context_prefix.len();
                 let level_score = e.security_level as u8;
@@ -873,7 +919,9 @@ impl VacmBuilder {
     /// - For SNMPv1/v2c: the community string
     /// - For `SNMPv3`: the USM username
     ///
-    /// Multiple security names can map to the same group.
+    /// Multiple security names can map to the same group. Concrete
+    /// [`SecurityModel`] values create exact mappings; pass
+    /// [`VacmSecurityModel::Any`] for a wildcard mapping.
     ///
     /// # Example
     ///
@@ -892,7 +940,7 @@ impl VacmBuilder {
     pub fn group(
         mut self,
         security_name: impl Into<Bytes>,
-        security_model: SecurityModel,
+        security_model: impl Into<VacmSecurityModel>,
         group_name: impl Into<Bytes>,
     ) -> Self {
         self.config
@@ -1190,18 +1238,18 @@ mod tests {
     }
 
     #[test]
-    fn test_vacm_group_any_model() {
+    fn test_vacm_group_prefers_exact_model_and_falls_back_to_any() {
         let mut config = VacmConfig::new();
-        config.add_group("universal", SecurityModel::Any, "universal_group");
+        config.add_group("shared", VacmSecurityModel::Any, "fallback_group");
+        config.add_group("shared", SecurityModel::V2c, "v2c_group");
 
-        // Should match any security model
         assert_eq!(
-            config.get_group(SecurityModel::V1, b"universal"),
-            Some(&Bytes::from_static(b"universal_group"))
+            config.get_group(SecurityModel::V2c, b"shared"),
+            Some(&Bytes::from_static(b"v2c_group"))
         );
         assert_eq!(
-            config.get_group(SecurityModel::V2c, b"universal"),
-            Some(&Bytes::from_static(b"universal_group"))
+            config.get_group(SecurityModel::V1, b"shared"),
+            Some(&Bytes::from_static(b"fallback_group"))
         );
     }
 
@@ -1211,7 +1259,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"readonly_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"full_view"),
@@ -1235,7 +1283,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"admin_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Usm,
+            security_model: SecurityModel::Usm.into(),
             security_level: SecurityLevel::AuthPriv, // Require encryption
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"full_view"),
@@ -1292,7 +1340,7 @@ mod tests {
             .group("admin", SecurityModel::Usm, "admin_group")
             .access("readonly_group", |a| {
                 a.context_prefix("")
-                    .security_model(SecurityModel::Any)
+                    .security_model(VacmSecurityModel::Any)
                     .security_level(SecurityLevel::NoAuthNoPriv)
                     .read_view("full_view")
             })
@@ -1325,7 +1373,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"any_view"),
@@ -1337,7 +1385,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::V2c,
+            security_model: SecurityModel::V2c.into(),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"v2c_view"),
@@ -1359,6 +1407,17 @@ mod tests {
             Bytes::from_static(b"v2c_view"),
             "should prefer specific security model over Any"
         );
+
+        // Query with V1 - the wildcard entry remains the fallback.
+        let access = config
+            .get_access(
+                b"test_group",
+                b"",
+                SecurityModel::V1,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .expect("should fall back to wildcard access entry");
+        assert_eq!(access.read_view, Bytes::from_static(b"any_view"));
     }
 
     #[test]
@@ -1370,7 +1429,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"prefix_view"),
@@ -1382,7 +1441,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"exact_view"),
@@ -1415,7 +1474,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"short_view"),
@@ -1427,7 +1486,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx_longer"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"long_view"),
@@ -1460,7 +1519,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"noauth_view"),
@@ -1472,7 +1531,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::AuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"auth_view"),
@@ -1484,7 +1543,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::AuthPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"authpriv_view"),
@@ -1518,7 +1577,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::AuthPriv, // highest security
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"any_prefix_short_high"),
@@ -1531,7 +1590,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::V2c,
+            security_model: SecurityModel::V2c.into(),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"v2c_prefix_short_low"),
@@ -1564,7 +1623,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"context"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"long_prefix_view"),
@@ -1576,7 +1635,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"short_exact_view"),
@@ -1609,7 +1668,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::AuthPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"short_high_sec"),
@@ -1621,7 +1680,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx_test"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"long_low_sec"),
@@ -1654,7 +1713,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"a"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"entry1"),
@@ -1666,7 +1725,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"a"),
-            security_model: SecurityModel::V2c,
+            security_model: SecurityModel::V2c.into(),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"entry2"),
@@ -1698,7 +1757,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"exact_view"),
@@ -1709,7 +1768,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"prefix_view"),
@@ -1740,7 +1799,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::AuthPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"authpriv_view"),
@@ -1751,7 +1810,7 @@ mod tests {
         config.add_access(VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::new(),
-            security_model: SecurityModel::Any,
+            security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Exact,
             read_view: Bytes::from_static(b"noauth_view"),

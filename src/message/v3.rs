@@ -33,12 +33,12 @@ use crate::pdu::Pdu;
 /// `SNMPv3` security model identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
-pub enum SecurityModel {
+pub enum V3SecurityModel {
     /// User-based Security Model (RFC 3414)
     Usm = 3,
 }
 
-impl SecurityModel {
+impl V3SecurityModel {
     /// Create from raw value.
     #[must_use]
     pub fn from_i32(value: i32) -> Option<Self> {
@@ -177,7 +177,7 @@ pub struct MsgGlobalData {
     /// Message flags (security level + reportable)
     pub msg_flags: MsgFlags,
     /// Security model (always USM=3 for our implementation)
-    pub msg_security_model: SecurityModel,
+    pub msg_security_model: V3SecurityModel,
 }
 
 impl MsgGlobalData {
@@ -188,7 +188,7 @@ impl MsgGlobalData {
             msg_id,
             msg_max_size,
             msg_flags,
-            msg_security_model: SecurityModel::Usm,
+            msg_security_model: V3SecurityModel::Usm,
         }
     }
 
@@ -229,7 +229,7 @@ impl MsgGlobalData {
         let msg_security_model_raw = seq.read_bounded_integer(1, i32::MAX)?;
         // Reject unknown security models per RFC 3412 Section 7.2
         let msg_security_model =
-            SecurityModel::from_i32(msg_security_model_raw).ok_or_else(|| {
+            V3SecurityModel::from_i32(msg_security_model_raw).ok_or_else(|| {
                 tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), model = msg_security_model_raw, kind = %DecodeErrorKind::UnknownSecurityModel(msg_security_model_raw) }, "decode error");
                 seq.malformed()
             })?;
@@ -709,7 +709,7 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
         return Some(MpdFailure::InvalidMsgFlags);
     }
     let model = global.read_bounded_integer(1, i32::MAX).ok()?;
-    if SecurityModel::from_i32(model).is_none() {
+    if V3SecurityModel::from_i32(model).is_none() {
         return Some(MpdFailure::UnknownSecurityModel);
     }
     None
@@ -1059,7 +1059,7 @@ mod tests {
             buf.push_octet_string(b"usm");
             buf.push_sequence(|buf| {
                 buf.push_integer(99);
-                buf.push_integer(SecurityModel::Usm.as_i32());
+                buf.push_integer(V3SecurityModel::Usm.as_i32());
                 buf.push_octet_string(&[0]);
                 buf.push_integer(1472);
                 buf.push_integer(17);
@@ -1137,7 +1137,7 @@ mod tests {
         assert_eq!(decoded.msg_max_size, 1472);
         assert_eq!(decoded.msg_flags.security_level, SecurityLevel::AuthNoPriv);
         assert!(decoded.msg_flags.reportable);
-        assert_eq!(decoded.msg_security_model, SecurityModel::Usm);
+        assert_eq!(decoded.msg_security_model, V3SecurityModel::Usm);
     }
 
     #[test]
@@ -1227,7 +1227,7 @@ mod tests {
         // represent this below-minimum msgMaxSize.
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_integer(SecurityModel::Usm.as_i32());
+            buf.push_integer(V3SecurityModel::Usm.as_i32());
             buf.push_octet_string(&[MsgFlags::new(SecurityLevel::NoAuthNoPriv, true).to_byte()]);
             buf.push_integer(400);
             buf.push_integer(100);
@@ -1264,26 +1264,30 @@ mod tests {
     }
 
     #[test]
-    fn test_msg_global_data_rejects_unknown_security_model() {
-        // Manually build encoded data with unknown security model
-        // SEQUENCE { msg_id, msg_max_size, msgFlags, msgSecurityModel=99 }
-        let mut buf = EncodeBuf::new();
-        buf.push_sequence(|buf| {
-            buf.push_integer(99); // unknown security model
-            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
-            buf.push_integer(1472); // msg_max_size
-            buf.push_integer(100); // msg_id
-        });
-        let encoded = buf.finish();
+    fn v3_security_model_accepts_only_usm() {
+        assert_eq!(V3SecurityModel::from_i32(3), Some(V3SecurityModel::Usm));
+        for model in [i32::MIN, -1, 0, 1, 2, 4, 99, i32::MAX] {
+            assert_eq!(V3SecurityModel::from_i32(model), None);
+        }
+    }
 
-        let mut decoder = Decoder::new(encoded);
-        let result = MsgGlobalData::decode(&mut decoder);
+    #[test]
+    fn msg_global_data_rejects_non_usm_security_models() {
+        for model in [-1, 0, 1, 2, 4, 99, i32::MAX] {
+            let mut buf = EncodeBuf::new();
+            buf.push_sequence(|buf| {
+                buf.push_integer(model);
+                buf.push_octet_string(&[0x04]);
+                buf.push_integer(1472);
+                buf.push_integer(100);
+            });
 
-        assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+            let mut decoder = Decoder::new(buf.finish());
+            assert!(matches!(
+                *MsgGlobalData::decode(&mut decoder).unwrap_err(),
+                Error::MalformedResponse { .. }
+            ));
+        }
     }
 
     #[test]
@@ -1369,7 +1373,7 @@ mod tests {
         let decoded = MsgGlobalData::decode(&mut decoder).unwrap();
 
         assert_eq!(decoded.msg_flags, MsgFlags::from_byte(0x04).unwrap());
-        assert_eq!(decoded.msg_security_model, SecurityModel::Usm);
+        assert_eq!(decoded.msg_security_model, V3SecurityModel::Usm);
     }
 
     #[test]
@@ -1388,7 +1392,7 @@ mod tests {
         let mut decoder = Decoder::new(encoded);
         let decoded = MsgGlobalData::decode(&mut decoder).unwrap();
 
-        assert_eq!(decoded.msg_security_model, SecurityModel::Usm);
+        assert_eq!(decoded.msg_security_model, V3SecurityModel::Usm);
     }
 
     // RFC 3412 bounds tests for msgID and msgMaxSize
