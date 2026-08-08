@@ -575,8 +575,8 @@ pub use notification::{
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
 pub use transport::{
-    CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport, Transport,
-    UdpHandle, UdpTransport,
+    Candidate, CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport,
+    Transport, UdpHandle, UdpTransport,
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, EngineCache, ParseProtocolError,

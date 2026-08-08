@@ -338,7 +338,7 @@ async fn v3_auth_priv_sha1_des() {
     assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
 }
 
-/// Wrong password fails authentication.
+/// A response signed with the wrong password is rejected until the exchange times out.
 #[tokio::test]
 async fn v3_wrong_password_fails() {
     let agent = TestAgentBuilder::new()
@@ -363,12 +363,12 @@ async fn v3_wrong_password_fails() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     assert!(
-        matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
-        "expected Auth error, got {result:?}"
+        matches!(result, Err(ref e) if matches!(**e, Error::Timeout { .. })),
+        "expected timeout after candidate rejection, got {result:?}"
     );
 }
 
-/// Unknown user with authentication fails.
+/// An authenticated unknown-user Report is rejected until the exchange times out.
 ///
 /// When authentication is required, the agent rejects unknown users.
 #[tokio::test]
@@ -396,8 +396,8 @@ async fn v3_unknown_user_auth_fails() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     assert!(
-        matches!(result, Err(ref e) if matches!(**e, Error::Auth { .. })),
-        "expected Auth error, got {result:?}"
+        matches!(result, Err(ref e) if matches!(**e, Error::Timeout { .. })),
+        "expected timeout after candidate rejection, got {result:?}"
     );
 }
 

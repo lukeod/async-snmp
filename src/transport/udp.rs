@@ -68,7 +68,7 @@
 
 pub use super::udp_core::TransportStats;
 use super::udp_core::UdpCore;
-use super::{RequestRegistration, Transport, extract_request_id};
+use super::{Candidate, RequestRegistration, Transport, extract_request_id};
 use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
 use crate::util::bind_udp_socket;
@@ -465,28 +465,37 @@ impl Transport for UdpHandle {
         Ok(())
     }
 
-    async fn request(
+    async fn request_with<T, F>(
         &self,
         data: &[u8],
         registration: RequestRegistration,
-    ) -> Result<(Bytes, SocketAddr)> {
+        validate: F,
+    ) -> Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+    {
         // Registration is the first work performed when this future is polled,
         // before a datagram can be sent. The guard owns primary and alias cleanup
         // across both awaits, including cancellation and send failure.
-        let registration = self
-            .inner
-            .core
-            .register(registration, self.target, self.strict_source);
+        let registration =
+            self.inner
+                .core
+                .register(registration, self.target, self.strict_source)?;
         self.send(data).await?;
-        self.recv_registered(&registration).await
+        self.recv_registered_with(&registration, validate).await
     }
 
-    async fn recv(&self, registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
-        let registration = self
-            .inner
-            .core
-            .register(registration, self.target, self.strict_source);
-        self.recv_registered(&registration).await
+    async fn recv_with<T, F>(&self, registration: RequestRegistration, validate: F) -> Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+    {
+        let registration =
+            self.inner
+                .core
+                .register(registration, self.target, self.strict_source)?;
+        self.recv_registered_with(&registration, validate).await
     }
 
     fn peer_addr(&self) -> SocketAddr {
@@ -507,31 +516,43 @@ impl Transport for UdpHandle {
 }
 
 impl UdpHandle {
+    #[cfg(test)]
     async fn recv_registered(
         &self,
         registration: &super::udp_core::UdpRegistration,
     ) -> Result<(Bytes, SocketAddr)> {
+        self.recv_registered_with(registration, |data, source| {
+            Ok(Candidate::Accept((data, source)))
+        })
+        .await
+    }
+
+    async fn recv_registered_with<T, F>(
+        &self,
+        registration: &super::udp_core::UdpRegistration,
+        mut validate: F,
+    ) -> Result<T>
+    where
+        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>>,
+    {
         let request_id = registration.request_id();
         tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv waiting");
 
         let result = self
             .inner
             .core
-            .wait_for_response(registration, self.target)
-            .await;
-
-        match &result {
-            Ok((data, source)) => {
-                if self.inner.config.warn_on_source_mismatch && *source != self.target {
+            .wait_for_response_with(registration, self.target, |data, source| {
+                if self.inner.config.warn_on_source_mismatch && source != self.target {
                     tracing::warn!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.target = %self.target, snmp.source = %source }, "response source address mismatch");
                 }
-                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.source = %source, snmp.bytes = data.len() }, "UDP recv complete");
-            }
-            Err(_) => {
-                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv failed");
-            }
-        }
+                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.source = %source, snmp.bytes = data.len() }, "UDP recv candidate");
+                validate(data, source)
+            })
+            .await;
 
+        if result.is_err() {
+            tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv failed");
+        }
         result
     }
 }
@@ -545,11 +566,15 @@ mod tests {
         request_id: i32,
         timeout: Duration,
     ) -> super::super::udp_core::UdpRegistration {
-        handle.inner.core.register(
-            RequestRegistration::v3(request_id, timeout),
-            handle.target,
-            handle.strict_source,
-        )
+        handle
+            .inner
+            .core
+            .register(
+                RequestRegistration::v3(request_id, timeout),
+                handle.target,
+                handle.strict_source,
+            )
+            .unwrap()
     }
 
     #[test]
@@ -761,6 +786,33 @@ mod tests {
             "pending slot should have been reclaimed on send failure"
         );
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn failed_registration_sends_no_datagram() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle(target);
+        let _owner = register_v3(&handle, 60, Duration::from_secs(30));
+
+        let error = handle
+            .request(
+                b"must not be sent",
+                RequestRegistration::v3(61, Duration::from_secs(30)).with_aliases([60]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(*error, Error::RequestIdInUse { request_id: 60 }));
+
+        let mut datagram = [0u8; 32];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.recv_from(&mut datagram))
+                .await
+                .is_err(),
+            "failed registration sent a datagram"
+        );
+        assert_eq!(transport.inner.core.pending_counts(), (1, 0));
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ pub use tcp::*;
 pub use udp::*;
 
 use crate::ber::length::parse_ber_length;
+#[cfg(test)]
+use crate::error::Error;
 use crate::error::Result;
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_LIMITS};
 use crate::version::Version;
@@ -29,7 +31,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Global request ID counter, initialized with a cryptographically random seed.
 ///
@@ -148,10 +150,12 @@ impl RequestRegistration {
     /// Attach prior transmission IDs to this registration.
     #[must_use]
     pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = i32>) -> Self {
-        self.aliases = aliases
-            .into_iter()
-            .filter(|alias| *alias != self.request_id)
-            .collect();
+        self.aliases.clear();
+        for alias in aliases {
+            if alias != self.request_id && !self.aliases.contains(&alias) {
+                self.aliases.push(alias);
+            }
+        }
         self
     }
 
@@ -202,48 +206,108 @@ impl ResponseCorrelation {
     }
 }
 
+/// Result of validating a correlated response candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Candidate<T> {
+    /// Accept this candidate and complete the exchange.
+    Accept(T),
+    /// Ignore this candidate and continue waiting under the original deadline.
+    Reject,
+}
+
 /// Client-side transport abstraction.
 ///
 /// All transports implement this trait uniformly. For shared transports,
 /// handles (not the pool itself) implement Transport. A response that fails the
-/// registered correlation metadata must be ignored without consuming the
-/// pending request or extending its deadline.
+/// registered correlation metadata or the caller's validator must be ignored
+/// without consuming the pending request or extending its deadline.
 pub trait Transport: Send + Sync {
     /// Send request data to the target.
     fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
-    /// Wait for a response using the supplied correlation metadata and deadline.
+    /// Receive one correlated response without additional validation.
     ///
-    /// Transports with out-of-band demultiplexing must install the registration
-    /// as part of this future and remove it whenever the future completes or is
-    /// dropped.
+    /// This compatibility operation is implemented in terms of
+    /// [`recv_with`](Self::recv_with); clients should use the validated boundary.
     fn recv(
         &self,
         registration: RequestRegistration,
-    ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send;
+    ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+        self.recv_with(registration, |data, source| {
+            Ok(Candidate::Accept((data, source)))
+        })
+    }
 
-    /// Send request data and wait for the correlated response as a single unit.
+    /// Wait until the validator accepts a response candidate.
     ///
-    /// The default implementation simply chains [`send`](Self::send) then
-    /// [`recv`](Self::recv). Transports that serialize a request/response pair by
-    /// holding a lock between the two steps (e.g. TCP holding its stream lock)
-    /// must override this so the lock is owned by one future for the whole
-    /// exchange. Otherwise, if the caller's future is dropped between `send` and
-    /// `recv` (for example a `timeout()` wrapping the call), the lock is stashed
-    /// across independent await points and leaks, permanently wedging later
-    /// requests.
+    /// Transports with out-of-band demultiplexing must install the registration
+    /// as part of this future and remove it whenever the future completes or is
+    /// dropped. [`Candidate::Reject`] retains that same registration and its
+    /// original absolute deadline. Validator errors are fatal local errors.
+    #[cfg(not(test))]
+    fn recv_with<T, F>(
+        &self,
+        registration: RequestRegistration,
+        validate: F,
+    ) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send;
+
+    #[cfg(test)]
+    fn recv_with<T, F>(
+        &self,
+        registration: RequestRegistration,
+        mut validate: F,
+    ) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+    {
+        async move {
+            let (data, source) = self.recv(registration).await?;
+            match validate(data, source)? {
+                Candidate::Accept(value) => Ok(value),
+                Candidate::Reject => Err(Error::MalformedResponse {
+                    target: self.peer_addr(),
+                }
+                .boxed()),
+            }
+        }
+    }
+
+    /// Send request data and wait until the validator accepts a response.
     ///
-    /// The registration is owned by the returned future. Transports with
-    /// out-of-band demultiplexing must install it before sending and remove it
-    /// whenever the future completes or is dropped.
+    /// The default implementation chains [`send`](Self::send) and
+    /// [`recv_with`](Self::recv_with). Transports that serialize an exchange by
+    /// holding a lock (such as TCP) must override this so one future owns the
+    /// lock across the write and every rejected candidate.
+    /// Send request data and receive one correlated response without additional
+    /// validation. This compatibility operation accepts the first candidate.
     fn request(
         &self,
         data: &[u8],
         registration: RequestRegistration,
     ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+        self.request_with(data, registration, |response, source| {
+            Ok(Candidate::Accept((response, source)))
+        })
+    }
+
+    fn request_with<T, F>(
+        &self,
+        data: &[u8],
+        registration: RequestRegistration,
+        validate: F,
+    ) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+    {
         async move {
+            checked_deadline(registration.timeout, "transport timeout")?;
             self.send(data).await?;
-            self.recv(registration).await
+            self.recv_with(registration, validate).await
         }
     }
 
@@ -274,6 +338,15 @@ pub trait Transport: Send + Sync {
     fn receive_limits(&self) -> ReceiveLimits {
         UDP_RECEIVE_LIMITS
     }
+}
+
+pub(crate) fn checked_deadline(timeout: Duration, description: &str) -> Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        crate::error::Error::Config(
+            format!("{description} exceeds the representable deadline").into(),
+        )
+        .boxed()
+    })
 }
 
 // ============================================================================

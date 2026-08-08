@@ -133,6 +133,10 @@ pub enum Error {
     #[error("transport closed while waiting for {target}")]
     Closed { target: SocketAddr },
 
+    /// A UDP request or alias ID is already reserved by another live exchange.
+    #[error("request ID {request_id} is already in use")]
+    RequestIdInUse { request_id: i32 },
+
     /// SNMP protocol error from agent.
     #[error("SNMP error from {target}: {status} at index {index}")]
     Snmp {

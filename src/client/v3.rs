@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::format::hex;
 use crate::message::{RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message};
 use crate::pdu::{Pdu, PduType};
-use crate::transport::{RequestRegistration, Transport};
+use crate::transport::{Candidate, RequestRegistration, Transport};
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
     classify_report,
@@ -31,6 +31,13 @@ struct PacketLocalEngineTime {
     engine_id: Bytes,
     boots: u32,
     time: u32,
+}
+
+struct ValidatedV3Response {
+    usm: UsmSecurityParams,
+    received_level: SecurityLevel,
+    scoped_pdu: ScopedPdu,
+    authenticated: bool,
 }
 
 fn check_and_update_engine_timeliness(
@@ -157,7 +164,7 @@ impl<T: Transport> Client<T> {
         };
 
         let mut last_error: Option<Box<Error>> = None;
-        let mut response_data_opt: Option<(Bytes, SocketAddr, i32)> = None;
+        let mut engine_state_opt: Option<EngineState> = None;
 
         'discovery: for attempt in 0..=max_attempts {
             if attempt > 0 {
@@ -176,11 +183,24 @@ impl<T: Transport> Client<T> {
             match self
                 .inner
                 .transport
-                .request(&discovery_data, registration)
+                .request_with(&discovery_data, registration, |data, source| {
+                    let Ok(decoded) = RawV3Message::decode_bounded_with_target(
+                        data,
+                        self.inner.transport.receive_limits().accepted(),
+                        source,
+                        crate::message::DecodePolicy::Compatible,
+                    ) else {
+                        return Ok(Candidate::Reject);
+                    };
+                    match self.validate_discovery_response(&decoded.value, msg_id, source) {
+                        Ok(state) => Ok(Candidate::Accept(state)),
+                        Err(_) => Ok(Candidate::Reject),
+                    }
+                })
                 .await
             {
-                Ok((data, source)) => {
-                    response_data_opt = Some((data, source, msg_id));
+                Ok(engine_state) => {
+                    engine_state_opt = Some(engine_state);
                     break 'discovery;
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
@@ -198,7 +218,7 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let (response_data, source, expected_msg_id) = response_data_opt.ok_or_else(|| {
+        let engine_state = engine_state_opt.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
                 Error::Timeout {
                     target: self.peer_addr(),
@@ -208,19 +228,6 @@ impl<T: Transport> Client<T> {
                 .boxed()
             })
         })?;
-
-        // Apply USM syntax/security processing and parse the scoped PDU before
-        // Message Processing Model correlation (RFC 3412 Section 7.2), then
-        // require the exact RFC 3414 discovery Report shape before adopting an
-        // unauthenticated engine-ID candidate.
-        let response = RawV3Message::decode_bounded_with_target(
-            response_data,
-            self.inner.transport.receive_limits().accepted(),
-            source,
-            crate::message::DecodePolicy::Compatible,
-        )?
-        .value;
-        let engine_state = self.validate_discovery_response(&response, expected_msg_id, source)?;
         tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size.as_usize() }, "discovered engine identity");
 
         let security = self
@@ -590,6 +597,116 @@ impl<T: Transport> Client<T> {
         ScopedPdu::decode(&mut decoder)
     }
 
+    fn validate_v3_candidate(
+        &self,
+        response_data: Bytes,
+        source: SocketAddr,
+        msg_ids: &[i32],
+        request: &EncodedV3Request,
+        expected_pdu_id: i32,
+        expected_level: SecurityLevel,
+    ) -> Result<Candidate<ValidatedV3Response>> {
+        let Ok(decoded) = RawV3Message::decode_bounded_with_target(
+            response_data.clone(),
+            self.inner.transport.receive_limits().accepted(),
+            source,
+            crate::message::DecodePolicy::Compatible,
+        ) else {
+            return Ok(Candidate::Reject);
+        };
+        let raw = decoded.value;
+        let received_level = raw.security_level();
+        let Ok(usm) = UsmSecurityParams::decode_with_target(raw.security_params.clone(), source)
+        else {
+            return Ok(Candidate::Reject);
+        };
+
+        if let Err(error) = self.verify_response_security(&response_data, &usm, received_level) {
+            return if matches!(*error, Error::Config(_)) {
+                Err(error)
+            } else {
+                Ok(Candidate::Reject)
+            };
+        }
+
+        if received_level.requires_auth() {
+            let local_state = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?
+                .as_ref()
+                .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?
+                .state
+                .clone();
+            let timely = self
+                .inner
+                .engine_cache
+                .as_deref()
+                .and_then(|cache| {
+                    cache.timeliness_candidate(
+                        &self.peer_addr(),
+                        &local_state,
+                        &usm.engine_id,
+                        usm.engine_boots,
+                        usm.engine_time,
+                    )
+                })
+                .map_or_else(
+                    || {
+                        local_state
+                            .clone()
+                            .check_and_update_timeliness(usm.engine_boots, usm.engine_time)
+                    },
+                    |(timely, _)| timely,
+                );
+            if !timely {
+                return Ok(Candidate::Reject);
+            }
+        }
+
+        let scoped_pdu = match &raw.msg_data {
+            RawMsgData::Plaintext(bytes) => {
+                let mut decoder = Decoder::with_target(bytes.clone(), source);
+                match ScopedPdu::decode(&mut decoder) {
+                    Ok(scoped) => scoped,
+                    Err(_) => return Ok(Candidate::Reject),
+                }
+            }
+            RawMsgData::Encrypted(ciphertext) => {
+                match self.decrypt_scoped_pdu(ciphertext, &usm, source) {
+                    Ok(scoped) => scoped,
+                    Err(error) if matches!(*error, Error::Config(_)) => return Err(error),
+                    Err(_) => return Ok(Candidate::Reject),
+                }
+            }
+        };
+
+        if !msg_ids.contains(&raw.global_data.msg_id) {
+            return Ok(Candidate::Reject);
+        }
+
+        if scoped_pdu.pdu.pdu_type() == PduType::Report {
+            if classify_report(&scoped_pdu.pdu).is_err() {
+                return Ok(Candidate::Reject);
+            }
+        } else if received_level != expected_level
+            || scoped_pdu.context_engine_id != request.context_engine_id
+            || scoped_pdu.context_name != request.context_name
+            || scoped_pdu.pdu.pdu_type() != PduType::Response
+            || scoped_pdu.pdu.request_id != expected_pdu_id
+        {
+            return Ok(Candidate::Reject);
+        }
+
+        Ok(Candidate::Accept(ValidatedV3Response {
+            usm,
+            received_level,
+            scoped_pdu,
+            authenticated: received_level.requires_auth(),
+        }))
+    }
+
     /// Send a V3 request and handle the response.
     #[instrument(
         level = "debug",
@@ -659,85 +776,39 @@ impl<T: Transport> Client<T> {
             match self
                 .inner
                 .transport
-                .request(&request.data, registration)
+                .request_with(&request.data, registration, |data, source| {
+                    self.validate_v3_candidate(
+                        data,
+                        source,
+                        &msg_id_window,
+                        &request,
+                        pdu.request_id,
+                        security_level,
+                    )
+                })
                 .await
             {
-                Ok((response_data, source)) => {
-                    tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received V3 response");
+                Ok(validated) => {
+                    let response_usm = validated.usm;
+                    let received_level = validated.received_level;
+                    let scoped_pdu = validated.scoped_pdu;
 
-                    // RFC 3412 Section 7.2: decode only the envelope and
-                    // derive the security level from the received flags.
-                    // Invalid flag combinations (privacy without
-                    // authentication) are rejected inside the decode, before
-                    // any authentication work.
-                    let raw = RawV3Message::decode_bounded_with_target(
-                        response_data.clone(),
-                        self.inner.transport.receive_limits().accepted(),
-                        source,
-                        crate::message::DecodePolicy::Compatible,
-                    )?
-                    .value;
-                    let received_level = raw.security_level();
-                    let response_usm =
-                        UsmSecurityParams::decode_with_target(raw.security_params.clone(), source)?;
-
-                    // RFC 3414 Steps 3-6: bind the received engine ID and
-                    // security name to the cached localized keys, validate
-                    // support for the received level, then authenticate.
-                    self.verify_response_security(&response_data, &response_usm, received_level)?;
-
-                    // RFC 3414 Section 3.2 Step 7b: for every HMAC-verified
-                    // message, advance the local notion of the engine's
-                    // boots/time and check timeliness before decryption and
-                    // PDU parsing. Only state for the message's claimed
-                    // engine is touched; unauthenticated messages never
-                    // mutate the notion.
-                    let mut deferred_authenticated_update = false;
-                    if received_level.requires_auth() {
-                        let timely = if engine_time_override.is_some() {
-                            // A response to the packet-local compatibility
-                            // correction is provisional until it is proven to
-                            // be the fully matched Response for this request.
-                            // Evaluate Step 7(b) on a clone so malformed,
-                            // uncorrelated, or Report replies cannot mutate live
-                            // or shared trusted state.
-                            let local_state = {
-                                let engine = self.inner.engine.read().map_err(|_| {
-                                    Error::Config("engine lock poisoned".into()).boxed()
-                                })?;
-                                engine
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        Error::Config("engine not discovered".into()).boxed()
-                                    })?
-                                    .state
-                                    .clone()
-                            };
-                            let timely = self
-                                .inner
-                                .engine_cache
-                                .as_deref()
-                                .and_then(|cache| {
-                                    cache.timeliness_candidate(
-                                        &self.peer_addr(),
-                                        &local_state,
-                                        &response_usm.engine_id,
-                                        response_usm.engine_boots,
-                                        response_usm.engine_time,
-                                    )
-                                })
-                                .map_or_else(
-                                    || {
-                                        local_state.clone().check_and_update_timeliness(
-                                            response_usm.engine_boots,
-                                            response_usm.engine_time,
-                                        )
-                                    },
-                                    |(timely, _candidate)| timely,
-                                );
-                            deferred_authenticated_update = true;
-                            timely
-                        } else {
+                    // Publish candidate timeliness state only after every deep
+                    // validation check has accepted the response.
+                    #[cfg(test)]
+                    if validated.authenticated && engine_time_override.is_some() {
+                        let hook = self
+                            .inner
+                            .deferred_authenticated_update_hook
+                            .read()
+                            .expect("deferred update hook lock poisoned")
+                            .clone();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    if validated.authenticated {
+                        let timely = {
                             let mut engine = self.inner.engine.write().map_err(|_| {
                                 Error::Config("engine lock poisoned".into()).boxed()
                             })?;
@@ -753,53 +824,12 @@ impl<T: Transport> Client<T> {
                                 response_usm.engine_time,
                             )
                         };
-
                         if !timely {
-                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), msg_boots = response_usm.engine_boots, msg_time = response_usm.engine_time }, "message outside time window");
                             return Err(Error::Auth {
                                 target: self.peer_addr(),
                             }
                             .boxed());
                         }
-                    }
-
-                    #[cfg(test)]
-                    if deferred_authenticated_update {
-                        let hook = self
-                            .inner
-                            .deferred_authenticated_update_hook
-                            .read()
-                            .expect("deferred update hook lock poisoned")
-                            .clone();
-                        if let Some(hook) = hook {
-                            hook();
-                        }
-                    }
-
-                    // Security processing is complete: decrypt (per the
-                    // received level) and parse the scoped PDU.
-                    let scoped_pdu = match &raw.msg_data {
-                        RawMsgData::Plaintext(bytes) => {
-                            let mut decoder = Decoder::with_target(bytes.clone(), source);
-                            ScopedPdu::decode(&mut decoder)?
-                        }
-                        RawMsgData::Encrypted(ciphertext) => {
-                            self.decrypt_scoped_pdu(ciphertext, &response_usm, source)?
-                        }
-                    };
-
-                    // RFC 3412 Section 7.2: Security Model processing above
-                    // precedes Message Processing Model correlation. Bind both
-                    // ordinary Responses and Reports to this exact attempt.
-                    // A mismatch terminates the exchange because Transport's
-                    // request API does not universally support receiving a
-                    // second packet (notably custom transports).
-                    if !msg_id_window.contains(&raw.global_data.msg_id) {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_ids = ?msg_id_window, actual_msg_id = raw.global_data.msg_id }, "msgID mismatch in response");
-                        return Err(Error::MalformedResponse {
-                            target: self.peer_addr(),
-                        }
-                        .boxed());
                     }
 
                     // Report action begins only after USM processing and exact
@@ -946,42 +976,6 @@ impl<T: Transport> Client<T> {
                             target: self.peer_addr(),
                         }
                         .boxed());
-                    }
-
-                    // The response to a packet-local compatibility correction
-                    // is now authenticated, correlated, and fully matched.
-                    // Revalidate against the current coherent live/cache state
-                    // before publishing: another request may have advanced the
-                    // time window while this response was being processed.
-                    if deferred_authenticated_update {
-                        let timely = {
-                            let mut engine = self.inner.engine.write().map_err(|_| {
-                                Error::Config("engine lock poisoned".into()).boxed()
-                            })?;
-                            let engine = engine.as_mut().ok_or_else(|| {
-                                Error::Config("engine not discovered".into()).boxed()
-                            })?;
-                            if engine.state.engine_id != response_usm.engine_id {
-                                return Err(Error::MalformedResponse {
-                                    target: self.peer_addr(),
-                                }
-                                .boxed());
-                            }
-                            check_and_update_engine_timeliness(
-                                &mut engine.state,
-                                self.inner.engine_cache.as_deref(),
-                                self.peer_addr(),
-                                &response_usm.engine_id,
-                                response_usm.engine_boots,
-                                response_usm.engine_time,
-                            )
-                        };
-                        if !timely {
-                            return Err(Error::Auth {
-                                target: self.peer_addr(),
-                            }
-                            .boxed());
-                        }
                     }
 
                     tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type(), snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status(), snmp.error_index = response_pdu.error_index() }, "received V3 {} response", response_pdu.pdu_type());
@@ -1580,14 +1574,27 @@ mod response_validation_tests {
             Err(Error::Config("DeferredUpdateTransport uses request()".into()).boxed())
         }
 
-        async fn request(
+        async fn request_with<U, F>(
             &self,
             data: &[u8],
             _registration: RequestRegistration,
-        ) -> Result<(Bytes, SocketAddr)> {
+            mut validate: F,
+        ) -> Result<U>
+        where
+            U: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
+        {
             let response_number = self.response_number.fetch_add(1, Ordering::SeqCst);
             let response = build_deferred_update_response(data, response_number);
-            Ok((response, self.peer))
+            match validate(response, self.peer)? {
+                Candidate::Accept(value) => Ok(value),
+                Candidate::Reject => Err(Error::Timeout {
+                    target: self.peer,
+                    elapsed: Duration::ZERO,
+                    retries: 0,
+                }
+                .boxed()),
+            }
         }
 
         fn peer_addr(&self) -> SocketAddr {
@@ -1883,8 +1890,8 @@ mod response_validation_tests {
 
         let err = client.send_v3_and_recv(pdu).await.unwrap_err();
         assert!(
-            matches!(*err, Error::Auth { .. }),
-            "expected Auth error for unverifiable received auth, got: {err}"
+            matches!(*err, Error::MalformedResponse { .. }),
+            "test transport must surface rejected unverifiable candidate, got: {err}"
         );
     }
 
@@ -1929,8 +1936,8 @@ mod response_validation_tests {
 
         let err = client.send_v3_and_recv(pdu).await.unwrap_err();
         assert!(
-            matches!(*err, Error::Auth { .. }),
-            "expected Auth error, got: {err}"
+            matches!(*err, Error::MalformedResponse { .. }),
+            "test transport must surface rejected stale candidate, got: {err}"
         );
     }
 }

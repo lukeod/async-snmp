@@ -826,18 +826,28 @@ impl Transport for ScriptedTransport {
         Ok(())
     }
 
-    async fn recv(
+    async fn recv_with<T, F>(
         &self,
         _registration: async_snmp::RequestRegistration,
-    ) -> async_snmp::Result<(Bytes, SocketAddr)> {
-        Err(Error::Config("ScriptedTransport uses request()".into()).boxed())
+        _validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<async_snmp::Candidate<T>> + Send,
+    {
+        Err(Error::Config("ScriptedTransport uses request_with()".into()).boxed())
     }
 
-    async fn request(
+    async fn request_with<T, F>(
         &self,
         data: &[u8],
         registration: async_snmp::RequestRegistration,
-    ) -> async_snmp::Result<(Bytes, SocketAddr)> {
+        mut validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<async_snmp::Candidate<T>> + Send,
+    {
         let request_id = registration.request_id;
         let (request, step) = self
             .0
@@ -855,17 +865,19 @@ impl Transport for ScriptedTransport {
             .run(&request)
             .map_err(|error| Error::Config(error.into()).boxed())?
         {
-            ScriptOutput::Replies(mut replies) if replies.len() == 1 => {
-                Ok((replies.remove(0), self.0.peer))
+            ScriptOutput::Replies(replies) => {
+                for reply in replies {
+                    if let async_snmp::Candidate::Accept(value) = validate(reply, self.0.peer)? {
+                        return Ok(value);
+                    }
+                }
+                Err(Error::Timeout {
+                    target: self.0.peer,
+                    elapsed: Duration::ZERO,
+                    retries: 0,
+                }
+                .boxed())
             }
-            ScriptOutput::Replies(replies) => Err(Error::Config(
-                format!(
-                    "scripted transport request requires exactly one reply, got {}",
-                    replies.len()
-                )
-                .into(),
-            )
-            .boxed()),
             ScriptOutput::RepliesFromOtherSource(_) => Err(Error::Config(
                 "alternate-source script output is only supported by UDP peers".into(),
             )

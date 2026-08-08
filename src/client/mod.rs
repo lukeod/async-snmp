@@ -51,8 +51,7 @@ use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
-use crate::transport::Transport;
-use crate::transport::UdpHandle;
+use crate::transport::{Candidate, Transport, UdpHandle};
 use crate::v3::{EngineCache, EngineState, SaltCounter};
 use crate::value::Value;
 use crate::varbind::VarBind;
@@ -262,6 +261,8 @@ impl ClientConfig {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
+        crate::transport::checked_deadline(self.timeout, "request timeout")?;
+
         if self.max_oids_per_request == 0 {
             return Err(
                 Error::Config("max_oids_per_request must be greater than 0".into()).boxed(),
@@ -407,34 +408,25 @@ impl<T: Transport> Client<T> {
             // whole exchange, so a cancelled request cannot leak the lock and
             // wedge later requests.
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = data.len() }, "sending request");
-            match self.inner.transport.request(data, registration).await {
-                Ok((response_data, source)) => {
-                    tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response");
-
-                    // Decode response and extract PDU
-                    let response = Message::decode_bounded_with_target(
+            match self
+                .inner
+                .transport
+                .request_with(data, registration, |response_data, source| {
+                    tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response candidate");
+                    let Ok(decoded) = Message::decode_bounded_with_target(
                         response_data,
                         self.inner.transport.receive_limits().accepted(),
                         source,
                         crate::message::DecodePolicy::Compatible,
-                    )?
-                    .value;
-
-                    // Validate response version matches request version
-                    let response_version = response.version();
-                    let expected_version = version;
-                    if response_version != expected_version {
-                        tracing::warn!(target: "async_snmp::client", { ?expected_version, ?response_version, peer = %self.peer_addr() }, "version mismatch in response");
-                        return Err(Error::MalformedResponse {
-                            target: self.peer_addr(),
-                        }
-                        .boxed());
+                    ) else {
+                        return Ok(Candidate::Reject);
+                    };
+                    let response = decoded.value;
+                    if response.version() != version {
+                        return Ok(Candidate::Reject);
                     }
-
-                    // Defense in depth for custom transports that do not enforce
-                    // the non-consuming registration contract themselves.
-                    if let Message::Community(ref m) = response
-                        && community != m.community()
+                    if let Message::Community(ref message) = response
+                        && community != message.community()
                     {
                         let accepted = match self.inner.config.community_response_policy {
                             crate::transport::CommunityResponsePolicy::Exact => false,
@@ -444,49 +436,27 @@ impl<T: Transport> Client<T> {
                             crate::transport::CommunityResponsePolicy::AllowMismatchFromAnySource => true,
                         };
                         if !accepted {
-                            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "community mismatch in response rejected");
-                            return Err(Error::MalformedResponse {
-                                target: self.peer_addr(),
-                            }
-                            .boxed());
+                            return Ok(Candidate::Reject);
                         }
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "accepted rewritten response community");
                     }
-
                     let Some(response_pdu) = response.into_pdu() else {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "received TrapV1 in response to request");
-                        return Err(Error::MalformedResponse {
-                            target: self.peer_addr(),
-                        }
-                        .boxed());
+                        return Ok(Candidate::Reject);
                     };
-
-                    // RFC 3416 Section 4.2: only a Response-PDU may answer a
-                    // request; reject echoed request-type PDUs
-                    if response_pdu.pdu_type() != PduType::Response {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), pdu_type = ?response_pdu.pdu_type() }, "non-Response PDU in response");
-                        return Err(Error::MalformedResponse {
-                            target: self.peer_addr(),
-                        }
-                        .boxed());
+                    if response_pdu.pdu_type() != PduType::Response
+                        || response_pdu.request_id != request_id
+                    {
+                        return Ok(Candidate::Reject);
                     }
-
-                    // Validate request ID
-                    if response_pdu.request_id != request_id {
-                        tracing::warn!(target: "async_snmp::client", { expected_request_id = request_id, actual_request_id = response_pdu.request_id, peer = %self.peer_addr() }, "request ID mismatch in response");
-                        return Err(Error::MalformedResponse {
-                            target: self.peer_addr(),
-                        }
-                        .boxed());
-                    }
-
-                    // Check for SNMP error
+                    Ok(Candidate::Accept(response_pdu))
+                })
+                .await
+            {
+                Ok(response_pdu) => {
                     if let Some(err) = pdu_to_snmp_error(&response_pdu, self.peer_addr()) {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                         return Err(err);
                     }
-
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                     return Ok(response_pdu);
                 }
@@ -1525,6 +1495,13 @@ mod tests {
         assert_config_error(Client::new(
             transport.clone(),
             ClientConfig {
+                timeout: Duration::MAX,
+                ..ClientConfig::default()
+            },
+        ));
+        assert_config_error(Client::new(
+            transport.clone(),
+            ClientConfig {
                 max_oids_per_request: 0,
                 ..ClientConfig::default()
             },
@@ -1553,6 +1530,15 @@ mod tests {
             },
             Arc::new(EngineCache::new()),
         ));
+
+        Client::new(
+            transport.clone(),
+            ClientConfig {
+                timeout: Duration::ZERO,
+                ..ClientConfig::default()
+            },
+        )
+        .expect("zero timeout remains an explicit immediate deadline");
 
         for auth in [
             Auth::v1("public"),

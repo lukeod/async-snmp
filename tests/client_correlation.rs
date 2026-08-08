@@ -70,6 +70,82 @@ async fn wrong_community_does_not_consume_pending_udp_request() {
 }
 
 #[tokio::test]
+async fn malformed_and_wrong_pdu_candidates_do_not_consume_udp_exchange() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = socket.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        let (len, source) = socket.recv_from(&mut buf).await.unwrap();
+        let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let request_id = request.into_pdu().unwrap().request_id;
+        let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
+
+        let wrong_pdu = CommunityMessage::v2c(
+            "public",
+            Pdu::get_request(request_id, std::slice::from_ref(&oid)),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        socket.send_to(&wrong_pdu, source).await.unwrap();
+
+        let mut malformed = CommunityMessage::v2c(
+            "public",
+            Pdu::response(
+                request_id,
+                0,
+                0,
+                vec![VarBind::new(
+                    oid.clone(),
+                    Value::ObjectIdentifier(Oid::from_slice(&[1, 3, 6, 1])),
+                )],
+            ),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+        .to_vec();
+        *malformed.last_mut().unwrap() = 0x80;
+        socket.send_to(&malformed, source).await.unwrap();
+
+        let genuine = CommunityMessage::v2c(
+            "public",
+            Pdu::response(
+                request_id,
+                0,
+                0,
+                vec![VarBind::new(
+                    oid,
+                    Value::OctetString(Bytes::from_static(b"genuine")),
+                )],
+            ),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        socket.send_to(&genuine, source).await.unwrap();
+    });
+
+    let client = Client::builder(peer, Auth::v2c("public"))
+        .timeout(Duration::from_secs(2))
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let result = client
+        .get(&Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.varbinds[0].value,
+        Value::OctetString(Bytes::from_static(b"genuine"))
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn non_utf8_community_correlates_udp_response() {
     let community = Bytes::from_static(b"public\xff");
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();

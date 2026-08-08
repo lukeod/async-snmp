@@ -8,8 +8,8 @@ use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
 use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
-    Auth, Client, ClientConfig, EngineCache, MasterKeys, ReceiveLimits, Retry, UsmConfig, Value,
-    VarBind, oid,
+    Auth, Client, ClientConfig, EngineCache, ErrorStatus, MasterKeys, ReceiveLimits, Retry,
+    UsmConfig, Value, VarBind, oid,
 };
 use bytes::Bytes;
 use common::v3::{
@@ -173,6 +173,130 @@ async fn v3_scripted_udp_success_at_all_security_levels() {
 }
 
 #[tokio::test]
+async fn v3_custom_transport_rejects_unauthenticated_candidate_then_accepts_response() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::replies(move |request| {
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                let rejected = V3ReplyBuilder::response_to(request, &response_engine)
+                    .security_level(SecurityLevel::NoAuthNoPriv)
+                    .varbinds(vec![VarBind::new(
+                        oid.clone(),
+                        Value::OctetString(Bytes::from_static(b"rejected")),
+                    )])
+                    .build()?;
+                let accepted = V3ReplyBuilder::response_to(request, &response_engine)
+                    .varbinds(vec![VarBind::new(
+                        oid,
+                        Value::OctetString(Bytes::from_static(b"accepted")),
+                    )])
+                    .build()?;
+                Ok(vec![rejected, accepted])
+            }),
+        ],
+        100,
+        true,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, None);
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.varbinds[0].value.as_str(), Some("accepted"));
+    assert_eq!(log.len(), 2, "candidate rejection must not resend");
+}
+
+#[tokio::test]
+async fn rejected_candidate_then_valid_snmp_error_is_accepted_without_resend() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::replies(move |request| {
+                let rejected = V3ReplyBuilder::response_to(request, &response_engine)
+                    .context_name("wrong-context")
+                    .build()?;
+                let accepted = V3ReplyBuilder::response_to(request, &response_engine)
+                    .error_status(ErrorStatus::GenErr.as_i32())
+                    .error_index(1)
+                    .build()?;
+                Ok(vec![rejected, accepted])
+            }),
+        ],
+        100,
+        true,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, Some("requested-context"));
+
+    let error = client
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *error,
+        async_snmp::Error::Snmp {
+            status: ErrorStatus::GenErr,
+            index: 1,
+            ..
+        }
+    ));
+    assert_eq!(log.len(), 2, "candidate rejection must not resend");
+}
+
+#[tokio::test]
+async fn rejected_authenticated_candidate_does_not_commit_timeliness() {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::replies(move |request| {
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                let rejected = V3ReplyBuilder::response_to(request, &response_engine)
+                    .engine_time(300)
+                    .context_name("wrong-context")
+                    .varbinds(vec![VarBind::new(
+                        oid.clone(),
+                        Value::OctetString(Bytes::from_static(b"rejected")),
+                    )])
+                    .build()?;
+                let accepted = V3ReplyBuilder::response_to(request, &response_engine)
+                    .engine_time(100)
+                    .context_name("requested-context")
+                    .varbinds(vec![VarBind::new(
+                        oid,
+                        Value::OctetString(Bytes::from_static(b"accepted")),
+                    )])
+                    .build()?;
+                Ok(vec![rejected, accepted])
+            }),
+        ],
+        100,
+        true,
+    );
+    let log = transport.log();
+    let client = custom_client(transport, level, Some("requested-context"));
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(result.varbinds[0].value.as_str(), Some("accepted"));
+    assert_eq!(log.len(), 2, "candidate rejection must not resend");
+}
+
+#[tokio::test]
 async fn v3_discovery_advertises_active_transport_receive_limit() {
     let level = SecurityLevel::NoAuthNoPriv;
     let engine = engine_for(level);
@@ -325,8 +449,8 @@ async fn v3_discovery_rejects_noncanonical_security_and_report_shapes() {
             .await
             .unwrap_err();
         assert!(
-            matches!(*error, async_snmp::Error::MalformedResponse { .. }),
-            "{case} should be rejected as malformed, got {error}"
+            matches!(*error, async_snmp::Error::Timeout { .. }),
+            "{case} should be rejected until timeout, got {error}"
         );
         assert_eq!(transport.log().len(), 1, "{case} must not continue");
     }
@@ -373,10 +497,7 @@ async fn v3_discovery_rejects_trailing_usm_security_parameter_data() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(
-        *error,
-        async_snmp::Error::MalformedResponse { .. }
-    ));
+    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
 }
 
 #[tokio::test]
@@ -506,7 +627,7 @@ async fn v3_established_identity_ignores_ordinary_discovery_traffic() {
         Some("before")
     );
     let error = client.get(&oid).await.unwrap_err();
-    assert!(matches!(*error, async_snmp::Error::Auth { .. }));
+    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
     assert_eq!(
         client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("after")
@@ -649,10 +770,7 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     );
 
     let error = client.rediscover_engine().await.unwrap_err();
-    assert!(matches!(
-        *error,
-        async_snmp::Error::MalformedResponse { .. }
-    ));
+    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
     assert_eq!(
         cache.get(&client.peer_addr()).unwrap().engine_id().as_ref(),
         ENGINE_ID
@@ -814,7 +932,7 @@ async fn v3_unauthenticated_time_report_compatibility_is_explicit() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
+        matches!(*err, async_snmp::Error::Timeout { .. }),
         "the compatibility path must remain disabled by default: {err}"
     );
     assert_eq!(log.len(), 2, "a disabled path must not send a correction");
@@ -1510,7 +1628,7 @@ async fn v3_repeated_time_window_report_is_typed_and_bounded() {
 }
 
 #[tokio::test]
-async fn v3_malformed_reports_are_terminal_without_correction() {
+async fn v3_malformed_reports_are_rejected_until_timeout_without_correction() {
     type Mutate = Box<dyn Fn(V3ReplyBuilder) -> V3ReplyBuilder + Send>;
     let cases: Vec<(&str, Mutate)> = vec![
         ("nonzero status", Box::new(|reply| reply.error_status(1))),
@@ -1570,8 +1688,8 @@ async fn v3_malformed_reports_are_terminal_without_correction() {
             .await
             .unwrap_err();
         assert!(
-            matches!(*err, async_snmp::Error::MalformedResponse { .. }),
-            "{case} should be malformed, got {err}"
+            matches!(*err, async_snmp::Error::Timeout { .. }),
+            "{case} should be rejected until timeout, got {err}"
         );
         assert_eq!(log.len(), 2, "{case} must not trigger correction");
     }
@@ -1683,9 +1801,9 @@ async fn v3_failed_correction_preserves_authenticated_report_time() {
 }
 
 /// A client configured without authentication cannot verify a received
-/// authenticated Report, so it must fail with an Auth error instead of
-/// acting on the Report's contents (RFC 3412 Section 7.2 processes at the
-/// received level; acting requires the claimed authentication to be checked).
+/// authenticated Report, so it must reject the candidate instead of acting on
+/// the Report's contents (RFC 3412 Section 7.2 processes at the received level;
+/// acting requires the claimed authentication to be checked).
 #[tokio::test]
 async fn v3_noauth_client_rejects_authenticated_report() {
     let engine = engine_for(SecurityLevel::NoAuthNoPriv);
@@ -1714,7 +1832,7 @@ async fn v3_noauth_client_rejects_authenticated_report() {
 
     let client = Client::builder(peer.addr(), auth_for(SecurityLevel::NoAuthNoPriv))
         .timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(1, Duration::ZERO))
+        .retry(Retry::none())
         .connect()
         .await
         .unwrap();
@@ -1723,8 +1841,8 @@ async fn v3_noauth_client_rejects_authenticated_report() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "expected Auth error, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "expected timeout after candidate rejection, got: {err}"
     );
 
     peer.finish().await.unwrap();
@@ -1778,8 +1896,8 @@ async fn v3_authenticated_wrong_username_does_not_mutate_time_or_retry() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "wrong security name must fail USM processing, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "wrong security name must be rejected until timeout, got: {err}"
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
@@ -1825,7 +1943,7 @@ async fn v3_authenticated_wrong_engine_id_does_not_trigger_report_retry() {
 
     let client = Client::builder(peer.addr(), auth_for(level))
         .timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(1, Duration::ZERO))
+        .retry(Retry::none())
         .connect()
         .await
         .unwrap();
@@ -1834,8 +1952,8 @@ async fn v3_authenticated_wrong_engine_id_does_not_trigger_report_retry() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "wrong authoritative engine must fail USM processing, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "wrong authoritative engine must be rejected until timeout, got: {err}"
     );
 
     peer.finish().await.unwrap();
@@ -1882,8 +2000,8 @@ async fn v3_auth_no_priv_client_rejects_auth_priv_without_time_mutation() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "unsupported authPriv must fail capability selection, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "unsupported authPriv must be rejected until timeout, got: {err}"
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
@@ -1944,8 +2062,8 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "failed HMAC must win over malformed plaintext, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "failed HMAC candidate must be rejected until timeout, got: {err}"
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
@@ -1998,8 +2116,8 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "stale ciphertext must fail timeliness before decode, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "stale ciphertext must be rejected until timeout, got: {err}"
     );
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
@@ -2054,8 +2172,8 @@ async fn v3_auth_client_rejects_unauthenticated_response() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Auth { .. }),
-        "expected Auth error, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "expected timeout after candidate rejection, got: {err}"
     );
     peer.finish().await.unwrap();
 }
@@ -2093,7 +2211,7 @@ async fn v3_auth_priv_client_rejects_auth_no_priv_response() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        matches!(*err, async_snmp::Error::Timeout { .. }),
         "lower-security ordinary Response must not be accepted: {err}"
     );
     peer.finish().await.unwrap();
@@ -2267,7 +2385,7 @@ async fn v3_udp_pending_map_ignores_wrong_ids_before_correlated_response() {
 }
 
 #[tokio::test]
-async fn v3_tcp_rejects_wrong_response_msg_id() {
+async fn v3_tcp_skips_wrong_response_msg_id_until_timeout() {
     let level = SecurityLevel::NoAuthNoPriv;
     let engine = engine_for(level);
     let response_engine = engine.clone();
@@ -2294,14 +2412,14 @@ async fn v3_tcp_rejects_wrong_response_msg_id() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
-        "wrong TCP msgID must be terminal, got: {err}"
+        matches!(*err, async_snmp::Error::Timeout { .. }),
+        "wrong TCP msgID must be skipped under the request deadline, got: {err}"
     );
     peer.finish().await.unwrap();
 }
 
 #[tokio::test]
-async fn v3_tcp_rejects_wrong_discovery_msg_id() {
+async fn v3_tcp_skips_wrong_discovery_msg_id_until_timeout() {
     let level = SecurityLevel::NoAuthNoPriv;
     let engine = engine_for(level);
     let report_engine = engine.clone();
@@ -2329,7 +2447,7 @@ async fn v3_tcp_rejects_wrong_discovery_msg_id() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(*err, async_snmp::Error::MalformedResponse { .. }));
+    assert!(matches!(*err, async_snmp::Error::Timeout { .. }));
     peer.finish().await.unwrap();
 }
 
@@ -2359,7 +2477,7 @@ async fn v3_custom_transport_rejects_prior_attempt_msg_id() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        matches!(*err, async_snmp::Error::Timeout { .. }),
         "matching PDU request-id must not rescue a prior msgID: {err}"
     );
     let requests = log.snapshot();
@@ -2396,7 +2514,7 @@ async fn v3_custom_transport_rejects_future_discovery_msg_id() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(*err, async_snmp::Error::MalformedResponse { .. }));
+    assert!(matches!(*err, async_snmp::Error::Timeout { .. }));
 }
 
 /// RFC 3412 Section 7.2 processes the Security Model before parsing the
@@ -2429,7 +2547,7 @@ async fn v3_discovery_usm_processing_precedes_parse_and_correlation() {
         .await
         .unwrap_err();
     match *err {
-        async_snmp::Error::MalformedResponse { target } => {
+        async_snmp::Error::Timeout { target, .. } => {
             assert_eq!(target, std::net::SocketAddr::from(([127, 0, 0, 1], 161)));
         }
         _ => panic!("invalid discovery USM parameters must be rejected first: {err}"),
@@ -2441,7 +2559,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
     let level = SecurityLevel::AuthNoPriv;
     let engine = engine_for(level);
     let report_engine = engine.clone();
-    let advanced_engine = engine.clone().boots_time(8, 10);
+    let valid_response_engine = engine.clone().boots_time(8, 10);
     let transport = ScriptedTransport::new(
         engine.clone(),
         vec![
@@ -2459,7 +2577,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
                 .msg_id(request.global_data.msg_id - 1)
                 .build()
             }),
-            response_step(advanced_engine, "state advanced before correlation"),
+            response_step(valid_response_engine, "state unchanged after rejection"),
         ],
         100,
         false,
@@ -2472,7 +2590,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
         ClientConfig {
             auth: Auth::Usm(security),
             timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::fixed(1, Duration::ZERO),
+            retry: Retry::none(),
             ..ClientConfig::default()
         },
     )
@@ -2483,7 +2601,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        matches!(*err, async_snmp::Error::Timeout { .. }),
         "wrong-ID Report with request-id zero must not be acted on: {err}"
     );
     assert_eq!(
@@ -2495,12 +2613,15 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(
         result.varbinds[0].value.as_str(),
-        Some("state advanced before correlation")
+        Some("state unchanged after rejection")
     );
     let requests = log.snapshot();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2].usm.engine_boots, 8);
-    assert!(requests[2].usm.engine_time >= 10);
+    assert_eq!(
+        requests[2].usm.engine_boots, 0,
+        "a wrong-ID Report must not publish its candidate timeliness state"
+    );
+    assert_eq!(requests[2].usm.engine_time, 0);
 }
 
 #[tokio::test]
@@ -2542,7 +2663,7 @@ async fn v3_rejects_wrong_scoped_context_at_every_security_level() {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+                matches!(*err, async_snmp::Error::Timeout { .. }),
                 "{level:?}, wrong_context_name={wrong_context_name}: {err}"
             );
         }
@@ -2806,7 +2927,7 @@ async fn v3_pre_correction_msg_id_rejected_after_correction() {
         ClientConfig {
             auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::fixed(1, Duration::ZERO),
+            retry: Retry::none(),
             ..ClientConfig::default()
         },
     )
@@ -2817,7 +2938,7 @@ async fn v3_pre_correction_msg_id_rejected_after_correction() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        matches!(*err, async_snmp::Error::Timeout { .. }),
         "correction resets the window; pre-correction msgID must not correlate: {err}"
     );
     assert_eq!(log.snapshot().len(), 3);
@@ -3015,7 +3136,7 @@ async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
         ClientConfig {
             auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::fixed(1, Duration::ZERO),
+            retry: Retry::none(),
             ..ClientConfig::default()
         },
     )
@@ -3026,7 +3147,7 @@ async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        matches!(*err, async_snmp::Error::Timeout { .. }),
         "a Report stamped with the pre-correction msgID must not trigger a second correction: {err}"
     );
     assert_eq!(
@@ -3083,7 +3204,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
         ClientConfig {
             auth: Auth::Usm(user_for(level)),
             timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::fixed(1, Duration::ZERO),
+            retry: Retry::none(),
             ..ClientConfig::default()
         },
     )
@@ -3097,7 +3218,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::MalformedResponse { .. }),
+        matches!(*err, async_snmp::Error::Timeout { .. }),
         "a completed operation's msgID must not correlate to the next operation: {err}"
     );
     assert_eq!(log.snapshot().len(), 3);
