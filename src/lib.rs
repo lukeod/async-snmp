@@ -393,55 +393,108 @@
 //! RUST_LOG=async_snmp::ber=debug cargo run
 //! ```
 //!
-//! ## Agent Compatibility
+//! ## Interoperability policy
 //!
-//! Real-world SNMP agents often have quirks. This library provides several
-//! options to handle non-conformant implementations.
+//! Interoperability deviations are independent controls, not a global
+//! "permissive" mode. Defaults either preserve a bounded, unambiguous value or
+//! narrowly accommodate common agent behavior. Security-sensitive relaxations
+//! are off by default. [`CompatibilityPolicy`] is supplied to low-level message
+//! encode/decode calls; it is **not** a client-wide or receiver-wide setting.
 //!
-//! ### Walk Issues
+//! ### Malformed BER and value normalization
 //!
-//! | Problem | Solution |
-//! |---------|----------|
-//! | GETBULK returns errors or garbage | Use [`WalkMode::GetNext`] |
-//! | OIDs returned out of order | Use [`OidOrdering::AllowNonIncreasing`] |
-//! | Walk never terminates | Set [`ClientBuilder::max_walk_results`] |
-//! | Slow responses cause timeouts | Reduce [`ClientBuilder::max_repetitions`] |
+//! [`CompatibilityPolicy::DEFAULT`] enables five normalizations. Every accepted
+//! deviation emits a tracing warning with a stable `anomaly` field.
+//! [`CompatibilityPolicy::STRICT`] disables all six behaviors.
 //!
-//! **Warning**: [`OidOrdering::AllowNonIncreasing`] uses O(n) memory to track
-//! seen OIDs for cycle detection. Always pair it with [`ClientBuilder::max_walk_results`]
-//! to bound memory usage. The cycle detection catches duplicate OIDs, but a
-//! pathological agent could still return an infinite sequence of unique OIDs.
+//! | `CompatibilityPolicy` field | Default | Scope and boundary |
+//! |---|:---:|---|
+//! | `truncate_numeric_values` | on | Decode out-of-range generic INTEGER and Unsigned32 values into their public 32-bit representation. |
+//! | `empty_counter64_as_zero` | on | Decode a zero-length Counter64 as zero. |
+//! | `empty_object_identifier` | on | Decode a zero-length OBJECT IDENTIFIER as [`Oid::empty`]. |
+//! | `clamp_bounded_strings` | on | Clamp an over-declared OCTET STRING or Opaque length to its enclosing varbind; it cannot consume the next varbind. |
+//! | `normalize_negative_get_bulk_fields` | on | Normalize negative GETBULK non-repeaters and max-repetitions to zero during both encoding and decoding. |
+//! | `malformed_exception_payloads` | **off** | When enabled, discard non-empty payloads on exception values; the default rejects them. |
+//!
+//! These controls do not govern bytes after a complete top-level message. That
+//! separate envelope policy is described below. Unknown BER value tags remain
+//! preserved as [`Value::Unknown`] for forward compatibility.
+//!
+//! ### Other policy layers
+//!
+//! | Control | Default | Scope, tradeoff, and observation |
+//! |---|---|---|
+//! | [`message::DecodePolicy`] | `Compatible` | Accepts only bytes after a fully consumed top-level message TLV. The outcome records their count and a stable `trailing_bytes` warning is emitted; `Strict` rejects them. Both modes reject unconsumed fields inside the declared envelope. |
+//! | [`ResponseShapePolicy`] | `Compatible` | Fixed-cardinality operations preserve all received varbinds and return bounded anomalies for count, OID, successor, or SET-echo problems. `Strict` returns [`Error::ResponseShape`] with the same data and diagnostics. |
+//! | [`NotificationVarbindValidation`] | `Tolerant` | V2c/v3 TrapV2 and Inform prefixes may use non-standard names, but still require `TimeTicks` then `ObjectIdentifier` values. `Strict` also requires the RFC names and order. Rejected notifications are dropped, rejected Informs are not acknowledged, and validation failures are traced. |
+//! | [`WalkMode`], [`OidOrdering`], and walk limits | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires [`ClientBuilder::max_walk_results`] to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
+//! | UDP source correlation | off-target replies accepted with a warning | [`ClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`transport::TransportStats::unmatched`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
+//! | [`CommunityResponsePolicy`] | `Exact` | V1/v2c response communities match byte-for-byte. Rewrite policies emit warnings when used; accepting rewrites from any source weakens spoof resistance, especially with permissive UDP source handling. |
+//! | [`ClientBuilder::allow_unauthenticated_v3_time_correction`] | off | Allows one correlated, packet-local correction from an unauthenticated time-window Report. The tuple is never trusted globally, but an injector can choose one packet's time fields. Use strict UDP source correlation where possible; tracing records protocol correction. |
+//!
+//! [`transport::TransportStats`] exposes UDP `delivered`, `expired`,
+//! `unmatched`, and `malformed` counters for transport health. It is not an
+//! anomaly counter for every policy above; malformed-input acceptance,
+//! correlation decisions, and protocol corrections are observed through their
+//! tracing events or returned diagnostics as documented.
+//!
+//! ### Strict low-level inspection and client controls
+//!
+//! Low-level strict decoding requires both exact envelope consumption and the
+//! strict malformed-input policy. Client controls must be selected separately;
+//! setting [`CompatibilityPolicy::STRICT`] does not make ordinary network
+//! clients globally BER-strict.
 //!
 //! ```rust,no_run
-//! use async_snmp::{Auth, Client, WalkMode, OidOrdering};
+//! use async_snmp::{
+//!     Auth, Client, CommunityResponsePolicy, CompatibilityPolicy,
+//!     ResponseShapePolicy,
+//!     message::{DecodePolicy, Message},
+//! };
+//! use bytes::Bytes;
 //!
-//! # async fn example() -> async_snmp::Result<()> {
-//! // Configure for a problematic agent
-//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .walk_mode(WalkMode::GetNext)           // Avoid buggy GETBULK
-//!     .oid_ordering(OidOrdering::AllowNonIncreasing)  // Handle out-of-order OIDs
-//!     .max_walk_results(10_000)               // IMPORTANT: bound memory usage
-//!     .max_repetitions(10)                    // Smaller responses
-//!     .connect()
-//!     .await?;
-//! # Ok(())
-//! # }
+//! fn inspect_strictly(packet: Bytes) -> async_snmp::Result<Message> {
+//!     Ok(Message::decode_with_policies(
+//!         packet,
+//!         DecodePolicy::Strict,
+//!         CompatibilityPolicy::STRICT,
+//!     )?.value)
+//! }
+//!
+//! let _client = Client::builder("192.0.2.1:161", Auth::v2c("public"))
+//!     .response_shape_policy(ResponseShapePolicy::Strict)
+//!     .strict_source(true)
+//!     .community_response_policy(CommunityResponsePolicy::Exact)
+//!     .allow_unauthenticated_v3_time_correction(false);
 //! ```
 //!
-//! ### Permissive Parsing
+//! ### Targeted workarounds
 //!
-//! The BER decoder accepts non-conformant encodings that some agents produce:
-//! - Non-minimal integer encodings (extra leading bytes)
-//! - Non-minimal OID subidentifier encodings
-//! - Truncated values (logged as warnings)
+//! Start from strict low-level behavior and enable only deviations confirmed for
+//! a specific agent. Configure client behavior independently rather than using
+//! a broad compatibility preset.
 //!
-//! This matches net-snmp's permissive behavior.
+//! ```rust,no_run
+//! use async_snmp::{Auth, Client, CompatibilityPolicy, WalkMode, message::Message};
+//! use bytes::Bytes;
 //!
-//! ### Unknown Value Types
+//! // This agent over-declares bounded string lengths and has broken GETBULK.
+//! let value_policy = CompatibilityPolicy {
+//!     clamp_bounded_strings: true,
+//!     ..CompatibilityPolicy::STRICT
+//! };
 //!
-//! Unrecognized BER tags are preserved as [`Value::Unknown`] rather than
-//! causing decode errors. This provides forward compatibility with new
-//! SNMP types or vendor extensions.
+//! fn decode_agent_packet(
+//!     packet: Bytes,
+//!     policy: CompatibilityPolicy,
+//! ) -> async_snmp::Result<Message> {
+//!     Message::decode_with_compatibility_policy(packet, policy)
+//! }
+//!
+//! let _client = Client::builder("192.0.2.2:161", Auth::v2c("public"))
+//!     .walk_mode(WalkMode::GetNext);
+//! # let _ = (value_policy, decode_agent_packet);
+//! ```
 //!
 //! ## Cargo Features
 //!

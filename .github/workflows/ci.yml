@@ -73,8 +73,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build docs
-        run: cargo doc --all-features --no-deps
+      - name: Test and build docs
+        run: |
+          cargo test --doc --all-features
+          cargo doc --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 

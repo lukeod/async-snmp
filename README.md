@@ -41,6 +41,21 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 | Send Traps | Y | Y | Y |
 | Send Informs | - | Y | Y |
 
+### Interoperability Policy
+
+Compatibility is controlled by separate, narrowly scoped policies rather than a
+global permissive mode. Bounded BER/value normalizations and anomaly-preserving
+response-shape handling are enabled by default; exact community matching and
+rejection of unauthenticated SNMPv3 time correction remain the default security
+boundary. Relaxed UDP source matching supports multihomed agents but warns on
+off-target replies. Enable only workarounds required by a known agent, and pair
+relaxed walk ordering with a result limit.
+
+See the crate documentation's
+[interoperability policy](https://docs.rs/async-snmp/latest/async_snmp/#interoperability-policy)
+for the full control inventory, defaults, tradeoffs, observability, and compiling
+configuration examples.
+
 ### SNMPv3 Security
 
 **Authentication:** MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512
