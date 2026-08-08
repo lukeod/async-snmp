@@ -74,10 +74,9 @@ mod response;
 mod set_handler;
 pub mod vacm;
 
+pub use crate::handler::SecurityModel;
 pub use notification::{NotificationOutcome, SinkOutcome, SinkSkipReason, SinkStatus};
-pub use vacm::{
-    SecurityModel, VacmBuilder, VacmConfig, VacmSecurityModel, View, ViewCheckResult, ViewSubtree,
-};
+pub use vacm::{VacmBuilder, VacmConfig, VacmSecurityModel, View, ViewCheckResult, ViewSubtree};
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

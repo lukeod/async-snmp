@@ -64,9 +64,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pending request and original deadline intact. Explicit target-only and
   any-source community rewrite policies support proxy deployments; accepted
   anomalies are warned and rejected packets count as unmatched.
-- The pre-1.0 `Transport::register_request` API now accepts
-  `RequestRegistration` correlation metadata. Custom transports must ignore a
-  failed correlation without consuming the pending request.
+- The pre-1.0 transport request boundary now accepts `RequestRegistration`
+  correlation metadata. Its primary ID, timeout, aliases, and protocol
+  correlation fields are private; construct it with `community` (using
+  `CommunityVersion`) or `v3`, add normalized aliases with `with_aliases`, and
+  inspect the request ID, timeout, and aliases through read accessors. The
+  read-only `evaluate_response_identity` method applies outer-ID/alias,
+  protocol-version, source, and community-policy correlation from packet bytes.
+  Custom transports must ignore a failed identity or candidate validation
+  without consuming the pending request or extending its original deadline.
+- **Breaking:** `ClientConfig`, `CompatibilityPolicy`, and `TcpOptions` are
+  non-exhaustive configuration structs. Prefer their builders where available,
+  or start with `Default`/the documented policy constants and mutate public
+  fields. No protocol, operation/response, authentication, target, or transport
+  enums were made non-exhaustive.
+- **Breaking:** Removed the pre-1.0 `GetResult::from_option`,
+  `GetNextResult::from_option`/`into_option`, both `From<Option<_>>` result
+  conversions, the unused `handler::Response`, and the nested
+  `agent::vacm::SecurityModel` re-export. Choose exception variants explicitly;
+  `From<Value>`, `From<VarBind>`, the crate-root and `handler::SecurityModel`
+  paths, boxed `Result<T>`, and `Oid::to_ber_checked` remain available.
 - Outbound OBJECT IDENTIFIER encoding is now checked. `Oid::to_ber`,
   `EncodeBuf::push_oid`, `Value::encode`, `VarBind::encode`, PDU encoders,
   `CommunityMessage::encode`, `ScopedPdu::encode`/`encode_to_bytes`, and
@@ -87,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration
 
+- Replace handler `Option` conversions with explicit `GetResult` and
+  `GetNextResult` variants. Use `GetResult::Value(value)` or `value.into()` for
+  present GET values, choose `NoSuchObject` versus `NoSuchInstance` for absent
+  values, and use `GetNextResult::Value(varbind)`/`varbind.into()` or
+  `EndOfMibView` for GETNEXT. Remove uses of the unused handler-level
+  `Response`, and import `SecurityModel` from the crate root or `handler`.
+- Replace external struct literals for `ClientConfig`, `CompatibilityPolicy`,
+  and `TcpOptions` with `Default` plus public-field mutation, or use the
+  preferred builders.
 - Handle the `Result` from `MasterKey::from_bytes` and
   `LocalizedKey::from_bytes`, and provide exact Ku/Kul digest output rather than
   an arbitrary HMAC key. Create one owner-held `SaltCounter` for each

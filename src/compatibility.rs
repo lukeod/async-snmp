@@ -10,6 +10,7 @@
 /// exception values with non-empty payloads are rejected. Every accepted
 /// deviation emits a warning with a stable `anomaly` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CompatibilityPolicy {
     /// Truncate generic INTEGER and Unsigned32 values that exceed their public
     /// 32-bit representation (net-snmp-compatible). Default: enabled.

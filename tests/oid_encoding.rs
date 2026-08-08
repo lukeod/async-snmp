@@ -210,10 +210,8 @@ fn empty_ber_oid_remains_receive_compatible() {
     let mut compatible = Decoder::new(encoded_varbind.clone());
     assert_eq!(VarBind::decode(&mut compatible).unwrap().oid, Oid::empty());
 
-    let policy = CompatibilityPolicy {
-        empty_object_identifier: false,
-        ..CompatibilityPolicy::DEFAULT
-    };
+    let mut policy = CompatibilityPolicy::DEFAULT;
+    policy.empty_object_identifier = false;
     let mut strict = Decoder::new(encoded_varbind).with_compatibility_policy(policy);
     assert!(VarBind::decode(&mut strict).is_err());
 }

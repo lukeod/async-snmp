@@ -74,7 +74,7 @@
 //! # }
 //! ```
 
-use super::{Candidate, CorrelationResult, RequestRegistration, Transport, extract_request_id};
+use super::{Candidate, RequestRegistration, ResponseIdentity, Transport, extract_request_id};
 use crate::error::{Error, Result};
 use crate::message_size::ReceiveLimits;
 use bytes::{Bytes, BytesMut};
@@ -103,6 +103,7 @@ const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 /// For advanced TCP socket configuration (`TCP_NODELAY`, keepalive, buffer sizes,
 /// etc.), use [`TcpTransport::from_socket()`] with a pre-configured `TcpSocket`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TcpOptions {
     /// Maximum size of incoming messages to accept.
     ///
@@ -454,8 +455,8 @@ impl Transport for TcpTransport {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
-        let request_id = registration.request_id;
-        let recv_timeout = registration.timeout;
+        let request_id = registration.request_id();
+        let recv_timeout = registration.timeout();
         let target = self.inner.target;
         tcp_deadline(recv_timeout, "TCP timeout")?;
         let mut stream = self.inner.stream.clone().lock_owned().await;
@@ -489,8 +490,8 @@ impl Transport for TcpTransport {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
-        let request_id = registration.request_id;
-        let recv_timeout = registration.timeout;
+        let request_id = registration.request_id();
+        let recv_timeout = registration.timeout();
         let target = self.inner.target;
         tcp_deadline(recv_timeout, "TCP timeout")?;
         let mut stream = self.inner.stream.clone().lock_owned().await;
@@ -589,7 +590,7 @@ async fn read_validated_message<T, F>(
 where
     F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>>,
 {
-    let request_id = registration.request_id;
+    let request_id = registration.request_id();
     loop {
         let frame =
             tokio::time::timeout_at(deadline, read_ber_message(stream, target, max_message_size))
@@ -606,13 +607,13 @@ where
             continue;
         }
 
-        match registration.correlation.evaluate(&frame, true) {
-            CorrelationResult::Match => {}
-            CorrelationResult::AcceptedCommunityMismatch => {
+        match registration.evaluate_response_identity(&frame, true) {
+            ResponseIdentity::Match => {}
+            ResponseIdentity::AcceptedCommunityMismatch => {
                 tracing::warn!(target: "async_snmp::transport::tcp", { request_id, %target }, "accepted rewritten response community");
             }
-            CorrelationResult::Reject => {
-                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "response rejected by community correlation");
+            ResponseIdentity::Reject => {
+                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "response rejected by registered identity correlation");
                 continue;
             }
         }
@@ -889,7 +890,7 @@ mod tests {
         transport.send(&request).await.unwrap();
 
         // Receive response
-        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let registration = RequestRegistration::test_unchecked(1, Duration::from_secs(5));
         let (response, source) = transport.recv(registration).await.unwrap();
 
         assert_eq!(source, server_addr);
@@ -918,7 +919,7 @@ mod tests {
         });
 
         let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let registration = RequestRegistration::test_unchecked(1, Duration::from_secs(5));
         let (response, _) = transport
             .request(&build_request_with_id(1), registration)
             .await
@@ -1032,7 +1033,8 @@ mod tests {
                 let request_id = i + 1;
                 let request = build_request_with_id(request_id);
 
-                let registration = RequestRegistration::v3(request_id, Duration::from_secs(5));
+                let registration =
+                    RequestRegistration::test_unchecked(request_id, Duration::from_secs(5));
                 let (response, _) = transport.request(&request, registration).await?;
 
                 // Verify we got a valid response
@@ -1152,7 +1154,7 @@ mod tests {
         let registration = RequestRegistration::community(
             77,
             Duration::from_secs(2),
-            crate::Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             super::super::CommunityResponsePolicy::Exact,
         );
@@ -1181,7 +1183,7 @@ mod tests {
         let (response, _) = transport
             .request(
                 &build_request_with_id(91),
-                RequestRegistration::v3(91, Duration::from_secs(2)),
+                RequestRegistration::test_unchecked(91, Duration::from_secs(2)),
             )
             .await
             .unwrap();
@@ -1206,8 +1208,8 @@ mod tests {
             });
 
             let transport = TcpTransport::connect(addr).await.unwrap();
-            let registration =
-                RequestRegistration::v3(100, Duration::from_secs(2)).with_aliases([101, 102]);
+            let registration = RequestRegistration::test_unchecked(100, Duration::from_secs(2))
+                .with_aliases([101, 102]);
             let (response, _) = transport
                 .request(&build_request_with_id(100), registration)
                 .await
@@ -1270,7 +1272,7 @@ mod tests {
         let registration = RequestRegistration::community(
             78,
             Duration::from_secs(2),
-            crate::Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             super::super::CommunityResponsePolicy::Exact,
         );

@@ -28,17 +28,8 @@
 use bytes::Bytes;
 
 use crate::v3::UsmConfig;
+pub use crate::version::CommunityVersion;
 use crate::version::Version;
-
-/// SNMP version for community-based authentication.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum CommunityVersion {
-    /// `SNMPv1`
-    V1,
-    /// `SNMPv2c`
-    #[default]
-    V2c,
-}
 
 /// Authentication configuration for SNMP clients.
 ///

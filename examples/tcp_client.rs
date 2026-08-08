@@ -81,12 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Reliable: {}", transport.is_reliable()); // Always true for TCP
 
             // Use Client::new for manual transport construction
-            let config = ClientConfig {
-                auth: Auth::v2c("public"),
-                timeout: Duration::from_secs(10),
-                response_shape_policy: ResponseShapePolicy::Strict,
-                ..Default::default()
-            };
+            let mut config = ClientConfig::default();
+            config.auth = Auth::v2c("public");
+            config.timeout = Duration::from_secs(10);
+            config.response_shape_policy = ResponseShapePolicy::Strict;
             let client = Client::new(transport, config)?;
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
@@ -111,11 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(transport) => {
             println!("Connected with {}s timeout", connect_timeout.as_secs());
 
-            let config = ClientConfig {
-                auth: Auth::v2c("public"),
-                timeout: Duration::from_secs(10),
-                ..Default::default()
-            };
+            let mut config = ClientConfig::default();
+            config.auth = Auth::v2c("public");
+            config.timeout = Duration::from_secs(10);
             let client = Client::new(transport, config)?;
 
             // Walk system subtree over TCP

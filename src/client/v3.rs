@@ -1405,7 +1405,7 @@ mod tests {
             &self,
             registration: RequestRegistration,
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
-            let request_id = registration.request_id;
+            let request_id = registration.request_id();
             let count = self.recv_count.fetch_add(1, Ordering::Relaxed);
             let peer = self.peer;
             let engine_id = self.engine_id.clone();

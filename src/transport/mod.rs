@@ -25,7 +25,7 @@ use crate::ber::length::parse_ber_length;
 use crate::error::Error;
 use crate::error::Result;
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_LIMITS};
-use crate::version::Version;
+use crate::version::{CommunityVersion, Version};
 use bytes::Bytes;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -85,9 +85,9 @@ pub enum CommunityResponsePolicy {
     AllowMismatchFromAnySource,
 }
 
-/// Response identity supplied when registering an in-flight request.
+/// Protocol-specific response identity held inside a request registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResponseCorrelation {
+pub(crate) enum ResponseCorrelation {
     /// SNMPv1/v2c responses must match this version and community policy.
     Community {
         /// Expected SNMP version.
@@ -99,17 +99,55 @@ pub enum ResponseCorrelation {
     },
     /// SNMPv3 correlation uses msgID and its existing authenticated checks.
     V3,
+    #[cfg(test)]
+    Unchecked,
 }
 
 /// Correlation metadata for an in-flight request.
+///
+/// Construct registrations with [`Self::community`] or [`Self::v3`]. Identity,
+/// community, and deadline metadata is read-only after construction; aliases
+/// are normalized by [`Self::with_aliases`].
+///
+/// ```compile_fail
+/// use async_snmp::RequestRegistration;
+/// use std::time::Duration;
+///
+/// let mut registration = RequestRegistration::v3(7, Duration::from_secs(1));
+/// registration.request_id = 8;
+/// ```
+///
+/// Protocol-specific correlation details are intentionally internal rather
+/// than a separately constructible public enum:
+///
+/// ```compile_fail
+/// use async_snmp::transport::ResponseCorrelation;
+/// ```
+///
+/// Community registrations accept only [`CommunityVersion`], so an SNMPv3
+/// registration cannot be constructed through the community API:
+///
+/// ```compile_fail
+/// use async_snmp::{CommunityResponsePolicy, RequestRegistration, Version};
+/// use bytes::Bytes;
+/// use std::time::Duration;
+///
+/// RequestRegistration::community(
+///     7,
+///     Duration::from_secs(1),
+///     Version::V3,
+///     Bytes::from_static(b"public"),
+///     CommunityResponsePolicy::Exact,
+/// );
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestRegistration {
     /// Request ID (v1/v2c) or msgID (v3).
-    pub request_id: i32,
+    request_id: i32,
     /// Overall response deadline duration.
-    pub timeout: Duration,
+    timeout: Duration,
     /// Protocol-specific response identity.
-    pub correlation: ResponseCorrelation,
+    correlation: ResponseCorrelation,
     /// Prior transmission IDs that may still receive a response for this operation.
     aliases: Vec<i32>,
 }
@@ -120,7 +158,7 @@ impl RequestRegistration {
     pub fn community(
         request_id: i32,
         timeout: Duration,
-        version: Version,
+        version: CommunityVersion,
         community: Bytes,
         policy: CommunityResponsePolicy,
     ) -> Self {
@@ -128,7 +166,7 @@ impl RequestRegistration {
             request_id,
             timeout,
             correlation: ResponseCorrelation::Community {
-                version,
+                version: version.into(),
                 community,
                 policy,
             },
@@ -147,7 +185,20 @@ impl RequestRegistration {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn test_unchecked(request_id: i32, timeout: Duration) -> Self {
+        Self {
+            request_id,
+            timeout,
+            correlation: ResponseCorrelation::Unchecked,
+            aliases: Vec::new(),
+        }
+    }
+
     /// Attach prior transmission IDs to this registration.
+    ///
+    /// The primary ID and duplicate aliases are omitted so transports can
+    /// reserve and correlate one coherent set of IDs.
     #[must_use]
     pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = i32>) -> Self {
         self.aliases.clear();
@@ -159,49 +210,106 @@ impl RequestRegistration {
         self
     }
 
+    /// Primary request ID (v1/v2c) or message ID (v3).
+    #[must_use]
+    pub const fn request_id(&self) -> i32 {
+        self.request_id
+    }
+
+    /// Duration from registration to the absolute response deadline.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Prior transmission IDs accepted for this operation.
     #[must_use]
     pub fn aliases(&self) -> &[i32] {
         &self.aliases
     }
+
+    /// Evaluate transport-level response identity without consuming the exchange.
+    ///
+    /// This checks the outer request ID (or SNMPv3 `msgID`) against the primary
+    /// ID and aliases, verifies the registered protocol version, and applies
+    /// the configured community response policy. `source_is_target` must report
+    /// whether the packet source equals the transport's configured target.
+    ///
+    /// A matching identity is only a candidate. Callers must still decode and
+    /// validate the response PDU and, for SNMPv3, perform the required security
+    /// and scoped-PDU checks before accepting it.
+    #[must_use]
+    pub fn evaluate_response_identity(
+        &self,
+        data: &[u8],
+        source_is_target: bool,
+    ) -> ResponseIdentity {
+        #[cfg(test)]
+        if matches!(self.correlation, ResponseCorrelation::Unchecked) {
+            return ResponseIdentity::Match;
+        }
+
+        let Some(response_id) = extract_request_id(data) else {
+            return ResponseIdentity::Reject;
+        };
+        if response_id != self.request_id && !self.aliases.contains(&response_id) {
+            return ResponseIdentity::Reject;
+        }
+
+        self.correlation.evaluate(data, source_is_target)
+    }
 }
 
+/// Result of evaluating immutable transport-level response identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CorrelationResult {
+pub enum ResponseIdentity {
+    /// The registered outer ID, version, and community matched exactly.
     Match,
+    /// The outer ID and version matched, and the community rewrite policy
+    /// explicitly accepted a different community.
     AcceptedCommunityMismatch,
+    /// The packet did not match the registered response identity.
     Reject,
 }
 
 impl ResponseCorrelation {
-    pub(crate) fn evaluate(&self, data: &[u8], source_is_target: bool) -> CorrelationResult {
+    fn evaluate(&self, data: &[u8], source_is_target: bool) -> ResponseIdentity {
+        #[cfg(test)]
+        if matches!(self, Self::Unchecked) {
+            return ResponseIdentity::Match;
+        }
+
         let Self::Community {
             version,
             community,
             policy,
         } = self
         else {
-            return CorrelationResult::Match;
+            return if extract_message_version(data) == Some(Version::V3) {
+                ResponseIdentity::Match
+            } else {
+                ResponseIdentity::Reject
+            };
         };
 
         let Some((actual_version, actual_community)) = extract_community_identity(data) else {
-            return CorrelationResult::Reject;
+            return ResponseIdentity::Reject;
         };
         if actual_version != *version {
-            return CorrelationResult::Reject;
+            return ResponseIdentity::Reject;
         }
         if actual_community == community.as_ref() {
-            return CorrelationResult::Match;
+            return ResponseIdentity::Match;
         }
         match policy {
-            CommunityResponsePolicy::Exact => CorrelationResult::Reject,
+            CommunityResponsePolicy::Exact => ResponseIdentity::Reject,
             CommunityResponsePolicy::AllowMismatchFromTarget if source_is_target => {
-                CorrelationResult::AcceptedCommunityMismatch
+                ResponseIdentity::AcceptedCommunityMismatch
             }
             CommunityResponsePolicy::AllowMismatchFromAnySource => {
-                CorrelationResult::AcceptedCommunityMismatch
+                ResponseIdentity::AcceptedCommunityMismatch
             }
-            CommunityResponsePolicy::AllowMismatchFromTarget => CorrelationResult::Reject,
+            CommunityResponsePolicy::AllowMismatchFromTarget => ResponseIdentity::Reject,
         }
     }
 }
@@ -242,8 +350,11 @@ pub trait Transport: Send + Sync {
     ///
     /// Transports with out-of-band demultiplexing must install the registration
     /// as part of this future and remove it whenever the future completes or is
-    /// dropped. [`Candidate::Reject`] retains that same registration and its
-    /// original absolute deadline. Validator errors are fatal local errors.
+    /// dropped. Implementors use
+    /// [`RequestRegistration::evaluate_response_identity`] before invoking the
+    /// caller's validator; [`ResponseIdentity::Reject`] and
+    /// [`Candidate::Reject`] both retain that same registration and its original
+    /// absolute deadline. Validator errors are fatal local errors.
     #[cfg(not(test))]
     fn recv_with<T, F>(
         &self,
@@ -305,7 +416,7 @@ pub trait Transport: Send + Sync {
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
         async move {
-            checked_deadline(registration.timeout, "transport timeout")?;
+            checked_deadline(registration.timeout(), "transport timeout")?;
             self.send(data).await?;
             self.recv_with(registration, validate).await
         }
@@ -353,12 +464,9 @@ pub(crate) fn checked_deadline(timeout: Duration, description: &str) -> Result<I
 // Correlation envelope extraction (shared between transports)
 // ============================================================================
 
-/// Extract a checked v1/v2c version and borrowed community without allocating.
-///
-/// All length arithmetic is checked and the outer BER frame must exactly cover
-/// the supplied packet. Malformed, truncated, v3, and overlong envelopes do not
-/// produce an identity match.
-pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])> {
+/// Extract a checked protocol version and return the position after its BER
+/// INTEGER plus the exact outer content end.
+fn extract_message_envelope(data: &[u8]) -> Option<(Version, usize, usize)> {
     if data.first().copied()? != 0x30 {
         return None;
     }
@@ -380,12 +488,24 @@ pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])
     if version_end > content_end || version_len == 0 || version_len > 4 {
         return None;
     }
-    let version_num = decode_ber_signed_integer(data.get(pos..version_end)?);
-    let version = Version::from_i32(version_num)?;
+    let version = Version::from_i32(decode_ber_signed_integer(data.get(pos..version_end)?))?;
+    Some((version, version_end, content_end))
+}
+
+fn extract_message_version(data: &[u8]) -> Option<Version> {
+    extract_message_envelope(data).map(|(version, _, _)| version)
+}
+
+/// Extract a checked v1/v2c version and borrowed community without allocating.
+///
+/// All length arithmetic is checked and the outer BER frame must exactly cover
+/// the supplied packet. Malformed, truncated, v3, and overlong envelopes do not
+/// produce an identity match.
+pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])> {
+    let (version, mut pos, content_end) = extract_message_envelope(data)?;
     if !matches!(version, Version::V1 | Version::V2c) {
         return None;
     }
-    pos = version_end;
 
     if *data.get(pos)? != 0x04 {
         return None;
@@ -418,131 +538,86 @@ pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])
 ///
 /// We need to navigate through BER encoding to find the appropriate ID.
 pub(crate) fn extract_request_id(data: &[u8]) -> Option<i32> {
-    let mut pos = 0;
-
-    // Outer SEQUENCE
-    if pos >= data.len() || data[pos] != 0x30 {
-        return None;
-    }
-    pos += 1;
-
-    // Skip outer SEQUENCE length
-    let (_, consumed) = parse_ber_length(&data[pos..])?;
-    pos += consumed;
-
-    // Version (INTEGER)
-    if pos >= data.len() || data[pos] != 0x02 {
-        return None;
-    }
-    pos += 1;
-    let (version_len, consumed) = parse_ber_length(&data[pos..])?;
-    pos += consumed;
-
-    // Read version value
-    if pos + version_len > data.len() {
-        return None;
-    }
-    let version = if version_len == 1 {
-        i32::from(data[pos])
-    } else {
-        // Multi-byte version (unusual but handle it)
-        let mut v: i32 = 0;
-        for i in 0..version_len {
-            v = (v << 8) | i32::from(data[pos + i]);
-        }
-        v
-    };
-    pos += version_len;
-
-    // Check what comes next to determine V1/V2c vs V3
-    if pos >= data.len() {
-        return None;
-    }
-
-    let next_tag = data[pos];
-
-    if version == 3 && next_tag == 0x30 {
-        // V3: Next is msgGlobalData SEQUENCE, extract msgID from it
-        extract_v3_msg_id(data, pos)
-    } else if next_tag == 0x04 {
-        // V1/V2c: Next is community OCTET STRING
-        extract_v1v2c_request_id(data, pos)
-    } else {
-        None
+    let (version, pos, content_end) = extract_message_envelope(data)?;
+    match version {
+        Version::V1 | Version::V2c => extract_v1v2c_request_id(data, pos, content_end),
+        Version::V3 => extract_v3_msg_id(data, pos, content_end),
     }
 }
 
 /// Extract msgID from V3 message starting at msgGlobalData position.
-fn extract_v3_msg_id(data: &[u8], mut pos: usize) -> Option<i32> {
+fn extract_v3_msg_id(data: &[u8], mut pos: usize, outer_end: usize) -> Option<i32> {
     // msgGlobalData SEQUENCE
-    if pos >= data.len() || data[pos] != 0x30 {
+    if *data.get(pos)? != 0x30 {
         return None;
     }
-    pos += 1;
-
-    // Skip msgGlobalData SEQUENCE length
-    let (_, consumed) = parse_ber_length(&data[pos..])?;
-    pos += consumed;
-
-    // First INTEGER inside msgGlobalData is msgID
-    if pos >= data.len() || data[pos] != 0x02 {
-        return None;
-    }
-    pos += 1;
-
-    // Read msgID length
-    let (id_len, consumed) = parse_ber_length(&data[pos..])?;
-    pos += consumed;
-
-    if pos + id_len > data.len() {
+    pos = pos.checked_add(1)?;
+    let (global_len, consumed) = parse_ber_length(data.get(pos..)?)?;
+    pos = pos.checked_add(consumed)?;
+    let global_end = pos.checked_add(global_len)?;
+    if global_end > outer_end {
         return None;
     }
 
-    // Decode msgID (signed integer, big-endian)
-    Some(decode_ber_signed_integer(&data[pos..pos + id_len]))
+    // First INTEGER inside msgGlobalData is msgID. Its complete encoding must
+    // be contained by msgGlobalData rather than merely appearing later in the
+    // outer packet.
+    if *data.get(pos)? != 0x02 {
+        return None;
+    }
+    pos = pos.checked_add(1)?;
+    let (id_len, consumed) = parse_ber_length(data.get(pos..)?)?;
+    pos = pos.checked_add(consumed)?;
+    let id_end = pos.checked_add(id_len)?;
+    if id_len == 0 || id_len > 4 || id_end > global_end {
+        return None;
+    }
+
+    Some(decode_ber_signed_integer(data.get(pos..id_end)?))
 }
 
 /// Extract `request_id` from V1/V2c message starting at community position.
-fn extract_v1v2c_request_id(data: &[u8], mut pos: usize) -> Option<i32> {
+fn extract_v1v2c_request_id(data: &[u8], mut pos: usize, outer_end: usize) -> Option<i32> {
     // Community (OCTET STRING)
-    if pos >= data.len() || data[pos] != 0x04 {
+    if *data.get(pos)? != 0x04 {
         return None;
     }
-    pos += 1;
-    let (community_len, consumed) = parse_ber_length(&data[pos..])?;
-    pos += consumed + community_len;
+    pos = pos.checked_add(1)?;
+    let (community_len, consumed) = parse_ber_length(data.get(pos..)?)?;
+    pos = pos.checked_add(consumed)?;
+    pos = pos.checked_add(community_len)?;
+    if pos > outer_end {
+        return None;
+    }
 
     // PDU (context-specific, e.g., 0xA2 for Response)
-    if pos >= data.len() {
-        return None;
-    }
-    let pdu_tag = data[pos];
-    // PDU tags are 0xA0-0xA8
+    let pdu_tag = *data.get(pos)?;
     if !(0xA0..=0xA8).contains(&pdu_tag) {
         return None;
     }
-    pos += 1;
-
-    // Skip PDU length
-    let (_, consumed) = parse_ber_length(&data[pos..])?;
-    pos += consumed;
-
-    // Request ID (INTEGER)
-    if pos >= data.len() || data[pos] != 0x02 {
-        return None;
-    }
-    pos += 1;
-
-    // Read request_id length
-    let (id_len, consumed) = parse_ber_length(&data[pos..])?;
-    pos += consumed;
-
-    if pos + id_len > data.len() {
+    pos = pos.checked_add(1)?;
+    let (pdu_len, consumed) = parse_ber_length(data.get(pos..)?)?;
+    pos = pos.checked_add(consumed)?;
+    let pdu_end = pos.checked_add(pdu_len)?;
+    if pdu_end > outer_end {
         return None;
     }
 
-    // Decode request_id (signed integer, big-endian)
-    Some(decode_ber_signed_integer(&data[pos..pos + id_len]))
+    // The complete request-id INTEGER must be contained by the PDU. Structural
+    // and security validation beyond this shallow identity stays in the caller
+    // validator.
+    if *data.get(pos)? != 0x02 {
+        return None;
+    }
+    pos = pos.checked_add(1)?;
+    let (id_len, consumed) = parse_ber_length(data.get(pos..)?)?;
+    pos = pos.checked_add(consumed)?;
+    let id_end = pos.checked_add(id_len)?;
+    if id_len == 0 || id_len > 4 || id_end > pdu_end {
+        return None;
+    }
+
+    Some(decode_ber_signed_integer(data.get(pos..id_end)?))
 }
 
 /// Decode a BER-encoded signed integer.

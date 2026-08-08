@@ -25,6 +25,19 @@ const AUTH_PASSWORD: &str = "authpassword123";
 const PRIV_PASSWORD: &str = "privpassword123";
 const LOOPBACK_TIMEOUT: Duration = Duration::from_millis(250);
 
+fn client_config(
+    auth: Auth,
+    retry: Retry,
+    allow_unauthenticated_v3_time_correction: bool,
+) -> ClientConfig {
+    let mut config = ClientConfig::default();
+    config.auth = auth;
+    config.timeout = LOOPBACK_TIMEOUT;
+    config.retry = retry;
+    config.allow_unauthenticated_v3_time_correction = allow_unauthenticated_v3_time_correction;
+    config
+}
+
 fn user_for(level: SecurityLevel) -> UsmConfig {
     let user = UsmConfig::new(USERNAME);
     match level {
@@ -104,13 +117,11 @@ fn custom_client_with_compatibility(
     }
     Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(security),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::none(),
+        client_config(
+            Auth::Usm(security),
+            Retry::none(),
             allow_unauthenticated_v3_time_correction,
-            ..ClientConfig::default()
-        },
+        ),
     )
     .expect("valid client config")
 }
@@ -681,12 +692,7 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
     );
     let client = Client::with_engine_cache(
         transport.clone(),
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::none(),
-            ..ClientConfig::default()
-        },
+        client_config(Auth::Usm(user_for(level)), Retry::none(), false),
         cache.clone(),
     )
     .expect("valid client config");
@@ -756,12 +762,7 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     );
     let client = Client::with_engine_cache(
         transport.clone(),
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::none(),
-            ..ClientConfig::default()
-        },
+        client_config(Auth::Usm(user_for(level)), Retry::none(), false),
         cache.clone(),
     )
     .expect("valid client config");
@@ -1198,13 +1199,11 @@ async fn v3_failed_packet_local_correction_preserves_trusted_time() {
     let log = transport.log();
     let client = Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::fixed(3, Duration::ZERO),
-            allow_unauthenticated_v3_time_correction: true,
-            ..ClientConfig::default()
-        },
+        client_config(
+            Auth::Usm(user_for(level)),
+            Retry::fixed(3, Duration::ZERO),
+            true,
+        ),
     )
     .expect("valid client config");
 
@@ -1622,12 +1621,11 @@ async fn v3_repeated_time_window_report_is_typed_and_bounded() {
     let log = transport.log();
     let client = Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::fixed(5, Duration::ZERO),
-            ..ClientConfig::default()
-        },
+        client_config(
+            Auth::Usm(user_for(level)),
+            Retry::fixed(5, Duration::ZERO),
+            false,
+        ),
     )
     .expect("valid client config");
 
@@ -2608,12 +2606,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
     security = security.context_name("requested-context");
     let client = Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(security),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::none(),
-            ..ClientConfig::default()
-        },
+        client_config(Auth::Usm(security), Retry::none(), false),
     )
     .expect("valid client config");
 
@@ -2888,12 +2881,11 @@ async fn v3_custom_transport_accepts_late_response_to_prior_attempt() {
     let log = transport.log();
     let client = Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::fixed(1, Duration::ZERO),
-            ..ClientConfig::default()
-        },
+        client_config(
+            Auth::Usm(user_for(level)),
+            Retry::fixed(1, Duration::ZERO),
+            false,
+        ),
     )
     .expect("valid client config");
 
@@ -2949,12 +2941,7 @@ async fn v3_pre_correction_msg_id_rejected_after_correction() {
     let log = transport.log();
     let client = Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::none(),
-            ..ClientConfig::default()
-        },
+        client_config(Auth::Usm(user_for(level)), Retry::none(), false),
     )
     .expect("valid client config");
 
@@ -3162,12 +3149,7 @@ async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
     let log = transport.log();
     let client = Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::none(),
-            ..ClientConfig::default()
-        },
+        client_config(Auth::Usm(user_for(level)), Retry::none(), false),
     )
     .expect("valid client config");
 
@@ -3230,12 +3212,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
     let log = transport.log();
     let client = Client::new(
         transport,
-        ClientConfig {
-            auth: Auth::Usm(user_for(level)),
-            timeout: LOOPBACK_TIMEOUT,
-            retry: Retry::none(),
-            ..ClientConfig::default()
-        },
+        client_config(Auth::Usm(user_for(level)), Retry::none(), false),
     )
     .expect("valid client config");
 

@@ -484,10 +484,8 @@
 //! use bytes::Bytes;
 //!
 //! // This agent over-declares bounded string lengths and has broken GETBULK.
-//! let value_policy = CompatibilityPolicy {
-//!     clamp_bounded_strings: true,
-//!     ..CompatibilityPolicy::STRICT
-//! };
+//! let mut value_policy = CompatibilityPolicy::STRICT;
+//! value_policy.clamp_bounded_strings = true;
 //!
 //! fn decode_agent_packet(
 //!     packet: Bytes,
@@ -564,7 +562,7 @@ pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
 #[cfg(feature = "agent")]
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,
-    RequestContext, Response, SecurityModel, SetResult,
+    RequestContext, SecurityModel, SetResult,
 };
 pub use message::SecurityLevel;
 pub use message_size::{
@@ -578,7 +576,7 @@ pub use notification::{
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
 pub use transport::{
-    Candidate, CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport,
+    Candidate, CommunityResponsePolicy, RequestRegistration, ResponseIdentity, TcpTransport,
     Transport, UdpHandle, UdpTransport,
 };
 pub use v3::{

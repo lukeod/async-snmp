@@ -4,6 +4,13 @@
 //! and what they are trying to access. It implements fine-grained access control
 //! through a three-table architecture.
 //!
+//! `SecurityModel` is canonical at [`crate::handler::SecurityModel`] and the
+//! crate root; it is not re-exported from this nested module.
+//!
+//! ```compile_fail
+//! use async_snmp::agent::vacm::SecurityModel;
+//! ```
+//!
 //! # Overview
 //!
 //! VACM (View-based Access Control Model) is the standard access control mechanism
@@ -169,7 +176,7 @@ use bytes::Bytes;
 use crate::message::SecurityLevel;
 use crate::oid::Oid;
 
-pub use crate::handler::SecurityModel;
+use crate::handler::SecurityModel;
 
 /// Security model selector used by VACM mappings and access entries.
 ///

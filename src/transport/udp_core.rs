@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use super::{
-    Candidate, CorrelationResult, RequestRegistration, ResponseCorrelation, checked_deadline,
-};
+use super::{Candidate, RequestRegistration, ResponseIdentity, checked_deadline};
 use crate::error::{Error, Result};
 
 const SHARDS: usize = 64;
@@ -92,7 +90,7 @@ struct ResponseSlot {
     target_source: SocketAddr,
     /// When true, only responses from exactly the target are delivered.
     strict_source: bool,
-    correlation: ResponseCorrelation,
+    registration: RequestRegistration,
 }
 
 enum PendingEntry {
@@ -200,9 +198,9 @@ impl UdpCore {
         target_source: SocketAddr,
         strict_source: bool,
     ) -> Result<UdpRegistration> {
-        let primary = registration.request_id;
+        let primary = registration.request_id();
         let now = Instant::now();
-        let deadline = checked_deadline(registration.timeout, "UDP timeout")?;
+        let deadline = checked_deadline(registration.timeout(), "UDP timeout")?;
         let aliases = registration.aliases().to_vec();
 
         let mut ids = Vec::with_capacity(1 + aliases.len());
@@ -264,7 +262,7 @@ impl UdpCore {
             owner: owner.clone(),
             target_source,
             strict_source,
-            correlation: registration.correlation,
+            registration,
         };
 
         let primary_shard = Self::shard_index(primary);
@@ -349,17 +347,20 @@ impl UdpCore {
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by strict source correlation");
                 return false;
             }
-            match slot.correlation.evaluate(&data, source_is_target) {
-                CorrelationResult::Reject => {
+            match slot
+                .registration
+                .evaluate_response_identity(&data, source_is_target)
+            {
+                ResponseIdentity::Reject => {
                     drop(pending);
                     self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by community correlation");
                     return false;
                 }
-                CorrelationResult::AcceptedCommunityMismatch => {
+                ResponseIdentity::AcceptedCommunityMismatch => {
                     tracing::warn!(target: "async_snmp::transport::udp", { request_id, %source }, "accepted rewritten response community");
                 }
-                CorrelationResult::Match => {}
+                ResponseIdentity::Match => {}
             }
             if slot
                 .responses
@@ -568,7 +569,7 @@ mod tests {
         strict: bool,
     ) -> UdpRegistration {
         core.register(
-            RequestRegistration::v3(request_id, timeout),
+            RequestRegistration::test_unchecked(request_id, timeout),
             test_addr(),
             strict,
         )
@@ -655,7 +656,7 @@ mod tests {
         let target = test_addr();
         let registration = core
             .register(
-                RequestRegistration::v3(2, Duration::from_secs(5)).with_aliases([1]),
+                RequestRegistration::test_unchecked(2, Duration::from_secs(5)).with_aliases([1]),
                 target,
                 false,
             )
@@ -690,7 +691,8 @@ mod tests {
         let target = test_addr();
         let first = core
             .register(
-                RequestRegistration::v3(20, Duration::from_secs(30)).with_aliases([10, 11]),
+                RequestRegistration::test_unchecked(20, Duration::from_secs(30))
+                    .with_aliases([10, 11]),
                 target,
                 false,
             )
@@ -875,7 +877,7 @@ mod tests {
                 RequestRegistration::community(
                     request_id,
                     Duration::from_secs(5),
-                    crate::Version::V2c,
+                    crate::CommunityVersion::V2c,
                     Bytes::from_static(b"public"),
                     CommunityResponsePolicy::Exact,
                 ),

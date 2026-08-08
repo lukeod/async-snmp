@@ -570,7 +570,7 @@ mod tests {
             .inner
             .core
             .register(
-                RequestRegistration::v3(request_id, timeout),
+                RequestRegistration::test_unchecked(request_id, timeout),
                 handle.target,
                 handle.strict_source,
             )

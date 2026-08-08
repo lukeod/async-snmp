@@ -1,5 +1,15 @@
 //! SNMP version enumeration.
 
+/// SNMP version for community-based authentication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CommunityVersion {
+    /// `SNMPv1`
+    V1,
+    /// `SNMPv2c`
+    #[default]
+    V2c,
+}
+
 /// SNMP protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -12,6 +22,15 @@ pub enum Version {
     V2c,
     /// `SNMPv3` (RFC 3411-3418)
     V3,
+}
+
+impl From<CommunityVersion> for Version {
+    fn from(version: CommunityVersion) -> Self {
+        match version {
+            CommunityVersion::V1 => Self::V1,
+            CommunityVersion::V2c => Self::V2c,
+        }
+    }
 }
 
 impl Version {

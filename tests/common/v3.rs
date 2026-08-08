@@ -951,7 +951,7 @@ impl Transport for ScriptedTransport {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<async_snmp::Candidate<T>> + Send,
     {
-        let request_id = registration.request_id;
+        let request_id = registration.request_id();
         let (request, step) = self
             .0
             .state

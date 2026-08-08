@@ -172,6 +172,7 @@ struct ClientInner<T: Transport> {
 /// };
 /// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Authentication and corresponding SNMP version (default: V2c "public").
     pub auth: Auth,
@@ -388,11 +389,16 @@ impl<T: Transport> Client<T> {
 
             // Register (or re-register) with fresh deadline before sending
             let version = self.inner.config.version();
+            let community_version = match version {
+                Version::V1 => CommunityVersion::V1,
+                Version::V2c => CommunityVersion::V2c,
+                Version::V3 => unreachable!("community request path cannot use SNMPv3"),
+            };
             let community = self.inner.config.community()?;
             let registration = crate::transport::RequestRegistration::community(
                 request_id,
                 self.inner.config.timeout,
-                version,
+                community_version,
                 community.clone(),
                 self.inner.config.community_response_policy,
             );
