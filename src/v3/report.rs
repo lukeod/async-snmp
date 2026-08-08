@@ -60,7 +60,7 @@ pub struct MalformedReport;
 /// USM report objects must carry a `Counter32`; unknown report objects preserve
 /// their value in [`ReportStatus::Other`].
 pub fn classify_report(pdu: &Pdu) -> Result<ReportStatus, MalformedReport> {
-    if pdu.pdu_type != PduType::Report || pdu.error_status != 0 || pdu.error_index != 0 {
+    if pdu.pdu_type() != PduType::Report || pdu.error_status() != 0 || pdu.error_index() != 0 {
         return Err(MalformedReport);
     }
 
@@ -115,13 +115,13 @@ mod tests {
     use crate::{VarBind, oid};
 
     fn report(oid: Oid, value: Value) -> Pdu {
-        Pdu {
-            pdu_type: PduType::Report,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(oid, value)],
-        }
+        Pdu::standard(
+            crate::pdu::StandardPduType::Report,
+            1,
+            0,
+            0,
+            vec![VarBind::new(oid, value)],
+        )
     }
 
     #[test]
@@ -178,15 +178,15 @@ mod tests {
         let valid = report(report_oids::not_in_time_windows(), Value::Counter32(1));
 
         let mut non_report = valid.clone();
-        non_report.pdu_type = PduType::Response;
+        assert!(non_report.set_standard_pdu_type(crate::pdu::StandardPduType::Response));
         assert_eq!(classify_report(&non_report), Err(MalformedReport));
 
         let mut status = valid.clone();
-        status.error_status = 1;
+        assert!(status.set_error_status(1));
         assert_eq!(classify_report(&status), Err(MalformedReport));
 
         let mut index = valid.clone();
-        index.error_index = 1;
+        assert!(index.set_error_index(1));
         assert_eq!(classify_report(&index), Err(MalformedReport));
 
         let mut empty = valid.clone();

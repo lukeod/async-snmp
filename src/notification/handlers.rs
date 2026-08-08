@@ -59,7 +59,7 @@ impl super::NotificationReceiver {
             return Ok(None);
         };
 
-        match pdu.pdu_type {
+        match pdu.pdu_type() {
             PduType::TrapV2 => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
@@ -172,7 +172,7 @@ impl super::NotificationReceiver {
         let context_name = scoped_pdu.context_name.clone();
         let pdu = &scoped_pdu.pdu;
 
-        match pdu.pdu_type {
+        match pdu.pdu_type() {
             PduType::TrapV2 => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;

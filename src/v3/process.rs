@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(report_usm.engine_id, engine_id);
         assert_eq!(report_usm.engine_boots, 7);
         let pdu = report.pdu().unwrap();
-        assert_eq!(pdu.pdu_type, PduType::Report);
+        assert_eq!(pdu.pdu_type(), PduType::Report);
         assert_eq!(pdu.varbinds[0].oid, report_oids::unknown_engine_ids());
     }
 

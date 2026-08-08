@@ -513,7 +513,7 @@ pub use notification::{
     validate_notification_varbinds,
 };
 pub use oid::Oid;
-pub use pdu::{GenericTrap, Pdu, PduType, TrapV1Pdu};
+pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
 pub use transport::{
     CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport, Transport,
     UdpHandle, UdpTransport,

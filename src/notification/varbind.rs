@@ -99,16 +99,15 @@ pub fn validate_notification_varbinds(pdu: &Pdu) -> bool {
 mod tests {
     use super::*;
     use crate::oid;
-    use crate::pdu::PduType;
 
     #[test]
     fn test_extract_notification_varbinds() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oids::sys_uptime(), Value::TimeTicks(12345)),
                 VarBind::new(
                     oids::snmp_trap_oid(),
@@ -116,7 +115,7 @@ mod tests {
                 ),
                 VarBind::new(oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1), Value::Integer(1)),
             ],
-        };
+        );
 
         let (uptime, trap_oid, varbinds) =
             extract_notification_varbinds(&pdu, NotificationVarbindValidation::Tolerant).unwrap();
@@ -127,13 +126,13 @@ mod tests {
 
     #[test]
     fn test_extract_notification_varbinds_too_few() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(oids::sys_uptime(), Value::TimeTicks(12345))],
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![VarBind::new(oids::sys_uptime(), Value::TimeTicks(12345))],
+        );
 
         for policy in [
             NotificationVarbindValidation::Tolerant,
@@ -145,16 +144,16 @@ mod tests {
 
     #[test]
     fn tolerant_accepts_nonstandard_prefix_names_but_strict_rejects_them() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oid!(1, 2, 3, 4), Value::TimeTicks(12345)),
                 VarBind::new(oid!(1, 2, 3, 5), Value::ObjectIdentifier(oids::link_down())),
             ],
-        };
+        );
 
         let result =
             extract_notification_varbinds(&pdu, NotificationVarbindValidation::Tolerant).unwrap();
@@ -181,13 +180,7 @@ mod tests {
                 VarBind::new(oid!(1, 2, 3, 4), Value::ObjectIdentifier(oids::link_down())),
             ],
         ] {
-            let pdu = Pdu {
-                pdu_type: PduType::TrapV2,
-                request_id: 1,
-                error_status: 0,
-                error_index: 0,
-                varbinds,
-            };
+            let pdu = Pdu::standard(crate::pdu::StandardPduType::TrapV2, 1, 0, 0, varbinds);
             assert!(
                 extract_notification_varbinds(&pdu, NotificationVarbindValidation::Strict).is_err()
             );
@@ -209,13 +202,7 @@ mod tests {
                 VarBind::new(oids::snmp_trap_oid(), Value::Integer(1)),
             ],
         ] {
-            let pdu = Pdu {
-                pdu_type: PduType::TrapV2,
-                request_id: 1,
-                error_status: 0,
-                error_index: 0,
-                varbinds,
-            };
+            let pdu = Pdu::standard(crate::pdu::StandardPduType::TrapV2, 1, 0, 0, varbinds);
             for policy in [
                 NotificationVarbindValidation::Tolerant,
                 NotificationVarbindValidation::Strict,
@@ -227,31 +214,31 @@ mod tests {
 
     #[test]
     fn test_validate_notification_varbinds_valid() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oids::sys_uptime(), Value::TimeTicks(12345)),
                 VarBind::new(
                     oids::snmp_trap_oid(),
                     Value::ObjectIdentifier(oids::link_down()),
                 ),
             ],
-        };
+        );
 
         assert!(validate_notification_varbinds(&pdu));
     }
 
     #[test]
     fn test_validate_notification_varbinds_wrong_first_oid() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 // Wrong OID for first varbind
                 VarBind::new(oid!(1, 2, 3, 4), Value::TimeTicks(12345)),
                 VarBind::new(
@@ -259,36 +246,36 @@ mod tests {
                     Value::ObjectIdentifier(oids::link_down()),
                 ),
             ],
-        };
+        );
 
         assert!(!validate_notification_varbinds(&pdu));
     }
 
     #[test]
     fn test_validate_notification_varbinds_wrong_second_oid() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oids::sys_uptime(), Value::TimeTicks(12345)),
                 // Wrong OID for second varbind
                 VarBind::new(oid!(1, 2, 3, 4), Value::ObjectIdentifier(oids::link_down())),
             ],
-        };
+        );
 
         assert!(!validate_notification_varbinds(&pdu));
     }
 
     #[test]
     fn test_validate_notification_varbinds_wrong_first_type() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 // Wrong value type for first varbind (should be TimeTicks)
                 VarBind::new(oids::sys_uptime(), Value::Integer(12345)),
                 VarBind::new(
@@ -296,40 +283,40 @@ mod tests {
                     Value::ObjectIdentifier(oids::link_down()),
                 ),
             ],
-        };
+        );
 
         assert!(!validate_notification_varbinds(&pdu));
     }
 
     #[test]
     fn test_validate_notification_varbinds_wrong_second_type() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oids::sys_uptime(), Value::TimeTicks(12345)),
                 // Wrong value type for second varbind (should be OID)
                 VarBind::new(oids::snmp_trap_oid(), Value::Integer(1)),
             ],
-        };
+        );
 
         assert!(!validate_notification_varbinds(&pdu));
     }
 
     #[test]
     fn test_validate_notification_varbinds_too_few() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::TrapV2,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oids::sys_uptime(), Value::TimeTicks(12345)),
                 // Missing second varbind
             ],
-        };
+        );
 
         assert!(!validate_notification_varbinds(&pdu));
     }

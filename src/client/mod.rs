@@ -50,7 +50,7 @@ impl Client<UdpHandle> {
 use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
-use crate::pdu::{GetBulkPdu, Pdu, PduType, TrapV1Pdu};
+use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::transport::Transport;
 use crate::transport::UdpHandle;
 use crate::v3::{EngineCache, EngineState, SaltCounter};
@@ -88,8 +88,7 @@ pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 /// (0..2147483647)`. `ClientBuilder::max_repetitions` takes a `u32`, so a
 /// configured value above `i32::MAX` would wrap to a negative number under a
 /// plain `as i32` cast; this saturates to `i32::MAX` instead, which
-/// `GetBulkPdu::encode`'s own clamp (`.max(0)`) would otherwise silently turn
-/// into `0` (disabling repetitions).
+/// the PDU encoder would otherwise normalize to `0` (disabling repetitions).
 pub(crate) fn max_repetitions_to_wire(max_repetitions: u32) -> i32 {
     i32::try_from(max_repetitions).unwrap_or(i32::MAX)
 }
@@ -103,7 +102,7 @@ pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Err
         return None;
     }
     let status = pdu.error_status_enum();
-    let oid = (pdu.error_index as usize)
+    let oid = (pdu.error_index() as usize)
         .checked_sub(1)
         .and_then(|idx| pdu.varbinds.get(idx))
         .map(|vb| vb.oid.clone());
@@ -111,7 +110,7 @@ pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Err
         Error::Snmp {
             target,
             status,
-            index: pdu.error_index.try_into().unwrap_or(0),
+            index: pdu.error_index().try_into().unwrap_or(0),
             oid,
         }
         .boxed(),
@@ -467,8 +466,8 @@ impl<T: Transport> Client<T> {
 
                     // RFC 3416 Section 4.2: only a Response-PDU may answer a
                     // request; reject echoed request-type PDUs
-                    if response_pdu.pdu_type != PduType::Response {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), pdu_type = ?response_pdu.pdu_type }, "non-Response PDU in response");
+                    if response_pdu.pdu_type() != PduType::Response {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), pdu_type = ?response_pdu.pdu_type() }, "non-Response PDU in response");
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
@@ -537,7 +536,7 @@ impl<T: Transport> Client<T> {
             return self.send_v3_and_recv(pdu).await;
         }
 
-        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type, snmp.varbind_count = pdu.varbinds.len() }, "sending {} request", pdu.pdu_type);
+        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type(), snmp.varbind_count = pdu.varbinds.len() }, "sending {} request", pdu.pdu_type());
 
         let request_id = pdu.request_id;
         let message = CommunityMessage::new(
@@ -548,36 +547,7 @@ impl<T: Transport> Client<T> {
         let data = message.encode()?;
         let response = self.send_and_recv(request_id, &data).await?;
 
-        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu_type, snmp.varbind_count = response.varbinds.len(), snmp.error_status = response.error_status, snmp.error_index = response.error_index }, "received {} response", response.pdu_type);
-
-        Ok(response)
-    }
-
-    /// Send a GETBULK request and wait for response.
-    async fn send_bulk_request(&self, pdu: GetBulkPdu) -> Result<Pdu> {
-        // Dispatch to V3 handler if configured
-        if self.is_v3() {
-            // Convert GetBulkPdu to Pdu for V3 encoding
-            let pdu = Pdu::get_bulk(
-                pdu.request_id,
-                pdu.non_repeaters,
-                pdu.max_repetitions,
-                pdu.varbinds,
-            );
-            return self.send_v3_and_recv(pdu).await;
-        }
-
-        tracing::debug!(target: "async_snmp::client", { snmp.non_repeaters = pdu.non_repeaters, snmp.max_repetitions = pdu.max_repetitions, snmp.varbind_count = pdu.varbinds.len() }, "sending GetBulkRequest");
-
-        let request_id = pdu.request_id;
-        let data = CommunityMessage::encode_bulk(
-            self.inner.config.version(),
-            self.inner.config.community()?,
-            &pdu,
-        )?;
-        let response = self.send_and_recv(request_id, &data).await?;
-
-        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu_type, snmp.varbind_count = response.varbinds.len(), snmp.error_status = response.error_status, snmp.error_index = response.error_index }, "received {} response", response.pdu_type);
+        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu_type(), snmp.varbind_count = response.varbinds.len(), snmp.error_status = response.error_status(), snmp.error_index = response.error_index() }, "received {} response", response.pdu_type());
 
         Ok(response)
     }
@@ -1048,8 +1018,13 @@ impl<T: Transport> Client<T> {
         max_repetitions: i32,
     ) -> Result<Vec<VarBind>> {
         let request_id = self.next_request_id();
-        let pdu = GetBulkPdu::new(request_id, non_repeaters, max_repetitions, oids);
-        let response = self.send_bulk_request(pdu).await?;
+        let pdu = Pdu::get_bulk(
+            request_id,
+            non_repeaters,
+            max_repetitions,
+            oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
+        );
+        let response = self.send_request(pdu).await?;
         Ok(response.varbinds)
     }
 
@@ -1298,13 +1273,7 @@ mod tests {
                     })
                     .collect();
 
-                let pdu = Pdu {
-                    pdu_type: PduType::Response,
-                    request_id,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds,
-                };
+                let pdu = Pdu::response(request_id, 0, 0, varbinds);
 
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 let encoded = msg.encode().unwrap();
@@ -1379,13 +1348,7 @@ mod tests {
                 .pop_front()
                 .expect("missing scripted response");
             async move {
-                let pdu = Pdu {
-                    pdu_type: PduType::Response,
-                    request_id,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds,
-                };
+                let pdu = Pdu::response(request_id, 0, 0, varbinds);
                 let message = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 Ok((message.encode().unwrap(), "127.0.0.1:161".parse().unwrap()))
             }
@@ -2009,13 +1972,7 @@ mod tests {
             async move {
                 let pdu = if varbind_count > max {
                     // Return tooBig with empty varbinds (per RFC 3416)
-                    Pdu {
-                        pdu_type: PduType::Response,
-                        request_id,
-                        error_status: ErrorStatus::TooBig.as_i32(),
-                        error_index: 0,
-                        varbinds: vec![],
-                    }
+                    Pdu::response(request_id, ErrorStatus::TooBig.as_i32(), 0, vec![])
                 } else {
                     // Echo back one varbind per requested OID
                     let varbinds: Vec<VarBind> = (0..varbind_count)
@@ -2026,13 +1983,7 @@ mod tests {
                             )
                         })
                         .collect();
-                    Pdu {
-                        pdu_type: PduType::Response,
-                        request_id,
-                        error_status: 0,
-                        error_index: 0,
-                        varbinds,
-                    }
+                    Pdu::response(request_id, 0, 0, varbinds)
                 };
 
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
@@ -2221,16 +2172,16 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
             let request_id = self.pending.lock().unwrap().pop_front().unwrap_or(1);
             let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();
-            let pdu = Pdu {
-                pdu_type: self.pdu_type,
+            let pdu = Pdu::standard(
+                crate::pdu::StandardPduType::try_from(self.pdu_type).unwrap(),
                 request_id,
-                error_status: 0,
-                error_index: 0,
-                varbinds: vec![VarBind::new(
+                0,
+                0,
+                vec![VarBind::new(
                     Oid::from_slice(&[1, 3, 6, 1, 1]),
                     crate::value::Value::Null,
                 )],
-            };
+            );
             let community = Bytes::from_static(self.community);
             let msg = if self.respond_as_v1 {
                 CommunityMessage::v1(community, pdu)

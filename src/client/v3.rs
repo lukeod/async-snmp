@@ -647,7 +647,7 @@ impl<T: Transport> Client<T> {
             let engine_time_override = packet_local_engine_time.take();
             let request = self.build_v3_message(&pdu, msg_id, engine_time_override.as_ref())?;
 
-            tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type, snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type);
+            tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type(), snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type());
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
 
             let registration = RequestRegistration::v3(msg_id, self.inner.config.timeout)
@@ -806,7 +806,7 @@ impl<T: Transport> Client<T> {
                     // outer-msgID correlation. Strict classification prevents
                     // an OID hidden in a malformed/multi-status Report from
                     // triggering a corrected send.
-                    if scoped_pdu.pdu.pdu_type == PduType::Report {
+                    if scoped_pdu.pdu.pdu_type() == PduType::Report {
                         let status = classify_report(&scoped_pdu.pdu).map_err(|_| {
                             Error::MalformedResponse {
                                 target: self.peer_addr(),
@@ -931,8 +931,8 @@ impl<T: Transport> Client<T> {
                     // RFC 3416 Section 4.2: only a Response-PDU may answer a
                     // request; reject echoed request-type PDUs (Report PDUs
                     // were classified above)
-                    if response_pdu.pdu_type != PduType::Response {
-                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), pdu_type = ?response_pdu.pdu_type }, "non-Response PDU in response");
+                    if response_pdu.pdu_type() != PduType::Response {
+                        tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), pdu_type = ?response_pdu.pdu_type() }, "non-Response PDU in response");
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
@@ -984,7 +984,7 @@ impl<T: Transport> Client<T> {
                         }
                     }
 
-                    tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type, snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status, snmp.error_index = response_pdu.error_index }, "received V3 {} response", response_pdu.pdu_type);
+                    tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type(), snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status(), snmp.error_index = response_pdu.error_index() }, "received V3 {} response", response_pdu.pdu_type());
 
                     // Check for SNMP error
                     if let Some(err) = super::pdu_to_snmp_error(&response_pdu, self.peer_addr()) {
@@ -1374,21 +1374,21 @@ mod tests {
     /// Build a minimal valid discovery response with the given engine ID.
     fn build_discovery_response(engine_id: &[u8], msg_id: i32) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
-        use crate::pdu::{Pdu, PduType};
+        use crate::pdu::Pdu;
         use crate::v3::UsmSecurityParams;
         use crate::value::Value;
         use crate::varbind::VarBind;
 
-        let report_pdu = Pdu {
-            pdu_type: PduType::Report,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let report_pdu = Pdu::standard(
+            crate::pdu::StandardPduType::Report,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 crate::oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0),
                 Value::Counter32(0),
             )],
-        };
+        );
 
         let global = MsgGlobalData::new(
             msg_id,
@@ -1644,13 +1644,13 @@ mod response_validation_tests {
         let scoped = ScopedPdu::new(
             Bytes::from_static(ENGINE_ID),
             Bytes::new(),
-            Pdu {
-                pdu_type,
+            Pdu::standard(
+                crate::pdu::StandardPduType::try_from(pdu_type).unwrap(),
                 request_id,
-                error_status: 0,
-                error_index: 0,
-                varbinds: vec![],
-            },
+                0,
+                0,
+                vec![],
+            ),
         );
         let msg = V3Message::new(global, usm.encode(), scoped);
         match auth_key {
@@ -1674,38 +1674,26 @@ mod response_validation_tests {
             0 => (
                 SecurityLevel::NoAuthNoPriv,
                 1100,
-                Pdu {
-                    pdu_type: PduType::Report,
-                    request_id: 0,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds: vec![crate::VarBind::new(
+                Pdu::standard(
+                    crate::pdu::StandardPduType::Report,
+                    0,
+                    0,
+                    0,
+                    vec![crate::VarBind::new(
                         crate::v3::report_oids::not_in_time_windows(),
                         crate::Value::Counter32(1),
                     )],
-                },
+                ),
             ),
             1 => (
                 SecurityLevel::AuthNoPriv,
                 1100,
-                Pdu {
-                    pdu_type: PduType::Response,
-                    request_id: scoped_request.pdu.request_id,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds: vec![],
-                },
+                Pdu::response(scoped_request.pdu.request_id, 0, 0, vec![]),
             ),
             2 => (
                 SecurityLevel::AuthNoPriv,
                 1400,
-                Pdu {
-                    pdu_type: PduType::Response,
-                    request_id: scoped_request.pdu.request_id,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds: vec![],
-                },
+                Pdu::response(scoped_request.pdu.request_id, 0, 0, vec![]),
             ),
             _ => panic!("unexpected deferred-update response {response_number}"),
         };

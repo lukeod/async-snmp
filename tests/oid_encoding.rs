@@ -2,7 +2,6 @@ use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::message::{
     CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message,
 };
-use async_snmp::pdu::GetBulkPdu;
 use async_snmp::{
     CompatibilityPolicy, Error, GenericTrap, Oid, Pdu, PduType, TrapV1Pdu, Value, VarBind,
 };
@@ -28,12 +27,16 @@ fn assert_invalid<T>(result: async_snmp::Result<T>) {
 }
 
 fn pdu_with(pdu_type: PduType, varbind: VarBind) -> Pdu {
-    Pdu {
-        pdu_type,
-        request_id: 7,
-        error_status: 0,
-        error_index: 0,
-        varbinds: vec![varbind],
+    if pdu_type == PduType::GetBulkRequest {
+        Pdu::get_bulk(7, 0, 10, vec![varbind])
+    } else {
+        Pdu::standard(
+            async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap(),
+            7,
+            0,
+            0,
+            vec![varbind],
+        )
     }
 }
 
@@ -89,13 +92,6 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             );
             assert_invalid(V3Message::new(global, Bytes::new(), scoped).encode());
         }
-
-        let bulk = GetBulkPdu::new(7, 0, 10, std::slice::from_ref(&oid));
-        assert_invalid(CommunityMessage::encode_bulk(
-            async_snmp::Version::V2c,
-            "public",
-            &bulk,
-        ));
 
         let trap = TrapV1Pdu::new(
             oid.clone(),

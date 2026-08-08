@@ -101,7 +101,7 @@ use crate::handler::{GetNextResult, GetResult, HandlerResult, MibHandler, Reques
 use crate::message_size::{MessageSize, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS};
 use crate::oid;
 use crate::oid::Oid;
-use crate::pdu::{Pdu, PduType};
+use crate::pdu::{Pdu, PduBody, PduType};
 use crate::util::bind_udp_socket;
 use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, UsmConfig};
@@ -1508,7 +1508,7 @@ impl Agent {
 
     /// Dispatch a request to the appropriate handler.
     async fn dispatch_request(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
-        match pdu.pdu_type {
+        match pdu.pdu_type() {
             PduType::GetRequest => self.handle_get(ctx, pdu).await,
             PduType::GetNextRequest => self.handle_get_next(ctx, pdu).await,
             PduType::GetBulkRequest => {
@@ -1623,13 +1623,7 @@ impl Agent {
         } else {
             Vec::new()
         };
-        Pdu {
-            pdu_type: PduType::Response,
-            request_id: pdu.request_id,
-            error_status: ErrorStatus::TooBig.as_i32(),
-            error_index: 0,
-            varbinds,
-        }
+        Pdu::response(pdu.request_id, ErrorStatus::TooBig.as_i32(), 0, varbinds)
     }
 
     /// Handle GET request.
@@ -1711,13 +1705,7 @@ impl Agent {
             return Ok(Self::too_big_response(ctx.version, pdu));
         }
 
-        Ok(Pdu {
-            pdu_type: PduType::Response,
-            request_id: pdu.request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: response_varbinds,
-        })
+        Ok(Pdu::response(pdu.request_id, 0, 0, response_varbinds))
     }
 
     /// Handle GETNEXT request.
@@ -1762,13 +1750,7 @@ impl Agent {
             return Ok(Self::too_big_response(ctx.version, pdu));
         }
 
-        Ok(Pdu {
-            pdu_type: PduType::Response,
-            request_id: pdu.request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: response_varbinds,
-        })
+        Ok(Pdu::response(pdu.request_id, 0, 0, response_varbinds))
     }
 
     /// Handle GETBULK request.
@@ -1776,9 +1758,15 @@ impl Agent {
     /// Per RFC 3416 Section 4.2.3, if the response would exceed the message
     /// size limit, we return fewer variable bindings rather than all of them.
     async fn handle_get_bulk(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
-        // For GETBULK, error_status is non_repeaters and error_index is max_repetitions
-        let non_repeaters = pdu.error_status.try_into().unwrap_or(0);
-        let max_repetitions = pdu.error_index.max(0);
+        let PduBody::GetBulk {
+            non_repeaters,
+            max_repetitions,
+        } = &pdu.body
+        else {
+            unreachable!("GETBULK handler requires a typed GETBULK body");
+        };
+        let non_repeaters = usize::try_from(*non_repeaters).unwrap_or(0);
+        let max_repetitions = *max_repetitions;
 
         let mut response_varbinds = Vec::new();
         let mut current_size: usize = self.response_overhead(ctx);
@@ -1823,13 +1811,7 @@ impl Agent {
                 // non-repeater prefix collected so far without running the
                 // repeater loop (falling through would emit repeater varbinds
                 // into the dropped non-repeater's slot).
-                return Ok(Pdu {
-                    pdu_type: PduType::Response,
-                    request_id: pdu.request_id,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds: response_varbinds,
-                });
+                return Ok(Pdu::response(pdu.request_id, 0, 0, response_varbinds));
             }
 
             current_size += next_vb.encoded_size();
@@ -1905,13 +1887,7 @@ impl Agent {
             }
         }
 
-        Ok(Pdu {
-            pdu_type: PduType::Response,
-            request_id: pdu.request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: response_varbinds,
-        })
+        Ok(Pdu::response(pdu.request_id, 0, 0, response_varbinds))
     }
 
     /// Find the handler for a given OID.
@@ -2259,20 +2235,20 @@ mod tests {
         // First varbind succeeds, second hits the failing backend: RFC 3416
         // Section 4.2.1 requires genErr with error-index of the failing varbind
         // and the request varbinds echoed.
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0), Value::Null),
             ],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index, 2);
+        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index(), 2);
         assert_eq!(response.varbinds.len(), 2);
         assert_eq!(response.varbinds[0].oid, pdu.varbinds[0].oid);
     }
@@ -2283,20 +2259,20 @@ mod tests {
         let mut ctx = test_ctx();
         ctx.version = Version::V1;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 2,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            2,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index, 1);
+        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index(), 1);
     }
 
     #[tokio::test]
@@ -2305,20 +2281,20 @@ mod tests {
         let mut ctx = test_ctx();
         ctx.pdu_type = PduType::GetNextRequest;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetNextRequest,
-            request_id: 3,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetNextRequest,
+            3,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index, 1);
+        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index(), 1);
     }
 
     #[tokio::test]
@@ -2330,20 +2306,19 @@ mod tests {
         // Non-repeater resolves to .1.0; the repeater's first GETNEXT fails.
         // error-index refers to the varbind position in the received request
         // (RFC 3416 Section 4.2.3), here 2, regardless of repetition count.
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 4,
-            error_status: 1, // non_repeaters
-            error_index: 5,  // max_repetitions
-            varbinds: vec![
+        let pdu = Pdu::get_bulk(
+            4,
+            1,
+            5,
+            vec![
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Null),
             ],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index, 2);
+        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index(), 2);
     }
 
     // FiveOidHandler has OIDs at .99999.{1,2,3,4,5}.0 with integer values 1-5.
@@ -2417,13 +2392,12 @@ mod tests {
         // GETBULK starting before the handler prefix, requesting up to 10 repeats.
         // The handler has OIDs {1,2,3,4,5}.0 but only {2,4} are in the view.
         // The walk must skip denied OIDs and continue, returning both 2 and 4.
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 0, // non_repeaters
-            error_index: 10, // max_repetitions
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::get_bulk(
+            1,
+            0,
+            10,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -2471,16 +2445,15 @@ mod tests {
         // and returns the first accessible .99999.2.0.
         // Second varbind starts at .99999.4.0 (the last accessible OID): walks
         // to .99999.5.0 (denied) and then hits end-of-MIB, returning EndOfMibView.
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 2,
-            error_status: 2, // non_repeaters
-            error_index: 0,  // max_repetitions
-            varbinds: vec![
+        let pdu = Pdu::get_bulk(
+            2,
+            2,
+            0,
+            vec![
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 4, 0), Value::Null),
             ],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -2559,13 +2532,13 @@ mod tests {
         ctx.pdu_type = PduType::GetNextRequest;
         ctx.read_view = Some(Bytes::from_static(b"restricted"));
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetNextRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetNextRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -2659,16 +2632,16 @@ mod tests {
         ctx.pdu_type = PduType::GetNextRequest;
         ctx.read_view = Some(Bytes::from_static(b"gap"));
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetNextRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetNextRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(response.varbinds.len(), 1);
@@ -2691,16 +2664,16 @@ mod tests {
         ctx.pdu_type = PduType::GetNextRequest;
         ctx.read_view = Some(Bytes::from_static(b"restricted"));
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetNextRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetNextRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 4, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(response.varbinds.len(), 1);
@@ -2725,13 +2698,12 @@ mod tests {
         let mut ctx = test_ctx();
         ctx.pdu_type = PduType::GetBulkRequest;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 10,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::get_bulk(
+            1,
+            0,
+            10,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -2766,17 +2738,16 @@ mod tests {
         ctx.security_model = SecurityModel::V1;
         ctx.pdu_type = PduType::GetBulkRequest;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 10,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::get_bulk(
+            1,
+            0,
+            10,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(
-            ErrorStatus::from_i32(response.error_status),
+            ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::GenErr,
             "v1 GETBULK should be rejected"
         );
@@ -2846,20 +2817,20 @@ mod tests {
         ctx.security_model = SecurityModel::V1;
         ctx.pdu_type = PduType::GetRequest;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(
-            ErrorStatus::from_i32(response.error_status),
+            ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::NoSuchName,
             "v1 GET of Counter64 should return noSuchName"
         );
@@ -2872,19 +2843,19 @@ mod tests {
 
         let ctx = test_ctx(); // v2c by default
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, 0);
+        assert_eq!(response.error_status(), 0);
         assert!(matches!(response.varbinds[0].value, Value::Counter64(_)));
     }
 
@@ -2908,13 +2879,12 @@ mod tests {
         ctx_unlimited.pdu_type = PduType::GetBulkRequest;
         ctx_unlimited.msg_max_size = None;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 0, // non_repeaters
-            error_index: 10, // max_repetitions
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::get_bulk(
+            1,
+            0,
+            10,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         let full_response = agent.dispatch_request(&ctx_unlimited, &pdu).await.unwrap();
         let full_count = full_response
@@ -3058,13 +3028,12 @@ mod tests {
             .await
             .unwrap();
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 0, // non_repeaters
-            error_index: 10, // max_repetitions
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::get_bulk(
+            1,
+            0,
+            10,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         // A limit large enough to expose the difference: v2c fits more varbinds
         // than authPriv because authPriv's overhead is larger.
@@ -3189,17 +3158,16 @@ mod tests {
         ctx.pdu_type = PduType::GetBulkRequest;
         ctx.msg_max_size = Some(max);
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 2, // non_repeaters
-            error_index: 2,  // max_repetitions
-            varbinds: vec![
+        let pdu = Pdu::get_bulk(
+            1,
+            2,
+            2,
+            vec![
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9), Value::Null),
             ],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
@@ -3247,21 +3215,20 @@ mod tests {
         // Below RESPONSE_OVERHEAD, so even the first varbind cannot fit.
         ctx.msg_max_size = Some(RESPONSE_OVERHEAD - 1);
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 2, // non_repeaters
-            error_index: 2,  // max_repetitions
-            varbinds: vec![
+        let pdu = Pdu::get_bulk(
+            1,
+            2,
+            2,
+            vec![
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2), Value::Null),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9), Value::Null),
             ],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
         assert!(
             response.varbinds.is_empty(),
             "tooBig Response must have empty varbinds, got {}",
@@ -3301,18 +3268,17 @@ mod tests {
         ctx.pdu_type = PduType::GetBulkRequest;
         ctx.msg_max_size = Some(max);
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 0, // non_repeaters == 0
-            error_index: 5,  // max_repetitions
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null)],
-        };
+        let pdu = Pdu::get_bulk(
+            1,
+            0,
+            5,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1), Value::Null)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
         assert_eq!(
-            response.error_status,
+            response.error_status(),
             ErrorStatus::TooBig.as_i32(),
             "first oversized repeater varbind (non_repeaters == 0) must yield tooBig"
         );
@@ -3341,13 +3307,12 @@ mod tests {
         ctx.pdu_type = PduType::GetBulkRequest;
         ctx.msg_max_size = None; // v2c, no client limit
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 10,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::get_bulk(
+            1,
+            0,
+            10,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         let data_count = response
@@ -3373,16 +3338,16 @@ mod tests {
         ctx.security_model = SecurityModel::V1;
         ctx.pdu_type = PduType::GetNextRequest;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetNextRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetNextRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, 0, "should succeed");
+        assert_eq!(response.error_status(), 0, "should succeed");
         assert_eq!(
             response.varbinds[0].oid,
             oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
@@ -3757,17 +3722,17 @@ mod tests {
 
         // GET for all five OIDs; the response cannot fit within the 150-byte
         // effective limit, so RFC 3416 Section 4.2.1 requires a tooBig Response.
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: five_varbinds(),
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            1,
+            0,
+            0,
+            five_varbinds(),
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index, 0);
+        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());
     }
 
@@ -3782,22 +3747,22 @@ mod tests {
         ctx.security_model = SecurityModel::V1;
 
         let request_varbinds = five_varbinds();
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: request_varbinds.clone(),
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            1,
+            0,
+            0,
+            request_varbinds.clone(),
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index, 0);
+        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index(), 0);
         assert_eq!(response.varbinds, request_varbinds);
 
         // The same oversized request under v2c must still clear the varbinds.
         let v2c_response = agent.dispatch_request(&test_ctx(), &pdu).await.unwrap();
-        assert_eq!(v2c_response.error_status, ErrorStatus::TooBig.as_i32());
+        assert_eq!(v2c_response.error_status(), ErrorStatus::TooBig.as_i32());
         assert!(v2c_response.varbinds.is_empty());
     }
 
@@ -3807,19 +3772,19 @@ mod tests {
         let ctx = test_ctx();
 
         // A single varbind fits comfortably; the tooBig check must not fire.
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, 0);
+        assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert!(matches!(response.varbinds[0].value, Value::Integer(1)));
     }
@@ -3830,17 +3795,17 @@ mod tests {
         let mut ctx = test_ctx();
         ctx.pdu_type = PduType::GetNextRequest;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetNextRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: five_varbinds(),
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetNextRequest,
+            1,
+            0,
+            0,
+            five_varbinds(),
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index, 0);
+        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());
     }
 
@@ -3856,17 +3821,17 @@ mod tests {
         // oversized echo, which would make a confirmed-class sender retry
         // indefinitely.
         let big = Value::OctetString(Bytes::from(vec![0xABu8; 256]));
-        let pdu = Pdu {
-            pdu_type: PduType::InformRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), big)],
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::InformRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), big)],
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index, 0);
+        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());
     }
 
@@ -3878,20 +3843,20 @@ mod tests {
 
         // A small Inform fits within the limit and is acknowledged by echoing
         // the same varbinds in a Response.
-        let pdu = Pdu {
-            pdu_type: PduType::InformRequest,
-            request_id: 7,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::InformRequest,
+            7,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Integer(42),
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.pdu_type, PduType::Response);
-        assert_eq!(response.error_status, 0);
+        assert_eq!(response.pdu_type(), PduType::Response);
+        assert_eq!(response.error_status(), 0);
         assert_eq!(response.request_id, 7);
         assert_eq!(response.varbinds.len(), 1);
         assert!(matches!(response.varbinds[0].value, Value::Integer(42)));
@@ -3903,19 +3868,19 @@ mod tests {
         let mut ctx = test_ctx();
         ctx.pdu_type = PduType::GetNextRequest;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetNextRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetNextRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Null,
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, 0);
+        assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].oid,

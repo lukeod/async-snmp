@@ -1289,19 +1289,19 @@ mod tests {
         });
 
         // Build a notification PDU with sysUpTime.0 and snmpTrapOID.0
-        let pdu = Pdu {
-            pdu_type,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::try_from(pdu_type).unwrap(),
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oids::sys_uptime(), Value::TimeTicks(1000)),
                 VarBind::new(
                     oids::snmp_trap_oid(),
                     Value::ObjectIdentifier(oids::cold_start()),
                 ),
             ],
-        };
+        );
 
         let level = if auth_key.is_some() {
             SecurityLevel::AuthNoPriv
@@ -1712,16 +1712,10 @@ mod tests {
     /// Build a V3 discovery request message (empty engine ID, noAuthNoPriv).
     fn build_v3_discovery_request(msg_id: i32, reportable: bool) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
-        use crate::pdu::{Pdu, PduType};
+        use crate::pdu::Pdu;
         use crate::v3::UsmSecurityParams;
 
-        let pdu = Pdu {
-            pdu_type: PduType::GetRequest,
-            request_id: 0,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![],
-        };
+        let pdu = Pdu::standard(crate::pdu::StandardPduType::GetRequest, 0, 0, 0, vec![]);
 
         let global = MsgGlobalData::new(
             msg_id,
@@ -1788,7 +1782,7 @@ mod tests {
         let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
         assert_eq!(report_usm.engine_id.as_ref(), b"test-discovery-engine");
         let scoped = report.scoped_pdu().expect("report should be plaintext");
-        assert_eq!(scoped.pdu.pdu_type, crate::pdu::PduType::Report);
+        assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
         assert_eq!(
             scoped.pdu.varbinds[0].oid,
             crate::v3::report_oids::unknown_engine_ids()
@@ -2374,7 +2368,7 @@ mod tests {
         assert!(verify_message(&key, &report_bytes, auth_offset, auth_len).unwrap());
 
         let scoped = report.scoped_pdu().expect("report should be plaintext");
-        assert_eq!(scoped.pdu.pdu_type, crate::pdu::PduType::Report);
+        assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
         assert_eq!(
             scoped.pdu.varbinds[0].oid,
             crate::v3::report_oids::not_in_time_windows()
@@ -2496,7 +2490,7 @@ mod tests {
         let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
         assert_eq!(report_usm.engine_id.as_ref(), b"test-engine");
         let scoped = report.scoped_pdu().expect("report should be plaintext");
-        assert_eq!(scoped.pdu.pdu_type, crate::pdu::PduType::Report);
+        assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
         assert_eq!(
             scoped.pdu.varbinds[0].oid,
             crate::v3::report_oids::unknown_user_names()

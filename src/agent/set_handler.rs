@@ -290,21 +290,21 @@ mod tests {
 
         // SET with two varbinds: first succeeds test_set, second fails.
         // free_set should be called once (for the first varbind).
-        let pdu = Pdu {
-            pdu_type: PduType::SetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            vec![
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), Value::Integer(1)),
                 VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0), Value::Integer(2)),
             ],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
         // Should have error on varbind 2
-        assert_eq!(response.error_index, 2);
+        assert_eq!(response.error_index(), 2);
         // free_set should have been called once for the first varbind
         assert_eq!(free_count.load(Ordering::Relaxed), 1);
     }
@@ -327,20 +327,20 @@ mod tests {
         let ctx = test_ctx();
 
         // SET with one varbind that passes test_set. No free_set should be called.
-        let pdu = Pdu {
-            pdu_type: PduType::SetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Integer(1),
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        assert_eq!(response.error_status, 0);
+        assert_eq!(response.error_status(), 0);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
     }
 
@@ -419,17 +419,17 @@ mod tests {
 
         // The echoed Response for five varbinds exceeds the 150-byte limit.
         // RFC 3416 Section 4.2.5 requires returning tooBig before any commit.
-        let pdu = Pdu {
-            pdu_type: PduType::SetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: five_set_varbinds(),
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            five_set_varbinds(),
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index, 0);
+        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
+        assert_eq!(response.error_index(), 0);
         assert!(response.varbinds.is_empty());
         // The commit phase must never run for an oversized SET.
         assert_eq!(commit_count.load(Ordering::Relaxed), 0);
@@ -455,19 +455,19 @@ mod tests {
         let ctx = test_ctx();
 
         // A single-varbind SET fits within the limit and must commit normally.
-        let pdu = Pdu {
-            pdu_type: PduType::SetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
                 Value::Integer(1),
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
-        assert_eq!(response.error_status, 0);
+        assert_eq!(response.error_status(), 0);
         assert_eq!(commit_count.load(Ordering::Relaxed), 1);
     }
 
@@ -490,20 +490,20 @@ mod tests {
 
         // SET where the first varbind fails test_set. No free_set calls since
         // there are no previously successful varbinds.
-        let pdu = Pdu {
-            pdu_type: PduType::SetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            vec![VarBind::new(
                 oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
                 Value::Integer(1),
             )],
-        };
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        assert_eq!(response.error_index, 1);
+        assert_eq!(response.error_index(), 1);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
     }
 
@@ -622,13 +622,13 @@ mod tests {
             .await
             .unwrap();
 
-        let pdu = Pdu {
-            pdu_type: PduType::SetRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: three_set_varbinds(),
-        };
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            three_set_varbinds(),
+        );
         let response = agent.dispatch_request(&test_ctx(), &pdu).await.unwrap();
         let calls = calls.lock().unwrap().clone();
         (response, calls)
@@ -642,8 +642,8 @@ mod tests {
         expected_undos: &[u32],
         expected_frees: &[u32],
     ) {
-        assert_eq!(response.error_status, ErrorStatus::CommitFailed.as_i32());
-        assert_eq!(response.error_index, failed_index);
+        assert_eq!(response.error_status(), ErrorStatus::CommitFailed.as_i32());
+        assert_eq!(response.error_index(), failed_index);
         assert_eq!(calls.commit, set_oids(expected_commits));
         assert_eq!(calls.undo, set_oids(expected_undos));
         assert_eq!(calls.free, set_oids(expected_frees));
@@ -685,8 +685,8 @@ mod tests {
         // earlier binding and free the trailing, never-attempted binding.
         let (response, calls) = run_commit_scenario(2, Some(2)).await;
 
-        assert_eq!(response.error_status, ErrorStatus::UndoFailed.as_i32());
-        assert_eq!(response.error_index, 0);
+        assert_eq!(response.error_status(), ErrorStatus::UndoFailed.as_i32());
+        assert_eq!(response.error_index(), 0);
         assert_eq!(calls.commit, set_oids(&[1, 2]));
         assert_eq!(calls.undo, set_oids(&[2, 1]));
         assert_eq!(calls.free, set_oids(&[3]));
@@ -698,7 +698,7 @@ mod tests {
     async fn test_all_commits_succeed_no_undo_or_free() {
         let (response, calls) = run_commit_scenario(99, None).await;
 
-        assert_eq!(response.error_status, 0);
+        assert_eq!(response.error_status(), 0);
         assert_eq!(calls.commit, set_oids(&[1, 2, 3]));
         assert!(calls.undo.is_empty());
         assert!(calls.free.is_empty());

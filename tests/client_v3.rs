@@ -471,13 +471,13 @@ async fn v3_engine_discovery() {
 /// Build a raw noAuthNoPriv V3 GET request with a given engine ID and username.
 fn build_raw_v3_get(engine_id: Bytes, username: Bytes) -> Bytes {
     let usm = UsmSecurityParams::new(engine_id, 0, 0, username);
-    let pdu = Pdu {
-        pdu_type: PduType::GetRequest,
-        request_id: 1,
-        error_status: 0,
-        error_index: 0,
-        varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Null)],
-    };
+    let pdu = Pdu::standard(
+        async_snmp::pdu::StandardPduType::GetRequest,
+        1,
+        0,
+        0,
+        vec![VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Null)],
+    );
     let scoped = ScopedPdu::with_empty_context(pdu);
     let global = MsgGlobalData::new(
         1,
@@ -521,7 +521,7 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     let resp1 = send_raw_udp(addr, msg1).await;
     let decoded1 = V3Message::decode(resp1).unwrap();
     let pdu1 = decoded1.pdu().unwrap();
-    assert_eq!(pdu1.pdu_type, PduType::Report, "expected Report PDU");
+    assert_eq!(pdu1.pdu_type(), PduType::Report, "expected Report PDU");
 
     // The varbind should be usmStatsUnknownEngineIDs (1.3.6.1.6.3.15.1.1.4.0) with value 1
     let vb1 = &pdu1.varbinds[0];
@@ -549,7 +549,7 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     let resp2 = send_raw_udp(addr, msg2).await;
     let decoded2 = V3Message::decode(resp2).unwrap();
     let pdu2 = decoded2.pdu().unwrap();
-    assert_eq!(pdu2.pdu_type, PduType::Report);
+    assert_eq!(pdu2.pdu_type(), PduType::Report);
 
     let vb2 = &pdu2.varbinds[0];
     assert_eq!(
@@ -591,7 +591,7 @@ async fn report_pdu_counter_matches_agent_counter_unknown_user() {
     let resp = send_raw_udp(addr, msg).await;
     let decoded = V3Message::decode(resp).unwrap();
     let pdu = decoded.pdu().unwrap();
-    assert_eq!(pdu.pdu_type, PduType::Report, "expected Report PDU");
+    assert_eq!(pdu.pdu_type(), PduType::Report, "expected Report PDU");
 
     let vb = &pdu.varbinds[0];
     // The OID should be usmStatsUnknownUserNames (1.3.6.1.6.3.15.1.1.3.0)

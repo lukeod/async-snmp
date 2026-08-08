@@ -89,56 +89,159 @@ impl std::fmt::Display for PduType {
     }
 }
 
-/// Generic PDU structure for request/response operations.
+/// PDU tags whose body uses the standard request/error/varbind layout.
+///
+/// GETBULK is deliberately absent because its two integer fields have different
+/// meanings. The SNMPv1 Trap body remains envelope-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardPduType {
+    /// GET request.
+    GetRequest,
+    /// GET-NEXT request.
+    GetNextRequest,
+    /// Response.
+    Response,
+    /// SET request.
+    SetRequest,
+    /// INFORM request.
+    InformRequest,
+    /// SNMPv2 trap.
+    TrapV2,
+    /// SNMPv3 report.
+    Report,
+}
+
+impl StandardPduType {
+    /// Return the corresponding wire PDU type.
+    #[must_use]
+    pub fn pdu_type(self) -> PduType {
+        match self {
+            Self::GetRequest => PduType::GetRequest,
+            Self::GetNextRequest => PduType::GetNextRequest,
+            Self::Response => PduType::Response,
+            Self::SetRequest => PduType::SetRequest,
+            Self::InformRequest => PduType::InformRequest,
+            Self::TrapV2 => PduType::TrapV2,
+            Self::Report => PduType::Report,
+        }
+    }
+}
+
+impl TryFrom<PduType> for StandardPduType {
+    type Error = PduType;
+
+    fn try_from(value: PduType) -> std::result::Result<Self, Self::Error> {
+        match value {
+            PduType::GetRequest => Ok(Self::GetRequest),
+            PduType::GetNextRequest => Ok(Self::GetNextRequest),
+            PduType::Response => Ok(Self::Response),
+            PduType::SetRequest => Ok(Self::SetRequest),
+            PduType::InformRequest => Ok(Self::InformRequest),
+            PduType::TrapV2 => Ok(Self::TrapV2),
+            PduType::Report => Ok(Self::Report),
+            PduType::TrapV1 | PduType::GetBulkRequest => Err(value),
+        }
+    }
+}
+
+/// The typed body of a standard or GETBULK PDU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PduBody {
+    /// Standard request/response body fields.
+    Standard {
+        /// PDU tag, excluding GETBULK and SNMPv1 Trap.
+        pdu_type: StandardPduType,
+        /// Error status (zero for requests).
+        error_status: i32,
+        /// One-based error index, or zero.
+        error_index: i32,
+    },
+    /// GETBULK-specific body fields.
+    GetBulk {
+        /// Number of non-repeating OIDs.
+        non_repeaters: i32,
+        /// Maximum repetitions for repeating OIDs.
+        max_repetitions: i32,
+    },
+}
+
+/// Canonical PDU representation for standard and GETBULK operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdu {
-    /// PDU type
-    pub pdu_type: PduType,
-    /// Request ID for correlating requests and responses
+    /// Request ID for correlating requests and responses.
     pub request_id: i32,
-    /// Error status (0 for requests, error code for responses)
-    pub error_status: i32,
-    /// Error index (1-based index of problematic varbind)
-    pub error_index: i32,
-    /// Variable bindings
+    /// Typed fields that determine the PDU tag and integer meanings.
+    pub body: PduBody,
+    /// Variable bindings.
     pub varbinds: Vec<VarBind>,
 }
 
 impl Pdu {
+    /// Construct a standard-layout PDU.
+    #[must_use]
+    pub fn standard(
+        pdu_type: StandardPduType,
+        request_id: i32,
+        error_status: i32,
+        error_index: i32,
+        varbinds: Vec<VarBind>,
+    ) -> Self {
+        Self {
+            request_id,
+            body: PduBody::Standard {
+                pdu_type,
+                error_status,
+                error_index,
+            },
+            varbinds,
+        }
+    }
+
+    /// Construct a response PDU.
+    #[must_use]
+    pub fn response(
+        request_id: i32,
+        error_status: i32,
+        error_index: i32,
+        varbinds: Vec<VarBind>,
+    ) -> Self {
+        Self::standard(
+            StandardPduType::Response,
+            request_id,
+            error_status,
+            error_index,
+            varbinds,
+        )
+    }
+
     /// Create a new GET request PDU.
     #[must_use]
     pub fn get_request(request_id: i32, oids: &[Oid]) -> Self {
-        Self {
-            pdu_type: PduType::GetRequest,
+        Self::standard(
+            StandardPduType::GetRequest,
             request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
-        }
+            0,
+            0,
+            oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
+        )
     }
 
     /// Create a new GETNEXT request PDU.
     #[must_use]
     pub fn get_next_request(request_id: i32, oids: &[Oid]) -> Self {
-        Self {
-            pdu_type: PduType::GetNextRequest,
+        Self::standard(
+            StandardPduType::GetNextRequest,
             request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
-        }
+            0,
+            0,
+            oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
+        )
     }
 
     /// Create a new SET request PDU.
     #[must_use]
     pub fn set_request(request_id: i32, varbinds: Vec<VarBind>) -> Self {
-        Self {
-            pdu_type: PduType::SetRequest,
-            request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds,
-        }
+        Self::standard(StandardPduType::SetRequest, request_id, 0, 0, varbinds)
     }
 
     /// Create a SNMPv2c/v3 Trap PDU.
@@ -160,13 +263,7 @@ impl Pdu {
             crate::value::Value::ObjectIdentifier(trap_oid.clone()),
         ));
         all_varbinds.extend(varbinds);
-        Self {
-            pdu_type: PduType::TrapV2,
-            request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: all_varbinds,
-        }
+        Self::standard(StandardPduType::TrapV2, request_id, 0, 0, all_varbinds)
     }
 
     /// Create an `InformRequest` PDU.
@@ -190,18 +287,17 @@ impl Pdu {
             crate::value::Value::ObjectIdentifier(trap_oid.clone()),
         ));
         all_varbinds.extend(varbinds);
-        Self {
-            pdu_type: PduType::InformRequest,
+        Self::standard(
+            StandardPduType::InformRequest,
             request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: all_varbinds,
-        }
+            0,
+            0,
+            all_varbinds,
+        )
     }
 
     /// Create a GETBULK request PDU.
     ///
-    /// Note: For GETBULK, `error_status` holds `non_repeaters` and `error_index` holds `max_repetitions`.
     /// The encode choke point applies the selected compatibility policy before
     /// either field reaches the wire.
     #[must_use]
@@ -212,10 +308,11 @@ impl Pdu {
         varbinds: Vec<VarBind>,
     ) -> Self {
         Self {
-            pdu_type: PduType::GetBulkRequest,
             request_id,
-            error_status: non_repeaters,
-            error_index: max_repetitions,
+            body: PduBody::GetBulk {
+                non_repeaters,
+                max_repetitions,
+            },
             varbinds,
         }
     }
@@ -231,30 +328,26 @@ impl Pdu {
         buf: &mut EncodeBuf,
         compatibility: CompatibilityPolicy,
     ) -> Result<()> {
-        // The SNMPv1 Trap PDU has a distinct wire layout and must be encoded via
-        // `TrapV1Pdu::encode`; the generic layout here is not round-trippable for it.
-        debug_assert!(
-            self.pdu_type != PduType::TrapV1,
-            "TrapV1 must be encoded via TrapV1Pdu, not the generic Pdu encoder"
-        );
-        // For GETBULK, error_status/error_index overload as non-repeaters and
-        // max-repetitions (RFC 3416 Section 4.2.3, INTEGER 0..2147483647). Clamp
-        // negatives to 0 at the encode choke point so a directly-constructed
-        // `Pdu { pdu_type: GetBulkRequest, error_status: -1, .. }` cannot emit a
-        // negative value on the wire, regardless of how the fields were set.
-        let (error_status, error_index) = if self.pdu_type == PduType::GetBulkRequest {
-            (
-                encode_bulk_field(self.error_status, "non_repeaters", compatibility)?,
-                encode_bulk_field(self.error_index, "max_repetitions", compatibility)?,
-            )
-        } else {
-            (self.error_status, self.error_index)
+        let (pdu_type, first_field, second_field) = match self.body {
+            PduBody::Standard {
+                pdu_type,
+                error_status,
+                error_index,
+            } => (pdu_type.pdu_type(), error_status, error_index),
+            PduBody::GetBulk {
+                non_repeaters,
+                max_repetitions,
+            } => (
+                PduType::GetBulkRequest,
+                encode_bulk_field(non_repeaters, "non_repeaters", compatibility)?,
+                encode_bulk_field(max_repetitions, "max_repetitions", compatibility)?,
+            ),
         };
 
-        buf.try_push_constructed(self.pdu_type.tag(), |buf| {
+        buf.try_push_constructed(pdu_type.tag(), |buf| {
             encode_varbind_list(buf, &self.varbinds)?;
-            buf.push_integer(error_index);
-            buf.push_integer(error_status);
+            buf.push_integer(second_field);
+            buf.push_integer(first_field);
             buf.push_integer(self.request_id);
             Ok(())
         })
@@ -284,23 +377,17 @@ impl Pdu {
         // These are protocol Integer32 fields, so decode the complete width
         // without consulting generic value-truncation compatibility.
         let request_id = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
-        let mut error_status = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
-        let mut error_index = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
+        let mut first_field = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
+        let mut second_field = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
         if !pdu_decoder.is_empty() {
             return Err(pdu_decoder.malformed());
         }
 
-        // For GETBULK, error_status/error_index overload as non-repeaters and
-        // max-repetitions (RFC 3416 Section 4.2.3, INTEGER 0..2147483647). Clamp
-        // negatives to 0 here so the single decode path normalizes them before the
-        // agent sees them, matching net-snmp (snmp_agent.c) and the agent's own
-        // normalization. The upper bound already equals i32::MAX, so only the
-        // negative floor needs enforcing.
-        if pdu_type == PduType::GetBulkRequest {
+        let body = if pdu_type == PduType::GetBulkRequest {
             for (field, value) in [
-                ("non_repeaters", &mut error_status),
-                ("max_repetitions", &mut error_index),
+                ("non_repeaters", &mut first_field),
+                ("max_repetitions", &mut second_field),
             ] {
                 if *value < 0 {
                     if !decoder
@@ -313,34 +400,124 @@ impl Pdu {
                     *value = 0;
                 }
             }
-        }
+            PduBody::GetBulk {
+                non_repeaters: first_field,
+                max_repetitions: second_field,
+            }
+        } else {
+            let standard_type =
+                StandardPduType::try_from(pdu_type).map_err(|_| pdu_decoder.malformed())?;
+            PduBody::Standard {
+                pdu_type: standard_type,
+                error_status: first_field,
+                error_index: second_field,
+            }
+        };
 
-        // For non-GETBULK PDUs, error_index is not validated here. net-snmp
-        // performs no bounds checking on this field (validation code in
-        // snmp_client.c is wrapped in #ifdef TEMPORARILY_DISABLED). RFC 3416
-        // Section 3 annotates it "sometimes ignored" and places no MUST/SHOULD
-        // obligation on receivers. Rejecting out-of-range values would break
-        // compatibility with buggy agents that work fine with net-snmp.
-
+        // For standard PDUs, error_index is not validated here. net-snmp
+        // performs no bounds checking on this field.
         Ok(Pdu {
-            pdu_type,
             request_id,
-            error_status,
-            error_index,
+            body,
             varbinds,
         })
+    }
+
+    /// Return the wire PDU type.
+    #[must_use]
+    pub fn pdu_type(&self) -> PduType {
+        match self.body {
+            PduBody::Standard { pdu_type, .. } => pdu_type.pdu_type(),
+            PduBody::GetBulk { .. } => PduType::GetBulkRequest,
+        }
+    }
+
+    /// Return standard response fields, if this is a standard-layout PDU.
+    #[must_use]
+    pub fn error_fields(&self) -> Option<(i32, i32)> {
+        match self.body {
+            PduBody::Standard {
+                error_status,
+                error_index,
+                ..
+            } => Some((error_status, error_index)),
+            PduBody::GetBulk { .. } => None,
+        }
+    }
+
+    /// Return GETBULK fields, if this is a GETBULK PDU.
+    #[must_use]
+    pub fn get_bulk_fields(&self) -> Option<(i32, i32)> {
+        match self.body {
+            PduBody::GetBulk {
+                non_repeaters,
+                max_repetitions,
+            } => Some((non_repeaters, max_repetitions)),
+            PduBody::Standard { .. } => None,
+        }
+    }
+
+    /// Return the standard error status, or zero for GETBULK.
+    #[must_use]
+    pub fn error_status(&self) -> i32 {
+        self.error_fields().map_or(0, |fields| fields.0)
+    }
+
+    /// Return the standard error index, or zero for GETBULK.
+    #[must_use]
+    pub fn error_index(&self) -> i32 {
+        self.error_fields().map_or(0, |fields| fields.1)
+    }
+
+    /// Set the tag of a standard-layout PDU.
+    ///
+    /// Returns false for a GETBULK PDU.
+    pub fn set_standard_pdu_type(&mut self, value: StandardPduType) -> bool {
+        match &mut self.body {
+            PduBody::Standard { pdu_type, .. } => {
+                *pdu_type = value;
+                true
+            }
+            PduBody::GetBulk { .. } => false,
+        }
+    }
+
+    /// Set the standard error status.
+    ///
+    /// Returns false for a GETBULK PDU.
+    pub fn set_error_status(&mut self, value: i32) -> bool {
+        match &mut self.body {
+            PduBody::Standard { error_status, .. } => {
+                *error_status = value;
+                true
+            }
+            PduBody::GetBulk { .. } => false,
+        }
+    }
+
+    /// Set the standard error index.
+    ///
+    /// Returns false for a GETBULK PDU.
+    pub fn set_error_index(&mut self, value: i32) -> bool {
+        match &mut self.body {
+            PduBody::Standard { error_index, .. } => {
+                *error_index = value;
+                true
+            }
+            PduBody::GetBulk { .. } => false,
+        }
     }
 
     /// Check if this is an error response.
     #[must_use]
     pub fn is_error(&self) -> bool {
-        self.pdu_type == PduType::Response && self.error_status != 0
+        self.pdu_type() == PduType::Response && self.error_status() != 0
     }
 
     /// Get the error status as an enum.
     #[must_use]
     pub fn error_status_enum(&self) -> ErrorStatus {
-        ErrorStatus::from_i32(self.error_status)
+        ErrorStatus::from_i32(self.error_status())
     }
 
     /// Create a Response PDU from this PDU (for Inform handling).
@@ -349,25 +526,18 @@ impl Pdu {
     /// sets `error_status` and `error_index` to 0, and changes the PDU type to Response.
     #[must_use]
     pub fn to_response(&self) -> Self {
-        Self {
-            pdu_type: PduType::Response,
-            request_id: self.request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds: self.varbinds.clone(),
-        }
+        Self::response(self.request_id, 0, 0, self.varbinds.clone())
     }
 
     /// Create a Response PDU with specific error status.
     #[must_use]
     pub fn to_error_response(&self, error_status: ErrorStatus, error_index: i32) -> Self {
-        Self {
-            pdu_type: PduType::Response,
-            request_id: self.request_id,
-            error_status: error_status.as_i32(),
+        Self::response(
+            self.request_id,
+            error_status.as_i32(),
             error_index,
-            varbinds: self.varbinds.clone(),
-        }
+            self.varbinds.clone(),
+        )
     }
 
     /// Convert a v2 notification PDU to a v1 `TrapV1Pdu` (RFC 3584 Section 3.2).
@@ -492,7 +662,7 @@ impl Pdu {
     #[must_use]
     pub fn is_notification(&self) -> bool {
         matches!(
-            self.pdu_type,
+            self.pdu_type(),
             PduType::TrapV1 | PduType::TrapV2 | PduType::InformRequest
         )
     }
@@ -501,7 +671,7 @@ impl Pdu {
     #[must_use]
     pub fn is_confirmed(&self) -> bool {
         matches!(
-            self.pdu_type,
+            self.pdu_type(),
             PduType::GetRequest
                 | PduType::GetNextRequest
                 | PduType::GetBulkRequest
@@ -724,13 +894,7 @@ impl TrapV1Pdu {
         ));
         varbinds.extend_from_slice(&self.varbinds);
 
-        Ok(Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 0,
-            error_status: 0,
-            error_index: 0,
-            varbinds,
-        })
+        Ok(Pdu::standard(StandardPduType::TrapV2, 0, 0, 0, varbinds))
     }
 
     /// Encode to BER.
@@ -812,78 +976,6 @@ impl TrapV1Pdu {
     }
 }
 
-/// GETBULK request PDU.
-#[derive(Debug, Clone)]
-pub struct GetBulkPdu {
-    /// Request ID
-    pub request_id: i32,
-    /// Number of non-repeating OIDs
-    pub non_repeaters: i32,
-    /// Maximum repetitions for repeating OIDs
-    pub max_repetitions: i32,
-    /// Variable bindings
-    pub varbinds: Vec<VarBind>,
-}
-
-impl GetBulkPdu {
-    /// Create a new GETBULK request.
-    #[must_use]
-    pub fn new(request_id: i32, non_repeaters: i32, max_repetitions: i32, oids: &[Oid]) -> Self {
-        Self {
-            request_id,
-            non_repeaters,
-            max_repetitions,
-            varbinds: oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
-        }
-    }
-
-    /// Encode to BER using the default malformed-input compatibility policy.
-    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
-        self.encode_with_compatibility_policy(buf, CompatibilityPolicy::default())
-    }
-
-    /// Encode to BER using an explicit compatibility policy.
-    pub fn encode_with_compatibility_policy(
-        &self,
-        buf: &mut EncodeBuf,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<()> {
-        let non_repeaters = encode_bulk_field(self.non_repeaters, "non_repeaters", compatibility)?;
-        let max_repetitions =
-            encode_bulk_field(self.max_repetitions, "max_repetitions", compatibility)?;
-        buf.try_push_constructed(tag::pdu::GET_BULK_REQUEST, |buf| {
-            encode_varbind_list(buf, &self.varbinds)?;
-            buf.push_integer(max_repetitions);
-            buf.push_integer(non_repeaters);
-            buf.push_integer(self.request_id);
-            Ok(())
-        })
-    }
-
-    /// Decode from BER.
-    ///
-    /// Delegates to `Pdu::decode` so GETBULK requests share a single decode and
-    /// normalization path. `Pdu::decode` clamps negative non-repeaters and
-    /// max-repetitions to 0 per RFC 3416 Section 4.2.3 (net-snmp-compatible),
-    /// after which the overloaded `error_status`/`error_index` fields map back
-    /// onto the typed `GetBulkPdu` shape.
-    pub fn decode(decoder: &mut Decoder) -> Result<Self> {
-        let pdu = Pdu::decode(decoder)?;
-
-        if pdu.pdu_type != PduType::GetBulkRequest {
-            tracing::debug!(target: "async_snmp::pdu", { pdu_type = ?pdu.pdu_type }, "expected GETBULK PDU");
-            return Err(decoder.malformed());
-        }
-
-        Ok(GetBulkPdu {
-            request_id: pdu.request_id,
-            non_repeaters: pdu.error_status,
-            max_repetitions: pdu.error_index,
-            varbinds: pdu.varbinds,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,14 +1029,14 @@ mod tests {
     }
 
     /// Test helper for encoding GETBULK PDUs with arbitrary field values.
-    struct RawGetBulkPdu {
+    struct RawBulkWirePdu {
         request_id: i32,
         non_repeaters: i32,
         max_repetitions: i32,
         varbinds: Vec<VarBind>,
     }
 
-    impl RawGetBulkPdu {
+    impl RawBulkWirePdu {
         fn new(
             request_id: i32,
             non_repeaters: i32,
@@ -982,25 +1074,24 @@ mod tests {
         let mut decoder = Decoder::new(bytes);
         let decoded = Pdu::decode(&mut decoder).unwrap();
 
-        assert_eq!(decoded.pdu_type, PduType::GetRequest);
+        assert_eq!(decoded.pdu_type(), PduType::GetRequest);
         assert_eq!(decoded.request_id, 12345);
         assert_eq!(decoded.varbinds.len(), 1);
     }
 
     #[test]
     fn test_getbulk_roundtrip() {
-        let pdu = GetBulkPdu::new(12345, 0, 10, &[oid!(1, 3, 6, 1, 2, 1, 1)]);
+        let pdu = Pdu::get_bulk(12345, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))]);
 
         let mut buf = EncodeBuf::new();
         pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
-        let decoded = GetBulkPdu::decode(&mut decoder).unwrap();
+        let decoded = Pdu::decode(&mut decoder).unwrap();
 
         assert_eq!(decoded.request_id, 12345);
-        assert_eq!(decoded.non_repeaters, 0);
-        assert_eq!(decoded.max_repetitions, 10);
+        assert_eq!(decoded.get_bulk_fields(), Some((0, 10)));
     }
 
     #[test]
@@ -1198,26 +1289,26 @@ mod tests {
         use crate::value::Value;
         use crate::varbind::VarBind;
 
-        let inform = Pdu {
-            pdu_type: PduType::InformRequest,
-            request_id: 99999,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![
+        let inform = Pdu::standard(
+            crate::pdu::StandardPduType::InformRequest,
+            99999,
+            0,
+            0,
+            vec![
                 VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), Value::TimeTicks(12345)),
                 VarBind::new(
                     oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0),
                     Value::ObjectIdentifier(oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1)),
                 ),
             ],
-        };
+        );
 
         let response = inform.to_response();
 
-        assert_eq!(response.pdu_type, PduType::Response);
+        assert_eq!(response.pdu_type(), PduType::Response);
         assert_eq!(response.request_id, 99999);
-        assert_eq!(response.error_status, 0);
-        assert_eq!(response.error_index, 0);
+        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_index(), 0);
         assert_eq!(response.varbinds.len(), 2);
     }
 
@@ -1226,22 +1317,10 @@ mod tests {
         let get = Pdu::get_request(1, &[oid!(1, 3, 6, 1)]);
         assert!(get.is_confirmed());
 
-        let inform = Pdu {
-            pdu_type: PduType::InformRequest,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![],
-        };
+        let inform = Pdu::standard(crate::pdu::StandardPduType::InformRequest, 1, 0, 0, vec![]);
         assert!(inform.is_confirmed());
 
-        let trap = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![],
-        };
+        let trap = Pdu::standard(crate::pdu::StandardPduType::TrapV2, 1, 0, 0, vec![]);
         assert!(!trap.is_confirmed());
         assert!(trap.is_notification());
     }
@@ -1264,7 +1343,7 @@ mod tests {
             "negative error_index must be accepted to match net-snmp behavior, got {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().error_index, -1);
+        assert_eq!(result.unwrap().error_index(), -1);
     }
 
     #[test]
@@ -1285,7 +1364,7 @@ mod tests {
             "error_index beyond varbind count must be accepted to match net-snmp behavior, got {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().error_index, 5);
+        assert_eq!(result.unwrap().error_index(), 5);
     }
 
     #[test]
@@ -1318,36 +1397,37 @@ mod tests {
         // RFC 3416 Section 4.2.3: non-repeaters is INTEGER (0..2147483647).
         // A negative value from a buggy peer is normalized to 0 (net-snmp
         // snmp_agent.c behavior) rather than rejected.
-        let raw = RawGetBulkPdu::new(1, -1, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let raw = RawBulkWirePdu::new(1, -1, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
         let mut decoder = Decoder::new(encoded.clone());
-        let decoded = GetBulkPdu::decode(&mut decoder).expect("negative non_repeaters clamps to 0");
-        assert_eq!(decoded.non_repeaters, 0);
-        assert_eq!(decoded.max_repetitions, 10);
+        let decoded = Pdu::decode(&mut decoder).expect("negative non_repeaters clamps to 0");
+        assert_eq!(decoded.get_bulk_fields(), Some((0, 10)));
 
         let mut strict = Decoder::new(encoded)
             .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
-        assert!(GetBulkPdu::decode(&mut strict).is_err());
+        assert!(Pdu::decode(&mut strict).is_err());
     }
 
     #[test]
     fn test_decode_clamps_negative_max_repetitions() {
-        let raw = RawGetBulkPdu::new(1, 0, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let raw = RawBulkWirePdu::new(1, 0, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
-        let mut decoder = Decoder::new(encoded);
-        let decoded =
-            GetBulkPdu::decode(&mut decoder).expect("negative max_repetitions clamps to 0");
-        assert_eq!(decoded.non_repeaters, 0);
-        assert_eq!(decoded.max_repetitions, 0);
+        let mut decoder = Decoder::new(encoded.clone());
+        let decoded = Pdu::decode(&mut decoder).expect("negative max_repetitions clamps to 0");
+        assert_eq!(decoded.get_bulk_fields(), Some((0, 0)));
+
+        let mut strict = Decoder::new(encoded)
+            .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
+        assert!(Pdu::decode(&mut strict).is_err());
     }
 
     #[test]
     fn test_pdu_decode_getbulk_clamps_negative_non_repeaters_repro() {
         // Regression (audit F06): production GETBULK decode goes through the
         // generic Pdu::decode path (community.rs / v3.rs), which must clamp the
-        // overloaded non-repeaters/max-repetitions to 0 for negatives.
+        // typed non-repeaters/max-repetitions to 0 for negatives.
         // Repro packet: GETBULK, request_id=1, non_repeaters=-1 (0xff),
         // max_repetitions=1, empty varbinds.
         let packet = [
@@ -1356,12 +1436,9 @@ mod tests {
         let encoded = bytes::Bytes::copy_from_slice(&packet);
         let mut decoder = Decoder::new(encoded.clone());
         let pdu = Pdu::decode(&mut decoder).expect("repro GETBULK packet must decode");
-        assert_eq!(pdu.pdu_type, PduType::GetBulkRequest);
+        assert_eq!(pdu.pdu_type(), PduType::GetBulkRequest);
         assert_eq!(pdu.request_id, 1);
-        // error_status = non_repeaters (was -1, clamped to 0)
-        assert_eq!(pdu.error_status, 0);
-        // error_index = max_repetitions
-        assert_eq!(pdu.error_index, 1);
+        assert_eq!(pdu.get_bulk_fields(), Some((0, 1)));
 
         let mut strict = Decoder::new(encoded)
             .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
@@ -1370,26 +1447,25 @@ mod tests {
 
     #[test]
     fn test_decode_accepts_valid_getbulk_params() {
-        let raw = RawGetBulkPdu::new(1, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let raw = RawBulkWirePdu::new(1, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
         let encoded = raw.encode();
 
         let mut decoder = Decoder::new(encoded);
-        let result = GetBulkPdu::decode(&mut decoder);
+        let result = Pdu::decode(&mut decoder);
         assert!(result.is_ok(), "valid GETBULK params should be accepted");
 
         let pdu = result.unwrap();
-        assert_eq!(pdu.non_repeaters, 0);
-        assert_eq!(pdu.max_repetitions, 10);
+        assert_eq!(pdu.get_bulk_fields(), Some((0, 10)));
     }
 
     #[test]
     fn test_encode_clamps_negative_non_repeaters_and_max_repetitions() {
         // RFC 3416 Section 4.2.3: non-repeaters and max-repetitions are
-        // INTEGER (0..2147483647). GetBulkPdu::encode clamps negative values
+        // INTEGER (0..2147483647). Pdu::encode normalizes negative values
         // to 0 before writing, so even a PDU built with negative fields
         // (e.g. via a raw i32 passed to Client::get_bulk) round-trips through
         // decode instead of producing a malformed request on the wire.
-        let pdu = GetBulkPdu::new(1, -1, -5, &[oid!(1, 3, 6, 1)]);
+        let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
 
         let mut strict_buf = EncodeBuf::new();
         assert!(
@@ -1406,40 +1482,34 @@ mod tests {
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
-        let result = GetBulkPdu::decode(&mut decoder);
+        let result = Pdu::decode(&mut decoder);
         assert!(
             result.is_ok(),
             "encoded negative non_repeaters/max_repetitions should decode after clamping, got {result:?}"
         );
         let decoded = result.unwrap();
-        assert_eq!(decoded.non_repeaters, 0);
-        assert_eq!(decoded.max_repetitions, 0);
+        assert_eq!(decoded.get_bulk_fields(), Some((0, 0)));
     }
 
     #[test]
     fn test_encode_leaves_non_negative_non_repeaters_and_max_repetitions_unchanged() {
-        let pdu = GetBulkPdu::new(1, 0, 10, &[oid!(1, 3, 6, 1)]);
+        let pdu = Pdu::get_bulk(1, 0, 10, vec![VarBind::null(oid!(1, 3, 6, 1))]);
 
         let mut buf = EncodeBuf::new();
         pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
-        let decoded = GetBulkPdu::decode(&mut decoder).unwrap();
-        assert_eq!(decoded.non_repeaters, 0);
-        assert_eq!(decoded.max_repetitions, 10);
+        let decoded = Pdu::decode(&mut decoder).unwrap();
+        assert_eq!(decoded.get_bulk_fields(), Some((0, 10)));
     }
 
     #[test]
     fn test_generic_pdu_get_bulk_clamps_negative_fields() {
-        // The SNMPv3 encode path builds a generic Pdu via Pdu::get_bulk (which
-        // overloads error_status/error_index for non_repeaters/max_repetitions)
-        // and serializes it with Pdu::encode, bypassing GetBulkPdu::encode. That
-        // path must apply the same RFC 3416 (0..max-bindings) clamp so a negative
+        // The shared encoder must apply the RFC 3416 (0..max-bindings) policy so a negative
         // passed to Client::get_bulk on a v3 client never reaches the wire.
         let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
-        assert_eq!(pdu.error_status, -1);
-        assert_eq!(pdu.error_index, -5);
+        assert_eq!(pdu.get_bulk_fields(), Some((-1, -5)));
 
         let mut strict_buf = EncodeBuf::new();
         assert!(
@@ -1456,31 +1526,23 @@ mod tests {
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
-        let decoded = GetBulkPdu::decode(&mut decoder)
-            .expect("clamped generic GETBULK encode should decode as valid");
-        assert_eq!(decoded.non_repeaters, 0);
-        assert_eq!(decoded.max_repetitions, 0);
+        let decoded = Pdu::decode(&mut decoder)
+            .expect("clamped canonical GETBULK encode should decode as valid");
+        assert_eq!(decoded.get_bulk_fields(), Some((0, 0)));
     }
 
     #[test]
     fn test_directly_constructed_getbulk_pdu_encode_clamps_negative_fields() {
-        // The pub fields let a caller build a GETBULK Pdu directly. The default
-        // encode policy must clamp overloaded non-repeaters/max-repetitions
-        // (error_status/error_index) to 0 so a directly-constructed PDU cannot
+        // The typed fields let a caller build a GETBULK PDU directly. The default
+        // encode policy must normalize negative fields to 0 so the PDU cannot
         // emit a negative on the wire.
-        let pdu = Pdu {
-            pdu_type: PduType::GetBulkRequest,
-            request_id: 1,
-            error_status: -1,
-            error_index: -5,
-            varbinds: vec![VarBind::null(oid!(1, 3, 6, 1))],
-        };
+        let pdu = Pdu::get_bulk(1, -1, -5, vec![VarBind::null(oid!(1, 3, 6, 1))]);
 
         let mut buf = EncodeBuf::new();
         pdu.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
-        // Read the raw wire integers directly rather than via GetBulkPdu::decode,
+        // Read the raw wire integers directly rather than via Pdu::decode,
         // which would re-clamp on the decode side (F06) and mask a broken encoder.
         let mut decoder = Decoder::new(bytes);
         let tag = decoder.read_tag().expect("read pdu tag");
@@ -1498,8 +1560,8 @@ mod tests {
     fn test_pdu_decode_getbulk_with_large_max_repetitions() {
         // GETBULK PDU with max_repetitions (25) > varbinds.len() (1)
         // This is the normal case for GETBULK requests.
-        // The generic Pdu::decode must not reject this as an invalid error_index.
-        let raw = RawGetBulkPdu::new(12345, 0, 25, vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))]);
+        // The canonical Pdu::decode must not reject this valid max-repetitions value.
+        let raw = RawBulkWirePdu::new(12345, 0, 25, vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))]);
         let encoded = raw.encode();
 
         let mut decoder = Decoder::new(encoded);
@@ -1511,11 +1573,9 @@ mod tests {
         );
 
         let pdu = result.unwrap();
-        assert_eq!(pdu.pdu_type, PduType::GetBulkRequest);
+        assert_eq!(pdu.pdu_type(), PduType::GetBulkRequest);
         assert_eq!(pdu.request_id, 12345);
-        // For GETBULK: error_status = non_repeaters, error_index = max_repetitions
-        assert_eq!(pdu.error_status, 0);
-        assert_eq!(pdu.error_index, 25);
+        assert_eq!(pdu.get_bulk_fields(), Some((0, 25)));
         assert_eq!(pdu.varbinds.len(), 1);
     }
 
@@ -1536,13 +1596,12 @@ mod tests {
 
     #[test]
     fn test_response_with_error_status_is_treated_as_error() {
-        let pdu = Pdu {
-            pdu_type: PduType::Response,
-            request_id: 12345,
-            error_status: ErrorStatus::TooBig.as_i32(),
-            error_index: 1,
-            varbinds: vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))],
-        };
+        let pdu = Pdu::response(
+            12345,
+            ErrorStatus::TooBig.as_i32(),
+            1,
+            vec![VarBind::null(oid!(1, 3, 6, 1, 2, 1, 1))],
+        );
 
         assert!(pdu.is_error());
     }
@@ -1580,7 +1639,7 @@ mod tests {
 
         let pdu = trap.to_v2_pdu().unwrap();
 
-        assert_eq!(pdu.pdu_type, PduType::TrapV2);
+        assert_eq!(pdu.pdu_type(), PduType::TrapV2);
         assert_eq!(pdu.request_id, 0);
         // sysUpTime.0 + snmpTrapOID.0 + 1 original varbind (no proxy varbinds)
         assert_eq!(pdu.varbinds.len(), 3);
@@ -1778,13 +1837,7 @@ mod tests {
 
     #[test]
     fn test_v2_to_v1_too_few_varbinds() {
-        let pdu = Pdu {
-            pdu_type: PduType::TrapV2,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![],
-        };
+        let pdu = Pdu::standard(crate::pdu::StandardPduType::TrapV2, 1, 0, 0, vec![]);
 
         assert!(pdu.to_v1_trap([0, 0, 0, 0]).is_none());
     }

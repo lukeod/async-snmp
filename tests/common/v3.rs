@@ -223,13 +223,13 @@ impl V3ReplyBuilder {
         // Reports default to the reporting entity's context, not the request context.
         builder.context_engine_id = engine.engine_id.clone();
         builder.context_name = Bytes::new();
-        builder.pdu = Pdu {
-            pdu_type: PduType::Report,
-            request_id: 0,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![VarBind::new(oid, Value::Counter32(counter))],
-        };
+        builder.pdu = Pdu::standard(
+            async_snmp::pdu::StandardPduType::Report,
+            0,
+            0,
+            0,
+            vec![VarBind::new(oid, Value::Counter32(counter))],
+        );
         builder
     }
 
@@ -321,7 +321,11 @@ impl V3ReplyBuilder {
     }
 
     pub fn pdu_type(mut self, pdu_type: PduType) -> Self {
-        self.pdu.pdu_type = pdu_type;
+        assert!(
+            self.pdu.set_standard_pdu_type(
+                async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap()
+            )
+        );
         self
     }
 
@@ -331,12 +335,12 @@ impl V3ReplyBuilder {
     }
 
     pub fn error_status(mut self, error_status: i32) -> Self {
-        self.pdu.error_status = error_status;
+        assert!(self.pdu.set_error_status(error_status));
         self
     }
 
     pub fn error_index(mut self, error_index: i32) -> Self {
-        self.pdu.error_index = error_index;
+        assert!(self.pdu.set_error_index(error_index));
         self
     }
 

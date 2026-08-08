@@ -30,10 +30,10 @@ fn pdu_trap_v2_has_correct_varbind_prefix() {
 
     let pdu = Pdu::trap_v2(1, 12345, &trap_oid, extra);
 
-    assert_eq!(pdu.pdu_type, async_snmp::PduType::TrapV2);
+    assert_eq!(pdu.pdu_type(), async_snmp::PduType::TrapV2);
     assert_eq!(pdu.request_id, 1);
-    assert_eq!(pdu.error_status, 0);
-    assert_eq!(pdu.error_index, 0);
+    assert_eq!(pdu.error_status(), 0);
+    assert_eq!(pdu.error_index(), 0);
     assert_eq!(pdu.varbinds.len(), 3);
 
     // First varbind: sysUpTime.0
@@ -56,7 +56,7 @@ fn pdu_inform_request_has_correct_varbind_prefix() {
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3); // linkDown
     let pdu = Pdu::inform_request(42, 99999, &trap_oid, vec![]);
 
-    assert_eq!(pdu.pdu_type, async_snmp::PduType::InformRequest);
+    assert_eq!(pdu.pdu_type(), async_snmp::PduType::InformRequest);
     assert_eq!(pdu.request_id, 42);
     assert_eq!(pdu.varbinds.len(), 2);
 
@@ -83,13 +83,13 @@ fn encode_raw_v2c_notification(
 ) -> Bytes {
     CommunityMessage::v2c(
         "public",
-        Pdu {
-            pdu_type,
+        Pdu::standard(
+            async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap(),
             request_id,
-            error_status: 0,
-            error_index: 0,
+            0,
+            0,
             varbinds,
-        },
+        ),
     )
     .unwrap()
     .encode()
@@ -203,7 +203,7 @@ async fn notification_varbind_validation_controls_inform_acknowledgement() {
         .unwrap();
     let response_msg = CommunityMessage::decode(Bytes::copy_from_slice(&response[..len])).unwrap();
     let response_pdu = response_msg.into_pdu().unwrap();
-    assert_eq!(response_pdu.pdu_type, PduType::Response);
+    assert_eq!(response_pdu.pdu_type(), PduType::Response);
     assert_eq!(response_pdu.request_id, 42);
     let (notification, _) = recv_handle.await.unwrap();
     assert!(matches!(

@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use crate::message_size::MessageSize;
 use crate::oid::Oid;
-use crate::pdu::{Pdu, PduType};
+use crate::pdu::Pdu;
 use crate::v3::auth::authenticate_message;
 use crate::v3::{LocalizedKey, SaltCounter, UsmSecurityParams};
 use crate::value::Value;
@@ -185,13 +185,13 @@ pub(crate) fn encode_v3_report(
     // path reaches here before the scopedPDU is decoded, so it cannot be
     // extracted. (msgID, which correlates the Report, is carried separately in
     // the header.)
-    let report_pdu = Pdu {
-        pdu_type: PduType::Report,
-        request_id: 0,
-        error_status: 0,
-        error_index: 0,
-        varbinds: vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
-    };
+    let report_pdu = Pdu::standard(
+        crate::pdu::StandardPduType::Report,
+        0,
+        0,
+        0,
+        vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
+    );
 
     let security_level = if auth_key.is_some() {
         SecurityLevel::AuthNoPriv

@@ -73,7 +73,6 @@ mod tests {
     use crate::message::{MsgFlags, SecurityLevel, V3Message};
     use crate::oid;
     use crate::oid::Oid;
-    use crate::pdu::PduType;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
@@ -132,13 +131,7 @@ mod tests {
     }
 
     fn dummy_response_pdu() -> Pdu {
-        Pdu {
-            pdu_type: PduType::Response,
-            request_id: 1,
-            error_status: 0,
-            error_index: 0,
-            varbinds: vec![],
-        }
+        Pdu::response(1, 0, 0, vec![])
     }
 
     #[tokio::test]

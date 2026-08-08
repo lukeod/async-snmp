@@ -765,8 +765,9 @@ mod tests {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
             let pdu = msg.pdu().standard().unwrap();
-            // For GETBULK, error_index carries max-repetitions.
-            let max_rep = pdu.error_index;
+            let (_, max_rep) = pdu
+                .get_bulk_fields()
+                .expect("walk request must contain typed GETBULK fields");
             self.pending
                 .lock()
                 .unwrap()
@@ -786,26 +787,14 @@ mod tests {
             async move {
                 let pdu = if max_rep > threshold {
                     *too_big_count.lock().unwrap() += 1;
-                    Pdu {
-                        pdu_type: PduType::Response,
-                        request_id,
-                        error_status: ErrorStatus::TooBig.as_i32(),
-                        error_index: 0,
-                        varbinds: vec![],
-                    }
+                    Pdu::response(request_id, ErrorStatus::TooBig.as_i32(), 0, vec![])
                 } else {
                     // One in-subtree value, then EndOfMibView to terminate the walk.
                     let varbinds = vec![
                         VarBind::new(oid!(1, 3, 6, 1, 2, 1, 2, 1, 0), Value::Integer(1)),
                         VarBind::new(oid!(1, 3, 6, 1, 2, 1, 2, 2, 0), Value::EndOfMibView),
                     ];
-                    Pdu {
-                        pdu_type: PduType::Response,
-                        request_id,
-                        error_status: 0,
-                        error_index: 0,
-                        varbinds,
-                    }
+                    Pdu::response(request_id, 0, 0, varbinds)
                 };
 
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
@@ -914,7 +903,7 @@ mod tests {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
-            let pdu_type = msg.pdu().standard().unwrap().pdu_type;
+            let pdu_type = msg.pdu().standard().unwrap().pdu_type();
             self.pending
                 .lock()
                 .unwrap()
@@ -931,16 +920,15 @@ mod tests {
             let peer: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
             async move {
-                let pdu = Pdu {
-                    pdu_type: PduType::Response,
+                let pdu = Pdu::response(
                     request_id,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds: vec![VarBind::new(
+                    0,
+                    0,
+                    vec![VarBind::new(
                         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
                         Value::EndOfMibView,
                     )],
-                };
+                );
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 Ok((msg.encode().unwrap(), peer))
             }

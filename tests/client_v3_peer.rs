@@ -342,16 +342,16 @@ async fn v3_discovery_rejects_trailing_usm_security_parameter_data() {
         let scoped = ScopedPdu::new(
             reply_engine.engine_id.clone(),
             Bytes::new(),
-            async_snmp::pdu::Pdu {
-                pdu_type: async_snmp::pdu::PduType::Report,
-                request_id: 0,
-                error_status: 0,
-                error_index: 0,
-                varbinds: vec![VarBind::new(
+            async_snmp::pdu::Pdu::standard(
+                async_snmp::pdu::StandardPduType::Report,
+                0,
+                0,
+                0,
+                vec![VarBind::new(
                     report_oids::unknown_engine_ids(),
                     Value::Counter32(1),
                 )],
-            },
+            ),
         )
         .encode_to_bytes()
         .unwrap();

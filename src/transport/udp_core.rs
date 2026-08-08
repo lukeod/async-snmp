@@ -468,17 +468,11 @@ mod tests {
 
     fn community_packet(request_id: i32, community: &'static [u8]) -> Bytes {
         use crate::message::CommunityMessage;
-        use crate::pdu::{Pdu, PduType};
+        use crate::pdu::Pdu;
 
         CommunityMessage::v2c(
             Bytes::from_static(community),
-            Pdu {
-                pdu_type: PduType::Response,
-                request_id,
-                error_status: 0,
-                error_index: 0,
-                varbinds: Vec::new(),
-            },
+            Pdu::response(request_id, 0, 0, Vec::new()),
         )
         .unwrap()
         .encode()

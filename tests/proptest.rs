@@ -9,7 +9,7 @@ mod common;
 
 use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::oid::Oid;
-use async_snmp::pdu::{GenericTrap, GetBulkPdu, Pdu, PduType, TrapV1Pdu};
+use async_snmp::pdu::{GenericTrap, Pdu, PduType, StandardPduType, TrapV1Pdu};
 use async_snmp::transport::UdpTransport;
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
@@ -179,18 +179,11 @@ fn arb_pdu_type() -> impl Strategy<Value = PduType> {
     ]
 }
 
-/// Strategy for generating generic PDUs.
-///
-/// Generates valid PDUs that pass RFC 3416 validation:
-/// - For non-GETBULK PDUs, `error_index` must be 0 or in range `1..=varbinds.len()`
-/// - `error_index` must be non-negative
+/// Strategy for generating canonical PDUs.
 fn arb_pdu() -> impl Strategy<Value = Pdu> {
     (arb_pdu_type(), any::<i32>(), any::<i32>(), arb_varbinds())
         .prop_flat_map(|(pdu_type, request_id, error_status, varbinds)| {
-            // For GETBULK, error_status/error_index hold non_repeaters/max_repetitions
-            // (RFC 3416 0..2147483647). Pdu::decode clamps negatives to 0, so the
-            // strategy only produces non-negative bulk fields to stay round-trippable.
-            // For other PDU types, error_index must be 0..=varbinds.len().
+            // GETBULK fields are constrained to non-negative values so they round-trip.
             let is_bulk = pdu_type == PduType::GetBulkRequest;
             let error_status = if is_bulk {
                 error_status.max(0)
@@ -213,24 +206,27 @@ fn arb_pdu() -> impl Strategy<Value = Pdu> {
             )
         })
         .prop_map(
-            |(pdu_type, request_id, error_status, error_index, varbinds)| Pdu {
-                pdu_type,
-                request_id,
-                error_status,
-                error_index,
-                varbinds,
+            |(pdu_type, request_id, first_field, second_field, varbinds)| {
+                if pdu_type == PduType::GetBulkRequest {
+                    Pdu::get_bulk(request_id, first_field, second_field, varbinds)
+                } else {
+                    Pdu::standard(
+                        StandardPduType::try_from(pdu_type).unwrap(),
+                        request_id,
+                        first_field,
+                        second_field,
+                        varbinds,
+                    )
+                }
             },
         )
 }
 
-/// Strategy for generating GETBULK PDUs.
-fn arb_getbulk_pdu() -> impl Strategy<Value = GetBulkPdu> {
+/// Strategy for generating typed GETBULK PDUs.
+fn arb_getbulk_pdu() -> impl Strategy<Value = Pdu> {
     (any::<i32>(), 0i32..=100, 0i32..=1000, arb_varbinds()).prop_map(
-        |(request_id, non_repeaters, max_repetitions, varbinds)| GetBulkPdu {
-            request_id,
-            non_repeaters,
-            max_repetitions,
-            varbinds,
+        |(request_id, non_repeaters, max_repetitions, varbinds)| {
+            Pdu::get_bulk(request_id, non_repeaters, max_repetitions, varbinds)
         },
     )
 }
@@ -477,11 +473,7 @@ proptest! {
         let mut decoder = Decoder::new(bytes);
         let decoded = Pdu::decode(&mut decoder).expect("decode should succeed");
 
-        prop_assert_eq!(pdu.pdu_type, decoded.pdu_type);
-        prop_assert_eq!(pdu.request_id, decoded.request_id);
-        prop_assert_eq!(pdu.error_status, decoded.error_status);
-        prop_assert_eq!(pdu.error_index, decoded.error_index);
-        prop_assert_eq!(pdu.varbinds, decoded.varbinds);
+        prop_assert_eq!(pdu, decoded);
     }
 
     #[test]
@@ -491,12 +483,9 @@ proptest! {
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
-        let decoded = GetBulkPdu::decode(&mut decoder).expect("decode should succeed");
+        let decoded = Pdu::decode(&mut decoder).expect("decode should succeed");
 
-        prop_assert_eq!(pdu.request_id, decoded.request_id);
-        prop_assert_eq!(pdu.non_repeaters, decoded.non_repeaters);
-        prop_assert_eq!(pdu.max_repetitions, decoded.max_repetitions);
-        prop_assert_eq!(pdu.varbinds, decoded.varbinds);
+        prop_assert_eq!(pdu, decoded);
     }
 
     #[test]
@@ -1105,16 +1094,10 @@ mod v3_msg_flags {
 
 mod request_id_mismatch {
     use super::*;
-    use async_snmp::pdu::{Pdu, PduType};
+    use async_snmp::pdu::Pdu;
 
     fn make_response(request_id: i32, varbinds: Vec<VarBind>) -> Pdu {
-        Pdu {
-            pdu_type: PduType::Response,
-            request_id,
-            error_status: 0,
-            error_index: 0,
-            varbinds,
-        }
+        Pdu::response(request_id, 0, 0, varbinds)
     }
 
     #[test]
@@ -1279,12 +1262,18 @@ fn arb_pdu_full_range() -> impl Strategy<Value = Pdu> {
         arb_varbinds(),
     )
         .prop_map(
-            |(pdu_type, request_id, error_status, error_index, varbinds)| Pdu {
-                pdu_type,
-                request_id,
-                error_status,
-                error_index,
-                varbinds,
+            |(pdu_type, request_id, first_field, second_field, varbinds)| {
+                if pdu_type == PduType::GetBulkRequest {
+                    Pdu::get_bulk(request_id, first_field, second_field, varbinds)
+                } else {
+                    Pdu::standard(
+                        StandardPduType::try_from(pdu_type).unwrap(),
+                        request_id,
+                        first_field,
+                        second_field,
+                        varbinds,
+                    )
+                }
             },
         )
 }
@@ -1350,10 +1339,10 @@ proptest! {
     fn pdu_to_response_preserves_fields(pdu in arb_pdu_full_range()) {
         let response = pdu.to_response();
 
-        prop_assert_eq!(response.pdu_type, PduType::Response);
+        prop_assert_eq!(response.pdu_type(), PduType::Response);
         prop_assert_eq!(response.request_id, pdu.request_id);
-        prop_assert_eq!(response.error_status, 0);
-        prop_assert_eq!(response.error_index, 0);
+        prop_assert_eq!(response.error_status(), 0);
+        prop_assert_eq!(response.error_index(), 0);
         prop_assert_eq!(response.varbinds, pdu.varbinds);
     }
 
@@ -1361,19 +1350,13 @@ proptest! {
     fn pdu_is_error_consistent(pdu in arb_pdu_full_range()) {
         prop_assert_eq!(
             pdu.is_error(),
-            pdu.pdu_type == PduType::Response && pdu.error_status != 0
+            pdu.pdu_type() == PduType::Response && pdu.error_status() != 0
         );
     }
 
     #[test]
     fn pdu_error_status_enum_no_panic(error_status in any::<i32>()) {
-        let pdu = Pdu {
-            pdu_type: PduType::Response,
-            request_id: 0,
-            error_status,
-            error_index: 0,
-            varbinds: vec![],
-        };
+        let pdu = Pdu::response(0, error_status, 0, vec![]);
 
         let _status = pdu.error_status_enum();
     }

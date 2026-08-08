@@ -1,5 +1,5 @@
 use async_snmp::message::{CommunityMessage, Message};
-use async_snmp::{Auth, Client, Oid, Pdu, PduType, Retry, Value, VarBind};
+use async_snmp::{Auth, Client, Oid, Pdu, Retry, Value, VarBind};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,16 +24,15 @@ async fn wrong_community_does_not_consume_pending_udp_request() {
         let response = |community: &'static [u8], value: &'static [u8]| {
             CommunityMessage::v2c(
                 Bytes::from_static(community),
-                Pdu {
-                    pdu_type: PduType::Response,
+                Pdu::response(
                     request_id,
-                    error_status: 0,
-                    error_index: 0,
-                    varbinds: vec![VarBind::new(
+                    0,
+                    0,
+                    vec![VarBind::new(
                         oid.clone(),
                         Value::OctetString(Bytes::from_static(value)),
                     )],
-                },
+                ),
             )
             .unwrap()
             .encode()
@@ -89,16 +88,15 @@ async fn non_utf8_community_correlates_udp_response() {
         let request_id = request.into_pdu().unwrap().request_id;
         let response = CommunityMessage::v2c(
             community,
-            Pdu {
-                pdu_type: PduType::Response,
+            Pdu::response(
                 request_id,
-                error_status: 0,
-                error_index: 0,
-                varbinds: vec![VarBind::new(
+                0,
+                0,
+                vec![VarBind::new(
                     Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
                     Value::OctetString(Bytes::from_static(b"matched")),
                 )],
-            },
+            ),
         )
         .unwrap()
         .encode()
