@@ -1,5 +1,7 @@
 //! Integration tests for notification sending (trap/inform).
 
+#![cfg(feature = "agent")]
+
 use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::message::CommunityMessage;
 use async_snmp::notification::{Notification, NotificationReceiver, NotificationVarbindValidation};

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::message::SecurityLevel;
-use crate::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol};
+use crate::v3::{AuthProtocol, CryptoBackend, LocalizedKey, PrivKey, PrivProtocol};
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Password(Vec<u8>);
@@ -47,6 +47,7 @@ pub struct UsmConfig {
     username: Bytes,
     credentials: UsmCredentials,
     context_name: Bytes,
+    crypto_backend: CryptoBackend,
 }
 
 impl UsmConfig {
@@ -56,10 +57,12 @@ impl UsmConfig {
             username: username.into(),
             credentials: UsmCredentials::NoAuthNoPriv,
             context_name: Bytes::new(),
+            crypto_backend: CryptoBackend::default(),
         }
     }
 
     /// Configure password-backed authentication (authNoPriv).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[must_use]
     pub fn auth(mut self, protocol: AuthProtocol, password: impl AsRef<[u8]>) -> Self {
         self.credentials = UsmCredentials::Passwords {
@@ -70,6 +73,7 @@ impl UsmConfig {
     }
 
     /// Configure password-backed authentication and privacy (authPriv).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[must_use]
     pub fn auth_priv(
         mut self,
@@ -85,6 +89,27 @@ impl UsmConfig {
         self
     }
 
+    /// Select the cryptographic backend for this USM configuration.
+    ///
+    /// When both backend features are enabled the default remains RustCrypto;
+    /// select `AwsLcFips` explicitly for FIPS operations.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[must_use]
+    pub fn with_crypto_backend(mut self, backend: CryptoBackend) -> Self {
+        self.crypto_backend = backend;
+        if let UsmCredentials::MasterKeys(master_keys) = &mut self.credentials {
+            master_keys.set_crypto_backend(backend);
+        }
+        self
+    }
+
+    /// Return the selected cryptographic backend.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[must_use]
+    pub fn crypto_backend(&self) -> CryptoBackend {
+        self.crypto_backend
+    }
+
     /// Set the `SNMPv3` context name for scoped PDUs.
     #[must_use]
     pub fn context_name(mut self, context_name: impl Into<Bytes>) -> Self {
@@ -93,8 +118,10 @@ impl UsmConfig {
     }
 
     /// Use pre-computed master keys for efficient key derivation.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[must_use]
-    pub fn with_master_keys(mut self, master_keys: crate::v3::MasterKeys) -> Self {
+    pub fn with_master_keys(mut self, mut master_keys: crate::v3::MasterKeys) -> Self {
+        master_keys.set_crypto_backend(self.crypto_backend);
         self.credentials = UsmCredentials::MasterKeys(master_keys);
         self
     }
@@ -160,7 +187,11 @@ impl UsmConfig {
             return;
         };
         let (auth_protocol, auth_password) = auth;
-        let master_keys = match crate::v3::MasterKeys::new(*auth_protocol, auth_password.as_ref()) {
+        let master_keys = match crate::v3::MasterKeys::new_with_backend(
+            *auth_protocol,
+            auth_password.as_ref(),
+            self.crypto_backend,
+        ) {
             Ok(master_keys) => master_keys,
             Err(_) => return,
         };
@@ -180,7 +211,17 @@ impl UsmConfig {
     }
 
     /// Derive localized keys for a specific engine ID.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     pub fn derive_keys(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
+        self.derive_keys_inner(engine_id)
+    }
+
+    #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+    pub(crate) fn derive_keys(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
+        self.derive_keys_inner(engine_id)
+    }
+
+    fn derive_keys_inner(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
         match &self.credentials {
             UsmCredentials::NoAuthNoPriv => Ok(DerivedKeys {
                 auth_key: None,
@@ -197,16 +238,21 @@ impl UsmConfig {
             UsmCredentials::Passwords { auth, privacy } => {
                 let (auth_protocol, auth_password) = auth;
                 tracing::trace!(target: "async_snmp::client", { engine_id_len = engine_id.len(), auth_protocol = ?auth_protocol }, "deriving localized keys from passwords");
-                let auth_key =
-                    LocalizedKey::from_password(*auth_protocol, auth_password.as_ref(), engine_id)?;
+                let auth_key = LocalizedKey::from_password_with_backend(
+                    *auth_protocol,
+                    auth_password.as_ref(),
+                    engine_id,
+                    self.crypto_backend,
+                )?;
                 let priv_key = privacy
                     .as_ref()
                     .map(|(priv_protocol, priv_password)| {
-                        PrivKey::from_password(
+                        PrivKey::from_password_with_backend(
                             *auth_protocol,
                             *priv_protocol,
                             priv_password.as_ref(),
                             engine_id,
+                            self.crypto_backend,
                         )
                     })
                     .transpose()?;
@@ -245,6 +291,7 @@ impl std::fmt::Debug for UsmConfig {
             .field("priv_protocol", &privacy)
             .field("priv_password", &priv_password)
             .field("context_name", &String::from_utf8_lossy(&self.context_name))
+            .field("crypto_backend", &self.crypto_backend)
             .field("master_keys", &master_keys)
             .finish()
     }

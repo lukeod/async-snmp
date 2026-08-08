@@ -135,6 +135,7 @@ impl Auth {
     ///     )
     ///     .into();
     /// ```
+    #[cfg(feature = "v3")]
     pub fn usm(username: impl Into<String>) -> UsmConfig {
         UsmConfig::new(bytes::Bytes::from(username.into()))
     }
@@ -168,6 +169,7 @@ impl Auth {
     }
 }
 
+#[cfg(feature = "v3")]
 impl From<UsmConfig> for Auth {
     fn from(config: UsmConfig) -> Self {
         Self::Usm(config)

@@ -9,7 +9,7 @@
 //! - Privacy (DES-CBC, 3DES-EDE-CBC, AES-128/192/256-CFB)
 //! - Engine discovery and time synchronization
 //! - Validated, increment-before-use authoritative engine startup state
-//! - Mutually exclusive compile-time cryptographic backends
+//! - Additive compile-time cryptographic backends with explicit selection
 //!
 //! Discovery is unauthenticated and establishes only a remote identity
 //! candidate and message-size limit. Boots/time becomes trusted only after
@@ -17,10 +17,13 @@
 //! roles use [`AuthoritativeEngine`] so a stable engine ID and every boots
 //! increment are persisted before protocol use.
 //!
-//! The crypto backend is selected for the whole crate build via the mutually
-//! exclusive `crypto-rustcrypto` (default) or `crypto-fips` feature flags.
-//! Runtime custom-provider injection is not supported.
+//! Cargo features determine which crypto backends are available. Each
+//! [`UsmConfig`] selects a backend; RustCrypto remains the default when both
+//! backends are enabled.
 
+#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+pub(crate) mod auth;
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub mod auth;
 mod authoritative;
 mod config;
@@ -32,17 +35,30 @@ pub(crate) mod process;
 mod report;
 mod usm;
 
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
+#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+pub(crate) use auth::{LocalizedKey, MasterKey, MasterKeys};
 pub use authoritative::{AuthoritativeEngine, PersistedAuthoritativeEngine};
-pub use config::{DerivedKeys, UsmConfig};
-pub use crypto::{CryptoError, CryptoResult};
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+pub use config::DerivedKeys;
+#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+pub(crate) use config::DerivedKeys;
+pub use config::UsmConfig;
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+pub use crypto::{CryptoBackend, CryptoError, CryptoResult};
+#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+pub(crate) use crypto::{CryptoBackend, CryptoError, CryptoResult};
 pub use engine::report_oids;
 pub use engine::{
     EngineCache, EngineState, MAX_ENGINE_ID_LEN, MAX_ENGINE_TIME, MIN_ENGINE_ID_LEN, TIME_WINDOW,
     TrustedEngineTime, compute_engine_boots_time, generate_engine_id, in_authoritative_time_window,
     parse_discovery_response, parse_discovery_response_with_limits, validate_engine_id,
 };
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use privacy::{PrivKey, PrivacyError, PrivacyResult, SaltCounter};
+#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+pub(crate) use privacy::{PrivKey, SaltCounter};
 pub use report::{MalformedReport, ReportStatus, classify_report};
 pub use usm::UsmSecurityParams;
 

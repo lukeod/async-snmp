@@ -38,7 +38,7 @@ To test with the FIPS crypto backend (requires aws-lc-rs build dependencies):
 cargo test --no-default-features --features agent,crypto-fips
 ```
 
-Note: `crypto-rustcrypto` and `crypto-fips` are mutually exclusive. Do not use `--all-features`.
+The crypto backend features are additive. Run `cargo test --all-features` to cover explicit dispatch through both providers.
 
 Container integration tests require Docker:
 

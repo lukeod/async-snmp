@@ -155,7 +155,12 @@ use crate::varbind::VarBind;
 use crate::version::Version;
 
 // Re-exports retained for compatibility with the original notification-local path.
-pub use crate::v3::{DerivedKeys, UsmConfig};
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+pub use crate::v3::DerivedKeys;
+#[cfg(feature = "v3")]
+pub use crate::v3::UsmConfig;
+#[cfg(not(feature = "v3"))]
+use crate::v3::UsmConfig;
 pub use varbind::{NotificationVarbindValidation, validate_notification_varbinds};
 
 /// Maximum number of distinct remote authoritative engines whose timeliness

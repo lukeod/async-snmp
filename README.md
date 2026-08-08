@@ -47,10 +47,12 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 
 **Privacy:** DES, 3DES, AES-128, AES-192, AES-256
 
-**Crypto backends:** Select exactly one backend for the whole build with mutually
-exclusive Cargo features; runtime custom-provider injection is not supported:
+**Crypto backends:** Backend Cargo features are additive. Each USM configuration
+selects one compiled backend; when both are enabled, RustCrypto remains the
+non-FIPS default:
 - `crypto-rustcrypto` (default) - RustCrypto crates, supports all protocols
-- `crypto-fips` - aws-lc-rs for FIPS 140-3 compliance (rejects MD5, DES, 3DES)
+- `crypto-fips` - aws-lc-rs (rejects MD5, DES, 3DES); select
+  `CryptoBackend::AwsLcFips` explicitly for FIPS operations
 
 Plaintext authentication and privacy passwords shorter than 8 octets are
 rejected with `CryptoError::PasswordTooShort`. Constructors that accept
@@ -370,17 +372,22 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `agent` | Yes | SNMP agent support (includes `quinn-udp`) |
+| `v3` | Yes | SNMPv3 protocol and USM surfaces (implied by either crypto backend) |
 | `crypto-rustcrypto` | Yes | RustCrypto-based crypto backend (all auth/priv protocols) |
 | `crypto-fips` | No | FIPS 140-3 crypto via aws-lc-rs (rejects MD5, DES, 3DES) |
 | `rt-multi-thread` | No | Multi-threaded tokio runtime |
 | `cli` | No | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 | `mib` | No | MIB integration via [mib-rs](https://github.com/lukeod/mib-rs) (OID name resolution, value formatting) |
 
-`crypto-rustcrypto` and `crypto-fips` are mutually exclusive. Exactly one must be enabled. To use the FIPS backend:
+The backend features can be enabled together. To use only the FIPS backend:
 
 ```bash
 cargo add async-snmp --no-default-features --features agent,crypto-fips
 ```
+
+When both are compiled, select FIPS explicitly on the shared USM configuration
+with `.with_crypto_backend(CryptoBackend::AwsLcFips)`. Enabling the Cargo feature
+alone is not a runtime FIPS-compliance selection.
 
 ## Minimum Supported Rust Version
 

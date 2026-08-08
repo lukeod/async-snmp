@@ -12,7 +12,7 @@ keywords = ["snmp", "network", "async", "monitoring"]
 categories = ["network-programming", "asynchronous"]
 
 [package.metadata.docs.rs]
-features = ["agent", "crypto-rustcrypto", "cli", "mib", "rt-multi-thread"]
+all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -89,13 +89,15 @@ name = "transport_comparison"
 harness = false
 
 [features]
-default = ["agent", "crypto-rustcrypto"]
+default = ["agent", "v3", "crypto-rustcrypto"]
+v3 = []                    # SNMPv3 protocol and USM surfaces
 agent = ["dep:quinn-udp"]  # SNMP agent
 crypto-rustcrypto = [
+    "v3",
     "dep:aes", "dep:cbc", "dep:cfb-mode", "dep:des",
     "dep:digest", "dep:hmac", "dep:md-5", "dep:sha1", "dep:sha2",
 ]
-crypto-fips = ["dep:aws-lc-rs"]
+crypto-fips = ["v3", "dep:aws-lc-rs"]
 rt-multi-thread = ["tokio/rt-multi-thread"]  # Multi-threaded tokio runtime
 cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
 mib = ["dep:mib-rs"]       # MIB integration (OID conversions, helpers)

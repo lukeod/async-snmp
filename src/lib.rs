@@ -444,18 +444,18 @@
 //! ## Cargo Features
 //!
 //! - `agent` - SNMP agent (enabled by default)
-//! - `crypto-rustcrypto` - RustCrypto-based crypto backend (enabled by default). Supports all auth and privacy protocols.
-//! - `crypto-fips` - FIPS 140-3 crypto backend via aws-lc-rs. Rejects MD5, DES, and 3DES. Mutually exclusive with `crypto-rustcrypto`.
+//! - `v3` - SNMPv3 protocol and USM surfaces (enabled by default)
+//! - `crypto-rustcrypto` - RustCrypto backend (enabled by default). Supports all auth and privacy protocols.
+//! - `crypto-fips` - FIPS backend via aws-lc-rs. Rejects MD5, DES, and 3DES.
 //! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
 //! - `mib` - MIB integration via mib-rs (OID conversions, value formatting helpers)
 //! - `rt-multi-thread` - Multi-threaded tokio runtime
 //! - `tls` - (Placeholder) SNMP over TLS per RFC 6353
 //! - `dtls` - (Placeholder) SNMP over DTLS per RFC 6353
 //!
-//! The crypto backend is selected for the whole crate at compile time; runtime
-//! custom-provider injection is not supported. `crypto-rustcrypto` and
-//! `crypto-fips` are mutually exclusive. Exactly one must be enabled. Using
-//! `--all-features` will not compile; specify features explicitly instead.
+//! Crypto backend features are additive. Each USM configuration selects one
+//! available backend with [`CryptoBackend`]. When both are compiled,
+//! RustCrypto remains the default; FIPS operation must be selected explicitly.
 
 #[cfg(feature = "agent")]
 pub mod agent;
@@ -472,6 +472,9 @@ pub mod oid;
 pub mod pdu;
 pub mod prelude;
 pub mod transport;
+#[cfg(not(feature = "v3"))]
+mod v3;
+#[cfg(feature = "v3")]
 pub mod v3;
 pub mod value;
 pub mod varbind;
@@ -515,11 +518,16 @@ pub use transport::{
     CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport, Transport,
     UdpHandle, UdpTransport,
 };
+#[cfg(feature = "v3")]
 pub use v3::{
-    AuthProtocol, AuthoritativeEngine, CryptoError, CryptoResult, EngineCache, LocalizedKey,
-    MasterKey, MasterKeys, ParseProtocolError, PersistedAuthoritativeEngine, PrivProtocol,
-    UsmConfig, generate_engine_id,
+    AuthProtocol, AuthoritativeEngine, EngineCache, ParseProtocolError,
+    PersistedAuthoritativeEngine, PrivProtocol, UsmConfig, generate_engine_id,
 };
+#[cfg(all(
+    feature = "v3",
+    any(feature = "crypto-rustcrypto", feature = "crypto-fips")
+))]
+pub use v3::{CryptoBackend, CryptoError, CryptoResult, LocalizedKey, MasterKey, MasterKeys};
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;
 pub use version::Version;

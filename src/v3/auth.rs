@@ -33,7 +33,7 @@
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::AuthProtocol;
-use super::crypto::{CryptoProvider, CryptoResult};
+use super::crypto::{CryptoBackend, CryptoResult};
 
 /// Minimum password length required for password-based key derivation.
 ///
@@ -85,6 +85,8 @@ pub struct MasterKey {
     key: Vec<u8>,
     #[zeroize(skip)]
     protocol: AuthProtocol,
+    #[zeroize(skip)]
+    backend: CryptoBackend,
 }
 
 impl MasterKey {
@@ -108,11 +110,24 @@ impl MasterKey {
     /// [`from_bytes`](Self::from_bytes), which take key material rather than a
     /// plaintext password.
     pub fn from_password(protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Self> {
+        Self::from_password_with_backend(protocol, password, CryptoBackend::default())
+    }
+
+    /// Derive a master key using an explicitly selected backend.
+    pub fn from_password_with_backend(
+        protocol: AuthProtocol,
+        password: &[u8],
+        backend: CryptoBackend,
+    ) -> CryptoResult<Self> {
         if password.len() < MIN_PASSWORD_LENGTH {
             return Err(super::CryptoError::PasswordTooShort);
         }
-        let key = password_to_key(protocol, password)?;
-        Ok(Self { key, protocol })
+        let key = password_to_key_with_backend(backend, protocol, password)?;
+        Ok(Self {
+            key,
+            protocol,
+            backend,
+        })
     }
 
     /// Derive a master key from a string password.
@@ -130,9 +145,19 @@ impl MasterKey {
     /// Use this if you already have a master key (e.g., from configuration).
     /// The bytes should be the raw digest output from the 1MB password expansion.
     pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> Self {
+        Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
+    }
+
+    /// Create a master key from raw bytes for an explicitly selected backend.
+    pub fn from_bytes_with_backend(
+        protocol: AuthProtocol,
+        key: impl Into<Vec<u8>>,
+        backend: CryptoBackend,
+    ) -> Self {
         Self {
             key: key.into(),
             protocol,
+            backend,
         }
     }
 
@@ -148,10 +173,12 @@ impl MasterKey {
     /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
     /// backend does not support the key's authentication protocol.
     pub fn localize(&self, engine_id: &[u8]) -> CryptoResult<LocalizedKey> {
-        let localized = localize_key(self.protocol, &self.key, engine_id)?;
+        let localized =
+            localize_key_with_backend(self.backend, self.protocol, &self.key, engine_id)?;
         Ok(LocalizedKey {
             key: localized,
             protocol: self.protocol,
+            backend: self.backend,
         })
     }
 
@@ -159,6 +186,16 @@ impl MasterKey {
     #[must_use]
     pub fn protocol(&self) -> AuthProtocol {
         self.protocol
+    }
+
+    /// Return the backend used by this key.
+    #[must_use]
+    pub fn crypto_backend(&self) -> CryptoBackend {
+        self.backend
+    }
+
+    pub(crate) fn set_crypto_backend(&mut self, backend: CryptoBackend) {
+        self.backend = backend;
     }
 
     /// Get the raw key bytes.
@@ -198,6 +235,8 @@ pub struct LocalizedKey {
     key: Vec<u8>,
     #[zeroize(skip)]
     protocol: AuthProtocol,
+    #[zeroize(skip)]
+    backend: CryptoBackend,
 }
 
 impl LocalizedKey {
@@ -224,7 +263,17 @@ impl LocalizedKey {
         password: &[u8],
         engine_id: &[u8],
     ) -> CryptoResult<Self> {
-        MasterKey::from_password(protocol, password)?.localize(engine_id)
+        Self::from_password_with_backend(protocol, password, engine_id, CryptoBackend::default())
+    }
+
+    /// Derive a localized key using an explicitly selected backend.
+    pub fn from_password_with_backend(
+        protocol: AuthProtocol,
+        password: &[u8],
+        engine_id: &[u8],
+        backend: CryptoBackend,
+    ) -> CryptoResult<Self> {
+        MasterKey::from_password_with_backend(protocol, password, backend)?.localize(engine_id)
     }
 
     /// Derive a localized key from a string password and engine ID.
@@ -251,9 +300,19 @@ impl LocalizedKey {
     ///
     /// Use this if you already have a localized key (e.g., from configuration).
     pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> Self {
+        Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
+    }
+
+    /// Create a localized key from raw bytes for an explicitly selected backend.
+    pub fn from_bytes_with_backend(
+        protocol: AuthProtocol,
+        key: impl Into<Vec<u8>>,
+        backend: CryptoBackend,
+    ) -> Self {
         Self {
             key: key.into(),
             protocol,
+            backend,
         }
     }
 
@@ -261,6 +320,12 @@ impl LocalizedKey {
     #[must_use]
     pub fn protocol(&self) -> AuthProtocol {
         self.protocol
+    }
+
+    /// Return the backend used by this key.
+    #[must_use]
+    pub fn crypto_backend(&self) -> CryptoBackend {
+        self.backend
     }
 
     /// Get the raw key bytes.
@@ -285,7 +350,7 @@ impl LocalizedKey {
     /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
     /// backend does not support the key's authentication protocol.
     pub fn compute_hmac(&self, data: &[u8]) -> CryptoResult<Vec<u8>> {
-        compute_hmac(self.protocol, &self.key, data)
+        compute_hmac(self.backend, self.protocol, &self.key, data)
     }
 
     /// Verify an HMAC.
@@ -328,37 +393,50 @@ impl AsRef<[u8]> for LocalizedKey {
 /// Password to key transformation (RFC 3414 Section A.2.1).
 ///
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
+#[cfg(test)]
 fn password_to_key(protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Vec<u8>> {
-    super::crypto::provider().password_to_key(protocol, password)
+    password_to_key_with_backend(CryptoBackend::default(), protocol, password)
 }
 
-/// Key localization (RFC 3414 Section A.2.2).
-///
-/// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
-fn localize_key(
+fn password_to_key_with_backend(
+    backend: CryptoBackend,
+    protocol: AuthProtocol,
+    password: &[u8],
+) -> CryptoResult<Vec<u8>> {
+    backend.password_to_key(protocol, password)
+}
+
+fn localize_key_with_backend(
+    backend: CryptoBackend,
     protocol: AuthProtocol,
     master_key: &[u8],
     engine_id: &[u8],
 ) -> CryptoResult<Vec<u8>> {
-    super::crypto::provider().localize_key(protocol, master_key, engine_id)
+    backend.localize_key(protocol, master_key, engine_id)
 }
 
 /// Compute HMAC with the appropriate algorithm.
 ///
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
-fn compute_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> CryptoResult<Vec<u8>> {
-    super::crypto::provider().compute_hmac(protocol, key, &[data], protocol.mac_len())
+fn compute_hmac(
+    backend: CryptoBackend,
+    protocol: AuthProtocol,
+    key: &[u8],
+    data: &[u8],
+) -> CryptoResult<Vec<u8>> {
+    backend.compute_hmac(protocol, key, &[data], protocol.mac_len())
 }
 
 /// HMAC computation over multiple data slices (avoids concatenation allocation).
 ///
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
 fn compute_hmac_slices(
+    backend: CryptoBackend,
     protocol: AuthProtocol,
     key: &[u8],
     slices: &[&[u8]],
 ) -> CryptoResult<Vec<u8>> {
-    super::crypto::provider().compute_hmac(protocol, key, slices, protocol.mac_len())
+    backend.compute_hmac(protocol, key, slices, protocol.mac_len())
 }
 
 /// Authenticate an outgoing message by computing and inserting the HMAC.
@@ -428,6 +506,7 @@ pub fn verify_message(
     let computed = {
         let zeros: [u8; MAX_MAC_LEN] = [0u8; MAX_MAC_LEN];
         compute_hmac_slices(
+            key.backend,
             key.protocol,
             key.as_bytes(),
             &[&message[..auth_offset], &zeros[..auth_len], &message[end..]],
@@ -490,8 +569,21 @@ impl MasterKeys {
     /// let keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap();
     /// ```
     pub fn new(auth_protocol: AuthProtocol, auth_password: &[u8]) -> CryptoResult<Self> {
+        Self::new_with_backend(auth_protocol, auth_password, CryptoBackend::default())
+    }
+
+    /// Create authentication master keys with an explicitly selected backend.
+    pub fn new_with_backend(
+        auth_protocol: AuthProtocol,
+        auth_password: &[u8],
+        backend: CryptoBackend,
+    ) -> CryptoResult<Self> {
         Ok(Self {
-            auth_master: MasterKey::from_password(auth_protocol, auth_password)?,
+            auth_master: MasterKey::from_password_with_backend(
+                auth_protocol,
+                auth_password,
+                backend,
+            )?,
             priv_protocol: None,
             priv_master: None,
         })
@@ -525,9 +617,10 @@ impl MasterKeys {
     ) -> CryptoResult<Self> {
         self.priv_protocol = Some(priv_protocol);
         // Use the auth protocol for priv key derivation (per RFC 3826 Section 1.2)
-        self.priv_master = Some(MasterKey::from_password(
+        self.priv_master = Some(MasterKey::from_password_with_backend(
             self.auth_master.protocol(),
             priv_password,
+            self.auth_master.crypto_backend(),
         )?);
         Ok(self)
     }
@@ -561,6 +654,19 @@ impl MasterKeys {
     #[must_use]
     pub fn auth_protocol(&self) -> AuthProtocol {
         self.auth_master.protocol()
+    }
+
+    /// Return the backend used by these keys.
+    #[must_use]
+    pub fn crypto_backend(&self) -> CryptoBackend {
+        self.auth_master.crypto_backend()
+    }
+
+    pub(crate) fn set_crypto_backend(&mut self, backend: CryptoBackend) {
+        self.auth_master.set_crypto_backend(backend);
+        if let Some(master) = &mut self.priv_master {
+            master.set_crypto_backend(backend);
+        }
     }
 
     /// Derive localized keys for a specific engine ID.
@@ -628,7 +734,17 @@ impl std::fmt::Debug for MasterKeys {
 /// ```
 ///
 /// Where `H()` is the hash function of the authentication protocol.
+#[cfg(test)]
 pub(crate) fn extend_key(
+    protocol: AuthProtocol,
+    key: &[u8],
+    target_len: usize,
+) -> CryptoResult<Vec<u8>> {
+    extend_key_with_backend(CryptoBackend::default(), protocol, key, target_len)
+}
+
+pub(crate) fn extend_key_with_backend(
+    backend: CryptoBackend,
     protocol: AuthProtocol,
     key: &[u8],
     target_len: usize,
@@ -638,12 +754,11 @@ pub(crate) fn extend_key(
         return Ok(key[..target_len].to_vec());
     }
 
-    let provider = super::crypto::provider();
     let mut result = key.to_vec();
 
     // Keep appending H(result) until we have enough bytes
     while result.len() < target_len {
-        let hash = provider.hash(protocol, &result)?;
+        let hash = backend.hash(protocol, &result)?;
         result.extend_from_slice(&hash);
     }
 
@@ -671,7 +786,24 @@ pub(crate) fn extend_key(
 ///
 /// This is approximately 1000x slower than [`extend_key`] (Blumenthal) because each
 /// iteration requires the full 1MB password expansion.
+#[cfg(test)]
 pub(crate) fn extend_key_reeder(
+    protocol: AuthProtocol,
+    key: &[u8],
+    engine_id: &[u8],
+    target_len: usize,
+) -> CryptoResult<Vec<u8>> {
+    extend_key_reeder_with_backend(
+        CryptoBackend::default(),
+        protocol,
+        key,
+        engine_id,
+        target_len,
+    )
+}
+
+pub(crate) fn extend_key_reeder_with_backend(
+    backend: CryptoBackend,
     protocol: AuthProtocol,
     key: &[u8],
     engine_id: &[u8],
@@ -689,10 +821,10 @@ pub(crate) fn extend_key_reeder(
     while result.len() < target_len {
         // Run full password-to-key using current Kul as the "passphrase"
         // This is the expensive 1MB expansion step
-        let ku = password_to_key(protocol, &current_kul)?;
+        let ku = password_to_key_with_backend(backend, protocol, &current_kul)?;
 
         // Localize the new Ku to get Kul
-        let new_kul = localize_key(protocol, &ku, engine_id)?;
+        let new_kul = localize_key_with_backend(backend, protocol, &ku, engine_id)?;
 
         // Append as many bytes as we need (or all of them)
         let bytes_needed = target_len - result.len();

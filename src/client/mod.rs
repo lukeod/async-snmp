@@ -67,7 +67,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{Span, instrument};
 
-pub use crate::v3::{DerivedKeys, UsmConfig};
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+pub use crate::v3::DerivedKeys;
+#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+use crate::v3::DerivedKeys;
+#[cfg(feature = "v3")]
+pub use crate::v3::UsmConfig;
+#[cfg(not(feature = "v3"))]
+use crate::v3::UsmConfig;
 pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 
 // ============================================================================

@@ -11,7 +11,7 @@
 use async_snmp::format::hex::{decode, encode};
 use async_snmp::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol};
 #[cfg(feature = "crypto-fips")]
-use async_snmp::v3::{CryptoError, PrivacyError};
+use async_snmp::v3::{CryptoBackend, CryptoError, PrivacyError};
 
 /// RFC 3414 Appendix A.3.1: Password to Key using MD5
 ///
@@ -677,10 +677,11 @@ fn test_aes256_with_md5_auto_key_extension_roundtrip() {
 #[cfg(feature = "crypto-fips")]
 #[test]
 fn test_fips_rejects_md5_password_to_key() {
-    let result = LocalizedKey::from_password(
+    let result = LocalizedKey::from_password_with_backend(
         AuthProtocol::Md5,
         b"maplesyrup",
         &decode("000000000000000000000002").unwrap(),
+        CryptoBackend::AwsLcFips,
     );
     assert!(
         matches!(result, Err(CryptoError::UnsupportedAlgorithm("MD5"))),
@@ -693,10 +694,11 @@ fn test_fips_rejects_md5_password_to_key() {
 #[cfg(feature = "crypto-fips")]
 #[test]
 fn test_fips_rejects_empty_password_before_md5_selection() {
-    let result = LocalizedKey::from_password(
+    let result = LocalizedKey::from_password_with_backend(
         AuthProtocol::Md5,
         b"",
         &decode("000000000000000000000002").unwrap(),
+        CryptoBackend::AwsLcFips,
     );
     assert!(
         matches!(result, Err(CryptoError::PasswordTooShort)),
@@ -709,7 +711,11 @@ fn test_fips_rejects_empty_password_before_md5_selection() {
 #[cfg(feature = "crypto-fips")]
 #[test]
 fn test_fips_rejects_md5_hmac() {
-    let key = LocalizedKey::from_bytes(AuthProtocol::Md5, vec![0; 16]);
+    let key = LocalizedKey::from_bytes_with_backend(
+        AuthProtocol::Md5,
+        vec![0; 16],
+        CryptoBackend::AwsLcFips,
+    );
     let result = key.compute_hmac(b"test data");
     assert!(
         matches!(result, Err(CryptoError::UnsupportedAlgorithm("MD5"))),
@@ -750,7 +756,9 @@ fn test_extended_keys_differ_by_engine_id() {
 #[cfg(feature = "crypto-fips")]
 #[test]
 fn test_fips_rejects_des_encrypt() {
-    let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0; 16]).unwrap();
+    let priv_key =
+        PrivKey::from_bytes_with_backend(PrivProtocol::Des, vec![0; 16], CryptoBackend::AwsLcFips)
+            .unwrap();
     let result = priv_key.encrypt(b"test data", 1, 1, None);
     assert!(
         matches!(
@@ -768,7 +776,9 @@ fn test_fips_rejects_des_encrypt() {
 #[cfg(feature = "crypto-fips")]
 #[test]
 fn test_fips_rejects_3des_encrypt() {
-    let priv_key = PrivKey::from_bytes(PrivProtocol::Des3, vec![0; 32]).unwrap();
+    let priv_key =
+        PrivKey::from_bytes_with_backend(PrivProtocol::Des3, vec![0; 32], CryptoBackend::AwsLcFips)
+            .unwrap();
     let result = priv_key.encrypt(b"test data", 1, 1, None);
     assert!(
         matches!(
@@ -785,6 +795,81 @@ fn test_fips_rejects_3des_encrypt() {
 // Cross-provider golden value tests
 // These tests run under EITHER feature to verify both providers produce
 // identical outputs for shared algorithms.
+
+#[cfg(all(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[test]
+fn both_backends_are_explicit_and_match_shared_sha_aes_vectors() {
+    use async_snmp::v3::SaltCounter;
+
+    let engine_id = decode("000000000000000000000002").unwrap();
+    assert_eq!(
+        async_snmp::UsmConfig::new("default").crypto_backend(),
+        CryptoBackend::RustCrypto
+    );
+
+    let rust = async_snmp::UsmConfig::new("user")
+        .with_crypto_backend(CryptoBackend::RustCrypto)
+        .auth_priv(
+            AuthProtocol::Sha256,
+            b"maplesyrup",
+            PrivProtocol::Aes128,
+            b"maplesyrup",
+        );
+    let fips = async_snmp::UsmConfig::new("user")
+        .with_crypto_backend(CryptoBackend::AwsLcFips)
+        .auth_priv(
+            AuthProtocol::Sha256,
+            b"maplesyrup",
+            PrivProtocol::Aes128,
+            b"maplesyrup",
+        );
+
+    assert_eq!(rust.crypto_backend(), CryptoBackend::RustCrypto);
+    assert_eq!(fips.crypto_backend(), CryptoBackend::AwsLcFips);
+
+    let rust_keys = rust.derive_keys(&engine_id).unwrap();
+    let fips_keys = fips.derive_keys(&engine_id).unwrap();
+    let rust_auth = rust_keys.auth_key.unwrap();
+    let fips_auth = fips_keys.auth_key.unwrap();
+    assert_eq!(rust_auth.crypto_backend(), CryptoBackend::RustCrypto);
+    assert_eq!(fips_auth.crypto_backend(), CryptoBackend::AwsLcFips);
+    assert_eq!(rust_auth.as_bytes(), fips_auth.as_bytes());
+    assert_eq!(
+        rust_auth.compute_hmac(b"shared provider KAT").unwrap(),
+        fips_auth.compute_hmac(b"shared provider KAT").unwrap()
+    );
+
+    let rust_priv = rust_keys.priv_key.unwrap();
+    let fips_priv = fips_keys.priv_key.unwrap();
+    assert_eq!(rust_priv.crypto_backend(), CryptoBackend::RustCrypto);
+    assert_eq!(fips_priv.crypto_backend(), CryptoBackend::AwsLcFips);
+    assert_eq!(rust_priv.encryption_key(), fips_priv.encryption_key());
+
+    let plaintext = b"shared AES-128 provider KAT";
+    let rust_salt = SaltCounter::from_value(41);
+    let fips_salt = SaltCounter::from_value(41);
+    let rust_encrypted = rust_priv
+        .encrypt(plaintext, 7, 11, Some(&rust_salt))
+        .unwrap();
+    let fips_encrypted = fips_priv
+        .encrypt(plaintext, 7, 11, Some(&fips_salt))
+        .unwrap();
+    assert_eq!(rust_encrypted, fips_encrypted);
+    assert_eq!(
+        rust_priv
+            .decrypt(&rust_encrypted.0, 7, 11, &rust_encrypted.1)
+            .unwrap()
+            .as_ref(),
+        plaintext
+    );
+    assert_eq!(
+        fips_priv
+            .decrypt(&fips_encrypted.0, 7, 11, &fips_encrypted.1)
+            .unwrap()
+            .as_ref(),
+        plaintext
+    );
+}
 
 /// Golden value: SHA-2 key localization for "maplesyrup".
 ///

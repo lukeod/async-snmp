@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use super::crypto::{CryptoError, CryptoProvider};
+use super::crypto::{CryptoBackend, CryptoError};
 use super::{AuthProtocol, PrivProtocol};
 
 /// Error type for privacy (encryption/decryption) operations.
@@ -110,6 +110,8 @@ pub struct PrivKey {
     /// Privacy protocol
     #[zeroize(skip)]
     protocol: PrivProtocol,
+    #[zeroize(skip)]
+    backend: CryptoBackend,
     /// Salt counter for generating unique IVs.
     /// Uses interior mutability so `encrypt()` can take &self.
     #[zeroize(skip)]
@@ -213,9 +215,26 @@ impl PrivKey {
         password: &[u8],
         engine_id: &[u8],
     ) -> super::crypto::CryptoResult<Self> {
+        Self::from_password_with_backend(
+            auth_protocol,
+            priv_protocol,
+            password,
+            engine_id,
+            CryptoBackend::default(),
+        )
+    }
+
+    /// Derive a privacy key using an explicitly selected backend.
+    pub fn from_password_with_backend(
+        auth_protocol: AuthProtocol,
+        priv_protocol: PrivProtocol,
+        password: &[u8],
+        engine_id: &[u8],
+        backend: CryptoBackend,
+    ) -> super::crypto::CryptoResult<Self> {
         use super::MasterKey;
 
-        let master = MasterKey::from_password(auth_protocol, password)?;
+        let master = MasterKey::from_password_with_backend(auth_protocol, password, backend)?;
         Self::from_master_key(&master, priv_protocol, engine_id)
     }
 
@@ -247,7 +266,7 @@ impl PrivKey {
     ) -> super::crypto::CryptoResult<Self> {
         use super::{
             KeyExtension,
-            auth::{extend_key, extend_key_reeder},
+            auth::{extend_key_reeder_with_backend, extend_key_with_backend},
         };
 
         let auth_protocol = master.protocol();
@@ -259,17 +278,25 @@ impl PrivKey {
 
         let key = match key_extension {
             KeyExtension::None => key_bytes.to_vec(),
-            KeyExtension::Blumenthal => {
-                extend_key(auth_protocol, key_bytes, priv_protocol.key_len())?
-            }
-            KeyExtension::Reeder => {
-                extend_key_reeder(auth_protocol, key_bytes, engine_id, priv_protocol.key_len())?
-            }
+            KeyExtension::Blumenthal => extend_key_with_backend(
+                master.crypto_backend(),
+                auth_protocol,
+                key_bytes,
+                priv_protocol.key_len(),
+            )?,
+            KeyExtension::Reeder => extend_key_reeder_with_backend(
+                master.crypto_backend(),
+                auth_protocol,
+                key_bytes,
+                engine_id,
+                priv_protocol.key_len(),
+            )?,
         };
 
         Ok(Self {
             key,
             protocol: priv_protocol,
+            backend: master.crypto_backend(),
             salt_counter: Self::init_salt()?,
         })
     }
@@ -286,6 +313,15 @@ impl PrivKey {
         protocol: PrivProtocol,
         key: impl Into<Vec<u8>>,
     ) -> super::crypto::CryptoResult<Self> {
+        Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
+    }
+
+    /// Create a privacy key for an explicitly selected backend.
+    pub fn from_bytes_with_backend(
+        protocol: PrivProtocol,
+        key: impl Into<Vec<u8>>,
+        backend: CryptoBackend,
+    ) -> super::crypto::CryptoResult<Self> {
         let key = key.into();
         if key.len() < protocol.key_len() {
             return Err(CryptoError::InvalidKeyLength);
@@ -293,6 +329,7 @@ impl PrivKey {
         Ok(Self {
             key,
             protocol,
+            backend,
             salt_counter: Self::init_salt()?,
         })
     }
@@ -307,6 +344,11 @@ impl PrivKey {
     /// Get the privacy protocol.
     pub fn protocol(&self) -> PrivProtocol {
         self.protocol
+    }
+
+    /// Return the backend used by this key.
+    pub fn crypto_backend(&self) -> CryptoBackend {
+        self.backend
     }
 
     /// Get the encryption key portion.
@@ -426,7 +468,8 @@ impl PrivKey {
         }
 
         let mut buffer = plaintext.to_vec();
-        super::crypto::provider().encrypt(PrivProtocol::Des, key, &iv, &mut buffer)?;
+        self.backend
+            .encrypt(PrivProtocol::Des, key, &iv, &mut buffer)?;
 
         Ok((Bytes::from(buffer), Bytes::copy_from_slice(&salt)))
     }
@@ -456,7 +499,8 @@ impl PrivKey {
         }
 
         let mut buffer = ciphertext.to_vec();
-        super::crypto::provider().decrypt(PrivProtocol::Des, key, &iv, &mut buffer)?;
+        self.backend
+            .decrypt(PrivProtocol::Des, key, &iv, &mut buffer)?;
 
         Ok(Bytes::from(buffer))
     }
@@ -485,7 +529,8 @@ impl PrivKey {
         }
 
         let mut buffer = plaintext.to_vec();
-        super::crypto::provider().encrypt(PrivProtocol::Des3, key, &iv, &mut buffer)?;
+        self.backend
+            .encrypt(PrivProtocol::Des3, key, &iv, &mut buffer)?;
 
         Ok((Bytes::from(buffer), Bytes::copy_from_slice(&salt)))
     }
@@ -515,7 +560,8 @@ impl PrivKey {
         }
 
         let mut buffer = ciphertext.to_vec();
-        super::crypto::provider().decrypt(PrivProtocol::Des3, key, &iv, &mut buffer)?;
+        self.backend
+            .decrypt(PrivProtocol::Des3, key, &iv, &mut buffer)?;
 
         Ok(Bytes::from(buffer))
     }
@@ -543,7 +589,7 @@ impl PrivKey {
         iv[8..].copy_from_slice(&salt_bytes);
 
         let mut buffer = plaintext.to_vec();
-        super::crypto::provider().encrypt(self.protocol, key, &iv, &mut buffer)?;
+        self.backend.encrypt(self.protocol, key, &iv, &mut buffer)?;
 
         Ok((Bytes::from(buffer), Bytes::copy_from_slice(&salt_bytes)))
     }
@@ -573,7 +619,7 @@ impl PrivKey {
         iv[8..].copy_from_slice(priv_params);
 
         let mut buffer = ciphertext.to_vec();
-        super::crypto::provider().decrypt(self.protocol, key, &iv, &mut buffer)?;
+        self.backend.decrypt(self.protocol, key, &iv, &mut buffer)?;
 
         Ok(Bytes::from(buffer))
     }
@@ -594,6 +640,7 @@ impl Clone for PrivKey {
         Self {
             key: self.key.clone(),
             protocol: self.protocol,
+            backend: self.backend,
             // Fresh counter so the clone does not replay the same salt sequence.
             salt_counter: Self::init_salt().expect("OS random source unavailable"),
         }

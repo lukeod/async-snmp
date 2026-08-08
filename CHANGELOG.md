@@ -9,10 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** The internal `CryptoProvider` abstraction and concrete backend
-  provider types are no longer exported. Applications select exactly one
-  backend for the whole build with the mutually exclusive `crypto-rustcrypto`
-  or `crypto-fips` features; runtime custom-provider injection is not supported.
+- **Breaking:** Crypto backend features are additive and `--all-features` is
+  supported. `UsmConfig` carries an observable `CryptoBackend` selection;
+  RustCrypto remains the default when both are compiled and AWS-LC FIPS must be
+  selected explicitly. Backend-free community and SNMPv3 builds now compile.
   `CryptoError` gains `InvalidHmacTruncationLength` for invalid primitive output
   requests.
 - Notification receivers now expose `NotificationVarbindValidation` through

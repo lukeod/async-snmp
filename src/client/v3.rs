@@ -597,7 +597,7 @@ impl<T: Transport> Client<T> {
         fields(
             snmp.target = %self.peer_addr(),
             snmp.request_id = pdu.request_id,
-            snmp.security_level = ?self.inner.config.usm_config().map(crate::UsmConfig::security_level),
+            snmp.security_level = ?self.inner.config.usm_config().map(crate::v3::UsmConfig::security_level),
             snmp.attempt = tracing::field::Empty,
             snmp.protocol_correction = tracing::field::Empty,
             snmp.elapsed_ms = tracing::field::Empty,
