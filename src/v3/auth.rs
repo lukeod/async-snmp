@@ -149,8 +149,14 @@ impl MasterKey {
     /// Create a master key from raw bytes.
     ///
     /// Use this if you already have a master key (e.g., from configuration).
-    /// The bytes should be the raw digest output from the 1MB password expansion.
-    pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> Self {
+    /// The bytes must be the exact digest output from the 1MB password
+    /// expansion for `protocol`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::InvalidKeyLength`](super::CryptoError::InvalidKeyLength)
+    /// unless `key` is exactly [`AuthProtocol::digest_len`] octets.
+    pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> CryptoResult<Self> {
         Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
     }
 
@@ -159,12 +165,16 @@ impl MasterKey {
         protocol: AuthProtocol,
         key: impl Into<Vec<u8>>,
         backend: CryptoBackend,
-    ) -> Self {
-        Self {
-            key: key.into(),
+    ) -> CryptoResult<Self> {
+        let key = key.into();
+        if key.len() != protocol.digest_len() {
+            return Err(super::CryptoError::InvalidKeyLength);
+        }
+        Ok(Self {
+            key,
             protocol,
             backend,
-        }
+        })
     }
 
     /// Localize this master key to a specific engine ID.
@@ -305,7 +315,12 @@ impl LocalizedKey {
     /// Create a localized key from raw bytes.
     ///
     /// Use this if you already have a localized key (e.g., from configuration).
-    pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::InvalidKeyLength`](super::CryptoError::InvalidKeyLength)
+    /// unless `key` is exactly [`AuthProtocol::digest_len`] octets.
+    pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> CryptoResult<Self> {
         Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
     }
 
@@ -314,12 +329,16 @@ impl LocalizedKey {
         protocol: AuthProtocol,
         key: impl Into<Vec<u8>>,
         backend: CryptoBackend,
-    ) -> Self {
-        Self {
-            key: key.into(),
+    ) -> CryptoResult<Self> {
+        let key = key.into();
+        if key.len() != protocol.digest_len() {
+            return Err(super::CryptoError::InvalidKeyLength);
+        }
+        Ok(Self {
+            key,
             protocol,
             backend,
-        }
+        })
     }
 
     /// Get the protocol this key is for.
@@ -928,7 +947,8 @@ mod tests {
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
                 0x0f, 0x10,
             ],
-        );
+        )
+        .unwrap();
 
         let data = b"test message";
         let mac = key.compute_hmac(data).unwrap();
@@ -943,6 +963,8 @@ mod tests {
         let mut wrong_mac = mac.clone();
         wrong_mac[0] ^= 0xFF;
         assert!(!key.verify_hmac(data, &wrong_mac).unwrap());
+        assert!(!key.verify_hmac(b"different message", &mac).unwrap());
+        assert!(!key.verify_hmac(data, &mac[..8]).unwrap());
     }
 
     #[cfg(feature = "crypto-rustcrypto")]
@@ -954,7 +976,8 @@ mod tests {
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
                 0x0f, 0x10,
             ],
-        );
+        )
+        .unwrap();
 
         // auth_len larger than the biggest supported MAC (48 bytes for
         // SHA-512) but still within the message bounds must be rejected,
@@ -973,7 +996,8 @@ mod tests {
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
                 0x0f, 0x10,
             ],
-        );
+        )
+        .unwrap();
 
         // An auth-parameter offset/length reaching past the message end must be
         // rejected rather than silently leaving the message unsigned.
@@ -1035,14 +1059,111 @@ mod tests {
     }
 
     #[test]
-    fn test_from_bytes_bypasses_length_check() {
-        // Pre-derived key constructors take key material, not a plaintext
-        // password, and must remain unaffected by the length check.
-        let short_key = vec![0xAAu8; 4];
-        let master = MasterKey::from_bytes(AuthProtocol::Sha1, short_key.clone());
-        assert_eq!(master.as_bytes(), short_key.as_slice());
-        let localized = LocalizedKey::from_bytes(AuthProtocol::Sha1, short_key.clone());
-        assert_eq!(localized.as_bytes(), short_key.as_slice());
+    fn test_raw_auth_key_lengths_for_each_protocol_and_backend() {
+        let protocols = [
+            AuthProtocol::Md5,
+            AuthProtocol::Sha1,
+            AuthProtocol::Sha224,
+            AuthProtocol::Sha256,
+            AuthProtocol::Sha384,
+            AuthProtocol::Sha512,
+        ];
+        let backends = [
+            #[cfg(feature = "crypto-rustcrypto")]
+            CryptoBackend::RustCrypto,
+            #[cfg(feature = "crypto-fips")]
+            CryptoBackend::AwsLcFips,
+        ];
+
+        for backend in backends {
+            for protocol in protocols {
+                let len = protocol.digest_len();
+                for actual in [len - 1, len + 1] {
+                    assert_eq!(
+                        MasterKey::from_bytes_with_backend(protocol, vec![0xAA; actual], backend),
+                        Err(super::super::CryptoError::InvalidKeyLength)
+                    );
+                    assert!(matches!(
+                        LocalizedKey::from_bytes_with_backend(
+                            protocol,
+                            vec![0xAA; actual],
+                            backend
+                        ),
+                        Err(super::super::CryptoError::InvalidKeyLength)
+                    ));
+                }
+
+                let master =
+                    MasterKey::from_bytes_with_backend(protocol, vec![0xAA; len], backend).unwrap();
+                assert_eq!(master.as_bytes().len(), len);
+                let localized =
+                    LocalizedKey::from_bytes_with_backend(protocol, vec![0xAA; len], backend)
+                        .unwrap();
+                assert_eq!(localized.as_bytes().len(), len);
+            }
+        }
+    }
+
+    #[test]
+    fn test_generic_hmac_vectors_use_internal_arbitrary_key_helper() {
+        fn generic_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> Vec<u8> {
+            compute_hmac(CryptoBackend::default(), protocol, key, data).unwrap()
+        }
+
+        let cases = [
+            (
+                AuthProtocol::Sha1,
+                vec![0x0b; 20],
+                b"Hi There".as_slice(),
+                "b617318655057264e28bc0b6",
+            ),
+            (
+                AuthProtocol::Sha224,
+                vec![0x0b; 20],
+                b"Hi There".as_slice(),
+                "896fb1128abbdf196832107cd49df33f",
+            ),
+            (
+                AuthProtocol::Sha256,
+                vec![0x0b; 20],
+                b"Hi There".as_slice(),
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da7",
+            ),
+            (
+                AuthProtocol::Sha384,
+                vec![0x0b; 20],
+                b"Hi There".as_slice(),
+                "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c",
+            ),
+            (
+                AuthProtocol::Sha512,
+                vec![0x0b; 20],
+                b"Hi There".as_slice(),
+                "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4",
+            ),
+            (
+                AuthProtocol::Sha1,
+                b"Jefe".to_vec(),
+                b"what do ya want for nothing?".as_slice(),
+                "effcdf6ae5eb2fa2d27416d5",
+            ),
+            (
+                AuthProtocol::Sha256,
+                b"Jefe".to_vec(),
+                b"what do ya want for nothing?".as_slice(),
+                "5bdcc146bf60754e6a042426089575c75a003f089d273983",
+            ),
+            (
+                AuthProtocol::Sha1,
+                vec![0x0c; 20],
+                b"Test With Truncation".as_slice(),
+                "4c1a03424b55e07fe7f27be1",
+            ),
+        ];
+
+        for (protocol, key, data, expected) in cases {
+            assert_eq!(encode_hex(&generic_hmac(protocol, &key, data)), expected);
+        }
     }
 
     #[test]

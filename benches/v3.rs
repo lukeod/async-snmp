@@ -3,7 +3,7 @@
 //! Tests the performance of V3 crypto operations which are on the hot path
 //! for all `SNMPv3` communications.
 
-use async_snmp::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol};
+use async_snmp::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol, SaltCounter};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -127,6 +127,7 @@ fn bench_encrypt(c: &mut Criterion) {
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
+    let salt_counter = SaltCounter::new();
 
     for size in data_sizes {
         let data = vec![0xABu8; size];
@@ -138,20 +139,35 @@ fn bench_encrypt(c: &mut Criterion) {
         {
             let key = des_key.clone();
             group.bench_with_input(BenchmarkId::new("DES", size), &data, |b, data| {
-                b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()));
+                b.iter(|| {
+                    black_box(
+                        key.encrypt(data, engine_boots, engine_time, &salt_counter)
+                            .unwrap(),
+                    )
+                });
             });
         }
 
         // AES-128
         let key = aes128_key.clone();
         group.bench_with_input(BenchmarkId::new("AES-128", size), &data, |b, data| {
-            b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()));
+            b.iter(|| {
+                black_box(
+                    key.encrypt(data, engine_boots, engine_time, &salt_counter)
+                        .unwrap(),
+                )
+            });
         });
 
         // AES-256
         let key = aes256_key.clone();
         group.bench_with_input(BenchmarkId::new("AES-256", size), &data, |b, data| {
-            b.iter(|| black_box(key.encrypt(data, engine_boots, engine_time, None).unwrap()));
+            b.iter(|| {
+                black_box(
+                    key.encrypt(data, engine_boots, engine_time, &salt_counter)
+                        .unwrap(),
+                )
+            });
         });
     }
 
@@ -195,6 +211,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
+    let salt_counter = SaltCounter::new();
 
     for size in data_sizes {
         let plaintext = vec![0xABu8; size];
@@ -205,7 +222,7 @@ fn bench_decrypt(c: &mut Criterion) {
         #[cfg(feature = "crypto-rustcrypto")]
         {
             let (ciphertext, priv_params) = des_key
-                .encrypt(&plaintext, engine_boots, engine_time, None)
+                .encrypt(&plaintext, engine_boots, engine_time, &salt_counter)
                 .unwrap();
             group.bench_with_input(
                 BenchmarkId::new("DES", size),
@@ -220,7 +237,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
         // AES-128
         let (ciphertext, priv_params) = aes128_key
-            .encrypt(&plaintext, engine_boots, engine_time, None)
+            .encrypt(&plaintext, engine_boots, engine_time, &salt_counter)
             .unwrap();
         group.bench_with_input(
             BenchmarkId::new("AES-128", size),
@@ -238,7 +255,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
         // AES-256
         let (ciphertext, priv_params) = aes256_key
-            .encrypt(&plaintext, engine_boots, engine_time, None)
+            .encrypt(&plaintext, engine_boots, engine_time, &salt_counter)
             .unwrap();
         group.bench_with_input(
             BenchmarkId::new("AES-256", size),
@@ -275,6 +292,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
+    let salt_counter = SaltCounter::new();
 
     // Typical SNMP message (256 bytes total, ~200 bytes ScopedPDU)
     let scoped_pdu = vec![0xABu8; 200];
@@ -286,7 +304,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
     group.bench_function("outgoing_encrypt_then_auth", |b| {
         b.iter(|| {
             let (encrypted, _priv_params) = priv_key
-                .encrypt(&scoped_pdu, engine_boots, engine_time, None)
+                .encrypt(&scoped_pdu, engine_boots, engine_time, &salt_counter)
                 .unwrap();
             let _hmac = auth_key.compute_hmac(&full_message).unwrap();
             black_box(encrypted)
@@ -295,7 +313,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
 
     // Incoming: verify HMAC, then decrypt
     let (ciphertext, priv_params) = priv_key
-        .encrypt(&scoped_pdu, engine_boots, engine_time, None)
+        .encrypt(&scoped_pdu, engine_boots, engine_time, &salt_counter)
         .unwrap();
     let hmac = auth_key.compute_hmac(&full_message).unwrap();
 

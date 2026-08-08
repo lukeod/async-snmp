@@ -68,12 +68,7 @@ pub fn encode_v3_message(
 
         let scoped_pdu_bytes = scoped_pdu.encode_to_bytes()?;
         let (ciphertext, salt) = priv_key
-            .encrypt(
-                &scoped_pdu_bytes,
-                engine_boots,
-                engine_time,
-                Some(salt_counter),
-            )
+            .encrypt(&scoped_pdu_bytes, engine_boots, engine_time, salt_counter)
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
         (V3MessageData::Encrypted(ciphertext), salt)
@@ -272,7 +267,7 @@ pub(crate) fn encode_v3_response(
                     &scoped_pdu_bytes,
                     usm.engine_boots,
                     usm.engine_time,
-                    Some(salt_counter),
+                    salt_counter,
                 )
                 .map_err(|e| {
                     tracing::debug!(target: "async_snmp::v3", { error = %e }, "encryption failed for response");

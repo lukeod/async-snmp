@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallible, and values above `i32::MAX` are rejected before request allocation,
   stream construction, or transport I/O. `ClientConfig::max_repetitions` is
   validated when the client is constructed rather than saturated on use.
+- **Breaking:** Raw `MasterKey` and `LocalizedKey` constructors now return
+  `Result` and require exactly the selected authentication protocol's digest
+  length. `PrivKey::encrypt` now requires an explicit `&SaltCounter`; privacy
+  keys no longer own implicit clone-local salt state. One counter must be shared
+  by all encryptions in an authoritative engine/key domain.
 - **Breaking:** `Agent::send_trap()` and `Agent::send_inform()` now return a
   `NotificationOutcome` with a `SinkStatus` for every configured sink. Inform
   sinks using SNMPv1 are reported as explicitly skipped, so an all-skipped send
@@ -82,6 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration
 
+- Handle the `Result` from `MasterKey::from_bytes` and
+  `LocalizedKey::from_bytes`, and provide exact Ku/Kul digest output rather than
+  an arbitrary HMAC key. Create one owner-held `SaltCounter` for each
+  authoritative engine/key domain and pass it to every `PrivKey::encrypt` call;
+  cloned or re-derived privacy keys use the same counter.
 - Replace `send_trap_detailed()` and `send_inform_detailed()` with
   `send_trap()` and `send_inform()`, and match each `SinkOutcome.status` as
   `Succeeded`, `Failed(error)`, or `Skipped(reason)`. Code that deliberately

@@ -39,7 +39,7 @@ impl TestV3Engine {
             engine_time: 1,
             msg_max_size: 65_507,
             users: Vec::new(),
-            salt: Arc::new(SaltCounter::from_value(1)),
+            salt: Arc::new(SaltCounter::new()),
         }
     }
 
@@ -480,7 +480,7 @@ impl V3ReplyBuilder {
                     &scoped_bytes,
                     self.engine_boots,
                     self.engine_time,
-                    Some(&self.salt),
+                    &self.salt,
                 )
                 .map_err(|error| error.to_string())?;
             let ciphertext = self.ciphertext_override.unwrap_or(ciphertext);

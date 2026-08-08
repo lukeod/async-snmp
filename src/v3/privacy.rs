@@ -103,7 +103,7 @@ fn random_nonzero_u64() -> super::crypto::CryptoResult<u64> {
 /// Key material is automatically zeroed from memory when the key is dropped,
 /// using the `zeroize` crate. This provides defense-in-depth against memory
 /// scraping attacks.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PrivKey {
     /// The localized key bytes
     key: Vec<u8>,
@@ -112,13 +112,14 @@ pub struct PrivKey {
     protocol: PrivProtocol,
     #[zeroize(skip)]
     backend: CryptoBackend,
-    /// Salt counter for generating unique IVs.
-    /// Uses interior mutability so `encrypt()` can take &self.
-    #[zeroize(skip)]
-    salt_counter: AtomicU64,
 }
 
-/// Thread-safe salt counter for shared use across multiple encryptions.
+/// Thread-safe salt counter for shared use across privacy encryptions.
+///
+/// The owner of an authoritative engine/key domain must create one counter and
+/// pass that same counter to every encryption in the domain, including
+/// encryptions performed with cloned or re-derived [`PrivKey`] values. This
+/// keeps IV allocation independent of key object lifetime and cloning.
 pub struct SaltCounter(AtomicU64);
 
 impl SaltCounter {
@@ -133,35 +134,27 @@ impl SaltCounter {
         ))
     }
 
-    /// Create a salt counter initialized to a specific value.
-    ///
-    /// This is primarily for testing purposes.
+    /// Create a salt counter initialized to a specific value for internal tests.
+    #[cfg(test)]
     #[must_use]
-    pub fn from_value(value: u64) -> Self {
+    pub(crate) fn from_value(value: u64) -> Self {
         Self(AtomicU64::new(value))
     }
 
     /// Get the next salt value and increment the counter.
     ///
-    /// This method never returns zero. Per net-snmp behavior, zero is skipped
-    /// on wraparound to avoid potential IV reuse issues.
-    ///
-    /// Uses the post-increment value as the salt. On wraparound (the single
-    /// thread that observes `old == u64::MAX`), it consumes the next counter
-    /// value via a fresh `fetch_add` rather than returning a fixed constant.
-    /// Returning a constant would duplicate the value produced by whichever
-    /// thread reads `old == 0`, causing IV reuse under concurrent access.
+    /// This method never returns a value whose low 32 bits are zero. DES and
+    /// 3DES place only those low 32 bits in `privParameters`, so skipping that
+    /// value gives their counter portion the same non-zero wrap behavior as the
+    /// full 64-bit AES salt. A wrapping caller consumes another atomic value
+    /// rather than returning a fixed constant, preserving concurrency safety.
     pub fn next(&self) -> u64 {
         loop {
             let old = self.0.fetch_add(1, Ordering::SeqCst);
             let val = old.wrapping_add(1);
-            if val != 0 {
+            if val as u32 != 0 {
                 return val;
             }
-            // Counter wrapped to zero (old == u64::MAX). Only one thread observes
-            // this per wrap; loop to take the next distinct counter value instead
-            // of returning a constant that another thread (old == 0) would also
-            // return.
         }
     }
 }
@@ -303,7 +296,6 @@ impl PrivKey {
             key,
             protocol: priv_protocol,
             backend: master.crypto_backend(),
-            salt_counter: Self::init_salt()?,
         })
     }
 
@@ -336,15 +328,7 @@ impl PrivKey {
             key,
             protocol,
             backend,
-            salt_counter: Self::init_salt()?,
         })
-    }
-
-    /// Initialize salt counter from cryptographic randomness.
-    ///
-    /// Never returns zero to avoid IV reuse issues on wraparound.
-    fn init_salt() -> super::crypto::CryptoResult<AtomicU64> {
-        Ok(AtomicU64::new(random_nonzero_u64()?))
     }
 
     /// Get the privacy protocol.
@@ -374,7 +358,17 @@ impl PrivKey {
     /// * `plaintext` - The data to encrypt (typically the serialized `ScopedPDU`)
     /// * `engine_boots` - The authoritative engine's boot count
     /// * `engine_time` - The authoritative engine's time
-    /// * `salt_counter` - Optional shared salt counter; if None, uses internal counter
+    /// * `salt_counter` - Counter owned by the authoritative engine/key domain
+    ///
+    /// The same counter must be shared by every encryption using this key
+    /// domain. Cloning or re-deriving a key does not create a salt owner.
+    ///
+    /// ```compile_fail,E0061
+    /// # use async_snmp::v3::{PrivKey, PrivProtocol};
+    /// # let key = PrivKey::from_bytes(PrivProtocol::Aes128, [0_u8; 16]).unwrap();
+    /// // Encryption cannot be called without an explicit owner-held counter.
+    /// let _ = key.encrypt(b"scoped PDU", 1, 1);
+    /// ```
     ///
     /// # Returns
     /// * `Ok((ciphertext, priv_params))` on success
@@ -384,20 +378,9 @@ impl PrivKey {
         plaintext: &[u8],
         engine_boots: u32,
         engine_time: u32,
-        salt_counter: Option<&SaltCounter>,
+        salt_counter: &SaltCounter,
     ) -> PrivacyResult<(Bytes, Bytes)> {
-        let salt = salt_counter.map_or_else(
-            || {
-                // Fetch the current value, then increment. Skip zero.
-                let val = self.salt_counter.fetch_add(1, Ordering::Relaxed);
-                if val != 0 {
-                    return val;
-                }
-                // Counter was zero (initial or wrapped). Fetch the next value.
-                self.salt_counter.fetch_add(1, Ordering::Relaxed)
-            },
-            SaltCounter::next,
-        );
+        let salt = salt_counter.next();
 
         match self.protocol {
             PrivProtocol::Des => self.encrypt_des(plaintext, engine_boots, salt),
@@ -636,20 +619,7 @@ impl std::fmt::Debug for PrivKey {
         f.debug_struct("PrivKey")
             .field("protocol", &self.protocol)
             .field("key", &"[REDACTED]")
-            .field("salt_counter", &"[REDACTED]")
             .finish()
-    }
-}
-
-impl Clone for PrivKey {
-    fn clone(&self) -> Self {
-        Self {
-            key: self.key.clone(),
-            protocol: self.protocol,
-            backend: self.backend,
-            // Fresh counter so the clone does not replay the same salt sequence.
-            salt_counter: Self::init_salt().expect("OS random source unavailable"),
-        }
     }
 }
 
@@ -673,7 +643,7 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -708,7 +678,7 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -740,7 +710,7 @@ mod tests {
         let engine_time = 54321u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -809,7 +779,7 @@ mod tests {
         // trailing bytes are unused but harmless.
         let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 20]).unwrap();
         // Encrypting should not panic now that the key is validated as long enough.
-        let _ = priv_key.encrypt(b"data", 0, 0, None);
+        let _ = priv_key.encrypt(b"data", 0, 0, &SaltCounter::new());
     }
 
     #[test]
@@ -825,7 +795,7 @@ mod tests {
 
     #[test]
     fn test_salt_counter() {
-        let counter = SaltCounter::new();
+        let counter = SaltCounter::from_value(100);
         let s1 = counter.next();
         let s2 = counter.next();
         let s3 = counter.next();
@@ -881,51 +851,17 @@ mod tests {
         }
     }
 
-    /// Test that `PrivKey`'s internal salt counter never produces zero.
-    ///
-    /// When using the internal counter (not a shared `SaltCounter`), the salt
-    /// should also skip zero on wraparound.
     #[test]
-    fn test_priv_key_internal_salt_skips_zero() {
+    fn test_multiple_encryptions_use_shared_counter() {
         let key = vec![0u8; 16];
         let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key).unwrap();
+        let counter = SaltCounter::from_value(100);
 
-        // Set the internal counter to u64::MAX
-        priv_key.salt_counter.store(u64::MAX, Ordering::Relaxed);
+        let (_, salt1) = priv_key.encrypt(b"test data", 0, 0, &counter).unwrap();
+        let (_, salt2) = priv_key.encrypt(b"test data", 0, 0, &counter).unwrap();
 
-        let plaintext = b"test";
-
-        // First encryption uses u64::MAX
-        let (_, salt1) = priv_key.encrypt(plaintext, 0, 0, None).unwrap();
-        assert_eq!(
-            u64::from_be_bytes(salt1.as_ref().try_into().unwrap()),
-            u64::MAX
-        );
-
-        // Second encryption should skip 0 and use 1
-        let (_, salt2) = priv_key.encrypt(plaintext, 0, 0, None).unwrap();
-        let salt2_value = u64::from_be_bytes(salt2.as_ref().try_into().unwrap());
-        assert_ne!(salt2_value, 0, "Salt should never be zero");
-        assert_eq!(salt2_value, 1, "Salt should skip 0 and be 1");
-
-        // Third encryption should use 2
-        let (_, salt3) = priv_key.encrypt(plaintext, 0, 0, None).unwrap();
-        let salt3_value = u64::from_be_bytes(salt3.as_ref().try_into().unwrap());
-        assert_eq!(salt3_value, 2);
-    }
-
-    #[test]
-    fn test_multiple_encryptions_different_salt() {
-        let key = vec![0u8; 16];
-        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key).unwrap();
-
-        let plaintext = b"test data";
-
-        let (_, salt1) = priv_key.encrypt(plaintext, 0, 0, None).unwrap();
-        let (_, salt2) = priv_key.encrypt(plaintext, 0, 0, None).unwrap();
-
-        // Salts should be different for each encryption
-        assert_ne!(salt1, salt2);
+        assert_eq!(u64::from_be_bytes(salt1[..].try_into().unwrap()), 101);
+        assert_eq!(u64::from_be_bytes(salt2[..].try_into().unwrap()), 102);
     }
 
     #[test]
@@ -944,7 +880,9 @@ mod tests {
 
         // Just verify we can encrypt/decrypt with the derived key
         let plaintext = b"test message";
-        let (ciphertext, priv_params) = priv_key.encrypt(plaintext, 100, 200, None).unwrap();
+        let (ciphertext, priv_params) = priv_key
+            .encrypt(plaintext, 100, 200, &SaltCounter::new())
+            .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
             .unwrap();
@@ -966,7 +904,7 @@ mod tests {
         let engine_time = 67890u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("AES-192 encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -999,7 +937,7 @@ mod tests {
         let engine_time = 11111u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("AES-256 encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -1032,7 +970,9 @@ mod tests {
         .unwrap();
 
         let plaintext = b"test message for AES-192";
-        let (ciphertext, priv_params) = priv_key.encrypt(plaintext, 100, 200, None).unwrap();
+        let (ciphertext, priv_params) = priv_key
+            .encrypt(plaintext, 100, 200, &SaltCounter::new())
+            .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
             .unwrap();
@@ -1055,7 +995,9 @@ mod tests {
         .unwrap();
 
         let plaintext = b"test message for AES-256";
-        let (ciphertext, priv_params) = priv_key.encrypt(plaintext, 100, 200, None).unwrap();
+        let (ciphertext, priv_params) = priv_key
+            .encrypt(plaintext, 100, 200, &SaltCounter::new())
+            .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
             .unwrap();
@@ -1095,7 +1037,7 @@ mod tests {
 
         // Encrypt with correct key
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         // Decrypt with wrong key - this will "succeed" but produce garbage
@@ -1141,7 +1083,7 @@ mod tests {
 
         // Encrypt with correct key
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         // Decrypt with wrong key
@@ -1182,7 +1124,7 @@ mod tests {
         let engine_time = 67890u32;
 
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         let wrong_decrypted = wrong_priv_key
@@ -1217,7 +1159,7 @@ mod tests {
         let engine_time = 11111u32;
 
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         let wrong_decrypted = wrong_priv_key
@@ -1248,7 +1190,7 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, correct_priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         // Use wrong priv_params (different salt)
@@ -1299,7 +1241,7 @@ mod tests {
         let plaintext = b"RFC 3414 8.1.1.1 salt/IV composition test";
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, Some(&salt_counter))
+            .encrypt(plaintext, engine_boots, engine_time, &salt_counter)
             .expect("encryption failed");
 
         // 1. Salt composition: privParameters = engineBoots || counter.
@@ -1361,26 +1303,80 @@ mod tests {
         }
     }
 
-    /// Test that a cloned `PrivKey` starts with an independent salt counter.
-    ///
-    /// This is a regression test for derive(Clone) copying the `salt_counter`
-    /// field, which caused clones to emit identical salts for their first encryptions.
+    #[cfg(feature = "crypto-rustcrypto")]
     #[test]
-    fn test_priv_key_clone_independent_salts() {
-        let key = vec![0u8; 16];
-        let original = PrivKey::from_bytes(PrivProtocol::Aes128, key).unwrap();
+    fn test_des_family_shared_counter_concurrency_and_low_32_bit_wrap() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        for (protocol, key_len) in [(PrivProtocol::Des, 16), (PrivProtocol::Des3, 32)] {
+            let key = Arc::new(PrivKey::from_bytes(protocol, vec![0x5A; key_len]).unwrap());
+            let counter = Arc::new(SaltCounter::from_value(u64::from(u32::MAX) - 2));
+            let portions = Arc::new(Mutex::new(HashSet::new()));
+
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let key = Arc::clone(&key);
+                    let counter = Arc::clone(&counter);
+                    let portions = Arc::clone(&portions);
+                    thread::spawn(move || {
+                        let (_, params) = key.encrypt(b"shared", 7, 11, &counter).unwrap();
+                        assert_eq!(&params[..4], &7_u32.to_be_bytes());
+                        let low = u32::from_be_bytes(params[4..].try_into().unwrap());
+                        assert_ne!(low, 0);
+                        assert!(portions.lock().unwrap().insert(low));
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(
+                *portions.lock().unwrap(),
+                HashSet::from([u32::MAX - 1, u32::MAX, 1, 2])
+            );
+        }
+    }
+
+    #[test]
+    fn test_cloned_priv_keys_require_same_explicit_counter() {
+        let original = PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; 16]).unwrap();
         let cloned = original.clone();
+        let counter = SaltCounter::from_value(200);
 
-        let plaintext = b"test";
+        let (_, salt_orig) = original.encrypt(b"test", 0, 0, &counter).unwrap();
+        let (_, salt_clone) = cloned.encrypt(b"test", 0, 0, &counter).unwrap();
 
-        // Encrypt once with each key; the priv_params (salt) must differ.
-        let (_, salt_orig) = original.encrypt(plaintext, 0, 0, None).unwrap();
-        let (_, salt_clone) = cloned.encrypt(plaintext, 0, 0, None).unwrap();
+        assert_eq!(u64::from_be_bytes(salt_orig[..].try_into().unwrap()), 201);
+        assert_eq!(u64::from_be_bytes(salt_clone[..].try_into().unwrap()), 202);
+    }
 
-        assert_ne!(
-            salt_orig, salt_clone,
-            "cloned PrivKey must start with an independent salt counter"
-        );
+    #[cfg(all(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn test_aes128_backends_match_with_deterministic_salt() {
+        let key = vec![0x5A; PrivProtocol::Aes128.key_len()];
+        let rust = PrivKey::from_bytes_with_backend(
+            PrivProtocol::Aes128,
+            key.clone(),
+            CryptoBackend::RustCrypto,
+        )
+        .unwrap();
+        let fips =
+            PrivKey::from_bytes_with_backend(PrivProtocol::Aes128, key, CryptoBackend::AwsLcFips)
+                .unwrap();
+        let rust_counter = SaltCounter::from_value(41);
+        let fips_counter = SaltCounter::from_value(41);
+
+        let rust_encrypted = rust
+            .encrypt(b"shared AES-128 provider KAT", 7, 11, &rust_counter)
+            .unwrap();
+        let fips_encrypted = fips
+            .encrypt(b"shared AES-128 provider KAT", 7, 11, &fips_counter)
+            .unwrap();
+
+        assert_eq!(rust_encrypted, fips_encrypted);
     }
 
     #[test]
@@ -1399,7 +1395,7 @@ mod tests {
         let engine_time = 54321u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, None)
+            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
             .expect("encryption failed");
 
         // Decrypt with wrong engine_time (IV mismatch)
