@@ -13,6 +13,7 @@
 use async_snmp::{
     Auth, Client, Error, FixedCardinalityResponse, ResponseShapePolicy, Retry, Value, VarBind, oid,
 };
+use bytes::Bytes;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -30,12 +31,15 @@ fn oneshot_get(
         .expect("failed to create tokio runtime");
 
     rt.block_on(async {
-        let client = Client::builder(target, Auth::v2c(community))
-            .response_shape_policy(ResponseShapePolicy::Strict)
-            .timeout(Duration::from_secs(5))
-            .retry(Retry::fixed(2, Duration::ZERO))
-            .connect()
-            .await?;
+        let client = Client::builder(
+            target,
+            Auth::v2c(Bytes::copy_from_slice(community.as_bytes())),
+        )
+        .response_shape_policy(ResponseShapePolicy::Strict)
+        .timeout(Duration::from_secs(5))
+        .retry(Retry::fixed(2, Duration::ZERO))
+        .connect()
+        .await?;
 
         client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await
     })
@@ -58,12 +62,15 @@ impl SyncSnmpClient {
             .expect("failed to create tokio runtime");
 
         let client = rt.block_on(async {
-            Client::builder(target, Auth::v2c(community))
-                .response_shape_policy(ResponseShapePolicy::Strict)
-                .timeout(Duration::from_secs(5))
-                .retry(Retry::fixed(2, Duration::ZERO))
-                .connect()
-                .await
+            Client::builder(
+                target,
+                Auth::v2c(Bytes::copy_from_slice(community.as_bytes())),
+            )
+            .response_shape_policy(ResponseShapePolicy::Strict)
+            .timeout(Duration::from_secs(5))
+            .retry(Retry::fixed(2, Duration::ZERO))
+            .connect()
+            .await
         })?;
 
         Ok(Self { rt, client })

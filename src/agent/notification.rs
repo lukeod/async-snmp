@@ -60,7 +60,7 @@ impl TrapSink {
                     dest,
                     auth: sink_auth,
                     version: snmp_version,
-                    community: Bytes::copy_from_slice(community.as_bytes()),
+                    community: community.clone(),
                     v3_security: None,
                     derived_keys: RwLock::new(None),
                     inform_timeout,

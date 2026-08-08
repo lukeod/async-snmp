@@ -1,7 +1,7 @@
 //! Authentication configuration types for the SNMP client.
 //!
 //! This module provides the [`Auth`] enum for specifying authentication
-//! configuration, supporting SNMPv1/v2c community strings and `SNMPv3` USM.
+//! configuration, supporting SNMPv1/v2c community identifiers and `SNMPv3` USM.
 //!
 //! # Master Key Caching
 //!
@@ -22,6 +22,8 @@
 //!     .into();
 //! ```
 
+use bytes::Bytes;
+
 use crate::v3::UsmConfig;
 use crate::version::Version;
 
@@ -37,16 +39,16 @@ pub enum CommunityVersion {
 
 /// Authentication configuration for SNMP clients.
 ///
-/// The [`Debug`] implementation redacts community strings so that credentials
+/// The [`Debug`] implementation redacts community identifiers so that credentials
 /// are not leaked through logs or diagnostics.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Auth {
-    /// Community string authentication (`SNMPv1` or v2c).
+    /// Community authentication (`SNMPv1` or v2c).
     Community {
         /// SNMP version (V1 or V2c)
         version: CommunityVersion,
-        /// Community string
-        community: String,
+        /// Community identifier bytes.
+        community: Bytes,
     },
     /// User-based Security Model (`SNMPv3`).
     Usm(UsmConfig),
@@ -63,17 +65,23 @@ impl Auth {
     /// `SNMPv1` community authentication.
     ///
     /// Creates authentication configuration for `SNMPv1`, which only supports
-    /// community string authentication without encryption.
+    /// community authentication without encryption. Community identifiers are
+    /// protocol octets and do not need to be valid UTF-8.
     ///
     /// # Example
     ///
     /// ```rust
     /// use async_snmp::Auth;
+    /// use bytes::Bytes;
     ///
-    /// // Create SNMPv1 authentication with "private" community
+    /// // String literals and owned strings can be passed directly.
     /// let auth = Auth::v1("private");
+    ///
+    /// // Copy a short-lived borrowed string into owned community bytes.
+    /// let community = String::from("private");
+    /// let auth = Auth::v1(Bytes::copy_from_slice(community.as_bytes()));
     /// ```
-    pub fn v1(community: impl Into<String>) -> Self {
+    pub fn v1(community: impl Into<Bytes>) -> Self {
         Auth::Community {
             version: CommunityVersion::V1,
             community: community.into(),
@@ -83,21 +91,27 @@ impl Auth {
     /// `SNMPv2c` community authentication.
     ///
     /// Creates authentication configuration for `SNMPv2c`, which supports
-    /// community string authentication without encryption but adds GETBULK
-    /// and improved error handling over `SNMPv1`.
+    /// community authentication without encryption but adds GETBULK and
+    /// improved error handling over `SNMPv1`. Community identifiers are
+    /// protocol octets and do not need to be valid UTF-8.
     ///
     /// # Example
     ///
     /// ```rust
     /// use async_snmp::Auth;
+    /// use bytes::Bytes;
     ///
-    /// // Create SNMPv2c authentication with "public" community
+    /// // String literals and owned strings can be passed directly.
     /// let auth = Auth::v2c("public");
+    ///
+    /// // Copy a short-lived borrowed string into owned community bytes.
+    /// let community = String::from("public");
+    /// let auth = Auth::v2c(Bytes::copy_from_slice(community.as_bytes()));
     ///
     /// // Auth::default() is equivalent to Auth::v2c("public")
     /// let auth = Auth::default();
     /// ```
-    pub fn v2c(community: impl Into<String>) -> Self {
+    pub fn v2c(community: impl Into<Bytes>) -> Self {
         Auth::Community {
             version: CommunityVersion::V2c,
             community: community.into(),
@@ -154,7 +168,7 @@ impl Auth {
         }
     }
 
-    pub(crate) fn community(&self) -> Option<&str> {
+    pub(crate) fn community(&self) -> Option<&Bytes> {
         match self {
             Auth::Community { community, .. } => Some(community),
             Auth::Usm(_) => None,
@@ -204,7 +218,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community, "public");
+                assert_eq!(community.as_ref(), b"public");
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -216,7 +230,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V1);
-                assert_eq!(community, "private");
+                assert_eq!(community.as_ref(), b"private");
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -228,9 +242,30 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community, "secret");
+                assert_eq!(community.as_ref(), b"secret");
             }
             Auth::Usm(_) => panic!("expected Community variant"),
+        }
+    }
+
+    #[test]
+    fn test_non_utf8_community_auth() {
+        let community = Bytes::from_static(b"public\xff");
+
+        for (auth, expected_version) in [
+            (Auth::v1(community.clone()), CommunityVersion::V1),
+            (Auth::v2c(community.clone()), CommunityVersion::V2c),
+        ] {
+            match auth {
+                Auth::Community {
+                    version,
+                    community: actual,
+                } => {
+                    assert_eq!(version, expected_version);
+                    assert_eq!(actual, community);
+                }
+                Auth::Usm(_) => panic!("expected Community variant"),
+            }
         }
     }
 

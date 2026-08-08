@@ -257,7 +257,7 @@ impl ClientConfig {
     fn community(&self) -> Result<Bytes> {
         self.auth
             .community()
-            .map(|community| Bytes::copy_from_slice(community.as_bytes()))
+            .cloned()
             .ok_or_else(|| Error::Config("community authentication required".into()).boxed())
     }
 

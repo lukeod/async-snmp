@@ -208,7 +208,7 @@ impl V3Args {
             };
             Ok(config.into())
         } else {
-            let community = &common.community;
+            let community = common.community.clone();
             Ok(match common.snmp_version {
                 SnmpVersion::V1 => Auth::v1(community),
                 _ => Auth::v2c(community),
