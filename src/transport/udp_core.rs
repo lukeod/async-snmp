@@ -480,6 +480,7 @@ mod tests {
                 varbinds: Vec::new(),
             },
         )
+        .unwrap()
         .encode()
         .unwrap()
     }

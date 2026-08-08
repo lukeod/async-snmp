@@ -27,16 +27,16 @@ impl super::NotificationReceiver {
     ) -> Result<Option<Notification>> {
         let msg = CommunityMessage::decode_with_target(data, source)?;
 
-        if !super::community_allowed(&self.inner.communities, &msg.community) {
+        if !super::community_allowed(&self.inner.communities, msg.community()) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v1 notification with unaccepted community");
             return Ok(None);
         }
 
-        match msg.pdu {
-            crate::message::CommunityPdu::TrapV1(trap) => Ok(Some(Notification::TrapV1 {
-                community: msg.community,
-                trap,
-            })),
+        let (_, community, pdu) = msg.into_parts();
+        match pdu {
+            crate::message::CommunityPdu::TrapV1(trap) => {
+                Ok(Some(Notification::TrapV1 { community, trap }))
+            }
             crate::message::CommunityPdu::Standard(_) => Ok(None),
         }
     }
@@ -49,13 +49,13 @@ impl super::NotificationReceiver {
     ) -> Result<Option<Notification>> {
         let msg = CommunityMessage::decode_with_target(data, source)?;
 
-        if !super::community_allowed(&self.inner.communities, &msg.community) {
+        if !super::community_allowed(&self.inner.communities, msg.community()) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v2c notification with unaccepted community");
             return Ok(None);
         }
 
         // V2c messages carry standard PDUs; TrapV1 is only valid in V1 messages.
-        let Some(pdu) = msg.pdu.standard() else {
+        let Some(pdu) = msg.pdu().standard() else {
             return Ok(None);
         };
 
@@ -64,7 +64,7 @@ impl super::NotificationReceiver {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
                 Ok(Some(Notification::TrapV2c {
-                    community: msg.community,
+                    community: msg.community().clone(),
                     uptime,
                     trap_oid,
                     varbinds,
@@ -78,7 +78,7 @@ impl super::NotificationReceiver {
 
                 // Send response
                 let response = pdu.to_response();
-                let response_msg = CommunityMessage::v2c(msg.community.clone(), response);
+                let response_msg = CommunityMessage::v2c(msg.community().clone(), response)?;
                 let response_bytes = response_msg.encode()?;
 
                 self.inner
@@ -93,7 +93,7 @@ impl super::NotificationReceiver {
                 tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
 
                 Ok(Some(Notification::InformV2c {
-                    community: msg.community,
+                    community: msg.community().clone(),
                     uptime,
                     trap_oid,
                     varbinds,

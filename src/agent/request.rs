@@ -40,13 +40,13 @@ impl Agent {
         let msg = CommunityMessage::decode_with_target(data, source)?;
 
         // Validate community
-        if !self.validate_community(&msg.community) {
+        if !self.validate_community(msg.community()) {
             tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "invalid community string");
             return Ok(None);
         }
 
         // Skip non-request PDUs (TrapV1 and other non-request types are ignored)
-        let pdu = match msg.pdu.standard() {
+        let pdu = match msg.pdu().standard() {
             Some(p) if is_request_pdu(p.pdu_type) => p,
             _ => return Ok(None),
         };
@@ -84,7 +84,7 @@ impl Agent {
             source,
             version,
             security_model,
-            security_name: msg.community.clone(),
+            security_name: msg.community().clone(),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
             request_id: pdu.request_id,
@@ -100,10 +100,10 @@ impl Agent {
 
         let response_pdu = self.dispatch_request(&ctx, pdu).await?;
         let response_msg = match version {
-            Version::V1 => CommunityMessage::v1(msg.community, response_pdu),
-            Version::V2c => CommunityMessage::v2c(msg.community, response_pdu),
+            Version::V1 => CommunityMessage::v1(msg.community().clone(), response_pdu),
+            Version::V2c => CommunityMessage::v2c(msg.community().clone(), response_pdu),
             Version::V3 => unreachable!("handle_community called with V3"),
-        };
+        }?;
 
         Ok(Some(response_msg.encode()?))
     }
@@ -346,16 +346,28 @@ mod tests {
         }
     }
 
+    fn encode_community_pdu(version: Version, community: &[u8], pdu: &Pdu) -> Bytes {
+        let mut buf = crate::ber::EncodeBuf::new();
+        buf.try_push_sequence(|buf| {
+            pdu.encode(buf)?;
+            buf.push_octet_string(community);
+            buf.push_integer(version.as_i32());
+            Ok(())
+        })
+        .unwrap();
+        buf.finish()
+    }
+
     fn community_request(
         version: Version,
         pdu_type: PduType,
         community: &'static [u8],
         value: Value,
     ) -> Bytes {
-        CommunityMessage::new(
+        encode_community_pdu(
             version,
-            Bytes::from_static(community),
-            Pdu {
+            community,
+            &Pdu {
                 pdu_type,
                 request_id: 41,
                 error_status: 0,
@@ -363,8 +375,6 @@ mod tests {
                 varbinds: vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), value)],
             },
         )
-        .encode()
-        .unwrap()
     }
 
     async fn community_test_agent(callbacks: Arc<CallbackCounts>) -> Agent {
@@ -420,9 +430,10 @@ mod tests {
             assert_no_callbacks(&callbacks);
         }
 
-        let multiple_counter64s = CommunityMessage::v1(
-            Bytes::from_static(b"public"),
-            Pdu {
+        let multiple_counter64s = encode_community_pdu(
+            Version::V1,
+            b"public",
+            &Pdu {
                 pdu_type: PduType::SetRequest,
                 request_id: 42,
                 error_status: 0,
@@ -432,9 +443,7 @@ mod tests {
                     VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0), Value::Counter64(2)),
                 ],
             },
-        )
-        .encode()
-        .unwrap();
+        );
         assert!(
             agent
                 .handle_v1(multiple_counter64s, source)
@@ -459,7 +468,7 @@ mod tests {
             .unwrap()
             .expect("ordinary SNMPv1 GET should produce a response");
         let decoded = CommunityMessage::decode(response).unwrap();
-        assert_eq!(decoded.pdu.pdu_type(), PduType::Response);
+        assert_eq!(decoded.pdu().pdu_type(), PduType::Response);
         assert_eq!(callbacks.get.load(Ordering::Relaxed), 1);
         assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
     }
@@ -482,7 +491,7 @@ mod tests {
             .unwrap()
             .expect("SNMPv2c Counter64 SET should produce a response");
         let decoded = CommunityMessage::decode(response).unwrap();
-        assert_eq!(decoded.pdu.pdu_type(), PduType::Response);
+        assert_eq!(decoded.pdu().pdu_type(), PduType::Response);
         assert_eq!(callbacks.test_set.load(Ordering::Relaxed), 1);
         assert_eq!(callbacks.commit_set.load(Ordering::Relaxed), 1);
         assert_eq!(agent.snmp_in_asn_parse_errs(), 0);

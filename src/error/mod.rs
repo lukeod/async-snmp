@@ -178,6 +178,10 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(Box<str>),
 
+    /// Message cannot be represented by the selected SNMP version.
+    #[error("invalid SNMP message: {0}")]
+    InvalidMessage(Box<str>),
+
     /// Invalid OID format.
     #[error("invalid OID: {0}")]
     InvalidOid(Box<str>),

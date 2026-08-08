@@ -302,7 +302,8 @@ fn bench_request_overhead(c: &mut Criterion) {
     group.bench_function("encode_get_request", |b| {
         b.iter(|| {
             let pdu = Pdu::get_request(12345, &oids);
-            let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu);
+            let msg =
+                CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
             black_box(msg.encode())
         });
     });
@@ -316,7 +317,8 @@ fn bench_request_overhead(c: &mut Criterion) {
             b"Linux test-host 5.15.0-generic",
         )),
     )];
-    let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), response_pdu);
+    let msg =
+        CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), response_pdu).unwrap();
     let encoded = msg.encode().unwrap();
 
     group.bench_function("decode_get_response", |b| {

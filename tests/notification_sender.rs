@@ -89,6 +89,7 @@ fn encode_raw_v2c_notification(
             varbinds,
         },
     )
+    .unwrap()
     .encode()
     .unwrap()
 }
@@ -108,6 +109,7 @@ fn valid_sentinel_trap(request_id: i32) -> Bytes {
         "public",
         Pdu::trap_v2(request_id, 777, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), vec![]),
     )
+    .unwrap()
     .encode()
     .unwrap()
 }

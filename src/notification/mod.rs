@@ -2537,6 +2537,7 @@ mod tests {
         use crate::pdu::Pdu;
         let pdu = Pdu::trap_v2(1, 100, &oids::cold_start(), vec![]);
         CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu)
+            .unwrap()
             .encode()
             .unwrap()
     }
@@ -2546,6 +2547,7 @@ mod tests {
         use crate::pdu::Pdu;
         let pdu = Pdu::inform_request(1, 100, &oids::cold_start(), vec![]);
         CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu)
+            .unwrap()
             .encode()
             .unwrap()
     }
@@ -2562,6 +2564,7 @@ mod tests {
             vec![],
         );
         CommunityMessage::v1_trap(Bytes::copy_from_slice(community), trap)
+            .unwrap()
             .encode()
             .unwrap()
     }

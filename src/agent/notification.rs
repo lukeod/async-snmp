@@ -419,11 +419,11 @@ impl super::Agent {
                     Error::Config("cannot convert trap to v1 for sink (Counter64 varbind?)".into())
                         .boxed()
                 })?;
-                let msg = CommunityMessage::v1_trap(sink.community.clone(), trap);
+                let msg = CommunityMessage::v1_trap(sink.community.clone(), trap)?;
                 msg.encode()
             }
             Version::V2c => {
-                let msg = CommunityMessage::new(Version::V2c, sink.community.clone(), pdu.clone());
+                let msg = CommunityMessage::new(Version::V2c, sink.community.clone(), pdu.clone())?;
                 msg.encode()
             }
             Version::V3 => {

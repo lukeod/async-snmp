@@ -764,7 +764,7 @@ mod tests {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
-            let pdu = msg.pdu.standard().unwrap();
+            let pdu = msg.pdu().standard().unwrap();
             // For GETBULK, error_index carries max-repetitions.
             let max_rep = pdu.error_index;
             self.pending
@@ -808,7 +808,7 @@ mod tests {
                     }
                 };
 
-                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 Ok((msg.encode().unwrap(), peer))
             }
         }
@@ -914,7 +914,7 @@ mod tests {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
-            let pdu_type = msg.pdu.standard().unwrap().pdu_type;
+            let pdu_type = msg.pdu().standard().unwrap().pdu_type;
             self.pending
                 .lock()
                 .unwrap()
@@ -941,7 +941,7 @@ mod tests {
                         Value::EndOfMibView,
                     )],
                 };
-                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 Ok((msg.encode().unwrap(), peer))
             }
         }

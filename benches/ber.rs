@@ -376,7 +376,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
     let mut pdu = request.to_response();
     pdu.varbinds = varbinds;
 
-    let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu);
+    let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
     let encoded = msg.encode().unwrap();
 
     group.throughput(Throughput::Bytes(encoded.len() as u64));
@@ -401,7 +401,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
     let mut pdu = request.to_response();
     pdu.varbinds = many_varbinds;
 
-    let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu);
+    let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
     let encoded_large = msg.encode().unwrap();
 
     group.throughput(Throughput::Bytes(encoded_large.len() as u64));

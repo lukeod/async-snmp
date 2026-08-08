@@ -99,7 +99,7 @@ impl Message {
     /// Returns `None` for encrypted V3 messages or `SNMPv1` Trap messages.
     pub fn pdu(&self) -> Option<&Pdu> {
         match self {
-            Message::Community(m) => m.pdu.standard(),
+            Message::Community(m) => m.pdu().standard(),
             Message::V3(m) => m.pdu(),
         }
     }
@@ -109,10 +109,7 @@ impl Message {
     /// Returns `None` for encrypted V3 messages or `SNMPv1` Trap messages.
     pub fn into_pdu(self) -> Option<Pdu> {
         match self {
-            Message::Community(m) => match m.pdu {
-                CommunityPdu::Standard(p) => Some(p),
-                CommunityPdu::TrapV1(_) => None,
-            },
+            Message::Community(m) => m.into_pdu(),
             Message::V3(m) => m.into_pdu(),
         }
     }
@@ -120,7 +117,7 @@ impl Message {
     /// Get the SNMP version.
     pub fn version(&self) -> Version {
         match self {
-            Message::Community(m) => m.version,
+            Message::Community(m) => m.version(),
             Message::V3(_) => Version::V3,
         }
     }
@@ -278,7 +275,8 @@ mod tests {
             Version::V2c,
             vec![b'x'; 3 * 1024 * 1024],
             Pdu::get_request(1, &[]),
-        );
+        )
+        .unwrap();
         let encoded = message.encode().unwrap();
         let encoded_len = encoded.len();
 
@@ -305,6 +303,7 @@ mod tests {
     #[test]
     fn community_decoders_share_envelope_and_root_suffix_policy() {
         let encoded = CommunityMessage::v2c("public", Pdu::get_request(1, &[]))
+            .unwrap()
             .encode()
             .unwrap();
 
@@ -357,6 +356,7 @@ mod tests {
     #[test]
     fn peer_target_survives_nested_pdu_decoder_errors() {
         let mut encoded = CommunityMessage::v2c("public", Pdu::get_request(1, &[]))
+            .unwrap()
             .encode()
             .unwrap()
             .to_vec();
@@ -379,6 +379,7 @@ mod tests {
             "public",
             Pdu::get_request(1, &[crate::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]),
         )
+        .unwrap()
         .encode()
         .unwrap()
         .to_vec();

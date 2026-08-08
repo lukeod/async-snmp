@@ -75,7 +75,11 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             assert_invalid(pdu.encode(&mut buf));
             assert!(buf.is_empty());
 
-            assert_invalid(CommunityMessage::v2c("public", pdu.clone()).encode());
+            assert_invalid(
+                CommunityMessage::v2c("public", pdu.clone())
+                    .unwrap()
+                    .encode(),
+            );
 
             let scoped = ScopedPdu::new(Bytes::new(), Bytes::new(), pdu);
             let global = MsgGlobalData::new(
@@ -101,12 +105,12 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             10,
             vec![],
         );
-        assert_invalid(CommunityMessage::v1_trap("public", trap).encode());
+        assert_invalid(CommunityMessage::v1_trap("public", trap).unwrap().encode());
 
         let trap_v2 = Pdu::trap_v2(7, 10, &oid, vec![]);
-        assert_invalid(CommunityMessage::v2c("public", trap_v2).encode());
+        assert_invalid(CommunityMessage::v2c("public", trap_v2).unwrap().encode());
         let inform = Pdu::inform_request(7, 10, &oid, vec![]);
-        assert_invalid(CommunityMessage::v2c("public", inform).encode());
+        assert_invalid(CommunityMessage::v2c("public", inform).unwrap().encode());
     }
 }
 
@@ -126,7 +130,10 @@ fn valid_oid_boundaries_preserve_identity() {
         assert_eq!(Oid::from_ber(&content).unwrap(), oid);
 
         let pdu = Pdu::get_request(7, std::slice::from_ref(&oid));
-        let bytes = CommunityMessage::v2c("public", pdu).encode().unwrap();
+        let bytes = CommunityMessage::v2c("public", pdu)
+            .unwrap()
+            .encode()
+            .unwrap();
         let decoded = CommunityMessage::decode(bytes).unwrap();
         assert_eq!(decoded.into_pdu().unwrap().varbinds[0].oid, oid);
     }

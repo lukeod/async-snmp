@@ -9,8 +9,8 @@
 
 use crate::ber::{Decoder, EncodeBuf, tag};
 use crate::compatibility::CompatibilityPolicy;
-use crate::error::Result;
 use crate::error::internal::DecodeErrorKind;
+use crate::error::{Error, Result};
 use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
 use crate::pdu::{GetBulkPdu, Pdu, PduType, TrapV1Pdu};
 use crate::version::Version;
@@ -104,6 +104,51 @@ fn pdu_type_valid_for_version(pdu_type: PduType, version: Version) -> bool {
     }
 }
 
+fn invalid_message(reason: impl Into<Box<str>>) -> Box<Error> {
+    Error::InvalidMessage(reason.into()).boxed()
+}
+
+fn validate_community_message(version: Version, pdu: &CommunityPdu) -> Result<()> {
+    if version == Version::V3 {
+        return Err(invalid_message(
+            "community messages only support SNMPv1 and SNMPv2c",
+        ));
+    }
+
+    match pdu {
+        CommunityPdu::Standard(pdu) => {
+            if !pdu_type_valid_for_version(pdu.pdu_type, version) {
+                return Err(invalid_message(format!(
+                    "{} PDU is not valid for {version:?}",
+                    pdu.pdu_type
+                )));
+            }
+            if version == Version::V1
+                && pdu
+                    .varbinds
+                    .iter()
+                    .any(|varbind| matches!(varbind.value, crate::value::Value::Counter64(_)))
+            {
+                return Err(invalid_message("Counter64 is not valid in SNMPv1"));
+            }
+        }
+        CommunityPdu::TrapV1(trap) => {
+            if version != Version::V1 {
+                return Err(invalid_message("TrapV1 PDU is only valid in SNMPv1"));
+            }
+            if trap
+                .varbinds
+                .iter()
+                .any(|varbind| matches!(varbind.value, crate::value::Value::Counter64(_)))
+            {
+                return Err(invalid_message("Counter64 is not valid in SNMPv1"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Community-based SNMP message (v1/v2c).
 ///
 /// This unified type handles both `SNMPv1` and `SNMPv2c` messages,
@@ -113,47 +158,89 @@ fn pdu_type_valid_for_version(pdu_type: PduType, version: Version) -> bool {
 #[derive(Debug, Clone)]
 pub struct CommunityMessage {
     /// SNMP version (V1 or V2c)
-    pub version: Version,
+    version: Version,
     /// Community string for authentication
-    pub community: Bytes,
+    community: Bytes,
     /// Protocol data unit
-    pub pdu: CommunityPdu,
+    pdu: CommunityPdu,
 }
 
 impl CommunityMessage {
     /// Create a new community message with a standard PDU.
     ///
-    /// # Panics
-    /// Panics if version is V3 (use `V3Message` instead).
-    pub fn new(version: Version, community: impl Into<Bytes>, pdu: Pdu) -> Self {
-        assert!(
-            matches!(version, Version::V1 | Version::V2c),
-            "CommunityMessage only supports V1/V2c, not {version:?}"
-        );
-        Self {
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] when the version cannot carry the PDU
+    /// or an SNMPv1 PDU contains a `Counter64` value.
+    pub fn new(version: Version, community: impl Into<Bytes>, pdu: Pdu) -> Result<Self> {
+        let message = Self {
             version,
             community: community.into(),
             pdu: CommunityPdu::Standard(pdu),
-        }
+        };
+        message.validate()?;
+        Ok(message)
     }
 
     /// Create a V2c message (convenience constructor).
-    pub fn v2c(community: impl Into<Bytes>, pdu: Pdu) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv2c.
+    pub fn v2c(community: impl Into<Bytes>, pdu: Pdu) -> Result<Self> {
         Self::new(Version::V2c, community, pdu)
     }
 
     /// Create a V1 message with a standard PDU (convenience constructor).
-    pub fn v1(community: impl Into<Bytes>, pdu: Pdu) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv1.
+    pub fn v1(community: impl Into<Bytes>, pdu: Pdu) -> Result<Self> {
         Self::new(Version::V1, community, pdu)
     }
 
     /// Create a V1 message carrying a `TrapV1` PDU.
-    pub fn v1_trap(community: impl Into<Bytes>, trap: TrapV1Pdu) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] when the trap contains `Counter64`.
+    pub fn v1_trap(community: impl Into<Bytes>, trap: TrapV1Pdu) -> Result<Self> {
+        let message = Self {
             version: Version::V1,
             community: community.into(),
             pdu: CommunityPdu::TrapV1(trap),
-        }
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_community_message(self.version, &self.pdu)
+    }
+
+    /// Return the SNMP version.
+    #[must_use]
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Return the community string.
+    #[must_use]
+    pub fn community(&self) -> &Bytes {
+        &self.community
+    }
+
+    /// Return the community PDU.
+    #[must_use]
+    pub fn pdu(&self) -> &CommunityPdu {
+        &self.pdu
+    }
+
+    /// Consume the message into its version, community string, and PDU.
+    #[must_use]
+    pub fn into_parts(self) -> (Version, Bytes, CommunityPdu) {
+        (self.version, self.community, self.pdu)
     }
 
     /// Encode to BER using the default malformed-input compatibility policy.
@@ -166,6 +253,7 @@ impl CommunityMessage {
         &self,
         compatibility: CompatibilityPolicy,
     ) -> Result<Bytes> {
+        self.validate()?;
         let mut buf = EncodeBuf::new();
 
         buf.try_push_sequence(|buf| {
@@ -311,15 +399,19 @@ impl CommunityMessage {
         self.pdu
     }
 
-    /// Encode a GETBULK request message (v2c/v3 only).
+    /// Encode a GETBULK request message.
     ///
-    /// GETBULK is not supported in `SNMPv1`.
+    /// Community-based GETBULK is only supported in `SNMPv2c`.
     pub fn encode_bulk(
         version: Version,
         community: impl Into<Bytes>,
         pdu: &GetBulkPdu,
     ) -> Result<Bytes> {
-        debug_assert!(version != Version::V1, "GETBULK not supported in SNMPv1");
+        if version != Version::V2c {
+            return Err(invalid_message(
+                "community GETBULK messages require SNMPv2c",
+            ));
+        }
 
         let community = community.into();
         let mut buf = EncodeBuf::new();
@@ -339,153 +431,231 @@ impl CommunityMessage {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::oid;
+    use crate::pdu::GenericTrap;
+    use crate::value::Value;
+    use crate::varbind::VarBind;
+
+    fn standard_pdu(pdu_type: PduType, varbinds: Vec<VarBind>) -> Pdu {
+        Pdu {
+            pdu_type,
+            request_id: 1,
+            error_status: 0,
+            error_index: 0,
+            varbinds,
+        }
+    }
+
+    fn trap_v1(varbinds: Vec<VarBind>) -> TrapV1Pdu {
+        TrapV1Pdu::new(
+            oid!(1, 3, 6, 1, 4, 1, 9999),
+            [192, 168, 1, 1],
+            GenericTrap::LinkDown,
+            0,
+            12345,
+            varbinds,
+        )
+    }
+
+    fn raw_standard_message(version: Version, pdu: &Pdu) -> Bytes {
+        let mut buf = EncodeBuf::new();
+        buf.try_push_sequence(|buf| {
+            pdu.encode(buf)?;
+            buf.push_octet_string(b"public");
+            buf.push_integer(version.as_i32());
+            Ok(())
+        })
+        .unwrap();
+        buf.finish()
+    }
+
+    fn assert_invalid_message<T: std::fmt::Debug>(result: Result<T>) {
+        assert!(matches!(&*result.unwrap_err(), Error::InvalidMessage(_)));
+    }
 
     #[test]
     fn encode_rejects_invalid_oid() {
         let message =
-            CommunityMessage::v2c("public", Pdu::get_request(1, &[crate::oid::Oid::empty()]));
+            CommunityMessage::v2c("public", Pdu::get_request(1, &[crate::oid::Oid::empty()]))
+                .unwrap();
         assert!(matches!(
             &*message.encode().unwrap_err(),
             Error::InvalidOid(_)
         ));
     }
-    use crate::oid;
-    use crate::pdu::{GenericTrap, TrapV1Pdu};
 
     #[test]
-    fn test_v1_trap_roundtrip() {
-        let trap = TrapV1Pdu::new(
-            oid!(1, 3, 6, 1, 4, 1, 9999),
-            [192, 168, 1, 1],
-            GenericTrap::LinkDown,
-            0,
-            12345,
-            vec![],
+    fn valid_messages_roundtrip() {
+        let trap = trap_v1(vec![]);
+        let message = CommunityMessage::v1_trap("public", trap).unwrap();
+        let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
+        assert_eq!(decoded.version(), Version::V1);
+        assert_eq!(decoded.community().as_ref(), b"public");
+        assert_eq!(
+            decoded.pdu().trap_v1().unwrap().enterprise,
+            oid!(1, 3, 6, 1, 4, 1, 9999)
         );
-        let msg = CommunityMessage::v1_trap(b"public".as_slice(), trap);
 
-        let encoded = msg.encode().unwrap();
-        let decoded = CommunityMessage::decode(encoded).unwrap();
-
-        assert_eq!(decoded.version, Version::V1);
-        assert_eq!(decoded.community.as_ref(), b"public");
-        match decoded.pdu {
-            CommunityPdu::TrapV1(ref t) => {
-                assert_eq!(t.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
-                assert_eq!(t.agent_addr, [192, 168, 1, 1]);
-                assert_eq!(t.generic_trap, GenericTrap::LinkDown);
-                assert_eq!(t.time_stamp, 12345);
-            }
-            CommunityPdu::Standard(_) => panic!("expected TrapV1 pdu"),
+        for version in [Version::V1, Version::V2c] {
+            let message = CommunityMessage::new(
+                version,
+                "private",
+                Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]),
+            )
+            .unwrap();
+            let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
+            assert_eq!(decoded.version(), version);
+            assert_eq!(decoded.community().as_ref(), b"private");
+            assert_eq!(decoded.pdu().standard().unwrap().request_id, 123);
         }
     }
 
     #[test]
-    fn test_v1_roundtrip() {
-        let pdu = Pdu::get_request(42, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
-        let msg = CommunityMessage::v1(b"public".as_slice(), pdu);
+    fn constructors_reject_invalid_version_pdu_pairs() {
+        for pdu_type in [
+            PduType::GetBulkRequest,
+            PduType::InformRequest,
+            PduType::TrapV2,
+            PduType::Report,
+        ] {
+            assert_invalid_message(CommunityMessage::v1(
+                "public",
+                standard_pdu(pdu_type, vec![]),
+            ));
+        }
 
-        let encoded = msg.encode().unwrap();
+        assert_invalid_message(CommunityMessage::v2c(
+            "public",
+            standard_pdu(PduType::TrapV1, vec![]),
+        ));
+        assert_invalid_message(CommunityMessage::new(
+            Version::V3,
+            "public",
+            standard_pdu(PduType::GetRequest, vec![]),
+        ));
+    }
+
+    #[test]
+    fn constructors_reject_counter64_in_every_v1_varbind_container() {
+        for pdu_type in [
+            PduType::GetRequest,
+            PduType::GetNextRequest,
+            PduType::Response,
+            PduType::SetRequest,
+        ] {
+            assert_invalid_message(CommunityMessage::v1(
+                "public",
+                standard_pdu(
+                    pdu_type,
+                    vec![VarBind::new(oid!(1, 3, 6, 1), Value::Counter64(1))],
+                ),
+            ));
+        }
+
+        assert_invalid_message(CommunityMessage::v1_trap(
+            "public",
+            trap_v1(vec![VarBind::new(oid!(1, 3, 6, 1), Value::Counter64(1))]),
+        ));
+    }
+
+    #[test]
+    fn encoders_revalidate_internal_state() {
+        let mut invalid_messages: Vec<_> = [
+            PduType::GetBulkRequest,
+            PduType::InformRequest,
+            PduType::TrapV2,
+            PduType::Report,
+        ]
+        .into_iter()
+        .map(|pdu_type| CommunityMessage {
+            version: Version::V1,
+            community: Bytes::from_static(b"public"),
+            pdu: CommunityPdu::Standard(standard_pdu(pdu_type, vec![])),
+        })
+        .collect();
+        invalid_messages.extend(
+            [
+                PduType::GetRequest,
+                PduType::GetNextRequest,
+                PduType::Response,
+                PduType::SetRequest,
+            ]
+            .into_iter()
+            .map(|pdu_type| CommunityMessage {
+                version: Version::V1,
+                community: Bytes::from_static(b"public"),
+                pdu: CommunityPdu::Standard(standard_pdu(
+                    pdu_type,
+                    vec![VarBind::new(oid!(1, 3, 6, 1), Value::Counter64(1))],
+                )),
+            }),
+        );
+        invalid_messages.extend([
+            CommunityMessage {
+                version: Version::V2c,
+                community: Bytes::from_static(b"public"),
+                pdu: CommunityPdu::Standard(standard_pdu(PduType::TrapV1, vec![])),
+            },
+            CommunityMessage {
+                version: Version::V3,
+                community: Bytes::from_static(b"public"),
+                pdu: CommunityPdu::Standard(standard_pdu(PduType::GetRequest, vec![])),
+            },
+            CommunityMessage {
+                version: Version::V1,
+                community: Bytes::from_static(b"public"),
+                pdu: CommunityPdu::TrapV1(trap_v1(vec![VarBind::new(
+                    oid!(1, 3, 6, 1),
+                    Value::Counter64(1),
+                )])),
+            },
+        ]);
+
+        for message in invalid_messages {
+            assert_invalid_message(message.encode());
+            assert_invalid_message(
+                message.encode_with_compatibility_policy(CompatibilityPolicy::STRICT),
+            );
+        }
+    }
+
+    #[test]
+    fn encode_bulk_requires_v2c() {
+        let bulk = GetBulkPdu::new(7, 0, 10, &[]);
+        let v1_error = CommunityMessage::encode_bulk(Version::V1, "public", &bulk).unwrap_err();
+        let v3_error = CommunityMessage::encode_bulk(Version::V3, "public", &bulk).unwrap_err();
+        assert!(matches!(&*v1_error, Error::InvalidMessage(_)));
+        assert!(matches!(&*v3_error, Error::InvalidMessage(_)));
+        assert_eq!(v1_error.to_string(), v3_error.to_string());
+
+        let encoded = CommunityMessage::encode_bulk(Version::V2c, "public", &bulk).unwrap();
         let decoded = CommunityMessage::decode(encoded).unwrap();
-
-        assert_eq!(decoded.version, Version::V1);
-        assert_eq!(decoded.community.as_ref(), b"public");
-        assert_eq!(decoded.pdu.standard().unwrap().request_id, 42);
-    }
-
-    #[test]
-    fn test_v2c_roundtrip() {
-        let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
-        let msg = CommunityMessage::v2c(b"private".as_slice(), pdu);
-
-        let encoded = msg.encode().unwrap();
-        let decoded = CommunityMessage::decode(encoded).unwrap();
-
-        assert_eq!(decoded.version, Version::V2c);
-        assert_eq!(decoded.community.as_ref(), b"private");
-        assert_eq!(decoded.pdu.standard().unwrap().request_id, 123);
-    }
-
-    #[test]
-    fn test_v1_getbulk_rejected() {
-        // GETBULK is an SNMPv2 construct (RFC 3416) and must be rejected in an
-        // SNMPv1 message even though the encoder will emit it.
-        let pdu = Pdu::get_bulk(1, 0, 10, vec![]);
-        let msg = CommunityMessage::new(Version::V1, b"public".as_slice(), pdu);
-        let encoded = msg.encode().unwrap();
-
-        let result = CommunityMessage::decode(encoded);
-        assert!(
-            result.is_err(),
-            "v1 GETBULK must be rejected, got {result:?}"
+        assert_eq!(decoded.version(), Version::V2c);
+        assert_eq!(
+            decoded.pdu().standard().unwrap().pdu_type,
+            PduType::GetBulkRequest
         );
     }
 
     #[test]
-    fn test_v1_inform_rejected() {
-        // InformRequest is an SNMPv2 construct and must be rejected in a v1 message.
-        let pdu = Pdu::inform_request(1, 0, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), vec![]);
-        let msg = CommunityMessage::new(Version::V1, b"public".as_slice(), pdu);
-        let encoded = msg.encode().unwrap();
+    fn decoder_rejects_invalid_version_pdu_pairs_from_raw_ber() {
+        for pdu_type in [
+            PduType::GetBulkRequest,
+            PduType::InformRequest,
+            PduType::TrapV2,
+            PduType::Report,
+        ] {
+            let encoded = raw_standard_message(Version::V1, &standard_pdu(pdu_type, vec![]));
+            assert!(CommunityMessage::decode(encoded).is_err());
+        }
 
-        let result = CommunityMessage::decode(encoded);
-        assert!(
-            result.is_err(),
-            "v1 Inform must be rejected, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_v1_trapv2_rejected() {
-        // SNMPv2-Trap must be rejected in a v1 message.
-        let pdu = Pdu::trap_v2(1, 0, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), vec![]);
-        let msg = CommunityMessage::new(Version::V1, b"public".as_slice(), pdu);
-        let encoded = msg.encode().unwrap();
-
-        let result = CommunityMessage::decode(encoded);
-        assert!(
-            result.is_err(),
-            "v1 SNMPv2-Trap must be rejected, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_v2c_trapv1_rejected() {
-        // The v1 Trap PDU (tag 0xA4) has a distinct wire layout and is only
-        // defined for SNMPv1; a v2c message carrying it must be rejected.
-        let trap = TrapV1Pdu::new(
-            oid!(1, 3, 6, 1, 4, 1, 9999),
-            [192, 168, 1, 1],
-            GenericTrap::LinkDown,
-            0,
-            12345,
-            vec![],
-        );
+        let trap = trap_v1(vec![]);
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             trap.encode(buf).unwrap();
             buf.push_octet_string(b"public");
             buf.push_integer(Version::V2c.as_i32());
         });
-        let encoded = buf.finish();
-
-        let result = CommunityMessage::decode(encoded);
-        assert!(
-            result.is_err(),
-            "v2c v1-Trap (0xA4) must be rejected, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_version_preserved() {
-        for version in [Version::V1, Version::V2c] {
-            let pdu = Pdu::get_request(1, &[oid!(1, 3, 6, 1)]);
-            let msg = CommunityMessage::new(version, b"test".as_slice(), pdu);
-
-            let encoded = msg.encode().unwrap();
-            let decoded = CommunityMessage::decode(encoded).unwrap();
-
-            assert_eq!(decoded.version, version);
-        }
+        assert!(CommunityMessage::decode(buf.finish()).is_err());
     }
 }

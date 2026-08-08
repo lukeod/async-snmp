@@ -421,7 +421,7 @@ impl<T: Transport> Client<T> {
                     // Defense in depth for custom transports that do not enforce
                     // the non-consuming registration contract themselves.
                     if let Message::Community(ref m) = response
-                        && m.community != community
+                        && community != m.community()
                     {
                         let accepted = match self.inner.config.community_response_policy {
                             crate::transport::CommunityResponsePolicy::Exact => false,
@@ -527,7 +527,7 @@ impl<T: Transport> Client<T> {
             self.inner.config.version(),
             self.inner.config.community()?,
             pdu,
-        );
+        )?;
         let data = message.encode()?;
         let response = self.send_and_recv(request_id, &data).await?;
 
@@ -903,7 +903,7 @@ impl<T: Transport> Client<T> {
                 self.inner.config.version(),
                 self.inner.config.community()?,
                 pdu,
-            );
+            )?;
             let data = message.encode()?;
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.bytes = data.len() }, "sending v2c trap");
             self.inner.transport.send(&data).await?;
@@ -947,7 +947,7 @@ impl<T: Transport> Client<T> {
             return Err(Error::Config("send_v1_trap requires a V1 client".into()).boxed());
         }
 
-        let message = CommunityMessage::v1_trap(self.inner.config.community()?, trap);
+        let message = CommunityMessage::v1_trap(self.inner.config.community()?, trap)?;
         let data = message.encode()?;
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
         self.inner.transport.send(&data).await?;
@@ -1289,7 +1289,7 @@ mod tests {
                     varbinds,
                 };
 
-                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 let encoded = msg.encode().unwrap();
                 Ok((encoded, peer))
             }
@@ -1369,7 +1369,7 @@ mod tests {
                     error_index: 0,
                     varbinds,
                 };
-                let message = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                let message = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 Ok((message.encode().unwrap(), "127.0.0.1:161".parse().unwrap()))
             }
         }
@@ -1970,7 +1970,7 @@ mod tests {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             // Decode the message to count varbinds
             let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
-            let varbind_count = msg.pdu.standard().unwrap().varbinds.len();
+            let varbind_count = msg.pdu().standard().unwrap().varbinds.len();
             {
                 let mut q = self.pending.lock().unwrap();
                 q.push_back((request_id, varbind_count));
@@ -2018,7 +2018,7 @@ mod tests {
                     }
                 };
 
-                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu);
+                let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 Ok((msg.encode().unwrap(), peer))
             }
         }
@@ -2219,7 +2219,8 @@ mod tests {
                 CommunityMessage::v1(community, pdu)
             } else {
                 CommunityMessage::v2c(community, pdu)
-            };
+            }
+            .unwrap();
             let encoded = msg.encode().unwrap();
             async move { Ok((encoded, peer)) }
         }

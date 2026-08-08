@@ -820,7 +820,7 @@ mod tests {
     /// into `UdpCore::deliver` in the source-mismatch tests below.
     fn response_packet(request_id: i32) -> Bytes {
         let pdu = crate::pdu::Pdu::get_request(request_id, &[]).to_response();
-        let msg = crate::message::CommunityMessage::v2c(b"public".as_slice(), pdu);
+        let msg = crate::message::CommunityMessage::v2c(b"public".as_slice(), pdu).unwrap();
         msg.encode().unwrap()
     }
 
