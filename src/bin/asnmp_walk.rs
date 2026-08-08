@@ -2,14 +2,14 @@
 //!
 //! Part of the async-snmp CLI utilities.
 
-use async_snmp::cli::args::{CommonArgs, OutputArgs, SnmpVersion, V3Args, WalkArgs};
+use async_snmp::cli::args::{CommonArgs, OutputArgs, V3Args, WalkArgs};
 #[cfg(feature = "mib")]
 use async_snmp::cli::output::VarBindFormatter;
 use async_snmp::cli::output::{
     OperationType, OutputContext, RequestInfo, build_security_info, write_error,
     write_verbose_request, write_verbose_response,
 };
-use async_snmp::{Client, Oid, VarBind, WalkMode};
+use async_snmp::{Auth, Client, Oid, VarBind, Version, WalkMode};
 use clap::Parser;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -55,6 +55,14 @@ async fn main() -> ExitCode {
         eprintln!("Error: {}", e);
         return ExitCode::FAILURE;
     }
+    let auth = match args.v3.auth(&args.common) {
+        Ok(auth) => auth,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let version = auth.version();
 
     let target = &args.common.target;
 
@@ -81,11 +89,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Determine version (V3 if username provided)
-    let version = args.common.effective_version(&args.v3);
-
     // V1 doesn't support GETBULK, force GETNEXT
-    let use_getnext = args.walk.getnext || matches!(version, SnmpVersion::V1);
+    let use_getnext = args.walk.getnext || matches!(version, Version::V1);
 
     // Verbose output: show request info before executing
     if args.output.verbose {
@@ -99,8 +104,8 @@ async fn main() -> ExitCode {
 
         let request_info = RequestInfo {
             target: target.as_str(),
-            version: version.into(),
-            security: build_security_info(&args.v3, &args.common),
+            version,
+            security: build_security_info(&auth),
             operation,
             oids: vec![oid.clone()],
         };
@@ -109,7 +114,7 @@ async fn main() -> ExitCode {
 
     // Build and run the walk
     let start = Instant::now();
-    let result = run_walk(target.as_str(), &args, oid, use_getnext).await;
+    let result = run_walk(target.as_str(), &args, auth, oid, use_getnext).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -131,7 +136,7 @@ async fn main() -> ExitCode {
 
             if let Err(e) = output_ctx.write_results(
                 target.as_str(),
-                version.into(),
+                version,
                 &varbinds,
                 args.output.elapsed(elapsed),
                 None,
@@ -152,14 +157,10 @@ async fn main() -> ExitCode {
 async fn run_walk(
     target: &str,
     args: &Args,
+    auth: Auth,
     oid: Oid,
     use_getnext: bool,
 ) -> async_snmp::Result<Vec<VarBind>> {
-    let auth = args
-        .v3
-        .auth(&args.common)
-        .map_err(|e| async_snmp::Error::Config(e.to_string().into()))?;
-
     // Set walk mode based on CLI flags
     let walk_mode = if use_getnext {
         WalkMode::GetNext

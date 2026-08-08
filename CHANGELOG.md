@@ -18,12 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   speculative `AgentTransport` trait. `UdpTransportConfig` is now private;
   configure UDP transports through `UdpTransportBuilder`. Handler APIs are now
   available only with the `agent` feature.
-- **Breaking:** Crypto backend features are additive and `--all-features` is
-  supported. `UsmConfig` carries an observable `CryptoBackend` selection;
-  RustCrypto remains the default when both are compiled and AWS-LC FIPS must be
-  selected explicitly. Backend-free community and SNMPv3 builds now compile.
-  `CryptoError` gains `InvalidHmacTruncationLength` for invalid primitive output
-  requests.
+- **Breaking:** SNMPv3 protocol and USM support are unconditional; the standalone
+  `v3` feature is removed. Crypto backend features are optional and additive,
+  and `--all-features` is supported. `UsmConfig` carries an observable
+  `CryptoBackend` selection; RustCrypto remains the default when both are
+  compiled and AWS-LC FIPS must be selected explicitly. Backend-free community,
+  SNMPv3, and CLI builds compile; password credentials fail configuration
+  validation when no selected backend is available. The CLI exposes explicit
+  backend selection. `CryptoError` gains `InvalidHmacTruncationLength` for
+  invalid primitive output requests.
 - Notification receivers now expose `NotificationVarbindValidation` through
   `NotificationReceiverBuilder::varbind_validation()`. The default tolerant
   policy accepts non-standard first/second varbind names when their values are

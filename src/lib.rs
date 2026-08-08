@@ -229,6 +229,8 @@
 //! For polling many targets with shared credentials, cache both:
 //!
 //! ```rust,no_run
+//! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+//! # {
 //! use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, oid, UdpTransport};
 //! use std::sync::Arc;
 //!
@@ -256,6 +258,7 @@
 //!     println!("{}: {:?}", target, result.varbinds[0].value);
 //! }
 //! # Ok(())
+//! # }
 //! # }
 //! ```
 //!
@@ -499,7 +502,6 @@
 //! ## Cargo Features
 //!
 //! - `agent` - SNMP agent (enabled by default)
-//! - `v3` - SNMPv3 protocol and USM surfaces (enabled by default)
 //! - `crypto-rustcrypto` - RustCrypto backend (enabled by default). Supports all auth and privacy protocols.
 //! - `crypto-fips` - FIPS backend via aws-lc-rs. Rejects MD5, DES, and 3DES.
 //! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
@@ -526,9 +528,10 @@ pub mod oid;
 pub mod pdu;
 pub mod prelude;
 pub mod transport;
-#[cfg(not(feature = "v3"))]
-mod v3;
-#[cfg(feature = "v3")]
+#[cfg_attr(
+    not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
 pub mod v3;
 pub mod value;
 pub mod varbind;
@@ -575,15 +578,11 @@ pub use transport::{
     CommunityResponsePolicy, RequestRegistration, ResponseCorrelation, TcpTransport, Transport,
     UdpHandle, UdpTransport,
 };
-#[cfg(feature = "v3")]
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, EngineCache, ParseProtocolError,
     PersistedAuthoritativeEngine, PrivProtocol, UsmConfig, generate_engine_id,
 };
-#[cfg(all(
-    feature = "v3",
-    any(feature = "crypto-rustcrypto", feature = "crypto-fips")
-))]
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{CryptoBackend, CryptoError, CryptoResult, LocalizedKey, MasterKey, MasterKeys};
 pub use value::{RowStatus, StorageType, Value};
 pub use varbind::VarBind;

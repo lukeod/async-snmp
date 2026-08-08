@@ -9,7 +9,7 @@ use async_snmp::cli::output::{
     OperationType, OutputContext, RequestInfo, build_security_info, write_error,
     write_verbose_request, write_verbose_response,
 };
-use async_snmp::{Client, Oid, Value};
+use async_snmp::{Auth, Client, Oid, Value};
 use clap::Parser;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -104,6 +104,14 @@ async fn main() -> ExitCode {
         eprintln!("Error: {}", e);
         return ExitCode::FAILURE;
     }
+    let auth = match args.v3.auth(&args.common) {
+        Ok(auth) => auth,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let version = auth.version();
 
     let target = &args.common.target;
 
@@ -135,17 +143,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Determine version (V3 if username provided)
-    let version = args.common.effective_version(&args.v3);
-
     // Verbose output: show request info before executing
     if args.output.verbose {
         let oids: Vec<_> = varbinds.iter().map(|vb| vb.oid.clone()).collect();
 
         let request_info = RequestInfo {
             target: target.as_str(),
-            version: version.into(),
-            security: build_security_info(&args.v3, &args.common),
+            version,
+            security: build_security_info(&auth),
             operation: OperationType::Set,
             oids,
         };
@@ -154,7 +159,7 @@ async fn main() -> ExitCode {
 
     // Build and run the SET request
     let start = Instant::now();
-    let result = run_set(target.as_str(), &args, varbinds).await;
+    let result = run_set(target.as_str(), &args, auth, varbinds).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -180,7 +185,7 @@ async fn main() -> ExitCode {
 
             if let Err(e) = output_ctx.write_results(
                 target.as_str(),
-                version.into(),
+                version,
                 &result_varbinds,
                 args.output.elapsed(elapsed),
                 None,
@@ -201,13 +206,9 @@ async fn main() -> ExitCode {
 async fn run_set(
     target: &str,
     args: &Args,
+    auth: Auth,
     varbinds: Vec<SetVarbind>,
 ) -> async_snmp::Result<async_snmp::FixedCardinalityResponse> {
-    let auth = args
-        .v3
-        .auth(&args.common)
-        .map_err(|e| async_snmp::Error::Config(e.to_string().into()))?;
-
     let timeout = args
         .common
         .timeout_duration()

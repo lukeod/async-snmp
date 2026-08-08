@@ -20,6 +20,8 @@
 //! the expensive 1MB expansion for every engine.
 //!
 //! ```rust
+//! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+//! # {
 //! use async_snmp::{AuthProtocol, MasterKey};
 //!
 //! // Expensive: ~850μs - do once per password
@@ -28,6 +30,7 @@
 //! // Cheap: ~1μs each - do per engine
 //! let key1 = master.localize(b"\x80\x00\x1f\x88\x80...").unwrap();
 //! let key2 = master.localize(b"\x80\x00\x1f\x88\x81...").unwrap();
+//! # }
 //! ```
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -68,6 +71,8 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// # Example
 ///
 /// ```rust
+/// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+/// # {
 /// use async_snmp::{AuthProtocol, MasterKey};
 ///
 /// // Derive master key once (expensive)
@@ -79,6 +84,7 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 ///
 /// let key1 = master.localize(engine1_id).unwrap();
 /// let key2 = master.localize(engine2_id).unwrap();
+/// # }
 /// ```
 #[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MasterKey {
@@ -534,6 +540,8 @@ pub fn verify_message(
 /// # Example
 ///
 /// ```rust
+/// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+/// # {
 /// use async_snmp::{AuthProtocol, PrivProtocol, MasterKeys};
 ///
 /// // Create master keys once (expensive)
@@ -541,6 +549,7 @@ pub fn verify_message(
 ///     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 ///
 /// // Use with multiple clients - localization is cheap (~1μs per engine)
+/// # }
 /// ```
 #[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MasterKeys {
@@ -564,9 +573,12 @@ impl MasterKeys {
     /// # Example
     ///
     /// ```rust
+    /// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    /// # {
     /// use async_snmp::{AuthProtocol, MasterKeys};
     ///
     /// let keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap();
+    /// # }
     /// ```
     pub fn new(auth_protocol: AuthProtocol, auth_password: &[u8]) -> CryptoResult<Self> {
         Self::new_with_backend(auth_protocol, auth_password, CryptoBackend::default())
@@ -683,6 +695,8 @@ impl MasterKeys {
     /// # Example
     ///
     /// ```rust
+    /// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    /// # {
     /// use async_snmp::{AuthProtocol, MasterKeys, PrivProtocol};
     ///
     /// let keys = MasterKeys::new(AuthProtocol::Sha1, b"authpassword").unwrap()
@@ -693,6 +707,7 @@ impl MasterKeys {
     /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
     /// // Blumenthal extension is automatically applied.
     /// let (auth, priv_key) = keys.localize(&engine_id).unwrap();
+    /// # }
     /// ```
     pub fn localize(
         &self,
@@ -838,7 +853,7 @@ pub(crate) fn extend_key_reeder_with_backend(
     Ok(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 mod tests {
     use super::*;
     use crate::format::hex::{decode as decode_hex, encode as encode_hex};

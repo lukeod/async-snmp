@@ -22,6 +22,7 @@
 //! backends are enabled.
 
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+#[doc(hidden)]
 pub(crate) mod auth;
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub mod auth;
@@ -30,6 +31,10 @@ mod config;
 mod crypto;
 pub(crate) mod encode;
 mod engine;
+#[cfg_attr(
+    not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
+    doc(hidden)
+)]
 mod privacy;
 pub(crate) mod process;
 mod report;

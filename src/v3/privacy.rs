@@ -196,6 +196,8 @@ impl PrivKey {
     /// # Example
     ///
     /// ```rust
+    /// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    /// # {
     /// use async_snmp::{AuthProtocol, PrivProtocol, v3::PrivKey};
     ///
     /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
@@ -208,6 +210,7 @@ impl PrivKey {
     ///     b"password",
     ///     &engine_id,
     /// ).unwrap();
+    /// # }
     /// ```
     pub fn from_password(
         auth_protocol: AuthProtocol,
@@ -250,6 +253,8 @@ impl PrivKey {
     /// # Example
     ///
     /// ```rust
+    /// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    /// # {
     /// use async_snmp::{AuthProtocol, MasterKey, PrivProtocol, v3::PrivKey};
     ///
     /// let master = MasterKey::from_password(AuthProtocol::Sha1, b"password").unwrap();
@@ -258,6 +263,7 @@ impl PrivKey {
     /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
     /// // Blumenthal extension is automatically applied.
     /// let priv_key = PrivKey::from_master_key(&master, PrivProtocol::Aes256, &engine_id).unwrap();
+    /// # }
     /// ```
     pub fn from_master_key(
         master: &super::MasterKey,
@@ -647,7 +653,7 @@ impl Clone for PrivKey {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 mod tests {
     use super::*;
     use crate::format::hex::decode as decode_hex;

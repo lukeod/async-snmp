@@ -19,7 +19,6 @@ pub use crate::client::{Auth, Client, ClientBuilder, Retry};
 pub use crate::compatibility::CompatibilityPolicy;
 pub use crate::error::{Error, Result};
 pub use crate::oid::Oid;
-#[cfg(feature = "v3")]
 pub use crate::v3::{AuthProtocol, PrivProtocol};
 pub use crate::value::Value;
 pub use crate::varbind::VarBind;

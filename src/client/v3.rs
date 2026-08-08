@@ -1486,7 +1486,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 mod response_validation_tests {
     use super::*;
     use crate::UsmConfig;

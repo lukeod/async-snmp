@@ -1,9 +1,7 @@
-#![cfg(not(feature = "v3"))]
-
 use async_snmp::{Auth, ClientConfig, CommunityVersion};
 
 #[test]
-fn community_client_configuration_is_available_without_v3() {
+fn community_client_configuration_is_available_without_crypto() {
     let config = ClientConfig {
         auth: Auth::v2c("public"),
         ..ClientConfig::default()

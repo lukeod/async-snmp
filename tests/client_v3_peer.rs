@@ -1,3 +1,5 @@
+#![cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+
 //! Scripted-peer characterization for the SNMPv3 client receive path.
 
 mod common;

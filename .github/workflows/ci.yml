@@ -63,11 +63,18 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --lib --no-default-features
-      - run: cargo check --locked --no-default-features --features v3
+      - run: cargo test --locked --lib --no-default-features
+      - run: cargo test --locked --test v3_without_crypto --no-default-features
+      - run: cargo test --locked --doc --no-default-features
+      - run: cargo check --locked --examples --no-default-features
+      - run: cargo test --locked --lib --bins --no-default-features --features cli
+      - run: cargo test --locked --lib --bins --no-default-features --features cli,crypto-rustcrypto
+      - run: cargo test --locked --lib --bins --no-default-features --features cli,crypto-fips
+      - run: cargo test --locked --lib --bins --no-default-features --features cli,crypto-rustcrypto,crypto-fips
       - run: cargo test --locked --no-default-features --features crypto-rustcrypto --test kat
       - run: cargo test --locked --no-default-features --features crypto-fips --test kat
-      - run: cargo check --locked --all-features
+      - run: cargo test --locked --all-features
+      - run: cargo check --locked --all-targets --all-features
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.toolchain }})

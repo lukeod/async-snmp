@@ -64,7 +64,9 @@ impl UsmConfig {
     }
 
     /// Configure password-backed authentication (authNoPriv).
-    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    ///
+    /// Backend availability is checked when the containing configuration is
+    /// validated.
     #[must_use]
     pub fn auth(mut self, protocol: AuthProtocol, password: impl AsRef<[u8]>) -> Self {
         self.credentials = UsmCredentials::Passwords {
@@ -75,7 +77,9 @@ impl UsmConfig {
     }
 
     /// Configure password-backed authentication and privacy (authPriv).
-    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    ///
+    /// Backend availability is checked when the containing configuration is
+    /// validated.
     #[must_use]
     pub fn auth_priv(
         mut self,
@@ -370,6 +374,7 @@ mod tests {
         assert_eq!(config.priv_protocol(), Some(PrivProtocol::Aes128));
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_user_config_master_key_levels() {
         let auth = crate::v3::MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
@@ -391,6 +396,7 @@ mod tests {
         assert!(keys.priv_key.is_some());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_password_configurators_replace_master_keys() {
         let master_keys = crate::v3::MasterKeys::new(AuthProtocol::Sha256, b"masterauthpass")
@@ -426,6 +432,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_master_key_debug_redacts_key_material() {
         let master_keys = crate::v3::MasterKeys::new(AuthProtocol::Sha256, b"masterauthpass")
@@ -448,6 +455,7 @@ mod tests {
         assert_eq!(config.configured_context_name().as_ref(), b"ctx");
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_user_config_derive_keys() {
         let config = UsmConfig::new(Bytes::from_static(b"testuser"))
@@ -460,6 +468,7 @@ mod tests {
         assert!(keys.priv_key.is_none());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_user_config_derive_keys_with_privacy() {
         let config = UsmConfig::new(Bytes::from_static(b"testuser")).auth_priv(
@@ -479,6 +488,7 @@ mod tests {
     /// Precomputing master keys populates the cache, so subsequent
     /// `derive_keys` calls take the master-key localization path instead of
     /// re-running the 1 MiB password expansion (the CPU-amplification vector).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_precompute_master_keys_replaces_passwords() {
         let mut config = UsmConfig::new(Bytes::from_static(b"testuser")).auth_priv(
@@ -498,6 +508,7 @@ mod tests {
 
     /// The cached (master-key) path and the uncached (password) path must
     /// derive identical localized keys, for both auth-only and authPriv.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_precompute_master_keys_preserves_derivation() {
         let engine_id = b"\x80\x00\x00\x00\x01test-engine";
@@ -601,6 +612,23 @@ mod tests {
         ));
     }
 
+    #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+    #[test]
+    fn password_credentials_are_rejected_without_crypto_backend() {
+        let mut config = UsmConfig::new("user").auth(AuthProtocol::Sha256, b"authpassword");
+        assert_eq!(
+            config.validate_and_precompute(),
+            Err(CryptoError::UnsupportedAlgorithm(
+                "no crypto backend is enabled"
+            ))
+        );
+        assert!(matches!(
+            config.credentials,
+            UsmCredentials::Passwords { .. }
+        ));
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn validate_accepts_eight_octet_passwords() {
         let mut config = UsmConfig::new("user").auth_priv(

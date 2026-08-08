@@ -7,7 +7,9 @@
 #![allow(unused_imports)]
 
 pub mod fixtures;
+#[cfg(feature = "agent")]
 pub mod handler;
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub mod v3;
 
 #[cfg(feature = "agent")]
@@ -36,4 +38,5 @@ pub use fixtures::{combined, interface_table};
 pub use agent::{TestAgent, TestAgentBuilder, V3User};
 #[cfg(feature = "agent")]
 pub use faulty::{LossyAgent, PausableAgent, SlowAgent};
+#[cfg(feature = "agent")]
 pub use handler::TestHandler;

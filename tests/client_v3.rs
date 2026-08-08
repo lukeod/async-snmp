@@ -1,4 +1,7 @@
-#![cfg(feature = "agent")]
+#![cfg(all(
+    feature = "agent",
+    any(feature = "crypto-rustcrypto", feature = "crypto-fips")
+))]
 //! `SNMPv3` security tests using `TestAgent`.
 
 mod common;

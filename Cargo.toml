@@ -81,21 +81,20 @@ harness = false
 [[bench]]
 name = "v3"
 harness = false
+required-features = ["crypto-rustcrypto"]
 
 [[bench]]
 name = "transport_comparison"
 harness = false
 
 [features]
-default = ["agent", "v3", "crypto-rustcrypto"]
-v3 = []                    # SNMPv3 protocol and USM surfaces
+default = ["agent", "crypto-rustcrypto"]
 agent = ["dep:quinn-udp"]  # SNMP agent
 crypto-rustcrypto = [
-    "v3",
     "dep:aes", "dep:cbc", "dep:cfb-mode", "dep:des",
     "dep:digest", "dep:hmac", "dep:md-5", "dep:sha1", "dep:sha2",
 ]
-crypto-fips = ["v3", "dep:aws-lc-rs"]
+crypto-fips = ["dep:aws-lc-rs"]
 rt-multi-thread = ["tokio/rt-multi-thread"]  # Multi-threaded tokio runtime
 cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
 mib = ["dep:mib-rs"]       # MIB integration (OID conversions, helpers)
@@ -117,7 +116,23 @@ required-features = ["cli"]
 
 [[example]]
 name = "notification_sender"
-required-features = ["agent"]
+required-features = ["agent", "crypto-rustcrypto"]
+
+[[example]]
+name = "notification_receiver"
+required-features = ["agent", "crypto-rustcrypto"]
+
+[[example]]
+name = "shared_transport"
+required-features = ["crypto-rustcrypto"]
+
+[[example]]
+name = "snmpv3_client"
+required-features = ["crypto-rustcrypto"]
+
+[[example]]
+name = "tcp_client"
+required-features = ["crypto-rustcrypto"]
 
 [[example]]
 name = "agent_with_set"

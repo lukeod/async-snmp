@@ -426,7 +426,7 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
     pub(crate) fn engine_boots(mut self, boots: u32) -> Self {
         let engine_id = self
             .authoritative_engine
@@ -1237,6 +1237,7 @@ mod tests {
     /// `engine_boots` and `engine_time` in the USM parameters. With
     /// `auth: Some((password, protocol))` the message is AuthNoPriv with a
     /// valid HMAC; with `None` it is noAuthNoPriv.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     fn build_v3_notification(
         pdu_type: crate::pdu::PduType,
         engine_id: &[u8],
@@ -1258,6 +1259,7 @@ mod tests {
 
     /// As [`build_v3_notification`], but with an explicit advertised
     /// `msg_max_size` in the message header.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     fn build_v3_notification_with_max(
         pdu_type: crate::pdu::PduType,
         engine_id: &[u8],
@@ -1332,6 +1334,7 @@ mod tests {
 
     /// Build an authenticated V3 `InformRequest` message with the given
     /// `engine_boots` and `engine_time` in the USM parameters.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     fn build_authed_v3_inform(
         engine_id: &[u8],
         engine_boots: u32,
@@ -1352,6 +1355,7 @@ mod tests {
 
     /// Build an authenticated V3 `SNMPv2-Trap` message with the given
     /// `engine_boots` and `engine_time` in the USM parameters.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     fn build_authed_v3_trap(engine_id: &[u8], engine_boots: u32, engine_time: u32) -> Bytes {
         build_v3_notification(
             crate::pdu::PduType::TrapV2,
@@ -1364,12 +1368,14 @@ mod tests {
     }
 
     /// Build an unauthenticated (noAuthNoPriv) V3 `SNMPv2-Trap` message.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     fn build_noauth_v3_trap(engine_id: &[u8], username: &[u8]) -> Bytes {
         build_v3_notification(crate::pdu::PduType::TrapV2, engine_id, 0, 0, username, None)
     }
 
     /// Build a receiver with its own engine ID and a `trapuser` configured,
     /// for tests exercising traps sent under a remote sender's engine ID.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     async fn remote_trap_receiver() -> NotificationReceiver {
         NotificationReceiver::builder()
             .bind("127.0.0.1:0")
@@ -1390,6 +1396,7 @@ mod tests {
     /// reports the security level it was received at (RFC 3411 Section
     /// 3.4.3: securityLevel accompanies every message up to the
     /// application).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_from_remote_sender_engine_accepted() {
         let receiver = remote_trap_receiver().await;
@@ -1415,6 +1422,7 @@ mod tests {
     /// A noAuthNoPriv V3 trap from a configured user is delivered (no
     /// per-user minimum is enforced here) but must be distinguishable from
     /// an authenticated one via its security level.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_noauth_trap_carries_security_level() {
         let receiver = remote_trap_receiver().await;
@@ -1438,6 +1446,7 @@ mod tests {
     /// the local configuration regardless of security level, so a
     /// noAuthNoPriv message from an unknown user is dropped and counted,
     /// not delivered.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_noauth_trap_unknown_user_rejected_and_counted() {
         let receiver = remote_trap_receiver().await;
@@ -1451,6 +1460,7 @@ mod tests {
 
     /// Each remote engine gets independent timeliness state: traps from
     /// multiple senders with unrelated boots/time are all accepted.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_traps_from_multiple_remote_engines_accepted() {
         let receiver = remote_trap_receiver().await;
@@ -1473,6 +1483,7 @@ mod tests {
     /// exist, an authenticated trap under a new engine ID evicts an old entry
     /// rather than growing the map, so a credential holder cannot exhaust
     /// memory by fabricating engine IDs.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_remote_engines_table_bounded() {
         let receiver = remote_trap_receiver().await;
@@ -1503,6 +1514,7 @@ mod tests {
     /// its engine time is more than 150 seconds behind the local notion
     /// established by an earlier authentic message (RFC 3414 Section 3.2
     /// Step 7b).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_remote_engine_stale_time_rejected() {
         let receiver = remote_trap_receiver().await;
@@ -1520,6 +1532,7 @@ mod tests {
     }
 
     /// A trap claiming an older boot cycle than previously seen is rejected.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_remote_engine_old_boots_rejected() {
         let receiver = remote_trap_receiver().await;
@@ -1537,6 +1550,7 @@ mod tests {
 
     /// A sender reboot (higher boots, low time) is tolerated and updates
     /// the local notion; the previous boot cycle is then rejected.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_remote_engine_reboot_accepted() {
         let receiver = remote_trap_receiver().await;
@@ -1564,6 +1578,7 @@ mod tests {
 
     /// A trap with a bad HMAC from an unknown remote engine must not seed
     /// timeliness state or be accepted.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_remote_engine_bad_auth_rejected() {
         let receiver = remote_trap_receiver().await;
@@ -1587,6 +1602,7 @@ mod tests {
         assert!(receiver.handle_v3(good, source).await.unwrap().is_some());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_outside_time_window_rejected() {
         let receiver = NotificationReceiver::builder()
@@ -1620,6 +1636,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_wrong_boots_rejected() {
         let receiver = NotificationReceiver::builder()
@@ -1653,6 +1670,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_within_time_window_accepted() {
         let receiver = NotificationReceiver::builder()
@@ -1806,6 +1824,7 @@ mod tests {
     /// local engine ID. An Inform localized to a foreign (e.g. the sender's)
     /// authoritative engine ID is rejected rather than acknowledged under that
     /// foreign engine.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_under_remote_engine_id_rejected() {
         let receiver = NotificationReceiver::builder()
@@ -1841,6 +1860,7 @@ mod tests {
     /// An Inform localized to the receiver's own local engine ID is accepted
     /// (RFC 3414 Section 1.5.1: the receiver is the authoritative engine for a
     /// Confirmed-class PDU).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_under_local_engine_id_accepted() {
         let receiver = NotificationReceiver::builder()
@@ -1875,6 +1895,7 @@ mod tests {
 
     /// RFC 3412 Section 6.3: the inform acknowledgement advertises the
     /// receiver's own receive capacity, not the sender's echoed msgMaxSize.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_ack_advertises_local_max_size() {
         let receiver = NotificationReceiver::builder()
@@ -1931,6 +1952,7 @@ mod tests {
     /// RFC 3414 Section 3.1 Steps 1(a) and 6: an Inform Response is generated
     /// under the local authoritative engine and carries its current boots/time
     /// tuple rather than echoing the accepted request's tuple.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_ack_uses_current_authoritative_time() {
         use crate::message::V3Message;
@@ -2029,6 +2051,7 @@ mod tests {
         assert_eq!(receiver.engine_id(), b"custom-engine");
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_usm_counter_accessors_default_zero() {
         let receiver = remote_trap_receiver().await;
@@ -2042,6 +2065,7 @@ mod tests {
 
     /// RFC 3414 Section 3.2 Step 6: a failed HMAC increments
     /// usmStatsWrongDigests.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_wrong_digest_increments_counter() {
         let receiver = remote_trap_receiver().await;
@@ -2061,6 +2085,7 @@ mod tests {
 
     /// RFC 3414 Section 3.2 Step 4: an authenticated message for a user not
     /// in the local configuration increments usmStatsUnknownUserNames.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_unknown_user_increments_counter() {
         let receiver = remote_trap_receiver().await;
@@ -2083,6 +2108,7 @@ mod tests {
     /// RFC 3414 Section 3.2 Step 5: an authenticated message for a user
     /// configured without an auth key increments
     /// usmStatsUnsupportedSecLevels.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_user_without_auth_key_increments_counter() {
         let receiver = NotificationReceiver::builder()
@@ -2110,6 +2136,7 @@ mod tests {
 
     /// RFC 3414 Section 3.2 Step 7a: an inform under the receiver's engine ID
     /// outside the time window increments usmStatsNotInTimeWindows.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_time_window_failure_increments_counter() {
         let receiver = NotificationReceiver::builder()
@@ -2141,6 +2168,7 @@ mod tests {
     /// usmStatsNotInTimeWindows and its Report belong to the authoritative
     /// case (Step 7a) only, matching net-snmp's
     /// usm_check_and_update_timeliness.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_remote_stale_not_counted() {
         let receiver = remote_trap_receiver().await;
@@ -2161,6 +2189,7 @@ mod tests {
     /// rejected as foreign-engine (RFC 3414 Section 1.5.1), so a stale
     /// remote-engine inform still fails at Step 7b rather than being
     /// acknowledged.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_inform_remote_stale_gets_no_report() {
         let receiver = remote_trap_receiver().await;
@@ -2207,6 +2236,7 @@ mod tests {
     /// Build an authPriv V3 trap for the given username, HMAC'd with the
     /// given password, with undecryptable privacy parameters (wrong salt
     /// length) and garbage ciphertext.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     fn build_v3_trap_bad_ciphertext(
         engine_id: &[u8],
         username: &[u8],
@@ -2247,6 +2277,7 @@ mod tests {
 
     /// RFC 3414 Section 3.2 Step 8: a decryption failure increments
     /// usmStatsDecryptionErrors.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_decryption_error_increments_counter() {
         let receiver = NotificationReceiver::builder()
@@ -2275,6 +2306,7 @@ mod tests {
     /// a user configured without privacy increments
     /// usmStatsUnsupportedSecLevels even when its HMAC is invalid, not
     /// usmStatsWrongDigests.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_authpriv_for_auth_only_user_counts_unsupported_sec_level() {
         let receiver = remote_trap_receiver().await;
@@ -2296,6 +2328,7 @@ mod tests {
     /// report carries the receiver's engine ID/boots/time for time
     /// resynchronization and is authenticated at authNoPriv
     /// (RFC 3414 Section 3.2 Step 7).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_failed_inform_gets_authenticated_time_window_report() {
         use crate::message::V3Message;
@@ -2367,6 +2400,7 @@ mod tests {
     /// RFC 3414 Section 3.2 Step 7a lists latched engine boots as a Time
     /// Window failure and mandates the report be authenticated at
     /// authNoPriv, like the other notInTimeWindows reports.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_latched_boots_report_is_authenticated() {
         use crate::message::V3Message;
@@ -2431,6 +2465,7 @@ mod tests {
 
     /// A USM-failed inform for an unknown user gets an unauthenticated
     /// Report (no key exists to authenticate it with).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_failed_inform_unknown_user_gets_noauth_report() {
         use crate::message::V3Message;
@@ -2488,6 +2523,7 @@ mod tests {
 
     /// A USM-failed trap must NOT get a Report: traps are Unconfirmed Class
     /// and carry reportableFlag=0 (RFC 3412 Sections 6.4 and 7.1 Step 3).
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_failed_trap_gets_no_report() {
         let receiver = remote_trap_receiver().await;

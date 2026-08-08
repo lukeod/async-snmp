@@ -387,14 +387,14 @@ Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `agent` | Yes | SNMP agent support (includes `quinn-udp`) |
-| `v3` | Yes | SNMPv3 protocol and USM surfaces (implied by either crypto backend) |
 | `crypto-rustcrypto` | Yes | RustCrypto-based crypto backend (all auth/priv protocols) |
 | `crypto-fips` | No | FIPS 140-3 crypto via aws-lc-rs (rejects MD5, DES, 3DES) |
 | `rt-multi-thread` | No | Multi-threaded tokio runtime |
 | `cli` | No | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 | `mib` | No | MIB integration via [mib-rs](https://github.com/lukeod/mib-rs) (OID name resolution, value formatting) |
 
-The backend features can be enabled together. To use only the FIPS backend:
+SNMPv3 protocol and USM support are always available; cryptographic backends
+are optional and additive. The backend features can be enabled together. To use only the FIPS backend:
 
 ```bash
 cargo add async-snmp --no-default-features --features agent,crypto-fips

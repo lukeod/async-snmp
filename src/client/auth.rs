@@ -10,6 +10,8 @@
 //! derivation:
 //!
 //! ```rust
+//! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+//! # {
 //! use async_snmp::{Auth, AuthProtocol, PrivProtocol, MasterKeys};
 //!
 //! // Derive master keys once (expensive: ~850μs for SHA-256)
@@ -20,6 +22,7 @@
 //! let auth: Auth = Auth::usm("admin")
 //!     .with_master_keys(master_keys)
 //!     .into();
+//! # }
 //! ```
 
 use bytes::Bytes;
@@ -149,12 +152,13 @@ impl Auth {
     ///     )
     ///     .into();
     /// ```
-    #[cfg(feature = "v3")]
     pub fn usm(username: impl Into<String>) -> UsmConfig {
         UsmConfig::new(bytes::Bytes::from(username.into()))
     }
 
-    pub(crate) fn version(&self) -> Version {
+    /// Return the SNMP version selected by this authentication configuration.
+    #[must_use]
+    pub fn version(&self) -> Version {
         match self {
             Auth::Community {
                 version: CommunityVersion::V1,
@@ -183,7 +187,6 @@ impl Auth {
     }
 }
 
-#[cfg(feature = "v3")]
 impl From<UsmConfig> for Auth {
     fn from(config: UsmConfig) -> Self {
         Self::Usm(config)

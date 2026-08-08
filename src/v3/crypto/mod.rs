@@ -294,6 +294,10 @@ impl CryptoBackend {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
+        allow(clippy::ptr_arg)
+    )]
     pub(crate) fn encrypt(
         self,
         protocol: PrivProtocol,

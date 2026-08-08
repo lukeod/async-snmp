@@ -761,7 +761,9 @@ fn split_host_port(target: &str) -> (&str, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v3::{AuthProtocol, MasterKeys, PrivProtocol, UsmConfig};
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    use crate::v3::MasterKeys;
+    use crate::v3::{AuthProtocol, PrivProtocol, UsmConfig};
 
     #[test]
     fn test_builder_defaults() {
@@ -992,6 +994,7 @@ mod tests {
         assert!(builder.validate().is_ok());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_validate_master_keys_configs() {
         let auth_only = MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();

@@ -602,6 +602,7 @@ mod tests {
     /// when its plaintext scoped PDU is malformed garbage. Parsing the
     /// plaintext before authentication would turn this into a bare decode
     /// error and skip the counter and Report.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_wrong_digest_reported_before_plaintext_pdu_parse() {
         use crate::ber::EncodeBuf;

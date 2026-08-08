@@ -2,8 +2,9 @@
 //!
 //! Supports human-readable, JSON, and raw output formats.
 
-use crate::cli::args::{CommonArgs, OutputArgs, OutputFormat, V3Args};
+use crate::cli::args::{OutputArgs, OutputFormat};
 use crate::cli::hints;
+use crate::client::Auth;
 use crate::format::hex;
 use crate::{Oid, Value, VarBind, Version};
 use serde::Serialize;
@@ -593,16 +594,17 @@ fn format_timeticks(centiseconds: u32) -> String {
     crate::format::format_timeticks(centiseconds)
 }
 
-/// Build a SecurityInfo from CLI arguments.
-pub fn build_security_info(v3: &V3Args, common: &CommonArgs) -> SecurityInfo {
-    if v3.is_v3() {
-        SecurityInfo::V3 {
-            username: v3.username.clone().unwrap_or_default(),
-            auth_protocol: v3.auth_protocol.map(|p| format!("{}", p)),
-            priv_protocol: v3.priv_protocol.map(|p| format!("{}", p)),
+/// Build display security data from a constructed authentication configuration.
+pub fn build_security_info(auth: &Auth) -> SecurityInfo {
+    match auth {
+        Auth::Community { community, .. } => {
+            SecurityInfo::Community(String::from_utf8_lossy(community).into_owned())
         }
-    } else {
-        SecurityInfo::Community(common.community.clone())
+        Auth::Usm(config) => SecurityInfo::V3 {
+            username: String::from_utf8_lossy(config.username()).into_owned(),
+            auth_protocol: config.auth_protocol().map(|protocol| protocol.to_string()),
+            priv_protocol: config.priv_protocol().map(|protocol| protocol.to_string()),
+        },
     }
 }
 
@@ -614,6 +616,29 @@ pub fn write_error(err: &crate::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_info_is_derived_from_constructed_auth() {
+        let community = Auth::v1("private");
+        assert_eq!(community.version(), Version::V1);
+        assert!(matches!(
+            build_security_info(&community),
+            SecurityInfo::Community(value) if value == "private"
+        ));
+
+        let usm: Auth = crate::Auth::usm("operator")
+            .auth(crate::AuthProtocol::Sha256, "authpassword")
+            .into();
+        assert_eq!(usm.version(), Version::V3);
+        assert!(matches!(
+            build_security_info(&usm),
+            SecurityInfo::V3 {
+                username,
+                auth_protocol: Some(protocol),
+                priv_protocol: None,
+            } if username == "operator" && protocol == "SHA-256"
+        ));
+    }
 
     #[test]
     fn test_format_timeticks() {

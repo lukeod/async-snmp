@@ -71,10 +71,7 @@ use tracing::{Span, instrument};
 pub use crate::v3::DerivedKeys;
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 use crate::v3::DerivedKeys;
-#[cfg(feature = "v3")]
 pub use crate::v3::UsmConfig;
-#[cfg(not(feature = "v3"))]
-use crate::v3::UsmConfig;
 pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 
 // ============================================================================

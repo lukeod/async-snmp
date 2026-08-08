@@ -1,3 +1,5 @@
+#![cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+
 //! Known-Answer Tests (KAT) for cryptographic operations.
 //!
 //! These tests use test vectors from RFCs to verify that our implementations
