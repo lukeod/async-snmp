@@ -221,9 +221,10 @@ pub(crate) fn encode_v3_report(
 ///
 /// Shared by the agent and the notification receiver (Inform acks). `usm`
 /// carries the authoritative engine ID/boots/time the response will claim
-/// and echoes the requester's username; `msg_id`, `msg_max_size`, and
-/// `security_level` echo the incoming message header. Encryption (authPriv)
-/// uses the boots/time already present in `usm`.
+/// and echoes the requester's username. `msg_id` and `security_level` correspond
+/// to the incoming message, while `msg_max_size` advertises the responder's local
+/// receive capacity (it is not the requester's value). Encryption (authPriv) uses
+/// the boots/time already present in `usm`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_v3_response(
     response_pdu: Pdu,

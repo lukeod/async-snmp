@@ -22,8 +22,8 @@
 
 use async_snmp::transport::UdpTransport;
 use async_snmp::{
-    Auth, AuthProtocol, Client, CommunityResponsePolicy, EngineCache, MasterKeys, PrivProtocol,
-    ResponseShapePolicy, Retry, oid,
+    Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, ResponseShapePolicy, Retry,
+    oid,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
@@ -51,11 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Shared transport bound to {}", shared.local_addr());
 
-    // Create clients for different targets - all use the same underlying socket
-    // Exact community matching is the default. For a known proxy that rewrites
-    // communities, retain target-source correlation for rewritten responses.
+    // Create clients for different targets - all use the same underlying socket.
+    // This local agent has a stable response address, so require source matching;
+    // exact community matching remains the default.
     let client1 = Client::builder(container_target, Auth::v2c("public"))
-        .community_response_policy(CommunityResponsePolicy::AllowMismatchFromTarget)
+        .strict_source(true)
         .build_with(&shared)
         .await?;
     let client2 = Client::builder(("192.0.2.1", 161), Auth::v2c("public")) // TEST-NET-1 (unreachable)

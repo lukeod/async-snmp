@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = ("127.0.0.1", 11161);
 
     // =========================================================================
-    // Example 1: authPriv (SHA-1 + AES-128) - Most secure
+    // Example 1: legacy-interoperable authPriv (SHA-1 + AES-128)
     // =========================================================================
     println!("--- SNMPv3 authPriv (SHA-1 + AES-128) ---\n");
 
@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect()
         .await?;
 
-    println!("Connected to {} with authPriv", client.peer_addr());
+    println!(
+        "UDP client configured for {} with authPriv; the GET below tests reachability",
+        client.peer_addr()
+    );
 
     // Perform a GET request
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
@@ -70,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect()
         .await?;
 
-    println!("Connected with authNoPriv");
+    println!("UDP authNoPriv client configured; the GET below tests reachability");
 
     match client_auth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
         Ok(result) => println!("sysName: {:?}\n", result.varbinds[0].value),
@@ -92,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect()
         .await?;
 
-    println!("Connected with noAuthNoPriv");
+    println!("UDP noAuthNoPriv client configured; the GET below tests reachability");
 
     match client_noauth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
         Ok(result) => println!("sysUpTime: {:?}\n", result.varbinds[0].value),
@@ -115,7 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Master keys derived once (expensive operation)");
 
     // Create multiple clients using the cached master keys
-    // Note: These TEST-NET-1 addresses are for demonstration - they won't be reachable
+    // These TEST-NET-1 addresses are for configuration demonstration only.
+    // UDP `connect()` resolves/binds/configures a peer; it does not probe reachability.
     let targets = [("192.0.2.1", 161), ("192.0.2.2", 161), ("192.0.2.3", 161)];
 
     for target_addr in &targets {
@@ -132,16 +136,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             Ok(client) => {
                 println!(
-                    "Connected to {} (using cached master keys)",
+                    "Configured UDP client for {} (using cached master keys)",
                     client.peer_addr()
                 );
                 // In a real scenario, you would poll OIDs here
                 drop(client);
             }
             Err(e) => {
-                // Expected to fail if hosts are not reachable
+                // This reports local resolution/bind/configuration failures, not
+                // an agent reachability probe.
                 println!(
-                    "Could not connect to {}:{}: {}",
+                    "Could not configure client for {}:{}: {}",
                     target_addr.0, target_addr.1, e
                 );
             }
@@ -163,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Available privacy protocols:
     // - PrivProtocol::Des      (legacy, not recommended)
+    // - PrivProtocol::Des3     (legacy 3DES, not recommended)
     // - PrivProtocol::Aes128   (recommended; RFC 3826)
     // - PrivProtocol::Aes192   (draft/vendor extension)
     // - PrivProtocol::Aes256   (draft/vendor extension)

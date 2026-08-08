@@ -204,7 +204,7 @@ impl UdpTransport {
     /// Shutdown the transport, stopping the background receiver.
     ///
     /// Signals the background recv task to stop and waits for it to exit.
-    /// Pending requests are woken and fail with timeout errors.
+    /// Pending requests are woken and fail with [`crate::Error::Closed`].
     ///
     /// Calling this is optional: the recv task is also cancelled when the
     /// last `UdpTransport` clone and [`UdpHandle`] are dropped.

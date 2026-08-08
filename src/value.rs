@@ -246,11 +246,12 @@ pub enum Value {
     /// fall back to Counter32 (with potential overflow for high-bandwidth counters).
     Counter64(u64),
 
-    /// noSuchObject exception - the requested OID exists in the MIB but has no value.
+    /// noSuchObject exception - the requested object identity is not available.
     ///
-    /// This exception indicates that the agent recognizes the OID (it's a valid
-    /// MIB object), but there is no instance available. This commonly occurs when
-    /// requesting a table column OID without an index.
+    /// This exception indicates that the object identity prefix does not match an
+    /// accessible object in the agent's MIB view. It is distinct from
+    /// [`Value::NoSuchInstance`], where the object identity exists but the requested
+    /// instance does not.
     ///
     /// # Example
     ///
@@ -262,7 +263,7 @@ pub enum Value {
     ///
     /// // When handling responses, check for exceptions:
     /// match response {
-    ///     Value::NoSuchObject => println!("OID exists but has no value"),
+    ///     Value::NoSuchObject => println!("object identity is not in the MIB view"),
     ///     _ => {}
     /// }
     /// ```

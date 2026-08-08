@@ -178,8 +178,8 @@ pub(crate) trait CryptoProvider: Send + Sync + 'static {
 ///
 /// Cargo features only determine which variants are available. Enabling the
 /// FIPS backend does not by itself make an operation FIPS-compliant; callers
-/// must select [`CryptoBackend::AwsLcFips`] and can inspect that choice through
-/// [`UsmConfig::crypto_backend`](super::UsmConfig::crypto_backend).
+/// must select the `AwsLcFips` variant of [`CryptoBackend`] and can inspect that
+/// choice through [`UsmConfig::crypto_backend`](super::UsmConfig::crypto_backend).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum CryptoBackend {

@@ -361,7 +361,7 @@ impl Pdu {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidMessage`](crate::Error::InvalidMessage) when
+    /// Returns [`Error::InvalidMessage`] when
     /// either GETBULK parameter exceeds the RFC 3416 `Integer32` maximum.
     pub fn get_bulk(
         request_id: i32,

@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Persistent client ---\n");
 
     let client = SyncSnmpClient::connect(target, "public")?;
-    println!("Connected to {}", client.peer_addr());
+    println!("UDP client configured for {}", client.peer_addr());
 
     // GET
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))?;

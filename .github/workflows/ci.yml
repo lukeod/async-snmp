@@ -34,47 +34,63 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-  clippy-fips:
-    name: Clippy (FIPS)
+  minimal-features:
+    name: No defaults (library, integrations, docs, examples)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --all-targets --no-default-features --features agent,crypto-fips -- -D warnings
+      - run: cargo test --locked --no-default-features --lib
+      - run: cargo test --locked --no-default-features --test community_only
+      - run: cargo test --locked --no-default-features --test v3_without_crypto
+      - run: cargo test --locked --no-default-features --doc
+      - run: cargo check --locked --no-default-features --examples
 
-  clippy-cli:
-    name: Clippy (CLI without MIB)
+  cli-features:
+    name: CLI (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no crypto
+            features: cli
+          - name: RustCrypto
+            features: cli,crypto-rustcrypto
+          - name: FIPS
+            features: cli,crypto-fips
+          - name: both backends
+            features: cli,crypto-rustcrypto,crypto-fips
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --all-targets --no-default-features --features agent,cli,crypto-rustcrypto -- -D warnings
+      # The CLI unit suite covers community, V3 noAuthNoPriv, password
+      # rejection without crypto, explicit V3 without a username, and backend
+      # selection when the corresponding providers are present. Check all three
+      # binaries separately because they contain no binary-local tests.
+      - run: "cargo test --locked --no-default-features --features ${{ matrix.features }} --lib cli::"
+      - run: "cargo check --locked --no-default-features --features ${{ matrix.features }} --bins"
 
-  feature-checks:
-    name: Feature combination checks
+  crypto-features:
+    name: Crypto (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: RustCrypto
+            feature: crypto-rustcrypto
+          - name: FIPS
+            feature: crypto-fips
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --lib --no-default-features
-      - run: cargo test --locked --test v3_without_crypto --no-default-features
-      - run: cargo test --locked --doc --no-default-features
-      - run: cargo check --locked --examples --no-default-features
-      - run: cargo test --locked --lib --bins --no-default-features --features cli
-      - run: cargo test --locked --lib --bins --no-default-features --features cli,crypto-rustcrypto
-      - run: cargo test --locked --lib --bins --no-default-features --features cli,crypto-fips
-      - run: cargo test --locked --lib --bins --no-default-features --features cli,crypto-rustcrypto,crypto-fips
-      - run: cargo test --locked --no-default-features --features crypto-rustcrypto --test kat
-      - run: cargo test --locked --no-default-features --features crypto-fips --test kat
-      - run: cargo test --locked --all-features
-      - run: cargo check --locked --all-targets --all-features
+      - run: "cargo test --locked --no-default-features --features agent,${{ matrix.feature }} --test kat"
+      - run: "cargo test --locked --no-default-features --features agent,${{ matrix.feature }} --test client_v3"
+      - run: "cargo test --locked --no-default-features --features agent,${{ matrix.feature }} --lib v3::config::tests"
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.toolchain }})
@@ -94,6 +110,16 @@ jobs:
         run: |
           cargo test --locked --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --lib
           cargo test --locked --tests --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
+
+  all-features:
+    name: All features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-features
+      - run: cargo check --locked --all-features --all-targets
 
   docs:
     name: Documentation

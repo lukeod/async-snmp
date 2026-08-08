@@ -41,7 +41,7 @@ jobs:
 
       - name: Check CHANGELOG has entry
         run: |
-          if ! grep -q "\[${{ needs.prepare.outputs.version }}\]" CHANGELOG.md; then
+          if ! grep -q "^## \[${{ needs.prepare.outputs.version }}\]" CHANGELOG.md; then
             echo "Error: CHANGELOG.md does not contain an entry for version ${{ needs.prepare.outputs.version }}"
             exit 1
           fi

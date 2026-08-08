@@ -113,7 +113,12 @@ pub fn write_verbose_request(info: &RequestInfo) {
 }
 
 /// Write verbose response summary to stderr.
-pub fn write_verbose_response(varbinds: &[VarBind], elapsed: Duration, show_hints: bool) {
+pub fn write_verbose_response(
+    varbinds: &[VarBind],
+    elapsed: Duration,
+    show_hints: bool,
+    force_hex: bool,
+) {
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(stderr, "--- Response ---");
     let _ = writeln!(stderr, "Results:   {} varbind(s)", varbinds.len());
@@ -121,7 +126,7 @@ pub fn write_verbose_response(varbinds: &[VarBind], elapsed: Duration, show_hint
     let _ = writeln!(stderr);
 
     for vb in varbinds {
-        write_verbose_varbind(&mut stderr, vb, show_hints);
+        write_verbose_varbind(&mut stderr, vb, show_hints, force_hex);
     }
 
     if !varbinds.is_empty() {
@@ -341,7 +346,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
 }
 
 /// Write detailed varbind information for verbose output.
-fn write_verbose_varbind<W: Write>(w: &mut W, vb: &VarBind, show_hints: bool) {
+fn write_verbose_varbind<W: Write>(w: &mut W, vb: &VarBind, show_hints: bool, force_hex: bool) {
     // OID with optional hint
     let hint = if show_hints {
         hints::lookup(&vb.oid)
@@ -354,7 +359,7 @@ fn write_verbose_varbind<W: Write>(w: &mut W, vb: &VarBind, show_hints: bool) {
         let _ = writeln!(w, "  {}", format_oid(&vb.oid));
     }
 
-    let decoded = decode_value(&vb.value, false);
+    let decoded = decode_value(&vb.value, force_hex);
 
     let _ = writeln!(w, "    Type:    {}", decoded.type_name);
     let _ = writeln!(w, "    Value:   {}", decoded.display);
@@ -638,6 +643,21 @@ mod tests {
                 priv_protocol: None,
             } if username == "operator" && protocol == "SHA-256"
         ));
+    }
+
+    #[test]
+    fn verbose_varbind_honors_force_hex() {
+        let vb = VarBind::new(
+            Oid::from_slice(&[1, 3, 6, 1]),
+            Value::OctetString(bytes::Bytes::from_static(b"text")),
+        );
+        let mut output = Vec::new();
+
+        write_verbose_varbind(&mut output, &vb, false, true);
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Type:    Hex-STRING"));
+        assert!(output.contains("Value:   74 65 78 74"));
     }
 
     #[test]

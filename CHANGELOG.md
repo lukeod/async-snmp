@@ -104,6 +104,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration
 
+- **Client fixed-cardinality responses:** `get`, `get_many`, `get_next`,
+  `get_next_many`, `set`, and `set_many` now return
+  `FixedCardinalityResponse` rather than a bare `Vec<VarBind>`/single binding.
+  Extract received bindings through `.varbinds` and inspect `.anomalies` before
+  assuming positional correspondence:
+
+  ```rust
+  let response = client.get_many(&oids).await?;
+  if !response.anomalies.is_empty() {
+      eprintln!("response-shape anomalies: {:?}", response.anomalies);
+  }
+  for varbind in response.varbinds {
+      println!("{} = {:?}", varbind.oid, varbind.value);
+  }
+  ```
+
+  Compatible mode preserves bounded malformed-response evidence in both fields.
+  To retain the old fail-fast expectation, configure
+  `Client::builder(...).response_shape_policy(ResponseShapePolicy::Strict)`;
+  shape failures then return `Error::ResponseShape` with the received bindings
+  and diagnostics.
 - Replace handler `Option` conversions with explicit `GetResult` and
   `GetNextResult` variants. Use `GetResult::Value(value)` or `value.into()` for
   present GET values, choose `NoSuchObject` versus `NoSuchInstance` for absent

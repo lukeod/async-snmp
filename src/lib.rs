@@ -1,3 +1,6 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg))]
+
 //! # async-snmp
 //!
 //! Modern, async-first SNMP client library for Rust.
@@ -308,8 +311,9 @@
 //!
 //! ## Tracing Integration
 //!
-//! The library uses the `tracing` crate for structured logging. All SNMP
-//! operations emit spans and events with relevant context.
+//! The library uses the `tracing` crate for structured logging. Client
+//! operations are instrumented with spans, and protocol/transport paths emit
+//! events with relevant context.
 //!
 //! ### Basic Setup
 //!
@@ -340,22 +344,22 @@
 //!
 //! | Level | What's Logged |
 //! |-------|---------------|
-//! | ERROR | Socket errors, fatal transport failures |
-//! | WARN | Auth failures, parse errors, source address mismatches |
-//! | INFO | Connect/disconnect, walk completion |
-//! | DEBUG | Request/response flow, engine discovery, retries |
-//! | TRACE | Auth verification, raw packet data |
+//! | ERROR | UDP receive failures and agent request-task/handler-contract failures |
+//! | WARN | Authentication, correlation, compatibility, parse, and source-policy anomalies |
+//! | INFO | Agent shutdown requests |
+//! | DEBUG | Request/response flow, engine discovery, retries, and walk progress |
+//! | TRACE | Detailed BER, value, USM, crypto, and packet-processing state |
 //!
 //! ### Structured Fields
 //!
-//! All fields use the `snmp.` prefix for easy filtering:
+//! Stable operation fields use the `snmp.` prefix for easy filtering:
 //!
 //! | Field | Description |
 //! |-------|-------------|
 //! | `snmp.target` | Target address for outgoing requests |
 //! | `snmp.source` | Source address of incoming messages |
 //! | `snmp.request_id` | SNMP request identifier |
-//! | `snmp.retries` | Current retry attempt number |
+//! | `snmp.attempt` | Current retry attempt number |
 //! | `snmp.elapsed_ms` | Request duration in milliseconds |
 //! | `snmp.pdu_type` | PDU type (Get, `GetNext`, etc.) |
 //! | `snmp.varbind_count` | Number of varbinds in request/response |
@@ -377,10 +381,12 @@
 //! | `async_snmp` | Everything |
 //! | `async_snmp::client` | Client operations, requests, retries |
 //! | `async_snmp::agent` | Agent request/response handling |
-//! | `async_snmp::ber` | BER encoding/decoding |
-//! | `async_snmp::v3` | `SNMPv3` message processing |
-//! | `async_snmp::transport` | UDP/TCP transport layer |
-//! | `async_snmp::notification` | Trap/inform receiver |
+//! | `async_snmp::notification` | Trap/inform sending and receiving |
+//! | `async_snmp::message`, `async_snmp::pdu` | SNMP message and PDU processing |
+//! | `async_snmp::ber`, `async_snmp::oid`, `async_snmp::value` | BER and SMI value processing |
+//! | `async_snmp::v3`, `async_snmp::usm`, `async_snmp::crypto`, `async_snmp::engine` | `SNMPv3`/USM processing |
+//! | `async_snmp::transport`, `async_snmp::transport::udp`, `async_snmp::transport::tcp` | Transport processing |
+//! | `async_snmp::walk`, `async_snmp::error` | Walk and error processing |
 //!
 //! ```bash
 //! # All library logs at debug level

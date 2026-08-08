@@ -12,13 +12,17 @@ Async-first SNMP client library for Rust.
 
 This library is not currently stable. While pre v1.0, breaking changes are likely to occur frequently, no attempt will be made to maintain backward compatibility pre-1.0.
 
+This README and every code sample in it describe the `main` branch and the next
+release API, not the published 0.17.0 API. Exact 0.17.0 links are provided
+[separately below](#published-0170).
+
 MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the `mib` feature flag for integrated OID name resolution, symbolic formatting, and type-aware value rendering.
 
 ## Features
 
 - **Full protocol support**: SNMPv1, v2c, and v3 (USM)
 - **Async-first**: Built on Tokio
-- **All operations**: GET, GETNEXT, GETBULK, SET, WALK, BULKWALK
+- **All operations**: GET, GETNEXT, GETBULK, SET, WALK, BULKWALK (GETBULK/BULKWALK require v2c or v3)
 - **Trap and inform sending**: Agent-based (multi-sink) and client-based notification sending with V1/V2c/V3 support
 - **Trap and inform receiving**: V1/V2c/V3 notification receiver with optional community filtering and per-notification security-level reporting
 - **SNMP agent**: Async handler framework with two-phase SET commit, VACM access control, and built-in MIB handlers for engine/USM/MPD statistics
@@ -35,7 +39,8 @@ MIB parsing is handled by [mib-rs](https://github.com/lukeod/mib-rs). Enable the
 | GET / GETNEXT | Y | Y | Y |
 | GETBULK | - | Y | Y |
 | SET | Y | Y | Y |
-| WALK / BULKWALK | Y | Y | Y |
+| WALK (GETNEXT) | Y | Y | Y |
+| BULKWALK (GETBULK) | - | Y | Y |
 | Receive Traps | Y | Y | Y |
 | Receive Informs | - | Y | Y |
 | Send Traps | Y | Y | Y |
@@ -116,13 +121,26 @@ boots value is not used. Polling clients and V3 Inform senders do not need local
 authoritative state because the remote responder is authoritative for those
 exchanges.
 
-## Installation
+## Main branch / next release
+
+Install the main branch for the next-release samples:
 
 ```bash
-cargo add async-snmp@0.17.0
+cargo add async-snmp --git https://github.com/lukeod/async-snmp
+cargo add tokio --features macros,rt
+# Also needed by the Shared Transport sample below:
+cargo add futures
 ```
 
-## Quick Start
+## Published 0.17.0
+
+Install the exact published release with `cargo add async-snmp@0.17.0`. Use its
+version-specific [API documentation](https://docs.rs/async-snmp/0.17.0/async_snmp/),
+[crate page](https://crates.io/crates/async-snmp/0.17.0), and
+[source](https://github.com/lukeod/async-snmp/tree/v0.17.0) rather than the
+next-release samples below.
+
+## Quick Start (main / next release)
 
 ### SNMPv2c
 
@@ -267,12 +285,14 @@ A shared socket uses one file descriptor and one recv loop for all targets, inst
 | Per-client socket (`.connect()`) | Default for simple use. Each client gets its own socket and OS buffer. |
 
 UDP source checking is permissive by default for multihomed agents and proxy
-paths, while v1/v2c community matching remains exact. Proxies that rewrite the
-community can opt into `CommunityResponsePolicy::AllowMismatchFromTarget`.
-`AllowMismatchFromAnySource` also accepts an off-target rewritten response and
-therefore weakens spoof resistance. `strict_source(true)` is independent and
-always rejects off-target responses. Rejected packets increment the transport
-`unmatched` counter; accepted source or community anomalies emit warnings.
+paths, while v1/v2c community matching remains exact. When the agent always
+replies from its configured address, prefer `.strict_source(true)`. Proxies
+that rewrite the community can opt into
+`CommunityResponsePolicy::AllowMismatchFromTarget` while retaining target-source
+correlation. `AllowMismatchFromAnySource` also accepts an off-target rewritten
+response and therefore weakens spoof resistance. Rejected packets increment the
+transport `unmatched` counter; accepted source or community anomalies emit
+warnings.
 
 ### Using from Synchronous Code
 
@@ -356,6 +376,27 @@ failed or skipped sinks and discard the aggregate outcome.
 
 Client-based sending is useful for one-shot notifications without running an agent. See [examples/notification_sender.rs](examples/notification_sender.rs) for both approaches with V2c and V3 examples.
 
+### Command-line tools
+
+The next release provides `asnmp-get`, `asnmp-walk`, and `asnmp-set` behind the
+`cli` feature:
+
+```bash
+cargo install --git https://github.com/lukeod/async-snmp --features cli
+asnmp-get -v 2c -c public 192.0.2.10 sysDescr.0
+asnmp-walk -v 2c -c public 192.0.2.10 1.3.6.1.2.1.1
+asnmp-set -v 2c -c private 192.0.2.10 sysLocation.0 s rack-7
+```
+
+`asnmp-walk` uses GETBULK by default for v2c/v3 and GETNEXT for v1; pass
+`--getnext` to select GETNEXT explicitly. SNMPv3 noAuthNoPriv uses `-u USER`.
+Password-backed authentication adds `-a PROTOCOL -A PASSWORD`; privacy also
+adds `-x PROTOCOL -X PASSWORD`. Use `--crypto-backend rustcrypto|fips` when
+both backends are installed. Run each tool with `--help` for its complete,
+version-specific option set. The exact 0.17.0 CLI can instead be installed with
+`cargo install async-snmp --version 0.17.0 --features cli` and must be used with
+its own `--help` output.
+
 ### Tracing
 
 The library uses the `tracing` crate for structured logging. Filter by target:
@@ -373,14 +414,16 @@ RUST_LOG=async_snmp::transport=debug cargo run
 
 Available targets:
 - **Core**: `async_snmp::client`, `async_snmp::agent`, `async_snmp::notification`
-- **Protocol**: `async_snmp::ber`, `async_snmp::pdu`, `async_snmp::oid`, `async_snmp::value`
+- **Protocol**: `async_snmp::message`, `async_snmp::ber`, `async_snmp::pdu`, `async_snmp::oid`, `async_snmp::value`
 - **SNMPv3**: `async_snmp::v3`, `async_snmp::usm`, `async_snmp::crypto`, `async_snmp::engine`
 - **Transport**: `async_snmp::transport`, `async_snmp::transport::tcp`, `async_snmp::transport::udp`
 - **Operations**: `async_snmp::walk`, `async_snmp::error`
 
 ## Documentation
 
-Full API documentation is available on [docs.rs](https://docs.rs/async-snmp).
+The exact published 0.17.0 API is on
+[docs.rs](https://docs.rs/async-snmp/0.17.0/async_snmp/). For the main/next API,
+build this checkout with `cargo doc --all-features --open`.
 
 ## Feature Flags
 

@@ -12,8 +12,9 @@
 //!   # Start snmpd with a writable community
 //!   sudo snmpd -f -Lo -c /etc/snmp/snmpd.conf
 //!
-//! Or use the testcontainers snmpd image:
-//!   docker run -p 11161:161/udp testainers/snmpd-container
+//! Or use the project's net-snmp test image:
+//!   docker build -t async-snmp-test:latest tests/containers/snmpd/
+//!   docker run --rm -p 11161:161/udp async-snmp-test:latest
 
 use async_snmp::{Auth, Client, Error, ErrorStatus, Retry, Value, oid};
 use std::time::Duration;
@@ -39,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect()
         .await?;
 
-    println!("Connected to {}", client.peer_addr());
+    println!("UDP client configured for {}", client.peer_addr());
 
     // =========================================================================
     // GET: Retrieve a single OID

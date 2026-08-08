@@ -121,7 +121,7 @@ async fn main() -> ExitCode {
         Ok(varbinds) => {
             // Verbose output: show response summary with varbind details
             if args.output.verbose {
-                write_verbose_response(&varbinds, elapsed, !args.output.no_hints);
+                write_verbose_response(&varbinds, elapsed, !args.output.no_hints, args.output.hex);
             }
 
             let output_ctx = OutputContext::from_args(&args.output);

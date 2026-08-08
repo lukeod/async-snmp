@@ -192,7 +192,7 @@ pub struct V3Args {
     #[arg(short = 'A', long = "auth-password")]
     pub auth_password: Option<String>,
 
-    /// Privacy protocol: DES, AES, AES-128, AES-192, AES-256.
+    /// Privacy protocol: DES, 3DES, AES, AES-128, AES-192, AES-256.
     #[arg(short = 'x', long = "priv-protocol")]
     pub priv_protocol: Option<PrivProtocol>,
 
