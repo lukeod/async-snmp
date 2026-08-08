@@ -57,8 +57,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: |
-          cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --lib
-          cargo test --tests --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
+          cargo test --locked --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --lib
+          cargo test --locked --tests --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
 
   publish:
     name: Publish to crates.io
@@ -70,11 +70,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Update lockfile
-        run: cargo update --workspace
+      - name: Verify package
+        run: cargo publish --dry-run --locked
 
       - name: Publish
-        run: cargo publish --allow-dirty
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

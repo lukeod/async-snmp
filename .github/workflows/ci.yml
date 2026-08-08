@@ -32,7 +32,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   clippy-fips:
     name: Clippy (FIPS)
@@ -43,7 +43,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --no-default-features --features agent,crypto-fips -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features --features agent,crypto-fips -- -D warnings
 
   clippy-cli:
     name: Clippy (CLI without MIB)
@@ -54,7 +54,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --no-default-features --features agent,cli,crypto-rustcrypto -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features --features agent,cli,crypto-rustcrypto -- -D warnings
 
   feature-checks:
     name: Feature combination checks
@@ -63,11 +63,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --lib --no-default-features
-      - run: cargo check --no-default-features --features v3
-      - run: cargo test --no-default-features --features crypto-rustcrypto --test kat
-      - run: cargo test --no-default-features --features crypto-fips --test kat
-      - run: cargo check --all-features
+      - run: cargo check --locked --lib --no-default-features
+      - run: cargo check --locked --no-default-features --features v3
+      - run: cargo test --locked --no-default-features --features crypto-rustcrypto --test kat
+      - run: cargo test --locked --no-default-features --features crypto-fips --test kat
+      - run: cargo check --locked --all-features
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.toolchain }})
@@ -85,8 +85,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: |
-          cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --lib
-          cargo test --tests --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
+          cargo test --locked --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --lib
+          cargo test --locked --tests --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
 
   docs:
     name: Documentation
@@ -97,8 +97,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test and build docs
         run: |
-          cargo test --doc --all-features
-          cargo doc --all-features --no-deps
+          cargo test --locked --doc --all-features
+          cargo doc --locked --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -111,7 +111,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo generate-lockfile
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -134,4 +133,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Run container tests
-        run: cargo test --test interop --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread -- --ignored
+        run: cargo test --locked --test interop --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread -- --ignored
