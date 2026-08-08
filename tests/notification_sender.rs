@@ -5,6 +5,7 @@
 use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::message::CommunityMessage;
 use async_snmp::notification::{Notification, NotificationReceiver, NotificationVarbindValidation};
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 use async_snmp::v3::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
 use async_snmp::varbind::VarBind;
 use async_snmp::{Auth, Client, Pdu, PduType, Retry, Value, oid};
@@ -12,6 +13,7 @@ use bytes::Bytes;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 fn test_authoritative_engine(engine_id: Vec<u8>) -> AuthoritativeEngine {
     AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(())).unwrap()
 }
@@ -398,6 +400,7 @@ async fn v2c_inform_send_receive() {
 // V3 trap send/receive integration test
 // ============================================================================
 
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
 async fn v3_trap_send_receive() {
     // For V3 traps, the sender is the authoritative engine (RFC 3412 Section 6.4).
@@ -454,6 +457,7 @@ async fn v3_trap_send_receive() {
 // V3 inform send/receive integration test
 // ============================================================================
 
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
 async fn v3_inform_send_receive() {
     let engine = test_authoritative_engine(b"inform-receiver-engine".to_vec());
@@ -637,6 +641,7 @@ async fn v1_inform_returns_error() {
     assert!(result.is_err());
 }
 
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
 async fn v3_trap_without_local_authoritative_engine_returns_error() {
     let engine = test_authoritative_engine(b"trap-receiver-engine".to_vec());
@@ -747,6 +752,7 @@ async fn agent_v2c_inform_to_sink() {
     }
 }
 
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
 async fn agent_v3_trap_to_sink() {
     // Agent sends V3 trap using its own engine_id

@@ -182,6 +182,11 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(Box<str>),
 
+    /// Another [`Agent::run`](crate::agent::Agent::run) call is already active.
+    #[cfg(feature = "agent")]
+    #[error("agent is already running")]
+    AgentAlreadyRunning,
+
     /// Message cannot be represented by the selected SNMP version.
     #[error("invalid SNMP message: {0}")]
     InvalidMessage(Box<str>),

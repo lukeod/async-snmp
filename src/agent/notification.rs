@@ -12,7 +12,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::client::{Auth, Client, ClientConfig, CommunityVersion, Retry};
 use crate::error::{Error, Result};
-use crate::message::CommunityMessage;
+use crate::handler::SecurityModel;
+use crate::message::{CommunityMessage, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::Pdu;
 use crate::transport::{UdpHandle, UdpTransport};
@@ -145,12 +146,15 @@ impl TrapSink {
 pub enum SinkSkipReason {
     /// SNMPv1 does not support Inform requests.
     InformUnsupportedForV1,
+    /// VACM did not resolve a notify view containing the notification.
+    NotInNotifyView,
 }
 
 impl std::fmt::Display for SinkSkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InformUnsupportedForV1 => write!(f, "SNMPv1 does not support informs"),
+            Self::NotInNotifyView => write!(f, "notification is not in the sink's notify view"),
         }
     }
 }
@@ -282,12 +286,16 @@ impl super::Agent {
         }
 
         let request_id = self.next_notification_id();
-        let pdu = Pdu::trap_v2(request_id, uptime, trap_oid, varbinds);
+        let pdu = Pdu::trap_v2(request_id, uptime, trap_oid, varbinds.clone());
 
         for sink in sinks {
-            let status = match self.send_trap_to_sink(sink, &pdu).await {
-                Ok(()) => SinkStatus::Succeeded,
-                Err(error) => SinkStatus::Failed(error),
+            let status = if !self.notification_allowed(sink, trap_oid, &varbinds) {
+                SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+            } else {
+                match self.send_trap_to_sink(sink, &pdu).await {
+                    Ok(()) => SinkStatus::Succeeded,
+                    Err(error) => SinkStatus::Failed(error),
+                }
             };
             outcomes.push(SinkOutcome {
                 dest: sink.dest,
@@ -360,6 +368,8 @@ impl super::Agent {
         for sink in sinks {
             let status = if sink.version == Version::V1 {
                 SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
+            } else if !self.notification_allowed(sink, trap_oid, &varbinds) {
+                SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
             } else {
                 match self
                     .send_inform_to_sink(sink, trap_oid, uptime, &varbinds)
@@ -400,6 +410,56 @@ impl super::Agent {
                 SinkStatus::Succeeded => {}
             }
         }
+    }
+
+    /// Resolve and apply the target sink's VACM notify view.
+    fn notification_allowed(&self, sink: &TrapSink, trap_oid: &Oid, varbinds: &[VarBind]) -> bool {
+        let Some(vacm) = self.inner.vacm.as_ref() else {
+            return true;
+        };
+
+        let (model, security_name, security_level, context_name) = match &sink.auth {
+            Auth::Community { version, community } => {
+                let model = match version {
+                    CommunityVersion::V1 => SecurityModel::V1,
+                    CommunityVersion::V2c => SecurityModel::V2c,
+                };
+                (
+                    model,
+                    community.as_ref(),
+                    SecurityLevel::NoAuthNoPriv,
+                    &[][..],
+                )
+            }
+            Auth::Usm(security) => (
+                SecurityModel::Usm,
+                security.username().as_ref(),
+                security.security_level(),
+                security.configured_context_name().as_ref(),
+            ),
+        };
+
+        let Some(group) = vacm.get_group(model, security_name) else {
+            return false;
+        };
+        let Some(access) = vacm.get_access(group, context_name, model, security_level) else {
+            return false;
+        };
+        let notify_view = Some(&access.notify_view);
+
+        if !vacm.check_access(notify_view, trap_oid)
+            || varbinds
+                .iter()
+                .any(|varbind| !vacm.check_access(notify_view, &varbind.oid))
+        {
+            return false;
+        }
+
+        // SNMPv2c/v3 notifications carry these mandatory varbind names. In v1
+        // they are represented by Trap-PDU fields instead.
+        sink.version == Version::V1
+            || (vacm.check_access(notify_view, &crate::notification::oids::sys_uptime())
+                && vacm.check_access(notify_view, &crate::notification::oids::snmp_trap_oid()))
     }
 
     /// Send a trap PDU to a single sink.
@@ -498,10 +558,242 @@ impl super::Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::SinkStatus;
-    use crate::agent::Agent;
-    use crate::{Auth, Error, Value, VarBind, oid};
+    use super::{SinkSkipReason, SinkStatus, TrapSink};
+    use crate::agent::{Agent, SecurityModel};
+    use crate::{Auth, AuthProtocol, Error, PrivProtocol, Value, VarBind, oid};
     use bytes::Bytes;
+
+    fn test_sink(auth: impl Into<Auth>) -> TrapSink {
+        TrapSink::new(
+            "127.0.0.1:9".parse().unwrap(),
+            auth.into(),
+            std::time::Duration::from_millis(10),
+            crate::client::Retry::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn notify_view_uses_each_sink_identity_context_and_security_level() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .vacm(|v| {
+                v.group("v1-community", SecurityModel::V1, "v1")
+                    .group("v2-community", SecurityModel::V2c, "v2")
+                    .group("context-user", SecurityModel::Usm, "context")
+                    .group("security-user", SecurityModel::Usm, "security")
+                    .access("v1", |a| a.notify_view("all"))
+                    .access("v2", |a| a.notify_view("all"))
+                    .access("context", |a| {
+                        a.context_prefix("tenant/")
+                            .context_match_prefix()
+                            .security_model(SecurityModel::Usm)
+                            .notify_view("empty")
+                    })
+                    .access("context", |a| {
+                        a.context_prefix("tenant/blue")
+                            .security_model(SecurityModel::Usm)
+                            .notify_view("all")
+                    })
+                    .access("security", |a| {
+                        a.context_prefix("secure")
+                            .security_model(SecurityModel::Usm)
+                            .notify_view("empty")
+                    })
+                    .access("security", |a| {
+                        a.context_prefix("secure")
+                            .security_model(SecurityModel::Usm)
+                            .security_level(crate::message::SecurityLevel::AuthPriv)
+                            .notify_view("all")
+                    })
+                    .view("all", |view| view.include(oid!(1, 3, 6)))
+                    .view("empty", |view| view)
+            })
+            .build()
+            .await
+            .unwrap();
+        let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+
+        assert!(agent.notification_allowed(&test_sink(Auth::v1("v1-community")), &trap_oid, &[]));
+        assert!(agent.notification_allowed(&test_sink(Auth::v2c("v2-community")), &trap_oid, &[]));
+        assert!(agent.notification_allowed(
+            &test_sink(Auth::usm("context-user").context_name("tenant/blue")),
+            &trap_oid,
+            &[]
+        ));
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::usm("context-user").context_name("tenant/red")),
+            &trap_oid,
+            &[]
+        ));
+        assert!(
+            !agent.notification_allowed(
+                &test_sink(
+                    Auth::usm("security-user")
+                        .auth(AuthProtocol::Sha256, "auth-password")
+                        .context_name("secure")
+                ),
+                &trap_oid,
+                &[]
+            )
+        );
+        assert!(
+            agent.notification_allowed(
+                &test_sink(
+                    Auth::usm("security-user")
+                        .auth_priv(
+                            AuthProtocol::Sha256,
+                            "auth-password",
+                            PrivProtocol::Aes128,
+                            "privacy-password",
+                        )
+                        .context_name("secure")
+                ),
+                &trap_oid,
+                &[]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_view_denies_trap_oid_extra_varbind_and_missing_views() {
+        let denied_trap = oid!(1, 3, 6, 1, 4, 1, 9999, 1);
+        let allowed_trap = oid!(1, 3, 6, 1, 4, 1, 9999, 2);
+        let denied_extra = oid!(1, 3, 6, 1, 4, 1, 9999, 3);
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .vacm(|v| {
+                v.group("trap-denied", SecurityModel::V2c, "trap-denied")
+                    .group("extra-denied", SecurityModel::V2c, "extra-denied")
+                    .group("missing", SecurityModel::V2c, "missing")
+                    .group("empty", SecurityModel::V2c, "empty")
+                    .group("no-access", SecurityModel::V2c, "no-access")
+                    .access("trap-denied", |a| a.notify_view("trap-view"))
+                    .access("extra-denied", |a| a.notify_view("extra-view"))
+                    .access("missing", |a| a.notify_view("not-defined"))
+                    .access("empty", |a| a)
+                    .view("trap-view", |view| {
+                        view.include(oid!(1, 3, 6)).exclude(denied_trap.clone())
+                    })
+                    .view("extra-view", |view| {
+                        view.include(oid!(1, 3, 6)).exclude(denied_extra.clone())
+                    })
+            })
+            .build()
+            .await
+            .unwrap();
+        let extra = VarBind::new(denied_extra, Value::Integer(1));
+
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::v2c("trap-denied")),
+            &denied_trap,
+            &[]
+        ));
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::v2c("extra-denied")),
+            &allowed_trap,
+            &[extra]
+        ));
+        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("missing")), &allowed_trap, &[]));
+        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("empty")), &allowed_trap, &[]));
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::v2c("no-access")),
+            &allowed_trap,
+            &[]
+        ));
+        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("no-group")), &allowed_trap, &[]));
+    }
+
+    #[tokio::test]
+    async fn notify_view_checks_v2_mandatory_varbind_names_but_not_v1_fields() {
+        let trap_oid = oid!(1, 3, 6, 1, 4, 1, 9999, 1);
+        let extra_oid = oid!(1, 3, 6, 1, 4, 1, 9999, 2);
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .vacm(|v| {
+                v.group("v1", SecurityModel::V1, "group")
+                    .group("v2", SecurityModel::V2c, "group")
+                    .access("group", |a| a.notify_view("notification-only"))
+                    .view("notification-only", |view| {
+                        view.include(trap_oid.clone()).include(extra_oid.clone())
+                    })
+            })
+            .build()
+            .await
+            .unwrap();
+        let extra = VarBind::new(extra_oid, Value::Integer(1));
+
+        assert!(agent.notification_allowed(
+            &test_sink(Auth::v1("v1")),
+            &trap_oid,
+            std::slice::from_ref(&extra)
+        ));
+        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("v2")), &trap_oid, &[extra]));
+    }
+
+    #[tokio::test]
+    async fn notification_vacm_is_permissive_when_unconfigured_and_mixed_per_sink() {
+        let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+        let permissive = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
+        assert!(permissive.notification_allowed(
+            &test_sink(Auth::v2c("unmapped")),
+            &trap_oid,
+            &[VarBind::new(oid!(9, 9), Value::Integer(1))]
+        ));
+
+        let mixed = Agent::builder()
+            .bind("127.0.0.1:0")
+            .trap_sink("127.0.0.1:9", Auth::v2c("allowed"))
+            .trap_sink("127.0.0.1:9", Auth::v2c("denied"))
+            .vacm(|v| {
+                v.group("allowed", SecurityModel::V2c, "allowed")
+                    .group("denied", SecurityModel::V2c, "denied")
+                    .access("allowed", |a| a.notify_view("all"))
+                    .access("denied", |a| a.notify_view("empty"))
+                    .view("all", |view| view.include(oid!(1, 3, 6)))
+                    .view("empty", |view| view)
+            })
+            .build()
+            .await
+            .unwrap();
+        let outcome = mixed.send_trap(&trap_oid, 0, vec![]).await;
+        assert!(matches!(outcome.sinks()[0].status, SinkStatus::Succeeded));
+        assert!(matches!(
+            outcome.sinks()[1].status,
+            SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+        ));
+
+        let denied_inform = Agent::builder()
+            .bind("127.0.0.1:0")
+            .trap_sink("127.0.0.1:9", Auth::v2c("denied"))
+            .vacm(|v| {
+                v.group("denied", SecurityModel::V2c, "denied")
+                    .access("denied", |a| a.notify_view("empty"))
+                    .view("empty", |view| view)
+            })
+            .build()
+            .await
+            .unwrap()
+            .send_inform(&trap_oid, 0, vec![])
+            .await;
+        assert!(matches!(
+            denied_inform.sinks()[0].status,
+            SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+        ));
+
+        let denied_v1_inform = Agent::builder()
+            .bind("127.0.0.1:0")
+            .trap_sink("127.0.0.1:9", Auth::v1("denied"))
+            .vacm(|v| v)
+            .build()
+            .await
+            .unwrap()
+            .send_inform(&trap_oid, 0, vec![])
+            .await;
+        assert!(matches!(
+            denied_v1_inform.sinks()[0].status,
+            SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
+        ));
+    }
 
     #[tokio::test]
     async fn public_agent_notification_path_rejects_receive_only_values() {

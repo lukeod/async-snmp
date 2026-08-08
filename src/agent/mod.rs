@@ -83,7 +83,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -134,12 +134,23 @@ const V3_AUTH_OVERHEAD: usize = 48;
 /// scopedPDU, and up to a full DES/AES block of CBC padding.
 const V3_PRIV_OVERHEAD: usize = 20;
 
-/// Maximum number of VACM-denied OIDs skipped while advancing a single GETNEXT
-/// step before giving up and reporting end-of-MIB for that varbind. Without a
-/// cap, a request spanning a large denied range forces O(range) backing-store
-/// lookups per step, a CPU-DoS shape. When the cap is hit the scan for that
-/// varbind ends rather than continuing to probe.
-const MAX_VACM_SKIP_ITERATIONS: usize = 1000;
+/// Maximum number of inaccessible or version-incompatible OIDs skipped while
+/// advancing one GETNEXT step. The bound covers both VACM-denied candidates and
+/// `Counter64` candidates that cannot be returned to SNMPv1 requesters. Reaching
+/// it is an internal processing failure rather than evidence of end-of-MIB.
+const MAX_GETNEXT_SKIP_ITERATIONS: usize = 1000;
+
+/// Clears the shared active-run flag whenever an [`Agent::run`] future exits or
+/// is dropped.
+struct RunGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
 
 /// Request tasks owned by one [`Agent::run`] invocation.
 ///
@@ -925,6 +936,7 @@ impl AgentBuilder {
                 cancel,
                 trap_sinks,
                 notification_id: std::sync::atomic::AtomicI32::new(1),
+                run_active: AtomicBool::new(false),
             }),
         })
     }
@@ -1028,6 +1040,8 @@ pub(crate) struct AgentInner {
     pub(crate) trap_sinks: Vec<notification::TrapSink>,
     /// Per-agent monotonic counter for trap request-ids and v3 notification msgIDs.
     pub(crate) notification_id: std::sync::atomic::AtomicI32,
+    /// Shared across clones to enforce one active service loop.
+    pub(crate) run_active: AtomicBool,
 }
 
 /// SNMP Agent.
@@ -1301,6 +1315,14 @@ impl Agent {
     /// may still be used for other agent operations while that call is active.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn run(&self) -> Result<()> {
+        self.inner
+            .run_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::AgentAlreadyRunning.boxed())?;
+        let _run_guard = RunGuard {
+            active: &self.inner.run_active,
+        };
+
         let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
         let mut request_tasks = RequestTasks::new(self.inner.cancel.child_token());
 
@@ -1845,7 +1867,7 @@ impl Agent {
         from_oid: &Oid,
     ) -> HandlerResult<Option<VarBind>> {
         let mut search_from = from_oid.clone();
-        for _ in 0..MAX_VACM_SKIP_ITERATIONS {
+        for _ in 0..MAX_GETNEXT_SKIP_ITERATIONS {
             let candidate = self.get_next_oid(ctx, &search_from).await?;
             match candidate {
                 None => return Ok(None),
@@ -1874,15 +1896,15 @@ impl Agent {
                 }
             }
         }
-        // Skip cap reached: treat as end-of-MIB for this varbind rather than
-        // continuing to probe an unboundedly large denied range.
         tracing::warn!(
             target: "async_snmp::agent",
             from = %from_oid,
-            cap = MAX_VACM_SKIP_ITERATIONS,
-            "VACM skip cap reached in GETNEXT; ending scan for this varbind"
+            cap = MAX_GETNEXT_SKIP_ITERATIONS,
+            "GETNEXT inaccessible/version-incompatible candidate skip cap reached"
         );
-        Ok(None)
+        Err(crate::handler::HandlerError::new(
+            "GETNEXT candidate skip cap reached",
+        ))
     }
 
     /// Get the next OID from any handler.
@@ -2001,6 +2023,102 @@ mod tests {
         }
     }
 
+    async fn wait_for_run_state(agent: &Agent, expected: bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while agent.inner.run_active.load(Ordering::Acquire) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("agent run state did not change");
+    }
+
+    #[tokio::test]
+    async fn cloned_concurrent_run_fails_while_first_stays_operational() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+        let first_agent = agent.clone();
+        let first = tokio::spawn(async move { first_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+
+        let error = agent.clone().run().await.unwrap_err();
+        assert!(matches!(*error, Error::AgentAlreadyRunning));
+        assert!(!first.is_finished());
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = crate::message::CommunityMessage::new(
+            Version::V2c,
+            Bytes::from_static(b"public"),
+            Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        client.send_to(&request, agent.local_addr()).await.unwrap();
+        let mut response = [0_u8; 2048];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response))
+                .await
+                .expect("first run stopped receiving")
+                .unwrap();
+        let decoded =
+            crate::message::CommunityMessage::decode(Bytes::copy_from_slice(&response[..len]))
+                .unwrap();
+        let response_pdu = decoded.pdu().standard().unwrap();
+        assert_eq!(response_pdu.request_id, 7);
+        assert_eq!(response_pdu.error_status(), 0);
+
+        agent.cancel().cancel();
+        first.await.unwrap().unwrap();
+        wait_for_run_state(&agent, false).await;
+        assert!(
+            agent.run().await.is_ok(),
+            "a later call must acquire the guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_run_future_releases_exclusivity() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(10), agent.run()).await;
+        assert!(timed_out.is_err());
+        wait_for_run_state(&agent, false).await;
+
+        agent.cancel().cancel();
+        assert!(agent.run().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn aborted_run_task_releases_exclusivity() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .build()
+            .await
+            .unwrap();
+        let task_agent = agent.clone();
+        let task = tokio::spawn(async move { task_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        wait_for_run_state(&agent, false).await;
+
+        agent.cancel().cancel();
+        assert!(agent.run().await.is_ok());
+    }
+
     #[test]
     fn test_agent_builder_defaults() {
         let builder = AgentBuilder::new();
@@ -2114,6 +2232,313 @@ mod tests {
             .await
             .unwrap();
         assert!(next.is_end_of_mib_view());
+    }
+
+    struct SerialProbeHandler {
+        id: &'static str,
+        candidates: Vec<Oid>,
+        error: Option<&'static str>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+        dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+        handles: bool,
+    }
+
+    impl MibHandler for SerialProbeHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async move {
+                struct DropSignal(Option<Arc<std::sync::atomic::AtomicBool>>);
+
+                impl Drop for DropSignal {
+                    fn drop(&mut self) {
+                        if let Some(dropped) = &self.0 {
+                            dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.order.lock().unwrap().push(self.id);
+                let _drop_signal = DropSignal(self.dropped.clone());
+                if let Some(release) = &self.release {
+                    release.notified().await;
+                }
+                if let Some(message) = self.error {
+                    return Err(HandlerError::new(message));
+                }
+                Ok(self
+                    .candidates
+                    .iter()
+                    .find(|candidate| *candidate > oid)
+                    .cloned()
+                    .map(|next| GetNextResult::Value(VarBind::new(next, Value::Integer(1))))
+                    .unwrap_or(GetNextResult::EndOfMibView))
+            })
+        }
+
+        fn handles(&self, _registered_prefix: &Oid, _oid: &Oid) -> bool {
+            self.handles
+        }
+    }
+
+    fn serial_probe(
+        id: &'static str,
+        candidates: Vec<Oid>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> SerialProbeHandler {
+        SerialProbeHandler {
+            id,
+            candidates,
+            error: None,
+            calls,
+            order,
+            release: None,
+            dropped: None,
+            handles: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_next_serial_probing_preserves_registration_contracts() {
+        let cursor = oid!(1, 3, 6, 1, 4, 1, 100);
+        for reverse_registration in [false, true] {
+            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let nested_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let containing_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let nested = (
+                oid!(1, 3, 6, 1, 4, 1, 100, 2),
+                Arc::new(SerialProbeHandler {
+                    handles: false,
+                    ..serial_probe(
+                        "nested",
+                        vec![oid!(1, 3, 6, 1, 4, 1, 100, 1)],
+                        nested_calls.clone(),
+                        order.clone(),
+                    )
+                }) as Arc<dyn MibHandler>,
+            );
+            let containing = (
+                cursor.clone(),
+                Arc::new(serial_probe(
+                    "containing",
+                    vec![oid!(1, 3, 6, 1, 4, 1, 100, 3)],
+                    containing_calls.clone(),
+                    order.clone(),
+                )) as Arc<dyn MibHandler>,
+            );
+            let registrations = if reverse_registration {
+                vec![containing, nested]
+            } else {
+                vec![nested, containing]
+            };
+            let mut builder = Agent::builder()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .without_builtin_handlers();
+            for (prefix, handler) in registrations {
+                builder = builder.handler(prefix, handler);
+            }
+            let agent = builder.build().await.unwrap();
+
+            let result = agent
+                .get_next_oid(&test_ctx(), &cursor)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.oid, oid!(1, 3, 6, 1, 4, 1, 100, 1));
+            assert_eq!(nested_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                containing_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(*order.lock().unwrap(), ["nested", "containing"]);
+        }
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers();
+        for (id, suffix) in [("first", 3), ("second", 2)] {
+            builder = builder.handler(
+                cursor.clone(),
+                Arc::new(serial_probe(
+                    id,
+                    vec![cursor.child(suffix)],
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    order.clone(),
+                )),
+            );
+        }
+        let agent = builder.build().await.unwrap();
+        let result = agent
+            .get_next_oid(&test_ctx(), &cursor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.oid, cursor.child(2));
+        assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn get_next_waits_for_each_probe_before_starting_the_next() {
+        use std::sync::atomic::Ordering;
+
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 200);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let later_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first = SerialProbeHandler {
+            release: Some(release.clone()),
+            ..serial_probe(
+                "first",
+                vec![prefix.child(1)],
+                first_calls.clone(),
+                order.clone(),
+            )
+        };
+        let later = SerialProbeHandler {
+            error: Some("later failure"),
+            ..serial_probe("later", Vec::new(), later_calls.clone(), order.clone())
+        };
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .handler(prefix.clone(), Arc::new(first))
+            .handler(prefix.clone(), Arc::new(later))
+            .build()
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while first_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(later_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*order.lock().unwrap(), ["first"]);
+
+        release.notify_one();
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.message(), "later failure");
+        assert_eq!(later_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*order.lock().unwrap(), ["first", "later"]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_get_bulk_drops_current_probe_without_starting_later_handlers() {
+        use std::sync::atomic::Ordering;
+
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 300);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let later_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = SerialProbeHandler {
+            release: Some(Arc::new(tokio::sync::Notify::new())),
+            dropped: Some(dropped.clone()),
+            ..serial_probe("first", Vec::new(), first_calls.clone(), order.clone())
+        };
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .handler(prefix.clone(), Arc::new(first))
+            .handler(
+                prefix.clone(),
+                Arc::new(serial_probe(
+                    "later",
+                    Vec::new(),
+                    later_calls.clone(),
+                    order.clone(),
+                )),
+            )
+            .build()
+            .await
+            .unwrap();
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        let pdu = Pdu::get_bulk(9, 0, 2, vec![VarBind::new(prefix, Value::Null)]).unwrap();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                agent.dispatch_request(&ctx, &pdu)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(later_calls.load(Ordering::SeqCst), 0);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(*order.lock().unwrap(), ["first"]);
+    }
+
+    #[tokio::test]
+    async fn get_bulk_repeats_serial_handler_order_for_each_step() {
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 400);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .handler(
+                prefix.clone(),
+                Arc::new(serial_probe(
+                    "first",
+                    vec![prefix.child(2), prefix.child(4)],
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    order.clone(),
+                )),
+            )
+            .handler(
+                prefix.clone(),
+                Arc::new(serial_probe(
+                    "second",
+                    vec![prefix.child(1), prefix.child(3)],
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    order.clone(),
+                )),
+            )
+            .build()
+            .await
+            .unwrap();
+        let mut ctx = test_ctx();
+        ctx.pdu_type = PduType::GetBulkRequest;
+        let pdu = Pdu::get_bulk(10, 0, 3, vec![VarBind::new(prefix.clone(), Value::Null)]).unwrap();
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(
+            response
+                .varbinds
+                .iter()
+                .map(|varbind| varbind.oid.clone())
+                .collect::<Vec<_>>(),
+            [prefix.child(1), prefix.child(2), prefix.child(3)]
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["first", "second", "first", "second", "first", "second"]
+        );
     }
 
     // Serves .99999.1.0 and fails everything past it, simulating a backing
@@ -2407,9 +2832,8 @@ mod tests {
     }
 
     /// Handler exposing an effectively unbounded range of OIDs under
-    /// .99999.1.<n>, counting every `get_next` call. Used to exercise the VACM
-    /// skip cap: every OID it returns is denied by the accompanying view, so a
-    /// single GETNEXT step would loop forever without the bound.
+    /// .99999.1.<n>, counting every `get_next` call. Used to exercise the
+    /// GETNEXT candidate skip cap.
     struct CountingRangeHandler {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -2439,10 +2863,7 @@ mod tests {
         }
     }
 
-    // Regression: a GETNEXT over a large denied range must not make an unbounded
-    // number of backing-store lookups. The skip loop is capped, so the handler
-    // is called at most MAX_VACM_SKIP_ITERATIONS times per varbind and the step
-    // resolves to end-of-MIB instead of looping.
+    // Regression: cap exhaustion is a processing failure, not end-of-MIB.
     #[tokio::test]
     async fn test_getnext_vacm_denied_range_is_capped() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2480,16 +2901,95 @@ mod tests {
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
 
-        // The step resolves to end-of-MIB rather than returning a denied OID.
-        assert_eq!(response.varbinds.len(), 1);
-        assert_eq!(response.varbinds[0].value, Value::EndOfMibView);
+        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index(), 1);
 
-        // The skip loop is bounded: the handler is not called unboundedly.
         let total = calls.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            total <= MAX_VACM_SKIP_ITERATIONS,
-            "handler called {total} times, expected <= {MAX_VACM_SKIP_ITERATIONS}"
-        );
+        assert_eq!(total, MAX_GETNEXT_SKIP_ITERATIONS);
+    }
+
+    struct Counter64RangeHandler {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        unbounded: bool,
+    }
+
+    impl MibHandler for Counter64RangeHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async move {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if !self.unbounded && n > 1 {
+                    return Ok(GetNextResult::EndOfMibView);
+                }
+                let next = Oid::from_slice(&[1, 3, 6, 1, 4, 1, 99999, 1]).child(n as u32);
+                Ok(GetNextResult::Value(VarBind::new(
+                    next,
+                    Value::Counter64(n as u64),
+                )))
+            })
+        }
+    }
+
+    async fn counter64_range_agent(
+        unbounded: bool,
+    ) -> (Agent, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999),
+                Arc::new(Counter64RangeHandler {
+                    calls: calls.clone(),
+                    unbounded,
+                }),
+            )
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+        (agent, calls)
+    }
+
+    #[tokio::test]
+    async fn test_v1_counter64_skip_cap_is_gen_err() {
+        let (agent, calls) = counter64_range_agent(true).await;
+        let mut ctx = test_ctx();
+        ctx.version = Version::V1;
+        ctx.security_model = SecurityModel::V1;
+        ctx.pdu_type = PduType::GetNextRequest;
+        let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(response.error_index(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_GETNEXT_SKIP_ITERATIONS);
+    }
+
+    #[tokio::test]
+    async fn test_v1_counter64_skip_reaching_actual_eom_is_not_cap_failure() {
+        let (agent, calls) = counter64_range_agent(false).await;
+        let mut ctx = test_ctx();
+        ctx.version = Version::V1;
+        ctx.security_model = SecurityModel::V1;
+        ctx.pdu_type = PduType::GetNextRequest;
+        let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status(), ErrorStatus::NoSuchName.as_i32());
+        assert_eq!(response.error_index(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     // TestHandler with three OIDs: .99999.1.0, .99999.2.0, .99999.3.0
