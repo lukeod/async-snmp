@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Removed the unimplemented `tls` and `dtls` features and the
+  speculative `AgentTransport` trait. `UdpTransportConfig` is now private;
+  configure UDP transports through `UdpTransportBuilder`. Handler APIs are now
+  available only with the `agent` feature.
 - **Breaking:** Crypto backend features are additive and `--all-features` is
   supported. `UsmConfig` carries an observable `CryptoBackend` selection;
   RustCrypto remains the default when both are compiled and AWS-LC FIPS must be

@@ -101,8 +101,6 @@ crypto-fips = ["v3", "dep:aws-lc-rs"]
 rt-multi-thread = ["tokio/rt-multi-thread"]  # Multi-threaded tokio runtime
 cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]  # CLI utilities
 mib = ["dep:mib-rs"]       # MIB integration (OID conversions, helpers)
-tls = []      # Future: SNMP over TLS (RFC 6353)
-dtls = []     # Future: SNMP over DTLS (RFC 6353)
 
 [[bin]]
 name = "asnmp-get"

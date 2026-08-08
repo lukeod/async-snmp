@@ -450,8 +450,6 @@
 //! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
 //! - `mib` - MIB integration via mib-rs (OID conversions, value formatting helpers)
 //! - `rt-multi-thread` - Multi-threaded tokio runtime
-//! - `tls` - (Placeholder) SNMP over TLS per RFC 6353
-//! - `dtls` - (Placeholder) SNMP over DTLS per RFC 6353
 //!
 //! Crypto backend features are additive. Each USM configuration selects one
 //! available backend with [`CryptoBackend`]. When both are compiled,
@@ -464,6 +462,7 @@ pub mod client;
 pub mod compatibility;
 pub mod error;
 pub mod format;
+#[cfg(feature = "agent")]
 pub mod handler;
 pub mod message;
 pub mod message_size;
@@ -499,6 +498,7 @@ pub use client::{
 };
 pub use compatibility::CompatibilityPolicy;
 pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
+#[cfg(feature = "agent")]
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,
     RequestContext, Response, SecurityModel, SetResult,

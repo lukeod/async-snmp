@@ -276,21 +276,6 @@ pub trait Transport: Send + Sync {
     }
 }
 
-/// Agent-side transport abstraction (listener mode).
-///
-/// This trait is for future agent functionality.
-pub trait AgentTransport: Send + Sync {
-    /// Receive data from any source.
-    fn recv_from(&self, buf: &mut [u8])
-    -> impl Future<Output = Result<(usize, SocketAddr)>> + Send;
-
-    /// Send data to a specific target.
-    fn send_to(&self, data: &[u8], target: SocketAddr) -> impl Future<Output = Result<()>> + Send;
-
-    /// Local bind address.
-    fn local_addr(&self) -> SocketAddr;
-}
-
 // ============================================================================
 // Correlation envelope extraction (shared between transports)
 // ============================================================================

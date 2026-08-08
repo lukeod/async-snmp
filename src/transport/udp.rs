@@ -99,14 +99,14 @@ fn next_recv_error_backoff(current: Duration) -> Duration {
 
 /// Configuration for UDP transport.
 #[derive(Clone)]
-pub struct UdpTransportConfig {
+struct UdpTransportConfig {
     /// Maximum message size for sending (default: 1472, fits Ethernet MTU).
     ///
     /// This affects the advertised msgMaxSize in `SNMPv3` requests. The receive
     /// buffer is always sized to accept the maximum UDP datagram (65535 bytes).
-    pub max_message_size: usize,
+    max_message_size: usize,
     /// Log warning when response source differs from target (default: true)
-    pub warn_on_source_mismatch: bool,
+    warn_on_source_mismatch: bool,
 }
 
 impl Default for UdpTransportConfig {
