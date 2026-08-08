@@ -9,6 +9,7 @@ use async_snmp::cli::output::{
     OperationType, OutputContext, RequestInfo, build_security_info, write_error,
     write_verbose_request, write_verbose_response,
 };
+use async_snmp::client::DEFAULT_MAX_OIDS_PER_REQUEST;
 use async_snmp::{Auth, Client, Oid, Value};
 use clap::Parser;
 use std::process::ExitCode;
@@ -43,12 +44,13 @@ struct Args {
     mib: async_snmp::cli::mib_cli::MibArgs,
 
     /// OID TYPE VALUE triplets (e.g., sysContact.0 s "admin@example.com").
-    /// Can specify multiple triplets for atomic SET of multiple values.
+    /// Up to 10 triplets can be sent in one atomic SET request.
     #[arg(required = true, value_name = "OID TYPE VALUE", num_args = 3..)]
     varbinds: Vec<String>,
 }
 
 /// Parsed SET varbind.
+#[derive(Debug)]
 struct SetVarbind {
     oid: Oid,
     value: Value,
@@ -60,6 +62,13 @@ fn parse_varbinds(
 ) -> Result<Vec<SetVarbind>, String> {
     if !args.len().is_multiple_of(3) {
         return Err("arguments must be OID TYPE VALUE triplets".into());
+    }
+
+    let count = args.len() / 3;
+    if count > DEFAULT_MAX_OIDS_PER_REQUEST {
+        return Err(format!(
+            "atomic SET accepts at most {DEFAULT_MAX_OIDS_PER_REQUEST} varbinds (got {count})"
+        ));
     }
 
     let mut varbinds = Vec::new();
@@ -237,5 +246,59 @@ async fn run_set(
         client.set(&oid, value).await
     } else {
         client.set_many(&pairs).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[String]) -> Result<Vec<SetVarbind>, String> {
+        parse_varbinds(args, |value| {
+            value.parse::<Oid>().map_err(|e| e.to_string())
+        })
+    }
+
+    #[test]
+    fn parse_accepts_ten_complete_atomic_triplets() {
+        let mut args = Vec::new();
+        for _ in 0..DEFAULT_MAX_OIDS_PER_REQUEST {
+            args.extend(["1.3.6.1".to_owned(), "i".to_owned(), "1".to_owned()]);
+        }
+
+        assert_eq!(parse(&args).unwrap().len(), DEFAULT_MAX_OIDS_PER_REQUEST);
+    }
+
+    #[test]
+    fn parse_rejects_more_than_atomic_request_limit() {
+        let mut args = Vec::new();
+        for _ in 0..=DEFAULT_MAX_OIDS_PER_REQUEST {
+            args.extend(["1.3.6.1".to_owned(), "i".to_owned(), "1".to_owned()]);
+        }
+
+        let error = parse(&args).unwrap_err();
+        assert!(error.contains("at most 10 varbinds"));
+    }
+
+    #[test]
+    fn parse_rejects_incomplete_and_malformed_triplets() {
+        let incomplete = [
+            "1.3.6.1".to_owned(),
+            "i".to_owned(),
+            "1".to_owned(),
+            "1.3.6.2".to_owned(),
+        ];
+        assert!(
+            parse(&incomplete)
+                .unwrap_err()
+                .contains("OID TYPE VALUE triplets")
+        );
+
+        let malformed = ["1.3.6.1".to_owned(), "invalid".to_owned(), "1".to_owned()];
+        assert!(
+            parse(&malformed)
+                .unwrap_err()
+                .contains("invalid type specifier")
+        );
     }
 }

@@ -94,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- BER length encoding now rejects host lengths above `u32::MAX` instead of
+  truncating them; `encode_length` and `EncodeBuf::push_length` are fallible.
+- USM report counters wrap as Counter32 values, V3 discovery timeout errors
+  report total elapsed time and configured retries, and retry jitter is seeded
+  once per process from the OS random source while respecting its delay cap.
+- CLI verbose/debug metadata redacts community strings. `asnmp-set` documents
+  and enforces the ten-varbind atomic request limit before network I/O.
 - Built-in HMAC operations now reject truncation lengths greater than the
   selected digest length instead of panicking while slicing the generated tag.
 - Authenticated SNMPv1 GET, GETNEXT, and SET requests carrying Counter64 values

@@ -228,14 +228,14 @@ impl MsgGlobalData {
     /// Encode to buffer after revalidating all construction invariants.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.validate()?;
-        buf.push_sequence(|buf| {
+        buf.try_push_sequence(|buf| {
             buf.push_integer(self.msg_security_model.as_i32());
             // msgFlags is a 1-byte OCTET STRING
-            buf.push_octet_string(&[self.msg_flags.to_byte()]);
+            buf.try_push_octet_string(&[self.msg_flags.to_byte()])?;
             buf.push_integer(self.msg_max_size.as_i32());
             buf.push_integer(self.msg_id);
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Decode from decoder.
@@ -322,8 +322,8 @@ impl ScopedPdu {
         buf.try_push_sequence(|buf| {
             self.pdu
                 .encode_for(buf, crate::Version::V3, self.pdu.outbound_direction())?;
-            buf.push_octet_string(&self.context_name);
-            buf.push_octet_string(&self.context_engine_id);
+            buf.try_push_octet_string(&self.context_name)?;
+            buf.try_push_octet_string(&self.context_engine_id)?;
             Ok(())
         })
     }
@@ -513,11 +513,11 @@ impl V3Message {
             // msgData
             match &self.data {
                 V3MessageData::Plaintext(scoped_pdu) => scoped_pdu.encode(buf)?,
-                V3MessageData::Encrypted(ciphertext) => buf.push_octet_string(ciphertext),
+                V3MessageData::Encrypted(ciphertext) => buf.try_push_octet_string(ciphertext)?,
             }
 
             // msgSecurityParameters (as OCTET STRING)
-            buf.push_octet_string(&self.security_params);
+            buf.try_push_octet_string(&self.security_params)?;
 
             // msgGlobalData
             self.global_data.encode(buf)?;
@@ -974,7 +974,7 @@ mod tests {
 
     fn push_integer_content(buf: &mut EncodeBuf, content: &[u8]) {
         buf.push_bytes(content);
-        buf.push_length(content.len());
+        buf.push_length(content.len()).unwrap();
         buf.push_tag(crate::ber::tag::universal::INTEGER);
     }
 

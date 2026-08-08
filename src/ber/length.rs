@@ -111,35 +111,40 @@ pub(crate) const fn unsigned64_content_len(value: u64) -> usize {
     }
 }
 
-/// Encode a length value into the buffer (returns bytes in reverse order for prepending)
+/// Encode a length value into the buffer (returns bytes in reverse order for prepending).
 ///
-/// Uses short form for lengths <= 127, long form otherwise.
-#[must_use]
-pub fn encode_length(len: usize) -> ([u8; 5], usize) {
+/// Uses short form for lengths <= 127, long form otherwise. SNMP's supported
+/// BER length domain is capped at `u32::MAX`; larger host `usize` values are
+/// rejected rather than truncated into the four-octet long form.
+pub fn encode_length(len: usize) -> Result<([u8; 5], usize)> {
+    if len > u32::MAX as usize {
+        return Err(Error::InvalidMessage("BER length exceeds u32::MAX".into()).boxed());
+    }
+
     let mut buf = [0u8; 5];
 
     if len <= 127 {
         // Short form
         buf[0] = len as u8;
-        (buf, 1)
+        Ok((buf, 1))
     } else if len <= 0xFF {
         // Long form, 1 byte
         buf[0] = len as u8;
         buf[1] = 0x81;
-        (buf, 2)
+        Ok((buf, 2))
     } else if len <= 0xFFFF {
         // Long form, 2 bytes
         buf[0] = len as u8;
         buf[1] = (len >> 8) as u8;
         buf[2] = 0x82;
-        (buf, 3)
+        Ok((buf, 3))
     } else if len <= 0xFF_FFFF {
         // Long form, 3 bytes
         buf[0] = len as u8;
         buf[1] = (len >> 8) as u8;
         buf[2] = (len >> 16) as u8;
         buf[3] = 0x83;
-        (buf, 4)
+        Ok((buf, 4))
     } else {
         // Long form, 4 bytes
         buf[0] = len as u8;
@@ -147,7 +152,7 @@ pub fn encode_length(len: usize) -> ([u8; 5], usize) {
         buf[2] = (len >> 16) as u8;
         buf[3] = (len >> 24) as u8;
         buf[4] = 0x84;
-        (buf, 5)
+        Ok((buf, 5))
     }
 }
 
@@ -292,19 +297,19 @@ mod tests {
 
     #[test]
     fn test_encode_short() {
-        let (buf, len) = encode_length(0);
+        let (buf, len) = encode_length(0).unwrap();
         assert_eq!(&buf[..len], &[0]);
 
-        let (buf, len) = encode_length(127);
+        let (buf, len) = encode_length(127).unwrap();
         assert_eq!(&buf[..len], &[127]);
     }
 
     #[test]
     fn test_encode_long() {
-        let (buf, len) = encode_length(128);
+        let (buf, len) = encode_length(128).unwrap();
         assert_eq!(&buf[..len], &[128, 0x81]);
 
-        let (buf, len) = encode_length(256);
+        let (buf, len) = encode_length(256).unwrap();
         assert_eq!(&buf[..len], &[0, 1, 0x82]);
     }
 
@@ -326,6 +331,18 @@ mod tests {
         // 0x83 0x00 0x00 0x80 = length 128 using 3 bytes (non-minimal, minimal would be 0x81 0x80)
         let result = decode_length(&[0x83, 0x00, 0x00, 0x80], 0, None);
         assert_eq!(result.unwrap(), (128, 4));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn encode_rejects_unrepresentable_length_without_truncation() {
+        let (buf, len) = encode_length(u32::MAX as usize).unwrap();
+        assert_eq!(&buf[..len], &[0xff, 0xff, 0xff, 0xff, 0x84]);
+
+        let error = encode_length(u32::MAX as usize + 1).unwrap_err();
+        assert!(
+            matches!(*error, Error::InvalidMessage(ref message) if message.contains("u32::MAX"))
+        );
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn parse_jitter(value: &str) -> Result<f64, String> {
 }
 
 /// Common arguments shared across all CLI tools.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 pub struct CommonArgs {
     /// Target host or host:port (default port 161).
     #[arg(value_name = "TARGET")]
@@ -130,6 +130,22 @@ pub struct CommonArgs {
         value_parser = parse_jitter
     )]
     pub backoff_jitter: f64,
+}
+
+impl std::fmt::Debug for CommonArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommonArgs")
+            .field("target", &self.target)
+            .field("snmp_version", &self.snmp_version)
+            .field("community", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .field("retries", &self.retries)
+            .field("backoff", &self.backoff)
+            .field("backoff_delay", &self.backoff_delay)
+            .field("backoff_max", &self.backoff_max)
+            .field("backoff_jitter", &self.backoff_jitter)
+            .finish()
+    }
 }
 
 impl CommonArgs {
@@ -698,6 +714,10 @@ mod tests {
     fn cli_parser_constructs_community_and_noauth_v3() {
         let community =
             TestCliArgs::try_parse_from(["test", "-v", "1", "-c", "private", "127.0.0.1"]).unwrap();
+        let rendered = format!("{community:?}");
+        assert!(!rendered.contains("private"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+
         let auth = community.v3.auth(&community.common).unwrap();
         assert!(matches!(
             auth,

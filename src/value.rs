@@ -987,7 +987,7 @@ impl Value {
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         match self {
             Value::Integer(v) => buf.push_integer(*v),
-            Value::OctetString(data) => buf.push_octet_string(data),
+            Value::OctetString(data) => buf.try_push_octet_string(data)?,
             Value::Null => buf.push_null(),
             Value::ObjectIdentifier(oid) => buf.push_oid(oid)?,
             Value::IpAddress(addr) => buf.push_ip_address(*addr),
@@ -1001,8 +1001,11 @@ impl Value {
             }
             Value::TimeTicks(v) => buf.push_unsigned32(tag::application::TIMETICKS, *v),
             Value::Opaque(data) => {
+                // Check before copying content so a non-representable length
+                // cannot leave a partial value in the buffer.
+                crate::ber::encode_length(data.len())?;
                 buf.push_bytes(data);
-                buf.push_length(data.len());
+                buf.push_length(data.len())?;
                 buf.push_tag(tag::application::OPAQUE);
             }
             Value::Nsap(_) => {
@@ -1012,15 +1015,15 @@ impl Value {
             }
             Value::Counter64(v) => buf.push_integer64(*v),
             Value::NoSuchObject => {
-                buf.push_length(0);
+                buf.push_length(0)?;
                 buf.push_tag(tag::context::NO_SUCH_OBJECT);
             }
             Value::NoSuchInstance => {
-                buf.push_length(0);
+                buf.push_length(0)?;
                 buf.push_tag(tag::context::NO_SUCH_INSTANCE);
             }
             Value::EndOfMibView => {
-                buf.push_length(0);
+                buf.push_length(0)?;
                 buf.push_tag(tag::context::END_OF_MIB_VIEW);
             }
             Value::Unknown { .. } => {

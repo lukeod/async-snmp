@@ -218,15 +218,15 @@ impl UsmSecurityParams {
     /// Encode to an existing buffer after revalidating all invariants.
     pub fn encode_to_buf(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.validate_common()?;
-        buf.push_sequence(|buf| {
-            buf.push_octet_string(&self.priv_params);
-            buf.push_octet_string(&self.auth_params);
-            buf.push_octet_string(&self.username);
+        buf.try_push_sequence(|buf| {
+            buf.try_push_octet_string(&self.priv_params)?;
+            buf.try_push_octet_string(&self.auth_params)?;
+            buf.try_push_octet_string(&self.username)?;
             buf.push_unsigned32(crate::ber::tag::universal::INTEGER, self.engine_time);
             buf.push_unsigned32(crate::ber::tag::universal::INTEGER, self.engine_boots);
-            buf.push_octet_string(&self.engine_id);
-        });
-        Ok(())
+            buf.try_push_octet_string(&self.engine_id)?;
+            Ok(())
+        })
     }
 
     /// Decode from BER bytes.
@@ -343,7 +343,7 @@ mod tests {
 
     fn push_integer_content(buf: &mut EncodeBuf, content: &[u8]) {
         buf.push_bytes(content);
-        buf.push_length(content.len());
+        buf.push_length(content.len()).unwrap();
         buf.push_tag(crate::ber::tag::universal::INTEGER);
     }
 

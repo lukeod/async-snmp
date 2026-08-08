@@ -60,7 +60,9 @@ impl UsmStats {
 
     /// Increment the counter for `failure` and return the new value.
     fn count(&self, failure: UsmFailure) -> u32 {
-        self.counter(failure).fetch_add(1, Ordering::Relaxed) + 1
+        self.counter(failure)
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
     }
 }
 
@@ -428,6 +430,18 @@ pub(crate) fn process_v3_inbound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usm_report_counter_wraps_at_counter32_rollover() {
+        let stats = UsmStats::default();
+        stats
+            .unknown_engine_ids
+            .store(u32::MAX - 1, Ordering::Relaxed);
+
+        assert_eq!(stats.count(UsmFailure::UnknownEngineIds), u32::MAX);
+        assert_eq!(stats.count(UsmFailure::UnknownEngineIds), 0);
+        assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 0);
+    }
     use crate::message::{MsgFlags, MsgGlobalData, V3Message};
     use crate::pdu::{Pdu, PduType};
 

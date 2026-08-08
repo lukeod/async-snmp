@@ -159,6 +159,7 @@ impl<T: Transport> Client<T> {
 
         // Perform discovery with retry (same policy as normal requests)
         tracing::debug!(target: "async_snmp::client", "performing engine discovery");
+        let start = std::time::Instant::now();
 
         let max_attempts = if self.inner.transport.is_reliable() {
             0
@@ -166,7 +167,6 @@ impl<T: Transport> Client<T> {
             self.inner.config.retry.max_attempts()
         };
 
-        let mut last_error: Option<Box<Error>> = None;
         let mut engine_state_opt: Option<EngineState> = None;
 
         'discovery: for attempt in 0..=max_attempts {
@@ -207,7 +207,6 @@ impl<T: Transport> Client<T> {
                     break 'discovery;
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
-                    last_error = Some(e);
                     if attempt < max_attempts {
                         let delay = self.inner.config.retry.compute_delay(attempt);
                         if !delay.is_zero() {
@@ -222,14 +221,12 @@ impl<T: Transport> Client<T> {
         }
 
         let engine_state = engine_state_opt.ok_or_else(|| {
-            last_error.unwrap_or_else(|| {
-                Error::Timeout {
-                    target: self.peer_addr(),
-                    elapsed: std::time::Duration::ZERO,
-                    retries: max_attempts,
-                }
-                .boxed()
-            })
+            Error::Timeout {
+                target: self.peer_addr(),
+                elapsed: start.elapsed(),
+                retries: max_attempts,
+            }
+            .boxed()
         })?;
         tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size.as_usize() }, "discovered engine identity");
 
@@ -1518,6 +1515,7 @@ mod tests {
             ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
                 let peer = self.peer;
                 async move {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                     Err(Error::Timeout {
                         target: peer,
                         elapsed: Duration::from_secs(5),
@@ -1547,11 +1545,20 @@ mod tests {
         };
         let client = Client::new(transport, config).expect("valid client config");
 
-        let result = client.ensure_engine_discovered().await;
-        assert!(
-            matches!(*result.unwrap_err(), Error::Timeout { .. }),
-            "should return Timeout after all retries exhausted"
-        );
+        let error = client.ensure_engine_discovered().await.unwrap_err();
+        match *error {
+            Error::Timeout {
+                elapsed, retries, ..
+            } => {
+                assert_eq!(retries, 2);
+                assert!(elapsed >= Duration::from_millis(15));
+                assert!(
+                    elapsed < Duration::from_secs(5),
+                    "discovery must replace per-attempt timeout metadata with total elapsed time"
+                );
+            }
+            ref other => panic!("should return Timeout after all retries exhausted, got {other}"),
+        }
     }
 }
 

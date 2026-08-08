@@ -205,7 +205,7 @@ impl CommunityMessage {
 
         buf.try_push_sequence(|buf| {
             self.pdu.encode(buf, self.version)?;
-            buf.push_octet_string(&self.community);
+            buf.try_push_octet_string(&self.community)?;
             buf.push_integer(self.version.as_i32());
             Ok(())
         })?;

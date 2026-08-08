@@ -42,12 +42,18 @@ impl EncodeBuf {
     }
 
     /// Push a BER length encoding.
-    pub fn push_length(&mut self, len: usize) {
-        let (bytes, count) = encode_length(len);
-        // The encode_length returns bytes in reverse order for prepending
-        for byte in bytes.iter().take(count) {
-            self.buf.push(*byte);
-        }
+    ///
+    /// The buffer is not modified when `len` is outside the supported BER
+    /// length domain.
+    pub fn push_length(&mut self, len: usize) -> Result<()> {
+        let (bytes, count) = encode_length(len)?;
+        self.push_encoded_length(&bytes, count);
+        Ok(())
+    }
+
+    fn push_encoded_length(&mut self, bytes: &[u8; 5], count: usize) {
+        // `encode_length` returns bytes in reverse order for prepending.
+        self.buf.extend_from_slice(&bytes[..count]);
     }
 
     /// Push a BER tag.
@@ -77,7 +83,10 @@ impl EncodeBuf {
         let start_len = self.len();
         f(self);
         let content_len = self.len() - start_len;
-        self.push_length(content_len);
+        if let Err(error) = self.push_length(content_len) {
+            self.buf.truncate(start_len);
+            panic!("constructed BER content length is not representable: {error}");
+        }
         self.push_tag(tag);
     }
 
@@ -92,7 +101,10 @@ impl EncodeBuf {
             return Err(error);
         }
         let content_len = self.len() - start_len;
-        self.push_length(content_len);
+        if let Err(error) = self.push_length(content_len) {
+            self.buf.truncate(start_len);
+            return Err(error);
+        }
         self.push_tag(tag);
         Ok(())
     }
@@ -118,7 +130,8 @@ impl EncodeBuf {
         let (arr, len) = encode_integer_stack(value);
         // Valid bytes are at the end of the array
         self.push_bytes(&arr[4 - len..]);
-        self.push_length(len);
+        self.push_length(len)
+            .expect("i32 BER content length is representable");
         self.push_tag(tag::universal::INTEGER);
     }
 
@@ -127,7 +140,8 @@ impl EncodeBuf {
         let (arr, len) = encode_integer64_stack(value);
         // Valid bytes are at the end of the array
         self.push_bytes(&arr[9 - len..]);
-        self.push_length(len);
+        self.push_length(len)
+            .expect("u64 BER content length is representable");
         self.push_tag(tag::application::COUNTER64);
     }
 
@@ -136,20 +150,36 @@ impl EncodeBuf {
         let (arr, len) = encode_unsigned32_stack(value);
         // Valid bytes are at the end of the array
         self.push_bytes(&arr[5 - len..]);
-        self.push_length(len);
+        self.push_length(len)
+            .expect("u32 BER content length is representable");
         self.push_tag(tag);
     }
 
     /// Encode an OCTET STRING.
+    ///
+    /// This convenience method is intended for content whose length is known
+    /// to be representable. Fallible structured encoders should use
+    /// [`Self::try_push_octet_string`].
     pub fn push_octet_string(&mut self, data: &[u8]) {
+        self.try_push_octet_string(data)
+            .expect("OCTET STRING BER content length is representable");
+    }
+
+    /// Encode an OCTET STRING after checking its length.
+    ///
+    /// Length representability is checked before the buffer is modified.
+    pub fn try_push_octet_string(&mut self, data: &[u8]) -> Result<()> {
+        let (bytes, count) = encode_length(data.len())?;
         self.push_bytes(data);
-        self.push_length(data.len());
+        self.push_encoded_length(&bytes, count);
         self.push_tag(tag::universal::OCTET_STRING);
+        Ok(())
     }
 
     /// Encode a NULL.
     pub fn push_null(&mut self) {
-        self.push_length(0);
+        self.push_length(0)
+            .expect("zero BER content length is representable");
         self.push_tag(tag::universal::NULL);
     }
 
@@ -160,7 +190,7 @@ impl EncodeBuf {
         oid.validate_for_wire()?;
         let ber = oid.to_ber_smallvec();
         self.push_bytes(&ber);
-        self.push_length(ber.len());
+        self.push_length(ber.len())?;
         self.push_tag(tag::universal::OBJECT_IDENTIFIER);
         Ok(())
     }
@@ -168,7 +198,8 @@ impl EncodeBuf {
     /// Encode an IP address.
     pub fn push_ip_address(&mut self, addr: [u8; 4]) {
         self.push_bytes(&addr);
-        self.push_length(4);
+        self.push_length(4)
+            .expect("IPv4 BER content length is representable");
         self.push_tag(tag::application::IP_ADDRESS);
     }
 
@@ -294,6 +325,17 @@ mod tests {
     fn encode_unsigned32(value: u32) -> Vec<u8> {
         let (arr, len) = encode_unsigned32_stack(value);
         arr[5 - len..].to_vec()
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_length_does_not_modify_buffer() {
+        let mut buf = EncodeBuf::new();
+        buf.push_byte(0xaa);
+        let before = buf.len();
+
+        assert!(buf.push_length(u32::MAX as usize + 1).is_err());
+        assert_eq!(buf.len(), before);
     }
 
     #[test]

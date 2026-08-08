@@ -3,6 +3,7 @@
 //! This module provides configurable retry strategies including fixed delay
 //! and exponential backoff with jitter.
 
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -176,7 +177,9 @@ impl Retry {
                 // beyond the representable range, so preserve the existing
                 // saturating backoff behavior at the conversion boundary.
                 let factor = jitter_factor(*jitter);
-                Duration::try_from_secs_f64(capped.as_secs_f64() * factor).unwrap_or(Duration::MAX)
+                Duration::try_from_secs_f64(capped.as_secs_f64() * factor)
+                    .unwrap_or(Duration::MAX)
+                    .min(*max)
             }
         }
     }
@@ -258,28 +261,37 @@ impl Retry {
     }
 }
 
-/// Global counter for jitter generation.
-static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Global jitter sequence, initialized once per process from the OS random source.
+static JITTER_COUNTER: LazyLock<AtomicU64> = LazyLock::new(|| {
+    let mut seed = [0_u8; 8];
+    getrandom::fill(&mut seed).expect("getrandom failed");
+    AtomicU64::new(u64::from_ne_bytes(seed))
+});
 
 /// Compute a jitter factor in the range [1-jitter, 1+jitter].
 ///
 /// Uses a multiplicative hash of an atomic counter to generate pseudo-random
 /// values. This is sufficient for retry desynchronization without requiring
 /// true randomness.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "u64->f64 cast is intentional part of hash-like algorithm"
-)]
 fn jitter_factor(jitter: f64) -> f64 {
     if jitter <= 0.0 {
         return 1.0;
     }
-    // Multiplicative hash of counter (Knuth's method)
     let counter = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let hash = counter.wrapping_mul(0x5851_f42d_4c95_7f2d);
-    // Convert to [0, 1) range using upper bits (better distribution)
+    jitter_factor_from_seed(jitter, counter)
+}
+
+/// Deterministic mixer boundary used by production with a process-random seed
+/// and by tests with an injected seed.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "u64->f64 cast is intentional part of hash-like algorithm"
+)]
+fn jitter_factor_from_seed(jitter: f64, seed: u64) -> f64 {
+    // Multiplicative hash of the seeded counter (Knuth's method).
+    let hash = seed.wrapping_mul(0x5851_f42d_4c95_7f2d);
+    // Convert to [0, 1) range using upper bits (better distribution).
     let random = (hash >> 11) as f64 / ((1u64 << 53) as f64);
-    // Return factor in [1-jitter, 1+jitter]
     1.0 + (random - 0.5) * 2.0 * jitter
 }
 
@@ -408,6 +420,36 @@ mod tests {
             let millis = delay.as_millis();
             assert!((75..=125).contains(&millis), "delay was {millis}ms");
         }
+    }
+
+    #[test]
+    fn test_compute_delay_jitter_respects_maximum_cap() {
+        let max = Duration::from_millis(500);
+        let retry = Retry::exponential(10)
+            .initial_delay(max)
+            .max_delay(max)
+            .jitter(1.0)
+            .build()
+            .unwrap();
+
+        for _ in 0..128 {
+            assert!(retry.compute_delay(u32::MAX) <= max);
+        }
+    }
+
+    #[test]
+    fn test_jitter_sequence_initializes() {
+        let counter = LazyLock::force(&JITTER_COUNTER);
+        let _ = counter.load(Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_injected_jitter_seed_is_deterministic() {
+        let seed = 0x0123_4567_89ab_cdef;
+        assert_eq!(
+            jitter_factor_from_seed(0.5, seed).to_bits(),
+            jitter_factor_from_seed(0.5, seed).to_bits()
+        );
     }
 
     #[test]

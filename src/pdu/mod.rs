@@ -1094,7 +1094,7 @@ impl TrapV1Pdu {
             // NetworkAddress is APPLICATION 0 IMPLICIT IpAddress
             // IpAddress is APPLICATION 0 IMPLICIT OCTET STRING (SIZE (4))
             buf.push_bytes(&self.agent_addr);
-            buf.push_length(4);
+            buf.push_length(4)?;
             buf.push_tag(tag::application::IP_ADDRESS);
             buf.push_oid(&self.enterprise)
         })

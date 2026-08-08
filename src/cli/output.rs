@@ -43,7 +43,7 @@ impl std::fmt::Display for OperationType {
 /// Security info for verbose output.
 #[derive(Debug, Clone)]
 pub enum SecurityInfo {
-    Community(String),
+    Community,
     V3 {
         username: String,
         auth_protocol: Option<String>,
@@ -64,52 +64,56 @@ pub struct RequestInfo<'a> {
 /// Write verbose request header to stderr.
 pub fn write_verbose_request(info: &RequestInfo) {
     let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "--- Request ---");
-    let _ = writeln!(stderr, "Target:    {}", info.target);
-    let _ = writeln!(stderr, "Version:   {:?}", info.version);
+    write_verbose_request_to(&mut stderr, info);
+}
+
+fn write_verbose_request_to(mut output: impl Write, info: &RequestInfo) {
+    let _ = writeln!(output, "--- Request ---");
+    let _ = writeln!(output, "Target:    {}", info.target);
+    let _ = writeln!(output, "Version:   {:?}", info.version);
 
     match &info.security {
-        SecurityInfo::Community(c) => {
-            let _ = writeln!(stderr, "Community: {}", c);
+        SecurityInfo::Community => {
+            let _ = writeln!(output, "Community: [REDACTED]");
         }
         SecurityInfo::V3 {
             username,
             auth_protocol,
             priv_protocol,
         } => {
-            let _ = writeln!(stderr, "Username:  {}", username);
+            let _ = writeln!(output, "Username:  {}", username);
             if let Some(auth) = auth_protocol {
-                let _ = writeln!(stderr, "Auth:      {}", auth);
+                let _ = writeln!(output, "Auth:      {}", auth);
             }
             if let Some(priv_p) = priv_protocol {
-                let _ = writeln!(stderr, "Privacy:   {}", priv_p);
+                let _ = writeln!(output, "Privacy:   {}", priv_p);
             }
         }
     }
 
-    let _ = writeln!(stderr, "Operation: {}", info.operation);
+    let _ = writeln!(output, "Operation: {}", info.operation);
 
     if let OperationType::GetBulk {
         non_repeaters,
         max_repetitions,
     } = info.operation
     {
-        let _ = writeln!(stderr, "  Non-repeaters:    {}", non_repeaters);
-        let _ = writeln!(stderr, "  Max-repetitions:  {}", max_repetitions);
+        let _ = writeln!(output, "  Non-repeaters:    {}", non_repeaters);
+        let _ = writeln!(output, "  Max-repetitions:  {}", max_repetitions);
     } else if let OperationType::BulkWalk { max_repetitions } = info.operation {
-        let _ = writeln!(stderr, "  Max-repetitions:  {}", max_repetitions);
+        let _ = writeln!(output, "  Max-repetitions:  {}", max_repetitions);
     }
 
-    let _ = writeln!(stderr, "OIDs:      {} total", info.oids.len());
+    let _ = writeln!(output, "OIDs:      {} total", info.oids.len());
     for oid in &info.oids {
         let hint = hints::lookup(oid);
         if let Some(h) = hint {
-            let _ = writeln!(stderr, "  {} ({})", oid, h);
+            let _ = writeln!(output, "  {} ({})", oid, h);
         } else {
-            let _ = writeln!(stderr, "  {}", oid);
+            let _ = writeln!(output, "  {}", oid);
         }
     }
-    let _ = writeln!(stderr);
+    let _ = writeln!(output);
 }
 
 /// Write verbose response summary to stderr.
@@ -602,9 +606,7 @@ fn format_timeticks(centiseconds: u32) -> String {
 /// Build display security data from a constructed authentication configuration.
 pub fn build_security_info(auth: &Auth) -> SecurityInfo {
     match auth {
-        Auth::Community { community, .. } => {
-            SecurityInfo::Community(String::from_utf8_lossy(community).into_owned())
-        }
+        Auth::Community { .. } => SecurityInfo::Community,
         Auth::Usm(config) => SecurityInfo::V3 {
             username: String::from_utf8_lossy(config.username()).into_owned(),
             auth_protocol: config.auth_protocol().map(|protocol| protocol.to_string()),
@@ -628,7 +630,7 @@ mod tests {
         assert_eq!(community.version(), Version::V1);
         assert!(matches!(
             build_security_info(&community),
-            SecurityInfo::Community(value) if value == "private"
+            SecurityInfo::Community
         ));
 
         let usm: Auth = crate::Auth::usm("operator")
@@ -643,6 +645,28 @@ mod tests {
                 priv_protocol: None,
             } if username == "operator" && protocol == "SHA-256"
         ));
+    }
+
+    #[test]
+    fn community_is_redacted_from_verbose_and_debug_output() {
+        let secret = "private-community";
+        let auth = Auth::v2c(secret);
+        let info = RequestInfo {
+            target: "127.0.0.1:161",
+            version: auth.version(),
+            security: build_security_info(&auth),
+            operation: OperationType::Get,
+            oids: vec![Oid::from_slice(&[1, 3, 6, 1])],
+        };
+        let mut output = Vec::new();
+
+        write_verbose_request_to(&mut output, &info);
+        let verbose = String::from_utf8(output).unwrap();
+        let debug = format!("{info:?}");
+
+        assert!(verbose.contains("Community: [REDACTED]"));
+        assert!(!verbose.contains(secret));
+        assert!(!debug.contains(secret));
     }
 
     #[test]
