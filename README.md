@@ -456,7 +456,8 @@ Available targets:
 
 The exact published 0.17.0 API is on
 [docs.rs](https://docs.rs/async-snmp/0.17.0/async_snmp/). For the main/next API,
-build this checkout with `cargo doc --all-features --open`.
+build this checkout with
+`cargo doc --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --open`.
 
 ## Feature Flags
 
