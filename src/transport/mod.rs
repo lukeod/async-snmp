@@ -4,6 +4,7 @@
 //!
 //! - [`UdpTransport`] + [`UdpHandle`] - UDP socket with per-target handles
 //! - [`TcpTransport`] - TCP stream with BER framing
+//! - [`BuiltinTransport`] - runtime selection between library-maintained transports
 //!
 //! # Choosing a Transport
 //!
@@ -12,11 +13,14 @@
 //! | Single target or few targets | [`Client::builder().connect()`](crate::Client::builder) - each client gets its own socket |
 //! | Many targets from one process | Share a [`UdpTransport`] via [`build_with()`](crate::ClientBuilder::build_with) - one socket, one recv loop |
 //! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::ClientBuilder::connect_tcp) |
+//! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then call [`build_with_transport()`](crate::ClientBuilder::build_with_transport) |
 
+mod builtin;
 mod tcp;
 mod udp;
 mod udp_core;
 
+pub use builtin::*;
 pub use tcp::*;
 pub use udp::*;
 

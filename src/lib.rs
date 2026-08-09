@@ -590,8 +590,8 @@ pub use notification::{
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
 pub use transport::{
-    Candidate, CommunityResponsePolicy, RequestRegistration, ResponseIdentity, TcpTransport,
-    Transport, UdpControl, UdpHandle, UdpStats, UdpTransport,
+    BuiltinTransport, Candidate, CommunityResponsePolicy, RequestRegistration, ResponseIdentity,
+    TcpTransport, Transport, UdpControl, UdpHandle, UdpStats, UdpTransport,
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, EngineCache, ParseProtocolError,
@@ -610,3 +610,9 @@ pub type UdpClient = Client<UdpHandle>;
 
 /// Type alias for a client using a TCP connection.
 pub type TcpClient = Client<TcpTransport>;
+
+/// Type alias for a client whose built-in transport is selected at runtime.
+///
+/// Configure a [`UdpHandle`] or [`TcpTransport`] before converting it to
+/// [`BuiltinTransport`] and passing it to [`ClientBuilder::build_with_transport`].
+pub type RuntimeClient = Client<BuiltinTransport>;
