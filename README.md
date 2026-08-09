@@ -437,23 +437,34 @@ build this checkout with `cargo doc --all-features --open`.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `agent` | Yes | SNMP agent support (includes `quinn-udp`) |
+| `agent` | No | SNMP agent support (includes `quinn-udp`) |
 | `crypto-rustcrypto` | Yes | RustCrypto-based crypto backend (all auth/priv protocols) |
 | `crypto-fips` | No | FIPS 140-3 crypto via aws-lc-rs (rejects MD5, DES, 3DES) |
 | `rt-multi-thread` | No | Multi-threaded tokio runtime |
 | `cli` | No | CLI utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`) |
 | `mib` | No | MIB integration via [mib-rs](https://github.com/lukeod/mib-rs) (OID name resolution, value formatting) |
 
-SNMPv3 protocol and USM support are always available; cryptographic backends
-are optional and additive. The backend features can be enabled together. To use only the FIPS backend:
+Client, protocol, transport, notification, and noAuthNoPriv APIs are always
+available. The `agent` and crypto-provider features are independent and
+additive; enabling the agent does not select a crypto provider. Supported core
+combinations are:
 
-```bash
-cargo add async-snmp --no-default-features --features agent,crypto-fips
-```
+| Configuration | Cargo selection |
+|---------------|-----------------|
+| Default client with RustCrypto | default features |
+| Client without a crypto provider | `--no-default-features` |
+| Agent without a crypto provider | `--no-default-features --features agent` |
+| RustCrypto-only client | `--no-default-features --features crypto-rustcrypto` |
+| FIPS-only client | `--no-default-features --features crypto-fips` |
+| Client with both providers | `--no-default-features --features crypto-rustcrypto,crypto-fips` |
+| Agent with either or both providers | add `agent` to the corresponding provider selection |
+| Every optional component | `--all-features` |
 
-When both are compiled, select FIPS explicitly on the shared USM configuration
-with `.with_crypto_backend(CryptoBackend::AwsLcFips)`. Enabling the Cargo feature
-alone is not a runtime FIPS-compliance selection.
+Backend-free builds support SNMPv1/v2c and SNMPv3 noAuthNoPriv operation. When
+both providers are compiled, RustCrypto remains the operational default. Select
+FIPS explicitly on the shared USM configuration with
+`.with_crypto_backend(CryptoBackend::AwsLcFips)`. Enabling `crypto-fips` alone
+does not establish runtime or deployment FIPS compliance.
 
 ## Minimum Supported Rust Version
 

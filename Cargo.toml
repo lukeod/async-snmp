@@ -88,7 +88,7 @@ name = "transport_comparison"
 harness = false
 
 [features]
-default = ["agent", "crypto-rustcrypto"]
+default = ["crypto-rustcrypto"]
 agent = ["dep:quinn-udp"]  # SNMP agent
 crypto-rustcrypto = [
     "dep:aes", "dep:cbc", "dep:cfb-mode", "dep:des",
@@ -120,7 +120,7 @@ required-features = ["agent", "crypto-rustcrypto"]
 
 [[example]]
 name = "notification_receiver"
-required-features = ["agent", "crypto-rustcrypto"]
+required-features = ["crypto-rustcrypto"]
 
 [[example]]
 name = "shared_transport"

@@ -507,16 +507,19 @@
 //!
 //! ## Cargo Features
 //!
-//! - `agent` - SNMP agent (enabled by default)
-//! - `crypto-rustcrypto` - RustCrypto backend (enabled by default). Supports all auth and privacy protocols.
+//! - `agent` - SNMP agent (not enabled by default)
+//! - `crypto-rustcrypto` - RustCrypto backend (the only default feature). Supports all auth and privacy protocols.
 //! - `crypto-fips` - FIPS backend via aws-lc-rs. Rejects MD5, DES, and 3DES.
 //! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
 //! - `mib` - MIB integration via mib-rs (OID conversions, value formatting helpers)
 //! - `rt-multi-thread` - Multi-threaded tokio runtime
 //!
-//! Crypto backend features are additive. Each USM configuration selects one
-//! available backend with [`CryptoBackend`]. When both are compiled,
-//! RustCrypto remains the default; FIPS operation must be selected explicitly.
+//! Client, protocol, transport, notification, and noAuthNoPriv APIs are always
+//! available. The agent and crypto backend features are independent and
+//! additive. Backend-free builds support SNMPv1/v2c and SNMPv3 noAuthNoPriv.
+//! Each USM configuration selects one available backend with [`CryptoBackend`].
+//! When both providers are compiled, RustCrypto remains the default; FIPS
+//! operation must be selected explicitly.
 
 #[cfg(feature = "agent")]
 pub mod agent;
