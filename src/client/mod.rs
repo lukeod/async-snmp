@@ -2,6 +2,7 @@
 
 mod auth;
 mod builder;
+mod chunks;
 mod response_shape;
 mod retry;
 mod v3;
@@ -9,6 +10,7 @@ mod walk;
 
 pub use auth::{Auth, CommunityVersion};
 pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target};
+pub use chunks::{FixedCardinalityChunk, FixedCardinalityChunkError, FixedCardinalityChunkStream};
 pub use response_shape::{
     FixedCardinalityOperation, FixedCardinalityResponse, ResponseShapeAnomaly, ResponseShapePolicy,
 };
@@ -66,7 +68,9 @@ impl Client<UdpHandle> {
         self.inner.transport.stats()
     }
 }
-use crate::error::{Error, ErrorStatus, Result};
+#[cfg(test)]
+use crate::error::ErrorStatus;
+use crate::error::{Error, Result};
 use crate::message::{CommunityMessage, Message, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
@@ -77,7 +81,6 @@ use crate::varbind::VarBind;
 use crate::version::Version;
 use response_shape::{RequestShape, classify};
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -597,7 +600,9 @@ impl<T: Transport> Client<T> {
     /// If the OID list exceeds `max_oids_per_request`, the request is
     /// automatically split into multiple batches. Response bindings are retained
     /// in received batch order; consult `anomalies` before assuming positional
-    /// correspondence with the input OIDs.
+    /// correspondence with the input OIDs. If any batch fails, this aggregate
+    /// convenience method returns the error without returning earlier results;
+    /// use [`get_many_chunks()`](Self::get_many_chunks) to retain partial work.
     ///
     /// # Example
     ///
@@ -615,8 +620,28 @@ impl<T: Transport> Client<T> {
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
     pub async fn get_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse> {
-        self.get_or_getnext_many(oids, FixedCardinalityOperation::Get, Pdu::get_request)
-            .await
+        self.get_many_chunks(oids)?.collect_response().await
+    }
+
+    /// Lazily GET multiple OIDs as sequential wire-level response chunks.
+    ///
+    /// All OIDs are validated when this method is called. No request is sent
+    /// until the returned stream is polled, and after each item the next request
+    /// waits for another poll. An agent `tooBig` response bisects that request
+    /// range and exposes successful child leaves independently.
+    ///
+    /// The stream emits one [`FixedCardinalityChunkError`] for a terminal
+    /// failure, then remains fused. Dropping a chunk stream while a TCP request
+    /// is in flight follows [`TcpTransport`](crate::TcpTransport)'s cancellation
+    /// contract: cancellation after acquiring the connection lock poisons that
+    /// connection, and later operations fail with [`Error::Closed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOid`] before any I/O if any input OID cannot be
+    /// represented on the wire.
+    pub fn get_many_chunks(&self, oids: &[Oid]) -> Result<FixedCardinalityChunkStream<'_, T>> {
+        FixedCardinalityChunkStream::new(self, oids, FixedCardinalityOperation::Get)
     }
 
     /// GETNEXT for a single OID.
@@ -638,7 +663,10 @@ impl<T: Transport> Client<T> {
     /// If the OID list exceeds `max_oids_per_request`, the request is
     /// automatically split into multiple batches. Response bindings are retained
     /// in received batch order; consult `anomalies` before assuming positional
-    /// correspondence with the input OIDs.
+    /// correspondence with the input OIDs. If any batch fails, this aggregate
+    /// convenience method returns the error without returning earlier results;
+    /// use [`get_next_many_chunks()`](Self::get_next_many_chunks) to retain
+    /// partial work.
     ///
     /// # Example
     ///
@@ -655,109 +683,15 @@ impl<T: Transport> Client<T> {
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
     pub async fn get_next_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse> {
-        self.get_or_getnext_many(
-            oids,
-            FixedCardinalityOperation::GetNext,
-            Pdu::get_next_request,
-        )
-        .await
+        self.get_next_many_chunks(oids)?.collect_response().await
     }
 
-    /// Shared implementation for GET-many and GETNEXT-many.
-    async fn get_or_getnext_many(
-        &self,
-        oids: &[Oid],
-        operation: FixedCardinalityOperation,
-        op: fn(i32, &[Oid]) -> Pdu,
-    ) -> Result<FixedCardinalityResponse> {
-        if oids.is_empty() {
-            return Ok(FixedCardinalityResponse::empty(operation));
-        }
-
-        let max_per_request = self.inner.config.max_oids_per_request;
-        let mut outcome = FixedCardinalityResponse::empty(operation);
-        let mut request_offset = 0;
-
-        for chunk in oids.chunks(max_per_request) {
-            self.send_batch_with_bisect(chunk, request_offset, operation, op, &mut outcome)
-                .await?;
-            request_offset += chunk.len();
-        }
-
-        Ok(outcome)
-    }
-
-    /// Send a batch of OIDs, automatically bisecting on tooBig errors.
-    fn send_batch_with_bisect<'a>(
-        &'a self,
-        oids: &'a [Oid],
-        request_offset: usize,
-        operation: FixedCardinalityOperation,
-        op: fn(i32, &[Oid]) -> Pdu,
-        outcome: &'a mut FixedCardinalityResponse,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let request_id = self.next_request_id();
-            let pdu = op(request_id, oids);
-            match self.send_request(pdu).await {
-                Ok(response) => {
-                    let response_offset = outcome.varbinds.len();
-                    let request = match operation {
-                        FixedCardinalityOperation::Get => RequestShape::Get(oids),
-                        FixedCardinalityOperation::GetNext => RequestShape::GetNext(oids),
-                        FixedCardinalityOperation::Set => unreachable!("SET is never batched"),
-                    };
-                    let batch =
-                        classify(request, response.varbinds, request_offset, response_offset);
-                    if self.inner.config.response_shape_policy == ResponseShapePolicy::Strict
-                        && !batch.anomalies.is_empty()
-                    {
-                        let mut strict_response = outcome.clone();
-                        strict_response.varbinds.extend(batch.varbinds);
-                        strict_response.anomalies.extend(batch.anomalies);
-                        return Err(Error::ResponseShape {
-                            target: self.peer_addr(),
-                            response: strict_response,
-                        }
-                        .boxed());
-                    }
-                    outcome.varbinds.extend(batch.varbinds);
-                    outcome.anomalies.extend(batch.anomalies);
-                    Ok(())
-                }
-                Err(e)
-                    if oids.len() > 1
-                        && matches!(
-                            &*e,
-                            Error::Snmp {
-                                status: ErrorStatus::TooBig,
-                                ..
-                            }
-                        ) =>
-                {
-                    let mid = oids.len() / 2;
-                    tracing::debug!(target: "async_snmp::client", { peer = %self.peer_addr(), snmp.batch_size = oids.len(), snmp.split_at = mid }, "tooBig response, bisecting batch");
-                    self.send_batch_with_bisect(
-                        &oids[..mid],
-                        request_offset,
-                        operation,
-                        op,
-                        outcome,
-                    )
-                    .await?;
-                    self.send_batch_with_bisect(
-                        &oids[mid..],
-                        request_offset + mid,
-                        operation,
-                        op,
-                        outcome,
-                    )
-                    .await?;
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        })
+    /// Lazily GETNEXT multiple OIDs as sequential wire-level response chunks.
+    ///
+    /// This has the same validation, backpressure, bisection, terminal-error,
+    /// and TCP cancellation behavior as [`get_many_chunks()`](Self::get_many_chunks).
+    pub fn get_next_many_chunks(&self, oids: &[Oid]) -> Result<FixedCardinalityChunkStream<'_, T>> {
+        FixedCardinalityChunkStream::new(self, oids, FixedCardinalityOperation::GetNext)
     }
 
     /// SET a single OID.

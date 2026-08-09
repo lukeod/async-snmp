@@ -566,7 +566,8 @@ pub use agent::{
 pub use client::{
     Auth, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_REQUEST_TIMEOUT, FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering,
+    DEFAULT_REQUEST_TIMEOUT, FixedCardinalityChunk, FixedCardinalityChunkError,
+    FixedCardinalityChunkStream, FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering,
     ResponseShapeAnomaly, ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk,
     WalkMode, WalkStream,
 };
