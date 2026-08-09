@@ -36,7 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 mib-rs = { version = "0.8", optional = true, default-features = false }
 
 # V3 crypto dependencies (FIPS backend)
-aws-lc-rs = { version = "1", optional = true, features = ["fips"] }
+aws-lc-rs = { version = "1", optional = true, default-features = false, features = ["fips"] }
 
 # V3 crypto dependencies
 getrandom = "0.4"
