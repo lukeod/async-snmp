@@ -63,8 +63,8 @@
 //! Bind to `0.0.0.0:0` for IPv4-only targets, `[::]:0` for IPv6-only targets,
 //! or `[::]:0` for mixed IPv4/IPv6 targets. When an IPv6 transport is given an
 //! IPv4 target, the address is automatically mapped to an IPv4-mapped IPv6
-//! address (`::ffff:x.x.x.x`), ensuring cross-platform compatibility with
-//! macOS and BSD (which default to `IPV6_V6ONLY=true`).
+//! address (`::ffff:x.x.x.x`). An IPv4 transport accepts IPv4 and mapped IPv6
+//! targets, but rejects native IPv6 targets during handle construction.
 
 pub use super::udp_core::TransportStats;
 use super::udp_core::UdpCore;
@@ -73,7 +73,7 @@ use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
 use crate::util::bind_udp_socket;
 use bytes::Bytes;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -162,28 +162,49 @@ impl UdpTransport {
     /// When the transport is bound to an IPv6 socket and the target is IPv4,
     /// the target is automatically mapped to an IPv4-mapped IPv6 address
     /// (`::ffff:x.x.x.x`) for cross-platform dual-stack compatibility.
-    #[must_use]
-    pub fn handle(&self, target: SocketAddr) -> UdpHandle {
-        let target = self.map_to_socket_family(target);
-        UdpHandle {
+    /// IPv4-mapped IPv6 targets are converted back to IPv4 for IPv4 sockets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when an IPv4 socket is paired with a native
+    /// IPv6 target, because that target cannot be represented by the socket.
+    pub fn handle(&self, target: SocketAddr) -> Result<UdpHandle> {
+        let target = self.map_to_socket_family(target)?;
+        Ok(UdpHandle {
             inner: self.inner.clone(),
             target,
             strict_source: false,
-        }
+        })
     }
 
     /// Map a target address to match this transport's socket family.
     ///
     /// Converts IPv4 targets to IPv4-mapped IPv6 addresses when the socket
     /// is IPv6, enabling dual-stack usage on platforms where the kernel does
-    /// not perform this mapping implicitly (macOS, BSD).
-    fn map_to_socket_family(&self, target: SocketAddr) -> SocketAddr {
-        if let SocketAddr::V4(v4) = target
-            && self.inner.local_addr.is_ipv6()
-        {
-            return SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port());
+    /// not perform this mapping implicitly (macOS, BSD). For an IPv4 socket,
+    /// mapped IPv6 targets are normalized to IPv4 and native IPv6 targets are
+    /// rejected before any I/O.
+    fn map_to_socket_family(&self, target: SocketAddr) -> Result<SocketAddr> {
+        match (self.inner.local_addr, target) {
+            (SocketAddr::V6(_), SocketAddr::V4(target)) => Ok(SocketAddr::new(
+                IpAddr::V6(target.ip().to_ipv6_mapped()),
+                target.port(),
+            )),
+            (SocketAddr::V4(_), SocketAddr::V6(target)) => {
+                let Some(ip) = target.ip().to_ipv4_mapped() else {
+                    return Err(Error::Config(
+                        format!(
+                            "UDP target {target} is incompatible with IPv4 socket {}",
+                            self.inner.local_addr
+                        )
+                        .into(),
+                    )
+                    .boxed());
+                };
+                Ok(SocketAddr::new(IpAddr::V4(ip), target.port()))
+            }
+            (_, target) => Ok(target),
         }
-        target
     }
 
     /// Get the local bind address.
@@ -604,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn ipv6_transport_maps_ipv4_target() {
         let transport = UdpTransport::bind("[::]:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap()).unwrap();
         let mapped: SocketAddr = "[::ffff:127.0.0.1]:161".parse().unwrap();
         assert_eq!(handle.peer_addr(), mapped);
     }
@@ -612,15 +633,36 @@ mod tests {
     #[tokio::test]
     async fn ipv4_transport_preserves_ipv4_target() {
         let transport = UdpTransport::bind("0.0.0.0:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap()).unwrap();
         let expected: SocketAddr = "127.0.0.1:161".parse().unwrap();
         assert_eq!(handle.peer_addr(), expected);
     }
 
     #[tokio::test]
+    async fn ipv4_transport_normalizes_mapped_ipv6_target() {
+        let transport = UdpTransport::bind("0.0.0.0:0").await.unwrap();
+        let handle = transport
+            .handle("[::ffff:127.0.0.1]:161".parse().unwrap())
+            .unwrap();
+        assert_eq!(handle.peer_addr(), "127.0.0.1:161".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ipv4_transport_rejects_native_ipv6_target() {
+        let transport = UdpTransport::bind("0.0.0.0:0").await.unwrap();
+        let error = transport
+            .handle("[::1]:161".parse().unwrap())
+            .err()
+            .expect("native IPv6 target must be rejected during handle construction");
+
+        assert!(matches!(*error, Error::Config(_)));
+        assert!(error.to_string().contains("incompatible with IPv4 socket"));
+    }
+
+    #[tokio::test]
     async fn ipv6_transport_preserves_ipv6_target() {
         let transport = UdpTransport::bind("[::]:0").await.unwrap();
-        let handle = transport.handle("[::1]:161".parse().unwrap());
+        let handle = transport.handle("[::1]:161".parse().unwrap()).unwrap();
         let expected: SocketAddr = "[::1]:161".parse().unwrap();
         assert_eq!(handle.peer_addr(), expected);
     }
@@ -628,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn max_message_size_default() {
         let transport = UdpTransport::bind("0.0.0.0:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap()).unwrap();
         // Default config is 1472
         assert_eq!(handle.receive_limits().advertised().as_usize(), 1472);
     }
@@ -640,7 +682,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let handle = transport.handle("127.0.0.1:161".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap()).unwrap();
         assert_eq!(handle.receive_limits().advertised().as_usize(), 8192);
     }
 
@@ -698,7 +740,7 @@ mod tests {
     async fn shutdown_wakes_pending_waiters() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         // Target port 9 (discard): no response will ever arrive.
-        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
         let waiter = tokio::spawn(async move {
             handle
                 .recv(RequestRegistration::v3(42, Duration::from_secs(30)))
@@ -723,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn recv_after_shutdown_without_slot_returns_closed() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
 
         transport.shutdown().await;
 
@@ -740,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn recv_zero_deadline_on_open_transport_returns_timeout() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
 
         let err = handle
             .recv(RequestRegistration::v3(42, Duration::ZERO))
@@ -759,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn send_failure_unregisters_pending_slot() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
 
         let request_id = 55;
         let registration =
@@ -793,7 +835,7 @@ mod tests {
         let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let handle = transport.handle(target);
+        let handle = transport.handle(target).unwrap();
         let _owner = register_v3(&handle, 60, Duration::from_secs(30));
 
         let error = handle
@@ -818,7 +860,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_unpolled_request_does_not_register() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
         let registration =
             RequestRegistration::v3(70, Duration::from_secs(300)).with_aliases([68, 69]);
 
@@ -833,7 +875,7 @@ mod tests {
         let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let handle = transport.handle(target);
+        let handle = transport.handle(target).unwrap();
         let mut datagram = [0u8; 16];
 
         for iteration in 0..20 {
@@ -891,7 +933,7 @@ mod tests {
         assert_ne!(target, mismatched);
 
         // Default config: warn_on_source_mismatch is true.
-        let handle = transport.handle(target);
+        let handle = transport.handle(target).unwrap();
         let registration = register_v3(&handle, 42, Duration::from_secs(5));
 
         let packet = response_packet(42);
@@ -925,7 +967,7 @@ mod tests {
         let mismatched: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         assert_ne!(target, mismatched);
 
-        let handle = transport.handle(target);
+        let handle = transport.handle(target).unwrap();
         let registration = register_v3(&handle, 7, Duration::from_secs(5));
 
         let packet = response_packet(7);
@@ -967,7 +1009,7 @@ mod tests {
     async fn second_deliver_after_recv_counts_unmatched() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
-        let handle = transport.handle(target);
+        let handle = transport.handle(target).unwrap();
         let registration = register_v3(&handle, 7, Duration::from_secs(5));
 
         let packet = response_packet(7);
@@ -1012,7 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_expired_counts_expired() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let handle = transport.handle("127.0.0.1:9".parse().unwrap());
+        let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
         let _registration = register_v3(&handle, 13, Duration::ZERO);
 
         transport.inner.core.cleanup_expired();
@@ -1026,7 +1068,7 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
         let mismatched: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let handle = transport.handle(target).strict_source(true);
+        let handle = transport.handle(target).unwrap().strict_source(true);
         let registration = register_v3(&handle, 21, Duration::from_secs(5));
 
         let packet = response_packet(21);
@@ -1056,7 +1098,7 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
-        let handle = transport.handle(target).strict_source(true);
+        let handle = transport.handle(target).unwrap().strict_source(true);
         let registration = register_v3(&handle, 22, Duration::from_secs(5));
 
         let packet = response_packet(22);
@@ -1079,7 +1121,7 @@ mod tests {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
 
-        let handle = transport.handle(target);
+        let handle = transport.handle(target).unwrap();
         let registration = register_v3(&handle, 99, Duration::from_secs(5));
 
         let packet = response_packet(99);

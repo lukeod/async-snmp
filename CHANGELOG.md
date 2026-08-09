@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `UdpTransport::handle` now returns `Result<UdpHandle>` and rejects
+  native IPv6 targets for IPv4 sockets during construction. IPv4-mapped targets
+  are normalized for IPv4 sockets, and `ClientBuilder::build_with` considers all
+  resolved addresses in order until one is compatible with the shared socket.
 - **Breaking:** Request and construction deadlines are now independent.
   `ClientBuilder::request_timeout`, `ClientConfig::request_timeout`, and
   `DEFAULT_REQUEST_TIMEOUT` replace the former timeout names. The builder-only

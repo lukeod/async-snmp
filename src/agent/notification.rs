@@ -134,7 +134,7 @@ impl TrapSink {
             "0.0.0.0:0"
         };
         let transport = UdpTransport::bind(bind_addr).await?;
-        let handle = transport.handle(self.dest);
+        let handle = transport.handle(self.dest)?;
         let client = Client::new(handle, config)?;
         *guard = Some((transport, client.clone()));
         Ok(client)

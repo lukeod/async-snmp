@@ -601,6 +601,27 @@ impl ClientBuilder {
             .await
     }
 
+    fn select_udp_handle(
+        transport: &UdpTransport,
+        target: &Target,
+        candidates: &[SocketAddr],
+    ) -> Result<UdpHandle> {
+        for candidate in candidates {
+            if let Ok(handle) = transport.handle(*candidate) {
+                return Ok(handle);
+            }
+        }
+
+        Err(Error::Config(
+            format!(
+                "no resolved address for '{target}' is compatible with UDP socket {}",
+                transport.local_addr()
+            )
+            .into(),
+        )
+        .boxed())
+    }
+
     /// Build `ClientConfig` from the builder settings.
     fn build_config(&self) -> ClientConfig {
         ClientConfig {
@@ -695,14 +716,20 @@ impl ClientBuilder {
         let transport = deadline
             .run(ConstructionStage::Bind, binder(bind_addr))
             .await?;
-        let handle = transport.handle(addr).strict_source(self.strict_source);
+        let handle = transport.handle(addr)?.strict_source(self.strict_source);
         self.build_inner(handle)
     }
 
     /// Build a client using a shared UDP transport.
     ///
-    /// Creates a handle for the builder's target address from the given transport.
-    /// All clients sharing a transport use one socket and one recv loop.
+    /// Resolves the builder's target and creates a handle for the first address
+    /// compatible with the given transport. All clients sharing a transport use
+    /// one socket and one recv loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when resolution produces no address compatible
+    /// with the transport's socket family.
     ///
     /// # Example
     ///
@@ -720,22 +747,32 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn build_with(mut self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
+    pub async fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
+        self.build_with_resolver(transport, |host, port| async move {
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map(|addresses| addresses.collect())
+                .map_err(|error| {
+                    Error::Config(format!("could not resolve address '{host}': {error}").into())
+                        .boxed()
+                })
+        })
+        .await
+    }
+
+    async fn build_with_resolver<R, RFut>(
+        mut self,
+        transport: &UdpTransport,
+        resolver: R,
+    ) -> Result<Client<UdpHandle>>
+    where
+        R: FnOnce(String, u16) -> RFut,
+        RFut: Future<Output = Result<Vec<SocketAddr>>>,
+    {
         self.validate_and_precompute()?;
         let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
-        let addresses = self
-            .resolve_targets_with(&deadline, |host, port| async move {
-                tokio::net::lookup_host((host.as_str(), port))
-                    .await
-                    .map(|addresses| addresses.collect())
-                    .map_err(|error| {
-                        Error::Config(format!("could not resolve address '{host}': {error}").into())
-                            .boxed()
-                    })
-            })
-            .await?;
-        let handle = transport
-            .handle(addresses[0])
+        let candidates = self.resolve_targets_with(&deadline, resolver).await?;
+        let handle = Self::select_udp_handle(transport, &self.target, &candidates)?
             .strict_source(self.strict_source);
         self.build_inner(handle)
     }
@@ -1437,6 +1474,58 @@ mod tests {
         let addr: SocketAddr = "[::1]:162".parse().unwrap();
         let t: Target = addr.into();
         assert_eq!(t.to_string(), "[::1]:162");
+    }
+
+    #[tokio::test]
+    async fn test_udp_candidate_selection_skips_incompatible_family() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::from("example.invalid");
+        let candidates = [
+            "[2001:db8::1]:161".parse().unwrap(),
+            "192.0.2.1:161".parse().unwrap(),
+        ];
+
+        let handle = ClientBuilder::select_udp_handle(&transport, &target, &candidates).unwrap();
+        assert_eq!(handle.peer_addr(), candidates[1]);
+    }
+
+    #[tokio::test]
+    async fn test_udp_candidate_selection_rejects_ipv6_only_for_ipv4_transport() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::from("example.invalid");
+        let candidates = [
+            "[2001:db8::1]:161".parse().unwrap(),
+            "[2001:db8::2]:161".parse().unwrap(),
+        ];
+
+        let error = ClientBuilder::select_udp_handle(&transport, &target, &candidates)
+            .err()
+            .expect("IPv6-only candidates must be rejected for an IPv4 transport");
+        assert!(matches!(*error, Error::Config(_)));
+        assert!(error.to_string().contains("no resolved address"));
+    }
+
+    #[tokio::test]
+    async fn test_udp_candidate_selection_normalizes_mapped_ipv6() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::from("example.invalid");
+        let candidates = ["[::ffff:192.0.2.1]:161".parse().unwrap()];
+
+        let handle = ClientBuilder::select_udp_handle(&transport, &target, &candidates).unwrap();
+        assert_eq!(handle.peer_addr(), "192.0.2.1:161".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_rejects_explicit_native_ipv6_for_ipv4_transport() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let error = ClientBuilder::new("[2001:db8::1]:161", Auth::v2c("public"))
+            .build_with(&transport)
+            .await
+            .err()
+            .expect("native IPv6 target must fail during client construction");
+
+        assert!(matches!(*error, Error::Config(_)));
+        assert!(error.to_string().contains("no resolved address"));
     }
 
     #[tokio::test]

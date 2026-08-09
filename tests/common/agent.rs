@@ -43,6 +43,12 @@ impl TestAgent {
         Self::with_data(fixtures::system_mib()).await
     }
 
+    /// Create an IPv6 loopback agent with default system MIB data.
+    pub async fn new_ipv6() -> Self {
+        let handler = Arc::new(TestHandler::new(fixtures::system_mib()));
+        Self::with_handler_at(handler, "[::1]:0").await
+    }
+
     /// Create an agent with custom initial data.
     pub async fn with_data(initial: BTreeMap<Oid, Value>) -> Self {
         let handler = Arc::new(TestHandler::new(initial));
@@ -51,10 +57,14 @@ impl TestAgent {
 
     /// Create an agent with a custom handler.
     pub async fn with_handler(handler: Arc<TestHandler>) -> Self {
+        Self::with_handler_at(handler, "127.0.0.1:0").await
+    }
+
+    async fn with_handler_at(handler: Arc<TestHandler>, bind_addr: &str) -> Self {
         let cancel = CancellationToken::new();
 
         let agent = Agent::builder()
-            .bind("127.0.0.1:0")
+            .bind(bind_addr)
             .community(b"public")
             .cancel(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())

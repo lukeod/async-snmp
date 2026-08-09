@@ -238,6 +238,24 @@ async fn getnext_past_end_returns_end_of_mib_view() {
     assert_eq!(result.varbinds[0].value, Value::EndOfMibView);
 }
 
+/// IPv6 shared transport can reach an IPv6 agent without address mapping.
+#[tokio::test]
+async fn ipv6_transport_reaches_ipv6_agent() {
+    let agent = TestAgent::new_ipv6().await;
+    assert!(agent.addr().is_ipv6(), "TestAgent should bind to IPv6");
+
+    let transport = UdpTransport::bind("[::]:0").await.unwrap();
+    let client = Client::builder(agent.addr(), Auth::v2c("public"))
+        .request_timeout(Duration::from_secs(2))
+        .build_with(&transport)
+        .await
+        .unwrap();
+
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert!(result.anomalies.is_empty());
+    assert_eq!(result.varbinds[0].value.as_str(), Some("Test SNMP Agent"));
+}
+
 /// IPv6 shared transport can reach an IPv4 agent via address mapping.
 #[tokio::test]
 async fn ipv6_transport_reaches_ipv4_agent() {

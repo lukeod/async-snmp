@@ -4,7 +4,7 @@ use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Error, Oid, RequestRegistration, Target,
-    WalkAbortReason,
+    UdpHandle, UdpTransport, WalkAbortReason,
 };
 #[cfg(feature = "agent")]
 use async_snmp::{GetNextResult, GetResult, Value, VarBind, oid};
@@ -49,13 +49,13 @@ fn bounded_walk_abort_reason_is_public_and_structured() {
     let reason = WalkAbortReason::ResultLimitExceeded { limit: 12 };
     assert_eq!(reason.to_string(), "result limit of 12 exceeded");
 
-    let error = async_snmp::Error::WalkAborted {
+    let error = Error::WalkAborted {
         target: "127.0.0.1:161".parse().unwrap(),
         reason,
     };
     assert!(matches!(
         error,
-        async_snmp::Error::WalkAborted {
+        Error::WalkAborted {
             reason: WalkAbortReason::ResultLimitExceeded { limit: 12 },
             ..
         }
@@ -76,6 +76,13 @@ fn request_registration_exposes_read_only_normalized_metadata() {
     assert_eq!(registration.request_id(), 42);
     assert_eq!(registration.timeout(), Duration::from_secs(3));
     assert_eq!(registration.aliases(), &[40, 41]);
+}
+
+#[tokio::test]
+async fn udp_handle_construction_is_publicly_fallible() {
+    let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let handle: async_snmp::Result<UdpHandle> = transport.handle("127.0.0.1:161".parse().unwrap());
+    assert!(handle.is_ok());
 }
 
 #[test]
