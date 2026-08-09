@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, ClientConfig, CommunityVersion, CompatibilityPolicy, Oid, RequestRegistration,
+    WalkAbortReason,
 };
 #[cfg(feature = "agent")]
 use async_snmp::{GetNextResult, GetResult, Value, VarBind, oid};
@@ -22,6 +23,24 @@ fn extensible_configs_support_default_plus_field_mutation() {
     let mut tcp = TcpOptions::default();
     tcp.max_message_size = 4096;
     assert_eq!(tcp.max_message_size, 4096);
+}
+
+#[test]
+fn bounded_walk_abort_reason_is_public_and_structured() {
+    let reason = WalkAbortReason::ResultLimitExceeded { limit: 12 };
+    assert_eq!(reason.to_string(), "result limit of 12 exceeded");
+
+    let error = async_snmp::Error::WalkAborted {
+        target: "127.0.0.1:161".parse().unwrap(),
+        reason,
+    };
+    assert!(matches!(
+        error,
+        async_snmp::Error::WalkAborted {
+            reason: WalkAbortReason::ResultLimitExceeded { limit: 12 },
+            ..
+        }
+    ));
 }
 
 #[test]

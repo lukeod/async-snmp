@@ -59,11 +59,17 @@ pub type Result<T> = std::result::Result<T, Box<Error>>;
 
 /// Reason a walk operation was aborted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum WalkAbortReason {
     /// Agent returned an OID that is not greater than the previous OID.
     NonIncreasing,
     /// Agent returned an OID that was already seen (cycle detected).
     Cycle,
+    /// A one-candidate look-ahead found more in-subtree data after the limit.
+    ResultLimitExceeded {
+        /// Configured maximum number of yielded bindings.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for WalkAbortReason {
@@ -71,6 +77,9 @@ impl std::fmt::Display for WalkAbortReason {
         match self {
             Self::NonIncreasing => write!(f, "non-increasing OID"),
             Self::Cycle => write!(f, "cycle detected"),
+            Self::ResultLimitExceeded { limit } => {
+                write!(f, "result limit of {limit} exceeded")
+            }
         }
     }
 }
@@ -171,7 +180,7 @@ pub enum Error {
         response: crate::client::FixedCardinalityResponse,
     },
 
-    /// Walk aborted due to agent misbehavior.
+    /// Walk aborted before observed natural completion.
     #[error("walk aborted for {target}: {reason}")]
     WalkAborted {
         target: SocketAddr,

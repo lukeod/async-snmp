@@ -1015,7 +1015,12 @@ impl<T: Transport> Client<T> {
     /// fallback; use [`get()`](Self::get) to retrieve a scalar value.
     ///
     /// Uses the client's configured `oid_ordering`, `max_walk_results`, and
-    /// `max_repetitions` (for GETBULK) settings.
+    /// `max_repetitions` (for GETBULK) settings. At a configured result limit,
+    /// the stream inspects one look-ahead candidate and may make one extra
+    /// request. Definite truncation is emitted as
+    /// [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded).
+    /// A walk is not an atomic MIB snapshot; values can change between the main
+    /// sequence and the look-ahead.
     ///
     /// # Example
     ///
@@ -1062,6 +1067,10 @@ impl<T: Transport> Client<T> {
     /// use [`get()`](Self::get) to retrieve a scalar value.
     ///
     /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
+    /// At a configured result limit, the stream sends GETNEXT for one look-ahead
+    /// candidate if needed. Definite truncation is emitted as
+    /// [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded).
+    /// A walk is not an atomic MIB snapshot; values can change before the probe.
     ///
     /// # Example
     ///
@@ -1093,6 +1102,11 @@ impl<T: Transport> Client<T> {
     /// as a fallback; use [`get()`](Self::get) to retrieve a scalar value.
     ///
     /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
+    /// At a configured result limit, the stream first inspects one buffered
+    /// binding, or sends GETBULK with `max_repetitions = 1` when none is buffered.
+    /// Definite truncation is emitted as
+    /// [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded).
+    /// A walk is not an atomic MIB snapshot; values can change before the probe.
     ///
     /// # Arguments
     ///

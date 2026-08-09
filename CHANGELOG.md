@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bounded walks now inspect exactly one look-ahead candidate after yielding the
+  configured limit. Definite truncation ends with
+  `WalkAbortReason::ResultLimitExceeded`; observed natural completion remains a
+  normal end-of-stream. GETNEXT probes stay GETNEXT, while GETBULK uses a
+  buffered binding or an additional request with `max_repetitions = 1`.
 - **Breaking:** The SNMPv3 wire enum is now `message::V3SecurityModel`, while
   `handler::SecurityModel` represents only concrete V1, V2c, and USM request
   identities. VACM wildcard selectors now use

@@ -384,8 +384,11 @@ impl ClientBuilder {
 
     /// Set maximum results from a single walk operation (default: unlimited).
     ///
-    /// Safety limit to prevent runaway walks. Walk terminates normally when
-    /// limit is reached.
+    /// Safety limit to prevent runaway walks. After yielding this many results,
+    /// the walk inspects exactly one additional candidate. Definite truncation
+    /// ends with [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded);
+    /// observed natural completion ends normally. The look-ahead can require one
+    /// extra request.
     ///
     /// # Example
     ///

@@ -236,6 +236,14 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
 }
 ```
 
+A configured `max_walk_results` limit uses exactly one look-ahead candidate to
+separate natural completion from definite truncation. The look-ahead may send
+one extra GETNEXT request, or one GETBULK request with `max_repetitions = 1` if
+no binding is already buffered. Definite truncation ends the stream with
+`WalkAbortReason::ResultLimitExceeded`; `collect()` therefore returns an error,
+while manual streaming retains bindings yielded before that error. A walk and
+its look-ahead observe a non-atomic MIB that can change between requests.
+
 ### Shared Transport
 
 For monitoring systems polling many targets, share a single UDP socket across all clients:

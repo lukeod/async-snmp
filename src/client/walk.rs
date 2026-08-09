@@ -18,6 +18,9 @@ macro_rules! impl_stream_helpers {
             }
 
             /// Collect all remaining varbinds from the walk stream.
+            ///
+            /// Definite result-limit truncation is returned as an error. Consume
+            /// the stream manually when partial bindings need to be retained.
             pub async fn collect(mut self) -> crate::error::Result<Vec<crate::varbind::VarBind>> {
                 let mut results = Vec::new();
                 while let Some(result) = self.next().await {
@@ -233,13 +236,7 @@ impl<T: Transport + 'static> Stream for Walk<T> {
             return Poll::Ready(None);
         }
 
-        // Check max_results limit
-        if let Some(max) = self.max_results
-            && self.count >= max
-        {
-            self.done = true;
-            return Poll::Ready(None);
-        }
+        let result_limit = self.max_results.filter(|limit| self.count >= *limit);
 
         // Check if we have a pending request
         if self.pending.is_none() {
@@ -259,6 +256,10 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                 self.pending = None;
 
                 match result {
+                    Ok(response) if result_limit.is_some() && response.varbinds.is_empty() => {
+                        self.done = true;
+                        Poll::Ready(None)
+                    }
                     Ok(response)
                         if response.anomalies.is_empty() && response.varbinds.len() == 1 =>
                     {
@@ -275,6 +276,15 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                                 return Poll::Ready(Some(Err(e)));
                             }
                             VarbindOutcome::Yield => {}
+                        }
+
+                        if let Some(limit) = result_limit {
+                            self.done = true;
+                            return Poll::Ready(Some(Err(Error::WalkAborted {
+                                target,
+                                reason: WalkAbortReason::ResultLimitExceeded { limit },
+                            }
+                            .boxed())));
                         }
 
                         // Update current OID for next iteration
@@ -370,15 +380,10 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                 return Poll::Ready(None);
             }
 
-            // Check max_results limit
-            if let Some(max) = self.max_results
-                && self.count >= max
-            {
-                self.done = true;
-                return Poll::Ready(None);
-            }
+            let result_limit = self.max_results.filter(|limit| self.count >= *limit);
 
-            // Check if we have buffered results to return
+            // Check if we have buffered results to return, including the single
+            // look-ahead candidate after the configured limit is yielded.
             if let Some(vb) = self.buffer.pop_front() {
                 let target = self.client.peer_addr();
                 let base_oid = self.base_oid.clone();
@@ -394,6 +399,15 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                     VarbindOutcome::Yield => {}
                 }
 
+                if let Some(limit) = result_limit {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(Error::WalkAborted {
+                        target,
+                        reason: WalkAbortReason::ResultLimitExceeded { limit },
+                    }
+                    .boxed())));
+                }
+
                 // Update current OID for next request
                 self.current_oid = vb.oid.clone();
                 self.count += 1;
@@ -405,7 +419,11 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
             if self.pending.is_none() {
                 let client = self.client.clone();
                 let oid = self.current_oid.clone();
-                let max_rep = self.max_repetitions;
+                let max_rep = if result_limit.is_some() {
+                    1
+                } else {
+                    self.max_repetitions
+                };
 
                 let fut = Box::pin(async move { client.get_bulk(&[oid], 0, max_rep).await });
                 self.pending = Some(fut);
@@ -433,7 +451,8 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                             // 4.2.3): halve max-repetitions down to a floor of 1
                             // and retry the same position. Only surface the error
                             // if it still fails at max-repetitions = 1.
-                            if self.max_repetitions > 1
+                            if result_limit.is_none()
+                                && self.max_repetitions > 1
                                 && matches!(
                                     &*e,
                                     Error::Snmp {
@@ -520,6 +539,9 @@ impl<T: Transport + 'static> WalkStream<T> {
     }
 
     /// Collect all remaining varbinds from the walk stream.
+    ///
+    /// Definite result-limit truncation is returned as an error. Consume the
+    /// stream manually when partial bindings need to be retained.
     pub async fn collect(mut self) -> Result<Vec<VarBind>> {
         let mut results = Vec::new();
         while let Some(result) = self.next().await {
@@ -1109,8 +1131,560 @@ mod tests {
         assert_requests(&requests, &[PduType::GetBulkRequest]);
     }
 
+    #[derive(Debug)]
+    enum WalkReply {
+        Response(Vec<VarBind>),
+        Status(ErrorStatus),
+        Timeout,
+        Closed,
+    }
+
+    type DetailedRequestLog = Arc<Mutex<Vec<(PduType, Option<u32>)>>>;
+
+    #[derive(Clone)]
+    struct ScriptedWalkTransport {
+        version: Version,
+        replies: Arc<Mutex<VecDeque<WalkReply>>>,
+        pending: Arc<Mutex<VecDeque<i32>>>,
+        requests: DetailedRequestLog,
+    }
+
+    impl ScriptedWalkTransport {
+        fn new(version: Version, replies: Vec<WalkReply>) -> (Self, DetailedRequestLog) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    version,
+                    replies: Arc::new(Mutex::new(replies.into())),
+                    pending: Arc::new(Mutex::new(VecDeque::new())),
+                    requests: requests.clone(),
+                },
+                requests,
+            )
+        }
+    }
+
+    impl Transport for ScriptedWalkTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let message = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let pdu = message.pdu().standard().unwrap();
+            let request = (
+                pdu.pdu_type(),
+                pdu.get_bulk_fields()
+                    .map(|(_, max_repetitions)| max_repetitions),
+            );
+            self.pending.lock().unwrap().push_back(pdu.request_id);
+            self.requests.lock().unwrap().push(request);
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _registration: crate::transport::RequestRegistration,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let request_id = self.pending.lock().unwrap().pop_front().unwrap();
+            let reply = self.replies.lock().unwrap().pop_front().unwrap();
+            let version = self.version;
+            let peer = target_addr();
+
+            async move {
+                match reply {
+                    WalkReply::Response(varbinds) => {
+                        let pdu = Pdu::response(request_id, 0, 0, varbinds);
+                        let message = match version {
+                            Version::V1 => CommunityMessage::v1(Bytes::from_static(b"public"), pdu),
+                            Version::V2c => {
+                                CommunityMessage::v2c(Bytes::from_static(b"public"), pdu)
+                            }
+                            Version::V3 => unreachable!("scripted walk uses community versions"),
+                        }
+                        .unwrap();
+                        Ok((message.encode().unwrap(), peer))
+                    }
+                    WalkReply::Status(status) => {
+                        let (error_index, varbinds) = if status == ErrorStatus::NoSuchName {
+                            (1, vec![VarBind::null(walk_base())])
+                        } else {
+                            (0, vec![])
+                        };
+                        let pdu = Pdu::response(request_id, status.as_i32(), error_index, varbinds);
+                        let message = match version {
+                            Version::V1 => CommunityMessage::v1(Bytes::from_static(b"public"), pdu),
+                            Version::V2c => {
+                                CommunityMessage::v2c(Bytes::from_static(b"public"), pdu)
+                            }
+                            Version::V3 => unreachable!("scripted walk uses community versions"),
+                        }
+                        .unwrap();
+                        Ok((message.encode().unwrap(), peer))
+                    }
+                    WalkReply::Timeout => Err(Error::Timeout {
+                        target: peer,
+                        elapsed: std::time::Duration::from_secs(3),
+                        retries: 2,
+                    }
+                    .boxed()),
+                    WalkReply::Closed => Err(Error::Closed { target: peer }.boxed()),
+                }
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            target_addr()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    fn scripted_walk_client(
+        version: Version,
+        max_walk_results: usize,
+        replies: Vec<WalkReply>,
+    ) -> (Client<ScriptedWalkTransport>, DetailedRequestLog) {
+        let (transport, requests) = ScriptedWalkTransport::new(version, replies);
+        let auth = match version {
+            Version::V1 => crate::Auth::v1("public"),
+            Version::V2c => crate::Auth::v2c("public"),
+            Version::V3 => unreachable!("scripted walk uses community versions"),
+        };
+        let config = ClientConfig {
+            auth,
+            retry: crate::client::retry::Retry::none(),
+            max_walk_results: Some(max_walk_results),
+            ..Default::default()
+        };
+        (
+            Client::new(transport, config).expect("valid client config"),
+            requests,
+        )
+    }
+
+    fn walk_base() -> Oid {
+        oid!(1, 3, 6, 1, 2, 1, 1)
+    }
+
+    fn walk_binding(index: u32) -> VarBind {
+        VarBind::new(walk_base().child(index), Value::Integer(index as i32))
+    }
+
+    fn out_of_subtree_binding() -> VarBind {
+        VarBind::new(oid!(1, 3, 6, 1, 2, 2, 1), Value::Integer(99))
+    }
+
+    fn assert_result_limit(error: &Error, expected_limit: usize) {
+        assert!(matches!(
+            error,
+            Error::WalkAborted {
+                reason: WalkAbortReason::ResultLimitExceeded { limit },
+                ..
+            } if *limit == expected_limit
+        ));
+    }
+
+    fn detailed_requests(requests: &DetailedRequestLog) -> Vec<(PduType, Option<u32>)> {
+        requests.lock().unwrap().clone()
+    }
+
     #[tokio::test]
-    async fn max_results_zero_is_empty_without_network_io() {
+    async fn getnext_zero_exact_and_plus_one_limit_semantics_are_truthful() {
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            0,
+            vec![WalkReply::Response(vec![walk_binding(1)])],
+        );
+        let mut walk = client.walk_getnext(walk_base());
+        let error = walk.next().await.unwrap().unwrap_err();
+        assert_result_limit(&error, 0);
+        assert!(walk.next().await.is_none());
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![(PduType::GetNextRequest, None)]
+        );
+
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            2,
+            vec![
+                WalkReply::Response(vec![walk_binding(1)]),
+                WalkReply::Response(vec![walk_binding(2)]),
+                WalkReply::Response(vec![out_of_subtree_binding()]),
+            ],
+        );
+        let results = client.walk_getnext(walk_base()).collect().await.unwrap();
+        assert_eq!(results, vec![walk_binding(1), walk_binding(2)]);
+        assert_eq!(detailed_requests(&requests).len(), 3);
+
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            2,
+            vec![
+                WalkReply::Response(vec![walk_binding(1)]),
+                WalkReply::Response(vec![walk_binding(2)]),
+                WalkReply::Response(vec![walk_binding(3)]),
+            ],
+        );
+        let mut walk = client.walk_getnext(walk_base());
+        assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(1));
+        assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(2));
+        let error = walk.next().await.unwrap().unwrap_err();
+        assert_result_limit(&error, 2);
+        assert!(walk.next().await.is_none());
+        assert_eq!(detailed_requests(&requests).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn getbulk_zero_exact_and_plus_one_use_buffered_probe_candidates() {
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            0,
+            vec![WalkReply::Response(vec![walk_binding(1)])],
+        );
+        let error = client
+            .bulk_walk(walk_base(), 9)
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_result_limit(&error, 0);
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![(PduType::GetBulkRequest, Some(1))]
+        );
+
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            2,
+            vec![WalkReply::Response(vec![
+                walk_binding(1),
+                walk_binding(2),
+                out_of_subtree_binding(),
+            ])],
+        );
+        let results = client
+            .bulk_walk(walk_base(), 9)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(results, vec![walk_binding(1), walk_binding(2)]);
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![(PduType::GetBulkRequest, Some(9))]
+        );
+
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            2,
+            vec![WalkReply::Response(vec![
+                walk_binding(1),
+                walk_binding(2),
+                walk_binding(3),
+                walk_binding(4),
+            ])],
+        );
+        let mut walk = client.bulk_walk(walk_base(), 9).unwrap();
+        assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(1));
+        assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(2));
+        let error = walk.next().await.unwrap().unwrap_err();
+        assert_result_limit(&error, 2);
+        assert!(walk.next().await.is_none());
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![(PduType::GetBulkRequest, Some(9))]
+        );
+    }
+
+    #[tokio::test]
+    async fn getbulk_additional_probe_uses_one_max_repetition() {
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            2,
+            vec![
+                WalkReply::Response(vec![walk_binding(1), walk_binding(2)]),
+                WalkReply::Response(vec![]),
+            ],
+        );
+        let results = client
+            .bulk_walk(walk_base(), 8)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(results, vec![walk_binding(1), walk_binding(2)]);
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![
+                (PduType::GetBulkRequest, Some(8)),
+                (PduType::GetBulkRequest, Some(1)),
+            ]
+        );
+
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            2,
+            vec![
+                WalkReply::Response(vec![walk_binding(1), walk_binding(2)]),
+                WalkReply::Response(vec![walk_binding(3), walk_binding(4)]),
+            ],
+        );
+        let error = client
+            .bulk_walk(walk_base(), 8)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert_result_limit(&error, 2);
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![
+                (PduType::GetBulkRequest, Some(8)),
+                (PduType::GetBulkRequest, Some(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn getbulk_additional_empty_out_of_subtree_and_exception_probes_complete() {
+        let completion_replies = [
+            vec![],
+            vec![out_of_subtree_binding()],
+            vec![VarBind::new(walk_base().child(1), Value::EndOfMibView)],
+        ];
+
+        for reply in completion_replies {
+            let (client, requests) = scripted_walk_client(
+                Version::V2c,
+                1,
+                vec![
+                    WalkReply::Response(vec![walk_binding(1)]),
+                    WalkReply::Response(reply),
+                ],
+            );
+            let results = client
+                .bulk_walk(walk_base(), 6)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(results, vec![walk_binding(1)]);
+            assert_eq!(
+                detailed_requests(&requests),
+                vec![
+                    (PduType::GetBulkRequest, Some(6)),
+                    (PduType::GetBulkRequest, Some(1)),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_out_of_subtree_exception_and_v1_no_such_name_probes_complete() {
+        let completion_replies = [
+            vec![],
+            vec![out_of_subtree_binding()],
+            vec![VarBind::new(walk_base(), Value::EndOfMibView)],
+        ];
+
+        for reply in completion_replies {
+            let (client, _) =
+                scripted_walk_client(Version::V2c, 0, vec![WalkReply::Response(reply)]);
+            assert!(
+                client
+                    .walk_getnext(walk_base())
+                    .collect()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let (client, requests) = scripted_walk_client(
+            Version::V1,
+            0,
+            vec![WalkReply::Status(ErrorStatus::NoSuchName)],
+        );
+        assert!(
+            client
+                .walk_getnext(walk_base())
+                .collect()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![(PduType::GetNextRequest, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_failures_preserve_timeout_protocol_shape_ordering_and_transport_errors() {
+        let (client, _) = scripted_walk_client(Version::V2c, 0, vec![WalkReply::Timeout]);
+        let error = client
+            .walk_getnext(walk_base())
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+
+        let (client, _) = scripted_walk_client(
+            Version::V2c,
+            0,
+            vec![WalkReply::Status(ErrorStatus::TooBig)],
+        );
+        let error = client
+            .walk_getnext(walk_base())
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::Snmp {
+                status: ErrorStatus::TooBig,
+                ..
+            }
+        ));
+
+        let (client, _) = scripted_walk_client(
+            Version::V2c,
+            0,
+            vec![WalkReply::Response(vec![walk_binding(1), walk_binding(2)])],
+        );
+        let error = client
+            .walk_getnext(walk_base())
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(matches!(*error, Error::ResponseShape { .. }));
+
+        let (client, _) = scripted_walk_client(
+            Version::V2c,
+            1,
+            vec![
+                WalkReply::Response(vec![walk_binding(2)]),
+                WalkReply::Response(vec![walk_binding(1)]),
+            ],
+        );
+        let error = client
+            .bulk_walk(walk_base(), 1)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::WalkAborted {
+                reason: WalkAbortReason::NonIncreasing,
+                ..
+            }
+        ));
+
+        let (client, _) = scripted_walk_client(Version::V2c, 0, vec![WalkReply::Closed]);
+        let error = client
+            .walk_getnext(walk_base())
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(matches!(*error, Error::Closed { .. }));
+    }
+
+    #[tokio::test]
+    async fn getbulk_probe_too_big_is_not_degraded_or_retried() {
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            1,
+            vec![
+                WalkReply::Response(vec![walk_binding(1)]),
+                WalkReply::Status(ErrorStatus::TooBig),
+            ],
+        );
+        let error = client
+            .bulk_walk(walk_base(), 7)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::Snmp {
+                status: ErrorStatus::TooBig,
+                ..
+            }
+        ));
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![
+                (PduType::GetBulkRequest, Some(7)),
+                (PduType::GetBulkRequest, Some(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn getbulk_additional_probe_failure_is_original_and_stream_is_fused() {
+        let (client, requests) = scripted_walk_client(
+            Version::V2c,
+            1,
+            vec![
+                WalkReply::Response(vec![walk_binding(1)]),
+                WalkReply::Timeout,
+            ],
+        );
+        let mut walk = client.bulk_walk(walk_base(), 7).unwrap();
+        assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(1));
+        let error = walk.next().await.unwrap().unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert!(walk.next().await.is_none());
+        assert_eq!(
+            detailed_requests(&requests),
+            vec![
+                (PduType::GetBulkRequest, Some(7)),
+                (PduType::GetBulkRequest, Some(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_rejects_truncation_while_manual_streaming_retains_yielded_values() {
+        let replies = || {
+            vec![
+                WalkReply::Response(vec![walk_binding(1)]),
+                WalkReply::Response(vec![walk_binding(2)]),
+            ]
+        };
+
+        let (client, _) = scripted_walk_client(Version::V2c, 1, replies());
+        let error = client
+            .walk_getnext(walk_base())
+            .collect()
+            .await
+            .unwrap_err();
+        assert_result_limit(&error, 1);
+
+        let (client, _) = scripted_walk_client(Version::V2c, 1, replies());
+        let mut walk = client.walk_getnext(walk_base());
+        let mut retained = Vec::new();
+        let terminal_error = loop {
+            match walk.next().await {
+                Some(Ok(varbind)) => retained.push(varbind),
+                Some(Err(error)) => break error,
+                None => panic!("definite truncation must emit a terminal error"),
+            }
+        };
+        assert_eq!(retained, vec![walk_binding(1)]);
+        assert_result_limit(&terminal_error, 1);
+        assert!(walk.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn max_results_zero_probes_and_exception_completes_normally() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
         let (client, requests) = empty_walk_client(Some(0));
@@ -1122,7 +1696,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_requests(&requests, &[]);
+        assert_requests(&requests, &[PduType::GetNextRequest]);
 
         let (client, requests) = empty_walk_client(Some(0));
         assert!(
@@ -1134,7 +1708,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_requests(&requests, &[]);
+        assert_requests(&requests, &[PduType::GetBulkRequest]);
 
         let (client, requests) = empty_walk_client(Some(0));
         assert!(
@@ -1146,6 +1720,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_requests(&requests, &[]);
+        assert_requests(&requests, &[PduType::GetBulkRequest]);
     }
 }
