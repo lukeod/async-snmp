@@ -30,32 +30,33 @@ pub struct UdpCore {
 
 /// Counters for transport health monitoring.
 struct CoreStats {
-    /// Responses successfully matched to a pending request.
-    delivered: AtomicU64,
+    /// Datagrams successfully correlated and queued for a pending request.
+    correlated_datagrams: AtomicU64,
     /// Requests that timed out without receiving a response.
-    expired: AtomicU64,
-    /// Responses with no matching pending request (late, duplicate, or
-    /// never registered).
-    unmatched: AtomicU64,
+    expired_registrations: AtomicU64,
+    /// Datagrams discarded because they were late, duplicate, unregistered,
+    /// over queue capacity, or rejected by source/community correlation.
+    discarded_datagrams: AtomicU64,
     /// Datagrams from which no request ID could be extracted.
-    malformed: AtomicU64,
+    malformed_datagrams: AtomicU64,
 }
 
-/// Transport-level statistics.
+/// UDP endpoint statistics.
 ///
-/// Returned by [`UdpTransport::stats()`](super::UdpTransport::stats).
-#[derive(Debug, Clone, Copy)]
+/// These cumulative counters are shared by every transport, handle, client,
+/// and control capability using the same UDP endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct TransportStats {
-    /// Responses successfully matched to a pending request.
-    pub delivered: u64,
+pub struct UdpStats {
+    /// Datagrams successfully correlated and queued for a pending request.
+    pub correlated_datagrams: u64,
     /// Requests that timed out without receiving a response.
-    pub expired: u64,
-    /// Responses with no matching pending request (late, duplicate, or
-    /// never registered).
-    pub unmatched: u64,
+    pub expired_registrations: u64,
+    /// Datagrams discarded because they were late, duplicate, unregistered,
+    /// over queue capacity, or rejected by source/community correlation.
+    pub discarded_datagrams: u64,
     /// Datagrams from which no request ID could be extracted.
-    pub malformed: u64,
+    pub malformed_datagrams: u64,
 }
 
 struct Shard {
@@ -74,7 +75,7 @@ struct RegistrationOwner {
 impl RegistrationOwner {
     fn note_expired(&self, stats: &CoreStats) {
         if !self.expired.swap(true, Ordering::AcqRel) {
-            stats.expired.fetch_add(1, Ordering::Relaxed);
+            stats.expired_registrations.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -149,10 +150,10 @@ impl UdpCore {
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("Vec has exactly SHARDS elements")),
             stats: CoreStats {
-                delivered: AtomicU64::new(0),
-                expired: AtomicU64::new(0),
-                unmatched: AtomicU64::new(0),
-                malformed: AtomicU64::new(0),
+                correlated_datagrams: AtomicU64::new(0),
+                expired_registrations: AtomicU64::new(0),
+                discarded_datagrams: AtomicU64::new(0),
+                malformed_datagrams: AtomicU64::new(0),
             },
             closed: AtomicBool::new(false),
         }
@@ -198,6 +199,13 @@ impl UdpCore {
         target_source: SocketAddr,
         strict_source: bool,
     ) -> Result<UdpRegistration> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed {
+                target: target_source,
+            }
+            .boxed());
+        }
+
         let primary = registration.request_id();
         let now = Instant::now();
         let deadline = checked_deadline(registration.timeout(), "UDP timeout")?;
@@ -220,6 +228,16 @@ impl UdpCore {
             .iter()
             .map(|index| (*index, self.shards[*index].pending.lock().unwrap()))
             .collect();
+
+        // Synchronize with `close()`: once it has marked the core closed, no
+        // registration may be installed, even if this call began just before
+        // cancellation and was waiting for a shard lock.
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed {
+                target: target_source,
+            }
+            .boxed());
+        }
 
         let mut expired_owners = Vec::new();
         let mut collision = None;
@@ -335,7 +353,9 @@ impl UdpCore {
                 drop(pending);
                 owner.note_expired(&self.stats);
                 owner.notify.notify_one();
-                self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .discarded_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
 
@@ -343,7 +363,9 @@ impl UdpCore {
             if slot.strict_source && !source_is_target {
                 // Leave the slot and original deadline intact.
                 drop(pending);
-                self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .discarded_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by strict source correlation");
                 return false;
             }
@@ -353,7 +375,9 @@ impl UdpCore {
             {
                 ResponseIdentity::Reject => {
                     drop(pending);
-                    self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .discarded_datagrams
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by community correlation");
                     return false;
                 }
@@ -372,23 +396,31 @@ impl UdpCore {
                 // candidates arrive faster than
                 // the waiting task can validate them.
                 drop(pending);
-                self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .discarded_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             slot.responses.push_back((data, source));
             let notify = slot.owner.notify.clone();
             drop(pending);
             notify.notify_one();
-            self.stats.delivered.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .correlated_datagrams
+                .fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        self.stats.unmatched.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .discarded_datagrams
+            .fetch_add(1, Ordering::Relaxed);
         false
     }
 
     /// Record a datagram from which no request ID could be extracted.
     pub(crate) fn note_malformed(&self) {
-        self.stats.malformed.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .malformed_datagrams
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Wait until a response candidate is accepted for the given request.
@@ -487,12 +519,12 @@ impl UdpCore {
     }
 
     /// Snapshot current stats.
-    pub fn stats(&self) -> TransportStats {
-        TransportStats {
-            delivered: self.stats.delivered.load(Ordering::Relaxed),
-            expired: self.stats.expired.load(Ordering::Relaxed),
-            unmatched: self.stats.unmatched.load(Ordering::Relaxed),
-            malformed: self.stats.malformed.load(Ordering::Relaxed),
+    pub fn stats(&self) -> UdpStats {
+        UdpStats {
+            correlated_datagrams: self.stats.correlated_datagrams.load(Ordering::Relaxed),
+            expired_registrations: self.stats.expired_registrations.load(Ordering::Relaxed),
+            discarded_datagrams: self.stats.discarded_datagrams.load(Ordering::Relaxed),
+            malformed_datagrams: self.stats.malformed_datagrams.load(Ordering::Relaxed),
         }
     }
 
@@ -576,6 +608,24 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn closed_core_rejects_registration_without_pending_state() {
+        let core = Arc::new(UdpCore::new());
+        core.close();
+
+        let result = core.register(
+            RequestRegistration::test_unchecked(42, Duration::from_secs(30)),
+            test_addr(),
+            false,
+        );
+        let Err(error) = result else {
+            panic!("closed core accepted a registration");
+        };
+
+        assert!(matches!(*error, Error::Closed { .. }));
+        assert_eq!(core.pending_counts(), (0, 0));
+    }
+
     fn community_packet(request_id: i32, community: &'static [u8]) -> Bytes {
         use crate::message::CommunityMessage;
         use crate::pdu::Pdu;
@@ -622,8 +672,8 @@ mod tests {
 
         assert!(core.deliver(7, first.clone(), addr));
         assert!(core.deliver(7, Bytes::from_static(b"second"), addr));
-        assert_eq!(core.stats().delivered, 2);
-        assert_eq!(core.stats().unmatched, 0);
+        assert_eq!(core.stats().correlated_datagrams, 2);
+        assert_eq!(core.stats().discarded_datagrams, 0);
         let (data, _) = core.wait_for_response(&registration, addr).await.unwrap();
         assert_eq!(data, first);
     }
@@ -789,7 +839,7 @@ mod tests {
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
-        assert_eq!(core.stats().expired, 1);
+        assert_eq!(core.stats().expired_registrations, 1);
     }
 
     #[test]
@@ -820,12 +870,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(*error, Error::Timeout { .. }));
         let stats = core.stats();
-        assert_eq!(stats.delivered, 0);
-        assert_eq!(stats.expired, 1);
-        assert_eq!(stats.unmatched, 1);
+        assert_eq!(stats.correlated_datagrams, 0);
+        assert_eq!(stats.expired_registrations, 1);
+        assert_eq!(stats.discarded_datagrams, 1);
 
         core.cleanup_expired();
-        assert_eq!(core.stats().expired, 1);
+        assert_eq!(core.stats().expired_registrations, 1);
     }
 
     #[tokio::test]
@@ -846,7 +896,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(*error, Error::Timeout { .. }));
         assert_eq!(validations, 0);
-        assert_eq!(core.stats().expired, 1);
+        assert_eq!(core.stats().expired_registrations, 1);
     }
 
     #[test]
@@ -862,7 +912,7 @@ mod tests {
             .unwrap();
         core.cleanup_expired();
         assert_eq!(core.pending_counts(), (0, 0));
-        assert_eq!(core.stats().expired, 1);
+        assert_eq!(core.stats().expired_registrations, 1);
         drop(registration);
     }
 

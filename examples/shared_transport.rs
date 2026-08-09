@@ -12,7 +12,7 @@
 //! - Source policy: Opt-in strict matching is available through
 //!   `ClientBuilder::strict_source()` or `UdpHandle::strict_source()`
 //! - Engine cache: Share V3 target identities and trusted engine time
-//! - Transport stats: `UdpTransport::stats()` counters for transport health
+//! - Endpoint stats: counters are observable through the transport or clients
 //!
 //! Run with: cargo run --example shared_transport
 //!
@@ -210,12 +210,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nResults: {success} success, {timeout} timeout");
 
-    // Transport-level counters: delivered responses, expired (timed-out) request
-    // slots, unmatched datagrams (no pending request), and malformed datagrams.
+    // Endpoint-level counters: correlated datagrams, expired request
+    // registrations, discarded datagrams, and malformed datagrams.
     let stats = shared.stats();
     println!(
-        "Transport stats: delivered={} expired={} unmatched={} malformed={}",
-        stats.delivered, stats.expired, stats.unmatched, stats.malformed
+        "UDP stats: correlated={} expired={} discarded={} malformed={}",
+        stats.correlated_datagrams,
+        stats.expired_registrations,
+        stats.discarded_datagrams,
+        stats.malformed_datagrams
     );
 
     println!("\nExample complete!");

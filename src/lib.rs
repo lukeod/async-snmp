@@ -439,13 +439,14 @@
 //! | [`ResponseShapePolicy`] | `Compatible` | Fixed-cardinality operations preserve all received varbinds and return bounded anomalies for count, OID, successor, or SET-echo problems. `Strict` returns [`Error::ResponseShape`] with the same data and diagnostics. |
 //! | [`NotificationVarbindValidation`] | `Tolerant` | V2c/v3 TrapV2 and Inform prefixes may use non-standard names, but still require `TimeTicks` then `ObjectIdentifier` values. `Strict` also requires the RFC names and order. Rejected notifications are dropped, rejected Informs are not acknowledged, and validation failures are traced. |
 //! | [`WalkMode`], [`OidOrdering`], and walk limits | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires [`ClientBuilder::max_walk_results`] to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
-//! | UDP source correlation | off-target replies accepted with a warning | [`ClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`transport::TransportStats::unmatched`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
+//! | UDP source correlation | off-target replies accepted with a warning | [`ClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`UdpStats::discarded_datagrams`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
 //! | [`CommunityResponsePolicy`] | `Exact` | V1/v2c response communities match byte-for-byte. Rewrite policies emit warnings when used; accepting rewrites from any source weakens spoof resistance, especially with permissive UDP source handling. |
 //! | [`ClientBuilder::allow_unauthenticated_v3_time_correction`] | off | Allows one correlated, packet-local correction from an unauthenticated time-window Report. The tuple is never trusted globally, but an injector can choose one packet's time fields. Use strict UDP source correlation where possible; tracing records protocol correction. |
 //! | [`ClientBuilder::request_timeout`] / [`ClientBuilder::construction_timeout`] | 5 seconds / 5 seconds | Request waiting and client construction are independent. Construction uses one absolute deadline across resolution and built-in transport creation; [`Error::Timeout`] remains request-only. Preconfigured transports and [`ClientBuilder::build_with_transport`] allow application-owned deadline policy. |
 //!
-//! [`transport::TransportStats`] exposes UDP `delivered`, `expired`,
-//! `unmatched`, and `malformed` counters for transport health. It is not an
+//! [`UdpStats`] exposes UDP `correlated_datagrams`, `expired_registrations`,
+//! `discarded_datagrams`, and `malformed_datagrams` counters for endpoint
+//! health. It is not an
 //! anomaly counter for every policy above; malformed-input acceptance,
 //! correlation decisions, and protocol corrections are observed through their
 //! tracing events or returned diagnostics as documented.
@@ -590,7 +591,7 @@ pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
 pub use transport::{
     Candidate, CommunityResponsePolicy, RequestRegistration, ResponseIdentity, TcpTransport,
-    Transport, UdpHandle, UdpTransport,
+    Transport, UdpControl, UdpHandle, UdpStats, UdpTransport,
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, EngineCache, ParseProtocolError,

@@ -18,7 +18,9 @@ use crate::client::{
     DEFAULT_REQUEST_TIMEOUT,
 };
 use crate::error::{ConstructionStage, Error, Result};
-use crate::transport::{CommunityResponsePolicy, TcpTransport, Transport, UdpHandle, UdpTransport};
+use crate::transport::{
+    CommunityResponsePolicy, TcpTransport, Transport, UdpControl, UdpHandle, UdpTransport,
+};
 use crate::v3::{AuthoritativeEngine, EngineCache};
 
 /// Target address for an SNMP client.
@@ -676,7 +678,41 @@ impl ClientBuilder {
     /// # }
     /// ```
     pub async fn connect(self) -> Result<Client<UdpHandle>> {
-        self.connect_with(
+        self.connect_with_control()
+            .await
+            .map(|(client, _control)| client)
+    }
+
+    /// Connect via a dedicated UDP endpoint and return lifecycle authority.
+    ///
+    /// The returned [`UdpControl`] controls the whole endpoint. Shutdown is
+    /// irreversible and affects the returned client and all of its clones.
+    /// Use [`connect()`](Self::connect) when drop-managed cleanup is sufficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid or endpoint creation
+    /// fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::{Auth, ClientBuilder};
+    ///
+    /// # async fn example() -> async_snmp::Result<()> {
+    /// let (client, control) =
+    ///     ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    ///         .connect_with_control()
+    ///         .await?;
+    ///
+    /// control.shutdown().await;
+    /// assert!(control.is_shutdown());
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect_with_control(self) -> Result<(Client<UdpHandle>, UdpControl)> {
+        self.connect_with_control_using(
             |host, port| async move {
                 tokio::net::lookup_host((host.as_str(), port))
                     .await
@@ -691,11 +727,11 @@ impl ClientBuilder {
         .await
     }
 
-    async fn connect_with<R, RFut, B, BFut>(
+    async fn connect_with_control_using<R, RFut, B, BFut>(
         mut self,
         resolver: R,
         binder: B,
-    ) -> Result<Client<UdpHandle>>
+    ) -> Result<(Client<UdpHandle>, UdpControl)>
     where
         R: FnOnce(String, u16) -> RFut,
         RFut: Future<Output = Result<Vec<SocketAddr>>>,
@@ -716,8 +752,10 @@ impl ClientBuilder {
         let transport = deadline
             .run(ConstructionStage::Bind, binder(bind_addr))
             .await?;
+        let control = transport.control();
         let handle = transport.handle(addr)?.strict_source(self.strict_source);
-        self.build_inner(handle)
+        let client = self.build_inner(handle)?;
+        Ok((client, control))
     }
 
     /// Build a client using a shared UDP transport.
@@ -1104,7 +1142,7 @@ mod tests {
     async fn udp_resolution_uses_construction_deadline() {
         let future = ClientBuilder::new("device.example", Auth::v2c("public"))
             .construction_timeout(Duration::from_secs(3))
-            .connect_with(
+            .connect_with_control_using(
                 |_, _| std::future::pending::<Result<Vec<SocketAddr>>>(),
                 |_| async { panic!("bind must not begin while resolution is pending") },
             );
@@ -1131,7 +1169,7 @@ mod tests {
     async fn udp_bind_uses_remaining_construction_deadline() {
         let future = ClientBuilder::new("192.0.2.1", Auth::v2c("public"))
             .construction_timeout(Duration::from_secs(2))
-            .connect_with(
+            .connect_with_control_using(
                 |_, _| async { panic!("numeric targets must not invoke the resolver") },
                 |_| std::future::pending::<Result<UdpTransport>>(),
             );

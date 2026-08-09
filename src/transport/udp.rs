@@ -1,13 +1,14 @@
 //! Unified UDP transport for SNMP clients.
 //!
-//! This module provides [`UdpTransport`] (the socket owner) and [`UdpHandle`]
-//! (per-target handles that implement [`Transport`]).
+//! This module provides [`UdpTransport`] (the socket owner), [`UdpHandle`]
+//! (per-target handles that implement [`Transport`]), and [`UdpControl`]
+//! (explicit endpoint-wide lifecycle authority).
 //!
 //! # Architecture
 //!
 //! ```text
 //! +------------------+
-//! |   UdpTransport   |  (owns socket, runs recv loop, manages shutdown)
+//! |   UdpTransport   |  (owns socket and endpoint state)
 //! +------------------+
 //!          |
 //!          | Arc<UdpTransportInner>
@@ -35,6 +36,10 @@
 //! `connect()` creates a dedicated `UdpTransport` per client. `build_with()`
 //! shares one `UdpTransport` across many clients - the demux logic is the same
 //! in both cases; sharing just avoids duplicating the socket and recv task.
+//! Dedicated endpoints are drop-managed by default. Call
+//! [`ClientBuilder::connect_with_control`](crate::ClientBuilder::connect_with_control)
+//! or [`UdpTransport::control`] only when orderly endpoint-wide shutdown is
+//! required.
 //!
 //! # Usage
 //!
@@ -66,8 +71,8 @@
 //! address (`::ffff:x.x.x.x`). An IPv4 transport accepts IPv4 and mapped IPv6
 //! targets, but rejects native IPv6 targets during handle construction.
 
-pub use super::udp_core::TransportStats;
 use super::udp_core::UdpCore;
+pub use super::udp_core::UdpStats;
 use super::{Candidate, RequestRegistration, Transport, extract_request_id};
 use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
@@ -134,6 +139,8 @@ struct UdpTransportInner {
     config: UdpTransportConfig,
     receive_limits: ReceiveLimits,
     shutdown: CancellationToken,
+    shutdown_complete: CancellationToken,
+    operations: tokio::sync::RwLock<()>,
     // Cancels the recv task when the last transport/handle reference drops.
     // The task itself must hold no strong reference to this struct, or the
     // guard would never fire.
@@ -215,25 +222,22 @@ impl UdpTransport {
 
     /// Snapshot transport statistics.
     ///
-    /// Returns cumulative counters for delivered, expired, unmatched, and
-    /// malformed datagrams. Useful for monitoring transport health under load.
+    /// Returns cumulative counters for correlated, discarded, and malformed
+    /// datagrams plus expired registrations.
     #[must_use]
-    pub fn stats(&self) -> TransportStats {
+    pub fn stats(&self) -> UdpStats {
         self.inner.core.stats()
     }
 
-    /// Shutdown the transport, stopping the background receiver.
+    /// Acquire endpoint-wide lifecycle authority.
     ///
-    /// Signals the background recv task to stop and waits for it to exit.
-    /// Pending requests are woken and fail with [`crate::Error::Closed`].
-    ///
-    /// Calling this is optional: the recv task is also cancelled when the
-    /// last `UdpTransport` clone and [`UdpHandle`] are dropped.
-    pub async fn shutdown(&self) {
-        self.inner.shutdown.cancel();
-        let handle = self.inner.recv_task.lock().await.take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
+    /// Shutdown through the returned [`UdpControl`] affects every transport,
+    /// handle, and client sharing this socket. Per-target handles intentionally
+    /// cannot acquire lifecycle authority.
+    #[must_use]
+    pub fn control(&self) -> UdpControl {
+        UdpControl {
+            inner: Arc::clone(&self.inner),
         }
     }
 
@@ -245,6 +249,7 @@ impl UdpTransport {
         let socket = inner.socket.clone();
         let core = inner.core.clone();
         let shutdown = inner.shutdown.clone();
+        let shutdown_complete = inner.shutdown_complete.clone();
         let local_addr = inner.local_addr;
         let receive_limits = inner.receive_limits;
         let handle = tokio::spawn(async move {
@@ -309,6 +314,7 @@ impl UdpTransport {
             // Wake pending waiters so they fail now rather than at their
             // individual deadlines.
             core.close();
+            shutdown_complete.cancel();
         });
         // Safe: mutex was just created, no contention possible
         *inner
@@ -422,6 +428,7 @@ impl UdpTransportBuilder {
         tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %local_addr }, "UDP transport bound");
 
         let shutdown = CancellationToken::new();
+        let shutdown_complete = CancellationToken::new();
         let inner = Arc::new(UdpTransportInner {
             socket: Arc::new(socket),
             local_addr,
@@ -430,12 +437,56 @@ impl UdpTransportBuilder {
             receive_limits,
             _shutdown_guard: shutdown.clone().drop_guard(),
             shutdown,
+            shutdown_complete,
+            operations: tokio::sync::RwLock::new(()),
             recv_task: tokio::sync::Mutex::new(None),
         });
 
         UdpTransport::start_recv_loop(&inner);
 
         Ok(UdpTransport { inner })
+    }
+}
+
+/// Endpoint-wide UDP lifecycle authority.
+///
+/// This capability is cloneable. Every clone controls the same socket, and
+/// shutdown is irreversible and idempotent. It affects all clients and handles
+/// that share the endpoint, including clients for other targets.
+#[derive(Clone)]
+pub struct UdpControl {
+    inner: Arc<UdpTransportInner>,
+}
+
+impl UdpControl {
+    /// Snapshot cumulative endpoint statistics.
+    ///
+    /// Statistics remain readable after shutdown.
+    #[must_use]
+    pub fn stats(&self) -> UdpStats {
+        self.inner.core.stats()
+    }
+
+    /// Return whether endpoint shutdown has been requested.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.inner.shutdown.is_cancelled()
+    }
+
+    /// Irreversibly shut down the entire UDP endpoint.
+    ///
+    /// Pending operations on every client are woken. When this method returns,
+    /// no operation that began before cancellation remains active, and future
+    /// sends, requests, and receives fail with [`Error::Closed`] before request
+    /// registration or socket I/O. Concurrent and repeated calls are safe.
+    pub async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+        self.inner.shutdown_complete.cancelled().await;
+
+        // The recv task has closed the correlation core and woken pending
+        // operations. Acquiring this writer guard waits until every operation
+        // that raced cancellation has returned and dropped its read guard.
+        let _operations = self.inner.operations.write().await;
     }
 }
 
@@ -449,6 +500,15 @@ impl Default for UdpTransportBuilder {
 ///
 /// Implements [`Transport`] and can be used with [`Client`](crate::Client).
 /// Cheap to clone (Arc + `SocketAddr`).
+///
+/// Handles expose endpoint observation but not lifecycle authority:
+///
+/// ```compile_fail
+/// async fn invalid(handle: async_snmp::UdpHandle) {
+///     let _control = handle.control();
+///     handle.shutdown().await;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct UdpHandle {
     inner: Arc<UdpTransportInner>,
@@ -457,13 +517,22 @@ pub struct UdpHandle {
 }
 
 impl UdpHandle {
+    /// Snapshot cumulative statistics for this handle's UDP endpoint.
+    ///
+    /// The counters are shared by all handles and clients using the socket and
+    /// remain readable after endpoint shutdown.
+    #[must_use]
+    pub fn stats(&self) -> UdpStats {
+        self.inner.core.stats()
+    }
+
     /// Require responses to originate from this handle's target address.
     ///
     /// By default (false), a source mismatch does not reject a response (see
     /// [`warn_on_source_mismatch`](UdpTransportBuilder::warn_on_source_mismatch)),
     /// because multihomed agents may legitimately reply from a different
     /// address. When enabled, a response from any other address is dropped
-    /// (counted as `unmatched` in [`TransportStats`]) and the request keeps
+    /// (counted as `discarded_datagrams` in [`UdpStats`]) and the request keeps
     /// waiting for a response from the target.
     #[must_use]
     pub fn strict_source(mut self, strict: bool) -> Self {
@@ -474,16 +543,9 @@ impl UdpHandle {
 
 impl Transport for UdpHandle {
     async fn send(&self, data: &[u8]) -> Result<()> {
-        tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.bytes = data.len() }, "UDP send");
-        self.inner
-            .socket
-            .send_to(data, self.target)
-            .await
-            .map_err(|e| Error::Network {
-                target: self.target,
-                source: e,
-            })?;
-        Ok(())
+        let _operation = self.inner.operations.read().await;
+        self.ensure_open()?;
+        self.send_datagram(data).await
     }
 
     async fn request_with<T, F>(
@@ -496,14 +558,17 @@ impl Transport for UdpHandle {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
-        // Registration is the first work performed when this future is polled,
-        // before a datagram can be sent. The guard owns primary and alias cleanup
-        // across both awaits, including cancellation and send failure.
+        let _operation = self.inner.operations.read().await;
+        self.ensure_open()?;
+
+        // Registration is the first protocol work performed when this future
+        // is polled. The guard owns primary and alias cleanup across both
+        // awaits, including cancellation and send failure.
         let registration =
             self.inner
                 .core
                 .register(registration, self.target, self.strict_source)?;
-        self.send(data).await?;
+        self.send_datagram(data).await?;
         self.recv_registered_with(&registration, validate).await
     }
 
@@ -512,6 +577,8 @@ impl Transport for UdpHandle {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
+        let _operation = self.inner.operations.read().await;
+        self.ensure_open()?;
         let registration =
             self.inner
                 .core
@@ -537,6 +604,28 @@ impl Transport for UdpHandle {
 }
 
 impl UdpHandle {
+    fn ensure_open(&self) -> Result<()> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(Error::Closed {
+                target: self.target,
+            }
+            .boxed());
+        }
+        Ok(())
+    }
+
+    async fn send_datagram(&self, data: &[u8]) -> Result<()> {
+        tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.bytes = data.len() }, "UDP send");
+        self.inner
+            .socket
+            .send_to(data, self.target)
+            .await
+            .map_err(|e| Error::Network {
+                target: self.target,
+                source: e,
+            })?;
+        Ok(())
+    }
     #[cfg(test)]
     async fn recv_registered(
         &self,
@@ -581,6 +670,7 @@ impl UdpHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Auth, Client, Retry, oid};
 
     fn register_v3(
         handle: &UdpHandle,
@@ -716,8 +806,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_without_shutdown_stops_recv_task() {
+    async fn final_endpoint_reference_drop_stops_recv_task() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle("127.0.0.1:161".parse().unwrap()).unwrap();
         let task = transport
             .inner
             .recv_task
@@ -728,12 +819,75 @@ mod tests {
         let weak = Arc::downgrade(&transport.inner);
 
         drop(transport);
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "recv task stopped while a handle still held the endpoint"
+        );
+
+        drop(handle);
 
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .expect("recv task did not exit after drop")
             .unwrap();
         assert_eq!(weak.strong_count(), 0, "transport state leaked after drop");
+    }
+
+    #[tokio::test]
+    async fn dedicated_client_and_control_observe_same_counters() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (client, control) =
+            Client::builder(listener.local_addr().unwrap(), Auth::v2c("public"))
+                .request_timeout(Duration::from_millis(20))
+                .retry(Retry::none())
+                .connect_with_control()
+                .await
+                .unwrap();
+
+        let error = client
+            .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+            .await
+            .expect_err("silent endpoint should time out");
+        assert!(matches!(*error, Error::Timeout { .. }));
+
+        assert_eq!(client.stats(), control.stats());
+        assert_eq!(client.stats().expired_registrations, 1);
+    }
+
+    #[tokio::test]
+    async fn shared_clients_handles_and_control_observe_same_counters() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let control = transport.control();
+        let target: SocketAddr = "127.0.0.1:161".parse().unwrap();
+        let handle = transport.handle(target).unwrap();
+        let client1 = Client::builder(target, Auth::v2c("public"))
+            .build_with(&transport)
+            .await
+            .unwrap();
+        let client2 = Client::builder(target, Auth::v2c("private"))
+            .build_with(&transport)
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        sender
+            .send_to(b"not snmp", transport.local_addr())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if control.stats().malformed_datagrams == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let expected = transport.stats();
+        assert_eq!(expected.malformed_datagrams, 1);
+        assert_eq!(handle.stats(), expected);
+        assert_eq!(client1.stats(), expected);
+        assert_eq!(client2.stats(), expected);
+        assert_eq!(control.stats(), expected);
     }
 
     #[tokio::test]
@@ -749,7 +903,7 @@ mod tests {
         // Let the waiter park on its notify before shutting down.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        transport.shutdown().await;
+        transport.control().shutdown().await;
 
         let result = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
@@ -763,11 +917,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_cloned_control_shutdown_wakes_all_shared_clients() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let control = transport.control();
+        let client1 = Client::builder(target, Auth::v2c("public"))
+            .request_timeout(Duration::from_secs(30))
+            .retry(Retry::none())
+            .build_with(&transport)
+            .await
+            .unwrap();
+        let client2 = Client::builder(target, Auth::v2c("private"))
+            .request_timeout(Duration::from_secs(30))
+            .retry(Retry::none())
+            .build_with(&transport)
+            .await
+            .unwrap();
+
+        let request1 =
+            tokio::spawn(async move { client1.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await });
+        let request2 =
+            tokio::spawn(async move { client2.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await });
+
+        let mut datagram = [0u8; 2048];
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), listener.recv_from(&mut datagram))
+                .await
+                .expect("client did not send request")
+                .unwrap();
+        }
+
+        let other_control = control.clone();
+        tokio::join!(control.shutdown(), other_control.shutdown());
+        assert!(control.is_shutdown());
+        assert!(other_control.is_shutdown());
+
+        for request in [request1, request2] {
+            let error = request
+                .await
+                .unwrap()
+                .expect_err("shared client request should be closed");
+            assert!(matches!(*error, Error::Closed { .. }));
+        }
+
+        let stats = control.stats();
+        control.shutdown().await;
+        other_control.shutdown().await;
+        assert_eq!(control.stats(), stats);
+    }
+
+    #[tokio::test]
+    async fn post_shutdown_operations_do_not_register_or_send() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle(target).unwrap();
+        let control = transport.control();
+
+        control.shutdown().await;
+        let stats = control.stats();
+
+        let send_error = handle.send(b"must not be sent").await.unwrap_err();
+        assert!(matches!(*send_error, Error::Closed { .. }));
+        let request_error = handle
+            .request(
+                b"must not be sent",
+                RequestRegistration::v3(101, Duration::from_secs(30)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(*request_error, Error::Closed { .. }));
+        let receive_error = handle
+            .recv(RequestRegistration::v3(102, Duration::from_secs(30)))
+            .await
+            .unwrap_err();
+        assert!(matches!(*receive_error, Error::Closed { .. }));
+
+        assert_eq!(transport.inner.core.pending_counts(), (0, 0));
+        let mut datagram = [0u8; 32];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.recv_from(&mut datagram))
+                .await
+                .is_err(),
+            "post-shutdown operation sent a datagram"
+        );
+
+        control.shutdown().await;
+        assert_eq!(control.stats(), stats);
+        assert_eq!(handle.stats(), stats);
+    }
+
+    #[tokio::test]
     async fn recv_after_shutdown_without_slot_returns_closed() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
 
-        transport.shutdown().await;
+        transport.control().shutdown().await;
 
         let err = handle
             .recv(RequestRegistration::v3(42, Duration::from_secs(30)))
@@ -1001,8 +1247,8 @@ mod tests {
         );
 
         let stats = transport.stats();
-        assert_eq!(stats.unmatched, 1);
-        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.discarded_datagrams, 1);
+        assert_eq!(stats.correlated_datagrams, 0);
     }
 
     #[tokio::test]
@@ -1026,8 +1272,8 @@ mod tests {
         assert!(!transport.inner.core.deliver(7, packet, target));
 
         let stats = transport.stats();
-        assert_eq!(stats.delivered, 1);
-        assert_eq!(stats.unmatched, 1);
+        assert_eq!(stats.correlated_datagrams, 1);
+        assert_eq!(stats.discarded_datagrams, 1);
     }
 
     #[tokio::test]
@@ -1042,7 +1288,7 @@ mod tests {
         // The recv loop processes the datagram asynchronously; poll briefly.
         let mut malformed = 0;
         for _ in 0..100 {
-            malformed = transport.stats().malformed;
+            malformed = transport.stats().malformed_datagrams;
             if malformed == 1 {
                 break;
             }
@@ -1059,7 +1305,7 @@ mod tests {
 
         transport.inner.core.cleanup_expired();
 
-        assert_eq!(transport.stats().expired, 1);
+        assert_eq!(transport.stats().expired_registrations, 1);
     }
 
     #[tokio::test]
@@ -1076,7 +1322,7 @@ mod tests {
             !transport.inner.core.deliver(21, packet.clone(), mismatched),
             "strict handle must reject a mismatched source"
         );
-        assert_eq!(transport.stats().unmatched, 1);
+        assert_eq!(transport.stats().discarded_datagrams, 1);
 
         // The slot must survive rejection so the genuine response still lands.
         assert!(transport.inner.core.deliver(21, packet.clone(), target));

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** UDP endpoint observation and lifecycle authority are separate.
+  `UdpStats` replaces `TransportStats` with counter names matching their
+  increment paths. `UdpHandle`, UDP clients, transports, and `UdpControl`
+  expose shared read-only statistics. `UdpControl` is the cloneable,
+  endpoint-wide shutdown capability available through `UdpTransport::control`
+  and `ClientBuilder::connect_with_control`; direct `UdpTransport::shutdown`
+  is removed. Completed shutdown prevents later registration and socket I/O.
 - **Breaking:** `UdpTransport::handle` now returns `Result<UdpHandle>` and rejects
   native IPv6 targets for IPv4 sockets during construction. IPv4-mapped targets
   are normalized for IPv4 sockets, and `ClientBuilder::build_with` considers all

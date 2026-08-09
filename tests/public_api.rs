@@ -4,7 +4,7 @@ use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Error, Oid, RequestRegistration, Target,
-    UdpHandle, UdpTransport, WalkAbortReason,
+    UdpControl, UdpHandle, UdpStats, UdpTransport, WalkAbortReason,
 };
 #[cfg(feature = "agent")]
 use async_snmp::{GetNextResult, GetResult, Value, VarBind, oid};
@@ -82,7 +82,10 @@ fn request_registration_exposes_read_only_normalized_metadata() {
 async fn udp_handle_construction_is_publicly_fallible() {
     let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
     let handle: async_snmp::Result<UdpHandle> = transport.handle("127.0.0.1:161".parse().unwrap());
-    assert!(handle.is_ok());
+    let handle = handle.unwrap();
+    let control: UdpControl = transport.control();
+    let _: UdpStats = handle.stats();
+    let _: UdpStats = control.stats();
 }
 
 #[test]

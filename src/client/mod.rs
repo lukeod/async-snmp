@@ -43,15 +43,34 @@ impl Client<UdpHandle> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// UDP clients expose endpoint observation but not lifecycle authority:
+    ///
+    /// ```compile_fail
+    /// async fn invalid(client: async_snmp::UdpClient) {
+    ///     let _control = client.control();
+    ///     client.shutdown().await;
+    /// }
+    /// ```
     pub fn builder(target: impl Into<Target>, auth: impl Into<Auth>) -> ClientBuilder {
         ClientBuilder::new(target, auth)
+    }
+
+    /// Snapshot cumulative statistics for this client's UDP endpoint.
+    ///
+    /// Dedicated clients observe their private endpoint. Clients built from a
+    /// shared [`UdpTransport`](crate::UdpTransport) observe the same counters as
+    /// every other client and handle using that endpoint.
+    #[must_use]
+    pub fn stats(&self) -> UdpStats {
+        self.inner.transport.stats()
     }
 }
 use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message};
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
-use crate::transport::{Candidate, Transport, UdpHandle};
+use crate::transport::{Candidate, Transport, UdpHandle, UdpStats};
 use crate::v3::{EngineCache, EngineState, SaltCounter};
 use crate::value::Value;
 use crate::varbind::VarBind;
