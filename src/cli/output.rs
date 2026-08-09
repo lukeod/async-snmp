@@ -6,7 +6,7 @@ use crate::cli::args::{OutputArgs, OutputFormat};
 use crate::cli::hints;
 use crate::client::Auth;
 use crate::format::hex;
-use crate::{Oid, Value, VarBind, Version};
+use crate::{Oid, Value, ValueKind, VarBind, Version};
 use serde::Serialize;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -153,11 +153,32 @@ struct DecodedValue {
     size: Option<usize>,
 }
 
+fn fixed_type_name(kind: ValueKind) -> &'static str {
+    match kind {
+        ValueKind::Integer => "INTEGER",
+        ValueKind::OctetString => "STRING",
+        ValueKind::Null => "NULL",
+        ValueKind::ObjectIdentifier => "OID",
+        ValueKind::IpAddress => "IpAddress",
+        ValueKind::Counter32 => "Counter32",
+        ValueKind::Gauge32 => "Gauge32",
+        ValueKind::UInteger32 => "UInteger32",
+        ValueKind::TimeTicks => "TimeTicks",
+        ValueKind::Opaque => "Opaque",
+        ValueKind::Nsap => "Nsap",
+        ValueKind::Counter64 => "Counter64",
+        ValueKind::NoSuchObject => "NoSuchObject",
+        ValueKind::NoSuchInstance => "NoSuchInstance",
+        ValueKind::EndOfMibView => "EndOfMibView",
+        ValueKind::Unknown => "Unknown",
+    }
+}
+
 /// Decode a Value into its display components.
 fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
     match value {
         Value::Integer(v) => DecodedValue {
-            type_name: "INTEGER".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: v.to_string(),
             json_value: (*v).into(),
             formatted: None,
@@ -193,7 +214,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         }
 
         Value::Null => DecodedValue {
-            type_name: "NULL".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: "(null)".into(),
             json_value: serde_json::Value::Null,
             formatted: None,
@@ -210,7 +231,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
                 s.clone()
             };
             DecodedValue {
-                type_name: "OID".into(),
+                type_name: fixed_type_name(value.kind()).into(),
                 display,
                 json_value: serde_json::Value::String(s),
                 formatted: None,
@@ -222,7 +243,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         Value::IpAddress(bytes) => {
             let s = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
             DecodedValue {
-                type_name: "IpAddress".into(),
+                type_name: fixed_type_name(value.kind()).into(),
                 display: s.clone(),
                 json_value: serde_json::Value::String(s),
                 formatted: None,
@@ -232,7 +253,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         }
 
         Value::Counter32(v) => DecodedValue {
-            type_name: "Counter32".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: v.to_string(),
             json_value: (*v).into(),
             formatted: None,
@@ -241,7 +262,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         },
 
         Value::Gauge32(v) => DecodedValue {
-            type_name: "Gauge32".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: v.to_string(),
             json_value: (*v).into(),
             formatted: None,
@@ -250,7 +271,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         },
 
         Value::UInteger32(v) => DecodedValue {
-            type_name: "UInteger32".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: v.to_string(),
             json_value: (*v).into(),
             formatted: None,
@@ -261,7 +282,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         Value::TimeTicks(v) => {
             let human = format_timeticks(*v);
             DecodedValue {
-                type_name: "TimeTicks".into(),
+                type_name: fixed_type_name(value.kind()).into(),
                 display: format!("({}) {}", v, human),
                 json_value: (*v).into(),
                 formatted: Some(format!("({}) {}", v, human)),
@@ -274,7 +295,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
             let compact_hex = hex::encode(bytes);
             let spaced_hex = format_hex_string(bytes);
             DecodedValue {
-                type_name: "Opaque".into(),
+                type_name: fixed_type_name(value.kind()).into(),
                 display: spaced_hex.clone(),
                 json_value: serde_json::Value::String(compact_hex.clone()),
                 formatted: Some(spaced_hex),
@@ -289,7 +310,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
             let spaced_hex = format_hex_string(bytes);
 
             DecodedValue {
-                type_name: "Nsap".into(),
+                type_name: fixed_type_name(value.kind()).into(),
                 display: spaced_hex.clone(),
                 json_value: serde_json::Value::String(compact_hex.clone()),
                 formatted: Some(spaced_hex),
@@ -299,7 +320,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         }
 
         Value::Counter64(v) => DecodedValue {
-            type_name: "Counter64".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: v.to_string(),
             json_value: (*v).into(),
             formatted: None,
@@ -308,7 +329,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         },
 
         Value::NoSuchObject => DecodedValue {
-            type_name: "NoSuchObject".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: "No Such Object available".into(),
             json_value: serde_json::Value::Null,
             formatted: Some("No Such Object available".into()),
@@ -317,7 +338,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         },
 
         Value::NoSuchInstance => DecodedValue {
-            type_name: "NoSuchInstance".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: "No Such Instance currently exists".into(),
             json_value: serde_json::Value::Null,
             formatted: Some("No Such Instance currently exists".into()),
@@ -326,7 +347,7 @@ fn decode_value(value: &Value, force_hex: bool) -> DecodedValue {
         },
 
         Value::EndOfMibView => DecodedValue {
-            type_name: "EndOfMibView".into(),
+            type_name: fixed_type_name(value.kind()).into(),
             display: "No more variables left in this MIB View".into(),
             json_value: serde_json::Value::Null,
             formatted: Some("No more variables left in this MIB View".into()),
@@ -623,6 +644,55 @@ pub fn write_error(err: &crate::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_kinds_drive_fixed_cli_type_names() {
+        let cases = [
+            (ValueKind::Integer, "INTEGER"),
+            (ValueKind::OctetString, "STRING"),
+            (ValueKind::Null, "NULL"),
+            (ValueKind::ObjectIdentifier, "OID"),
+            (ValueKind::IpAddress, "IpAddress"),
+            (ValueKind::Counter32, "Counter32"),
+            (ValueKind::Gauge32, "Gauge32"),
+            (ValueKind::UInteger32, "UInteger32"),
+            (ValueKind::TimeTicks, "TimeTicks"),
+            (ValueKind::Opaque, "Opaque"),
+            (ValueKind::Nsap, "Nsap"),
+            (ValueKind::Counter64, "Counter64"),
+            (ValueKind::NoSuchObject, "NoSuchObject"),
+            (ValueKind::NoSuchInstance, "NoSuchInstance"),
+            (ValueKind::EndOfMibView, "EndOfMibView"),
+            (ValueKind::Unknown, "Unknown"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(fixed_type_name(kind), expected);
+        }
+    }
+
+    #[test]
+    fn payload_specific_cli_type_names_are_preserved() {
+        assert_eq!(
+            decode_value(&Value::from("text"), false).type_name,
+            "STRING"
+        );
+        assert_eq!(
+            decode_value(&Value::from(&[0, 1][..]), false).type_name,
+            "Hex-STRING"
+        );
+        assert_eq!(
+            decode_value(
+                &Value::Unknown {
+                    tag: 0x1e,
+                    data: bytes::Bytes::new(),
+                },
+                false,
+            )
+            .type_name,
+            "Unknown(0x1E)"
+        );
+    }
 
     #[test]
     fn security_info_is_derived_from_constructed_auth() {

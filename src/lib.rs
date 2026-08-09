@@ -573,7 +573,7 @@ pub use client::{
 };
 pub use community::Community;
 pub use compatibility::CompatibilityPolicy;
-pub use error::{ConstructionStage, Error, ErrorStatus, Result, WalkAbortReason};
+pub use error::{ConstructionStage, Error, ErrorKind, ErrorStatus, Result, WalkAbortReason};
 #[cfg(feature = "agent")]
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,
@@ -600,7 +600,7 @@ pub use v3::{
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{CryptoBackend, CryptoError, CryptoResult, LocalizedKey, MasterKey, MasterKeys};
-pub use value::{RowStatus, StorageType, Value};
+pub use value::{RowStatus, StorageType, Value, ValueKind};
 pub use varbind::VarBind;
 pub use version::Version;
 

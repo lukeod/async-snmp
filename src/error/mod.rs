@@ -129,6 +129,75 @@ pub enum ConstructionStage {
     Connect,
 }
 
+/// Payload-free classification of a top-level [`Error`].
+///
+/// This is a shallow structural classification. It does not define
+/// retryability, severity, or root cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Network I/O failure.
+    Network,
+    /// Request timeout.
+    Timeout,
+    /// Bounded client-construction timeout.
+    ConstructionTimeout,
+    /// Closed or poisoned transport.
+    Closed,
+    /// Duplicate live request identifier.
+    RequestIdInUse,
+    /// SNMP protocol error status.
+    Snmp,
+    /// Authentication or authorization failure.
+    Auth,
+    /// Terminal SNMPv3 Report.
+    Report,
+    /// Malformed response.
+    MalformedResponse,
+    /// Fixed-cardinality response-shape violation.
+    ResponseShape,
+    /// Walk abort.
+    WalkAborted,
+    /// Invalid configuration.
+    Config,
+    /// Available even when the `agent` feature is disabled.
+    AgentAlreadyRunning,
+    /// Invalid outbound SNMP message.
+    InvalidMessage,
+    /// Invalid OID.
+    InvalidOid,
+}
+
+impl ErrorKind {
+    /// Returns the stable snake_case name for this error kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::ConstructionTimeout => "construction_timeout",
+            Self::Closed => "transport_closed",
+            Self::RequestIdInUse => "request_id_in_use",
+            Self::Snmp => "snmp",
+            Self::Auth => "authentication",
+            Self::Report => "v3_report",
+            Self::MalformedResponse => "malformed_response",
+            Self::ResponseShape => "response_shape",
+            Self::WalkAborted => "walk_aborted",
+            Self::Config => "configuration",
+            Self::AgentAlreadyRunning => "agent_already_running",
+            Self::InvalidMessage => "invalid_message",
+            Self::InvalidOid => "invalid_oid",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -230,6 +299,29 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns the payload-free kind of this error.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Network { .. } => ErrorKind::Network,
+            Self::Timeout { .. } => ErrorKind::Timeout,
+            Self::ConstructionTimeout { .. } => ErrorKind::ConstructionTimeout,
+            Self::Closed { .. } => ErrorKind::Closed,
+            Self::RequestIdInUse { .. } => ErrorKind::RequestIdInUse,
+            Self::Snmp { .. } => ErrorKind::Snmp,
+            Self::Auth { .. } => ErrorKind::Auth,
+            Self::Report { .. } => ErrorKind::Report,
+            Self::MalformedResponse { .. } => ErrorKind::MalformedResponse,
+            Self::ResponseShape { .. } => ErrorKind::ResponseShape,
+            Self::WalkAborted { .. } => ErrorKind::WalkAborted,
+            Self::Config(_) => ErrorKind::Config,
+            #[cfg(feature = "agent")]
+            Self::AgentAlreadyRunning => ErrorKind::AgentAlreadyRunning,
+            Self::InvalidMessage(_) => ErrorKind::InvalidMessage,
+            Self::InvalidOid(_) => ErrorKind::InvalidOid,
+        }
+    }
+
     /// Box this error (convenience for constructing boxed errors).
     #[must_use]
     pub fn boxed(self) -> Box<Self> {
@@ -455,6 +547,135 @@ impl std::fmt::Display for ErrorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_kind_exhaustively_maps_non_agent_variants() {
+        let target = "127.0.0.1:161".parse().unwrap();
+        let cases = vec![
+            (
+                Error::Network {
+                    target,
+                    source: std::io::Error::other("network"),
+                },
+                ErrorKind::Network,
+            ),
+            (
+                Error::Timeout {
+                    target,
+                    elapsed: Duration::from_secs(1),
+                    retries: 2,
+                },
+                ErrorKind::Timeout,
+            ),
+            (
+                Error::ConstructionTimeout {
+                    target: crate::client::Target::from("unresolved.example"),
+                    stage: ConstructionStage::Connect,
+                    elapsed: Duration::from_secs(2),
+                },
+                ErrorKind::ConstructionTimeout,
+            ),
+            (Error::Closed { target }, ErrorKind::Closed),
+            (
+                Error::RequestIdInUse { request_id: 7 },
+                ErrorKind::RequestIdInUse,
+            ),
+            (
+                Error::Snmp {
+                    target,
+                    status: ErrorStatus::GenErr,
+                    index: 1,
+                    oid: Some(Oid::from_slice(&[1, 3, 6, 1])),
+                },
+                ErrorKind::Snmp,
+            ),
+            (Error::Auth { target }, ErrorKind::Auth),
+            (
+                Error::Report {
+                    target,
+                    status: Box::new(crate::v3::ReportStatus::UnknownEngineId { counter: 1 }),
+                },
+                ErrorKind::Report,
+            ),
+            (
+                Error::MalformedResponse { target },
+                ErrorKind::MalformedResponse,
+            ),
+            (
+                Error::ResponseShape {
+                    target,
+                    response: crate::client::FixedCardinalityResponse {
+                        operation: crate::client::FixedCardinalityOperation::Get,
+                        varbinds: Vec::new(),
+                        anomalies: Vec::new(),
+                    },
+                },
+                ErrorKind::ResponseShape,
+            ),
+            (
+                Error::WalkAborted {
+                    target,
+                    reason: WalkAbortReason::Cycle,
+                },
+                ErrorKind::WalkAborted,
+            ),
+            (Error::Config("config".into()), ErrorKind::Config),
+            (
+                Error::InvalidMessage("message".into()),
+                ErrorKind::InvalidMessage,
+            ),
+            (Error::InvalidOid("oid".into()), ErrorKind::InvalidOid),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), expected);
+        }
+    }
+
+    #[test]
+    fn error_kind_canonical_names_and_display_are_total() {
+        let cases = [
+            (ErrorKind::Network, "network"),
+            (ErrorKind::Timeout, "timeout"),
+            (ErrorKind::ConstructionTimeout, "construction_timeout"),
+            (ErrorKind::Closed, "transport_closed"),
+            (ErrorKind::RequestIdInUse, "request_id_in_use"),
+            (ErrorKind::Snmp, "snmp"),
+            (ErrorKind::Auth, "authentication"),
+            (ErrorKind::Report, "v3_report"),
+            (ErrorKind::MalformedResponse, "malformed_response"),
+            (ErrorKind::ResponseShape, "response_shape"),
+            (ErrorKind::WalkAborted, "walk_aborted"),
+            (ErrorKind::Config, "configuration"),
+            (ErrorKind::AgentAlreadyRunning, "agent_already_running"),
+            (ErrorKind::InvalidMessage, "invalid_message"),
+            (ErrorKind::InvalidOid, "invalid_oid"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(kind.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn error_kind_names_are_const() {
+        const NAME: &str = ErrorKind::ConstructionTimeout.as_str();
+        assert_eq!(NAME, "construction_timeout");
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn agent_error_maps_to_always_nameable_kind() {
+        assert_eq!(
+            Error::AgentAlreadyRunning.kind(),
+            ErrorKind::AgentAlreadyRunning
+        );
+        assert_eq!(
+            ErrorKind::AgentAlreadyRunning.as_str(),
+            "agent_already_running"
+        );
+    }
 
     #[test]
     fn walk_abort_reason_is_error() {

@@ -183,6 +183,78 @@ impl std::fmt::Display for StorageType {
     }
 }
 
+/// Payload-free classification of an SNMP [`Value`].
+///
+/// This is a shallow structural classification. It does not define value
+/// conversion, validation, or an input grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ValueKind {
+    /// INTEGER.
+    Integer,
+    /// OCTET STRING.
+    OctetString,
+    /// NULL.
+    Null,
+    /// OBJECT IDENTIFIER.
+    ObjectIdentifier,
+    /// IPv4 address.
+    IpAddress,
+    /// 32-bit wrapping counter.
+    Counter32,
+    /// 32-bit gauge.
+    Gauge32,
+    /// Historic unsigned 32-bit application type.
+    UInteger32,
+    /// Hundredths-of-a-second time ticks.
+    TimeTicks,
+    /// Opaque bytes.
+    Opaque,
+    /// Historic NSAP address.
+    Nsap,
+    /// 64-bit wrapping counter.
+    Counter64,
+    /// `noSuchObject` exception.
+    NoSuchObject,
+    /// `noSuchInstance` exception.
+    NoSuchInstance,
+    /// `endOfMibView` exception.
+    EndOfMibView,
+    /// Unrecognized receive-side tag.
+    Unknown,
+}
+
+impl ValueKind {
+    /// Returns the stable snake_case name for this value kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Integer => "integer",
+            Self::OctetString => "octet_string",
+            Self::Null => "null",
+            Self::ObjectIdentifier => "object_identifier",
+            Self::IpAddress => "ip_address",
+            Self::Counter32 => "counter32",
+            Self::Gauge32 => "gauge32",
+            Self::UInteger32 => "uinteger32",
+            Self::TimeTicks => "time_ticks",
+            Self::Opaque => "opaque",
+            Self::Nsap => "nsap",
+            Self::Counter64 => "counter64",
+            Self::NoSuchObject => "no_such_object",
+            Self::NoSuchInstance => "no_such_instance",
+            Self::EndOfMibView => "end_of_mib_view",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ValueKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// SNMP value.
 ///
 /// Represents all SNMP data types including `SMIv2` types and exception values.
@@ -314,6 +386,29 @@ pub enum Value {
 }
 
 impl Value {
+    /// Returns the payload-free kind of this value.
+    #[must_use]
+    pub fn kind(&self) -> ValueKind {
+        match self {
+            Self::Integer(_) => ValueKind::Integer,
+            Self::OctetString(_) => ValueKind::OctetString,
+            Self::Null => ValueKind::Null,
+            Self::ObjectIdentifier(_) => ValueKind::ObjectIdentifier,
+            Self::IpAddress(_) => ValueKind::IpAddress,
+            Self::Counter32(_) => ValueKind::Counter32,
+            Self::Gauge32(_) => ValueKind::Gauge32,
+            Self::UInteger32(_) => ValueKind::UInteger32,
+            Self::TimeTicks(_) => ValueKind::TimeTicks,
+            Self::Opaque(_) => ValueKind::Opaque,
+            Self::Nsap(_) => ValueKind::Nsap,
+            Self::Counter64(_) => ValueKind::Counter64,
+            Self::NoSuchObject => ValueKind::NoSuchObject,
+            Self::NoSuchInstance => ValueKind::NoSuchInstance,
+            Self::EndOfMibView => ValueKind::EndOfMibView,
+            Self::Unknown { .. } => ValueKind::Unknown,
+        }
+    }
+
     /// Try to get as i32.
     ///
     /// Returns `Some(i32)` for [`Value::Integer`], `None` otherwise.
@@ -1305,6 +1400,95 @@ impl From<[u8; 4]> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_kind_exhaustively_maps_variants_and_canonical_names() {
+        let cases = [
+            (Value::Integer(-1), ValueKind::Integer, "integer"),
+            (
+                Value::OctetString(Bytes::from_static(b"text")),
+                ValueKind::OctetString,
+                "octet_string",
+            ),
+            (Value::Null, ValueKind::Null, "null"),
+            (
+                Value::ObjectIdentifier(Oid::from_slice(&[1, 3, 6, 1])),
+                ValueKind::ObjectIdentifier,
+                "object_identifier",
+            ),
+            (
+                Value::IpAddress([192, 0, 2, 1]),
+                ValueKind::IpAddress,
+                "ip_address",
+            ),
+            (Value::Counter32(1), ValueKind::Counter32, "counter32"),
+            (Value::Gauge32(2), ValueKind::Gauge32, "gauge32"),
+            (Value::UInteger32(3), ValueKind::UInteger32, "uinteger32"),
+            (Value::TimeTicks(4), ValueKind::TimeTicks, "time_ticks"),
+            (
+                Value::Opaque(Bytes::from_static(b"opaque")),
+                ValueKind::Opaque,
+                "opaque",
+            ),
+            (
+                Value::Nsap(Bytes::from_static(b"nsap")),
+                ValueKind::Nsap,
+                "nsap",
+            ),
+            (Value::Counter64(5), ValueKind::Counter64, "counter64"),
+            (
+                Value::NoSuchObject,
+                ValueKind::NoSuchObject,
+                "no_such_object",
+            ),
+            (
+                Value::NoSuchInstance,
+                ValueKind::NoSuchInstance,
+                "no_such_instance",
+            ),
+            (
+                Value::EndOfMibView,
+                ValueKind::EndOfMibView,
+                "end_of_mib_view",
+            ),
+            (
+                Value::Unknown {
+                    tag: 0x1f,
+                    data: Bytes::from_static(b"unknown"),
+                },
+                ValueKind::Unknown,
+                "unknown",
+            ),
+        ];
+
+        for (value, expected_kind, expected_name) in cases {
+            let kind = value.kind();
+            assert_eq!(kind, expected_kind);
+            assert_eq!(kind.as_str(), expected_name);
+            assert_eq!(kind.to_string(), expected_name);
+        }
+    }
+
+    #[test]
+    fn unknown_value_kind_does_not_depend_on_tag_or_data() {
+        let first = Value::Unknown {
+            tag: 0,
+            data: Bytes::new(),
+        };
+        let second = Value::Unknown {
+            tag: u8::MAX,
+            data: Bytes::from_static(b"payload"),
+        };
+
+        assert_eq!(first.kind(), ValueKind::Unknown);
+        assert_eq!(second.kind(), ValueKind::Unknown);
+    }
+
+    #[test]
+    fn value_kind_names_are_const() {
+        const NAME: &str = ValueKind::Null.as_str();
+        assert_eq!(NAME, "null");
+    }
 
     // AUDIT-003: Test that constructed OCTET STRING (0x24) is explicitly rejected.
     // Net-snmp documents but does not parse constructed form; we reject it.

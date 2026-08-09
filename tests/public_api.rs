@@ -3,11 +3,12 @@ use std::time::Duration;
 use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
-    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Error, Oid, RequestRegistration, Target,
-    UdpControl, UdpHandle, UdpStats, UdpTransport, WalkAbortReason,
+    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Error, ErrorKind, Oid,
+    RequestRegistration, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind,
+    WalkAbortReason,
 };
 #[cfg(feature = "agent")]
-use async_snmp::{GetNextResult, GetResult, Value, VarBind, oid};
+use async_snmp::{GetNextResult, GetResult, VarBind, oid};
 use bytes::Bytes;
 
 #[test]
@@ -60,6 +61,18 @@ fn bounded_walk_abort_reason_is_public_and_structured() {
             ..
         }
     ));
+}
+
+#[test]
+fn stable_value_and_error_kinds_are_public() {
+    assert_eq!(Value::Integer(1).kind(), ValueKind::Integer);
+    assert_eq!(ValueKind::Integer.as_str(), "integer");
+    assert_eq!(Error::Config("bad input".into()).kind(), ErrorKind::Config);
+    assert_eq!(ErrorKind::Config.as_str(), "configuration");
+
+    // The kind remains nameable when the feature-gated parent error does not.
+    let agent_kind = ErrorKind::AgentAlreadyRunning;
+    assert_eq!(agent_kind.to_string(), "agent_already_running");
 }
 
 #[test]
