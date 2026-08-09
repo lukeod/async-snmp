@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a v2c client with the "public" community string
     // The builder pattern allows configuring timeout, retries, etc.
     let client = Client::builder(target, Auth::v2c("public"))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .retry(Retry::fixed(3, Duration::ZERO))
         .connect()
         .await?;
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sysContact.0 is typically writable with the "private" community
     // Create a new client with write access
     let write_client = Client::builder(target, Auth::v2c("private"))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect()
         .await?;
 

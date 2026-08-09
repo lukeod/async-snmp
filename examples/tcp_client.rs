@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use connect_tcp() instead of connect()
     let client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(10))
+        .request_timeout(Duration::from_secs(10))
         // Timeout retries are ignored for TCP (is_reliable = true).
         // SNMPv3 protocol correction is a separate state transition.
         .retry(Retry::fixed(3, Duration::ZERO))
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Use Client::new for manual transport construction
             let mut config = ClientConfig::default();
             config.auth = Auth::v2c("public");
-            config.timeout = Duration::from_secs(10);
+            config.request_timeout = Duration::from_secs(10);
             config.response_shape_policy = ResponseShapePolicy::Strict;
             let client = Client::new(transport, config)?;
 
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut config = ClientConfig::default();
             config.auth = Auth::v2c("public");
-            config.timeout = Duration::from_secs(10);
+            config.request_timeout = Duration::from_secs(10);
             let client = Client::new(transport, config)?;
 
             // Walk system subtree over TCP
@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match Client::builder(target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(15))
+        .request_timeout(Duration::from_secs(15))
         .connect_tcp()
         .await
     {
@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // UDP client - retries on timeout
     let udp_client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(2))
+        .request_timeout(Duration::from_secs(2))
         .retry(Retry::fixed(3, Duration::ZERO)) // Will retry up to 3 times on timeout
         .connect()
         .await;
@@ -180,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TCP client - no timeout retransmissions
     let tcp_client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(2))
+        .request_timeout(Duration::from_secs(2))
         .retry(Retry::fixed(3, Duration::ZERO)) // Ignored for TCP!
         .connect_tcp()
         .await;

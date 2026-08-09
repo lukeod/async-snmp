@@ -170,7 +170,7 @@ async fn run_get(
         .map_err(|error| async_snmp::Error::Config(error.to_string().into()))?;
 
     let client = Client::builder(target, auth)
-        .timeout(timeout)
+        .request_timeout(timeout)
         .retry(retry)
         .connect()
         .await?;

@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::builder(target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(10))
+        .request_timeout(Duration::from_secs(10))
         .retry(Retry::fixed(3, Duration::ZERO))
         .connect()
         .await?;
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client_auth = Client::builder(target, auth_only)
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(10))
+        .request_timeout(Duration::from_secs(10))
         .connect()
         .await?;
 
@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client_noauth = Client::builder(target, no_auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(10))
+        .request_timeout(Duration::from_secs(10))
         .connect()
         .await?;
 
@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Each client reuses the master keys; only localization is performed
         match Client::builder(*target_addr, auth)
-            .timeout(Duration::from_secs(2))
+            .request_timeout(Duration::from_secs(2))
             .retry(Retry::fixed(1, Duration::ZERO))
             .connect()
             .await
@@ -185,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Priv protocol: {:?}", PrivProtocol::Aes256);
 
     // Build but don't connect (just demonstrate configuration)
-    let _builder = Client::builder(target, strong_auth).timeout(Duration::from_secs(10));
+    let _builder = Client::builder(target, strong_auth).request_timeout(Duration::from_secs(10));
 
     // =========================================================================
     // Example 6: Context name for VACM
@@ -204,7 +204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Created auth config with context name 'vlan100'");
 
-    let _builder = Client::builder(target, auth_with_context).timeout(Duration::from_secs(10));
+    let _builder =
+        Client::builder(target, auth_with_context).request_timeout(Duration::from_secs(10));
 
     println!("\nExample complete!");
     Ok(())

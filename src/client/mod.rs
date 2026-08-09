@@ -8,7 +8,7 @@ mod v3;
 mod walk;
 
 pub use auth::{Auth, CommunityVersion};
-pub use builder::{ClientBuilder, Target};
+pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target};
 pub use response_shape::{
     FixedCardinalityOperation, FixedCardinalityResponse, ResponseShapeAnomaly, ResponseShapePolicy,
 };
@@ -106,7 +106,7 @@ pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Err
 // ============================================================================
 
 /// Default timeout for SNMP requests.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default maximum OIDs per request.
 ///
@@ -179,7 +179,7 @@ pub struct ClientConfig {
     /// Policy for correlating v1/v2c response communities (default: exact).
     pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
-    pub timeout: Duration,
+    pub request_timeout: Duration,
     /// Retry configuration (default: 3 retries, 1-second delay)
     pub retry: Retry,
     /// Maximum OIDs per request (default: 10)
@@ -221,7 +221,7 @@ impl Default for ClientConfig {
         Self {
             auth: Auth::default(),
             community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
-            timeout: DEFAULT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             response_shape_policy: ResponseShapePolicy::Compatible,
@@ -252,7 +252,7 @@ impl ClientConfig {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
-        crate::transport::checked_deadline(self.timeout, "request timeout")?;
+        crate::transport::checked_deadline(self.request_timeout, "request timeout")?;
 
         if self.max_oids_per_request == 0 {
             return Err(
@@ -397,7 +397,7 @@ impl<T: Transport> Client<T> {
             let community = self.inner.config.community()?;
             let registration = crate::transport::RequestRegistration::community(
                 request_id,
-                self.inner.config.timeout,
+                self.inner.config.request_timeout,
                 community_version,
                 community.clone(),
                 self.inner.config.community_response_policy,
@@ -1589,7 +1589,7 @@ mod tests {
         assert_config_error(Client::new(
             transport.clone(),
             ClientConfig {
-                timeout: Duration::MAX,
+                request_timeout: Duration::MAX,
                 ..ClientConfig::default()
             },
         ));
@@ -1635,7 +1635,7 @@ mod tests {
         Client::new(
             transport.clone(),
             ClientConfig {
-                timeout: Duration::ZERO,
+                request_timeout: Duration::ZERO,
                 ..ClientConfig::default()
             },
         )

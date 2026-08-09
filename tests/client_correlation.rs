@@ -50,7 +50,7 @@ async fn wrong_community_does_not_consume_pending_udp_request() {
     });
 
     let client = Client::builder(peer, Auth::v2c("public"))
-        .timeout(Duration::from_secs(2))
+        .request_timeout(Duration::from_secs(2))
         .retry(Retry::none())
         .connect()
         .await
@@ -128,7 +128,7 @@ async fn malformed_and_wrong_pdu_candidates_do_not_consume_udp_exchange() {
     });
 
     let client = Client::builder(peer, Auth::v2c("public"))
-        .timeout(Duration::from_secs(2))
+        .request_timeout(Duration::from_secs(2))
         .retry(Retry::none())
         .connect()
         .await
@@ -181,7 +181,7 @@ async fn non_utf8_community_correlates_udp_response() {
     });
 
     let client = Client::builder(peer, Auth::v2c(Bytes::from_static(b"public\xff")))
-        .timeout(Duration::from_secs(2))
+        .request_timeout(Duration::from_secs(2))
         .retry(Retry::none())
         .connect()
         .await

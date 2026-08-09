@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Request and construction deadlines are now independent.
+  `ClientBuilder::request_timeout`, `ClientConfig::request_timeout`, and
+  `DEFAULT_REQUEST_TIMEOUT` replace the former timeout names. The builder-only
+  `construction_timeout` defaults to `DEFAULT_CONSTRUCTION_TIMEOUT` (five
+  seconds) and applies one absolute deadline across resolution, UDP bind, and
+  TCP connect. Construction expiry reports the original `Target` and active
+  `ConstructionStage`. `TcpTransportBuilder::connect_timeout` replaces its
+  former setter; preconfigured and unbounded low-level transports remain
+  available as deadline-policy escape hatches.
 - Bounded walks now inspect exactly one look-ahead candidate after yielding the
   configured limit. Definite truncation ends with
   `WalkAbortReason::ResultLimitExceeded`; observed natural completion remains a

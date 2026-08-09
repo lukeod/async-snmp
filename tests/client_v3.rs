@@ -354,7 +354,7 @@ async fn v3_wrong_password_fails() {
         agent.addr().to_string(),
         Auth::usm("authuser").auth(AuthProtocol::Sha256, "wrongpassword"),
     )
-    .timeout(Duration::from_millis(500))
+    .request_timeout(Duration::from_millis(500))
     .retry(Retry::none())
     .connect()
     .await
@@ -387,7 +387,7 @@ async fn v3_unknown_user_auth_fails() {
         agent.addr().to_string(),
         Auth::usm("unknownuser").auth(AuthProtocol::Sha256, AUTH_PASS),
     )
-    .timeout(Duration::from_millis(500))
+    .request_timeout(Duration::from_millis(500))
     .retry(Retry::none())
     .connect()
     .await
@@ -415,7 +415,7 @@ async fn v3_unknown_user_no_auth_fails() {
 
     // Try to use unknown user with noAuthNoPriv - must fail per RFC 3414
     let client = Client::builder(agent.addr().to_string(), Auth::usm("unknownuser"))
-        .timeout(Duration::from_millis(500))
+        .request_timeout(Duration::from_millis(500))
         .retry(Retry::none())
         .connect()
         .await

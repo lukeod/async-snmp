@@ -14,7 +14,7 @@ async fn client_retries_on_timeout() {
     let agent = TestAgent::new().await;
 
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
-        .timeout(Duration::from_millis(100))
+        .request_timeout(Duration::from_millis(100))
         .retry(Retry::fixed(2, Duration::ZERO))
         .connect()
         .await
@@ -38,7 +38,7 @@ async fn client_fails_after_max_retries() {
     let start = Instant::now();
 
     let client = Client::builder(addr, Auth::v2c("public"))
-        .timeout(Duration::from_millis(50))
+        .request_timeout(Duration::from_millis(50))
         .retry(Retry::fixed(2, Duration::ZERO)) // 3 total attempts
         .connect()
         .await
@@ -66,7 +66,7 @@ async fn zero_retries_single_attempt() {
     let start = Instant::now();
 
     let client = Client::builder(addr, Auth::v2c("public"))
-        .timeout(Duration::from_millis(50))
+        .request_timeout(Duration::from_millis(50))
         .retry(Retry::none()) // No retries
         .connect()
         .await

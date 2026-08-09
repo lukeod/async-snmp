@@ -178,7 +178,7 @@ async fn run_walk(
         .map_err(|error| async_snmp::Error::Config(error.to_string().into()))?;
 
     let client = Client::builder(target, auth)
-        .timeout(timeout)
+        .request_timeout(timeout)
         .retry(retry)
         .walk_mode(walk_mode)
         .max_repetitions(args.walk.max_repetitions)

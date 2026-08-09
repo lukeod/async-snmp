@@ -32,7 +32,7 @@ fn client_config(
 ) -> ClientConfig {
     let mut config = ClientConfig::default();
     config.auth = auth;
-    config.timeout = LOOPBACK_TIMEOUT;
+    config.request_timeout = LOOPBACK_TIMEOUT;
     config.retry = retry;
     config.allow_unauthenticated_v3_time_correction = allow_unauthenticated_v3_time_correction;
     config
@@ -139,7 +139,7 @@ async fn udp_success_at_level(level: SecurityLevel) {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -566,7 +566,7 @@ async fn v3_udp_discovery_source_policy_is_builder_configurable() {
     )
     .await;
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -590,7 +590,7 @@ async fn v3_udp_discovery_source_policy_is_builder_configurable() {
     .await;
     let log = peer.log();
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .strict_source(true)
         .connect()
@@ -809,7 +809,7 @@ async fn v3_scripted_tcp_auth_priv_success() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .connect_tcp()
         .await
         .unwrap();
@@ -864,7 +864,7 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -972,7 +972,7 @@ async fn v3_udp_unauthenticated_time_report_gets_packet_local_correction() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .allow_unauthenticated_v3_time_correction(true)
         .connect()
@@ -1048,7 +1048,7 @@ async fn v3_udp_compatibility_respects_strict_source_policy() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .strict_source(true)
         .allow_unauthenticated_v3_time_correction(true)
@@ -1092,7 +1092,7 @@ async fn v3_tcp_unauthenticated_time_report_compatibility_succeeds() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .allow_unauthenticated_v3_time_correction(true)
         .connect_tcp()
@@ -1449,7 +1449,7 @@ async fn v3_tcp_time_window_report_gets_one_protocol_correction() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect_tcp()
         .await
@@ -1553,7 +1553,7 @@ async fn v3_report_on_final_timeout_attempt_still_gets_correction() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::fixed(1, Duration::ZERO))
         .connect()
         .await
@@ -1848,7 +1848,7 @@ async fn v3_noauth_client_rejects_authenticated_report() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(SecurityLevel::NoAuthNoPriv))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -1903,7 +1903,7 @@ async fn v3_authenticated_wrong_username_does_not_mutate_time_or_retry() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -1960,7 +1960,7 @@ async fn v3_authenticated_wrong_engine_id_does_not_trigger_report_retry() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2008,7 +2008,7 @@ async fn v3_auth_no_priv_client_rejects_auth_priv_without_time_mutation() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(client_level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2071,7 +2071,7 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2119,7 +2119,7 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2181,7 +2181,7 @@ async fn v3_auth_client_rejects_unauthenticated_response() {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2220,7 +2220,7 @@ async fn v3_auth_priv_client_rejects_auth_no_priv_response() {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(requested_level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2263,7 +2263,7 @@ async fn v3_auth_priv_client_classifies_encrypted_report() {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2313,7 +2313,7 @@ async fn v3_reserved_flag_bits_in_reply_ignored_for_level() {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2340,7 +2340,7 @@ async fn v3_scripted_udp_timeout_retry_count() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::fixed(2, Duration::ZERO))
         .connect()
         .await
@@ -2394,7 +2394,7 @@ async fn v3_udp_pending_map_ignores_wrong_ids_before_correlated_response() {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await
@@ -2422,7 +2422,7 @@ async fn v3_tcp_skips_wrong_response_msg_id_until_timeout() {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .connect_tcp()
         .await
         .unwrap();
@@ -2458,7 +2458,7 @@ async fn v3_tcp_skips_wrong_discovery_msg_id_until_timeout() {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .connect_tcp()
         .await
         .unwrap();
@@ -2834,7 +2834,7 @@ async fn v3_udp_accepts_late_response_to_prior_attempt() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::fixed(1, Duration::ZERO))
         .connect()
         .await
@@ -2992,7 +2992,7 @@ async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::fixed(1, Duration::ZERO))
         .connect()
         .await
@@ -3058,7 +3058,7 @@ async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correcti
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .timeout(LOOPBACK_TIMEOUT)
+        .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::fixed(1, Duration::ZERO))
         .allow_unauthenticated_v3_time_correction(true)
         .connect()

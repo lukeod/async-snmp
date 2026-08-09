@@ -198,7 +198,7 @@ async fn v2c_get_returns_value() {
     let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect()
         .await
         .unwrap();
@@ -223,7 +223,7 @@ async fn v1_get_returns_value() {
     let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v1(COMMUNITY))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect()
         .await
         .unwrap();
@@ -344,7 +344,7 @@ async fn v3_no_auth_no_priv() {
     let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::usm(users::NOAUTH_USER))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect()
         .await
         .unwrap();
@@ -366,7 +366,7 @@ async fn v3_auth_no_priv() {
         &target,
         Auth::usm(users::AUTHSHA256_USER).auth(AuthProtocol::Sha256, AUTH_PASS),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .unwrap();
@@ -393,7 +393,7 @@ async fn v3_auth_priv() {
             PRIV_PASS,
         ),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .unwrap();
@@ -420,7 +420,7 @@ async fn v3_auth_md5() {
         &target,
         Auth::usm(users::AUTHMD5_USER).auth(AuthProtocol::Md5, AUTH_PASS),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .unwrap();
@@ -442,7 +442,7 @@ async fn v3_auth_sha1() {
         &target,
         Auth::usm(users::AUTHSHA1_USER).auth(AuthProtocol::Sha1, AUTH_PASS),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .unwrap();
@@ -464,7 +464,7 @@ async fn v3_auth_sha256() {
         &target,
         Auth::usm(users::AUTHSHA256_USER).auth(AuthProtocol::Sha256, AUTH_PASS),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .unwrap();
@@ -480,7 +480,7 @@ async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
     let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::usm(user).auth(protocol, AUTH_PASS))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect()
         .await
         .unwrap();
@@ -533,7 +533,7 @@ async fn v3_priv_des() {
             PRIV_PASS,
         ),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .unwrap();
@@ -560,7 +560,7 @@ async fn v3_priv_aes128() {
             PRIV_PASS,
         ),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .unwrap();
@@ -606,7 +606,7 @@ async fn wrong_community_fails() {
     let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c("wrongcommunity"))
-        .timeout(Duration::from_secs(2))
+        .request_timeout(Duration::from_secs(2))
         .retry(Retry::none())
         .connect()
         .await
@@ -668,7 +668,7 @@ async fn tcp_transport_get() {
     let target = snmpd.tcp_target();
 
     let client = Client::builder(&target, Auth::v2c(COMMUNITY))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect_tcp()
         .await
         .expect("Failed to connect via TCP");
@@ -705,13 +705,13 @@ async fn shared_transport_multiple_clients() {
         .expect("Failed to bind shared transport");
 
     let client1 = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .build_with(&shared)
         .await
         .expect("Failed to build client1");
 
     let client2 = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .build_with(&shared)
         .await
         .expect("Failed to build client2");
@@ -752,7 +752,7 @@ async fn v3_engine_discovery_and_request() {
             PRIV_PASS,
         ),
     )
-    .timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(5))
     .connect()
     .await
     .expect("V3 connection with discovery should succeed");
@@ -781,7 +781,7 @@ async fn set_writable_oid() {
     let target = snmpd.udp_target();
 
     let client = Client::builder(&target, Auth::v2c("private"))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect()
         .await
         .unwrap();

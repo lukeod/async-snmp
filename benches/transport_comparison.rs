@@ -167,7 +167,7 @@ async fn benchmark_non_shared(
     let mut clients = Vec::with_capacity(targets.len());
     for target in targets {
         let client = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .retry(Retry::fixed(1, Duration::ZERO))
             .connect()
             .await
@@ -204,7 +204,7 @@ async fn benchmark_shared(
     let mut clients = Vec::with_capacity(targets.len());
     for target in targets {
         let client = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .retry(Retry::fixed(1, Duration::ZERO))
             .build_with(&shared)
             .await

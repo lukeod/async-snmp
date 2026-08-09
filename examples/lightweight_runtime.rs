@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .retry(Retry::fixed(2, Duration::ZERO))
         .connect()
         .await?;

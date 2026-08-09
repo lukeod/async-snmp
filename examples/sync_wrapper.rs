@@ -36,7 +36,7 @@ fn oneshot_get(
             Auth::v2c(Bytes::copy_from_slice(community.as_bytes())),
         )
         .response_shape_policy(ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .retry(Retry::fixed(2, Duration::ZERO))
         .connect()
         .await?;
@@ -67,7 +67,7 @@ impl SyncSnmpClient {
                 Auth::v2c(Bytes::copy_from_slice(community.as_bytes())),
             )
             .response_shape_policy(ResponseShapePolicy::Strict)
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .retry(Retry::fixed(2, Duration::ZERO))
             .connect()
             .await

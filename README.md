@@ -152,7 +152,8 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<async_snmp::Error>> {
     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
+        .construction_timeout(Duration::from_secs(5))
         .connect()
         .await?;
 
@@ -162,6 +163,10 @@ async fn main() -> Result<(), Box<async_snmp::Error>> {
     Ok(())
 }
 ```
+
+Request and construction timeouts are independent and both default to five
+seconds. Construction uses one total deadline across DNS and built-in transport
+creation.
 
 Fixed-cardinality `get`, `get_next`, and `set` operations (including their
 `*_many` forms) return a `FixedCardinalityResponse`. Its `varbinds` field keeps

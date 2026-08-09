@@ -27,7 +27,7 @@ const COMMUNITY: &str = "public";
 fn is_container_available(rt: &Runtime) -> bool {
     rt.block_on(async {
         match Client::builder(TARGET, Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_millis(500))
+            .request_timeout(Duration::from_millis(500))
             .retry(Retry::none())
             .connect()
             .await
@@ -52,7 +52,7 @@ fn bench_get_single(c: &mut Criterion) {
 
     let client = rt.block_on(async {
         Client::builder(TARGET, Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .retry(Retry::fixed(1, Duration::ZERO))
             .connect()
             .await
@@ -89,7 +89,7 @@ fn bench_get_many(c: &mut Criterion) {
 
     let client = rt.block_on(async {
         Client::builder(TARGET, Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .max_oids_per_request(10)
             .connect()
             .await
@@ -142,7 +142,7 @@ fn bench_get_next(c: &mut Criterion) {
 
     let client = rt.block_on(async {
         Client::builder(TARGET, Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .connect()
             .await
             .expect("Failed to connect")
@@ -171,7 +171,7 @@ fn bench_get_bulk(c: &mut Criterion) {
 
     let client = rt.block_on(async {
         Client::builder(TARGET, Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .connect()
             .await
             .expect("Failed to connect")
@@ -213,7 +213,7 @@ fn bench_walk(c: &mut Criterion) {
 
     let client = rt.block_on(async {
         Client::builder(TARGET, Auth::v2c(COMMUNITY))
-            .timeout(Duration::from_secs(5))
+            .request_timeout(Duration::from_secs(5))
             .connect()
             .await
             .expect("Failed to connect")
@@ -277,7 +277,7 @@ fn bench_client_construction(c: &mut Criterion) {
     group.bench_function("connect_v2c", |b| {
         b.to_async(&rt).iter(|| async {
             let client = Client::builder(TARGET, Auth::v2c(COMMUNITY))
-                .timeout(Duration::from_secs(5))
+                .request_timeout(Duration::from_secs(5))
                 .connect()
                 .await
                 .unwrap();
@@ -348,7 +348,7 @@ fn bench_concurrent(c: &mut Criterion) {
         let mut clients = Vec::new();
         for _ in 0..10 {
             let client = Client::builder(TARGET, Auth::v2c(COMMUNITY))
-                .timeout(Duration::from_secs(5))
+                .request_timeout(Duration::from_secs(5))
                 .connect()
                 .await
                 .expect("Failed to connect");

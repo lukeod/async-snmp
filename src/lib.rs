@@ -29,7 +29,7 @@
 //!     // SNMPv2c client - target accepts (host, port), a string, or a SocketAddr
 //!     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
 //!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-//!         .timeout(Duration::from_secs(5))
+//!         .request_timeout(Duration::from_secs(5))
 //!         .connect()
 //!         .await?;
 //!
@@ -118,7 +118,7 @@
 //! async fn poll_device(addr: &str) -> Result<String, String> {
 //!     let client = Client::builder(addr, Auth::v2c("public"))
 //!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-//!         .timeout(Duration::from_secs(5))
+//!         .request_timeout(Duration::from_secs(5))
 //!         .retry(Retry::fixed(2, Duration::ZERO))
 //!         .connect()
 //!         .await
@@ -442,6 +442,7 @@
 //! | UDP source correlation | off-target replies accepted with a warning | [`ClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`transport::TransportStats::unmatched`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
 //! | [`CommunityResponsePolicy`] | `Exact` | V1/v2c response communities match byte-for-byte. Rewrite policies emit warnings when used; accepting rewrites from any source weakens spoof resistance, especially with permissive UDP source handling. |
 //! | [`ClientBuilder::allow_unauthenticated_v3_time_correction`] | off | Allows one correlated, packet-local correction from an unauthenticated time-window Report. The tuple is never trusted globally, but an injector can choose one packet's time fields. Use strict UDP source correlation where possible; tracing records protocol correction. |
+//! | [`ClientBuilder::request_timeout`] / [`ClientBuilder::construction_timeout`] | 5 seconds / 5 seconds | Request waiting and client construction are independent. Construction uses one absolute deadline across resolution and built-in transport creation; [`Error::Timeout`] remains request-only. Preconfigured transports and [`ClientBuilder::build_with_transport`] allow application-owned deadline policy. |
 //!
 //! [`transport::TransportStats`] exposes UDP `delivered`, `expired`,
 //! `unmatched`, and `malformed` counters for transport health. It is not an
@@ -562,12 +563,13 @@ pub use agent::{
 };
 pub use client::{
     Auth, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
-    DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT,
-    FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering, ResponseShapeAnomaly,
-    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk, WalkMode, WalkStream,
+    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
+    DEFAULT_REQUEST_TIMEOUT, FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering,
+    ResponseShapeAnomaly, ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk,
+    WalkMode, WalkStream,
 };
 pub use compatibility::CompatibilityPolicy;
-pub use error::{Error, ErrorStatus, Result, WalkAbortReason};
+pub use error::{ConstructionStage, Error, ErrorStatus, Result, WalkAbortReason};
 #[cfg(feature = "agent")]
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,

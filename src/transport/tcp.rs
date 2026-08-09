@@ -48,7 +48,7 @@
 //! # async fn example() -> async_snmp::Result<()> {
 //! // Create a TCP client via the builder
 //! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .timeout(Duration::from_secs(10))
+//!     .request_timeout(Duration::from_secs(10))
 //!     .connect_tcp()
 //!     .await?;
 //! # Ok(())
@@ -75,7 +75,7 @@
 //! ```
 
 use super::{Candidate, RequestRegistration, ResponseIdentity, Transport, extract_request_id};
-use crate::error::{Error, Result};
+use crate::error::{ConstructionStage, Error, Result};
 use crate::message_size::ReceiveLimits;
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
@@ -135,7 +135,7 @@ impl Default for TcpOptions {
 ///
 /// # async fn example() -> async_snmp::Result<()> {
 /// let transport = TcpTransport::builder()
-///     .timeout(Duration::from_secs(10))
+///     .connect_timeout(Duration::from_secs(10))
 ///     .max_message_size(1_000_000)  // 1MB limit
 ///     .connect("192.168.1.1:161".parse().unwrap())
 ///     .await?;
@@ -144,7 +144,7 @@ impl Default for TcpOptions {
 /// ```
 #[derive(Debug)]
 pub struct TcpTransportBuilder {
-    timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
     options: TcpOptions,
 }
 
@@ -153,15 +153,15 @@ impl TcpTransportBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            timeout: None,
+            connect_timeout: None,
             options: TcpOptions::default(),
         }
     }
 
     /// Set connection timeout.
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
         self
     }
 
@@ -181,21 +181,30 @@ impl TcpTransportBuilder {
     pub async fn connect(self, target: SocketAddr) -> Result<TcpTransport> {
         // Validate the deadline before normalizing limits or starting connect
         // I/O so an unrepresentable duration has deterministic precedence.
+        let started = tokio::time::Instant::now();
         let connect_deadline = self
-            .timeout
+            .connect_timeout
             .map(|timeout| tcp_deadline(timeout, "TCP connect timeout"))
             .transpose()?;
         let receive_limits = ReceiveLimits::tcp(self.options.max_message_size)
             .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
-        let stream = match (self.timeout, connect_deadline) {
-            (Some(t), Some(deadline)) => {
+        let stream = match (self.connect_timeout, connect_deadline) {
+            (Some(_), Some(deadline)) if tokio::time::Instant::now() >= deadline => {
+                return Err(Error::ConstructionTimeout {
+                    target: target.into(),
+                    stage: ConstructionStage::Connect,
+                    elapsed: started.elapsed(),
+                }
+                .boxed());
+            }
+            (Some(_), Some(deadline)) => {
                 tokio::time::timeout_at(deadline, TcpStream::connect(target))
                     .await
                     .map_err(|_| {
-                        Error::Timeout {
-                            target,
-                            elapsed: t,
-                            retries: 0,
+                        Error::ConstructionTimeout {
+                            target: target.into(),
+                            stage: ConstructionStage::Connect,
+                            elapsed: started.elapsed(),
                         }
                         .boxed()
                     })?
@@ -358,7 +367,7 @@ impl TcpTransport {
     /// For additional configuration, use [`builder()`](Self::builder).
     pub async fn connect_timeout(target: SocketAddr, connect_timeout: Duration) -> Result<Self> {
         Self::builder()
-            .timeout(connect_timeout)
+            .connect_timeout(connect_timeout)
             .connect(target)
             .await
     }
@@ -373,7 +382,7 @@ impl TcpTransport {
     ///
     /// # async fn example() -> async_snmp::Result<()> {
     /// let transport = TcpTransport::builder()
-    ///     .timeout(Duration::from_secs(10))
+    ///     .connect_timeout(Duration::from_secs(10))
     ///     .max_message_size(1_000_000)
     ///     .connect("192.168.1.1:161".parse().unwrap())
     ///     .await?;

@@ -181,7 +181,7 @@ impl<T: Transport> Client<T> {
             )?;
             let discovery_data = discovery_msg.encode()?;
 
-            let registration = RequestRegistration::v3(msg_id, self.inner.config.timeout);
+            let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout);
 
             match self
                 .inner
@@ -783,7 +783,7 @@ impl<T: Transport> Client<T> {
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type(), snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type());
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
 
-            let registration = RequestRegistration::v3(msg_id, self.inner.config.timeout)
+            let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout)
                 .with_aliases(msg_id_window.iter().copied());
             msg_id_window.push(msg_id);
 

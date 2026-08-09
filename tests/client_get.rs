@@ -76,7 +76,7 @@ async fn get_timeout_when_agent_stopped() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let client = Client::builder(addr.to_string(), Auth::v2c("public"))
-        .timeout(Duration::from_millis(100))
+        .request_timeout(Duration::from_millis(100))
         .retry(Retry::none()) // No retries for faster test
         .connect()
         .await
@@ -248,7 +248,7 @@ async fn ipv6_transport_reaches_ipv4_agent() {
     // UdpTransport::handle() maps the IPv4 target to ::ffff:x.x.x.x.
     let transport = UdpTransport::bind("[::]:0").await.unwrap();
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
-        .timeout(Duration::from_secs(2))
+        .request_timeout(Duration::from_secs(2))
         .build_with(&transport)
         .await
         .unwrap();

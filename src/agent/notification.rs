@@ -123,7 +123,7 @@ impl TrapSink {
         }
         let config = ClientConfig {
             auth: self.auth.clone(),
-            timeout: self.inform_timeout,
+            request_timeout: self.inform_timeout,
             retry: self.inform_retry.clone(),
             ..ClientConfig::default()
         };

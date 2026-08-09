@@ -339,7 +339,7 @@ mod tests {
 
         // Connection should fail now
         let result = Client::builder(addr.to_string(), Auth::v2c("public"))
-            .timeout(std::time::Duration::from_millis(100))
+            .request_timeout(std::time::Duration::from_millis(100))
             .connect()
             .await;
 

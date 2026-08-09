@@ -3,6 +3,7 @@
 //! This module provides:
 //!
 //! - [`Error`] - The main error type covering all failure modes
+//! - [`ConstructionStage`] - The phase active at a construction deadline
 //! - [`ErrorStatus`] - SNMP protocol errors returned by agents (RFC 3416)
 //! - [`WalkAbortReason`] - Reasons a walk operation was aborted
 //!
@@ -116,6 +117,18 @@ impl std::error::Error for WalkAbortReason {}
 ///     )
 /// }
 /// ```
+/// Asynchronous phase active when bounded client construction timed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ConstructionStage {
+    /// Resolving the original target into socket addresses.
+    Resolve,
+    /// Binding a local UDP socket.
+    Bind,
+    /// Establishing a TCP connection.
+    Connect,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -133,6 +146,17 @@ pub enum Error {
         target: SocketAddr,
         elapsed: Duration,
         retries: u32,
+    },
+
+    /// Client construction exceeded its single total deadline.
+    #[error("construction timed out during {stage:?} after {elapsed:?} for {target}")]
+    ConstructionTimeout {
+        /// Original builder target, retained even when it is unresolved.
+        target: crate::client::Target,
+        /// Phase active when the absolute construction deadline expired.
+        stage: ConstructionStage,
+        /// Total time elapsed since bounded construction began.
+        elapsed: Duration,
     },
 
     /// Transport was shut down while a request was pending.

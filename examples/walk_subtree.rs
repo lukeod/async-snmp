@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Walk system subtree (collect all) ---\n");
 
     let client = Client::builder(target, Auth::v2c("public"))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         .connect()
         .await?;
 
@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Configured walk behavior ---\n");
 
     let configured_client = Client::builder(target, Auth::v2c("public"))
-        .timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(5))
         // Force GETNEXT mode (useful for buggy agents)
         .walk_mode(WalkMode::GetNext)
         // Allow non-increasing OIDs (some agents have bugs)

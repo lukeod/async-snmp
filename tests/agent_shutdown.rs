@@ -54,7 +54,7 @@ async fn start_agent(
 
 async fn client(addr: SocketAddr) -> Client {
     Client::builder(addr.to_string(), Auth::v2c("public"))
-        .timeout(TEST_TIMEOUT)
+        .request_timeout(TEST_TIMEOUT)
         .retry(Retry::none())
         .connect()
         .await

@@ -285,7 +285,7 @@ mod tests {
         let agent = SlowAgent::with_delay(Duration::from_millis(10)).await;
 
         let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
-            .timeout(Duration::from_secs(1))
+            .request_timeout(Duration::from_secs(1))
             .retry(Retry::none())
             .connect()
             .await

@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use async_snmp::transport::TcpOptions;
 use async_snmp::{
-    Auth, ClientConfig, CommunityVersion, CompatibilityPolicy, Oid, RequestRegistration,
+    Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
+    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Error, Oid, RequestRegistration, Target,
     WalkAbortReason,
 };
 #[cfg(feature = "agent")]
@@ -13,8 +14,8 @@ use bytes::Bytes;
 fn extensible_configs_support_default_plus_field_mutation() {
     let mut client = ClientConfig::default();
     client.auth = Auth::v1("private");
-    client.timeout = Duration::from_secs(2);
-    assert_eq!(client.timeout, Duration::from_secs(2));
+    client.request_timeout = Duration::from_secs(2);
+    assert_eq!(client.request_timeout, Duration::from_secs(2));
 
     let mut compatibility = CompatibilityPolicy::STRICT;
     compatibility.clamp_bounded_strings = true;
@@ -23,6 +24,24 @@ fn extensible_configs_support_default_plus_field_mutation() {
     let mut tcp = TcpOptions::default();
     tcp.max_message_size = 4096;
     assert_eq!(tcp.max_message_size, 4096);
+}
+
+#[test]
+fn timeout_apis_are_separate_and_public() {
+    let _builder = Client::builder("example.invalid", Auth::v2c("public"))
+        .request_timeout(Duration::from_secs(2))
+        .construction_timeout(Duration::from_secs(3));
+    let _tcp_builder = async_snmp::TcpTransport::builder().connect_timeout(Duration::from_secs(4));
+
+    assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(5));
+    assert_eq!(DEFAULT_CONSTRUCTION_TIMEOUT, Duration::from_secs(5));
+
+    let error = Error::ConstructionTimeout {
+        target: Target::from("unresolved.example"),
+        stage: ConstructionStage::Resolve,
+        elapsed: Duration::from_secs(5),
+    };
+    assert!(error.to_string().contains("unresolved.example"));
 }
 
 #[test]

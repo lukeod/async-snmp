@@ -5,6 +5,7 @@
 //! or v3 USM).
 
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,9 +14,10 @@ use super::Client;
 use crate::client::retry::Retry;
 use crate::client::walk::{OidOrdering, WalkMode};
 use crate::client::{
-    Auth, ClientConfig, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_TIMEOUT,
+    Auth, ClientConfig, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
+    DEFAULT_REQUEST_TIMEOUT,
 };
-use crate::error::{Error, Result};
+use crate::error::{ConstructionStage, Error, Result};
 use crate::transport::{CommunityResponsePolicy, TcpTransport, Transport, UdpHandle, UdpTransport};
 use crate::v3::{AuthoritativeEngine, EngineCache};
 
@@ -41,7 +43,7 @@ use crate::v3::{AuthoritativeEngine, EngineCache};
 /// // From a SocketAddr
 /// let t: Target = "192.168.1.1:161".parse::<std::net::SocketAddr>().unwrap().into();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     /// A combined address string, e.g. `"192.168.1.1:161"` or `"[::1]:162"`.
     /// Port defaults to 161 if not specified.
@@ -124,7 +126,7 @@ impl From<SocketAddr> for Target {
 /// // v3 client with authentication
 /// let client = ClientBuilder::new("192.168.1.1:161",
 ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"))
-///     .timeout(Duration::from_secs(10))
+///     .request_timeout(Duration::from_secs(10))
 ///     .retry(Retry::fixed(5, Duration::ZERO))
 ///     .connect().await?;
 /// # Ok(())
@@ -134,7 +136,8 @@ impl From<SocketAddr> for Target {
 pub struct ClientBuilder {
     target: Target,
     auth: Auth,
-    timeout: Duration,
+    request_timeout: Duration,
+    construction_timeout: Duration,
     retry: Retry,
     max_oids_per_request: usize,
     response_shape_policy: crate::client::ResponseShapePolicy,
@@ -183,7 +186,8 @@ impl ClientBuilder {
         Self {
             target: target.into(),
             auth: auth.into(),
-            timeout: DEFAULT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            construction_timeout: DEFAULT_CONSTRUCTION_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             response_shape_policy: crate::client::ResponseShapePolicy::Compatible,
@@ -211,11 +215,22 @@ impl ClientBuilder {
     /// use std::time::Duration;
     ///
     /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
-    ///     .timeout(Duration::from_secs(10));
+    ///     .request_timeout(Duration::from_secs(10));
     /// ```
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Set the total timeout for client construction (default: 5 seconds).
+    ///
+    /// One absolute deadline is shared by target resolution and any UDP bind or
+    /// TCP connect work. This setting has no effect on requests after the client
+    /// has been constructed. [`Duration::ZERO`] is an immediate deadline.
+    #[must_use]
+    pub fn construction_timeout(mut self, timeout: Duration) -> Self {
+        self.construction_timeout = timeout;
         self
     }
 
@@ -532,40 +547,58 @@ impl ClientBuilder {
         Ok(())
     }
 
-    /// Resolve target address to `SocketAddr`, defaulting to port 161.
+    /// Resolve all target addresses, defaulting to port 161.
     ///
     /// Accepts IPv4 (`192.168.1.1`, `192.168.1.1:162`), IPv6 (`::1`,
     /// `[::1]:162`), hostnames (`switch.local`, `switch.local:162`), and
     /// `(host, port)` tuples. When no port is specified, SNMP port 161 is used.
-    ///
-    /// IP addresses are parsed directly without DNS. Hostnames are resolved
-    /// asynchronously via `tokio::net::lookup_host`, bounded by the builder's
-    /// configured timeout. To bypass DNS entirely, pass a resolved IP address.
-    async fn resolve_target(&self) -> Result<SocketAddr> {
+    #[cfg(test)]
+    async fn resolve_targets(&self) -> Result<Vec<SocketAddr>> {
+        let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
+        self.resolve_targets_with(&deadline, |host, port| async move {
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map(|addresses| addresses.collect())
+                .map_err(|error| {
+                    Error::Config(format!("could not resolve address '{host}': {error}").into())
+                        .boxed()
+                })
+        })
+        .await
+    }
+
+    async fn resolve_targets_with<F, Fut>(
+        &self,
+        deadline: &ConstructionDeadline,
+        resolver: F,
+    ) -> Result<Vec<SocketAddr>>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: Future<Output = Result<Vec<SocketAddr>>>,
+    {
         let (host, port) = match &self.target {
             Target::Address(addr) => split_host_port(addr),
             Target::HostPort(host, port) => (host.as_str(), *port),
         };
+        let host = host.to_owned();
+        let original_target = self.target.clone();
 
-        // Try direct parse first to avoid unnecessary async DNS lookup
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            return Ok(SocketAddr::new(ip, port));
-        }
+        deadline
+            .run(ConstructionStage::Resolve, async move {
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    return Ok(vec![SocketAddr::new(ip, port)]);
+                }
 
-        let lookup = tokio::net::lookup_host((host, port));
-        let mut addrs = tokio::time::timeout(self.timeout, lookup)
+                let addresses = resolver(host, port).await?;
+                if addresses.is_empty() {
+                    return Err(Error::Config(
+                        format!("could not resolve address '{original_target}'").into(),
+                    )
+                    .boxed());
+                }
+                Ok(addresses)
+            })
             .await
-            .map_err(|_| {
-                Error::Config(format!("DNS lookup timed out for '{}'", self.target).into()).boxed()
-            })?
-            .map_err(|e| {
-                Error::Config(format!("could not resolve address '{}': {}", self.target, e).into())
-                    .boxed()
-            })?;
-
-        addrs.next().ok_or_else(|| {
-            Error::Config(format!("could not resolve address '{}'", self.target).into()).boxed()
-        })
     }
 
     /// Build `ClientConfig` from the builder settings.
@@ -573,7 +606,7 @@ impl ClientBuilder {
         ClientConfig {
             auth: self.auth.clone(),
             community_response_policy: self.community_response_policy,
-            timeout: self.timeout,
+            request_timeout: self.request_timeout,
             retry: self.retry.clone(),
             max_oids_per_request: self.max_oids_per_request,
             response_shape_policy: self.response_shape_policy,
@@ -621,9 +654,36 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect(mut self) -> Result<Client<UdpHandle>> {
+    pub async fn connect(self) -> Result<Client<UdpHandle>> {
+        self.connect_with(
+            |host, port| async move {
+                tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .map(|addresses| addresses.collect())
+                    .map_err(|error| {
+                        Error::Config(format!("could not resolve address '{host}': {error}").into())
+                            .boxed()
+                    })
+            },
+            |bind_addr| async move { UdpTransport::bind(bind_addr).await },
+        )
+        .await
+    }
+
+    async fn connect_with<R, RFut, B, BFut>(
+        mut self,
+        resolver: R,
+        binder: B,
+    ) -> Result<Client<UdpHandle>>
+    where
+        R: FnOnce(String, u16) -> RFut,
+        RFut: Future<Output = Result<Vec<SocketAddr>>>,
+        B: FnOnce(&'static str) -> BFut,
+        BFut: Future<Output = Result<UdpTransport>>,
+    {
         self.validate_and_precompute()?;
-        let addr = self.resolve_target().await?;
+        let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
+        let addr = self.resolve_targets_with(&deadline, resolver).await?[0];
         // Match bind address to target address family for cross-platform
         // compatibility. Dual-stack ([::]:0) only works reliably on Linux;
         // macOS/BSD default to IPV6_V6ONLY=1 and reject IPv4 targets.
@@ -632,7 +692,9 @@ impl ClientBuilder {
         } else {
             "0.0.0.0:0"
         };
-        let transport = UdpTransport::bind(bind_addr).await?;
+        let transport = deadline
+            .run(ConstructionStage::Bind, binder(bind_addr))
+            .await?;
         let handle = transport.handle(addr).strict_source(self.strict_source);
         self.build_inner(handle)
     }
@@ -660,17 +722,30 @@ impl ClientBuilder {
     /// ```
     pub async fn build_with(mut self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
         self.validate_and_precompute()?;
-        let addr = self.resolve_target().await?;
-        let handle = transport.handle(addr).strict_source(self.strict_source);
+        let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
+        let addresses = self
+            .resolve_targets_with(&deadline, |host, port| async move {
+                tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .map(|addresses| addresses.collect())
+                    .map_err(|error| {
+                        Error::Config(format!("could not resolve address '{host}': {error}").into())
+                            .boxed()
+                    })
+            })
+            .await?;
+        let handle = transport
+            .handle(addresses[0])
+            .strict_source(self.strict_source);
         self.build_inner(handle)
     }
 
     /// Build a client around an already-created transport.
     ///
     /// The supplied transport owns its peer address and any source-validation
-    /// policy. The builder target and [`strict_source`](Self::strict_source)
-    /// setting are not applied, and this method does not resolve an address or
-    /// create a socket.
+    /// policy. The builder target, [`strict_source`](Self::strict_source), and
+    /// [`construction_timeout`](Self::construction_timeout) settings are not
+    /// applied, and this method does not resolve an address or create a socket.
     ///
     /// # Errors
     ///
@@ -705,6 +780,8 @@ impl ClientBuilder {
     ///
     /// For advanced TCP configuration (connection timeout, keepalive, buffer
     /// sizes), construct a [`TcpTransport`] directly and use [`Client::new()`].
+    /// [`TcpTransport::connect`] remains unbounded for applications that own a
+    /// different deadline policy.
     ///
     /// # Errors
     ///
@@ -722,13 +799,87 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect_tcp(mut self) -> Result<Client<TcpTransport>> {
+    pub async fn connect_tcp(self) -> Result<Client<TcpTransport>> {
+        self.connect_tcp_with(
+            |host, port| async move {
+                tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .map(|addresses| addresses.collect())
+                    .map_err(|error| {
+                        Error::Config(format!("could not resolve address '{host}': {error}").into())
+                            .boxed()
+                    })
+            },
+            |address| async move { TcpTransport::connect(address).await },
+        )
+        .await
+    }
+
+    async fn connect_tcp_with<R, RFut, C, CFut>(
+        mut self,
+        resolver: R,
+        connector: C,
+    ) -> Result<Client<TcpTransport>>
+    where
+        R: FnOnce(String, u16) -> RFut,
+        RFut: Future<Output = Result<Vec<SocketAddr>>>,
+        C: FnOnce(SocketAddr) -> CFut,
+        CFut: Future<Output = Result<TcpTransport>>,
+    {
         self.validate_and_precompute()?;
-        let addr = self.resolve_target().await?;
-        let transport = TcpTransport::connect(addr).await?;
+        let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
+        let addr = self.resolve_targets_with(&deadline, resolver).await?[0];
+        let transport = deadline
+            .run(ConstructionStage::Connect, connector(addr))
+            .await?;
         self.build_inner(transport)
     }
 }
+
+struct ConstructionDeadline {
+    target: Target,
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+}
+
+impl ConstructionDeadline {
+    fn new(target: &Target, timeout: Duration) -> Result<Self> {
+        let started = tokio::time::Instant::now();
+        let deadline = started.checked_add(timeout).ok_or_else(|| {
+            Error::Config("construction timeout exceeds the representable deadline".into()).boxed()
+        })?;
+        Ok(Self {
+            target: target.clone(),
+            started,
+            deadline,
+        })
+    }
+
+    async fn run<T, F>(&self, stage: ConstructionStage, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(self.timeout_error(stage));
+        }
+
+        tokio::time::timeout_at(self.deadline, future)
+            .await
+            .map_err(|_| self.timeout_error(stage))?
+    }
+
+    fn timeout_error(&self, stage: ConstructionStage) -> Box<Error> {
+        Error::ConstructionTimeout {
+            target: self.target.clone(),
+            stage,
+            elapsed: self.started.elapsed(),
+        }
+        .boxed()
+    }
+}
+
+/// Default total timeout for resolving and creating a built-in transport.
+pub const DEFAULT_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default SNMP port.
 const DEFAULT_PORT: u16 = 161;
@@ -773,7 +924,14 @@ mod tests {
     fn test_builder_defaults() {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::default());
         assert!(matches!(builder.target, Target::Address(ref s) if s == "192.168.1.1:161"));
-        assert_eq!(builder.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(builder.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(builder.construction_timeout, DEFAULT_CONSTRUCTION_TIMEOUT);
+        assert_eq!(
+            ClientConfig::default().request_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(DEFAULT_CONSTRUCTION_TIMEOUT, Duration::from_secs(5));
         assert_eq!(builder.retry.max_attempts(), 3);
         assert_eq!(builder.max_oids_per_request, DEFAULT_MAX_OIDS_PER_REQUEST);
         assert_eq!(
@@ -801,7 +959,8 @@ mod tests {
     fn test_builder_with_options() {
         let cache = Arc::new(EngineCache::new());
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("private"))
-            .timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_secs(10))
+            .construction_timeout(Duration::from_secs(7))
             .retry(Retry::fixed(5, Duration::ZERO))
             .max_oids_per_request(20)
             .response_shape_policy(crate::client::ResponseShapePolicy::Strict)
@@ -814,7 +973,8 @@ mod tests {
             .community_response_policy(CommunityResponsePolicy::AllowMismatchFromTarget)
             .allow_unauthenticated_v3_time_correction(true);
 
-        assert_eq!(builder.timeout, Duration::from_secs(10));
+        assert_eq!(builder.request_timeout, Duration::from_secs(10));
+        assert_eq!(builder.construction_timeout, Duration::from_secs(7));
         assert_eq!(builder.retry.max_attempts(), 5);
         assert_eq!(builder.max_oids_per_request, 20);
         assert_eq!(
@@ -837,6 +997,199 @@ mod tests {
                 .build_config()
                 .allow_unauthenticated_v3_time_correction
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_tcp_connect_uses_construction_deadline_and_diagnostics() {
+        let future = ClientBuilder::new("device.example:1161", Auth::v2c("public"))
+            .request_timeout(Duration::from_secs(91))
+            .construction_timeout(Duration::from_secs(5))
+            .connect_tcp_with(
+                |_, _| async { Ok(vec!["192.0.2.1:1161".parse().unwrap()]) },
+                |_| std::future::pending::<Result<TcpTransport>>(),
+            );
+        let task = tokio::spawn(future);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let error = task
+            .await
+            .unwrap()
+            .err()
+            .expect("construction must time out");
+        match *error {
+            Error::ConstructionTimeout {
+                target,
+                stage,
+                elapsed,
+            } => {
+                assert_eq!(target, Target::Address("device.example:1161".to_owned()));
+                assert_eq!(stage, ConstructionStage::Connect);
+                assert_eq!(elapsed, Duration::from_secs(5));
+            }
+            other => panic!("expected construction timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolution_and_tcp_connect_share_one_total_budget() {
+        let future = ClientBuilder::new("device.example", Auth::v2c("public"))
+            .construction_timeout(Duration::from_secs(5))
+            .connect_tcp_with(
+                |_, _| async {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    Ok(vec!["192.0.2.1:161".parse().unwrap()])
+                },
+                |_| std::future::pending::<Result<TcpTransport>>(),
+            );
+        let task = tokio::spawn(future);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let error = task
+            .await
+            .unwrap()
+            .err()
+            .expect("construction must time out");
+        assert!(matches!(
+            *error,
+            Error::ConstructionTimeout {
+                stage: ConstructionStage::Connect,
+                elapsed,
+                ..
+            } if elapsed == Duration::from_secs(5)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_resolution_uses_construction_deadline() {
+        let future = ClientBuilder::new("device.example", Auth::v2c("public"))
+            .construction_timeout(Duration::from_secs(3))
+            .connect_with(
+                |_, _| std::future::pending::<Result<Vec<SocketAddr>>>(),
+                |_| async { panic!("bind must not begin while resolution is pending") },
+            );
+        let task = tokio::spawn(future);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+
+        let error = task
+            .await
+            .unwrap()
+            .err()
+            .expect("construction must time out");
+        assert!(matches!(
+            *error,
+            Error::ConstructionTimeout {
+                stage: ConstructionStage::Resolve,
+                elapsed,
+                ..
+            } if elapsed == Duration::from_secs(3)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_bind_uses_remaining_construction_deadline() {
+        let future = ClientBuilder::new("192.0.2.1", Auth::v2c("public"))
+            .construction_timeout(Duration::from_secs(2))
+            .connect_with(
+                |_, _| async { panic!("numeric targets must not invoke the resolver") },
+                |_| std::future::pending::<Result<UdpTransport>>(),
+            );
+        let task = tokio::spawn(future);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let error = task
+            .await
+            .unwrap()
+            .err()
+            .expect("construction must time out");
+        assert!(matches!(
+            *error,
+            Error::ConstructionTimeout {
+                stage: ConstructionStage::Bind,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_tcp_listener_connects_with_construction_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let client = ClientBuilder::new(address, Auth::v2c("public"))
+            .construction_timeout(Duration::from_secs(5))
+            .connect_tcp()
+            .await
+            .unwrap();
+        assert_eq!(client.peer_addr(), address);
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_construction_timeout_precedes_resolution() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let error = ClientBuilder::new("device.example", Auth::v2c("public"))
+            .construction_timeout(Duration::MAX)
+            .connect_tcp_with(
+                move |_, _| {
+                    resolver_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async { Ok(vec!["127.0.0.1:161".parse().unwrap()]) }
+                },
+                |_| std::future::pending::<Result<TcpTransport>>(),
+            )
+            .await
+            .err()
+            .expect("unrepresentable timeout must fail");
+
+        assert!(matches!(*error, Error::Config(_)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_construction_timeout_is_immediate() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let error = ClientBuilder::new("device.example", Auth::v2c("public"))
+            .construction_timeout(Duration::ZERO)
+            .connect_tcp_with(
+                move |_, _| {
+                    resolver_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async { Ok(vec!["127.0.0.1:161".parse().unwrap()]) }
+                },
+                |_| std::future::pending::<Result<TcpTransport>>(),
+            )
+            .await
+            .err()
+            .expect("zero timeout must fail");
+
+        assert!(matches!(
+            *error,
+            Error::ConstructionTimeout {
+                target: Target::Address(ref target),
+                stage: ConstructionStage::Resolve,
+                ..
+            } if target == "device.example"
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn request_and_construction_settings_are_independent() {
+        let builder = ClientBuilder::new("unused.invalid", Auth::v2c("public"))
+            .request_timeout(Duration::from_secs(11))
+            .construction_timeout(Duration::from_secs(17));
+        assert_eq!(
+            builder.build_config().request_timeout,
+            Duration::from_secs(11)
+        );
+        assert_eq!(builder.construction_timeout, Duration::from_secs(17));
     }
 
     #[test]
@@ -901,7 +1254,7 @@ mod tests {
             calls: Arc::clone(&calls),
         };
         let client = ClientBuilder::new("unused.invalid", Auth::v2c("private"))
-            .timeout(Duration::from_secs(9))
+            .request_timeout(Duration::from_secs(9))
             .retry(Retry::none())
             .max_oids_per_request(7)
             .walk_mode(WalkMode::GetNext)
@@ -911,7 +1264,7 @@ mod tests {
             .build_with_transport(transport.clone())
             .expect("valid custom-transport client");
 
-        assert_eq!(client.inner.config.timeout, Duration::from_secs(9));
+        assert_eq!(client.inner.config.request_timeout, Duration::from_secs(9));
         assert_eq!(client.inner.config.retry.max_attempts(), 0);
         assert_eq!(client.inner.config.max_oids_per_request, 7);
         assert_eq!(client.inner.config.walk_mode, WalkMode::GetNext);
@@ -1090,29 +1443,29 @@ mod tests {
     async fn test_resolve_target_socket_addr() {
         let addr: SocketAddr = "10.0.0.1:162".parse().unwrap();
         let builder = ClientBuilder::new(addr, Auth::default());
-        let resolved = builder.resolve_target().await.unwrap();
-        assert_eq!(resolved, addr);
+        let resolved = builder.resolve_targets().await.unwrap();
+        assert_eq!(resolved, vec![addr]);
     }
 
     #[tokio::test]
     async fn test_resolve_target_host_port_ipv4() {
         let builder = ClientBuilder::new(("192.168.1.1", 162), Auth::default());
-        let addr = builder.resolve_target().await.unwrap();
-        assert_eq!(addr, "192.168.1.1:162".parse().unwrap());
+        let addrs = builder.resolve_targets().await.unwrap();
+        assert_eq!(addrs, vec!["192.168.1.1:162".parse().unwrap()]);
     }
 
     #[tokio::test]
     async fn test_resolve_target_host_port_ipv6() {
         let builder = ClientBuilder::new(("::1", 161), Auth::default());
-        let addr = builder.resolve_target().await.unwrap();
-        assert_eq!(addr, "[::1]:161".parse().unwrap());
+        let addrs = builder.resolve_targets().await.unwrap();
+        assert_eq!(addrs, vec!["[::1]:161".parse().unwrap()]);
     }
 
     #[tokio::test]
     async fn test_resolve_target_string_still_works() {
         let builder = ClientBuilder::new("10.0.0.1:162", Auth::default());
-        let addr = builder.resolve_target().await.unwrap();
-        assert_eq!(addr, "10.0.0.1:162".parse().unwrap());
+        let addrs = builder.resolve_targets().await.unwrap();
+        assert_eq!(addrs, vec!["10.0.0.1:162".parse().unwrap()]);
     }
 
     #[test]
