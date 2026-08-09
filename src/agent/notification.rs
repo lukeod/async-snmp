@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::Community;
 use crate::client::{Auth, Client, ClientConfig, CommunityVersion, Retry};
 use crate::error::{Error, Result};
 use crate::handler::SecurityModel;
@@ -29,7 +30,7 @@ pub(crate) struct TrapSink {
     pub(crate) dest: SocketAddr,
     auth: Auth,
     pub(crate) version: Version,
-    pub(crate) community: Bytes,
+    pub(crate) community: Community,
     pub(crate) v3_security: Option<UsmConfig>,
     /// Keys derived against the agent's `engine_id` for V3 trap sending.
     /// Lazily populated on first use.
@@ -73,7 +74,7 @@ impl TrapSink {
                 dest,
                 auth: sink_auth,
                 version: Version::V3,
-                community: Bytes::new(),
+                community: Community::default(),
                 v3_security: Some(security),
                 derived_keys: RwLock::new(None),
                 inform_timeout,
@@ -426,7 +427,7 @@ impl super::Agent {
                 };
                 (
                     model,
-                    community.as_ref(),
+                    community.as_bytes(),
                     SecurityLevel::NoAuthNoPriv,
                     &[][..],
                 )

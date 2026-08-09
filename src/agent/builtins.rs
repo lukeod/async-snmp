@@ -330,7 +330,7 @@ mod tests {
             source: "127.0.0.1:12345".parse().unwrap(),
             version: Version::V2c,
             security_model: SecurityModel::V2c,
-            security_name: Bytes::from_static(b"public"),
+            security_name: crate::SecurityName::Community(crate::Community::from("public")),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
             request_id: 1,

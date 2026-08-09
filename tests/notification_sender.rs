@@ -340,7 +340,7 @@ async fn v2c_trap_send_receive() {
             varbinds,
             ..
         } => {
-            assert_eq!(community.as_ref(), b"public");
+            assert_eq!(community.as_bytes(), b"public");
             assert_eq!(uptime, 12345);
             assert_eq!(received_oid, trap_oid);
             assert_eq!(varbinds.len(), 1);
@@ -387,7 +387,7 @@ async fn v2c_inform_send_receive() {
             varbinds,
             ..
         } => {
-            assert_eq!(community.as_ref(), b"public");
+            assert_eq!(community.as_bytes(), b"public");
             assert_eq!(uptime, 5000);
             assert_eq!(received_oid, trap_oid);
             assert_eq!(varbinds.len(), 0);
@@ -549,7 +549,7 @@ async fn v1_trap_send_receive() {
 
     match notification {
         Notification::TrapV1 { community, trap } => {
-            assert_eq!(community.as_ref(), b"public");
+            assert_eq!(community.as_bytes(), b"public");
             assert_eq!(trap.generic_trap, GenericTrap::LinkDown);
             assert_eq!(trap.time_stamp, 5000);
         }
@@ -589,7 +589,7 @@ async fn v1_trap_send_v1_trap_explicit() {
 
     match notification {
         Notification::TrapV1 { community, trap } => {
-            assert_eq!(community.as_ref(), b"public");
+            assert_eq!(community.as_bytes(), b"public");
             assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
             assert_eq!(trap.agent_addr, [10, 0, 0, 1]);
             assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
@@ -704,7 +704,7 @@ async fn agent_v2c_trap_to_sink() {
             trap_oid: received_oid,
             ..
         } => {
-            assert_eq!(community.as_ref(), b"public");
+            assert_eq!(community.as_bytes(), b"public");
             assert_eq!(uptime, 500);
             assert_eq!(received_oid, trap_oid);
         }
@@ -847,13 +847,13 @@ async fn agent_multiple_sinks() {
     // Verify different communities
     match n1 {
         Notification::TrapV2c { community, .. } => {
-            assert_eq!(community.as_ref(), b"public");
+            assert_eq!(community.as_bytes(), b"public");
         }
         other => panic!("expected TrapV2c, got {other:?}"),
     }
     match n2 {
         Notification::TrapV2c { community, .. } => {
-            assert_eq!(community.as_ref(), b"trap-community");
+            assert_eq!(community.as_bytes(), b"trap-community");
         }
         other => panic!("expected TrapV2c, got {other:?}"),
     }
@@ -886,7 +886,7 @@ async fn agent_v1_trap_to_sink() {
 
     match notification {
         Notification::TrapV1 { community, trap } => {
-            assert_eq!(community.as_ref(), b"public");
+            assert_eq!(community.as_bytes(), b"public");
             assert_eq!(trap.generic_trap, GenericTrap::WarmStart);
             assert_eq!(trap.time_stamp, 1000);
         }
@@ -929,7 +929,7 @@ async fn agent_mixed_v1_v2c_sinks() {
     // V1 sink gets a TrapV1
     match n1 {
         Notification::TrapV1 { community, trap } => {
-            assert_eq!(community.as_ref(), b"v1comm");
+            assert_eq!(community.as_bytes(), b"v1comm");
             assert_eq!(trap.generic_trap, GenericTrap::LinkUp);
             assert_eq!(trap.time_stamp, 777);
         }
@@ -944,7 +944,7 @@ async fn agent_mixed_v1_v2c_sinks() {
             trap_oid: received_oid,
             ..
         } => {
-            assert_eq!(community.as_ref(), b"v2comm");
+            assert_eq!(community.as_bytes(), b"v2comm");
             assert_eq!(uptime, 777);
             assert_eq!(received_oid, trap_oid);
         }

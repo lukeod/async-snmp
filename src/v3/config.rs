@@ -44,6 +44,13 @@ enum UsmCredentials {
 /// derivation. Calling [`with_master_keys`](Self::with_master_keys) replaces
 /// any password-backed credentials with cached master keys. Credential
 /// configurators use last-call-wins semantics.
+///
+/// # Password storage
+///
+/// Password-backed configurations zeroize the specifically owned password
+/// buffers when those buffers are dropped. This guarantee does not extend to
+/// caller-provided inputs, live clones, allocator or cryptographic-provider
+/// internals, encoded message buffers, or kernel copies.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UsmConfig {
     username: Bytes,

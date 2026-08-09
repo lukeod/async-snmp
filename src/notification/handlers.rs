@@ -29,7 +29,7 @@ impl super::NotificationReceiver {
 
         if !crate::util::community_matches(
             &self.inner.communities,
-            msg.community(),
+            msg.community().as_bytes(),
             crate::util::EmptyCommunityPolicy::Allow,
         ) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v1 notification with unaccepted community");
@@ -55,7 +55,7 @@ impl super::NotificationReceiver {
 
         if !crate::util::community_matches(
             &self.inner.communities,
-            msg.community(),
+            msg.community().as_bytes(),
             crate::util::EmptyCommunityPolicy::Allow,
         ) {
             tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v2c notification with unaccepted community");

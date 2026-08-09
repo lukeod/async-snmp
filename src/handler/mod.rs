@@ -165,7 +165,7 @@ mod oid_table;
 mod results;
 mod traits;
 
-pub use context::RequestContext;
+pub use context::{RequestContext, SecurityName};
 pub use oid_table::OidTable;
 pub use results::{GetNextResult, GetResult, HandlerError, HandlerResult, SetResult};
 pub use traits::{BoxFuture, MibHandler};

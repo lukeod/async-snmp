@@ -170,6 +170,7 @@
 //! - **SNMPv2c/v3 SET**: Returns `noAccess` error
 
 use std::collections::HashMap;
+use std::fmt;
 
 use bytes::Bytes;
 
@@ -728,7 +729,7 @@ impl AccessEntryBuilder {
 }
 
 /// VACM configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct VacmConfig {
     /// (securityModel selector, securityName) → groupName
     security_to_group: HashMap<(VacmSecurityModel, Bytes), Bytes>,
@@ -736,6 +737,51 @@ pub struct VacmConfig {
     access_entries: Vec<VacmAccessEntry>,
     /// viewName → View
     views: HashMap<Bytes, View>,
+}
+
+impl fmt::Debug for VacmConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VacmConfig")
+            .field(
+                "security_to_group",
+                &RedactedSecurityMappings(&self.security_to_group),
+            )
+            .field("access_entries", &self.access_entries)
+            .field("views", &self.views)
+            .finish()
+    }
+}
+
+struct RedactedSecurityMappings<'a>(&'a HashMap<(VacmSecurityModel, Bytes), Bytes>);
+
+impl fmt::Debug for RedactedSecurityMappings<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for ((security_model, _security_name), group_name) in self.0 {
+            list.entry(&RedactedSecurityMapping {
+                security_model,
+                security_name: "[REDACTED]",
+                group_name,
+            });
+        }
+        list.finish()
+    }
+}
+
+struct RedactedSecurityMapping<'a> {
+    security_model: &'a VacmSecurityModel,
+    security_name: &'static str,
+    group_name: &'a Bytes,
+}
+
+impl fmt::Debug for RedactedSecurityMapping<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecurityMapping")
+            .field("security_model", self.security_model)
+            .field("security_name", &self.security_name)
+            .field("group_name", self.group_name)
+            .finish()
+    }
 }
 
 impl VacmConfig {

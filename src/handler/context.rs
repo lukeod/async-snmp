@@ -7,11 +7,47 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
+use crate::Community;
 use crate::message::SecurityLevel;
 use crate::pdu::PduType;
 use crate::version::Version;
 
 use super::SecurityModel;
+
+/// A request's model-specific security name.
+///
+/// Community variants retain transitive Debug redaction, while USM usernames
+/// remain visible in diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SecurityName {
+    /// SNMPv1/v2c community identifier.
+    Community(Community),
+    /// SNMPv3 USM username.
+    Usm(Bytes),
+}
+
+impl SecurityName {
+    /// Return the protocol bytes for authorization and sizing.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Community(community) => community.as_bytes(),
+            Self::Usm(username) => username,
+        }
+    }
+
+    /// Return the length of the security name in octets.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    /// Return whether the security name is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_bytes().is_empty()
+    }
+}
 
 /// Request context passed to MIB handlers.
 ///
@@ -76,11 +112,8 @@ pub struct RequestContext {
     /// - `Usm` for `SNMPv3` User-based Security Model
     pub security_model: SecurityModel,
 
-    /// Security name (community string or USM username).
-    ///
-    /// For v1/v2c: the community string
-    /// For v3: the USM username
-    pub security_name: Bytes,
+    /// Model-specific community identifier or USM username.
+    pub security_name: SecurityName,
 
     /// Security level (v3 only, `NoAuthNoPriv` for v1/v2c).
     ///
@@ -135,7 +168,7 @@ impl RequestContext {
             source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             version: Version::V2c,
             security_model: SecurityModel::V2c,
-            security_name: Bytes::from_static(b"public"),
+            security_name: SecurityName::Community(Community::from("public")),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
             request_id: 1,

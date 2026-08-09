@@ -139,6 +139,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::Community;
 use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tracing::instrument;
@@ -245,7 +246,7 @@ pub mod oids {
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
     usm_users: HashMap<Bytes, UsmConfig>,
-    communities: Vec<Vec<u8>>,
+    communities: Vec<Community>,
     authoritative_engine: Option<AuthoritativeEngine>,
     varbind_validation: NotificationVarbindValidation,
     max_message_size: usize,
@@ -382,8 +383,8 @@ impl NotificationReceiverBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn community(mut self, community: &[u8]) -> Self {
-        self.communities.push(community.to_vec());
+    pub fn community(mut self, community: impl Into<Community>) -> Self {
+        self.communities.push(community.into());
         self
     }
 
@@ -410,10 +411,10 @@ impl NotificationReceiverBuilder {
     pub fn communities<I, C>(mut self, communities: I) -> Self
     where
         I: IntoIterator<Item = C>,
-        C: AsRef<[u8]>,
+        C: Into<Community>,
     {
         for c in communities {
-            self.communities.push(c.as_ref().to_vec());
+            self.communities.push(c.into());
         }
         self
     }
@@ -535,7 +536,7 @@ pub enum Notification {
     /// `SNMPv1` Trap with unique PDU structure.
     TrapV1 {
         /// Community string used for authentication
-        community: Bytes,
+        community: Community,
         /// The trap PDU
         trap: TrapV1Pdu,
     },
@@ -543,7 +544,7 @@ pub enum Notification {
     /// `SNMPv2c` Trap (unconfirmed notification).
     TrapV2c {
         /// Community string used for authentication
-        community: Bytes,
+        community: Community,
         /// sysUpTime.0 value (hundredths of seconds since agent init)
         uptime: u32,
         /// snmpTrapOID.0 value (trap type identifier)
@@ -581,7 +582,7 @@ pub enum Notification {
     /// A response is automatically sent when this notification is received.
     InformV2c {
         /// Community string
-        community: Bytes,
+        community: Community,
         /// sysUpTime.0 value
         uptime: u32,
         /// snmpTrapOID.0 value
@@ -732,7 +733,7 @@ struct ReceiverInner {
     /// Accepted v1/v2c community strings. Empty means accept any community
     /// (community filtering is opt-in); otherwise a v1/v2c notification whose
     /// community matches none of these is dropped.
-    communities: Vec<Vec<u8>>,
+    communities: Vec<Community>,
     /// Validation policy for SNMPv2c/v3 standard notification varbind prefixes.
     varbind_validation: NotificationVarbindValidation,
     /// Engine ID for V3 discovery responses
@@ -1027,7 +1028,7 @@ mod tests {
         );
 
         let notification = Notification::TrapV1 {
-            community: Bytes::from_static(b"public"),
+            community: Community::from(Bytes::from_static(b"public")),
             trap,
         };
 
@@ -1040,7 +1041,7 @@ mod tests {
     #[test]
     fn test_notification_trap_v2c() {
         let notification = Notification::TrapV2c {
-            community: Bytes::from_static(b"public"),
+            community: Community::from(Bytes::from_static(b"public")),
             uptime: 54321,
             trap_oid: oids::link_up(),
             varbinds: vec![],
@@ -1056,7 +1057,7 @@ mod tests {
     #[test]
     fn test_notification_inform() {
         let notification = Notification::InformV2c {
-            community: Bytes::from_static(b"public"),
+            community: Community::from(Bytes::from_static(b"public")),
             uptime: 11111,
             trap_oid: oids::cold_start(),
             varbinds: vec![],
@@ -1223,7 +1224,7 @@ mod tests {
         );
 
         let trap_v2c = Notification::TrapV2c {
-            community: Bytes::from_static(b"public"),
+            community: Community::from(Bytes::from_static(b"public")),
             uptime: 1,
             trap_oid: oids::cold_start(),
             varbinds: vec![],
@@ -1244,7 +1245,7 @@ mod tests {
         );
 
         let notification = Notification::TrapV1 {
-            community: Bytes::from_static(b"public"),
+            community: Community::from(Bytes::from_static(b"public")),
             trap,
         };
 
@@ -2776,7 +2777,7 @@ mod tests {
         ));
         assert!(community_matches(&[], b"", EmptyCommunityPolicy::Allow));
 
-        let configured = vec![b"public".to_vec(), b"monitor".to_vec()];
+        let configured = vec![Community::from("public"), Community::from("monitor")];
         assert!(community_matches(
             &configured,
             b"public",

@@ -7,6 +7,7 @@
 //! `SNMPv1` Trap PDUs (tag 0xA4) have a distinct wire format from standard PDUs
 //! and are represented by the `CommunityPdu::TrapV1` variant.
 
+use crate::Community;
 use crate::ber::{Decoder, EncodeBuf, tag};
 use crate::compatibility::CompatibilityPolicy;
 use crate::error::internal::DecodeErrorKind;
@@ -115,7 +116,7 @@ pub struct CommunityMessage {
     /// SNMP version (V1 or V2c)
     version: Version,
     /// Community string for authentication
-    community: Bytes,
+    community: Community,
     /// Protocol data unit
     pdu: CommunityPdu,
 }
@@ -127,7 +128,7 @@ impl CommunityMessage {
     ///
     /// Returns [`Error::InvalidMessage`] when the version cannot carry the PDU
     /// or an SNMPv1 PDU contains a `Counter64` value.
-    pub fn new(version: Version, community: impl Into<Bytes>, pdu: Pdu) -> Result<Self> {
+    pub fn new(version: Version, community: impl Into<Community>, pdu: Pdu) -> Result<Self> {
         let message = Self {
             version,
             community: community.into(),
@@ -142,7 +143,7 @@ impl CommunityMessage {
     /// # Errors
     ///
     /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv2c.
-    pub fn v2c(community: impl Into<Bytes>, pdu: Pdu) -> Result<Self> {
+    pub fn v2c(community: impl Into<Community>, pdu: Pdu) -> Result<Self> {
         Self::new(Version::V2c, community, pdu)
     }
 
@@ -151,7 +152,7 @@ impl CommunityMessage {
     /// # Errors
     ///
     /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv1.
-    pub fn v1(community: impl Into<Bytes>, pdu: Pdu) -> Result<Self> {
+    pub fn v1(community: impl Into<Community>, pdu: Pdu) -> Result<Self> {
         Self::new(Version::V1, community, pdu)
     }
 
@@ -160,7 +161,7 @@ impl CommunityMessage {
     /// # Errors
     ///
     /// Returns [`Error::InvalidMessage`] when the trap contains `Counter64`.
-    pub fn v1_trap(community: impl Into<Bytes>, trap: TrapV1Pdu) -> Result<Self> {
+    pub fn v1_trap(community: impl Into<Community>, trap: TrapV1Pdu) -> Result<Self> {
         let message = Self {
             version: Version::V1,
             community: community.into(),
@@ -182,7 +183,7 @@ impl CommunityMessage {
 
     /// Return the community string.
     #[must_use]
-    pub fn community(&self) -> &Bytes {
+    pub fn community(&self) -> &Community {
         &self.community
     }
 
@@ -194,7 +195,7 @@ impl CommunityMessage {
 
     /// Consume the message into its version, community string, and PDU.
     #[must_use]
-    pub fn into_parts(self) -> (Version, Bytes, CommunityPdu) {
+    pub fn into_parts(self) -> (Version, Community, CommunityPdu) {
         (self.version, self.community, self.pdu)
     }
 
@@ -205,7 +206,7 @@ impl CommunityMessage {
 
         buf.try_push_sequence(|buf| {
             self.pdu.encode(buf, self.version)?;
-            buf.try_push_octet_string(&self.community)?;
+            buf.try_push_octet_string(self.community.as_bytes())?;
             buf.push_integer(self.version.as_i32());
             Ok(())
         })?;
@@ -294,7 +295,7 @@ impl CommunityMessage {
             return Err(seq.malformed());
         }
 
-        let community = seq.read_octet_string()?;
+        let community = Community::from(seq.read_octet_string()?);
 
         // Peek at the PDU tag to dispatch between standard and TrapV1 layouts.
         let pdu_tag = seq.peek_tag().ok_or_else(|| {
@@ -414,7 +415,7 @@ mod tests {
         let message = CommunityMessage::v1_trap("public", trap).unwrap();
         let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
         assert_eq!(decoded.version(), Version::V1);
-        assert_eq!(decoded.community().as_ref(), b"public");
+        assert_eq!(decoded.community().as_bytes(), b"public");
         assert_eq!(
             decoded.pdu().trap_v1().unwrap().enterprise,
             oid!(1, 3, 6, 1, 4, 1, 9999)
@@ -429,7 +430,7 @@ mod tests {
             .unwrap();
             let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
             assert_eq!(decoded.version(), version);
-            assert_eq!(decoded.community().as_ref(), b"private");
+            assert_eq!(decoded.community().as_bytes(), b"private");
             assert_eq!(decoded.pdu().standard().unwrap().request_id, 123);
         }
     }
@@ -493,7 +494,7 @@ mod tests {
         .into_iter()
         .map(|pdu_type| CommunityMessage {
             version: Version::V1,
-            community: Bytes::from_static(b"public"),
+            community: Community::from(Bytes::from_static(b"public")),
             pdu: CommunityPdu::Standard(standard_pdu(pdu_type, vec![])),
         })
         .collect();
@@ -507,7 +508,7 @@ mod tests {
             .into_iter()
             .map(|pdu_type| CommunityMessage {
                 version: Version::V1,
-                community: Bytes::from_static(b"public"),
+                community: Community::from(Bytes::from_static(b"public")),
                 pdu: CommunityPdu::Standard(standard_pdu(
                     pdu_type,
                     vec![VarBind::new(oid!(1, 3, 6, 1), Value::Counter64(1))],
@@ -517,12 +518,12 @@ mod tests {
         invalid_messages.extend([
             CommunityMessage {
                 version: Version::V3,
-                community: Bytes::from_static(b"public"),
+                community: Community::from(Bytes::from_static(b"public")),
                 pdu: CommunityPdu::Standard(standard_pdu(PduType::GetRequest, vec![])),
             },
             CommunityMessage {
                 version: Version::V1,
-                community: Bytes::from_static(b"public"),
+                community: Community::from(Bytes::from_static(b"public")),
                 pdu: CommunityPdu::TrapV1(trap_v1(vec![VarBind::new(
                     oid!(1, 3, 6, 1),
                     Value::Counter64(1),

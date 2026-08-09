@@ -4,7 +4,7 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::error::Result;
-use crate::handler::{RequestContext, SecurityModel};
+use crate::handler::{RequestContext, SecurityModel, SecurityName};
 use crate::message::{CommunityMessage, SecurityLevel};
 use crate::pdu::PduType;
 use crate::v3::process::{MpdCounters, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
@@ -42,7 +42,7 @@ impl Agent {
         let msg = CommunityMessage::decode_with_target(data, source)?;
 
         // Validate community
-        if !self.validate_community(msg.community()) {
+        if !self.validate_community(msg.community().as_bytes()) {
             tracing::debug!(target: "async_snmp::agent", { snmp.source = %source }, "invalid community string");
             return Ok(None);
         }
@@ -86,7 +86,7 @@ impl Agent {
             source,
             version,
             security_model,
-            security_name: msg.community().clone(),
+            security_name: SecurityName::Community(msg.community().clone()),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
             request_id: pdu.request_id,
@@ -234,7 +234,7 @@ impl Agent {
             source,
             version: Version::V3,
             security_model: SecurityModel::from(global_data.msg_security_model),
-            security_name: usm_params.username.clone(),
+            security_name: SecurityName::Usm(usm_params.username.clone()),
             security_level,
             context_name: scoped_pdu.context_name.clone(),
             request_id: pdu.request_id,
@@ -295,7 +295,7 @@ impl Agent {
     /// Populate VACM group and view fields on a request context.
     fn resolve_vacm(&self, ctx: &mut RequestContext) {
         if let Some(ref vacm) = self.inner.vacm
-            && let Some(group) = vacm.get_group(ctx.security_model, &ctx.security_name)
+            && let Some(group) = vacm.get_group(ctx.security_model, ctx.security_name.as_bytes())
         {
             ctx.group_name = Some(group.clone());
             if let Some(access) = vacm.get_access(

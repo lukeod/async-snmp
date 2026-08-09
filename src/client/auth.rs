@@ -25,8 +25,7 @@
 //! # }
 //! ```
 
-use bytes::Bytes;
-
+use crate::Community;
 use crate::v3::UsmConfig;
 pub use crate::version::CommunityVersion;
 use crate::version::Version;
@@ -42,7 +41,7 @@ pub enum Auth {
         /// SNMP version (V1 or V2c)
         version: CommunityVersion,
         /// Community identifier bytes.
-        community: Bytes,
+        community: Community,
     },
     /// User-based Security Model (`SNMPv3`).
     Usm(UsmConfig),
@@ -75,7 +74,7 @@ impl Auth {
     /// let community = String::from("private");
     /// let auth = Auth::v1(Bytes::copy_from_slice(community.as_bytes()));
     /// ```
-    pub fn v1(community: impl Into<Bytes>) -> Self {
+    pub fn v1(community: impl Into<Community>) -> Self {
         Auth::Community {
             version: CommunityVersion::V1,
             community: community.into(),
@@ -105,7 +104,7 @@ impl Auth {
     /// // Auth::default() is equivalent to Auth::v2c("public")
     /// let auth = Auth::default();
     /// ```
-    pub fn v2c(community: impl Into<Bytes>) -> Self {
+    pub fn v2c(community: impl Into<Community>) -> Self {
         Auth::Community {
             version: CommunityVersion::V2c,
             community: community.into(),
@@ -163,7 +162,7 @@ impl Auth {
         }
     }
 
-    pub(crate) fn community(&self) -> Option<&Bytes> {
+    pub(crate) fn community(&self) -> Option<&Community> {
         match self {
             Auth::Community { community, .. } => Some(community),
             Auth::Usm(_) => None,
@@ -205,6 +204,7 @@ mod tests {
     use super::*;
     use crate::message::SecurityLevel;
     use crate::v3::{AuthProtocol, PrivProtocol};
+    use bytes::Bytes;
 
     #[test]
     fn test_default_auth() {
@@ -212,7 +212,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community.as_ref(), b"public");
+                assert_eq!(community.as_bytes(), b"public");
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -224,7 +224,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V1);
-                assert_eq!(community.as_ref(), b"private");
+                assert_eq!(community.as_bytes(), b"private");
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -236,7 +236,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community.as_ref(), b"secret");
+                assert_eq!(community.as_bytes(), b"secret");
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -256,7 +256,7 @@ mod tests {
                     community: actual,
                 } => {
                     assert_eq!(version, expected_version);
-                    assert_eq!(actual, community);
+                    assert_eq!(actual.as_bytes(), community);
                 }
                 Auth::Usm(_) => panic!("expected Community variant"),
             }

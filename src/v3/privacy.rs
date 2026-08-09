@@ -100,9 +100,9 @@ fn random_nonzero_u64() -> super::crypto::CryptoResult<u64> {
 ///
 /// # Security
 ///
-/// Key material is automatically zeroed from memory when the key is dropped,
-/// using the `zeroize` crate. This provides defense-in-depth against memory
-/// scraping attacks.
+/// The specifically owned key buffer is zeroized when this value is dropped.
+/// This does not promise erasure of caller inputs, live clones, allocator or
+/// provider internals, encoded message buffers, or kernel copies.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PrivKey {
     /// The localized key bytes

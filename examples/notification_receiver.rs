@@ -194,7 +194,10 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
     match notification {
         Notification::TrapV1 { community, trap } => {
             println!("  Type: SNMPv1 Trap");
-            println!("  Community: {}", String::from_utf8_lossy(community));
+            println!(
+                "  Community: {}",
+                String::from_utf8_lossy(community.as_bytes())
+            );
             println!("  Enterprise: {}", trap.enterprise);
             println!("  Generic Trap: {:?}", trap.generic_trap);
             println!("  Specific Trap: {}", trap.specific_trap);
@@ -207,7 +210,10 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             ..
         } => {
             println!("  Type: SNMPv2c Trap");
-            println!("  Community: {}", String::from_utf8_lossy(community));
+            println!(
+                "  Community: {}",
+                String::from_utf8_lossy(community.as_bytes())
+            );
             println!("  Request ID: {request_id}");
         }
 
@@ -233,7 +239,10 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             ..
         } => {
             println!("  Type: SNMPv2c Inform (response sent automatically)");
-            println!("  Community: {}", String::from_utf8_lossy(community));
+            println!(
+                "  Community: {}",
+                String::from_utf8_lossy(community.as_bytes())
+            );
             println!("  Request ID: {request_id}");
         }
 

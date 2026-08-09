@@ -20,6 +20,7 @@ mod udp_core;
 pub use tcp::*;
 pub use udp::*;
 
+use crate::Community;
 use crate::ber::length::parse_ber_length;
 #[cfg(test)]
 use crate::error::Error;
@@ -93,7 +94,7 @@ pub(crate) enum ResponseCorrelation {
         /// Expected SNMP version.
         version: Version,
         /// Community sent in the request.
-        community: Bytes,
+        community: Community,
         /// Policy for safely accepting a rewritten community.
         policy: CommunityResponsePolicy,
     },
@@ -159,7 +160,7 @@ impl RequestRegistration {
         request_id: i32,
         timeout: Duration,
         version: CommunityVersion,
-        community: Bytes,
+        community: impl Into<Community>,
         policy: CommunityResponsePolicy,
     ) -> Self {
         Self {
@@ -167,7 +168,7 @@ impl RequestRegistration {
             timeout,
             correlation: ResponseCorrelation::Community {
                 version: version.into(),
-                community,
+                community: community.into(),
                 policy,
             },
             aliases: Vec::new(),
@@ -298,7 +299,7 @@ impl ResponseCorrelation {
         if actual_version != *version {
             return ResponseIdentity::Reject;
         }
-        if actual_community == community.as_ref() {
+        if actual_community == community.as_bytes() {
             return ResponseIdentity::Match;
         }
         match policy {

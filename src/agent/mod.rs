@@ -282,7 +282,7 @@ pub(crate) struct RegisteredHandler {
 /// ```
 pub struct AgentBuilder {
     bind_addr: String,
-    communities: Vec<Vec<u8>>,
+    communities: Vec<crate::Community>,
     usm_users: HashMap<Bytes, UsmConfig>,
     handlers: Vec<RegisteredHandler>,
     authoritative_engine: Option<AuthoritativeEngine>,
@@ -391,8 +391,8 @@ impl AgentBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn community(mut self, community: &[u8]) -> Self {
-        self.communities.push(community.to_vec());
+    pub fn community(mut self, community: impl Into<crate::Community>) -> Self {
+        self.communities.push(community.into());
         self
     }
 
@@ -417,10 +417,10 @@ impl AgentBuilder {
     pub fn communities<I, C>(mut self, communities: I) -> Self
     where
         I: IntoIterator<Item = C>,
-        C: AsRef<[u8]>,
+        C: Into<crate::Community>,
     {
         for c in communities {
-            self.communities.push(c.as_ref().to_vec());
+            self.communities.push(c.into());
         }
         self
     }
@@ -1026,7 +1026,7 @@ pub(crate) struct AgentInner {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) socket_state: UdpSocketState,
     pub(crate) local_addr: SocketAddr,
-    pub(crate) communities: Vec<Vec<u8>>,
+    pub(crate) communities: Vec<crate::Community>,
     pub(crate) usm_users: HashMap<Bytes, UsmConfig>,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
@@ -2010,7 +2010,7 @@ mod tests {
             source: "127.0.0.1:12345".parse().unwrap(),
             version: Version::V2c,
             security_model: SecurityModel::V2c,
-            security_name: Bytes::from_static(b"public"),
+            security_name: crate::SecurityName::Community(crate::Community::from("public")),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
             request_id: 1,
@@ -3388,7 +3388,7 @@ mod tests {
         let mut noauth = test_ctx();
         noauth.version = Version::V3;
         noauth.security_level = SecurityLevel::NoAuthNoPriv;
-        noauth.security_name = username.clone();
+        noauth.security_name = crate::SecurityName::Usm(username.clone());
         assert_eq!(
             agent.response_overhead(&noauth),
             RESPONSE_OVERHEAD + variable
@@ -3427,7 +3427,7 @@ mod tests {
         // response wrapper and must be reflected in GETBULK's early budget.
         let short = test_ctx();
         let mut long = test_ctx();
-        long.security_name = Bytes::from(vec![b'x'; 200]);
+        long.security_name = crate::SecurityName::Usm(Bytes::from(vec![b'x'; 200]));
 
         assert_eq!(
             agent.response_overhead(&long) - agent.response_overhead(&short),
@@ -3478,7 +3478,7 @@ mod tests {
         let mut authpriv = test_ctx();
         authpriv.version = Version::V3;
         authpriv.security_level = SecurityLevel::AuthPriv;
-        authpriv.security_name = Bytes::from_static(b"user");
+        authpriv.security_name = crate::SecurityName::Usm(Bytes::from_static(b"user"));
         authpriv.pdu_type = PduType::GetBulkRequest;
         authpriv.msg_max_size = Some(limit);
         let authpriv_count = agent

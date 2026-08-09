@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 
+use crate::Community;
 use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
 use subtle::ConstantTimeEq;
@@ -22,7 +23,7 @@ pub(crate) enum EmptyCommunityPolicy {
 
 /// Compare a community against every configured value without early return.
 pub(crate) fn community_matches(
-    configured: &[Vec<u8>],
+    configured: &[Community],
     community: &[u8],
     empty_policy: EmptyCommunityPolicy,
 ) -> bool {
@@ -32,7 +33,9 @@ pub(crate) fn community_matches(
 
     let mut valid = false;
     for candidate in configured {
-        if candidate.len() == community.len() && bool::from(candidate.as_slice().ct_eq(community)) {
+        if candidate.as_bytes().len() == community.len()
+            && bool::from(candidate.as_bytes().ct_eq(community))
+        {
             valid = true;
         }
     }

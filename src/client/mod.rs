@@ -56,7 +56,6 @@ use crate::v3::{EngineCache, EngineState, SaltCounter};
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
-use bytes::Bytes;
 use response_shape::{RequestShape, classify};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -240,7 +239,7 @@ impl ClientConfig {
         self.auth.version()
     }
 
-    fn community(&self) -> Result<Bytes> {
+    fn community(&self) -> Result<crate::Community> {
         self.auth
             .community()
             .cloned()
@@ -426,7 +425,7 @@ impl<T: Transport> Client<T> {
                         return Ok(Candidate::Reject);
                     }
                     if let Message::Community(ref message) = response
-                        && community != message.community()
+                        && community.as_bytes() != message.community().as_bytes()
                     {
                         let accepted = match self.inner.config.community_response_policy {
                             crate::transport::CommunityResponsePolicy::Exact => false,

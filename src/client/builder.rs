@@ -1316,7 +1316,7 @@ mod tests {
             Auth::Community {
                 version: crate::CommunityVersion::V2c,
                 community,
-            } if community.as_ref() == b"private"
+            } if community.as_bytes() == b"private"
         ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 

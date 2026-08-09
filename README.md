@@ -61,6 +61,21 @@ See the crate documentation's
 for the full control inventory, defaults, tradeoffs, observability, and compiling
 configuration examples.
 
+### Community Redaction and Wire Security
+
+SNMPv1/v2c communities use the root-exported `Community` type. Structured
+`Debug` implementations provided by this library redact community contents
+transitively through messages, notifications, client builders, request
+registrations, and agent request contexts. Call `Community::as_bytes()` or
+`Community::into_bytes()` when the raw protocol octets are intentionally
+needed.
+
+Communities use ordinary cloneable storage and are not guaranteed to be
+zeroized. They are transmitted in plaintext. Debug redaction reduces accidental
+credential disclosure in diagnostics; it does not protect raw message buffers,
+packet captures, application copies, or downstream formatting of explicitly
+accessed bytes.
+
 ### SNMPv3 Security
 
 **Authentication:** MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512
@@ -77,6 +92,11 @@ non-FIPS default:
 Plaintext authentication and privacy passwords shorter than 8 octets are
 rejected with `CryptoError::PasswordTooShort`. Constructors that accept
 pre-derived key material are unaffected.
+
+The specifically owned password and key buffers wrapped in zeroizing types are
+zeroized on drop. This does not promise erasure of caller inputs, clones that
+remain alive, allocator or provider internals, encoded message buffers, or
+kernel copies.
 
 ### Authoritative Engine Persistence
 

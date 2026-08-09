@@ -526,6 +526,7 @@
 pub mod agent;
 pub mod ber;
 pub mod client;
+mod community;
 pub mod compatibility;
 pub mod error;
 pub mod format;
@@ -568,12 +569,13 @@ pub use client::{
     ResponseShapeAnomaly, ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk,
     WalkMode, WalkStream,
 };
+pub use community::Community;
 pub use compatibility::CompatibilityPolicy;
 pub use error::{ConstructionStage, Error, ErrorStatus, Result, WalkAbortReason};
 #[cfg(feature = "agent")]
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,
-    RequestContext, SecurityModel, SetResult,
+    RequestContext, SecurityModel, SecurityName, SetResult,
 };
 pub use message::SecurityLevel;
 pub use message_size::{
