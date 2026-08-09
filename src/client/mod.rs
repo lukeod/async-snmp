@@ -67,7 +67,7 @@ impl Client<UdpHandle> {
     }
 }
 use crate::error::{Error, ErrorStatus, Result};
-use crate::message::{CommunityMessage, Message};
+use crate::message::{CommunityMessage, Message, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::transport::{Candidate, Transport, UdpHandle, UdpStats};
@@ -365,6 +365,28 @@ impl<T: Transport> Client<T> {
     #[must_use]
     pub fn peer_addr(&self) -> SocketAddr {
         self.inner.transport.peer_addr()
+    }
+
+    /// Returns the SNMP version configured for this client.
+    ///
+    /// The version is selected by the client's authentication configuration and
+    /// does not expose community or USM identity data.
+    #[must_use]
+    pub fn version(&self) -> Version {
+        self.inner.config.version()
+    }
+
+    /// Returns the configured SNMPv3 USM security level.
+    ///
+    /// Returns `None` for SNMPv1 and SNMPv2c clients. For SNMPv3 clients, the
+    /// value describes the configured security level and does not expose the
+    /// USM identity or credentials.
+    #[must_use]
+    pub fn security_level(&self) -> Option<SecurityLevel> {
+        self.inner
+            .config
+            .usm_config()
+            .map(UsmConfig::security_level)
     }
 
     /// Generate next request ID.
@@ -1291,6 +1313,93 @@ mod tests {
         fn is_reliable(&self) -> bool {
             true
         }
+    }
+
+    fn metadata_client(auth: Auth) -> Client<TruncatingTransport> {
+        Client::new(
+            TruncatingTransport::new(0),
+            ClientConfig {
+                auth,
+                retry: Retry::none(),
+                ..Default::default()
+            },
+        )
+        .expect("valid client config")
+    }
+
+    #[test]
+    fn client_protocol_metadata_covers_versions_and_security_levels() {
+        let v1 = metadata_client(Auth::v1("private"));
+        assert_eq!(v1.version(), Version::V1);
+        assert_eq!(v1.security_level(), None);
+
+        let v2c = metadata_client(Auth::v2c("public"));
+        assert_eq!(v2c.version(), Version::V2c);
+        assert_eq!(v2c.security_level(), None);
+
+        let no_auth = metadata_client(Auth::usm("no-auth-user").into());
+        assert_eq!(no_auth.version(), Version::V3);
+        assert_eq!(no_auth.security_level(), Some(SecurityLevel::NoAuthNoPriv));
+
+        #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+        {
+            let auth = metadata_client(
+                Auth::usm("auth-user")
+                    .auth(crate::AuthProtocol::Sha256, "authpassword")
+                    .into(),
+            );
+            assert_eq!(auth.version(), Version::V3);
+            assert_eq!(auth.security_level(), Some(SecurityLevel::AuthNoPriv));
+
+            let auth_priv = metadata_client(
+                Auth::usm("private-user")
+                    .auth_priv(
+                        crate::AuthProtocol::Sha256,
+                        "authpassword",
+                        crate::PrivProtocol::Aes128,
+                        "privpassword",
+                    )
+                    .into(),
+            );
+            assert_eq!(auth_priv.version(), Version::V3);
+            assert_eq!(auth_priv.security_level(), Some(SecurityLevel::AuthPriv));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_protocol_metadata_is_transport_independent() {
+        let udp_transport = crate::UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let udp_handle = udp_transport
+            .handle("127.0.0.1:161".parse().unwrap())
+            .unwrap();
+        let udp_client = Client::new(
+            udp_handle,
+            ClientConfig {
+                auth: Auth::v1("private"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(udp_client.version(), Version::V1);
+        assert_eq!(udp_client.security_level(), None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_transport = crate::TcpTransport::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let tcp_client = Client::new(
+            tcp_transport,
+            ClientConfig {
+                auth: Auth::usm("no-auth-user").into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tcp_client.version(), Version::V3);
+        assert_eq!(
+            tcp_client.security_level(),
+            Some(SecurityLevel::NoAuthNoPriv)
+        );
     }
 
     fn make_client(response_varbind_count: usize) -> Client<TruncatingTransport> {
