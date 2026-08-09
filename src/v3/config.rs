@@ -37,14 +37,6 @@ enum UsmCredentials {
 /// authNoPriv/authPriv. Privacy-only and incomplete protocol/password states
 /// cannot be constructed.
 ///
-/// # Master Key Caching
-///
-/// When polling many engines with shared credentials, use
-/// [`MasterKeys`](crate::MasterKeys) to cache the expensive password-to-key
-/// derivation. Calling [`with_master_keys`](Self::with_master_keys) replaces
-/// any password-backed credentials with cached master keys. Credential
-/// configurators use last-call-wins semantics.
-///
 /// # Password storage
 ///
 /// Password-backed configurations zeroize the specifically owned password
@@ -131,6 +123,14 @@ impl UsmConfig {
     }
 
     /// Use pre-computed master keys for efficient key derivation.
+    ///
+    /// # Master Key Caching
+    ///
+    /// When polling many engines with shared credentials, use
+    /// [`MasterKeys`](crate::MasterKeys) to cache the expensive password-to-key
+    /// derivation. Calling this method replaces any password-backed credentials
+    /// with cached master keys. Credential configurators use last-call-wins
+    /// semantics.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[must_use]
     pub fn with_master_keys(mut self, mut master_keys: crate::v3::MasterKeys) -> Self {

@@ -519,9 +519,6 @@
 //! Client, protocol, transport, notification, and noAuthNoPriv APIs are always
 //! available. The agent and crypto backend features are independent and
 //! additive. Backend-free builds support SNMPv1/v2c and SNMPv3 noAuthNoPriv.
-//! Each USM configuration selects one available backend with [`CryptoBackend`].
-//! When both providers are compiled, RustCrypto remains the default; FIPS
-//! operation must be selected explicitly.
 
 #[cfg(feature = "agent")]
 pub mod agent;
