@@ -161,6 +161,7 @@ jobs:
         run: |
           cargo test --locked --doc --all-features
           cargo doc --locked --all-features --no-deps
+          cargo doc --locked --no-default-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
