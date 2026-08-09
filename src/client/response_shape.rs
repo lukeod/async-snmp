@@ -39,6 +39,37 @@ impl FixedCardinalityResponse {
             anomalies: Vec::new(),
         }
     }
+
+    /// Returns the sole response binding when the response has exactly one
+    /// binding and no shape anomalies.
+    ///
+    /// Compatible response-shape handling can preserve empty, excess, renamed,
+    /// or otherwise anomalous responses. Callers that require a valid singleton
+    /// can use this method without discarding those diagnostics.
+    #[must_use]
+    pub fn single(&self) -> Option<&VarBind> {
+        if self.anomalies.is_empty() {
+            let [varbind] = self.varbinds.as_slice() else {
+                return None;
+            };
+            Some(varbind)
+        } else {
+            None
+        }
+    }
+
+    /// Consumes this response and returns its sole binding when it has exactly
+    /// one binding and no shape anomalies.
+    ///
+    /// On failure, the original response is returned so that every received
+    /// binding and shape diagnostic remains available to the caller.
+    pub fn into_single(mut self) -> Result<VarBind, Self> {
+        if self.anomalies.is_empty() && self.varbinds.len() == 1 {
+            Ok(self.varbinds.remove(0))
+        } else {
+            Err(self)
+        }
+    }
 }
 
 /// A bounded, structured diagnostic for a fixed-cardinality response.
@@ -267,6 +298,105 @@ mod tests {
 
     fn oid(last: u32) -> Oid {
         Oid::from_slice(&[1, 3, 6, 1, last])
+    }
+
+    fn fixed_response(
+        varbinds: Vec<VarBind>,
+        anomalies: Vec<ResponseShapeAnomaly>,
+    ) -> FixedCardinalityResponse {
+        FixedCardinalityResponse {
+            operation: FixedCardinalityOperation::Get,
+            varbinds,
+            anomalies,
+        }
+    }
+
+    #[test]
+    fn singleton_extractors_return_clean_single_binding() {
+        let varbind = VarBind::new(oid(1), Value::Integer(42));
+        let response = fixed_response(vec![varbind.clone()], Vec::new());
+
+        assert_eq!(response.single(), Some(&varbind));
+        assert_eq!(response.into_single(), Ok(varbind));
+    }
+
+    #[test]
+    fn singleton_extractors_reject_other_cardinalities_and_preserve_response() {
+        let responses = [
+            fixed_response(Vec::new(), Vec::new()),
+            fixed_response(
+                vec![
+                    VarBind::new(oid(1), Value::Integer(1)),
+                    VarBind::new(oid(2), Value::Integer(2)),
+                ],
+                Vec::new(),
+            ),
+        ];
+
+        for response in responses {
+            assert_eq!(response.single(), None);
+            assert_eq!(response.clone().into_single(), Err(response));
+        }
+    }
+
+    #[test]
+    fn singleton_extractors_reject_every_anomaly_and_preserve_response() {
+        let anomalies = [
+            ResponseShapeAnomaly::Truncated {
+                request_range: 0..2,
+                response_range: 0..1,
+                expected: 2,
+                actual: 1,
+            },
+            ResponseShapeAnomaly::Excess {
+                request_range: 0..0,
+                response_range: 0..1,
+                expected: 0,
+                actual: 1,
+            },
+            ResponseShapeAnomaly::Reordered {
+                request_range: 0..1,
+                response_range: 0..1,
+            },
+            ResponseShapeAnomaly::OidMismatch {
+                request_index: 0,
+                response_index: 0,
+                expected: oid(1),
+                actual: oid(2),
+            },
+            ResponseShapeAnomaly::GetNextNotSuccessor {
+                request_index: 0,
+                response_index: 0,
+                cursor: oid(2),
+                actual: oid(1),
+            },
+            ResponseShapeAnomaly::GetNextEndOfMibNameMismatch {
+                request_index: 0,
+                response_index: 0,
+                cursor: oid(1),
+                actual: oid(2),
+            },
+            ResponseShapeAnomaly::GetNextUnexpectedException {
+                request_index: 0,
+                response_index: 0,
+                value: Value::NoSuchInstance,
+            },
+            ResponseShapeAnomaly::SetValueMismatch {
+                request_index: 0,
+                response_index: 0,
+                expected: Value::Integer(1),
+                actual: Value::Integer(2),
+            },
+        ];
+
+        for anomaly in anomalies {
+            let response = fixed_response(
+                vec![VarBind::new(oid(1), Value::Integer(42))],
+                vec![anomaly],
+            );
+            assert_eq!(response.single(), None);
+            assert_eq!(response.clone().into_single(), Err(response));
+        }
     }
 
     #[test]
