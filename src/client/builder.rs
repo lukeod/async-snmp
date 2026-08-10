@@ -853,6 +853,10 @@ impl ClientBuilder {
     /// Note that TCP has higher overhead than UDP due to connection setup
     /// and per-message framing.
     ///
+    /// When a hostname resolves to multiple addresses, each address is tried
+    /// in resolver order until a connection succeeds. Resolution and all
+    /// connection attempts share the configured construction timeout.
+    ///
     /// For advanced TCP configuration (connection timeout, keepalive, buffer
     /// sizes), construct a [`TcpTransport`] directly and use [`Client::new()`].
     /// [`TcpTransport::connect`] remains unbounded for applications that own a
@@ -893,21 +897,43 @@ impl ClientBuilder {
     async fn connect_tcp_with<R, RFut, C, CFut>(
         mut self,
         resolver: R,
-        connector: C,
+        mut connector: C,
     ) -> Result<Client<TcpTransport>>
     where
         R: FnOnce(String, u16) -> RFut,
         RFut: Future<Output = Result<Vec<SocketAddr>>>,
-        C: FnOnce(SocketAddr) -> CFut,
+        C: FnMut(SocketAddr) -> CFut,
         CFut: Future<Output = Result<TcpTransport>>,
     {
         self.validate_and_precompute()?;
         let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
-        let addr = self.resolve_targets_with(&deadline, resolver).await?[0];
-        let transport = deadline
-            .run(ConstructionStage::Connect, connector(addr))
-            .await?;
-        self.build_inner(transport)
+        let candidates = self.resolve_targets_with(&deadline, resolver).await?;
+        let mut last_error = None;
+
+        for address in candidates {
+            match deadline
+                .run(ConstructionStage::Connect, connector(address))
+                .await
+            {
+                Ok(transport) => return self.build_inner(transport),
+                Err(error) if matches!(*error, Error::ConstructionTimeout { .. }) => {
+                    return Err(error);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        match last_error {
+            Some(error) => Err(error),
+            None => Err(Error::Config(
+                format!(
+                    "could not connect to any resolved address for '{}'",
+                    self.target
+                )
+                .into(),
+            )
+            .boxed()),
+        }
     }
 }
 
@@ -1072,6 +1098,71 @@ mod tests {
                 .build_config()
                 .allow_unauthenticated_v3_time_correction
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_tries_later_resolved_addresses() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let unreachable = "192.0.2.1:161".parse().unwrap();
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector_attempts = Arc::clone(&attempts);
+
+        let client = ClientBuilder::new("device.example", Auth::v2c("public"))
+            .connect_tcp_with(
+                move |_, _| async move { Ok(vec![unreachable, reachable]) },
+                move |address| {
+                    let connector_attempts = Arc::clone(&connector_attempts);
+                    async move {
+                        connector_attempts.lock().unwrap().push(address);
+                        if address == unreachable {
+                            return Err(Error::Network {
+                                target: address,
+                                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                            }
+                            .boxed());
+                        }
+                        TcpTransport::connect(address).await
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(client.peer_addr(), reachable);
+        assert_eq!(*attempts.lock().unwrap(), vec![unreachable, reachable]);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_returns_last_candidate_error() {
+        let first = "192.0.2.1:161".parse().unwrap();
+        let last = "192.0.2.2:161".parse().unwrap();
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector_attempts = Arc::clone(&attempts);
+
+        let error = ClientBuilder::new("device.example", Auth::v2c("public"))
+            .connect_tcp_with(
+                move |_, _| async move { Ok(vec![first, last]) },
+                move |address| {
+                    let connector_attempts = Arc::clone(&connector_attempts);
+                    async move {
+                        connector_attempts.lock().unwrap().push(address);
+                        Err::<TcpTransport, _>(
+                            Error::Network {
+                                target: address,
+                                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                            }
+                            .boxed(),
+                        )
+                    }
+                },
+            )
+            .await
+            .err()
+            .expect("all connection attempts must fail");
+
+        assert!(matches!(*error, Error::Network { target, .. } if target == last));
+        assert_eq!(*attempts.lock().unwrap(), vec![first, last]);
     }
 
     #[tokio::test(start_paused = true)]
