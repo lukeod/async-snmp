@@ -1,20 +1,21 @@
 //! SNMP Agent with Writable Objects
 //!
 //! Demonstrates a MibHandler that supports SET operations using the
-//! two-phase commit protocol (RFC 3416):
+//! library's two-phase SET protocol (RFC 3416):
 //!
 //! 1. **test_set** - Validate and optionally reserve resources
-//! 2. **commit_set** - Apply the change; failure may be partially mutating
-//! 3. **undo_set** - Roll back and release resources for every attempted commit,
-//!    including the failed attempt
-//! 4. **free_set** - Release resources for successful tests whose commit was
-//!    never attempted
+//! 2. **commit_set** - Apply the change
+//!
+//! After validation, both commits in this example are infallible and reserve no
+//! resources, so the default `undo_set` and `free_set` implementations are
+//! sufficient. A handler whose commit can fail must retain the previous value
+//! and restore it from `undo_set`.
 //!
 //! The example exposes a small configuration subtree under a private
 //! enterprise OID with two writable scalars (a string and an integer)
 //! and one read-only counter.
 //!
-//! Run with: cargo run --example agent_with_set
+//! Run with: cargo run --example agent_with_set --features agent
 
 use async_snmp::agent::Agent;
 use async_snmp::handler::{
@@ -23,6 +24,7 @@ use async_snmp::handler::{
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
 use async_snmp::{Oid, oid};
+use bytes::Bytes;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -36,7 +38,7 @@ const OID_CONFIG_INTERVAL: [u32; 9] = [1, 3, 6, 1, 4, 1, 99999, 2, 0];
 const OID_CONFIG_CHANGES: [u32; 9] = [1, 3, 6, 1, 4, 1, 99999, 3, 0];
 
 struct ConfigHandler {
-    name: RwLock<String>,
+    name: RwLock<Bytes>,
     interval: RwLock<i32>,
     change_count: AtomicU32,
 }
@@ -44,7 +46,7 @@ struct ConfigHandler {
 impl ConfigHandler {
     fn new() -> Self {
         Self {
-            name: RwLock::new("default".to_string()),
+            name: RwLock::new(Bytes::from_static(b"default")),
             interval: RwLock::new(60),
             change_count: AtomicU32::new(0),
         }
@@ -72,12 +74,18 @@ impl ConfigHandler {
     fn get_value(&self, oid: &Oid) -> GetResult {
         if oid.as_ref() == OID_CONFIG_NAME {
             let name = self.name.read().unwrap();
-            GetResult::Value(Value::OctetString(name.as_bytes().to_vec().into()))
+            GetResult::Value(Value::OctetString(name.clone()))
         } else if oid.as_ref() == OID_CONFIG_INTERVAL {
             let interval = *self.interval.read().unwrap();
             GetResult::Value(Value::Integer(interval))
         } else if oid.as_ref() == OID_CONFIG_CHANGES {
             GetResult::Value(Value::Counter32(self.change_count.load(Ordering::Relaxed)))
+        } else if oid.as_ref().starts_with(&OID_CONFIG_NAME[..8])
+            || oid.as_ref().starts_with(&OID_CONFIG_INTERVAL[..8])
+            || oid.as_ref().starts_with(&OID_CONFIG_CHANGES[..8])
+        {
+            // The scalar object exists, but only its .0 instance is valid.
+            GetResult::NoSuchInstance
         } else {
             GetResult::NoSuchObject
         }
@@ -149,8 +157,7 @@ impl MibHandler for ConfigHandler {
             if oid.as_ref() == OID_CONFIG_NAME
                 && let Value::OctetString(bytes) = value
             {
-                let s = String::from_utf8_lossy(bytes).to_string();
-                *self.name.write().unwrap() = s;
+                *self.name.write().unwrap() = bytes.clone();
                 self.change_count.fetch_add(1, Ordering::Relaxed);
                 return SetResult::Ok;
             } else if oid.as_ref() == OID_CONFIG_INTERVAL
@@ -161,22 +168,6 @@ impl MibHandler for ConfigHandler {
                 return SetResult::Ok;
             }
             SetResult::CommitFailed
-        })
-    }
-
-    fn undo_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        oid: &'a Oid,
-        _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        // A production handler would save the previous value in test_set
-        // (e.g., in a per-request map keyed by request ID), then restore it and
-        // release that reservation here. This callback may follow this binding's
-        // own failed commit. This example only logs the rollback.
-        Box::pin(async move {
-            tracing::warn!(oid = %oid, "rolling back SET (previous value not tracked in this example)");
-            SetResult::Ok
         })
     }
 }

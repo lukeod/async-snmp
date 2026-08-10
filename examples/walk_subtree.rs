@@ -13,7 +13,7 @@
 
 use async_snmp::format::hints;
 use async_snmp::{Auth, Client, OidOrdering, WalkMode, oid};
-use futures::StreamExt;
+use futures::TryStreamExt;
 use std::time::Duration;
 
 #[tokio::main]
@@ -86,17 +86,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Walk system subtree and filter for string values only
     let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;
 
-    // Use StreamExt methods for functional-style processing. These consume the
-    // same walk sequence as the inherent next() and collect() helpers.
+    // Use TryStreamExt methods for functional-style processing while preserving
+    // walk errors. These consume the same sequence as next() and collect().
     let strings: Vec<_> = walk
-        .filter_map(|result| async move {
-            match result {
-                Ok(vb) => vb.value.as_str().map(|s| (vb.oid, s.to_string())),
-                Err(_) => None,
-            }
+        .try_filter_map(|vb| async move {
+            let value = vb.value.as_str().map(str::to_owned);
+            Ok(value.map(|value| (vb.oid, value)))
         })
-        .collect()
-        .await;
+        .try_collect()
+        .await?;
 
     println!("String values found:");
     for (oid, value) in &strings {

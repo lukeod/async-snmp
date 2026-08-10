@@ -56,8 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Response shape anomaly: {anomaly:?}");
             }
             for varbind in &response.varbinds {
-                println!("OID: {}", varbind.oid);
-                println!("Value: {:?}", varbind.value);
+                print_varbind(varbind);
             }
 
             // Extract a singleton string only when correspondence is unambiguous.
@@ -92,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Response shape anomaly: {anomaly:?}");
             }
             for vb in response.varbinds {
-                println!("  {}: {:?}", vb.oid, vb.value);
+                print_varbind(&vb);
             }
         }
         Err(e) => {
@@ -115,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for varbind in response.varbinds {
                 println!("Next OID after {}: {}", system_oid, varbind.oid);
-                println!("Value: {:?}", varbind.value);
+                print_varbind(&varbind);
             }
         }
         Err(e) => {
@@ -144,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Response shape anomaly: {anomaly:?}");
             }
             for varbind in response.varbinds {
-                println!("Set response: {}: {:?}", varbind.oid, varbind.value);
+                print_varbind(&varbind);
             }
         }
         Err(e) => {
@@ -164,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Response shape anomaly: {anomaly:?}");
             }
             for varbind in response.varbinds {
-                println!("Current value: {:?}", varbind.value);
+                print_varbind(&varbind);
             }
         }
         Err(e) => {
@@ -174,6 +173,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nExample complete!");
     Ok(())
+}
+
+/// Print a varbind while distinguishing SNMPv2 exception values from ordinary data.
+fn print_varbind(varbind: &async_snmp::VarBind) {
+    match &varbind.value {
+        Value::NoSuchObject => {
+            println!("  {}: object identity is not available", varbind.oid);
+        }
+        Value::NoSuchInstance => {
+            println!("  {}: object instance does not exist", varbind.oid);
+        }
+        Value::EndOfMibView => {
+            println!("  {}: end of MIB view", varbind.oid);
+        }
+        value => println!("  {}: {value:?}", varbind.oid),
+    }
 }
 
 /// Handle SNMP errors with informative messages.
@@ -193,7 +208,7 @@ fn handle_error(operation: &str, error: &Error) {
             // Provide specific guidance based on error type
             match status {
                 ErrorStatus::NoSuchName => {
-                    println!("  -> OID does not exist on this agent");
+                    println!("  -> OID does not exist on this SNMPv1 agent");
                 }
                 ErrorStatus::NotWritable => {
                     println!("  -> OID is read-only");

@@ -107,9 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("--- Master Key Caching ---\n");
 
-    // For polling many devices with the same credentials, pre-compute master keys.
-    // This avoids the expensive key derivation (~850us) on every connection.
-    // Only the cheap localization (~1us) is done per engine.
+    // For polling many devices with the same credentials, pre-compute master
+    // keys. This avoids repeating password-to-key derivation; only the much
+    // cheaper per-engine localization remains for each target.
 
     // Uses container user: privaes192_user (SHA-256 + AES-192)
     let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")?

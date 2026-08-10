@@ -19,13 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
     // Load MIBs from system paths (net-snmp, libsmi)
-    let mib = tokio::task::spawn_blocking(|| {
-        Loader::new()
-            .system_paths()
-            .load()
-            .expect("failed to load system MIBs")
-    })
-    .await?;
+    let mib = tokio::task::spawn_blocking(|| Loader::new().system_paths().load()).await??;
 
     // Resolve "ifTable" by name
     let if_table = mib_support::resolve_oid(&mib, "ifTable")?;

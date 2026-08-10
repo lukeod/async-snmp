@@ -9,7 +9,7 @@
 //! 2. **Client-based** (for standalone tools like snmptrap/snmpinform): a Client
 //!    is created per destination, useful for one-shot sends.
 //!
-//! Run with: cargo run --example notification_sender
+//! Run with: cargo run --example notification_sender --features agent
 
 use async_snmp::agent::{Agent, NotificationOutcome, SinkStatus};
 use async_snmp::notification::{Notification, NotificationReceiver};

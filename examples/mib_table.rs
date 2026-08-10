@@ -1,7 +1,8 @@
 //! Walk a table and decode results using MIB metadata.
 //!
-//! Uses `describe_varbind` to decode index values and group columns by row.
-//! Shows programmatic use of MIB metadata beyond simple string formatting.
+//! Uses `describe_varbind` to group columns by row and `decode_indexes` to
+//! interpret each row's INDEX components. Shows programmatic use of MIB
+//! metadata beyond simple string formatting.
 //!
 //! Requires the `mib` feature:
 //!   cargo run --example mib_table --features mib -- 192.168.1.1
@@ -20,13 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
     // Load MIBs from system paths
-    let mib = tokio::task::spawn_blocking(|| {
-        Loader::new()
-            .system_paths()
-            .load()
-            .expect("failed to load system MIBs")
-    })
-    .await?;
+    let mib = tokio::task::spawn_blocking(|| Loader::new().system_paths().load()).await??;
 
     // Resolve ifTable and walk it
     let if_table = mib_support::resolve_oid(&mib, "ifTable")?;
@@ -38,20 +33,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let results: Vec<_> = client.walk(if_table)?.collect().await?;
 
     // Group varbinds by row index using describe_varbind
-    let mut rows: BTreeMap<SmallVec<[u32; 4]>, Vec<(&VarBind, mib_support::VarBindInfo<'_>)>> =
-        BTreeMap::new();
+    type Row<'a> = (
+        Vec<String>,
+        Vec<(&'a VarBind, mib_support::VarBindInfo<'a>)>,
+    );
+    let mut rows: BTreeMap<SmallVec<[u32; 4]>, Row<'_>> = BTreeMap::new();
 
     for vb in &results {
         if let Some(info) = mib_support::describe_varbind(&mib, vb) {
+            let indexes = mib
+                .lookup_instance(&vb.oid.to_mib_oid())
+                .decode_indexes()
+                .into_iter()
+                .map(|index| index.to_string())
+                .collect();
             let suffix = info.suffix.clone();
-            rows.entry(suffix).or_default().push((vb, info));
+            rows.entry(suffix)
+                .or_insert_with(|| (indexes, Vec::new()))
+                .1
+                .push((vb, info));
         }
     }
 
     // Display grouped by row
-    for (index, columns) in &rows {
-        let index_str: Vec<_> = index.iter().map(|a| a.to_string()).collect();
-        println!("--- Row index: {} ---", index_str.join("."));
+    for (raw_index, (indexes, columns)) in &rows {
+        if indexes.is_empty() {
+            let raw: Vec<_> = raw_index.iter().map(|arc| arc.to_string()).collect();
+            println!("--- Row index: {} ---", raw.join("."));
+        } else {
+            println!("--- Row index: {} ---", indexes.join(", "));
+        }
 
         for (_, info) in columns {
             println!(

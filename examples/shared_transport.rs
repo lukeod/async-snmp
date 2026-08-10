@@ -84,16 +84,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oid!(1, 3, 6, 1, 2, 1, 1, 6, 0), // sysLocation
     ];
 
-    // Spawn concurrent GET requests
+    // Queue concurrent GET requests. Reuse one client so request IDs and target
+    // state are shared as well as the underlying socket.
     let mut futures = FuturesUnordered::new();
 
+    let client = Client::builder(container_target, Auth::v2c("public"))
+        .response_shape_policy(ResponseShapePolicy::Strict)
+        .request_timeout(Duration::from_secs(5))
+        .retry(Retry::fixed(2, Duration::ZERO))
+        .build_with(&shared)
+        .await?;
+
     for oid in &oids {
-        let client = Client::builder(container_target, Auth::v2c("public"))
-            .response_shape_policy(ResponseShapePolicy::Strict)
-            .request_timeout(Duration::from_secs(5))
-            .retry(Retry::fixed(2, Duration::ZERO))
-            .build_with(&shared)
-            .await?;
+        let client = client.clone();
         let oid = oid.clone();
 
         futures.push(async move {
@@ -122,8 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // established identity until rediscover_engine() is called explicitly.
     let engine_cache = Arc::new(EngineCache::new());
 
-    // Pre-compute master keys once (expensive: ~850us for SHA-256).
-    // These can be reused across all clients with the same credentials.
+    // Pre-compute master keys once. Password-to-key derivation is substantially
+    // more expensive than per-engine localization, and these keys can be reused
+    // across clients with the same credentials.
     let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")?
         .with_privacy(PrivProtocol::Aes192, b"privpass123")?;
 
@@ -138,20 +142,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), // sysUpTime
     ];
 
+    // Uses container user: privaes192_user (SHA-256 + AES-192). Other clients
+    // with these credentials can cheaply clone the master keys and engine cache.
+    let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
+    let client = Client::builder(container_target, auth)
+        .response_shape_policy(ResponseShapePolicy::Strict)
+        .request_timeout(Duration::from_secs(5))
+        .retry(Retry::fixed(2, Duration::ZERO))
+        .engine_cache(engine_cache.clone())
+        .build_with(&shared_v3)
+        .await?;
+
     for oid in &v3_oids {
-        // Cloning copies only the small zeroizing key buffers and avoids
-        // repeating password-to-key derivation.
-        // Uses container user: privaes192_user (SHA-256 + AES-192)
-        let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
-
-        let client = Client::builder(container_target, auth)
-            .response_shape_policy(ResponseShapePolicy::Strict)
-            .request_timeout(Duration::from_secs(5))
-            .retry(Retry::fixed(2, Duration::ZERO))
-            .engine_cache(engine_cache.clone())
-            .build_with(&shared_v3)
-            .await?;
-
         match client.get(oid).await {
             Ok(response) => println!("  {oid}: {:?}", response.varbinds[0].value),
             Err(e) => println!("  {oid}: {e}"),
