@@ -1355,61 +1355,65 @@ impl Agent {
                 }
             };
 
-            if recv_meta.len > UDP_RECEIVE_LIMITS.advertised().as_usize() {
-                tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, received_size = recv_meta.len, advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
-            }
-            let data = Bytes::copy_from_slice(&buf[..recv_meta.len]);
-            let agent = self.clone();
+            // UDP GRO can place multiple datagrams in one receive buffer. Each
+            // stride-delimited datagram is an independent SNMP request.
+            for range in datagram_ranges(recv_meta.len, recv_meta.stride) {
+                let data = Bytes::copy_from_slice(&buf[range]);
+                if data.len() > UDP_RECEIVE_LIMITS.advertised().as_usize() {
+                    tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, received_size = data.len(), advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
+                }
+                let agent = self.clone();
 
-            let permit = if let Some(ref sem) = self.inner.concurrency_limit {
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = self.inner.cancel.cancelled() => {
-                            tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
-                            break 'service Ok(());
-                        }
-                        result = request_tasks.join_next(), if !request_tasks.is_empty() => {
-                            if let Some(result) = result {
-                                log_task_result(result);
+                let permit = if let Some(ref sem) = self.inner.concurrency_limit {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = self.inner.cancel.cancelled() => {
+                                tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
+                                break 'service Ok(());
+                            }
+                            result = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                                if let Some(result) = result {
+                                    log_task_result(result);
+                                }
+                            }
+                            result = sem.clone().acquire_owned() => {
+                                break Some(result.expect("semaphore closed"));
                             }
                         }
-                        result = sem.clone().acquire_owned() => {
-                            break Some(result.expect("semaphore closed"));
+                    }
+                } else {
+                    None
+                };
+
+                let task_cancel = request_tasks.cancellation_token();
+                request_tasks.spawn(async move {
+                    let _permit = permit;
+
+                    // This is the only cooperative cancellation boundary. Once
+                    // handle_request is entered, its handler lifecycle and response
+                    // attempt must run to completion and must never be aborted.
+                    if task_cancel.is_cancelled() {
+                        return;
+                    }
+
+                    if let Err(error) = agent.update_engine_time() {
+                        tracing::warn!(target: "async_snmp::agent", %error, "could not persist authoritative engine time transition");
+                    }
+
+                    match agent.handle_request(data, recv_meta.addr).await {
+                        Ok(Some(response_bytes)) => {
+                            if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
+                                tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "failed to send response");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "error handling request");
                         }
                     }
-                }
-            } else {
-                None
-            };
-
-            let task_cancel = request_tasks.cancellation_token();
-            request_tasks.spawn(async move {
-                let _permit = permit;
-
-                // This is the only cooperative cancellation boundary. Once
-                // handle_request is entered, its handler lifecycle and response
-                // attempt must run to completion and must never be aborted.
-                if task_cancel.is_cancelled() {
-                    return;
-                }
-
-                if let Err(error) = agent.update_engine_time() {
-                    tracing::warn!(target: "async_snmp::agent", %error, "could not persist authoritative engine time transition");
-                }
-
-                match agent.handle_request(data, recv_meta.addr).await {
-                    Ok(Some(response_bytes)) => {
-                        if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
-                            tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "failed to send response");
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "error handling request");
-                    }
-                }
-            });
+                });
+            }
         };
 
         request_tasks.cancel();
@@ -1945,6 +1949,13 @@ impl Agent {
     }
 }
 
+fn datagram_ranges(len: usize, stride: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let stride = if stride == 0 { len.max(1) } else { stride };
+    (0..len.max(1))
+        .step_by(stride)
+        .map(move |start| start..start.saturating_add(stride).min(len))
+}
+
 impl Clone for Agent {
     fn clone(&self) -> Self {
         Self {
@@ -2007,6 +2018,33 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    struct CountingHandler {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl MibHandler for CountingHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(GetResult::Value(Value::Integer(42)))
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async move { Ok(GetNextResult::EndOfMibView) })
+        }
+    }
+
     fn test_ctx() -> RequestContext {
         RequestContext {
             source: "127.0.0.1:12345".parse().unwrap(),
@@ -2032,6 +2070,115 @@ mod tests {
         })
         .await
         .expect("agent run state did not change");
+    }
+
+    #[test]
+    fn coalesced_datagram_ranges_follow_stride_and_keep_short_tail() {
+        assert_eq!(
+            datagram_ranges(10, 4).collect::<Vec<_>>(),
+            [0..4, 4..8, 8..10]
+        );
+        let empty = datagram_ranges(0, 0).collect::<Vec<_>>();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0], 0..0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_gro_dispatches_each_coalesced_request() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6),
+                Arc::new(CountingHandler {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .without_builtin_handlers()
+            .build()
+            .await
+            .unwrap();
+        let run_agent = agent.clone();
+        let run_task = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+
+        let request = |request_id| {
+            crate::message::CommunityMessage::new(
+                Version::V2c,
+                Bytes::from_static(b"public"),
+                Pdu::get_request(request_id, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]),
+            )
+            .unwrap()
+            .encode()
+            .unwrap()
+        };
+        let first = request(17);
+        let second = request(18);
+        assert_eq!(first.len(), second.len());
+        let mut coalesced = Vec::with_capacity(first.len() + second.len());
+        coalesced.extend_from_slice(&first);
+        coalesced.extend_from_slice(&second);
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket_state = UdpSocketState::new(UdpSockRef::from(&client)).unwrap();
+        assert!(socket_state.max_gso_segments() >= 2);
+        let transmit = Transmit {
+            destination: agent.local_addr(),
+            ecn: None,
+            contents: &coalesced,
+            segment_size: Some(first.len()),
+            src_ip: None,
+        };
+        loop {
+            client.writable().await.unwrap();
+            match client.try_io(tokio::io::Interest::WRITABLE, || {
+                socket_state.try_send(UdpSockRef::from(&client), &transmit)
+            }) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to send segmented requests: {error}"),
+            }
+        }
+
+        let mut response_ids = HashSet::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = [0_u8; UDP_RECEIVE_BUFFER_SIZE];
+            while response_ids.len() < 2 {
+                client.readable().await.unwrap();
+                let mut meta = [RecvMeta::default()];
+                let result = {
+                    let mut iov = [IoSliceMut::new(&mut response)];
+                    client.try_io(tokio::io::Interest::READABLE, || {
+                        socket_state.recv(UdpSockRef::from(&client), &mut iov, &mut meta)
+                    })
+                };
+                match result {
+                    Ok(count) => {
+                        for recv_meta in &meta[..count] {
+                            for range in datagram_ranges(recv_meta.len, recv_meta.stride) {
+                                let message = crate::message::CommunityMessage::decode(
+                                    Bytes::copy_from_slice(&response[range]),
+                                )
+                                .unwrap();
+                                response_ids.insert(message.pdu().standard().unwrap().request_id);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("failed to receive responses: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("agent did not respond to both coalesced requests");
+
+        assert_eq!(response_ids, HashSet::from([17, 18]));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        agent.cancel().cancel();
+        run_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
