@@ -9,6 +9,7 @@ use async_snmp::{
     ResponseIdentity, Transport,
 };
 use bytes::Bytes;
+use tokio::sync::oneshot;
 
 #[derive(Clone)]
 struct ExternalTransport {
@@ -106,6 +107,108 @@ impl Transport for ExternalTransport {
     }
 }
 
+#[derive(Clone)]
+struct ImmediateResponseTransport {
+    inner: Arc<ImmediateResponseTransportInner>,
+}
+
+struct ImmediateResponseTransportInner {
+    peer: SocketAddr,
+    local: SocketAddr,
+    response: Bytes,
+    pending: Mutex<Option<oneshot::Sender<(Bytes, SocketAddr)>>>,
+    unmatched_responses: AtomicUsize,
+}
+
+struct ImmediateResponseRegistration {
+    inner: Arc<ImmediateResponseTransportInner>,
+}
+
+impl Drop for ImmediateResponseRegistration {
+    fn drop(&mut self) {
+        self.inner.pending.lock().unwrap().take();
+    }
+}
+
+impl ImmediateResponseTransport {
+    fn new(peer: SocketAddr, response: Bytes) -> Self {
+        Self {
+            inner: Arc::new(ImmediateResponseTransportInner {
+                peer,
+                local: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                response,
+                pending: Mutex::new(None),
+                unmatched_responses: AtomicUsize::new(0),
+            }),
+        }
+    }
+}
+
+impl Transport for ImmediateResponseTransport {
+    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+        let Some(pending) = self.inner.pending.lock().unwrap().take() else {
+            self.inner
+                .unmatched_responses
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        };
+        pending
+            .send((self.inner.response.clone(), self.inner.peer))
+            .map_err(|_| Error::Config("custom transport registration closed".into()).boxed())
+    }
+
+    async fn recv_with<T, F>(
+        &self,
+        registration: RequestRegistration,
+        mut validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+    {
+        let (sender, receiver) = oneshot::channel();
+        assert!(self.inner.pending.lock().unwrap().replace(sender).is_none());
+        let _registration = ImmediateResponseRegistration {
+            inner: Arc::clone(&self.inner),
+        };
+        let (data, source) = tokio::time::timeout(registration.timeout(), receiver)
+            .await
+            .map_err(|_| {
+                Error::Timeout {
+                    target: self.inner.peer,
+                    elapsed: registration.timeout(),
+                    retries: 0,
+                }
+                .boxed()
+            })?
+            .map_err(|_| Error::Config("custom transport response closed".into()).boxed())?;
+
+        assert_ne!(
+            registration.evaluate_response_identity(&data, source == self.inner.peer),
+            ResponseIdentity::Reject
+        );
+        match validate(data, source)? {
+            Candidate::Accept(value) => Ok(value),
+            Candidate::Reject => Err(Error::MalformedResponse {
+                target: self.inner.peer,
+            }
+            .boxed()),
+        }
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        self.inner.peer
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local
+    }
+
+    fn is_reliable(&self) -> bool {
+        true
+    }
+}
+
 fn v2c_response(request_id: u8, community: &[u8]) -> Bytes {
     let pdu = [
         0xa2, 0x0b, 0x02, 0x01, request_id, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00,
@@ -126,6 +229,28 @@ fn v3_identity(msg_id: u8) -> Bytes {
     Bytes::from(vec![
         0x30, 0x08, 0x02, 0x01, 0x03, 0x30, 0x03, 0x02, 0x01, msg_id,
     ])
+}
+
+#[tokio::test]
+async fn default_request_registers_before_an_immediate_response() {
+    let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
+    let response = v2c_response(6, b"public");
+    let transport = ImmediateResponseTransport::new(peer, response.clone());
+    let registration = RequestRegistration::community(
+        6,
+        Duration::from_millis(50),
+        CommunityVersion::V2c,
+        Bytes::from_static(b"public"),
+        CommunityResponsePolicy::Exact,
+    );
+
+    let received = transport.request(b"request", registration).await.unwrap();
+
+    assert_eq!(received, (response, peer));
+    assert_eq!(
+        transport.inner.unmatched_responses.load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[tokio::test]

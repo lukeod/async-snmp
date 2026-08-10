@@ -36,6 +36,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 /// Global request ID counter, initialized with a cryptographically random seed.
@@ -354,8 +355,8 @@ pub trait Transport: Send + Sync {
     /// Wait until the validator accepts a response candidate.
     ///
     /// Transports with out-of-band demultiplexing must install the registration
-    /// as part of this future and remove it whenever the future completes or is
-    /// dropped. Implementors use
+    /// before this future first returns [`Poll::Pending`] and remove it whenever
+    /// the future completes or is dropped. Implementors use
     /// [`RequestRegistration::evaluate_response_identity`] before invoking the
     /// caller's validator; [`ResponseIdentity::Reject`] and
     /// [`Candidate::Reject`] both retain that same registration and its original
@@ -381,6 +382,9 @@ pub trait Transport: Send + Sync {
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
         async move {
+            // Unit-test transport doubles may implement only `recv` and expect
+            // its synchronous setup to run after `send`.
+            tokio::task::yield_now().await;
             let (data, source) = self.recv(registration).await?;
             match validate(data, source)? {
                 Candidate::Accept(value) => Ok(value),
@@ -392,12 +396,6 @@ pub trait Transport: Send + Sync {
         }
     }
 
-    /// Send request data and wait until the validator accepts a response.
-    ///
-    /// The default implementation chains [`send`](Self::send) and
-    /// [`recv_with`](Self::recv_with). Transports that serialize an exchange by
-    /// holding a lock (such as TCP) must override this so one future owns the
-    /// lock across the write and every rejected candidate.
     /// Send request data and receive one correlated response without additional
     /// validation. This compatibility operation accepts the first candidate.
     fn request(
@@ -410,6 +408,14 @@ pub trait Transport: Send + Sync {
         })
     }
 
+    /// Send request data and wait until the validator accepts a response.
+    ///
+    /// The default implementation polls [`recv_with`](Self::recv_with) once
+    /// before sending, allowing an out-of-band demultiplexer to install its
+    /// correlation state before a fast response can arrive. Transports that
+    /// serialize an exchange by holding a lock (such as TCP) must override this
+    /// so one future owns the lock across the write and every rejected
+    /// candidate.
     fn request_with<T, F>(
         &self,
         data: &[u8],
@@ -422,8 +428,21 @@ pub trait Transport: Send + Sync {
     {
         async move {
             checked_deadline(registration.timeout(), "transport timeout")?;
+
+            let mut receive = std::pin::pin!(self.recv_with(registration, validate));
+            let ready_response = std::future::poll_fn(|context| {
+                Poll::Ready(match receive.as_mut().poll(context) {
+                    Poll::Ready(result) => Some(result),
+                    Poll::Pending => None,
+                })
+            })
+            .await;
+
             self.send(data).await?;
-            self.recv_with(registration, validate).await
+            match ready_response {
+                Some(result) => result,
+                None => receive.await,
+            }
         }
     }
 
