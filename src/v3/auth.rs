@@ -463,14 +463,19 @@ fn compute_hmac_slices(
 /// backend does not support the key's authentication protocol.
 ///
 /// Returns [`CryptoError::CipherError`](super::CryptoError::CipherError) if the auth-parameter
-/// offset/length is out of bounds for the message; leaving the message unsigned would be a
-/// silent failure, so an out-of-bounds offset is rejected rather than returning `Ok(())`.
+/// length does not match the key's protocol or the offset/length is out of bounds for the
+/// message; leaving the message unsigned would be a silent failure, so an invalid range is
+/// rejected rather than returning `Ok(())`.
 pub fn authenticate_message(
     key: &LocalizedKey,
     message: &mut [u8],
     auth_offset: usize,
     auth_len: usize,
 ) -> CryptoResult<()> {
+    if auth_len != key.mac_len() {
+        return Err(super::CryptoError::CipherError);
+    }
+
     let end = match auth_offset.checked_add(auth_len) {
         Some(e) if e <= message.len() => e,
         _ => return Err(super::CryptoError::CipherError),
@@ -999,6 +1004,19 @@ mod tests {
         let mut message = vec![0u8; 32];
         assert_eq!(
             authenticate_message(&key, &mut message, usize::MAX, 12),
+            Err(super::super::CryptoError::CipherError)
+        );
+    }
+
+    #[test]
+    fn test_authenticate_message_mismatched_auth_len_errors() {
+        let key = LocalizedKey::from_bytes(AuthProtocol::Sha256, vec![0x01; 32]).unwrap();
+        let mut message = vec![0u8; 32];
+
+        // HMAC-SHA-2-256-192 requires 24 authentication octets. A shorter
+        // in-bounds destination must be rejected instead of panicking.
+        assert_eq!(
+            authenticate_message(&key, &mut message, 0, 12),
             Err(super::super::CryptoError::CipherError)
         );
     }
