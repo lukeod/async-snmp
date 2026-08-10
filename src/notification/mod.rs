@@ -1,11 +1,11 @@
-//! SNMP Notification Receiver (RFC 3413).
+//! SNMP notification receiver (RFC 3413).
 //!
-//! This module provides functionality for receiving SNMP notifications:
+//! [`NotificationReceiver`] receives:
 //! - `TrapV1` (SNMP v1 format, different PDU structure)
 //! - `TrapV2`/`SNMPv2-Trap` (SNMP v2c/v3 format)
 //! - `InformRequest` (confirmed notification, requires response)
 //!
-//! # Example
+//! # SNMPv1 and SNMPv2c
 //!
 //! Receive v1/v2c notifications. A receiver constructed with `bind` has no
 //! USM user table, so v3 notifications are rejected; see below for v3.
@@ -16,7 +16,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<async_snmp::Error>> {
-//!     let receiver = NotificationReceiver::bind("0.0.0.0:162").await?;
+//!     let receiver = NotificationReceiver::bind("0.0.0.0:1162").await?;
 //!
 //!     loop {
 //!         match receiver.recv().await {
@@ -31,7 +31,7 @@
 //! }
 //! ```
 //!
-//! # V3 Notifications
+//! # SNMPv3
 //!
 //! To receive V3 traps and `InformRequests`, configure USM credentials via
 //! the builder. Only notifications from registered usernames are accepted,
@@ -48,7 +48,7 @@
 //!     Ok::<(), Infallible>(())
 //! })?;
 //! let receiver = NotificationReceiver::builder()
-//!     .bind("0.0.0.0:162")
+//!     .bind("0.0.0.0:1162")
 //!     .authoritative_engine(engine)
 //!     .usm_user("informuser", |u| {
 //!         u.auth_priv(
@@ -64,7 +64,7 @@
 //! # }
 //! ```
 //!
-//! # Mixed Versions on One Port
+//! # Mixed versions on one port
 //!
 //! A single receiver on one UDP port handles v1, v2c, and v3 concurrently;
 //! each datagram is dispatched by its version field. Community filtering
@@ -82,7 +82,7 @@
 //!     Ok::<(), Infallible>(())
 //! })?;
 //! let receiver = NotificationReceiver::builder()
-//!     .bind("0.0.0.0:162")
+//!     .bind("0.0.0.0:1162")
 //!     .authoritative_engine(engine)
 //!     .communities(["public", "monitor"]) // gates v1/v2c
 //!     .usm_user("trapuser", |u| {          // gates v3
@@ -105,7 +105,7 @@
 //! username and [`security_level`](Notification::security_level) for v3 — so
 //! branch on the variant when `recv` returns to apply per-version policy.
 //!
-//! # V3 Authoritative Roles
+//! # SNMPv3 authoritative roles
 //!
 //! The sender of an unconfirmed V3 trap is authoritative. The receiver verifies
 //! the trap against per-sender engine state and reports the received security
@@ -115,7 +115,7 @@
 //! incoming tuple. Configuring any USM user therefore requires a persisted
 //! [`AuthoritativeEngine`].
 //!
-//! # Notification Varbind Validation
+//! # Notification varbind validation
 //!
 //! SNMPv2c and SNMPv3 TrapV2 and Inform PDUs start with an uptime value and a
 //! trap OID value. By default, [`NotificationVarbindValidation::Tolerant`]

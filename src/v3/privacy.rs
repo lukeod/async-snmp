@@ -180,11 +180,9 @@ impl PrivKey {
     /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
     /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
     ///
-    /// # Performance Note
-    ///
-    /// This method performs the full key derivation (~850μs for SHA-256). When
-    /// polling many engines with shared credentials, use [`MasterKey`](super::MasterKey)
-    /// and call [`PrivKey::from_master_key`] for each engine.
+    /// This method performs password expansion and localization. When multiple
+    /// engines share credentials, retain a [`MasterKey`](super::MasterKey) and
+    /// call [`PrivKey::from_master_key`] for each engine.
     ///
     /// # Example
     ///
@@ -236,7 +234,8 @@ impl PrivKey {
 
     /// Derive a privacy key from a master key and engine ID.
     ///
-    /// This is the efficient path when you have a cached [`MasterKey`](super::MasterKey).
+    /// This avoids repeating password expansion when a cached
+    /// [`MasterKey`](super::MasterKey) is available.
     /// Key extension is automatically applied when needed based on the auth/priv
     /// protocol combination:
     ///

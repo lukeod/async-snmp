@@ -1,33 +1,33 @@
 //! Authentication key derivation and HMAC operations (RFC 3414).
 //!
 //! This module implements:
-//! - Password-to-key derivation (1MB expansion + hash)
+//! - Password-to-key derivation (1 MB expansion and hash)
 //! - Key localization (binding key to engine ID)
 //! - HMAC authentication for message integrity
 //!
-//! # Two-Level Key Derivation
+//! # Two-level key derivation
 //!
 //! `SNMPv3` key derivation is a two-step process:
 //!
-//! 1. **Password to Master Key** (~850μs for SHA-256): Expand password to 1MB
-//!    by repetition and hash it. This produces a protocol-specific master key.
+//! 1. **Password to master key**: Expand the password to 1 MB by repetition
+//!    and hash it. This produces a protocol-specific master key.
 //!
-//! 2. **Localization** (~1μs): Bind the master key to a specific engine ID by
+//! 2. **Localization**: Bind the master key to a specific engine ID by
 //!    computing `H(master_key || engine_id || master_key)`.
 //!
 //! When polling many engines with the same credentials, cache the [`MasterKey`]
 //! and call [`MasterKey::localize`] for each engine ID. This avoids repeating
-//! the expensive 1MB expansion for every engine.
+//! the 1 MB expansion for every engine.
 //!
 //! ```rust
 //! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 //! # {
 //! use async_snmp::{AuthProtocol, MasterKey};
 //!
-//! // Expensive: ~850μs - do once per password
+//! // Expand and hash the password once.
 //! let master = MasterKey::from_password(AuthProtocol::Sha256, b"authpassword").unwrap();
 //!
-//! // Cheap: ~1μs each - do per engine
+//! // Localize the result for each engine.
 //! let key1 = master.localize(b"\x80\x00\x1f\x88\x80...").unwrap();
 //! let key2 = master.localize(b"\x80\x00\x1f\x88\x81...").unwrap();
 //! # }
@@ -49,19 +49,9 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// Master authentication key (Ku) before engine localization.
 ///
 /// This is the intermediate result of the RFC 3414 password-to-key algorithm,
-/// computed by expanding the password to 1MB and hashing it. This step is
-/// computationally expensive (~850μs for SHA-256) but can be cached and reused
-/// across multiple engines that share the same credentials.
-///
-/// # Performance
-///
-/// | Operation | Time |
-/// |-----------|------|
-/// | `MasterKey::from_password` (SHA-256) | ~850 μs |
-/// | `MasterKey::localize` | ~1 μs |
-///
-/// For applications polling many engines with shared credentials, caching the
-/// `MasterKey` provides significant performance benefits.
+/// computed by expanding the password to 1 MB and hashing it. The result can
+/// be cached and reused across engines that share the same credentials,
+/// avoiding repeated password expansion.
 ///
 /// # Security
 ///
@@ -76,10 +66,10 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// # {
 /// use async_snmp::{AuthProtocol, MasterKey};
 ///
-/// // Derive master key once (expensive)
+/// // Derive the master key once for these credentials.
 /// let master = MasterKey::from_password(AuthProtocol::Sha256, b"authpassword").unwrap();
 ///
-/// // Localize to different engines (cheap)
+/// // Localize it to different engines.
 /// let engine1_id = b"\x80\x00\x1f\x88\x80\xe9\xb1\x04\x61\x73\x61\x00\x00\x00";
 /// let engine2_id = b"\x80\x00\x1f\x88\x80\xe9\xb1\x04\x61\x73\x61\x00\x00\x01";
 ///
@@ -99,9 +89,9 @@ pub struct MasterKey {
 impl MasterKey {
     /// Derive a master key from a password.
     ///
-    /// This implements RFC 3414 Section A.2.1: expand the password to 1MB by
-    /// repetition, then hash the result. This is computationally expensive
-    /// (~850μs for SHA-256) but only needs to be done once per password.
+    /// This implements RFC 3414 Section A.2.1: expand the password to 1 MB by
+    /// repetition, then hash the result. The result can be reused for engines
+    /// that share the same password and authentication protocol.
     ///
     /// # Errors
     ///
@@ -150,7 +140,7 @@ impl MasterKey {
     /// Create a master key from raw bytes.
     ///
     /// Use this if you already have a master key (e.g., from configuration).
-    /// The bytes must be the exact digest output from the 1MB password
+    /// The bytes must be the exact digest output from the 1 MB password
     /// expansion for `protocol`.
     ///
     /// # Errors
@@ -182,8 +172,6 @@ impl MasterKey {
     ///
     /// This implements RFC 3414 Section A.2.2:
     /// `localized_key = H(master_key || engine_id || master_key)`
-    ///
-    /// This operation is cheap (~1μs) compared to master key derivation.
     ///
     /// # Errors
     ///
@@ -260,15 +248,13 @@ impl LocalizedKey {
     /// Derive a localized key from a password and engine ID.
     ///
     /// This implements the key localization algorithm from RFC 3414 Section A.2:
-    /// 1. Expand password to 1MB by repetition
+    /// 1. Expand password to 1 MB by repetition
     /// 2. Hash the expansion to get the master key
     /// 3. Hash (`master_key` || `engine_id` || `master_key`) to get the localized key
     ///
-    /// # Performance Note
-    ///
-    /// This method performs the full key derivation (~850μs for SHA-256). When
-    /// polling many engines with shared credentials, use [`MasterKey`] to cache
-    /// the intermediate result and call [`MasterKey::localize`] for each engine.
+    /// This method performs password expansion and localization. When multiple
+    /// engines share credentials, use [`MasterKey`] to retain the intermediate
+    /// result and call [`MasterKey::localize`] for each engine.
     ///
     /// # Empty and Short Passwords
     ///
@@ -307,8 +293,8 @@ impl LocalizedKey {
 
     /// Create a localized key from a master key and engine ID.
     ///
-    /// This is the efficient path when you have a cached [`MasterKey`].
-    /// Equivalent to calling [`MasterKey::localize`].
+    /// This avoids repeating password expansion when a [`MasterKey`] is already
+    /// available. Equivalent to calling [`MasterKey::localize`].
     pub fn from_master_key(master: &MasterKey, engine_id: &[u8]) -> CryptoResult<Self> {
         master.localize(engine_id)
     }
@@ -552,10 +538,11 @@ pub fn verify_message(
 
 /// Pre-computed master keys for `SNMPv3` authentication and privacy.
 ///
-/// This struct caches the expensive password-to-key derivation results for
-/// both authentication and privacy passwords. When polling many engines with
-/// shared credentials, create a `MasterKeys` once and use it with
-/// [`UsmConfig::with_master_keys`](crate::UsmConfig::with_master_keys) to avoid repeating the ~850μs key derivation for each engine.
+/// This struct stores password-to-key derivation results for both
+/// authentication and privacy passwords. When multiple engines share
+/// credentials, create `MasterKeys` once and use it with
+/// [`UsmConfig::with_master_keys`](crate::UsmConfig::with_master_keys) to avoid
+/// repeating password expansion for each engine.
 ///
 /// # Example
 ///
@@ -564,11 +551,11 @@ pub fn verify_message(
 /// # {
 /// use async_snmp::{AuthProtocol, PrivProtocol, MasterKeys};
 ///
-/// // Create master keys once (expensive)
+/// // Create the master keys once for these credentials.
 /// let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
 ///     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 ///
-/// // Use with multiple clients - localization is cheap (~1μs per engine)
+/// // Use with multiple clients; each client localizes for its engine.
 /// # }
 /// ```
 #[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -820,7 +807,7 @@ pub(crate) fn extend_key_with_backend(
 /// # Performance Warning
 ///
 /// This is approximately 1000x slower than [`extend_key`] (Blumenthal) because each
-/// iteration requires the full 1MB password expansion.
+/// iteration requires the full 1 MB password expansion.
 #[cfg(test)]
 pub(crate) fn extend_key_reeder(
     protocol: AuthProtocol,

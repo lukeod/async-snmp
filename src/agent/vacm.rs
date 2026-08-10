@@ -1,8 +1,7 @@
 //! View-based Access Control Model (RFC 3415).
 //!
-//! VACM controls access to MIB objects based on who is making the request
-//! and what they are trying to access. It implements fine-grained access control
-//! through a three-table architecture.
+//! VACM selects read, write, and notification views from a request's security
+//! model, security name, security level, and context.
 //!
 //! `SecurityModel` is canonical at [`crate::handler::SecurityModel`] and the
 //! crate root; it is not re-exported from this nested module.
@@ -11,26 +10,20 @@
 //! use async_snmp::agent::vacm::SecurityModel;
 //! ```
 //!
-//! # Overview
-//!
-//! VACM (View-based Access Control Model) is the standard access control mechanism
-//! for `SNMPv3`, though it can also be used with SNMPv1/v2c. It answers the question:
-//! "Can this user perform this operation on this OID?"
-//!
 //! # Architecture
 //!
 //! VACM controls access through three tables:
 //!
-//! 1. **Security-to-Group Table**: Maps (securityModel, securityName) to groupName.
-//!    This groups users/communities with similar access rights.
+//! 1. **Security-to-group table**: Maps `(securityModel, securityName)` to a
+//!    group name.
 //!
-//! 2. **Access Table**: Maps (groupName, contextPrefix, securityModel, securityLevel)
-//!    to view names for read, write, and notify operations.
+//! 2. **Access table**: Maps `(groupName, contextPrefix, securityModel,
+//!    securityLevel)` to view names for read, write, and notify operations.
 //!
-//! 3. **View Tree Family Table**: Defines views as collections of OID subtrees,
-//!    with optional inclusion/exclusion and wildcard masks.
+//! 3. **View-tree-family table**: Defines views as included or excluded OID
+//!    subtrees, with optional wildcard masks.
 //!
-//! # Basic Example
+//! # Read-only community
 //!
 //! Configure read-only access for "public" community:
 //!
@@ -50,7 +43,7 @@
 //! # }
 //! ```
 //!
-//! # Read/Write Access Example
+//! # Read and write access
 //!
 //! Configure different access levels for different users:
 //!
@@ -95,7 +88,7 @@
 //! # }
 //! ```
 //!
-//! # View Exclusions
+//! # View exclusions
 //!
 //! Views can exclude specific subtrees from a broader include:
 //!
@@ -112,7 +105,7 @@
 //! assert!(!view.contains(&oid!(1, 3, 6, 1, 2, 1, 1, 7, 0)));  // sysServices.0 - blocked
 //! ```
 //!
-//! # Wildcard Masks
+//! # Wildcard masks
 //!
 //! Masks allow matching OIDs with wildcards at specific positions:
 //!
@@ -137,7 +130,7 @@
 //! assert!(!subtree.matches(&oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 1)));   // ifType.1
 //! ```
 //!
-//! # Integration with Agent
+//! # Agent integration
 //!
 //! Use [`AgentBuilder::vacm()`](super::AgentBuilder::vacm) to configure VACM:
 //!
@@ -147,7 +140,7 @@
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
 //! let agent = Agent::builder()
-//!     .bind("0.0.0.0:161")
+//!     .bind("0.0.0.0:1161")
 //!     .community(b"public")
 //!     .community(b"private")
 //!     .vacm(|v| v
@@ -162,7 +155,7 @@
 //! # }
 //! ```
 //!
-//! # Access Denied Behavior
+//! # Denied requests
 //!
 //! When VACM denies access:
 //! - **`SNMPv1`**: Returns `noSuchName` error

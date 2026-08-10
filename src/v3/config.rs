@@ -122,15 +122,15 @@ impl UsmConfig {
         self
     }
 
-    /// Use pre-computed master keys for efficient key derivation.
+    /// Use pre-computed master keys.
     ///
-    /// # Master Key Caching
+    /// # Reusing master keys
     ///
     /// When polling many engines with shared credentials, use
-    /// [`MasterKeys`](crate::MasterKeys) to cache the expensive password-to-key
+    /// [`MasterKeys`](crate::MasterKeys) to avoid repeating password-to-key
     /// derivation. Calling this method replaces any password-backed credentials
-    /// with cached master keys. Credential configurators use last-call-wins
-    /// semantics.
+    /// with the supplied master keys. Credential configurators use
+    /// last-call-wins semantics.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[must_use]
     pub fn with_master_keys(mut self, mut master_keys: crate::v3::MasterKeys) -> Self {

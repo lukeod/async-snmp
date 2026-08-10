@@ -1,4 +1,4 @@
-//! Unified UDP transport for SNMP clients.
+//! UDP transport for SNMP clients.
 //!
 //! This module provides [`UdpTransport`] (the socket owner), [`UdpHandle`]
 //! (per-target handles that implement [`Transport`]), and [`UdpControl`]
@@ -30,12 +30,12 @@
 //! response is matched to its caller by extracting the request ID (or msgID for
 //! `SNMPv3`) from the packet header and looking up the corresponding pending
 //! request slot. V1/v2c slots additionally enforce the registered version and
-//! community policy before consuming a response. The pending map is sharded (64 shards, keyed by request ID) to
-//! reduce lock contention under high concurrency.
+//! community policy before consuming a response. The pending map is sharded by
+//! request ID.
 //!
 //! `connect()` creates a dedicated `UdpTransport` per client. `build_with()`
-//! shares one `UdpTransport` across many clients - the demux logic is the same
-//! in both cases; sharing just avoids duplicating the socket and recv task.
+//! shares one `UdpTransport` across many clients. The demultiplexing logic is
+//! the same in both cases; sharing avoids duplicating the socket and recv task.
 //! Dedicated endpoints are drop-managed by default. Call
 //! [`ClientBuilder::connect_with_control`](crate::ClientBuilder::connect_with_control)
 //! or [`UdpTransport::control`] only when orderly endpoint-wide shutdown is

@@ -508,10 +508,9 @@ struct EngineCacheInner {
 ///
 /// # Capacity
 ///
-/// The cache is unbounded by default. Each entry is roughly 100-150 bytes,
-/// so even 100k targets uses only ~10-15 MB. For deployments that scan
-/// very large address ranges, [`with_max_capacity`](Self::with_max_capacity)
-/// sets a hard limit with oldest-entry eviction.
+/// The cache is unbounded by default. Applications that need a fixed bound can
+/// use [`with_max_capacity`](Self::with_max_capacity), which evicts the oldest
+/// entry when inserting at capacity.
 ///
 /// # Example
 ///

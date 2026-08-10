@@ -3,69 +3,263 @@
 
 //! # async-snmp
 //!
-//! Modern, async-first SNMP client library for Rust.
+//! An asynchronous SNMP library built on Tokio.
 //!
-//! ## Features
+//! ## Protocol and API coverage
 //!
-//! - Full `SNMPv1`, v2c, and v3 support
-//! - Async-first API built on Tokio
-//! - Zero-copy BER encoding/decoding
-//! - Permissive OID tree/receive representation with checked outbound wire encoding
-//! - Config-driven client construction
-//! - Trap and inform sending (agent-based multi-sink or client-based)
-//! - Trap and inform receiving with optional community filtering and per-notification
-//!   security-level reporting
-//! - SNMP agent with async handlers, two-phase SET, VACM, and built-in MIB handlers
-//! - Automatic tooBig recovery (GET/GETNEXT batches bisect on oversized responses)
+//! - `SNMPv1`, v2c, and v3 USM clients
+//! - GET, GETNEXT, GETBULK, SET, WALK, and BULKWALK operations
+//! - Trap and inform sending and receiving through [`notification`]
+//! - Per-client UDP, shared UDP, and TCP transports
+//! - An SNMP agent with async handlers, two-phase SET processing, VACM, and
+//!   built-in engine/USM/MPD objects when the `agent` feature is enabled
+//! - Automatic `tooBig` recovery for GET and GETNEXT batches
 //!
-//! ## Quick Start
+//! GETBULK, BULKWALK, and informs require SNMPv2c or SNMPv3. Structured
+//! outbound encoding rejects values that cannot be represented on the wire;
+//! receive-side compatibility behavior is described under
+//! [Interoperability](#interoperability-policy).
+//!
+//! ## Client setup
+//!
+//! [`Client::builder`] accepts a `(host, port)` tuple, a combined address
+//! string, or a [`std::net::SocketAddr`]. [`ClientBuilder::connect`] constructs
+//! a UDP transport; [`ClientBuilder::connect_tcp`] constructs a TCP transport.
+//! Request and construction timeouts are independent and default to five
+//! seconds. The construction timeout is one deadline covering name resolution
+//! and built-in transport creation.
+//!
+//! ### SNMPv2c
 //!
 //! ```rust,no_run
 //! use async_snmp::{Auth, Client, oid};
-//! use std::time::Duration;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<async_snmp::Error>> {
-//!     // SNMPv2c client - target accepts (host, port), a string, or a SocketAddr
+//! async fn main() -> async_snmp::Result<()> {
 //!     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
-//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-//!         .request_timeout(Duration::from_secs(5))
 //!         .connect()
 //!         .await?;
 //!
-//!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-//!     println!("sysDescr: {:?}", result.varbinds[0].value);
+//!     let response = client
+//!         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+//!         .await?;
+//!
+//!     match response.single() {
+//!         Some(varbind) => println!("sysDescr: {:?}", varbind.value),
+//!         None => eprintln!("unexpected response shape: {:?}", response.anomalies),
+//!     }
 //!
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## `SNMPv3` Example
+//! Fixed-cardinality GET, GETNEXT, and SET methods return a
+//! [`FixedCardinalityResponse`]. The default [`ResponseShapePolicy::Compatible`]
+//! preserves every decoded binding in `varbinds` and records bounded shape
+//! problems in `anomalies`. [`FixedCardinalityResponse::single`] returns the
+//! binding only when a singleton response is unambiguous. Applications that
+//! want anomalous responses returned as errors can configure
+//! [`ResponseShapePolicy::Strict`].
+//!
+//! ### SNMPv3 authentication and privacy
 //!
 //! ```rust,no_run
-//! use async_snmp::{Auth, Client, oid, v3::{AuthProtocol, PrivProtocol}};
+//! use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, oid};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<async_snmp::Error>> {
-//!     let client = Client::builder(("192.168.1.1", 161),
-//!         Auth::usm("admin").auth_priv(
-//!             AuthProtocol::Sha256,
-//!             "authpass123",
-//!             PrivProtocol::Aes128,
-//!             "privpass123",
-//!         ))
-//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
+//! async fn main() -> async_snmp::Result<()> {
+//!     let auth = Auth::usm("admin").auth_priv(
+//!         AuthProtocol::Sha256,
+//!         "authpass123",
+//!         PrivProtocol::Aes128,
+//!         "privpass123",
+//!     );
+//!
+//!     let client = Client::builder(("192.168.1.1", 161), auth)
 //!         .connect()
 //!         .await?;
 //!
-//!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-//!     println!("sysDescr: {:?}", result.varbinds[0].value);
+//!     let response = client
+//!         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+//!         .await?;
+//!
+//!     match response.single() {
+//!         Some(varbind) => println!("sysDescr: {:?}", varbind.value),
+//!         None => eprintln!("unexpected response shape: {:?}", response.anomalies),
+//!     }
 //!
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## `SNMPv3` Trust, Corrections, and Roles
+//! Plaintext authentication and privacy passwords must contain at least eight
+//! octets. See [`v3`] for supported algorithms, backend selection, key
+//! handling, and authoritative-engine requirements.
+//!
+//! ### Errors and retries
+//!
+//! Client operations use the boxed [`Error`] type. Match on variants when an
+//! application needs to distinguish transport, protocol, authentication, or
+//! response-shape failures. The [`error`] module documents every variant.
+//!
+//! ```rust,no_run
+//! use async_snmp::{Auth, Client, Error, ErrorStatus, Retry, oid};
+//! use std::time::Duration;
+//!
+//! async fn poll_device(addr: &str) -> Result<String, String> {
+//!     let client = Client::builder(addr, Auth::v2c("public"))
+//!         .request_timeout(Duration::from_secs(5))
+//!         .retry(Retry::fixed(2, Duration::ZERO))
+//!         .connect()
+//!         .await
+//!         .map_err(|error| format!("client construction failed: {error}"))?;
+//!
+//!     match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
+//!         Ok(response) => response
+//!             .single()
+//!             .and_then(|varbind| varbind.value.as_str())
+//!             .map(str::to_owned)
+//!             .ok_or_else(|| format!("unexpected response shape: {:?}", response.anomalies)),
+//!         Err(error) => match *error {
+//!             Error::Timeout { retries, .. } => {
+//!                 Err(format!("device did not respond after {retries} retries"))
+//!             }
+//!             Error::Snmp { status: ErrorStatus::NoSuchName, .. } => {
+//!                 Err("OID is not supported by the device".to_owned())
+//!             }
+//!             _ => Err(format!("SNMP request failed: {error}")),
+//!         },
+//!     }
+//! }
+//! ```
+//!
+//! UDP requests can retry on timeout with a fixed or exponential delay. TCP
+//! requests do not use this retry policy because retransmission is handled by
+//! the transport.
+//!
+//! ```rust
+//! use async_snmp::{Auth, Client, Retry};
+//! use std::time::Duration;
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! let no_retries = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     .retry(Retry::none())
+//!     .connect()
+//!     .await?;
+//!
+//! let fixed = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     .retry(Retry::fixed(3, Duration::ZERO))
+//!     .connect()
+//!     .await?;
+//!
+//! let exponential = Client::builder("192.168.1.1:161", Auth::v2c("public"))
+//!     .retry(
+//!         Retry::exponential(5)
+//!             .max_delay(Duration::from_secs(5))
+//!             .jitter(0.25)
+//!             .build()
+//!             .expect("valid retry configuration"),
+//!     )
+//!     .connect()
+//!     .await?;
+//! # let _ = (no_retries, fixed, exponential);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### Shared UDP transport
+//!
+//! [`ClientBuilder::connect`] gives each client its own UDP endpoint.
+//! [`ClientBuilder::build_with`] instead creates a per-target client handle on
+//! an existing [`UdpTransport`]. Clients built from the same transport share
+//! its socket, receive task, statistics, and lifecycle. Responses are
+//! correlated by request identity; v1/v2c also applies version and community
+//! checks, while v3 performs its authenticated client checks.
+//!
+//! ```rust,no_run
+//! use async_snmp::{Auth, Client, UdpTransport, oid};
+//! use futures::future::join_all;
+//!
+//! async fn poll_many_devices(
+//!     targets: Vec<&str>,
+//! ) -> Vec<(&str, Result<String, String>)> {
+//!     let transport = UdpTransport::bind("0.0.0.0:0")
+//!         .await
+//!         .expect("failed to bind UDP transport");
+//!     let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+//!
+//!     let mut clients = Vec::with_capacity(targets.len());
+//!     for target in &targets {
+//!         let client = Client::builder((*target, 161), Auth::v2c("public"))
+//!             .build_with(&transport)
+//!             .await
+//!             .expect("failed to build client");
+//!         clients.push(client);
+//!     }
+//!
+//!     let results = join_all(clients.iter().map(|client| async {
+//!         match client.get(&sys_descr).await {
+//!             Ok(response) => response
+//!                 .single()
+//!                 .map(|varbind| varbind.value.to_string())
+//!                 .ok_or_else(|| format!("unexpected response shape: {:?}", response.anomalies)),
+//!             Err(error) => Err(error.to_string()),
+//!         }
+//!     }))
+//!     .await;
+//!
+//!     targets.into_iter().zip(results).collect()
+//! }
+//! ```
+//!
+//! Multiple transports can be used when separate sockets, buffer policies, or
+//! failure domains are required. See [`transport`] for correlation,
+//! address-family, statistics, and shutdown details.
+//!
+//! ### Reusing SNMPv3 key and discovery state
+//!
+//! Password-to-key derivation expands the password to one megabyte before
+//! hashing it. `MasterKeys` allows that result to be reused across engines
+//! that share credentials. [`EngineCache`] shares discovered engine identities,
+//! remote message-size limits, and trusted engine time between clients.
+//!
+//! ```rust,no_run
+//! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+//! # {
+//! use async_snmp::{
+//!     Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol,
+//!     UdpTransport, oid,
+//! };
+//! use std::sync::Arc;
+//!
+//! # async fn example() -> async_snmp::Result<()> {
+//! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
+//!     .expect("valid authentication configuration")
+//!     .with_privacy(PrivProtocol::Aes128, b"privpassword")
+//!     .expect("valid privacy configuration");
+//! let engine_cache = Arc::new(EngineCache::new());
+//! let transport = UdpTransport::bind("0.0.0.0:0").await?;
+//!
+//! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
+//!     let auth = Auth::usm("snmpuser").with_master_keys(master_keys.clone());
+//!     let client = Client::builder(target, auth)
+//!         .engine_cache(engine_cache.clone())
+//!         .build_with(&transport)
+//!         .await?;
+//!
+//!     let response = client
+//!         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+//!         .await?;
+//!     if let Some(varbind) = response.single() {
+//!         println!("{target}: {:?}", varbind.value);
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! ## SNMPv3 trust, correction, and authoritative roles
 //!
 //! Engine discovery is unauthenticated. A client accepts only a correlated,
 //! standard `usmStatsUnknownEngineIDs.0` Report and learns an engine identity
@@ -73,11 +267,11 @@
 //! Trusted time is established and advanced only after HMAC verification and
 //! RFC 3414 Step 7(b) processing.
 //!
-//! Incoming auth/privacy flags select the received security level. HMAC and
-//! timeliness processing precede decryption, scoped-PDU parsing, and msgID
-//! correlation. Ordinary Responses then require exact identity, security,
-//! context, PDU type, and request-id matches. Reports also require a current
-//! exchange msgID and exact shape; terminal statuses are returned as
+//! Incoming authentication/privacy flags select the received security level.
+//! HMAC and timeliness processing precede decryption, scoped-PDU parsing, and
+//! msgID correlation. Ordinary Responses then require exact identity,
+//! security, context, PDU type, and request-id matches. Reports also require a
+//! current-exchange msgID and exact shape; terminal statuses are returned as
 //! [`Error::Report`].
 //!
 //! On an SNMPv3 timeout, each transmission uses a fresh outer msgID while the
@@ -99,223 +293,19 @@
 //! injector can choose that packet's time fields; enable strict UDP source
 //! checking where possible.
 //!
-//! Agents with USM users or V3 trap sinks, notification receivers with USM
-//! users, and clients originating V3 traps are locally authoritative and need
-//! a persisted [`AuthoritativeEngine`]. Polling and V3 Inform originators use
-//! the remote responder as authoritative and do not need local engine state.
+//! Agents with USM users or v3 trap sinks, notification receivers with USM
+//! users, and clients originating v3 traps are locally authoritative and need
+//! a persisted [`AuthoritativeEngine`]. Polling clients and v3 Inform
+//! originators use the remote responder as authoritative and do not need local
+//! engine state.
 //!
-//! # Advanced Topics
-//!
-//! ## Error Handling Patterns
-//!
-//! The library provides detailed error information for debugging and recovery.
-//! See the [`error`] module for complete documentation.
-//!
-//! ```rust,no_run
-//! use async_snmp::{Auth, Client, Error, ErrorStatus, Retry, oid};
-//! use std::time::Duration;
-//!
-//! async fn poll_device(addr: &str) -> Result<String, String> {
-//!     let client = Client::builder(addr, Auth::v2c("public"))
-//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-//!         .request_timeout(Duration::from_secs(5))
-//!         .retry(Retry::fixed(2, Duration::ZERO))
-//!         .connect()
-//!         .await
-//!         .map_err(|e| format!("Failed to connect: {}", e))?;
-//!
-//!     match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
-//!         Ok(response) => Ok(response.varbinds[0].value.as_str().unwrap_or("(non-string)").to_string()),
-//!         Err(e) => match *e {
-//!             Error::Timeout { retries, .. } => {
-//!                 Err(format!("Device unreachable after {} retries", retries))
-//!             }
-//!             Error::Snmp { status: ErrorStatus::NoSuchName, .. } => {
-//!                 Err("OID not supported by device".to_string())
-//!             }
-//!             _ => Err(format!("SNMP error: {}", e)),
-//!         },
-//!     }
-//! }
-//! ```
-//!
-//! ## Retry Configuration
-//!
-//! UDP transports retry on timeout with configurable backoff strategies.
-//! TCP transports ignore retry configuration (the transport layer handles reliability).
-//!
-//! ```rust
-//! use async_snmp::{Auth, Client, Retry};
-//! use std::time::Duration;
-//!
-//! # async fn example() -> async_snmp::Result<()> {
-//! // No retries (fail immediately on timeout)
-//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .retry(Retry::none())
-//!     .connect().await?;
-//!
-//! // 3 retries with no delay between attempts
-//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .retry(Retry::fixed(3, Duration::ZERO))
-//!     .connect().await?;
-//!
-//! // Exponential backoff with jitter (1s, 2s, 4s, 5s, 5s)
-//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .retry(Retry::exponential(5)
-//!         .max_delay(Duration::from_secs(5))
-//!         .jitter(0.25)
-//!         .build()
-//!         .expect("valid retry configuration"))  // ±25% randomization
-//!     .connect().await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Scalable Polling (Shared Transport)
-//!
-//! For monitoring systems polling many targets, share a single [`UdpTransport`]
-//! across all clients:
-//!
-//! - **1 file descriptor** for all targets (vs 1 per target)
-//! - **Firewall session reuse** between polls to the same target
-//! - **Lower memory** from shared socket buffers
-//! - **No per-poll socket creation** overhead
-//!
-//! **Scaling guidance:**
-//! - **Most use cases**: Single shared [`UdpTransport`] recommended
-//! - **~100,000s+ targets**: Multiple [`UdpTransport`] instances, sharded by target
-//! - **Scrape isolation**: Per-client via [`.connect()`](ClientBuilder::connect) (FD + syscall overhead)
-//!
-//! ```rust,no_run
-//! use async_snmp::{Auth, Client, oid, UdpTransport};
-//! use futures::future::join_all;
-//!
-//! async fn poll_many_devices(targets: Vec<&str>) -> Vec<(&str, Result<String, String>)> {
-//!     // Single socket shared across all clients
-//!     let transport = UdpTransport::bind("0.0.0.0:0")
-//!         .await
-//!         .expect("failed to bind");
-//!
-//!     let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
-//!
-//!     // Create clients for each target - (host, port) tuples work naturally
-//!     let mut clients = Vec::new();
-//!     for t in &targets {
-//!         let client = Client::builder((*t, 161), Auth::v2c("public"))
-//!             .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-//!             .build_with(&transport)
-//!             .await
-//!             .expect("failed to build client");
-//!         clients.push(client);
-//!     }
-//!
-//!     // Poll all targets concurrently
-//!     let results = join_all(
-//!         clients.iter().map(|c| async {
-//!             match c.get(&sys_descr).await {
-//!                 Ok(response) => Ok(response.varbinds[0].value.to_string()),
-//!                 Err(e) => Err(e.to_string()),
-//!             }
-//!         })
-//!     ).await;
-//!
-//!     targets.into_iter().zip(results).collect()
-//! }
-//! ```
-//!
-//! ## High-Throughput `SNMPv3` Polling
-//!
-//! `SNMPv3` has two expensive per-connection operations:
-//! - **Password derivation**: ~850μs to derive keys from passwords (SHA-256)
-//! - **Engine discovery**: Round-trip to learn the agent's engine ID and message-size limit
-//!
-//! For polling many targets with shared credentials, cache both:
-//!
-//! ```rust,no_run
-//! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-//! # {
-//! use async_snmp::{Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, oid, UdpTransport};
-//! use std::sync::Arc;
-//!
-//! # async fn example() -> async_snmp::Result<()> {
-//! // 1. Derive master keys once (expensive: ~850μs)
-//! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
-//!     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
-//!
-//! // 2. Share engine discovery results across clients
-//! let engine_cache = Arc::new(EngineCache::new());
-//!
-//! // 3. Use shared transport for socket efficiency
-//! let transport = UdpTransport::bind("0.0.0.0:0").await?;
-//!
-//! // Poll multiple targets - only ~1μs key localization per engine
-//! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
-//!     let auth = Auth::usm("snmpuser").with_master_keys(master_keys.clone());
-//!
-//!     let client = Client::builder(target, auth)
-//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-//!         .engine_cache(engine_cache.clone())
-//!         .build_with(&transport).await?;
-//!
-//!     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-//!     println!("{}: {:?}", target, result.varbinds[0].value);
-//! }
-//! # Ok(())
-//! # }
-//! # }
-//! ```
-//!
-//! | Optimization | Without | With | Savings |
-//! |--------------|---------|------|---------|
-//! | `MasterKeys` | 850μs/engine | 1μs/engine | ~99.9% |
-//! | `EngineCache` | 1 RTT/engine | 0 RTT (cached) | 1 RTT |
-//!
-//! ## Graceful Shutdown
-//!
-//! Use `tokio::select!` or cancellation tokens for clean shutdown.
-//!
-//! ```rust,no_run
-//! use async_snmp::{Auth, Client, oid};
-//! use std::time::Duration;
-//! use tokio::time::interval;
-//!
-//! async fn poll_with_shutdown(
-//!     addr: &str,
-//!     mut shutdown: tokio::sync::oneshot::Receiver<()>,
-//! ) {
-//!     let client = Client::builder(addr, Auth::v2c("public"))
-//!         .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
-//!         .connect()
-//!         .await
-//!         .expect("failed to connect");
-//!
-//!     let sys_uptime = oid!(1, 3, 6, 1, 2, 1, 1, 3, 0);
-//!     let mut poll_interval = interval(Duration::from_secs(30));
-//!
-//!     loop {
-//!         tokio::select! {
-//!             _ = &mut shutdown => {
-//!                 println!("Shutdown signal received");
-//!                 break;
-//!             }
-//!             _ = poll_interval.tick() => {
-//!                 match client.get(&sys_uptime).await {
-//!                     Ok(response) => println!("Uptime: {:?}", response.varbinds[0].value),
-//!                     Err(e) => eprintln!("Poll failed: {}", e),
-//!                 }
-//!             }
-//!         }
-//!     }
-//! }
-//! ```
-//!
-//! ## Tracing Integration
+//! ## Tracing
 //!
 //! The library uses the `tracing` crate for structured logging. Client
 //! operations are instrumented with spans, and protocol/transport paths emit
 //! events with relevant context.
 //!
-//! ### Basic Setup
+//! ### Subscriber setup
 //!
 //! ```rust,no_run
 //! use async_snmp::{Auth, Client, oid};
@@ -335,14 +325,13 @@
 //!         .await
 //!         .expect("failed to connect");
 //!
-//!     // Logs: DEBUG async_snmp::client snmp.target=192.168.1.1:161 snmp.request_id=12345
 //!     let _ = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 //! }
 //! ```
 //!
-//! ### Log Levels
+//! ### Log levels
 //!
-//! | Level | What's Logged |
+//! | Level | Typical events |
 //! |-------|---------------|
 //! | ERROR | UDP receive failures and agent request-task/handler-contract failures |
 //! | WARN | Authentication, correlation, compatibility, parse, and source-policy anomalies |
@@ -350,9 +339,9 @@
 //! | DEBUG | Request/response flow, engine discovery, retries, and walk progress |
 //! | TRACE | Detailed BER, value, USM, crypto, and packet-processing state |
 //!
-//! ### Structured Fields
+//! ### Structured fields
 //!
-//! Stable operation fields use the `snmp.` prefix for easy filtering:
+//! Operation fields use the `snmp.` prefix:
 //!
 //! | Field | Description |
 //! |-------|-------------|
@@ -372,9 +361,9 @@
 //! | `snmp.engine_id` | `SNMPv3` engine identifier (hex) |
 //! | `snmp.local_addr` | Local bind address |
 //!
-//! ### Filtering by Target
+//! ### Tracing targets and filters
 //!
-//! Tracing targets follow a stable naming scheme (not tied to internal module paths):
+//! Tracing targets are grouped by subsystem:
 //!
 //! | Target Prefix | What's Included |
 //! |---------------|-----------------|
@@ -404,7 +393,7 @@
 //!
 //! ## Interoperability policy
 //!
-//! Interoperability deviations are independent controls, not a global
+//! Interoperability deviations are independent controls rather than a global
 //! "permissive" mode. Defaults either preserve a bounded, unambiguous value or
 //! narrowly accommodate common agent behavior. Security-sensitive relaxations
 //! are off by default. [`CompatibilityPolicy`] is supplied to low-level message
@@ -413,9 +402,11 @@
 //!
 //! ### Malformed BER and value normalization
 //!
-//! [`CompatibilityPolicy::DEFAULT`] enables five normalizations. Every accepted
-//! deviation emits a tracing warning with a stable `anomaly` field.
-//! [`CompatibilityPolicy::STRICT`] disables all six behaviors.
+//! [`CompatibilityPolicy`] contains six controls.
+//! [`CompatibilityPolicy::DEFAULT`] enables the first five listed below and
+//! leaves malformed exception payloads disabled. Every accepted deviation emits
+//! a tracing warning with a stable `anomaly` field.
+//! [`CompatibilityPolicy::STRICT`] disables all six controls.
 //!
 //! | `CompatibilityPolicy` field | Default | Scope and boundary |
 //! |---|:---:|---|
@@ -507,14 +498,15 @@
 //! # let _ = (value_policy, decode_agent_packet);
 //! ```
 //!
-//! ## Cargo Features
+//! ## Cargo features
 //!
-//! - `agent` - SNMP agent (not enabled by default)
-//! - `crypto-rustcrypto` - RustCrypto backend (the only default feature). Supports all auth and privacy protocols.
-//! - `crypto-fips` - FIPS backend via aws-lc-rs. Rejects MD5, DES, and 3DES.
-//! - `cli` - Builds command-line utilities (`asnmp-get`, `asnmp-walk`, `asnmp-set`)
-//! - `mib` - MIB integration via mib-rs (OID conversions, value formatting helpers)
-//! - `rt-multi-thread` - Multi-threaded tokio runtime
+//! - `agent`: SNMP agent support.
+//! - `crypto-rustcrypto` (default): RustCrypto authentication and privacy
+//!   backend; supports MD5, SHA-1/SHA-2, DES/3DES, and AES.
+//! - `crypto-fips`: AWS-LC FIPS backend; rejects MD5, DES, and 3DES.
+//! - `cli`: Builds `asnmp-get`, `asnmp-walk`, and `asnmp-set`.
+//! - `mib`: MIB integration through mib-rs.
+//! - `rt-multi-thread`: Tokio's multi-threaded runtime.
 //!
 //! Client, protocol, transport, notification, and noAuthNoPriv APIs are always
 //! available. The agent and crypto backend features are independent and

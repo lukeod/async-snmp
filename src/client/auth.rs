@@ -3,22 +3,21 @@
 //! This module provides the [`Auth`] enum for specifying authentication
 //! configuration, supporting SNMPv1/v2c community identifiers and `SNMPv3` USM.
 //!
-//! # Master Key Caching
+//! # Reusing master keys
 //!
 //! When polling many engines with shared credentials, use
-//! [`MasterKeys`] to cache the expensive password-to-key
-//! derivation:
+//! [`MasterKeys`] to avoid repeating password-to-key derivation:
 //!
 //! ```rust
 //! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 //! # {
 //! use async_snmp::{Auth, AuthProtocol, PrivProtocol, MasterKeys};
 //!
-//! // Derive master keys once (expensive: ~850μs for SHA-256)
+//! // Derive the master keys once for these credentials.
 //! let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword").unwrap()
 //!     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 //!
-//! // Use with the shared USM config - localization is cheap (~1μs per engine)
+//! // Each client localizes the keys for its authoritative engine.
 //! let auth: Auth = Auth::usm("admin")
 //!     .with_master_keys(master_keys)
 //!     .into();

@@ -1,10 +1,9 @@
 //! TCP transport implementation for SNMP clients.
 //!
-//! This module provides [`TcpTransport`], a TCP-based transport for SNMP
-//! communication. TCP transport is useful when UDP is unreliable (firewalls,
-//! lossy networks) or when larger message sizes are needed.
+//! [`TcpTransport`] carries BER-encoded SNMP messages over a connected TCP
+//! stream. The peer must support SNMP over TCP.
 //!
-//! # Message Framing
+//! # Message framing
 //!
 //! Unlike UDP where each datagram is a complete message, TCP is a byte stream.
 //! SNMP over TCP uses BER's self-describing length for framing:
@@ -21,23 +20,20 @@
 //! 2. Length field (1-5 bytes, definite form only)
 //! 3. Content bytes (length determined by step 2)
 //!
-//! This is the native BER encoding - no additional framing is needed.
+//! This uses the message's BER envelope without an additional framing header.
 //!
-//! # When to Prefer TCP Over UDP
+//! # Transport differences
 //!
-//! | Use Case | Recommendation |
-//! |----------|----------------|
-//! | Standard polling | UDP (lower overhead, retries handle loss) |
-//! | Firewalled networks | TCP (stateful connection may pass firewall) |
-//! | Large responses (>64KB) | TCP (no UDP datagram size limit) |
-//! | Unreliable networks | TCP (built-in retransmission) |
-//! | Simple deployment | UDP (no connection state to manage) |
+//! UDP preserves message boundaries and does not require connection state. TCP
+//! presents a byte stream, provides ordered delivery while the connection is
+//! usable, and is not constrained by a UDP datagram boundary. Message-size
+//! limits still apply at the SNMP and library configuration layers.
 //!
-//! # No Automatic Retries
+//! # Request retries
 //!
-//! Since TCP guarantees delivery or connection failure, the client disables
-//! automatic retries when using TCP transport. A timeout means the connection
-//! is likely broken, and retry would require reconnection.
+//! The client does not apply its UDP retry policy to TCP requests. A request
+//! timeout is returned to the caller; reconnecting or retrying on another
+//! connection is an application decision.
 //!
 //! # Example
 //!
