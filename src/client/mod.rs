@@ -920,7 +920,9 @@ impl<T: Transport> Client<T> {
     /// GETBULK splits the requested OIDs into two groups:
     ///
     /// - **Non-repeaters** (first N OIDs): Each gets a single GETNEXT, returning
-    ///   one value per OID. Use for scalar values like `sysUpTime.0`.
+    ///   the first lexicographic successor of the requested OID. To retrieve a
+    ///   scalar instance such as `sysUpTime.0`, request its object OID without
+    ///   the `.0` instance suffix.
     /// - **Repeaters** (remaining OIDs): Each gets up to `max_repetitions` GETNEXTs,
     ///   returning multiple values per OID. Use for walking table columns.
     ///
@@ -941,9 +943,10 @@ impl<T: Transport> Client<T> {
     /// # use async_snmp::{Auth, Client, oid};
     /// # async fn example() -> async_snmp::Result<()> {
     /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
-    /// // Get sysUpTime (non-repeater) plus 10 interface descriptions (repeater)
+    /// // Get sysUpTime.0 (non-repeater) plus 10 interface descriptions (repeater).
+    /// // Both inputs are object OIDs; GETBULK returns their instance successors.
     /// let results = client.get_bulk(
-    ///     &[oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2)],
+    ///     &[oid!(1, 3, 6, 1, 2, 1, 1, 3), oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2)],
     ///     1,  // first OID is non-repeating
     ///     10, // get up to 10 values for the second OID
     /// ).await?;

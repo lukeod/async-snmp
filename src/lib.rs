@@ -34,7 +34,7 @@
 //! ```rust,no_run
 //! use async_snmp::{Auth, Client, oid};
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> async_snmp::Result<()> {
 //!     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
 //!         .connect()
@@ -66,7 +66,7 @@
 //! ```rust,no_run
 //! use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, oid};
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> async_snmp::Result<()> {
 //!     let auth = Auth::usm("admin").auth_priv(
 //!         AuthProtocol::Sha256,
@@ -311,7 +311,7 @@
 //! use async_snmp::{Auth, Client, oid};
 //! use tracing_subscriber::EnvFilter;
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() {
 //!     tracing_subscriber::fmt()
 //!         .with_env_filter(

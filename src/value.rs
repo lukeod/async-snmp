@@ -310,9 +310,8 @@ pub enum Value {
     /// Counter64 (unsigned 64-bit, wrapping).
     ///
     /// **SNMPv2c/v3 only.** Counter64 was introduced in `SNMPv2` (RFC 2578) and is
-    /// not supported in `SNMPv1`. When sending Counter64 values to an `SNMPv1` agent,
-    /// the value will be silently ignored or cause an error depending on the agent
-    /// implementation.
+    /// not supported in `SNMPv1`. The library's structured encoders reject an
+    /// outbound `SNMPv1` message containing this value before transmission.
     ///
     /// If your application needs to support `SNMPv1`, avoid using Counter64 or
     /// fall back to Counter32 (with potential overflow for high-bandwidth counters).
@@ -643,13 +642,16 @@ impl Value {
 
     /// Extract Counter64 as f64 with wrapping at 2^53.
     ///
-    /// Prevents precision loss for large counters. IEEE 754 double-precision
+    /// Keeps converted samples exact for large counters. IEEE 754 double-precision
     /// floats have a 53-bit mantissa, so Counter64 values above 2^53 lose
-    /// precision when converted directly. This method wraps at the mantissa
-    /// limit, preserving precision for rate calculations.
+    /// precision when converted directly. This method reduces the value modulo
+    /// 2^53 before conversion.
     ///
-    /// Use when computing rates where precision matters more than absolute
-    /// magnitude. For Counter32 and other types, behaves identically to `as_f64()`.
+    /// This introduces an artificial wrap at 2^53. Rate calculations must use a
+    /// modulo-2^53 delta rather than ordinary subtraction when that boundary is
+    /// crossed. When possible, compute the delta from [`Value::as_u64`] first and
+    /// convert the delta to `f64`. For Counter32 and other types, this behaves
+    /// identically to [`Value::as_f64`].
     ///
     /// # Examples
     ///
@@ -659,10 +661,11 @@ impl Value {
     /// // Small values behave the same as as_f64()
     /// assert_eq!(Value::Counter64(1000).as_f64_wrapped(), Some(1000.0));
     ///
-    /// // Large Counter64 wraps at 2^53
-    /// let large = 1u64 << 54; // 2^54
-    /// let wrapped = Value::Counter64(large).as_f64_wrapped().unwrap();
-    /// assert!(wrapped < large as f64); // Wrapped to smaller value
+    /// // Crossing the artificial boundary requires modular subtraction.
+    /// let modulus = (1u64 << 53) as f64;
+    /// let previous = Value::Counter64((1u64 << 53) - 1).as_f64_wrapped().unwrap();
+    /// let current = Value::Counter64((1u64 << 53) + 1).as_f64_wrapped().unwrap();
+    /// assert_eq!((current - previous).rem_euclid(modulus), 2.0);
     /// ```
     #[expect(
         clippy::cast_precision_loss,

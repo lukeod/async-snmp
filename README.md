@@ -48,7 +48,7 @@ cargo add tokio --features macros,rt
 ```rust
 use async_snmp::{Auth, Client, oid};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder(("192.168.1.1", 161), Auth::v2c("public"))
         .connect()

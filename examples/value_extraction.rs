@@ -41,10 +41,10 @@ fn main() {
     let sys_descr = Value::OctetString(Bytes::from_static(b"Linux router"));
     println!("String value: {:?}", sys_descr.as_f64());
 
-    // --- as_f64_wrapped(): Safe Counter64 handling ---
+    // --- as_f64_wrapped(): Exact Counter64 samples modulo 2^53 ---
     // IEEE 754 double-precision floats have a 53-bit mantissa, so Counter64
-    // values above 2^53 (~9 petabytes) lose precision. This method wraps at
-    // 2^53 to preserve precision for rate calculations.
+    // values above 2^53 lose precision. This method wraps at 2^53 so each
+    // converted sample remains exact, at the cost of an artificial wrap point.
 
     println!("\n--- Counter64 Precision Handling ---");
 
@@ -64,8 +64,16 @@ fn main() {
         large_counter.as_f64_wrapped()
     );
 
-    // For rate calculations: (current_wrapped - previous_wrapped) gives correct
-    // delta even with wrap-around, as long as both values use the same wrapping.
+    // Ordinary subtraction is not sufficient when the artificial wrap is
+    // crossed. Apply modulo 2^53 to the difference.
+    let modulus = (1u64 << 53) as f64;
+    let previous = Value::Counter64((1u64 << 53) - 1).as_f64_wrapped().unwrap();
+    let current = Value::Counter64((1u64 << 53) + 1).as_f64_wrapped().unwrap();
+    let delta = (current - previous).rem_euclid(modulus);
+    println!("Wrapped delta across 2^53: {delta}");
+
+    // Prefer calculating Counter64 deltas as u64 before converting to f64 when
+    // both raw samples are available.
 
     // --- as_decimal(): Fixed-point value extraction ---
     // Many sensors report values as integers with an implied decimal point.
