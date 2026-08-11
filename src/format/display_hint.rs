@@ -100,7 +100,13 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
 
         let mut take = 0usize;
         while hint_pos < hint.len() && is_digit(hint[hint_pos]) {
-            take = take * 10 + (hint[hint_pos] - b'0') as usize;
+            take = match take
+                .checked_mul(10)
+                .and_then(|value| value.checked_add((hint[hint_pos] - b'0') as usize))
+            {
+                Some(value) => value,
+                None => return hex::encode(data),
+            };
             hint_pos += 1;
         }
 
@@ -182,7 +188,10 @@ pub fn apply(hint: &str, data: &[u8]) -> String {
                 break;
             }
 
-            let end = (data_pos + take).min(data.len());
+            let end = data_pos
+                .checked_add(take)
+                .unwrap_or(data.len())
+                .min(data.len());
             let chunk = &data[data_pos..end];
 
             // Format the chunk
@@ -283,7 +292,7 @@ fn is_digit(c: u8) -> bool {
 /// INTEGER hints have the form: `<format>[-<decimal-places>]`
 ///
 /// Format characters:
-/// - `d` or `d-N`: Decimal, optionally with N implied decimal places
+/// - `d` or `d-N`: Decimal, optionally with 0..=255 implied decimal places
 /// - `x`: Lowercase hexadecimal
 /// - `o`: Octal
 /// - `b`: Binary
@@ -315,7 +324,7 @@ pub fn apply_integer(hint: &str, value: i32) -> Option<String> {
         "b" => Some(format!("{value:b}")),
         "d" => Some(format!("{value}")),
         hint if hint.starts_with("d-") => {
-            let places: usize = hint[2..].parse().ok()?;
+            let places = usize::from(hint[2..].parse::<u8>().ok()?);
             if places == 0 {
                 return Some(format!("{value}"));
             }
@@ -594,6 +603,20 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_take_value_returns_hex() {
+        assert_eq!(
+            apply("9999999999999999999999999999999999999999a", &[1, 2, 3]),
+            "010203"
+        );
+    }
+
+    #[test]
+    fn maximum_take_value_does_not_overflow_data_position() {
+        let hint = format!("*{}a", usize::MAX);
+        assert_eq!(apply(&hint, &[1, b'a']), "a");
+    }
+
+    #[test]
     fn zero_width_trailing_no_abort_no_loop() {
         // RFC 2579 3.1(2): octet length may be zero. A trailing zero-width spec
         // consumes no data and emits no separator/terminator, and must not loop
@@ -695,6 +718,12 @@ mod tests {
 
         // d-0 is just decimal
         assert_eq!(apply_integer("d-0", 1234), Some("1234".to_string()));
+
+        // Decimal places use the same u8 range accepted by mib-rs.
+        let max_places = apply_integer("d-255", 42).unwrap();
+        assert_eq!(max_places.len(), 257);
+        assert!(max_places.starts_with("0."));
+        assert!(max_places.ends_with("42"));
     }
 
     #[test]
@@ -702,6 +731,8 @@ mod tests {
         assert_eq!(apply_integer("", 42), None);
         assert_eq!(apply_integer("z", 42), None);
         assert_eq!(apply_integer("d-abc", 42), None);
+        assert_eq!(apply_integer("d-256", 42), None);
+        assert_eq!(apply_integer(&format!("d-{}", usize::MAX), 42), None);
         assert_eq!(apply_integer("1d", 42), None); // OCTET STRING format, not INTEGER
     }
 }
