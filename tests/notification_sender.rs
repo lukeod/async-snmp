@@ -1004,6 +1004,46 @@ async fn agent_inform_reports_failing_sink() {
 }
 
 #[tokio::test]
+async fn agent_inform_does_not_delay_later_sinks_after_unreachable_sink() {
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let live_addr = receiver.local_addr();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink(dead_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(live_addr.to_string(), Auth::v2c("public"))
+        .inform_timeout(Duration::from_secs(2))
+        .inform_retry(Retry::none())
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
+    let send = tokio::spawn({
+        let agent = agent.clone();
+        let trap_oid = trap_oid.clone();
+        async move { agent.send_inform(&trap_oid, 0, vec![]).await }
+    });
+
+    let (notification, _) = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+        .await
+        .expect("later sink was delayed by the unreachable sink")
+        .unwrap();
+    assert!(matches!(notification, Notification::InformV2c { .. }));
+
+    let outcome = send.await.unwrap();
+    assert_eq!(outcome.len(), 2);
+    assert_eq!(outcome.sinks()[0].dest, dead_addr);
+    assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Failed(_)));
+    assert_eq!(outcome.sinks()[1].dest, live_addr);
+    assert!(matches!(&outcome.sinks()[1].status, SinkStatus::Succeeded));
+}
+
+#[tokio::test]
 async fn agent_trap_reports_total_conversion_failure() {
     let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
     let sink_addr = receiver.local_addr();

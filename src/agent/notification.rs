@@ -8,6 +8,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::Community;
@@ -329,8 +330,9 @@ impl super::Agent {
     /// Send an inform to all configured trap sinks, reporting every outcome.
     ///
     /// Constructs an `InformRequest` PDU and sends it to each destination,
-    /// waiting for acknowledgement from each. Reuses a cached client per sink
-    /// for the request/response exchange.
+    /// waiting for acknowledgement from each. Sink exchanges run concurrently,
+    /// and outcomes remain in sink configuration order. Reuses a cached client
+    /// per sink for the request/response exchange.
     ///
     /// V1 trap sinks are explicitly reported as skipped because v1 does not
     /// support informs. For a V3 sink, the receiver is authoritative; the
@@ -364,27 +366,27 @@ impl super::Agent {
         varbinds: Vec<VarBind>,
     ) -> NotificationOutcome {
         let sinks = &self.inner.trap_sinks;
-        let mut outcomes = Vec::with_capacity(sinks.len());
-
-        for sink in sinks {
+        let varbinds = &varbinds;
+        let outcomes = join_all(sinks.iter().map(|sink| async move {
             let status = if sink.version == Version::V1 {
                 SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
-            } else if !self.notification_allowed(sink, trap_oid, &varbinds) {
+            } else if !self.notification_allowed(sink, trap_oid, varbinds) {
                 SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
             } else {
                 match self
-                    .send_inform_to_sink(sink, trap_oid, uptime, &varbinds)
+                    .send_inform_to_sink(sink, trap_oid, uptime, varbinds)
                     .await
                 {
                     Ok(()) => SinkStatus::Succeeded,
                     Err(error) => SinkStatus::Failed(error),
                 }
             };
-            outcomes.push(SinkOutcome {
+            SinkOutcome {
                 dest: sink.dest,
                 status,
-            });
-        }
+            }
+        }))
+        .await;
 
         NotificationOutcome { sinks: outcomes }
     }

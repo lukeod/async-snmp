@@ -140,6 +140,7 @@ dependencies = [
  "dirs",
  "futures",
  "futures-core",
+ "futures-util",
  "getrandom 0.4.3",
  "hdrhistogram",
  "hmac",

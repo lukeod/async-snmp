@@ -18,6 +18,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 bytes = "1.11.0"
 futures-core = "0.3.31"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 smallvec = "1.15.1"
 socket2 = "0.6"
 quinn-udp = { version = "0.6", optional = true }
