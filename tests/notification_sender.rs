@@ -6,9 +6,11 @@ use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::message::CommunityMessage;
 use async_snmp::notification::{Notification, NotificationReceiver, NotificationVarbindValidation};
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-use async_snmp::v3::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+use async_snmp::v3::{AuthProtocol, PrivProtocol};
 use async_snmp::varbind::VarBind;
-use async_snmp::{Auth, Client, Pdu, PduType, Retry, Value, oid};
+use async_snmp::{
+    Auth, AuthoritativeEngine, Client, Pdu, PduType, Retry, SecurityLevel, Value, Version, oid,
+};
 use bytes::Bytes;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -16,6 +18,23 @@ use tokio::net::UdpSocket;
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 fn test_authoritative_engine(engine_id: Vec<u8>) -> AuthoritativeEngine {
     AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(())).unwrap()
+}
+
+fn no_op_authoritative_engine(engine_id: &[u8]) -> AuthoritativeEngine {
+    AuthoritativeEngine::install(engine_id.to_vec(), |_| {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap()
+}
+
+fn expect_agent_build_error(
+    result: async_snmp::Result<Agent>,
+    message: &str,
+) -> Box<async_snmp::Error> {
+    match result {
+        Ok(_) => panic!("{message}"),
+        Err(error) => error,
+    }
 }
 
 // ============================================================================
@@ -682,7 +701,7 @@ async fn agent_v2c_trap_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("v2c", recv_addr.to_string(), Auth::v2c("public"))
         .build()
         .await
         .unwrap();
@@ -713,6 +732,42 @@ async fn agent_v2c_trap_to_sink() {
 }
 
 #[tokio::test]
+async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
+    let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let recv_addr = receiver.local_addr();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink("lazy", recv_addr.to_string(), Auth::v2c("public"))
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    let mut stream = agent.send_trap_stream(&trap_oid, 321, vec![]);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+            .await
+            .is_err(),
+        "creating the stream sent a trap before it was polled"
+    );
+
+    let sink = stream.next().await.expect("configured sink outcome");
+    assert_eq!(sink.sink.id().as_str(), "lazy");
+    assert_eq!(sink.sink.index(), 0);
+    assert_eq!(sink.sink.dest(), recv_addr);
+    assert!(matches!(sink.status, SinkStatus::Succeeded));
+    assert!(stream.next().await.is_none());
+
+    let (notification, _) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("timeout waiting for lazily sent trap")
+        .unwrap();
+    assert_eq!(notification.uptime(), 321);
+}
+
+#[tokio::test]
 async fn agent_v2c_inform_to_sink() {
     let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
     let recv_addr = receiver.local_addr();
@@ -720,7 +775,7 @@ async fn agent_v2c_inform_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("v2c", recv_addr.to_string(), Auth::v2c("public"))
         .build()
         .await
         .unwrap();
@@ -778,6 +833,7 @@ async fn agent_v3_trap_to_sink() {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
         .trap_sink(
+            "v3",
             recv_addr.to_string(),
             Auth::usm("trapuser").auth(AuthProtocol::Sha256, "authpass12345678"),
         )
@@ -820,8 +876,8 @@ async fn agent_multiple_sinks() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(addr1.to_string(), Auth::v2c("public"))
-        .trap_sink(addr2.to_string(), Auth::v2c("trap-community"))
+        .trap_sink("first", addr1.to_string(), Auth::v2c("public"))
+        .trap_sink("second", addr2.to_string(), Auth::v2c("trap-community"))
         .build()
         .await
         .unwrap();
@@ -869,7 +925,7 @@ async fn agent_v1_trap_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(recv_addr.to_string(), Auth::v1("public"))
+        .trap_sink("v1", recv_addr.to_string(), Auth::v1("public"))
         .build()
         .await
         .unwrap();
@@ -906,8 +962,8 @@ async fn agent_mixed_v1_v2c_sinks() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(addr_v1.to_string(), Auth::v1("v1comm"))
-        .trap_sink(addr_v2.to_string(), Auth::v2c("v2comm"))
+        .trap_sink("v1", addr_v1.to_string(), Auth::v1("v1comm"))
+        .trap_sink("v2c", addr_v2.to_string(), Auth::v2c("v2comm"))
         .build()
         .await
         .unwrap();
@@ -963,6 +1019,16 @@ async fn agent_no_sinks_is_noop() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    let mut trap_stream = agent.send_trap_stream(&trap_oid, 0, vec![]);
+    fn assert_send_unpin<T: Send + Unpin>(_: &T) {}
+    assert_send_unpin(&trap_stream);
+    assert!(trap_stream.next().await.is_none());
+    assert!(trap_stream.next().await.is_none());
+
+    let inform_stream = agent.send_inform_stream(&trap_oid, 0, vec![]);
+    let collected: Vec<_> = futures::StreamExt::collect(inform_stream).await;
+    assert!(collected.is_empty());
+
     // Primary methods report an empty (all-succeeded) outcome for no sinks.
     let trap_outcome = agent.send_trap(&trap_oid, 0, vec![]).await;
     assert!(trap_outcome.is_empty());
@@ -971,6 +1037,128 @@ async fn agent_no_sinks_is_noop() {
     let inform_outcome = agent.send_inform(&trap_oid, 0, vec![]).await;
     assert!(inform_outcome.is_empty());
     assert!(inform_outcome.all_succeeded());
+}
+
+#[tokio::test]
+async fn agent_rejects_invalid_sink_id_lengths_before_bind_configuration() {
+    let empty = expect_agent_build_error(
+        Agent::builder()
+            .bind("not-a-socket-address")
+            .trap_sink("", "127.0.0.1:9", Auth::v1("public"))
+            .build()
+            .await,
+        "empty sink ID unexpectedly accepted",
+    );
+    assert_eq!(
+        empty.to_string(),
+        "configuration error: notification sink ID must not be empty"
+    );
+
+    let too_long = expect_agent_build_error(
+        Agent::builder()
+            .bind("not-a-socket-address")
+            .trap_sink("x".repeat(33), "127.0.0.1:9", Auth::v1("public"))
+            .build()
+            .await,
+        "overlong sink ID unexpectedly accepted",
+    );
+    assert_eq!(
+        too_long.to_string(),
+        "configuration error: notification sink ID length 33 exceeds maximum 32 UTF-8 octets"
+    );
+
+    let multibyte = expect_agent_build_error(
+        Agent::builder()
+            .bind("not-a-socket-address")
+            .trap_sink("é".repeat(17), "127.0.0.1:9", Auth::v1("public"))
+            .build()
+            .await,
+        "overlong multibyte sink ID unexpectedly accepted",
+    );
+    assert_eq!(
+        multibyte.to_string(),
+        "configuration error: notification sink ID length 34 exceeds maximum 32 UTF-8 octets"
+    );
+
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .trap_sink("é".repeat(16), "127.0.0.1:9", Auth::v1("public"))
+        .build()
+        .await
+        .expect("32-octet sink ID should be accepted");
+    assert_eq!(
+        agent.notification_sinks().next().unwrap().id().as_str(),
+        "é".repeat(16)
+    );
+}
+
+#[tokio::test]
+async fn agent_rejects_duplicate_sink_ids_before_bind_configuration() {
+    let result = Agent::builder()
+        .bind("not-a-socket-address")
+        .trap_sink("duplicate", "127.0.0.1:9", Auth::v1("first"))
+        .trap_sink("duplicate", "127.0.0.1:10", Auth::v2c("second"))
+        .build()
+        .await;
+
+    let error = match result {
+        Ok(_) => panic!("duplicate sink IDs unexpectedly accepted"),
+        Err(error) => error,
+    };
+    assert!(matches!(&*error, async_snmp::Error::Config(_)));
+    assert_eq!(
+        error.to_string(),
+        "configuration error: duplicate notification sink ID: duplicate"
+    );
+}
+
+#[tokio::test]
+async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
+    const COMMUNITY_SECRET: &str = "community-summary-secret";
+    const USER_SECRET: &str = "username-summary-secret";
+    const CONTEXT_SECRET: &str = "context-summary-secret";
+
+    let dest: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .authoritative_engine(no_op_authoritative_engine(b"sink-summary-engine"))
+        .trap_sink("community", dest.to_string(), Auth::v2c(COMMUNITY_SECRET))
+        .trap_sink(
+            "usm",
+            dest.to_string(),
+            Auth::usm(USER_SECRET).context_name(CONTEXT_SECRET),
+        )
+        .build()
+        .await
+        .unwrap();
+
+    let summaries: Vec<_> = agent.notification_sinks().cloned().collect();
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].index(), 0);
+    assert_eq!(summaries[0].id().as_str(), "community");
+    assert_eq!(summaries[0].dest(), dest);
+    assert_eq!(summaries[0].version(), Version::V2c);
+    assert_eq!(summaries[0].security_level(), None);
+    assert_eq!(summaries[1].index(), 1);
+    assert_eq!(summaries[1].id().as_str(), "usm");
+    assert_eq!(summaries[1].dest(), dest);
+    assert_eq!(summaries[1].version(), Version::V3);
+    assert_eq!(
+        summaries[1].security_level(),
+        Some(SecurityLevel::NoAuthNoPriv)
+    );
+
+    let rendered = format!("{summaries:?}");
+    for secret in [COMMUNITY_SECRET, USER_SECRET, CONTEXT_SECRET] {
+        assert!(!rendered.contains(secret), "summary exposed {secret}");
+    }
+
+    let outcome = agent
+        .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
+        .await;
+    assert_eq!(outcome.len(), 2);
+    assert_eq!(outcome.sinks()[0].sink, summaries[0]);
+    assert_eq!(outcome.sinks()[1].sink, summaries[1]);
 }
 
 #[tokio::test]
@@ -985,7 +1173,7 @@ async fn agent_inform_reports_failing_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(dead_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("dead", dead_addr.to_string(), Auth::v2c("public"))
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())
         .build()
@@ -999,12 +1187,12 @@ async fn agent_inform_reports_failing_sink() {
     assert!(!outcome.all_succeeded());
     let failures: Vec<_> = outcome.failures().collect();
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].dest, dead_addr);
+    assert_eq!(failures[0].sink.dest(), dead_addr);
     assert!(matches!(&failures[0].status, SinkStatus::Failed(_)));
 }
 
 #[tokio::test]
-async fn agent_inform_does_not_delay_later_sinks_after_unreachable_sink() {
+async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() {
     let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = probe.local_addr().unwrap();
     drop(probe);
@@ -1014,8 +1202,8 @@ async fn agent_inform_does_not_delay_later_sinks_after_unreachable_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(dead_addr.to_string(), Auth::v2c("public"))
-        .trap_sink(live_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("dead", dead_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("live", live_addr.to_string(), Auth::v2c("public"))
         .inform_timeout(Duration::from_secs(2))
         .inform_retry(Retry::none())
         .build()
@@ -1023,24 +1211,95 @@ async fn agent_inform_does_not_delay_later_sinks_after_unreachable_sink() {
         .unwrap();
 
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
-    let send = tokio::spawn({
-        let agent = agent.clone();
-        let trap_oid = trap_oid.clone();
-        async move { agent.send_inform(&trap_oid, 0, vec![]).await }
-    });
+    let mut stream = agent.send_inform_stream(&trap_oid, 0, vec![]);
+    let receive = tokio::spawn(async move { receiver.recv().await });
 
-    let (notification, _) = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+    let live = tokio::time::timeout(Duration::from_millis(500), stream.next())
         .await
-        .expect("later sink was delayed by the unreachable sink")
-        .unwrap();
+        .expect("live sink completion was delayed by the unreachable sink")
+        .expect("live sink outcome");
+    assert_eq!(live.sink.id().as_str(), "live");
+    assert_eq!(live.sink.index(), 1);
+    assert_eq!(live.sink.dest(), live_addr);
+    assert!(matches!(live.status, SinkStatus::Succeeded));
+
+    let (notification, _) = receive.await.unwrap().unwrap();
     assert!(matches!(notification, Notification::InformV2c { .. }));
 
-    let outcome = send.await.unwrap();
-    assert_eq!(outcome.len(), 2);
-    assert_eq!(outcome.sinks()[0].dest, dead_addr);
-    assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Failed(_)));
-    assert_eq!(outcome.sinks()[1].dest, live_addr);
-    assert!(matches!(&outcome.sinks()[1].status, SinkStatus::Succeeded));
+    let dead = stream.next().await.expect("dead sink outcome");
+    assert_eq!(dead.sink.id().as_str(), "dead");
+    assert_eq!(dead.sink.index(), 0);
+    assert_eq!(dead.sink.dest(), dead_addr);
+    assert!(matches!(dead.status, SinkStatus::Failed(_)));
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn dropping_inform_stream_cancels_retries() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink("cancelled", target_addr.to_string(), Auth::v2c("public"))
+        .inform_timeout(Duration::from_millis(50))
+        .inform_retry(Retry::fixed(2, Duration::ZERO))
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
+    let mut stream = agent.send_inform_stream(&trap_oid, 0, vec![]);
+    let mut next = Box::pin(stream.next());
+    let mut first = [0; 2048];
+    tokio::select! {
+        outcome = &mut next => panic!("unacknowledged Inform completed unexpectedly: {outcome:?}"),
+        received = target.recv_from(&mut first) => {
+            received.expect("receive first Inform");
+        }
+    }
+    drop(next);
+    drop(stream);
+
+    let mut retry = [0; 2048];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), target.recv_from(&mut retry))
+            .await
+            .is_err(),
+        "a retry was sent after dropping the Inform stream"
+    );
+}
+
+#[tokio::test]
+async fn agent_inform_aggregate_restores_configuration_order() {
+    let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let live_addr = receiver.local_addr();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink("dead", dead_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("live", live_addr.to_string(), Auth::v2c("public"))
+        .inform_timeout(Duration::from_millis(100))
+        .inform_retry(Retry::none())
+        .build()
+        .await
+        .unwrap();
+
+    let receive = tokio::spawn(async move { receiver.recv().await });
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
+    let outcome = agent.send_inform(&trap_oid, 0, vec![]).await;
+    receive.await.unwrap().unwrap();
+
+    assert_eq!(outcome.sinks()[0].sink.id().as_str(), "dead");
+    assert_eq!(outcome.sinks()[0].sink.index(), 0);
+    assert!(matches!(outcome.sinks()[0].status, SinkStatus::Failed(_)));
+    assert_eq!(outcome.sinks()[1].sink.id().as_str(), "live");
+    assert_eq!(outcome.sinks()[1].sink.index(), 1);
+    assert!(matches!(outcome.sinks()[1].status, SinkStatus::Succeeded));
 }
 
 #[tokio::test]
@@ -1050,7 +1309,7 @@ async fn agent_trap_reports_total_conversion_failure() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(sink_addr.to_string(), Auth::v1("public"))
+        .trap_sink("v1", sink_addr.to_string(), Auth::v1("public"))
         .build()
         .await
         .unwrap();
@@ -1069,7 +1328,7 @@ async fn agent_trap_reports_total_conversion_failure() {
 
     assert_eq!(outcome.len(), 1);
     assert!(!outcome.all_succeeded());
-    assert_eq!(outcome.sinks()[0].dest, sink_addr);
+    assert_eq!(outcome.sinks()[0].sink.dest(), sink_addr);
     assert!(matches!(
         &outcome.sinks()[0].status,
         SinkStatus::Failed(error)
@@ -1086,8 +1345,8 @@ async fn agent_trap_reports_ordered_partial_success() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(v1_addr.to_string(), Auth::v1("public"))
-        .trap_sink(v2_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("v1", v1_addr.to_string(), Auth::v1("public"))
+        .trap_sink("v2c", v2_addr.to_string(), Auth::v2c("public"))
         .build()
         .await
         .unwrap();
@@ -1106,9 +1365,9 @@ async fn agent_trap_reports_ordered_partial_success() {
 
     assert_eq!(outcome.len(), 2);
     assert!(!outcome.all_succeeded());
-    assert_eq!(outcome.sinks()[0].dest, v1_addr);
+    assert_eq!(outcome.sinks()[0].sink.dest(), v1_addr);
     assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Failed(_)));
-    assert_eq!(outcome.sinks()[1].dest, v2_addr);
+    assert_eq!(outcome.sinks()[1].sink.dest(), v2_addr);
     assert!(matches!(&outcome.sinks()[1].status, SinkStatus::Succeeded));
 
     let (notification, _) = tokio::time::timeout(Duration::from_secs(5), v2_receiver.recv())
@@ -1126,7 +1385,7 @@ async fn agent_v1_inform_is_explicitly_skipped() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(sink_addr.to_string(), Auth::v1("public"))
+        .trap_sink("v1", sink_addr.to_string(), Auth::v1("public"))
         .build()
         .await
         .unwrap();
@@ -1139,11 +1398,33 @@ async fn agent_v1_inform_is_explicitly_skipped() {
     assert!(!outcome.all_succeeded());
     assert_eq!(outcome.failures().count(), 0);
     assert_eq!(outcome.skipped().count(), 1);
-    assert_eq!(outcome.sinks()[0].dest, sink_addr);
+    assert_eq!(outcome.sinks()[0].sink.dest(), sink_addr);
     assert!(matches!(
         &outcome.sinks()[0].status,
         SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
     ));
+}
+
+#[tokio::test]
+async fn agent_inform_stream_yields_skipped_sink() {
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink("v1-skip", "127.0.0.1:9", Auth::v1("public"))
+        .build()
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
+    let mut stream = agent.send_inform_stream(&trap_oid, 0, vec![]);
+    let skipped = stream.next().await.expect("skipped sink outcome");
+    assert_eq!(skipped.sink.id().as_str(), "v1-skip");
+    assert_eq!(skipped.sink.index(), 0);
+    assert!(matches!(
+        skipped.status,
+        SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
+    ));
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
@@ -1152,7 +1433,7 @@ async fn agent_best_effort_helpers_complete_after_failure_and_skip() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(receiver.local_addr().to_string(), Auth::v1("public"))
+        .trap_sink("v1", receiver.local_addr().to_string(), Auth::v1("public"))
         .build()
         .await
         .unwrap();

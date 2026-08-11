@@ -77,7 +77,10 @@ mod set_handler;
 pub mod vacm;
 
 pub use crate::handler::SecurityModel;
-pub use notification::{NotificationOutcome, SinkOutcome, SinkSkipReason, SinkStatus};
+pub use notification::{
+    NotificationOutcome, NotificationSendStream, NotificationSinkId, NotificationSinkSummary,
+    SinkOutcome, SinkSkipReason, SinkStatus,
+};
 pub use vacm::{VacmBuilder, VacmConfig, VacmSecurityModel, View, ViewCheckResult, ViewSubtree};
 
 use std::collections::{HashMap, HashSet};
@@ -293,7 +296,7 @@ pub struct AgentBuilder {
     recv_buffer_size: Option<usize>,
     vacm: Option<VacmConfig>,
     cancel: Option<CancellationToken>,
-    trap_sinks: Vec<(String, crate::client::Auth)>,
+    trap_sinks: Vec<(NotificationSinkId, String, crate::client::Auth)>,
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
     disabled_builtins: HashSet<BuiltinMib>,
@@ -697,6 +700,10 @@ impl AgentBuilder {
     /// any V3 sink still requires local authoritative state because it may be
     /// used by [`Agent::send_trap()`].
     ///
+    /// `id` must be unique within the agent and contain 1 to 32 UTF-8 octets.
+    /// It is included in delivery outcomes and should remain stable across
+    /// restarts when the application retains sink status.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -713,8 +720,8 @@ impl AgentBuilder {
     ///     .bind("0.0.0.0:1161")
     ///     .authoritative_engine(engine)
     ///     .community(b"public")
-    ///     .trap_sink("192.168.1.100:162", Auth::v2c("public"))
-    ///     .trap_sink("10.0.0.1:162", Auth::usm("trapuser").auth_priv(
+    ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
+    ///     .trap_sink("secure", "10.0.0.1:162", Auth::usm("trapuser").auth_priv(
     ///         AuthProtocol::Sha256,
     ///         "authpass",
     ///         PrivProtocol::Aes128,
@@ -728,10 +735,11 @@ impl AgentBuilder {
     #[must_use]
     pub fn trap_sink(
         mut self,
+        id: impl Into<NotificationSinkId>,
         dest: impl Into<String>,
         auth: impl Into<crate::client::Auth>,
     ) -> Self {
-        self.trap_sinks.push((dest.into(), auth.into()));
+        self.trap_sinks.push((id.into(), dest.into(), auth.into()));
         self
     }
 
@@ -780,11 +788,22 @@ impl AgentBuilder {
 
     /// Build the agent.
     ///
-    /// Returns a configuration error when USM credentials are invalid, USM
-    /// users or V3 trap sinks are configured without a persisted
-    /// [`AuthoritativeEngine`], or the response-size limit exceeds the fixed
-    /// UDP receive capacity.
+    /// Returns a configuration error when notification sink IDs are empty,
+    /// longer than 32 UTF-8 octets, or duplicated; USM credentials are invalid;
+    /// USM users or V3 trap sinks are configured without a persisted
+    /// [`AuthoritativeEngine`]; or the response-size limit exceeds the fixed UDP
+    /// receive capacity.
     pub async fn build(mut self) -> Result<Agent> {
+        let mut sink_ids = HashSet::with_capacity(self.trap_sinks.len());
+        for (id, _, _) in &self.trap_sinks {
+            id.validate()?;
+            if !sink_ids.insert(id.clone()) {
+                return Err(
+                    Error::Config(format!("duplicate notification sink ID: {id}").into()).boxed(),
+                );
+            }
+        }
+
         let max_udp_message_size = UDP_RECEIVE_LIMITS.advertised().as_usize();
         if self.max_message_size > max_udp_message_size {
             return Err(Error::Config(
@@ -798,7 +817,7 @@ impl AgentBuilder {
         // Keep trap-sink credential validation local because outbound sinks
         // are agent-specific, but prepare inbound USM and engine state through
         // the same path used by notification receivers.
-        for (_, auth) in &mut self.trap_sinks {
+        for (_, _, auth) in &mut self.trap_sinks {
             if let crate::client::Auth::Usm(config) = auth {
                 config.validate_and_precompute().map_err(|error| {
                     Error::Config(format!("invalid trap sink USM configuration: {error}").into())
@@ -810,7 +829,7 @@ impl AgentBuilder {
             || self
                 .trap_sinks
                 .iter()
-                .any(|(_, auth)| matches!(auth, crate::client::Auth::Usm(_)));
+                .any(|(_, _, auth)| matches!(auth, crate::client::Auth::Usm(_)));
         let PreparedAuthoritativeUsm {
             users: usm_users,
             authoritative_engine,
@@ -861,11 +880,13 @@ impl AgentBuilder {
 
         // Resolve trap sink addresses
         let mut trap_sinks = Vec::with_capacity(self.trap_sinks.len());
-        for (dest_str, auth) in self.trap_sinks {
+        for (index, (id, dest_str, auth)) in self.trap_sinks.into_iter().enumerate() {
             let dest: SocketAddr = dest_str.parse().map_err(|_| {
                 Error::Config(format!("invalid trap sink address: {dest_str}").into())
             })?;
             trap_sinks.push(notification::TrapSink::new(
+                index,
+                id,
                 dest,
                 auth,
                 self.inform_timeout,
@@ -1080,6 +1101,13 @@ impl Agent {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
+    }
+
+    /// Iterate over credential-free notification sink summaries in configuration order.
+    pub fn notification_sinks(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &NotificationSinkSummary> + DoubleEndedIterator {
+        self.inner.trap_sinks.iter().map(|sink| &sink.summary)
     }
 
     /// Get the local engine ID.
@@ -4041,7 +4069,7 @@ mod tests {
     async fn test_v3_trap_sink_requires_authoritative_engine_before_bind() {
         let result = Agent::builder()
             .bind("not a socket address")
-            .trap_sink("127.0.0.1:162", crate::Auth::usm("trapuser"))
+            .trap_sink("v3-sink", "127.0.0.1:162", crate::Auth::usm("trapuser"))
             .build()
             .await;
 

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `AgentBuilder::trap_sink` now requires a stable caller-supplied
+  `NotificationSinkId`; duplicate IDs are rejected during agent construction.
+  `Agent::notification_sinks` exposes cloneable, credential-free
+  `NotificationSinkSummary` values in configuration order, and each
+  `SinkOutcome` carries the same summary instead of a destination-only identity.
+  `Agent::send_trap_stream` and `Agent::send_inform_stream` return lazy
+  `NotificationSendStream` values that expose per-sink outcomes in completion
+  order. Trap and Inform sink operations are driven concurrently; aggregate
+  sends still return outcomes in sink configuration order.
 - **Breaking:** UDP endpoint observation and lifecycle authority are separate.
   `UdpStats` replaces `TransportStats` with counter names matching their
   increment paths. `UdpHandle`, UDP clients, transports, and `UdpControl`

@@ -3,12 +3,16 @@
 //! Provides trap sink configuration and methods for sending notifications
 //! from an agent to configured destinations.
 
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::RwLock;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::future::join_all;
+use futures_core::stream::{FusedStream, Stream};
+use futures_util::stream::FuturesUnordered;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::Community;
@@ -23,14 +27,129 @@ use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
+const MAX_NOTIFICATION_SINK_ID_LEN: usize = 32;
+
+/// Stable caller-supplied identifier for a notification sink.
+///
+/// The identifier is operational metadata and is never derived from sink
+/// credentials. Callers should keep it stable across agent restarts when sink
+/// delivery outcomes are retained outside the library. Configured identifiers
+/// must contain 1 to 32 UTF-8 octets, matching the `snmpTargetAddrName` size
+/// defined by RFC 3413.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NotificationSinkId(Arc<str>);
+
+impl NotificationSinkId {
+    /// Create a notification sink identifier.
+    ///
+    /// Validation is deferred until [`AgentBuilder::build`](super::AgentBuilder::build)
+    /// so identifiers can be supplied directly to the fluent builder API.
+    #[must_use]
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
+        Self(id.into())
+    }
+
+    /// Return the identifier as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let len = self.0.len();
+        if len == 0 {
+            return Err(Error::Config("notification sink ID must not be empty".into()).boxed());
+        }
+        if len > MAX_NOTIFICATION_SINK_ID_LEN {
+            return Err(Error::Config(
+                format!(
+                    "notification sink ID length {len} exceeds maximum {MAX_NOTIFICATION_SINK_ID_LEN} UTF-8 octets"
+                )
+                .into(),
+            )
+            .boxed());
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for NotificationSinkId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for NotificationSinkId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for NotificationSinkId {
+    fn from(id: &str) -> Self {
+        Self::new(Arc::<str>::from(id))
+    }
+}
+
+impl From<String> for NotificationSinkId {
+    fn from(id: String) -> Self {
+        Self::new(Arc::<str>::from(id))
+    }
+}
+
+/// Credential-free description of a configured notification sink.
+///
+/// This summary deliberately excludes community identifiers, USM usernames,
+/// context names, keys, and the original authentication configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NotificationSinkSummary {
+    index: usize,
+    id: NotificationSinkId,
+    dest: SocketAddr,
+    version: Version,
+    security_level: Option<SecurityLevel>,
+}
+
+impl NotificationSinkSummary {
+    /// Zero-based position in sink configuration order.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Stable caller-supplied sink identifier.
+    #[must_use]
+    pub fn id(&self) -> &NotificationSinkId {
+        &self.id
+    }
+
+    /// Sink destination address.
+    #[must_use]
+    pub fn dest(&self) -> SocketAddr {
+        self.dest
+    }
+
+    /// SNMP version used for this sink.
+    #[must_use]
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Configured SNMPv3 security level, or `None` for community versions.
+    #[must_use]
+    pub fn security_level(&self) -> Option<SecurityLevel> {
+        self.security_level
+    }
+}
+
 /// A configured notification destination.
 ///
 /// Stores resolved credentials and cached keys for sending traps and informs
 /// to a specific target.
 pub(crate) struct TrapSink {
-    pub(crate) dest: SocketAddr,
+    pub(crate) summary: NotificationSinkSummary,
     auth: Auth,
-    pub(crate) version: Version,
     pub(crate) community: Community,
     pub(crate) v3_security: Option<UsmConfig>,
     /// Keys derived against the agent's `engine_id` for V3 trap sending.
@@ -47,34 +166,38 @@ pub(crate) struct TrapSink {
 impl TrapSink {
     /// Create from an Auth configuration and resolved destination address.
     pub(crate) fn new(
+        index: usize,
+        id: NotificationSinkId,
         dest: SocketAddr,
         auth: Auth,
         inform_timeout: Duration,
         inform_retry: Retry,
     ) -> Self {
         let sink_auth = auth.clone();
+        let summary = NotificationSinkSummary {
+            index,
+            id,
+            dest,
+            version: auth.version(),
+            security_level: match &auth {
+                Auth::Community { .. } => None,
+                Auth::Usm(security) => Some(security.security_level()),
+            },
+        };
         match auth {
-            Auth::Community { version, community } => {
-                let snmp_version = match version {
-                    CommunityVersion::V1 => Version::V1,
-                    CommunityVersion::V2c => Version::V2c,
-                };
-                TrapSink {
-                    dest,
-                    auth: sink_auth,
-                    version: snmp_version,
-                    community: community.clone(),
-                    v3_security: None,
-                    derived_keys: RwLock::new(None),
-                    inform_timeout,
-                    inform_retry,
-                    inform_client: AsyncMutex::new(None),
-                }
-            }
-            Auth::Usm(security) => TrapSink {
-                dest,
+            Auth::Community { community, .. } => TrapSink {
+                summary,
                 auth: sink_auth,
-                version: Version::V3,
+                community: community.clone(),
+                v3_security: None,
+                derived_keys: RwLock::new(None),
+                inform_timeout,
+                inform_retry,
+                inform_client: AsyncMutex::new(None),
+            },
+            Auth::Usm(security) => TrapSink {
+                summary,
+                auth: sink_auth,
                 community: Community::default(),
                 v3_security: Some(security),
                 derived_keys: RwLock::new(None),
@@ -120,7 +243,7 @@ impl TrapSink {
             return Ok(client.clone());
         }
 
-        if self.version == Version::V1 {
+        if self.summary.version == Version::V1 {
             unreachable!("v1 does not support informs");
         }
         let config = ClientConfig {
@@ -130,13 +253,13 @@ impl TrapSink {
             ..ClientConfig::default()
         };
 
-        let bind_addr = if self.dest.is_ipv6() {
+        let bind_addr = if self.summary.dest.is_ipv6() {
             "[::]:0"
         } else {
             "0.0.0.0:0"
         };
         let transport = UdpTransport::bind(bind_addr).await?;
-        let handle = transport.handle(self.dest)?;
+        let handle = transport.handle(self.summary.dest)?;
         let client = Client::new(handle, config)?;
         *guard = Some((transport, client.clone()));
         Ok(client)
@@ -180,10 +303,62 @@ pub enum SinkStatus {
 /// exchange, including acknowledgement.
 #[derive(Debug)]
 pub struct SinkOutcome {
-    /// The sink destination address.
-    pub dest: SocketAddr,
+    /// Credential-free configured sink identity and protocol summary.
+    pub sink: NotificationSinkSummary,
     /// The delivery status for this sink.
     pub status: SinkStatus,
+}
+
+type PendingSinkOutcome<'a> = Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>>;
+
+/// Lazy stream of notification sink completions.
+///
+/// Configured sink operations are driven concurrently as the stream is polled.
+/// Each item is yielded as its operation reports completion, so stream order can
+/// differ from sink configuration order. Dropping the stream cancels unfinished
+/// sink futures, but does not undo network I/O or remote processing that already
+/// occurred.
+///
+/// Use [`into_outcome`](Self::into_outcome) on a newly created stream to run
+/// every sink operation and restore sink configuration order in the resulting
+/// [`NotificationOutcome`].
+#[must_use = "notification streams must be polled to send notifications"]
+pub struct NotificationSendStream<'a> {
+    pending: FuturesUnordered<PendingSinkOutcome<'a>>,
+}
+
+impl NotificationSendStream<'_> {
+    /// Return the next sink outcome in completion order.
+    pub async fn next(&mut self) -> Option<SinkOutcome> {
+        std::future::poll_fn(|context| Pin::new(&mut *self).poll_next(context)).await
+    }
+
+    /// Consume the stream and return its remaining outcomes in configuration order.
+    ///
+    /// Outcomes already yielded by [`next`](Self::next) are not included.
+    pub async fn into_outcome(mut self) -> NotificationOutcome {
+        let mut sinks = Vec::with_capacity(self.pending.len());
+        while let Some(outcome) = self.next().await {
+            sinks.push(outcome);
+        }
+        sinks.sort_unstable_by_key(|outcome| outcome.sink.index());
+        NotificationOutcome { sinks }
+    }
+}
+
+impl Stream for NotificationSendStream<'_> {
+    type Item = SinkOutcome;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.pending).poll_next(context)
+    }
+}
+
+impl FusedStream for NotificationSendStream<'_> {
+    fn is_terminated(&self) -> bool {
+        self.pending.is_empty()
+    }
 }
 
 /// Aggregate outcome of sending a notification to all configured sinks.
@@ -244,6 +419,56 @@ impl NotificationOutcome {
 }
 
 impl super::Agent {
+    /// Lazily send a trap to all configured sinks.
+    ///
+    /// No sink operation or request-ID allocation occurs until the returned
+    /// stream is polled. Sink operations are then driven concurrently and
+    /// outcomes are yielded as they complete. Dropping the stream cancels
+    /// unfinished operations but cannot undo a trap write that already occurred.
+    /// Use [`NotificationSendStream::into_outcome`] when outcomes are needed in
+    /// sink configuration order.
+    pub fn send_trap_stream(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> NotificationSendStream<'_> {
+        let pending = FuturesUnordered::new();
+        let pdu = Arc::new(OnceLock::new());
+        let trap_oid = Arc::new(trap_oid.clone());
+        let varbinds: Arc<[VarBind]> = Arc::from(varbinds);
+
+        for sink in &self.inner.trap_sinks {
+            let pdu = Arc::clone(&pdu);
+            let trap_oid = Arc::clone(&trap_oid);
+            let varbinds = Arc::clone(&varbinds);
+            pending.push(Box::pin(async move {
+                let pdu = pdu.get_or_init(|| {
+                    Pdu::trap_v2(
+                        self.next_notification_id(),
+                        uptime,
+                        &trap_oid,
+                        varbinds.to_vec(),
+                    )
+                });
+                let status = if !self.notification_allowed(sink, &trap_oid, &varbinds) {
+                    SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+                } else {
+                    match self.send_trap_to_sink(sink, pdu).await {
+                        Ok(()) => SinkStatus::Succeeded,
+                        Err(error) => SinkStatus::Failed(error),
+                    }
+                };
+                SinkOutcome {
+                    sink: sink.summary.clone(),
+                    status,
+                }
+            }) as PendingSinkOutcome<'_>);
+        }
+
+        NotificationSendStream { pending }
+    }
+
     /// Send a trap to all configured trap sinks, reporting every outcome.
     ///
     /// Constructs a `TrapV2` PDU with the mandatory sysUpTime.0 and
@@ -264,7 +489,7 @@ impl super::Agent {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
-    ///     .trap_sink("192.168.1.100:162", Auth::v2c("public"))
+    ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
     ///     .build()
     ///     .await?;
     ///
@@ -281,50 +506,74 @@ impl super::Agent {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> NotificationOutcome {
-        let sinks = &self.inner.trap_sinks;
-        let mut outcomes = Vec::with_capacity(sinks.len());
-        if sinks.is_empty() {
-            return NotificationOutcome { sinks: outcomes };
-        }
-
-        let request_id = self.next_notification_id();
-        let pdu = Pdu::trap_v2(request_id, uptime, trap_oid, varbinds.clone());
-
-        for sink in sinks {
-            let status = if !self.notification_allowed(sink, trap_oid, &varbinds) {
-                SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
-            } else {
-                match self.send_trap_to_sink(sink, &pdu).await {
-                    Ok(()) => SinkStatus::Succeeded,
-                    Err(error) => SinkStatus::Failed(error),
-                }
-            };
-            outcomes.push(SinkOutcome {
-                dest: sink.dest,
-                status,
-            });
-        }
-
-        NotificationOutcome { sinks: outcomes }
+        self.send_trap_stream(trap_oid, uptime, varbinds)
+            .into_outcome()
+            .await
     }
 
     /// Send a trap to all configured sinks, warning and discarding outcomes.
     ///
     /// Use [`send_trap`](Self::send_trap) when the caller needs to observe
-    /// per-sink success or failure.
+    /// per-sink success or failure. Warnings are emitted as each sink operation
+    /// completes rather than after every sink has finished.
     pub async fn send_trap_best_effort(&self, trap_oid: &Oid, uptime: u32, varbinds: Vec<VarBind>) {
-        let outcome = self.send_trap(trap_oid, uptime, varbinds).await;
-        for sink in outcome.sinks() {
+        let mut stream = self.send_trap_stream(trap_oid, uptime, varbinds);
+        while let Some(sink) = stream.next().await {
             match &sink.status {
                 SinkStatus::Failed(error) => {
-                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %error }, "failed to send trap");
+                    tracing::warn!(target: "async_snmp::agent", { snmp.sink_id = %sink.sink.id(), snmp.dest = %sink.sink.dest(), error = %error }, "failed to send trap");
                 }
                 SinkStatus::Skipped(reason) => {
-                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, reason = %reason }, "skipped trap sink");
+                    tracing::warn!(target: "async_snmp::agent", { snmp.sink_id = %sink.sink.id(), snmp.dest = %sink.sink.dest(), reason = %reason }, "skipped trap sink");
                 }
                 SinkStatus::Succeeded => {}
             }
         }
+    }
+
+    /// Lazily send an Inform to all configured sinks.
+    ///
+    /// No sink operation starts until the returned stream is polled. Sink
+    /// operations are then driven concurrently and outcomes are yielded as they
+    /// complete. Dropping the stream cancels unfinished local exchanges but
+    /// cannot undo an Inform already processed by a remote receiver. Use
+    /// [`NotificationSendStream::into_outcome`] when outcomes are needed in sink
+    /// configuration order.
+    pub fn send_inform_stream(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> NotificationSendStream<'_> {
+        let pending = FuturesUnordered::new();
+        let trap_oid = Arc::new(trap_oid.clone());
+        let varbinds: Arc<[VarBind]> = Arc::from(varbinds);
+
+        for sink in &self.inner.trap_sinks {
+            let trap_oid = Arc::clone(&trap_oid);
+            let varbinds = Arc::clone(&varbinds);
+            pending.push(Box::pin(async move {
+                let status = if sink.summary.version == Version::V1 {
+                    SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
+                } else if !self.notification_allowed(sink, &trap_oid, &varbinds) {
+                    SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+                } else {
+                    match self
+                        .send_inform_to_sink(sink, &trap_oid, uptime, &varbinds)
+                        .await
+                    {
+                        Ok(()) => SinkStatus::Succeeded,
+                        Err(error) => SinkStatus::Failed(error),
+                    }
+                };
+                SinkOutcome {
+                    sink: sink.summary.clone(),
+                    status,
+                }
+            }) as PendingSinkOutcome<'_>);
+        }
+
+        NotificationSendStream { pending }
     }
 
     /// Send an inform to all configured trap sinks, reporting every outcome.
@@ -348,7 +597,7 @@ impl super::Agent {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
-    ///     .trap_sink("192.168.1.100:162", Auth::v2c("public"))
+    ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
     ///     .build()
     ///     .await?;
     ///
@@ -365,50 +614,31 @@ impl super::Agent {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> NotificationOutcome {
-        let sinks = &self.inner.trap_sinks;
-        let varbinds = &varbinds;
-        let outcomes = join_all(sinks.iter().map(|sink| async move {
-            let status = if sink.version == Version::V1 {
-                SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
-            } else if !self.notification_allowed(sink, trap_oid, varbinds) {
-                SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
-            } else {
-                match self
-                    .send_inform_to_sink(sink, trap_oid, uptime, varbinds)
-                    .await
-                {
-                    Ok(()) => SinkStatus::Succeeded,
-                    Err(error) => SinkStatus::Failed(error),
-                }
-            };
-            SinkOutcome {
-                dest: sink.dest,
-                status,
-            }
-        }))
-        .await;
-
-        NotificationOutcome { sinks: outcomes }
+        self.send_inform_stream(trap_oid, uptime, varbinds)
+            .into_outcome()
+            .await
     }
 
     /// Send an inform to all configured sinks, warning and discarding outcomes.
     ///
     /// Use [`send_inform`](Self::send_inform) when the caller needs to observe
-    /// per-sink acknowledgement, failure, or skip status.
+    /// per-sink acknowledgement, failure, or skip status. Warnings are emitted
+    /// as each sink operation completes rather than after every sink has
+    /// finished.
     pub async fn send_inform_best_effort(
         &self,
         trap_oid: &Oid,
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) {
-        let outcome = self.send_inform(trap_oid, uptime, varbinds).await;
-        for sink in outcome.sinks() {
+        let mut stream = self.send_inform_stream(trap_oid, uptime, varbinds);
+        while let Some(sink) = stream.next().await {
             match &sink.status {
                 SinkStatus::Failed(error) => {
-                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, error = %error }, "failed to send inform");
+                    tracing::warn!(target: "async_snmp::agent", { snmp.sink_id = %sink.sink.id(), snmp.dest = %sink.sink.dest(), error = %error }, "failed to send inform");
                 }
                 SinkStatus::Skipped(reason) => {
-                    tracing::warn!(target: "async_snmp::agent", { snmp.dest = %sink.dest, reason = %reason }, "skipped inform sink");
+                    tracing::warn!(target: "async_snmp::agent", { snmp.sink_id = %sink.sink.id(), snmp.dest = %sink.sink.dest(), reason = %reason }, "skipped inform sink");
                 }
                 SinkStatus::Succeeded => {}
             }
@@ -460,14 +690,14 @@ impl super::Agent {
 
         // SNMPv2c/v3 notifications carry these mandatory varbind names. In v1
         // they are represented by Trap-PDU fields instead.
-        sink.version == Version::V1
+        sink.summary.version == Version::V1
             || (vacm.check_access(notify_view, &crate::notification::oids::sys_uptime())
                 && vacm.check_access(notify_view, &crate::notification::oids::snmp_trap_oid()))
     }
 
     /// Send a trap PDU to a single sink.
     async fn send_trap_to_sink(&self, sink: &TrapSink, pdu: &Pdu) -> Result<()> {
-        let data = match sink.version {
+        let data = match sink.summary.version {
             Version::V1 => {
                 // Convert the v2 PDU to a v1 TrapV1Pdu (RFC 3584 Section 3.2).
                 // Use the agent's bound address as agent_addr if available.
@@ -518,13 +748,13 @@ impl super::Agent {
             }
         }?;
 
-        tracing::debug!(target: "async_snmp::agent", { snmp.dest = %sink.dest, snmp.bytes = data.len() }, "sending trap");
+        tracing::debug!(target: "async_snmp::agent", { snmp.sink_id = %sink.summary.id, snmp.dest = %sink.summary.dest, snmp.bytes = data.len() }, "sending trap");
         self.inner
             .socket
-            .send_to(&data, sink.dest)
+            .send_to(&data, sink.summary.dest)
             .await
             .map_err(|e| Error::Network {
-                target: sink.dest,
+                target: sink.summary.dest,
                 source: e,
             })?;
 
@@ -561,13 +791,15 @@ impl super::Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::{SinkSkipReason, SinkStatus, TrapSink};
+    use super::{NotificationSinkId, SinkSkipReason, SinkStatus, TrapSink};
     use crate::agent::{Agent, SecurityModel};
     use crate::{Auth, AuthProtocol, Error, PrivProtocol, Value, VarBind, oid};
     use bytes::Bytes;
 
     fn test_sink(auth: impl Into<Auth>) -> TrapSink {
         TrapSink::new(
+            0,
+            NotificationSinkId::from("test-sink"),
             "127.0.0.1:9".parse().unwrap(),
             auth.into(),
             std::time::Duration::from_millis(10),
@@ -745,8 +977,8 @@ mod tests {
 
         let mixed = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink("127.0.0.1:9", Auth::v2c("allowed"))
-            .trap_sink("127.0.0.1:9", Auth::v2c("denied"))
+            .trap_sink("allowed", "127.0.0.1:9", Auth::v2c("allowed"))
+            .trap_sink("denied", "127.0.0.1:9", Auth::v2c("denied"))
             .vacm(|v| {
                 v.group("allowed", SecurityModel::V2c, "allowed")
                     .group("denied", SecurityModel::V2c, "denied")
@@ -767,7 +999,7 @@ mod tests {
 
         let denied_inform = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink("127.0.0.1:9", Auth::v2c("denied"))
+            .trap_sink("denied", "127.0.0.1:9", Auth::v2c("denied"))
             .vacm(|v| {
                 v.group("denied", SecurityModel::V2c, "denied")
                     .access("denied", |a| a.notify_view("empty"))
@@ -785,7 +1017,7 @@ mod tests {
 
         let denied_v1_inform = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink("127.0.0.1:9", Auth::v1("denied"))
+            .trap_sink("denied-v1", "127.0.0.1:9", Auth::v1("denied"))
             .vacm(|v| v)
             .build()
             .await
@@ -803,7 +1035,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .trap_sink("127.0.0.1:9", Auth::v2c("public"))
+            .trap_sink("public", "127.0.0.1:9", Auth::v2c("public"))
             .build()
             .await
             .unwrap();
@@ -825,6 +1057,27 @@ mod tests {
             }
             status => panic!("expected outbound validation failure, got {status:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn unpolled_trap_stream_does_not_allocate_request_id() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .trap_sink("lazy", "127.0.0.1:9", Auth::v1("public"))
+            .build()
+            .await
+            .unwrap();
+        let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+
+        let stream = agent.send_trap_stream(&trap_oid, 0, vec![]);
+        drop(stream);
+
+        let mut stream = agent.send_trap_stream(&trap_oid, 0, vec![]);
+        assert!(matches!(
+            stream.next().await.unwrap().status,
+            SinkStatus::Succeeded
+        ));
+        assert_eq!(agent.next_notification_id(), 2);
     }
 
     #[tokio::test]

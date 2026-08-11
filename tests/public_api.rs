@@ -8,7 +8,10 @@ use async_snmp::{
     WalkAbortReason,
 };
 #[cfg(feature = "agent")]
-use async_snmp::{GetNextResult, GetResult, VarBind, oid};
+use async_snmp::{
+    GetNextResult, GetResult, NotificationSendStream, NotificationSinkId, NotificationSinkSummary,
+    VarBind, oid,
+};
 use bytes::Bytes;
 
 #[test]
@@ -127,4 +130,13 @@ fn security_model_canonical_paths_remain_available() {
     let from_handler = async_snmp::handler::SecurityModel::Usm;
     let from_root = async_snmp::SecurityModel::Usm;
     assert_eq!(from_handler, from_root);
+}
+
+#[cfg(feature = "agent")]
+#[test]
+fn notification_sink_identity_types_are_public() {
+    let id = NotificationSinkId::from("primary");
+    assert_eq!(id.as_str(), "primary");
+    let _: Option<NotificationSinkSummary> = None;
+    let _: Option<NotificationSendStream<'static>> = None;
 }

@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         // Configure trap sinks - agent sends to all of them
-        .trap_sink(recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink("local-receiver", recv_addr.to_string(), Auth::v2c("public"))
         .build()
         .await?;
 
@@ -93,15 +93,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let outcome = agent.send_trap(&cold_start, 12345, vec![]).await;
     print_outcome("v2c trap (coldStart)", &outcome);
 
-    // Send v2c inform to all configured sinks (waits for ack)
+    // Send v2c inform and process each sink as its acknowledgement completes.
     println!("--- Agent: sending v2c inform ---");
     let warm_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
     let extra = vec![VarBind::new(
         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
         Value::from("example agent"),
     )];
-    let outcome = agent.send_inform(&warm_start, 5000, extra).await;
-    print_outcome("v2c inform (warmStart)", &outcome);
+    let mut completions = agent.send_inform_stream(&warm_start, 5000, extra);
+    while let Some(sink) = completions.next().await {
+        print_sink_outcome("v2c inform (warmStart)", &sink);
+    }
+    println!();
 
     // =========================================================================
     // Client-based sending (for standalone tools)
@@ -156,13 +159,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_outcome(label: &str, outcome: &NotificationOutcome) {
     for sink in outcome.sinks() {
-        match &sink.status {
-            SinkStatus::Succeeded => println!("{label}: {} succeeded", sink.dest),
-            SinkStatus::Failed(error) => eprintln!("{label}: {} failed: {error}", sink.dest),
-            SinkStatus::Skipped(reason) => eprintln!("{label}: {} skipped: {reason}", sink.dest),
-        }
+        print_sink_outcome(label, sink);
     }
     println!();
+}
+
+fn print_sink_outcome(label: &str, sink: &async_snmp::SinkOutcome) {
+    match &sink.status {
+        SinkStatus::Succeeded => println!(
+            "{label}: {} ({}) succeeded",
+            sink.sink.id(),
+            sink.sink.dest()
+        ),
+        SinkStatus::Failed(error) => eprintln!(
+            "{label}: {} ({}) failed: {error}",
+            sink.sink.id(),
+            sink.sink.dest()
+        ),
+        SinkStatus::Skipped(reason) => eprintln!(
+            "{label}: {} ({}) skipped: {reason}",
+            sink.sink.id(),
+            sink.sink.dest()
+        ),
+    }
 }
 
 fn print_notification(notification: &Notification, source: std::net::SocketAddr) {
