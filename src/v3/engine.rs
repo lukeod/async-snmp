@@ -68,28 +68,20 @@ pub const MIN_ENGINE_ID_LEN: usize = 5;
 /// Maximum valid SnmpEngineID length in octets (RFC 3411 Section 5).
 pub const MAX_ENGINE_ID_LEN: usize = 32;
 
-/// Private Enterprise Number used in generated engine IDs.
-///
-/// 32473 is the IANA example PEN reserved for documentation and testing
-/// (RFC 5612), used here as a stand-in since the crate has no registered
-/// enterprise number of its own.
-const GENERATED_ENGINE_ID_PEN: u32 = 32473;
-
-/// Format octet value 5: "administratively assigned octets" (RFC 3411
-/// Section 5), a variable-length opaque local identifier.
-const ENGINE_ID_FORMAT_OCTETS: u8 = 5;
-
-/// Number of random octets appended to a generated engine ID.
-const GENERATED_ENGINE_ID_RANDOM_LEN: usize = 12;
+/// Number of random octets in a generated engine ID.
+const GENERATED_ENGINE_ID_LEN: usize = 17;
 
 /// Generate a locally-unique authoritative SnmpEngineID (RFC 3411 Section 5).
 ///
-/// Layout: a 4-octet enterprise number with the high bit set, followed by a
-/// format octet of 5 ("administratively assigned octets"), followed by 12
-/// random octets from the OS CSPRNG. The total length is 17 octets, within
-/// the RFC 3411 5..32 range. The random suffix ensures two instances started
-/// in the same second (or on the same host) do not collide, which would
-/// otherwise yield identical localized keys under shared credentials.
+/// Returns 17 opaque random octets from the OS CSPRNG. RFC 3411 recommends an
+/// enterprise-number-based layout but does not require it; this generator does
+/// not claim a Private Enterprise Number on behalf of the library's caller.
+/// Applications using the recommended layout should configure a stable engine
+/// ID under their own IANA-assigned enterprise number instead.
+///
+/// Generate this value once and persist it with the authoritative engine's
+/// boots counter. Generating a new value on every process start changes USM key
+/// localization and does not provide a stable engine identity.
 ///
 /// # Errors
 ///
@@ -102,15 +94,18 @@ pub fn generate_engine_id() -> Result<Bytes> {
 fn generate_engine_id_with(
     mut fill: impl FnMut(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
 ) -> Result<Bytes> {
-    let mut id = Vec::with_capacity(5 + GENERATED_ENGINE_ID_RANDOM_LEN);
-    // High bit of the first octet signals the RFC 3411 variable-length format.
-    let enterprise = 0x8000_0000_u32 | GENERATED_ENGINE_ID_PEN;
-    id.extend_from_slice(&enterprise.to_be_bytes());
-    id.push(ENGINE_ID_FORMAT_OCTETS);
-    let mut random = [0_u8; GENERATED_ENGINE_ID_RANDOM_LEN];
-    fill(&mut random).map_err(|source| Error::RandomSource { source }.boxed())?;
-    id.extend_from_slice(&random);
-    Ok(Bytes::from(id))
+    let mut id = [0_u8; GENERATED_ENGINE_ID_LEN];
+    fill(&mut id).map_err(|source| Error::RandomSource { source }.boxed())?;
+
+    // RFC 3411 reserves the all-zero and all-0xff values. Their probability
+    // from a CSPRNG is negligible, but keep the generator's contract absolute.
+    if id.iter().all(|&byte| byte == 0) {
+        id[GENERATED_ENGINE_ID_LEN - 1] = 1;
+    } else if id.iter().all(|&byte| byte == 0xff) {
+        id[GENERATED_ENGINE_ID_LEN - 1] = 0xfe;
+    }
+
+    Ok(Bytes::copy_from_slice(&id))
 }
 
 /// Validate a user-configured SnmpEngineID (RFC 3411 Section 5).
@@ -936,22 +931,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_engine_id_is_valid_and_well_formed() {
+    fn test_generate_engine_id_is_valid() {
         let id = generate_engine_id().unwrap();
 
-        // Valid length within RFC 3411 5..32 range.
-        assert!((MIN_ENGINE_ID_LEN..=MAX_ENGINE_ID_LEN).contains(&id.len()));
+        assert_eq!(id.len(), GENERATED_ENGINE_ID_LEN);
         validate_engine_id(&id).expect("generated engine ID must validate");
+    }
 
-        // High bit of the first octet set -> variable-length format.
-        assert_eq!(id[0] & 0x80, 0x80);
-        // Enterprise number matches the generator's PEN.
-        let enterprise = u32::from_be_bytes([id[0], id[1], id[2], id[3]]);
-        assert_eq!(enterprise, 0x8000_0000 | GENERATED_ENGINE_ID_PEN);
-        // Format octet is "administratively assigned octets".
-        assert_eq!(id[4], ENGINE_ID_FORMAT_OCTETS);
-        // Random suffix present.
-        assert_eq!(id.len(), 5 + GENERATED_ENGINE_ID_RANDOM_LEN);
+    #[test]
+    fn test_generate_engine_id_uses_random_bytes_as_opaque_identifier() {
+        let expected = [0x42; GENERATED_ENGINE_ID_LEN];
+        let id = generate_engine_id_with(|output| {
+            output.copy_from_slice(&expected);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(id.as_ref(), expected);
+    }
+
+    #[test]
+    fn test_generate_engine_id_avoids_reserved_values() {
+        for reserved in [0x00, 0xff] {
+            let id = generate_engine_id_with(|output| {
+                output.fill(reserved);
+                Ok(())
+            })
+            .unwrap();
+            validate_engine_id(&id).expect("generated engine ID must not be reserved");
+        }
     }
 
     #[test]

@@ -2254,8 +2254,7 @@ mod tests {
 
         crate::v3::validate_engine_id(first.engine_id()).unwrap();
         crate::v3::validate_engine_id(second.engine_id()).unwrap();
-        // RFC 3411 format: starts with 0x80 enterprise indicator
-        assert_eq!(first.engine_id()[0], 0x80);
+        assert_eq!(first.engine_id().len(), 17);
         assert_ne!(first.engine_id(), second.engine_id());
     }
 
@@ -2266,8 +2265,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-        assert!(!receiver.engine_id().is_empty());
-        assert_eq!(receiver.engine_id()[0], 0x80);
+        assert_eq!(receiver.engine_id().len(), 17);
+        crate::v3::validate_engine_id(receiver.engine_id()).unwrap();
     }
 
     #[tokio::test]

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Generated engine IDs now contain 17 opaque random octets instead of using
+  documentation-only PEN 32473. Applications that use RFC 3411's recommended
+  enterprise-specific layout should configure a stable engine ID under their
+  own IANA-assigned enterprise number.
 - **Breaking:** `SaltCounter::new` and `generate_engine_id` now return `Result`,
   `SaltCounter` no longer implements `Default`, and the unused
   `CryptoError::RandomSource` variant is replaced by `Error::RandomSource`.
