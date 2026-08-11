@@ -887,7 +887,8 @@ impl<T: Transport> Client<T> {
     ///
     /// Constructs an `InformRequest` PDU with the mandatory sysUpTime.0 and
     /// snmpTrapOID.0 prefix, sends it to the target, and waits for a Response
-    /// PDU. Uses the same retry and timeout logic as other request types.
+    /// PDU that echoes the request variable bindings. Uses the same retry and
+    /// timeout logic as other request types.
     ///
     /// For V3: uses engine discovery against the receiver (same as GET/SET).
     /// V1 is not supported and returns an error.
@@ -910,7 +911,14 @@ impl<T: Transport> Client<T> {
 
         let request_id = self.next_request_id();
         let pdu = Pdu::inform_request(request_id, uptime, trap_oid, varbinds);
-        let _response = self.send_request(pdu).await?;
+        let expected_varbinds = pdu.varbinds.clone();
+        let response = self.send_request(pdu).await?;
+        if response.varbinds != expected_varbinds {
+            return Err(Error::MalformedResponse {
+                target: self.peer_addr(),
+            }
+            .boxed());
+        }
         Ok(())
     }
 
@@ -1772,6 +1780,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inform_requires_exact_echoed_varbinds() {
+        let trap_oid = Oid::from_slice(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]);
+        let additional = VarBind::new(
+            Oid::from_slice(&[1, 3, 6, 1, 4, 1, 9999, 1]),
+            Value::Integer(7),
+        );
+        let expected = Pdu::inform_request(1, 123, &trap_oid, vec![additional.clone()]).varbinds;
+
+        for policy in [ResponseShapePolicy::Compatible, ResponseShapePolicy::Strict] {
+            scripted_client(vec![expected.clone()], policy)
+                .send_inform(&trap_oid, 123, vec![additional.clone()])
+                .await
+                .expect("an exact Inform echo must be accepted");
+
+            let mut renamed = expected.clone();
+            renamed[0].oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 4, 0]);
+            let mut reordered = expected.clone();
+            reordered.swap(0, 1);
+            let mut changed = expected.clone();
+            changed[2].value = Value::Integer(8);
+
+            for response in [Vec::new(), renamed, reordered, changed] {
+                let error = scripted_client(vec![response], policy)
+                    .send_inform(&trap_oid, 123, vec![additional.clone()])
+                    .await
+                    .expect_err("a malformed Inform acknowledgement must be rejected");
+                assert!(matches!(*error, Error::MalformedResponse { .. }));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn compatible_policy_preserves_scripted_semantics_across_all_fixed_operations() {
         let a = Oid::from_slice(&[1, 3, 6, 1, 1]);
         let b = Oid::from_slice(&[1, 3, 6, 1, 2]);
@@ -2150,6 +2190,32 @@ mod tests {
         fn is_reliable(&self) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn inform_preserves_empty_varbind_too_big_response() {
+        let client = Client::new(
+            TooBigTransport::new(0),
+            ClientConfig {
+                auth: crate::Auth::v2c("public"),
+                retry: Retry::none(),
+                ..Default::default()
+            },
+        )
+        .expect("valid client config");
+        let trap_oid = Oid::from_slice(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]);
+
+        let error = client
+            .send_inform(&trap_oid, 123, Vec::new())
+            .await
+            .expect_err("tooBig must remain an SNMP protocol error");
+        assert!(matches!(
+            *error,
+            Error::Snmp {
+                status: ErrorStatus::TooBig,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
