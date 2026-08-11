@@ -124,7 +124,7 @@ impl std::fmt::Display for ParseProtocolError {
             ),
             ProtocolKind::Priv => write!(
                 f,
-                "unknown privacy protocol '{}'; expected one of: DES, AES, AES-128, AES-192, AES-256",
+                "unknown privacy protocol '{}'; expected one of: DES, 3DES, 3DES-EDE, DES3, TDES, AES, AES-128, AES-192, AES-256",
                 self.input
             ),
         }
@@ -411,7 +411,9 @@ mod tests {
         assert!(err.to_string().contains("authentication protocol"));
 
         let err = "bogus".parse::<PrivProtocol>().unwrap_err();
-        assert!(err.to_string().contains("bogus"));
-        assert!(err.to_string().contains("privacy protocol"));
+        assert_eq!(
+            err.to_string(),
+            "unknown privacy protocol 'bogus'; expected one of: DES, 3DES, 3DES-EDE, DES3, TDES, AES, AES-128, AES-192, AES-256"
+        );
     }
 }
