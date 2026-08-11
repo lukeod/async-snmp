@@ -39,7 +39,7 @@ impl TestV3Engine {
             engine_time: 1,
             msg_max_size: 65_507,
             users: Vec::new(),
-            salt: Arc::new(SaltCounter::new()),
+            salt: Arc::new(SaltCounter::new().unwrap()),
         }
     }
 

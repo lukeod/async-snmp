@@ -166,7 +166,7 @@ struct ClientInner<T: Transport> {
     /// Coherent V3 identity, trusted time, and identity-localized keys.
     engine: RwLock<Option<ClientEngine>>,
     /// Salt counter for privacy (V3)
-    salt_counter: SaltCounter,
+    salt_counter: Option<SaltCounter>,
     /// Shared engine cache (V3, optional)
     engine_cache: Option<Arc<EngineCache>>,
     /// Serializes concurrent discovery attempts so only one runs at a time.
@@ -321,7 +321,8 @@ impl<T: Transport> Client<T> {
     /// # Errors
     ///
     /// Returns [`Error::Config`] when the configuration violates a client
-    /// invariant.
+    /// invariant, or [`Error::RandomSource`] when an `authPriv` client cannot
+    /// initialize its privacy salt.
     pub fn new(transport: T, config: ClientConfig) -> Result<Self> {
         Self::with_optional_engine_cache(transport, config, None)
     }
@@ -331,7 +332,8 @@ impl<T: Transport> Client<T> {
     /// # Errors
     ///
     /// Returns [`Error::Config`] when the configuration violates a client
-    /// invariant.
+    /// invariant, or [`Error::RandomSource`] when an `authPriv` client cannot
+    /// initialize its privacy salt.
     pub fn with_engine_cache(
         transport: T,
         config: ClientConfig,
@@ -346,12 +348,17 @@ impl<T: Transport> Client<T> {
         engine_cache: Option<Arc<EngineCache>>,
     ) -> Result<Self> {
         config.validate_and_precompute()?;
+        let salt_counter = config
+            .usm_config()
+            .filter(|security| security.security_level().requires_priv())
+            .map(|_| SaltCounter::new())
+            .transpose()?;
         Ok(Self {
             inner: Arc::new(ClientInner {
                 transport,
                 config,
                 engine: RwLock::new(None),
-                salt_counter: SaltCounter::new(),
+                salt_counter,
                 engine_cache,
                 discovery_lock: AsyncMutex::new(()),
                 local_derived_keys: RwLock::new(None),
@@ -1277,14 +1284,17 @@ mod tests {
         let v1 = metadata_client(Auth::v1("private"));
         assert_eq!(v1.version(), Version::V1);
         assert_eq!(v1.security_level(), None);
+        assert!(v1.inner.salt_counter.is_none());
 
         let v2c = metadata_client(Auth::v2c("public"));
         assert_eq!(v2c.version(), Version::V2c);
         assert_eq!(v2c.security_level(), None);
+        assert!(v2c.inner.salt_counter.is_none());
 
         let no_auth = metadata_client(Auth::usm("no-auth-user").into());
         assert_eq!(no_auth.version(), Version::V3);
         assert_eq!(no_auth.security_level(), Some(SecurityLevel::NoAuthNoPriv));
+        assert!(no_auth.inner.salt_counter.is_none());
 
         #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
         {
@@ -1295,6 +1305,7 @@ mod tests {
             );
             assert_eq!(auth.version(), Version::V3);
             assert_eq!(auth.security_level(), Some(SecurityLevel::AuthNoPriv));
+            assert!(auth.inner.salt_counter.is_none());
 
             let auth_priv = metadata_client(
                 Auth::usm("private-user")
@@ -1308,6 +1319,7 @@ mod tests {
             );
             assert_eq!(auth_priv.version(), Version::V3);
             assert_eq!(auth_priv.security_level(), Some(SecurityLevel::AuthPriv));
+            assert!(auth_priv.inner.salt_counter.is_some());
         }
     }
 

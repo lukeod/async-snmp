@@ -447,7 +447,11 @@ impl NotificationReceiverBuilder {
             .authoritative_engine
             .as_ref()
             .map(|engine| engine.engine_id().to_vec())
-            .unwrap_or_else(|| crate::v3::generate_engine_id().to_vec());
+            .unwrap_or_else(|| {
+                crate::v3::generate_engine_id()
+                    .expect("test engine ID generation")
+                    .to_vec()
+            });
         self.authoritative_engine = Some(AuthoritativeEngine::for_test(engine_id, boots));
         self
     }
@@ -456,6 +460,8 @@ impl NotificationReceiverBuilder {
     ///
     /// Returns a configuration error when USM credentials are invalid or a
     /// USM user is configured without a persisted [`AuthoritativeEngine`].
+    /// Returns [`Error::RandomSource`] when a generated engine ID or required
+    /// privacy salt cannot be initialized.
     pub async fn build(self) -> Result<NotificationReceiver> {
         if self.max_message_size > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
             return Err(Error::Config(
@@ -468,6 +474,10 @@ impl NotificationReceiverBuilder {
             .boxed());
         }
 
+        let requires_privacy = self
+            .usm_users
+            .values()
+            .any(|security| security.security_level().requires_priv());
         let requires_authoritative_engine = !self.usm_users.is_empty();
         let PreparedAuthoritativeUsm {
             users: usm_users,
@@ -481,6 +491,7 @@ impl NotificationReceiverBuilder {
             "invalid USM user configuration",
             "authoritative engine state is required for SNMPv3 notification receiving",
         )?;
+        let salt_counter = requires_privacy.then(SaltCounter::new).transpose()?;
 
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
@@ -507,7 +518,7 @@ impl NotificationReceiverBuilder {
                 communities: self.communities,
                 varbind_validation: self.varbind_validation,
                 engine_id,
-                salt_counter: SaltCounter::new(),
+                salt_counter,
                 engine_boots_base: engine_boots,
                 engine_start: Instant::now(),
                 usm_stats: UsmStats::default(),
@@ -739,7 +750,7 @@ struct ReceiverInner {
     /// Engine ID for V3 discovery responses
     engine_id: Bytes,
     /// Salt counter for privacy operations
-    salt_counter: SaltCounter,
+    salt_counter: Option<SaltCounter>,
     /// Initial engine boots value at startup, used to compute overflow-adjusted boots.
     engine_boots_base: u32,
     /// Time when the receiver was started, used to compute engine time.
@@ -823,6 +834,12 @@ impl NotificationReceiver {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the address is invalid, the socket cannot be
+    /// created, or the operating system cannot provide randomness for the
+    /// receiver's engine ID.
     pub async fn bind(addr: impl AsRef<str>) -> Result<Self> {
         let addr_str = addr.as_ref();
         let bind_addr: SocketAddr = addr_str
@@ -841,7 +858,7 @@ impl NotificationReceiver {
             source: e,
         })?;
 
-        let engine_id = crate::v3::generate_engine_id();
+        let engine_id = crate::v3::generate_engine_id()?;
 
         Ok(Self {
             inner: Arc::new(ReceiverInner {
@@ -852,7 +869,7 @@ impl NotificationReceiver {
                 communities: Vec::new(),
                 varbind_validation: NotificationVarbindValidation::Tolerant,
                 engine_id,
-                salt_counter: SaltCounter::new(),
+                salt_counter: None,
                 engine_boots_base: 1,
                 engine_start: Instant::now(),
                 usm_stats: UsmStats::default(),
@@ -1105,12 +1122,14 @@ mod tests {
             built.inner.varbind_validation,
             NotificationVarbindValidation::Strict
         );
+        assert!(built.inner.salt_counter.is_none());
 
         let bound = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
         assert_eq!(
             bound.inner.varbind_validation,
             NotificationVarbindValidation::Tolerant
         );
+        assert!(bound.inner.salt_counter.is_none());
     }
 
     #[test]
@@ -1431,7 +1450,7 @@ mod tests {
             0,
             &config,
             Some(&keys),
-            &crate::v3::SaltCounter::new(),
+            Some(&crate::v3::SaltCounter::new().unwrap()),
             true,
             msg_max_size,
         )
@@ -2082,7 +2101,7 @@ mod tests {
                     engine_id.clone(),
                     Bytes::new(),
                     Some(&keys),
-                    &SaltCounter::new(),
+                    Some(&SaltCounter::new().unwrap()),
                     "127.0.0.1:9999".parse().unwrap(),
                 )
             };

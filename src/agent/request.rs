@@ -913,7 +913,7 @@ mod tests {
             engine_id.clone(),
             Bytes::new(),
             None,
-            &SaltCounter::new(),
+            Some(&SaltCounter::new().unwrap()),
             "127.0.0.1:9999".parse().unwrap(),
         )
         .unwrap();

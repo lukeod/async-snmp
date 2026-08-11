@@ -262,7 +262,7 @@ impl TestAgentBuilder {
         }
 
         if !self.usm_users.is_empty() {
-            let engine = AuthoritativeEngine::install(generate_engine_id(), |_| {
+            let engine = AuthoritativeEngine::install(generate_engine_id().unwrap(), |_| {
                 Ok::<(), std::convert::Infallible>(())
             })
             .expect("failed to initialize test authoritative engine");

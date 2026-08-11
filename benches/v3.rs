@@ -127,7 +127,7 @@ fn bench_encrypt(c: &mut Criterion) {
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
-    let salt_counter = SaltCounter::new();
+    let salt_counter = SaltCounter::new().unwrap();
 
     for size in data_sizes {
         let data = vec![0xABu8; size];
@@ -211,7 +211,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
-    let salt_counter = SaltCounter::new();
+    let salt_counter = SaltCounter::new().unwrap();
 
     for size in data_sizes {
         let plaintext = vec![0xABu8; size];
@@ -292,7 +292,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
 
     let engine_boots = 100u32;
     let engine_time = 12345u32;
-    let salt_counter = SaltCounter::new();
+    let salt_counter = SaltCounter::new().unwrap();
 
     // Typical SNMP message (256 bytes total, ~200 bytes ScopedPDU)
     let scoped_pdu = vec![0xABu8; 200];

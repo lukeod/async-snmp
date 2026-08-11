@@ -262,11 +262,18 @@ impl Retry {
 }
 
 /// Global jitter sequence, initialized once per process from the OS random source.
-static JITTER_COUNTER: LazyLock<AtomicU64> = LazyLock::new(|| {
+static JITTER_COUNTER: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(jitter_seed_with(getrandom::fill)));
+
+fn jitter_seed_with(
+    mut fill: impl FnMut(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
+) -> u64 {
     let mut seed = [0_u8; 8];
-    getrandom::fill(&mut seed).expect("getrandom failed");
-    AtomicU64::new(u64::from_ne_bytes(seed))
-});
+    if let Err(error) = fill(&mut seed) {
+        tracing::warn!(target: "async_snmp::retry", %error, "OS random source unavailable; using deterministic retry jitter seed");
+    }
+    u64::from_ne_bytes(seed)
+}
 
 /// Compute a jitter factor in the range [1-jitter, 1+jitter].
 ///
@@ -450,6 +457,12 @@ mod tests {
             jitter_factor_from_seed(0.5, seed).to_bits(),
             jitter_factor_from_seed(0.5, seed).to_bits()
         );
+    }
+
+    #[test]
+    fn test_jitter_seed_falls_back_when_random_source_fails() {
+        let seed = jitter_seed_with(|_| Err(getrandom::Error::UNEXPECTED));
+        assert_eq!(seed, 0);
     }
 
     #[test]

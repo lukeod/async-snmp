@@ -280,7 +280,7 @@ mod tests {
                 ),
             };
             let keys = config.derive_keys(&engine_id).unwrap();
-            let salt = SaltCounter::new();
+            let salt = SaltCounter::new().unwrap();
             let encode = |pdu| {
                 encode_v3_response(
                     pdu,
@@ -291,7 +291,7 @@ mod tests {
                     engine_id.clone(),
                     context_name.clone(),
                     Some(&keys),
-                    &salt,
+                    Some(&salt),
                     "127.0.0.1:161".parse().unwrap(),
                 )
             };

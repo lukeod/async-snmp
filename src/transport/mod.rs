@@ -44,12 +44,19 @@ use std::time::{Duration, Instant};
 /// Using a global counter ensures request IDs are unique across all
 /// transports within the process, preventing collisions when multiple
 /// transports exist or when sockets are rapidly recreated.
-static REQUEST_ID_COUNTER: LazyLock<AtomicI32> = LazyLock::new(|| {
+static REQUEST_ID_COUNTER: LazyLock<AtomicI32> =
+    LazyLock::new(|| AtomicI32::new(request_id_seed_with(getrandom::fill)));
+
+fn request_id_seed_with(
+    mut fill: impl FnMut(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
+) -> i32 {
     let mut buf = [0u8; 4];
-    getrandom::fill(&mut buf).expect("getrandom failed");
-    let seed = i32::from_ne_bytes(buf);
-    AtomicI32::new(seed)
-});
+    if let Err(error) = fill(&mut buf) {
+        tracing::warn!(target: "async_snmp::transport", %error, "OS random source unavailable; using deterministic request ID seed");
+        buf = 1_i32.to_ne_bytes();
+    }
+    i32::from_ne_bytes(buf)
+}
 
 /// Allocate a globally unique request ID.
 ///
@@ -717,6 +724,12 @@ mod request_id_tests {
             let id = alloc_request_id();
             assert!(seen.insert(id), "request ID {id} was allocated twice");
         }
+    }
+
+    #[test]
+    fn request_id_seed_falls_back_when_random_source_fails() {
+        let seed = request_id_seed_with(|_| Err(getrandom::Error::UNEXPECTED));
+        assert_eq!(seed, 1);
     }
 }
 

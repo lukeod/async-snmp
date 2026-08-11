@@ -426,7 +426,7 @@ impl<T: Transport> Client<T> {
             engine_time,
             security,
             Some(&engine.derived_keys),
-            &self.inner.salt_counter,
+            self.inner.salt_counter.as_ref(),
             true, // reportable=true for requests
             // RFC 3412 Section 6.3: msgMaxSize advertises THIS sender's own
             // receive capacity, not the remote's. `engine_state.msg_max_size`
@@ -1124,7 +1124,7 @@ impl<T: Transport> Client<T> {
             engine_time,
             security,
             derived.as_ref(),
-            &self.inner.salt_counter,
+            self.inner.salt_counter.as_ref(),
             false, // reportable=false for traps
             self.inner.transport.receive_limits().advertised(),
         )

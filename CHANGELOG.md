@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `SaltCounter::new` and `generate_engine_id` now return `Result`,
+  `SaltCounter` no longer implements `Default`, and the unused
+  `CryptoError::RandomSource` variant is replaced by `Error::RandomSource`.
+  Privacy salt counters are initialized only for `authPriv` configurations;
+  request-ID and retry-jitter seeds use warned deterministic fallbacks when OS
+  entropy is unavailable.
 - **Breaking:** `AgentBuilder::trap_sink` now requires a stable caller-supplied
   `NotificationSinkId`; duplicate IDs are rejected during agent construction.
   `Agent::notification_sinks` exposes cloneable, credential-free

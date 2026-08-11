@@ -536,7 +536,11 @@ impl AgentBuilder {
             .authoritative_engine
             .as_ref()
             .map(|engine| engine.engine_id().to_vec())
-            .unwrap_or_else(|| crate::v3::generate_engine_id().to_vec());
+            .unwrap_or_else(|| {
+                crate::v3::generate_engine_id()
+                    .expect("test engine ID generation")
+                    .to_vec()
+            });
         self.authoritative_engine = Some(AuthoritativeEngine::for_test(engine_id, boots));
         self
     }
@@ -792,7 +796,8 @@ impl AgentBuilder {
     /// longer than 32 UTF-8 octets, or duplicated; USM credentials are invalid;
     /// USM users or V3 trap sinks are configured without a persisted
     /// [`AuthoritativeEngine`]; or the response-size limit exceeds the fixed UDP
-    /// receive capacity.
+    /// receive capacity. Returns [`Error::RandomSource`] when a generated engine
+    /// ID or required privacy salt cannot be initialized.
     pub async fn build(mut self) -> Result<Agent> {
         let mut sink_ids = HashSet::with_capacity(self.trap_sinks.len());
         for (id, _, _) in &self.trap_sinks {
@@ -825,6 +830,13 @@ impl AgentBuilder {
                 })?;
             }
         }
+        let requires_privacy = self
+            .usm_users
+            .values()
+            .any(|security| security.security_level().requires_priv())
+            || self.trap_sinks.iter().any(|(_, _, auth)| {
+                matches!(auth, crate::client::Auth::Usm(security) if security.security_level().requires_priv())
+            });
         let requires_authoritative_engine = !self.usm_users.is_empty()
             || self
                 .trap_sinks
@@ -842,6 +854,7 @@ impl AgentBuilder {
             "invalid USM user configuration",
             "authoritative engine state is required for SNMPv3 agent roles",
         )?;
+        let salt_counter = requires_privacy.then(SaltCounter::new).transpose()?;
 
         let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
@@ -952,7 +965,7 @@ impl AgentBuilder {
                 usm_users,
                 handlers: self.handlers,
                 state,
-                salt_counter: SaltCounter::new(),
+                salt_counter,
                 concurrency_limit,
                 vacm: self.vacm,
                 cancel,
@@ -1053,7 +1066,7 @@ pub(crate) struct AgentInner {
     pub(crate) usm_users: HashMap<Bytes, UsmConfig>,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
-    pub(crate) salt_counter: SaltCounter,
+    pub(crate) salt_counter: Option<SaltCounter>,
     pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
     pub(crate) vacm: Option<VacmConfig>,
     /// Cancellation token for graceful shutdown.
@@ -4102,6 +4115,7 @@ mod tests {
         let empty = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
         assert!(!empty.validate_community(b"public"));
         assert!(!empty.validate_community(b""));
+        assert!(empty.inner.salt_counter.is_none());
 
         let configured = Agent::builder()
             .bind("127.0.0.1:0")
@@ -4111,6 +4125,7 @@ mod tests {
             .unwrap();
         assert!(configured.validate_community(b"public"));
         assert!(configured.validate_community(b"monitor"));
+        assert!(configured.inner.salt_counter.is_none());
         for community in [b"private".as_slice(), b"pub", b"publicx", b""] {
             assert!(!configured.validate_community(community));
         }

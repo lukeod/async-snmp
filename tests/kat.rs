@@ -426,7 +426,12 @@ fn test_aes256_with_sha1_auto_key_extension_roundtrip() {
     let engine_time = 12345u32;
 
     let (ciphertext, priv_params) = priv_key
-        .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+        .encrypt(
+            plaintext,
+            engine_boots,
+            engine_time,
+            &SaltCounter::new().unwrap(),
+        )
         .expect("encryption should succeed");
 
     let decrypted = priv_key
@@ -461,7 +466,12 @@ fn test_aes192_with_sha1_auto_key_extension_roundtrip() {
     let engine_time = 54321u32;
 
     let (ciphertext, priv_params) = priv_key
-        .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+        .encrypt(
+            plaintext,
+            engine_boots,
+            engine_time,
+            &SaltCounter::new().unwrap(),
+        )
         .expect("encryption should succeed");
 
     let decrypted = priv_key
@@ -491,7 +501,7 @@ fn test_aes256_with_md5_auto_key_extension_roundtrip() {
 
     let plaintext = b"Test message for AES-256 with extended MD5 key";
     let (ciphertext, priv_params) = priv_key
-        .encrypt(plaintext, 300, 67890, &SaltCounter::new())
+        .encrypt(plaintext, 300, 67890, &SaltCounter::new().unwrap())
         .expect("encryption should succeed");
 
     let decrypted = priv_key
@@ -588,7 +598,7 @@ fn test_fips_rejects_des_encrypt() {
     let priv_key =
         PrivKey::from_bytes_with_backend(PrivProtocol::Des, vec![0; 16], CryptoBackend::AwsLcFips)
             .unwrap();
-    let result = priv_key.encrypt(b"test data", 1, 1, &SaltCounter::new());
+    let result = priv_key.encrypt(b"test data", 1, 1, &SaltCounter::new().unwrap());
     assert!(
         matches!(
             result,
@@ -608,7 +618,7 @@ fn test_fips_rejects_3des_encrypt() {
     let priv_key =
         PrivKey::from_bytes_with_backend(PrivProtocol::Des3, vec![0; 32], CryptoBackend::AwsLcFips)
             .unwrap();
-    let result = priv_key.encrypt(b"test data", 1, 1, &SaltCounter::new());
+    let result = priv_key.encrypt(b"test data", 1, 1, &SaltCounter::new().unwrap());
     assert!(
         matches!(
             result,
@@ -676,10 +686,10 @@ fn both_backends_are_explicit_and_match_shared_sha_aes_vectors() {
 
     let plaintext = b"shared AES-128 provider KAT";
     let rust_encrypted = rust_priv
-        .encrypt(plaintext, 7, 11, &SaltCounter::new())
+        .encrypt(plaintext, 7, 11, &SaltCounter::new().unwrap())
         .unwrap();
     let fips_encrypted = fips_priv
-        .encrypt(plaintext, 7, 11, &SaltCounter::new())
+        .encrypt(plaintext, 7, 11, &SaltCounter::new().unwrap())
         .unwrap();
     assert_eq!(
         rust_priv
@@ -743,7 +753,12 @@ fn test_golden_aes128_roundtrip() {
     let engine_time = 1u32;
 
     let (ct, params) = priv_key
-        .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+        .encrypt(
+            plaintext,
+            engine_boots,
+            engine_time,
+            &SaltCounter::new().unwrap(),
+        )
         .expect("AES-128 encryption failed");
 
     let pt = priv_key
@@ -768,7 +783,12 @@ fn test_golden_aes256_roundtrip() {
     let engine_time = 12345u32;
 
     let (ct, params) = priv_key
-        .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+        .encrypt(
+            plaintext,
+            engine_boots,
+            engine_time,
+            &SaltCounter::new().unwrap(),
+        )
         .expect("AES-256 encryption failed");
 
     let pt = priv_key

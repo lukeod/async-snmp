@@ -35,7 +35,8 @@ use crate::varbind::VarBind;
 /// - `engine_time` - Current engine time value
 /// - `security` - USM security configuration (username, context, security level)
 /// - `derived_keys` - Keys derived against `engine_id`
-/// - `salt_counter` - Salt counter for encryption IV generation
+/// - `salt_counter` - Salt counter for encryption IV generation; required for
+///   `authPriv`
 /// - `reportable` - Whether the receiver should send Report PDUs on error
 /// - `msg_max_size` - Maximum message size to advertise
 #[allow(clippy::too_many_arguments)]
@@ -47,7 +48,7 @@ pub fn encode_v3_message(
     engine_time: u32,
     security: &UsmConfig,
     derived_keys: Option<&DerivedKeys>,
-    salt_counter: &SaltCounter,
+    salt_counter: Option<&SaltCounter>,
     reportable: bool,
     msg_max_size: MessageSize,
 ) -> Result<Vec<u8>> {
@@ -65,6 +66,8 @@ pub fn encode_v3_message(
         let priv_key = derived_keys
             .and_then(|d| d.priv_key.as_ref())
             .ok_or_else(|| Error::Config("privacy key not available".into()).boxed())?;
+        let salt_counter = salt_counter
+            .ok_or_else(|| Error::Config("privacy salt counter not initialized".into()).boxed())?;
 
         let scoped_pdu_bytes = scoped_pdu.encode_to_bytes()?;
         let (ciphertext, salt) = priv_key
@@ -235,7 +238,7 @@ pub(crate) fn encode_v3_response(
     context_engine_id: Bytes,
     context_name: Bytes,
     derived_keys: Option<&DerivedKeys>,
-    salt_counter: &SaltCounter,
+    salt_counter: Option<&SaltCounter>,
     target: SocketAddr,
 ) -> Result<Bytes> {
     response_pdu.validate_outbound(crate::Version::V3, crate::pdu::PduDirection::Response)?;
@@ -260,6 +263,9 @@ pub(crate) fn encode_v3_response(
             let priv_key = keys.priv_key.as_ref().ok_or_else(|| {
                 tracing::debug!(target: "async_snmp::v3", { kind = %CryptoErrorKind::NoPrivKey }, "no privacy key for response");
                 Error::Auth { target }.boxed()
+            })?;
+            let salt_counter = salt_counter.ok_or_else(|| {
+                Error::Config("privacy salt counter not initialized".into()).boxed()
             })?;
 
             let scoped_pdu_bytes = scoped.encode_to_bytes()?;
@@ -335,7 +341,7 @@ mod tests {
             1,
             &security,
             None,
-            &salt,
+            Some(&salt),
             true,
             message_size(),
         );
@@ -364,7 +370,7 @@ mod tests {
             1,
             &security,
             None,
-            &salt,
+            Some(&salt),
             false,
             message_size(),
         );
@@ -393,7 +399,7 @@ mod tests {
             Bytes::from_static(b"engine-id"),
             Bytes::new(),
             None,
-            &salt,
+            Some(&salt),
             "127.0.0.1:161".parse().unwrap(),
         );
 

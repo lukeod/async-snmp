@@ -80,10 +80,16 @@ pub type PrivacyResult<T> = std::result::Result<T, PrivacyError>;
 /// Generate a random non-zero u64 for salt initialization.
 ///
 /// Uses the OS cryptographic random source via `getrandom`.
-fn random_nonzero_u64() -> super::crypto::CryptoResult<u64> {
+fn random_nonzero_u64() -> crate::error::Result<u64> {
+    random_nonzero_u64_with(getrandom::fill)
+}
+
+fn random_nonzero_u64_with(
+    mut fill: impl FnMut(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
+) -> crate::error::Result<u64> {
     let mut buf = [0u8; 8];
     loop {
-        getrandom::fill(&mut buf).map_err(|_| super::crypto::CryptoError::RandomSource)?;
+        fill(&mut buf).map_err(|source| crate::Error::RandomSource { source }.boxed())?;
         let val = u64::from_ne_bytes(buf);
         if val != 0 {
             return Ok(val);
@@ -125,13 +131,12 @@ pub struct SaltCounter(AtomicU64);
 impl SaltCounter {
     /// Create a new salt counter initialized from cryptographic randomness.
     ///
-    /// # Panics
-    /// Panics if the OS random source is unavailable.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(AtomicU64::new(
-            random_nonzero_u64().expect("OS random source unavailable"),
-        ))
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::RandomSource`] if the operating system cannot
+    /// provide random bytes.
+    pub fn new() -> crate::error::Result<Self> {
+        Ok(Self(AtomicU64::new(random_nonzero_u64()?)))
     }
 
     /// Create a salt counter initialized to a specific value for internal tests.
@@ -156,12 +161,6 @@ impl SaltCounter {
                 return val;
             }
         }
-    }
-}
-
-impl Default for SaltCounter {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -622,6 +621,32 @@ impl std::fmt::Debug for PrivKey {
     }
 }
 
+#[cfg(test)]
+mod entropy_tests {
+    use super::*;
+
+    #[test]
+    fn salt_counter_propagates_random_source_failure() {
+        let error = random_nonzero_u64_with(|_| Err(getrandom::Error::UNEXPECTED)).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::RandomSource);
+    }
+
+    #[test]
+    fn salt_counter_retries_a_zero_seed() {
+        let mut attempts = 0;
+        let value = random_nonzero_u64_with(|bytes| {
+            attempts += 1;
+            if attempts == 2 {
+                bytes.copy_from_slice(&1_u64.to_ne_bytes());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(value, 1);
+        assert_eq!(attempts, 2);
+    }
+}
+
 #[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 mod tests {
     use super::*;
@@ -642,7 +667,12 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -677,7 +707,12 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -709,7 +744,12 @@ mod tests {
         let engine_time = 54321u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -778,7 +818,7 @@ mod tests {
         // trailing bytes are unused but harmless.
         let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 20]).unwrap();
         // Encrypting should not panic now that the key is validated as long enough.
-        let _ = priv_key.encrypt(b"data", 0, 0, &SaltCounter::new());
+        let _ = priv_key.encrypt(b"data", 0, 0, &SaltCounter::new().unwrap());
     }
 
     #[test]
@@ -880,7 +920,7 @@ mod tests {
         // Just verify we can encrypt/decrypt with the derived key
         let plaintext = b"test message";
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, 100, 200, &SaltCounter::new())
+            .encrypt(plaintext, 100, 200, &SaltCounter::new().unwrap())
             .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
@@ -903,7 +943,12 @@ mod tests {
         let engine_time = 67890u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("AES-192 encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -936,7 +981,12 @@ mod tests {
         let engine_time = 11111u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("AES-256 encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -970,7 +1020,7 @@ mod tests {
 
         let plaintext = b"test message for AES-192";
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, 100, 200, &SaltCounter::new())
+            .encrypt(plaintext, 100, 200, &SaltCounter::new().unwrap())
             .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
@@ -995,7 +1045,7 @@ mod tests {
 
         let plaintext = b"test message for AES-256";
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, 100, 200, &SaltCounter::new())
+            .encrypt(plaintext, 100, 200, &SaltCounter::new().unwrap())
             .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
@@ -1036,7 +1086,12 @@ mod tests {
 
         // Encrypt with correct key
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         // Decrypt with wrong key - this will "succeed" but produce garbage
@@ -1082,7 +1137,12 @@ mod tests {
 
         // Encrypt with correct key
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         // Decrypt with wrong key
@@ -1123,7 +1183,12 @@ mod tests {
         let engine_time = 67890u32;
 
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         let wrong_decrypted = wrong_priv_key
@@ -1158,7 +1223,12 @@ mod tests {
         let engine_time = 11111u32;
 
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         let wrong_decrypted = wrong_priv_key
@@ -1189,7 +1259,12 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, correct_priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         // Use wrong priv_params (different salt)
@@ -1277,7 +1352,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::thread;
 
-        let counter = Arc::new(SaltCounter::new());
+        let counter = Arc::new(SaltCounter::new().unwrap());
         let results = Arc::new(Mutex::new(HashSet::new()));
         let iterations = 10_000usize;
         let threads = 8usize;
@@ -1394,7 +1469,12 @@ mod tests {
         let engine_time = 54321u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &SaltCounter::new())
+            .encrypt(
+                plaintext,
+                engine_boots,
+                engine_time,
+                &SaltCounter::new().unwrap(),
+            )
             .expect("encryption failed");
 
         // Decrypt with wrong engine_time (IV mismatch)

@@ -740,7 +740,7 @@ impl super::Agent {
                     engine_time,
                     security,
                     derived.as_ref(),
-                    &self.inner.salt_counter,
+                    self.inner.salt_counter.as_ref(),
                     false, // reportable=false for traps
                     self.inner.state.local_receive_capacity,
                 )?;

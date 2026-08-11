@@ -63,7 +63,7 @@ impl Agent {
                     context_engine_id.clone(),
                     context_name.clone(),
                     derived_keys,
-                    &self.inner.salt_counter,
+                    self.inner.salt_counter.as_ref(),
                     self.inner.local_addr,
                 )
             },

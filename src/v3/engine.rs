@@ -90,17 +90,27 @@ const GENERATED_ENGINE_ID_RANDOM_LEN: usize = 12;
 /// the RFC 3411 5..32 range. The random suffix ensures two instances started
 /// in the same second (or on the same host) do not collide, which would
 /// otherwise yield identical localized keys under shared credentials.
-#[must_use]
-pub fn generate_engine_id() -> Bytes {
+///
+/// # Errors
+///
+/// Returns [`Error::RandomSource`] if the operating system cannot provide
+/// random bytes.
+pub fn generate_engine_id() -> Result<Bytes> {
+    generate_engine_id_with(getrandom::fill)
+}
+
+fn generate_engine_id_with(
+    mut fill: impl FnMut(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
+) -> Result<Bytes> {
     let mut id = Vec::with_capacity(5 + GENERATED_ENGINE_ID_RANDOM_LEN);
     // High bit of the first octet signals the RFC 3411 variable-length format.
     let enterprise = 0x8000_0000_u32 | GENERATED_ENGINE_ID_PEN;
     id.extend_from_slice(&enterprise.to_be_bytes());
     id.push(ENGINE_ID_FORMAT_OCTETS);
     let mut random = [0_u8; GENERATED_ENGINE_ID_RANDOM_LEN];
-    getrandom::fill(&mut random).expect("getrandom failed");
+    fill(&mut random).map_err(|source| Error::RandomSource { source }.boxed())?;
     id.extend_from_slice(&random);
-    Bytes::from(id)
+    Ok(Bytes::from(id))
 }
 
 /// Validate a user-configured SnmpEngineID (RFC 3411 Section 5).
@@ -927,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_generate_engine_id_is_valid_and_well_formed() {
-        let id = generate_engine_id();
+        let id = generate_engine_id().unwrap();
 
         // Valid length within RFC 3411 5..32 range.
         assert!((MIN_ENGINE_ID_LEN..=MAX_ENGINE_ID_LEN).contains(&id.len()));
@@ -946,9 +956,15 @@ mod tests {
 
     #[test]
     fn test_generate_engine_id_distinct_across_generations() {
-        let a = generate_engine_id();
-        let b = generate_engine_id();
+        let a = generate_engine_id().unwrap();
+        let b = generate_engine_id().unwrap();
         assert_ne!(a, b, "two generated engine IDs must not collide");
+    }
+
+    #[test]
+    fn test_generate_engine_id_propagates_random_source_failure() {
+        let error = generate_engine_id_with(|_| Err(getrandom::Error::UNEXPECTED)).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::RandomSource);
     }
 
     #[test]

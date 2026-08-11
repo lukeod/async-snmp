@@ -73,7 +73,7 @@ pub(crate) fn prepare_authoritative_usm(
         None if requires_engine => {
             return Err(Error::Config(missing_engine_context.into()).boxed());
         }
-        None => (None, crate::v3::generate_engine_id(), 1),
+        None => (None, crate::v3::generate_engine_id()?, 1),
     };
 
     Ok(PreparedAuthoritativeUsm {

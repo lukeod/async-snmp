@@ -32,8 +32,6 @@ pub enum CryptoError {
         /// Maximum output length for the selected authentication protocol.
         digest_length: usize,
     },
-    /// The OS random source is unavailable.
-    RandomSource,
     /// The supplied password is shorter than the RFC 3414 minimum (8 octets).
     ///
     /// RFC 3414 Section 11.2 requires passwords of at least 8 octets, and
@@ -61,7 +59,6 @@ impl std::fmt::Display for CryptoError {
                 f,
                 "invalid HMAC truncation length {requested}; maximum is {digest_length} octets"
             ),
-            Self::RandomSource => write!(f, "OS random source unavailable"),
             Self::PasswordTooShort => write!(
                 f,
                 "password is shorter than the RFC 3414 minimum of 8 octets"

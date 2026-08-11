@@ -130,6 +130,8 @@ pub enum ErrorKind {
     WalkAborted,
     /// Invalid configuration.
     Config,
+    /// Operating-system random source failure.
+    RandomSource,
     /// Available even when the `agent` feature is disabled.
     AgentAlreadyRunning,
     /// Invalid outbound SNMP message.
@@ -155,6 +157,7 @@ impl ErrorKind {
             Self::ResponseShape => "response_shape",
             Self::WalkAborted => "walk_aborted",
             Self::Config => "configuration",
+            Self::RandomSource => "random_source",
             Self::AgentAlreadyRunning => "agent_already_running",
             Self::InvalidMessage => "invalid_message",
             Self::InvalidOid => "invalid_oid",
@@ -284,6 +287,13 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(Box<str>),
 
+    /// The operating system could not provide random bytes.
+    #[error("OS random source unavailable: {source}")]
+    RandomSource {
+        #[source]
+        source: getrandom::Error,
+    },
+
     /// Another [`Agent::run`](crate::agent::Agent::run) call is already active.
     #[cfg(feature = "agent")]
     #[error("agent is already running")]
@@ -315,6 +325,7 @@ impl Error {
             Self::ResponseShape { .. } => ErrorKind::ResponseShape,
             Self::WalkAborted { .. } => ErrorKind::WalkAborted,
             Self::Config(_) => ErrorKind::Config,
+            Self::RandomSource { .. } => ErrorKind::RandomSource,
             #[cfg(feature = "agent")]
             Self::AgentAlreadyRunning => ErrorKind::AgentAlreadyRunning,
             Self::InvalidMessage(_) => ErrorKind::InvalidMessage,
@@ -621,6 +632,12 @@ mod tests {
             ),
             (Error::Config("config".into()), ErrorKind::Config),
             (
+                Error::RandomSource {
+                    source: getrandom::Error::UNEXPECTED,
+                },
+                ErrorKind::RandomSource,
+            ),
+            (
                 Error::InvalidMessage("message".into()),
                 ErrorKind::InvalidMessage,
             ),
@@ -647,6 +664,7 @@ mod tests {
             (ErrorKind::ResponseShape, "response_shape"),
             (ErrorKind::WalkAborted, "walk_aborted"),
             (ErrorKind::Config, "configuration"),
+            (ErrorKind::RandomSource, "random_source"),
             (ErrorKind::AgentAlreadyRunning, "agent_already_running"),
             (ErrorKind::InvalidMessage, "invalid_message"),
             (ErrorKind::InvalidOid, "invalid_oid"),
