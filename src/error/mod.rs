@@ -87,36 +87,6 @@ impl std::fmt::Display for WalkAbortReason {
 
 impl std::error::Error for WalkAbortReason {}
 
-/// The main error type for all async-snmp operations.
-///
-/// This enum covers all possible error conditions including network issues,
-/// protocol errors, authentication failures, and configuration problems.
-///
-/// Errors are boxed (via [`Result`]) to keep the size small on the stack.
-///
-/// # Common Patterns
-///
-/// ## Checking Error Type
-///
-/// Use pattern matching to handle specific error conditions:
-///
-/// ```
-/// use async_snmp::{Error, ErrorStatus};
-///
-/// fn is_retriable(error: &Error) -> bool {
-///     matches!(error,
-///         Error::Timeout { .. } |
-///         Error::Network { .. }
-///     )
-/// }
-///
-/// fn is_access_error(error: &Error) -> bool {
-///     matches!(error,
-///         Error::Snmp { status: ErrorStatus::NoAccess | ErrorStatus::AuthorizationError, .. } |
-///         Error::Auth { .. }
-///     )
-/// }
-/// ```
 /// Asynchronous phase active when bounded client construction timed out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -198,6 +168,36 @@ impl std::fmt::Display for ErrorKind {
     }
 }
 
+/// The main error type for all async-snmp operations.
+///
+/// This enum covers all possible error conditions including network issues,
+/// protocol errors, authentication failures, and configuration problems.
+///
+/// Errors are boxed (via [`Result`]) to keep the size small on the stack.
+///
+/// # Common Patterns
+///
+/// ## Checking Error Type
+///
+/// Use pattern matching to handle specific error conditions:
+///
+/// ```
+/// use async_snmp::{Error, ErrorStatus};
+///
+/// fn is_retriable(error: &Error) -> bool {
+///     matches!(error,
+///         Error::Timeout { .. } |
+///         Error::Network { .. }
+///     )
+/// }
+///
+/// fn is_access_error(error: &Error) -> bool {
+///     matches!(error,
+///         Error::Snmp { status: ErrorStatus::NoAccess | ErrorStatus::AuthorizationError, .. } |
+///         Error::Auth { .. }
+///     )
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {

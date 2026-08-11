@@ -23,17 +23,35 @@
 
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 #[doc(hidden)]
+#[allow(
+    dead_code,
+    reason = "crypto key APIs are unavailable without a backend"
+)]
 pub(crate) mod auth;
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub mod auth;
 mod authoritative;
 mod config;
+#[cfg_attr(
+    not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
+    allow(
+        dead_code,
+        reason = "crypto provider APIs are unavailable without a backend"
+    )
+)]
 mod crypto;
 pub(crate) mod encode;
 mod engine;
 #[cfg_attr(
     not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
     doc(hidden)
+)]
+#[cfg_attr(
+    not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
+    allow(
+        dead_code,
+        reason = "privacy key APIs are unavailable without a backend"
+    )
 )]
 mod privacy;
 pub(crate) mod process;

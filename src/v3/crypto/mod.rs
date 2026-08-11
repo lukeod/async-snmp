@@ -235,14 +235,14 @@ impl CryptoBackend {
 
     pub(crate) fn password_to_key(
         self,
-        protocol: AuthProtocol,
-        password: &[u8],
+        _protocol: AuthProtocol,
+        _password: &[u8],
     ) -> CryptoResult<Vec<u8>> {
         match self {
             #[cfg(feature = "crypto-rustcrypto")]
-            Self::RustCrypto => RustCryptoProvider.password_to_key(protocol, password),
+            Self::RustCrypto => RustCryptoProvider.password_to_key(_protocol, _password),
             #[cfg(feature = "crypto-fips")]
-            Self::AwsLcFips => AwsLcFipsProvider.password_to_key(protocol, password),
+            Self::AwsLcFips => AwsLcFipsProvider.password_to_key(_protocol, _password),
             #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
             Self::Unavailable => Err(Self::unavailable()),
         }
@@ -250,15 +250,15 @@ impl CryptoBackend {
 
     pub(crate) fn localize_key(
         self,
-        protocol: AuthProtocol,
-        master_key: &[u8],
-        engine_id: &[u8],
+        _protocol: AuthProtocol,
+        _master_key: &[u8],
+        _engine_id: &[u8],
     ) -> CryptoResult<Vec<u8>> {
         match self {
             #[cfg(feature = "crypto-rustcrypto")]
-            Self::RustCrypto => RustCryptoProvider.localize_key(protocol, master_key, engine_id),
+            Self::RustCrypto => RustCryptoProvider.localize_key(_protocol, _master_key, _engine_id),
             #[cfg(feature = "crypto-fips")]
-            Self::AwsLcFips => AwsLcFipsProvider.localize_key(protocol, master_key, engine_id),
+            Self::AwsLcFips => AwsLcFipsProvider.localize_key(_protocol, _master_key, _engine_id),
             #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
             Self::Unavailable => Err(Self::unavailable()),
         }
@@ -266,29 +266,31 @@ impl CryptoBackend {
 
     pub(crate) fn compute_hmac(
         self,
-        protocol: AuthProtocol,
-        key: &[u8],
-        slices: &[&[u8]],
-        truncate_len: usize,
+        _protocol: AuthProtocol,
+        _key: &[u8],
+        _slices: &[&[u8]],
+        _truncate_len: usize,
     ) -> CryptoResult<Vec<u8>> {
         match self {
             #[cfg(feature = "crypto-rustcrypto")]
             Self::RustCrypto => {
-                RustCryptoProvider.compute_hmac(protocol, key, slices, truncate_len)
+                RustCryptoProvider.compute_hmac(_protocol, _key, _slices, _truncate_len)
             }
             #[cfg(feature = "crypto-fips")]
-            Self::AwsLcFips => AwsLcFipsProvider.compute_hmac(protocol, key, slices, truncate_len),
+            Self::AwsLcFips => {
+                AwsLcFipsProvider.compute_hmac(_protocol, _key, _slices, _truncate_len)
+            }
             #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
             Self::Unavailable => Err(Self::unavailable()),
         }
     }
 
-    pub(crate) fn hash(self, protocol: AuthProtocol, data: &[u8]) -> CryptoResult<Vec<u8>> {
+    pub(crate) fn hash(self, _protocol: AuthProtocol, _data: &[u8]) -> CryptoResult<Vec<u8>> {
         match self {
             #[cfg(feature = "crypto-rustcrypto")]
-            Self::RustCrypto => RustCryptoProvider.hash(protocol, data),
+            Self::RustCrypto => RustCryptoProvider.hash(_protocol, _data),
             #[cfg(feature = "crypto-fips")]
-            Self::AwsLcFips => AwsLcFipsProvider.hash(protocol, data),
+            Self::AwsLcFips => AwsLcFipsProvider.hash(_protocol, _data),
             #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
             Self::Unavailable => Err(Self::unavailable()),
         }
@@ -300,16 +302,16 @@ impl CryptoBackend {
     )]
     pub(crate) fn encrypt(
         self,
-        protocol: PrivProtocol,
-        key: &[u8],
-        iv: &[u8],
-        data: &mut Vec<u8>,
+        _protocol: PrivProtocol,
+        _key: &[u8],
+        _iv: &[u8],
+        _data: &mut Vec<u8>,
     ) -> CryptoResult<()> {
         match self {
             #[cfg(feature = "crypto-rustcrypto")]
-            Self::RustCrypto => RustCryptoProvider.encrypt(protocol, key, iv, data),
+            Self::RustCrypto => RustCryptoProvider.encrypt(_protocol, _key, _iv, _data),
             #[cfg(feature = "crypto-fips")]
-            Self::AwsLcFips => AwsLcFipsProvider.encrypt(protocol, key, iv, data),
+            Self::AwsLcFips => AwsLcFipsProvider.encrypt(_protocol, _key, _iv, _data),
             #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
             Self::Unavailable => Err(Self::unavailable()),
         }
@@ -317,16 +319,16 @@ impl CryptoBackend {
 
     pub(crate) fn decrypt(
         self,
-        protocol: PrivProtocol,
-        key: &[u8],
-        iv: &[u8],
-        data: &mut [u8],
+        _protocol: PrivProtocol,
+        _key: &[u8],
+        _iv: &[u8],
+        _data: &mut [u8],
     ) -> CryptoResult<()> {
         match self {
             #[cfg(feature = "crypto-rustcrypto")]
-            Self::RustCrypto => RustCryptoProvider.decrypt(protocol, key, iv, data),
+            Self::RustCrypto => RustCryptoProvider.decrypt(_protocol, _key, _iv, _data),
             #[cfg(feature = "crypto-fips")]
-            Self::AwsLcFips => AwsLcFipsProvider.decrypt(protocol, key, iv, data),
+            Self::AwsLcFips => AwsLcFipsProvider.decrypt(_protocol, _key, _iv, _data),
             #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
             Self::Unavailable => Err(Self::unavailable()),
         }

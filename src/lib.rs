@@ -1,5 +1,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, doc(auto_cfg))]
+#![forbid(unsafe_code)]
 
 //! # async-snmp
 //!
@@ -530,10 +531,6 @@ pub mod pdu;
 pub mod prelude;
 mod response_finalizer;
 pub mod transport;
-#[cfg_attr(
-    not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
-    allow(dead_code, unused_imports, unused_mut, unused_variables)
-)]
 pub mod v3;
 pub mod value;
 pub mod varbind;
