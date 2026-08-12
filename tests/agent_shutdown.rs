@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_snmp::handler::{
-    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, SetResult,
+    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet, RequestContext,
+    SetCommitResult, SetTestResult,
 };
 use async_snmp::{Agent, Auth, Client, Oid, Retry, Value, oid};
 use tokio::sync::Semaphore;
@@ -149,6 +150,32 @@ struct BlockingSetHandler {
     committed: Arc<AtomicBool>,
 }
 
+struct BlockingPreparedSet {
+    commit_started: Arc<Semaphore>,
+    release_commit: Arc<Semaphore>,
+    committed: Arc<AtomicBool>,
+}
+
+impl PreparedSet for BlockingPreparedSet {
+    fn commit<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, SetCommitResult> {
+        self.commit_started.add_permits(1);
+        Box::pin(async move {
+            self.release_commit
+                .acquire()
+                .await
+                .expect("release semaphore should remain open")
+                .forget();
+            self.committed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
 impl MibHandler for BlockingSetHandler {
     fn get<'a>(
         &'a self,
@@ -171,25 +198,13 @@ impl MibHandler for BlockingSetHandler {
         _ctx: &'a RequestContext,
         _oid: &'a Oid,
         _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        Box::pin(async { SetResult::Ok })
-    }
-
-    fn commit_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        _oid: &'a Oid,
-        _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        self.commit_started.add_permits(1);
+    ) -> BoxFuture<'a, SetTestResult> {
         Box::pin(async move {
-            self.release_commit
-                .acquire()
-                .await
-                .expect("release semaphore should remain open")
-                .forget();
-            self.committed.store(true, Ordering::SeqCst);
-            SetResult::Ok
+            Ok(Box::new(BlockingPreparedSet {
+                commit_started: self.commit_started.clone(),
+                release_commit: self.release_commit.clone(),
+                committed: self.committed.clone(),
+            }) as Box<dyn PreparedSet>)
         })
     }
 }
@@ -215,7 +230,7 @@ async fn cancellation_does_not_abort_set_commit() {
     tokio::task::yield_now().await;
     assert!(
         !run_task.is_finished(),
-        "run returned while commit_set was still blocked"
+        "run returned while prepared SET commit was still blocked"
     );
     assert!(!committed.load(Ordering::SeqCst));
 

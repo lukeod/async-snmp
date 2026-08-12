@@ -3,13 +3,14 @@
 //! Demonstrates a MibHandler that supports SET operations using the
 //! library's two-phase SET protocol (RFC 3416):
 //!
-//! 1. **test_set** - Validate and optionally reserve resources
-//! 2. **commit_set** - Apply the change
+//! 1. **test_set** - Validate and return request-owned prepared state
+//! 2. **PreparedSet::commit** - Apply the change
+//! 3. **PreparedSet::finalize** - Release successful transaction state
 //!
 //! After validation, both commits in this example are infallible and reserve no
-//! resources, so the default `undo_set` and `free_set` implementations are
-//! sufficient. A handler whose commit can fail must retain the previous value
-//! and restore it from `undo_set`.
+//! resources, so the default terminal methods are sufficient. A handler whose
+//! commit can fail must retain the previous value in its prepared object and
+//! restore it from `undo`.
 //!
 //! The example exposes a small configuration subtree under a private
 //! enterprise OID with two writable scalars (a string and an integer)
@@ -19,7 +20,8 @@
 
 use async_snmp::agent::Agent;
 use async_snmp::handler::{
-    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, SetResult,
+    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet, RequestContext,
+    SetCommitResult, SetTestError, SetTestResult,
 };
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
@@ -38,17 +40,55 @@ const OID_CONFIG_INTERVAL: [u32; 9] = [1, 3, 6, 1, 4, 1, 99999, 2, 0];
 const OID_CONFIG_CHANGES: [u32; 9] = [1, 3, 6, 1, 4, 1, 99999, 3, 0];
 
 struct ConfigHandler {
-    name: RwLock<Bytes>,
-    interval: RwLock<i32>,
-    change_count: AtomicU32,
+    name: Arc<RwLock<Bytes>>,
+    interval: Arc<RwLock<i32>>,
+    change_count: Arc<AtomicU32>,
+}
+
+enum ConfigChange {
+    Name {
+        target: Arc<RwLock<Bytes>>,
+        value: Bytes,
+    },
+    Interval {
+        target: Arc<RwLock<i32>>,
+        value: i32,
+    },
+}
+
+struct PreparedConfigSet {
+    change: ConfigChange,
+    change_count: Arc<AtomicU32>,
+}
+
+impl PreparedSet for PreparedConfigSet {
+    fn commit<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, SetCommitResult> {
+        Box::pin(async move {
+            match &self.change {
+                ConfigChange::Name { target, value } => {
+                    *target.write().unwrap() = value.clone();
+                }
+                ConfigChange::Interval { target, value } => {
+                    *target.write().unwrap() = *value;
+                }
+            }
+            self.change_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+    }
 }
 
 impl ConfigHandler {
     fn new() -> Self {
         Self {
-            name: RwLock::new(Bytes::from_static(b"default")),
-            interval: RwLock::new(60),
-            change_count: AtomicU32::new(0),
+            name: Arc::new(RwLock::new(Bytes::from_static(b"default"))),
+            interval: Arc::new(RwLock::new(60)),
+            change_count: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -124,50 +164,41 @@ impl MibHandler for ConfigHandler {
         _ctx: &'a RequestContext,
         oid: &'a Oid,
         value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
+    ) -> BoxFuture<'a, SetTestResult> {
         Box::pin(async move {
             if oid.as_ref() == OID_CONFIG_NAME {
                 match value {
-                    Value::OctetString(bytes) if bytes.len() <= 64 => SetResult::Ok,
-                    Value::OctetString(_) => SetResult::WrongLength,
-                    _ => SetResult::WrongType,
+                    Value::OctetString(bytes) if bytes.len() <= 64 => {
+                        Ok(Box::new(PreparedConfigSet {
+                            change: ConfigChange::Name {
+                                target: self.name.clone(),
+                                value: bytes.clone(),
+                            },
+                            change_count: self.change_count.clone(),
+                        }) as Box<dyn PreparedSet>)
+                    }
+                    Value::OctetString(_) => Err(SetTestError::WrongLength),
+                    _ => Err(SetTestError::WrongType),
                 }
             } else if oid.as_ref() == OID_CONFIG_INTERVAL {
                 match value {
-                    Value::Integer(v) if (1..=3600).contains(v) => SetResult::Ok,
-                    Value::Integer(_) => SetResult::WrongValue,
-                    _ => SetResult::WrongType,
+                    Value::Integer(v) if (1..=3600).contains(v) => Ok(Box::new(PreparedConfigSet {
+                        change: ConfigChange::Interval {
+                            target: self.interval.clone(),
+                            value: *v,
+                        },
+                        change_count: self.change_count.clone(),
+                    })
+                        as Box<dyn PreparedSet>),
+                    Value::Integer(_) => Err(SetTestError::WrongValue),
+                    _ => Err(SetTestError::WrongType),
                 }
             } else if oid.as_ref() == OID_CONFIG_CHANGES {
                 // Read-only counter
-                SetResult::NotWritable
+                Err(SetTestError::NotWritable)
             } else {
-                SetResult::NoAccess
+                Err(SetTestError::NoAccess)
             }
-        })
-    }
-
-    fn commit_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        oid: &'a Oid,
-        value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        Box::pin(async move {
-            if oid.as_ref() == OID_CONFIG_NAME
-                && let Value::OctetString(bytes) = value
-            {
-                *self.name.write().unwrap() = bytes.clone();
-                self.change_count.fetch_add(1, Ordering::Relaxed);
-                return SetResult::Ok;
-            } else if oid.as_ref() == OID_CONFIG_INTERVAL
-                && let Value::Integer(v) = value
-            {
-                *self.interval.write().unwrap() = *v;
-                self.change_count.fetch_add(1, Ordering::Relaxed);
-                return SetResult::Ok;
-            }
-            SetResult::CommitFailed
         })
     }
 }

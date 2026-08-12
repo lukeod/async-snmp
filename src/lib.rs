@@ -597,7 +597,8 @@ pub use error::{
 #[cfg(feature = "agent")]
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,
-    RequestContext, SecurityModel, SecurityName, SetResult,
+    PreparedSet, RequestContext, SecurityModel, SecurityName, SetCommitError, SetCommitResult,
+    SetTestError, SetTestResult, SetUndoError, SetUndoResult,
 };
 pub use message::SecurityLevel;
 pub use message_size::{

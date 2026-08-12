@@ -4,7 +4,9 @@
 //!
 //! - [`MibHandler`] - Trait for handling GET, GETNEXT, and SET operations
 //! - [`RequestContext`] - Information about the incoming request
-//! - [`GetResult`], [`GetNextResult`], [`SetResult`] - Operation results
+//! - [`PreparedSet`], [`SetTestResult`] - Request-owned SET transaction state
+//! - [`GetResult`], [`GetNextResult`] - Read operation results
+//! - [`SetTestResult`], [`SetCommitResult`], [`SetUndoResult`] - SET phase results
 //! - [`HandlerError`], [`HandlerResult`] - Processing failures, reported as `genErr`
 //! - [`OidTable`] - Helper for implementing GETNEXT with sorted OID storage
 //!
@@ -105,18 +107,24 @@
 //! after net-snmp's RESERVE/ACTION/COMMIT/FREE/UNDO phases:
 //!
 //! 1. **Test Phase**: [`MibHandler::test_set`] is called for ALL varbinds before any
-//!    commits. Only successful tests enter pending state. If a test fails,
-//!    [`MibHandler::free_set`] releases earlier successful reservations in reverse
-//!    order; a failing test must not leave resources for framework cleanup.
+//!    commits. Each successful test returns a request-owned [`PreparedSet`]. If a
+//!    test fails, [`PreparedSet::free`] cleans earlier successful reservations
+//!    in reverse order; a failing test must not leave resources behind.
 //!
-//! 2. **Commit Phase**: [`MibHandler::commit_set`] is called for each varbind in order.
-//!    A failed commit may have partially mutated state, so [`MibHandler::undo_set`]
-//!    is called in reverse order for every attempted binding, including the failed
-//!    attempt. Later successfully tested bindings whose commit was never attempted
-//!    receive [`MibHandler::free_set`] in reverse order. Undo owns rollback and
-//!    reservation cleanup for attempted bindings, and cleanup continues if undo fails.
+//! 2. **Commit Phase**: [`PreparedSet::commit`] is called for each varbind in order.
+//!    A failed commit may have partially mutated state, so [`PreparedSet::undo`]
+//!    cleans every attempted binding in reverse order, including the failed
+//!    attempt. Later prepared bindings receive [`PreparedSet::free`] in reverse
+//!    order. Cleanup continues if undo fails.
 //!
-//! By default, handlers are read-only (returning [`SetResult::NotWritable`]).
+//! 3. **Finalization Phase**: after all commits succeed, [`PreparedSet::finalize`]
+//!    releases rollback data and reservations in reverse order.
+//!
+//! Explicit terminal callbacks perform normal protocol cleanup. Prepared
+//! objects may implement idempotent `Drop` for synchronous reservation/resource
+//! fallback on cancellation or panic, but `Drop` cannot await rollback or
+//! promise transactional atomicity after commit starts.
+//! By default, handlers are read-only (returning [`SetTestError::NotWritable`]).
 //! See [`MibHandler`] documentation for implementation details.
 //!
 //! # Using `OidTable` for GETNEXT
@@ -167,8 +175,11 @@ mod traits;
 
 pub use context::{RequestContext, SecurityName};
 pub use oid_table::OidTable;
-pub use results::{GetNextResult, GetResult, HandlerError, HandlerResult, SetResult};
-pub use traits::{BoxFuture, MibHandler};
+pub use results::{
+    GetNextResult, GetResult, HandlerError, HandlerResult, SetCommitError, SetCommitResult,
+    SetTestError, SetTestResult, SetUndoError, SetUndoResult,
+};
+pub use traits::{BoxFuture, MibHandler, PreparedSet};
 
 /// Concrete security model used to authenticate an SNMP request (RFC 3411).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

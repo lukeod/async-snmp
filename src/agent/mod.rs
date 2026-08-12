@@ -2097,7 +2097,7 @@ mod tests {
     use super::*;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler,
-        RequestContext, SecurityModel, SetResult,
+        RequestContext, SecurityModel, SetTestError,
     };
     use crate::message::SecurityLevel;
     use crate::oid;
@@ -2369,7 +2369,7 @@ mod tests {
         let result = handler
             .test_set(&ctx, &oid!(1, 3, 6, 1), &Value::Integer(1))
             .await;
-        assert_eq!(result, SetResult::NotWritable);
+        assert!(matches!(result, Err(SetTestError::NotWritable)));
     }
 
     #[test]

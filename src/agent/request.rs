@@ -388,7 +388,8 @@ pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {
 mod tests {
     use super::*;
     use crate::handler::{
-        BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, SetResult,
+        BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet,
+        RequestContext, SetCommitResult, SetTestResult,
     };
     use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
     use crate::oid;
@@ -405,7 +406,21 @@ mod tests {
         get: AtomicU32,
         get_next: AtomicU32,
         test_set: AtomicU32,
-        commit_set: AtomicU32,
+        commit_set: Arc<AtomicU32>,
+    }
+
+    struct CountCommit(Arc<AtomicU32>);
+
+    impl PreparedSet for CountCommit {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
     }
 
     impl MibHandler for CallbackCounts {
@@ -437,19 +452,11 @@ mod tests {
             _ctx: &'a RequestContext,
             _oid: &'a Oid,
             _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
+        ) -> BoxFuture<'a, SetTestResult> {
             self.test_set.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { SetResult::Ok })
-        }
-
-        fn commit_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            self.commit_set.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { SetResult::Ok })
+            Box::pin(async move {
+                Ok(Box::new(CountCommit(self.commit_set.clone())) as Box<dyn PreparedSet>)
+            })
         }
     }
 
@@ -1205,7 +1212,27 @@ mod tests {
 
     struct BoundarySetHandler {
         state: Mutex<Option<Arc<crate::agent::AgentState>>>,
-        commits: AtomicU32,
+        commits: Arc<AtomicU32>,
+    }
+
+    struct BoundaryPreparedSet {
+        state: Arc<crate::agent::AgentState>,
+        commits: Arc<AtomicU32>,
+    }
+
+    impl PreparedSet for BoundaryPreparedSet {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                self.state.set_authoritative_elapsed_for_test(128);
+                Ok(())
+            })
+        }
     }
 
     impl MibHandler for BoundarySetHandler {
@@ -1230,17 +1257,7 @@ mod tests {
             _ctx: &'a RequestContext,
             _oid: &'a Oid,
             _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            Box::pin(async { SetResult::Ok })
-        }
-
-        fn commit_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            self.commits.fetch_add(1, Ordering::Relaxed);
+        ) -> BoxFuture<'a, SetTestResult> {
             let state = self
                 .state
                 .lock()
@@ -1249,8 +1266,10 @@ mod tests {
                 .expect("test state installed")
                 .clone();
             Box::pin(async move {
-                state.set_authoritative_elapsed_for_test(128);
-                SetResult::Ok
+                Ok(Box::new(BoundaryPreparedSet {
+                    state,
+                    commits: self.commits.clone(),
+                }) as Box<dyn PreparedSet>)
             })
         }
     }
@@ -1289,7 +1308,7 @@ mod tests {
 
         let handler = Arc::new(BoundarySetHandler {
             state: Mutex::new(None),
-            commits: AtomicU32::new(0),
+            commits: Arc::new(AtomicU32::new(0)),
         });
         let agent = Agent::builder()
             .bind("127.0.0.1:0")

@@ -11,8 +11,9 @@ use async_snmp::{
 };
 #[cfg(feature = "agent")]
 use async_snmp::{
-    GetNextResult, GetResult, NotificationSendStream, NotificationSinkId, NotificationSinkSummary,
-    oid,
+    BoxFuture, GetNextResult, GetResult, NotificationSendStream, NotificationSinkId,
+    NotificationSinkSummary, PreparedSet, RequestContext, SetCommitError, SetCommitResult,
+    SetTestError, SetTestResult, SetUndoError, SetUndoResult, oid,
 };
 use bytes::Bytes;
 
@@ -85,6 +86,75 @@ fn stable_value_and_error_kinds_are_public() {
     // The kind remains nameable when the feature-gated parent error does not.
     let agent_kind = ErrorKind::AgentAlreadyRunning;
     assert_eq!(agent_kind.to_string(), "agent_already_running");
+}
+
+#[cfg(feature = "agent")]
+#[test]
+fn prepared_set_lifecycle_types_are_public() {
+    struct PublicPreparedSet;
+
+    impl PreparedSet for PublicPreparedSet {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let prepared: SetTestResult = Ok(Box::new(PublicPreparedSet));
+    assert!(prepared.is_ok());
+
+    fn expected_test_status(failure: SetTestError) -> async_snmp::ErrorStatus {
+        match failure {
+            SetTestError::GeneralFailure => async_snmp::ErrorStatus::GenErr,
+            SetTestError::NoAccess => async_snmp::ErrorStatus::NoAccess,
+            SetTestError::NotWritable => async_snmp::ErrorStatus::NotWritable,
+            SetTestError::WrongType => async_snmp::ErrorStatus::WrongType,
+            SetTestError::WrongLength => async_snmp::ErrorStatus::WrongLength,
+            SetTestError::WrongEncoding => async_snmp::ErrorStatus::WrongEncoding,
+            SetTestError::WrongValue => async_snmp::ErrorStatus::WrongValue,
+            SetTestError::NoCreation => async_snmp::ErrorStatus::NoCreation,
+            SetTestError::InconsistentValue => async_snmp::ErrorStatus::InconsistentValue,
+            SetTestError::ResourceUnavailable => async_snmp::ErrorStatus::ResourceUnavailable,
+            SetTestError::InconsistentName => async_snmp::ErrorStatus::InconsistentName,
+        }
+    }
+
+    for failure in [
+        SetTestError::GeneralFailure,
+        SetTestError::NoAccess,
+        SetTestError::NotWritable,
+        SetTestError::WrongType,
+        SetTestError::WrongLength,
+        SetTestError::WrongEncoding,
+        SetTestError::WrongValue,
+        SetTestError::NoCreation,
+        SetTestError::InconsistentValue,
+        SetTestError::ResourceUnavailable,
+        SetTestError::InconsistentName,
+    ] {
+        assert_eq!(failure.to_error_status(), expected_test_status(failure));
+    }
+    assert_eq!(
+        SetCommitError::Failed.to_error_status(),
+        async_snmp::ErrorStatus::CommitFailed
+    );
+    assert_eq!(
+        SetUndoError::Failed.to_error_status(),
+        async_snmp::ErrorStatus::UndoFailed
+    );
 }
 
 #[test]

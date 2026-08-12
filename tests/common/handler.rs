@@ -4,7 +4,8 @@
 //! for GETNEXT operations.
 
 use async_snmp::handler::{
-    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, SetResult,
+    BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet, RequestContext,
+    SetCommitResult, SetTestResult, SetUndoResult,
 };
 use async_snmp::{Oid, Value, VarBind};
 use std::collections::BTreeMap;
@@ -16,6 +17,47 @@ use std::sync::{Arc, RwLock};
 /// The `BTreeMap` provides correct lexicographic ordering for GETNEXT.
 pub struct TestHandler {
     data: Arc<RwLock<BTreeMap<Oid, Value>>>,
+}
+
+struct PreparedMapSet {
+    data: Arc<RwLock<BTreeMap<Oid, Value>>>,
+    previous: Option<Value>,
+}
+
+impl PreparedSet for PreparedMapSet {
+    fn commit<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        oid: &'a Oid,
+        value: &'a Value,
+    ) -> BoxFuture<'a, SetCommitResult> {
+        self.data
+            .write()
+            .unwrap()
+            .insert(oid.clone(), value.clone());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn undo<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, SetUndoResult> {
+        let previous = self.previous.take();
+        Box::pin(async move {
+            let mut data = self.data.write().unwrap();
+            match previous {
+                Some(previous) => {
+                    data.insert(oid.clone(), previous);
+                }
+                None => {
+                    data.remove(oid);
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 impl TestHandler {
@@ -98,33 +140,14 @@ impl MibHandler for TestHandler {
     fn test_set<'a>(
         &'a self,
         _ctx: &'a RequestContext,
-        _oid: &'a Oid,
-        _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        // Accept all SET operations for testing
-        Box::pin(async { SetResult::Ok })
-    }
-
-    fn commit_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
         oid: &'a Oid,
-        value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        self.data
-            .write()
-            .unwrap()
-            .insert(oid.clone(), value.clone());
-        Box::pin(async { SetResult::Ok })
-    }
-
-    fn undo_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        _oid: &'a Oid,
         _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        Box::pin(async { SetResult::Ok })
+    ) -> BoxFuture<'a, SetTestResult> {
+        let prepared = PreparedMapSet {
+            data: self.data.clone(),
+            previous: self.data.read().unwrap().get(oid).cloned(),
+        };
+        Box::pin(async move { Ok(Box::new(prepared) as Box<dyn PreparedSet>) })
     }
 }
 

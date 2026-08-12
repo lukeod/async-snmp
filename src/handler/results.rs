@@ -5,7 +5,8 @@
 //!
 //! - [`GetResult`] - Result of a GET operation
 //! - [`GetNextResult`] - Result of a GETNEXT operation
-//! - [`SetResult`] - Result of SET test/commit phases
+//! - [`SetTestError`] / [`SetTestResult`] - SET validation failures and prepared state
+//! - [`SetCommitResult`] / [`SetUndoResult`] - Phase-specific apply and rollback results
 //! - [`HandlerError`] / [`HandlerResult`] - Handler processing failures (mapped to `genErr`)
 
 use std::borrow::Cow;
@@ -120,128 +121,143 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for HandlerError {
 /// answer `genErr`; see [`HandlerError`] for when to return which.
 pub type HandlerResult<T> = Result<T, HandlerError>;
 
-/// Result of a SET operation phase (RFC 3416).
+/// Result of preparing one SET varbind.
 ///
-/// This enum is used by the multi-phase SET protocol:
-/// - [`MibHandler::test_set`](super::MibHandler::test_set): `Ok` enters pending state;
-///   a non-`Ok` result must leave no resources for framework cleanup
-/// - [`MibHandler::commit_set`](super::MibHandler::commit_set): `Ok` means the change
-///   and reservation were finalized; failure may follow partial mutation
-/// - [`MibHandler::undo_set`](super::MibHandler::undo_set): terminal rollback and
-///   reservation cleanup for every commit-attempted binding, including a failed attempt
-/// - [`MibHandler::free_set`](super::MibHandler::free_set): terminal cleanup for a
-///   successful test whose commit was never attempted
+/// `Ok` carries request-owned state that the agent retains through the commit
+/// phase. `Err` is the protocol failure for this varbind and must not leave a
+/// reservation behind.
+pub type SetTestResult = Result<Box<dyn super::PreparedSet>, SetTestError>;
+
+/// A protocol validation failure from the SET test phase.
 ///
-/// After commit failure, undo and free cleanup is best-effort. An undo failure
-/// selects `undoFailed` but does not stop the remaining callbacks.
+/// This type deliberately cannot represent successful validation, or failures
+/// that only make sense after commit begins. Consequently `Err` from
+/// [`MibHandler::test_set`](super::MibHandler::test_set) can never accidentally
+/// encode `noError`, `commitFailed`, or `undoFailed`.
 ///
-/// # Choosing the Right Error
+/// ```compile_fail
+/// use async_snmp::{SetCommitError, SetTestResult};
 ///
-/// | Situation | Variant |
-/// |-----------|---------|
-/// | SET succeeded | [`Ok`](SetResult::Ok) |
-/// | User lacks permission | [`NoAccess`](SetResult::NoAccess) |
-/// | Object is read-only by design | [`NotWritable`](SetResult::NotWritable) |
-/// | Wrong ASN.1 type (e.g., String for Integer) | [`WrongType`](SetResult::WrongType) |
-/// | Value too long/short | [`WrongLength`](SetResult::WrongLength) |
-/// | Value encoding error | [`WrongEncoding`](SetResult::WrongEncoding) |
-/// | Semantic validation failed | [`WrongValue`](SetResult::WrongValue) |
-/// | Cannot create table row | [`NoCreation`](SetResult::NoCreation) |
-/// | Values conflict within request | [`InconsistentValue`](SetResult::InconsistentValue) |
-/// | Out of memory, lock contention | [`ResourceUnavailable`](SetResult::ResourceUnavailable) |
+/// let _: SetTestResult = Err(SetCommitError::Failed);
+/// ```
 ///
-/// # Example
+/// Commit- and undo-only failures are likewise different types:
 ///
-/// ```rust
-/// use async_snmp::handler::SetResult;
-/// use async_snmp::Value;
+/// ```compile_fail
+/// use async_snmp::{SetCommitError, SetTestError};
 ///
-/// fn validate_admin_status(value: &Value) -> SetResult {
-///     match value {
-///         Value::Integer(v) if *v == 1 || *v == 2 => SetResult::Ok, // up(1) or down(2)
-///         Value::Integer(_) => SetResult::WrongValue, // Invalid admin status
-///         _ => SetResult::WrongType, // Must be Integer
-///     }
-/// }
-///
-/// assert_eq!(validate_admin_status(&Value::Integer(1)), SetResult::Ok);
-/// assert_eq!(validate_admin_status(&Value::Integer(99)), SetResult::WrongValue);
-/// assert_eq!(validate_admin_status(&Value::OctetString("up".into())), SetResult::WrongType);
+/// let _: SetTestError = SetCommitError::Failed;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetResult {
-    /// Operation succeeded.
-    Ok,
-    /// Access denied (security/authorization failure).
+pub enum SetTestError {
+    /// Validation or its backing service failed without a more specific status.
     ///
-    /// Use this when the request lacks sufficient access rights to modify
-    /// the object, based on the security context (user, community, etc.).
-    /// Maps to RFC 3416 error status code 6 (noAccess).
+    /// Maps to `genErr`. Use a more specific variant whenever the failure is a
+    /// protocol validation outcome rather than an internal/backend failure.
+    GeneralFailure,
+    /// Access denied by the handler's application policy.
     NoAccess,
-    /// Object is inherently read-only (not writable by design).
-    ///
-    /// Use this when the object cannot be modified regardless of who
-    /// is making the request. Maps to RFC 3416 error status code 17 (notWritable).
+    /// Object is inherently read-only.
     NotWritable,
-    /// Value has wrong ASN.1 type for this OID.
-    ///
-    /// Use when the provided value type doesn't match the expected type
-    /// (e.g., `OctetString` provided for an Integer object).
+    /// Value has the wrong ASN.1 type.
     WrongType,
-    /// Value has wrong length for this OID.
-    ///
-    /// Use when the value length violates constraints (e.g., `DisplayString`
-    /// longer than 255 characters).
+    /// Value violates a length constraint.
     WrongLength,
-    /// Value encoding is incorrect.
+    /// Value encoding is invalid.
     WrongEncoding,
-    /// Value is not valid for this OID (semantic check failed).
-    ///
-    /// Use when the value type is correct but the value itself is invalid
-    /// (e.g., negative value for an unsigned counter, or value outside
-    /// an enumeration's valid range).
+    /// Value fails semantic validation.
     WrongValue,
-    /// Cannot create new row (table doesn't support row creation).
+    /// The requested object or row cannot be created.
     NoCreation,
-    /// Value is inconsistent with other values in the same SET.
+    /// Value conflicts with other state or varbinds.
     InconsistentValue,
-    /// Resource unavailable (memory, locks, etc.).
+    /// A reservation needed for the transaction is unavailable.
     ResourceUnavailable,
-    /// Commit failed (internal error during apply).
-    ///
-    /// The operation may have partially mutated state before returning this;
-    /// the framework calls `undo_set` for the failed attempt.
-    CommitFailed,
-    /// Undo failed (internal error during rollback or reservation cleanup).
-    UndoFailed,
-    /// Row name is inconsistent with existing data.
+    /// Row or instance name is inconsistent with existing data.
     InconsistentName,
 }
 
-impl SetResult {
-    /// Check if this result indicates success.
+impl SetTestError {
+    /// Convert this validation failure to its protocol response status.
     #[must_use]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, SetResult::Ok)
-    }
-
-    /// Convert to an `ErrorStatus` code.
-    #[must_use]
-    pub fn to_error_status(&self) -> ErrorStatus {
+    pub const fn to_error_status(self) -> ErrorStatus {
         match self {
-            SetResult::Ok => ErrorStatus::NoError,
-            SetResult::NoAccess => ErrorStatus::NoAccess,
-            SetResult::NotWritable => ErrorStatus::NotWritable,
-            SetResult::WrongType => ErrorStatus::WrongType,
-            SetResult::WrongLength => ErrorStatus::WrongLength,
-            SetResult::WrongEncoding => ErrorStatus::WrongEncoding,
-            SetResult::WrongValue => ErrorStatus::WrongValue,
-            SetResult::NoCreation => ErrorStatus::NoCreation,
-            SetResult::InconsistentValue => ErrorStatus::InconsistentValue,
-            SetResult::ResourceUnavailable => ErrorStatus::ResourceUnavailable,
-            SetResult::CommitFailed => ErrorStatus::CommitFailed,
-            SetResult::UndoFailed => ErrorStatus::UndoFailed,
-            SetResult::InconsistentName => ErrorStatus::InconsistentName,
+            Self::GeneralFailure => ErrorStatus::GenErr,
+            Self::NoAccess => ErrorStatus::NoAccess,
+            Self::NotWritable => ErrorStatus::NotWritable,
+            Self::WrongType => ErrorStatus::WrongType,
+            Self::WrongLength => ErrorStatus::WrongLength,
+            Self::WrongEncoding => ErrorStatus::WrongEncoding,
+            Self::WrongValue => ErrorStatus::WrongValue,
+            Self::NoCreation => ErrorStatus::NoCreation,
+            Self::InconsistentValue => ErrorStatus::InconsistentValue,
+            Self::ResourceUnavailable => ErrorStatus::ResourceUnavailable,
+            Self::InconsistentName => ErrorStatus::InconsistentName,
+        }
+    }
+}
+
+/// Result of applying one prepared SET varbind.
+///
+/// Validation failures cannot be returned from this phase:
+///
+/// ```compile_fail
+/// use async_snmp::{SetCommitResult, SetTestError};
+///
+/// let _: SetCommitResult = Err(SetTestError::GeneralFailure);
+/// ```
+pub type SetCommitResult = Result<(), SetCommitError>;
+
+/// Failure from the SET commit phase.
+///
+/// The dedicated type prevents a commit callback from returning validation or
+/// undo-only statuses. The agent maps this failure to `commitFailed` and uses
+/// the failed varbind's one-based index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetCommitError {
+    /// Applying the prepared change failed and may have partially mutated state.
+    Failed,
+}
+
+impl SetCommitError {
+    /// Convert this commit failure to its protocol response status.
+    #[must_use]
+    pub const fn to_error_status(self) -> ErrorStatus {
+        match self {
+            Self::Failed => ErrorStatus::CommitFailed,
+        }
+    }
+}
+
+/// Result of rolling back one attempted SET commit.
+///
+/// Commit failures cannot be returned from this phase:
+///
+/// ```compile_fail
+/// use async_snmp::{SetCommitError, SetUndoResult};
+///
+/// let _: SetUndoResult = Err(SetCommitError::Failed);
+/// ```
+pub type SetUndoResult = Result<(), SetUndoError>;
+
+/// Failure from the SET undo phase.
+///
+/// The dedicated type prevents an undo callback from returning validation or
+/// commit-only statuses. The agent maps this failure to `undoFailed` with
+/// error-index zero for SNMPv2c/v3. For SNMPv1, RFC 2576 downgrades the status
+/// to `genErr` and uses the failed undo binding's one-based index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetUndoError {
+    /// Rolling back the attempted change failed.
+    Failed,
+}
+
+impl SetUndoError {
+    /// Convert this undo failure to its protocol response status.
+    #[must_use]
+    pub const fn to_error_status(self) -> ErrorStatus {
+        match self {
+            Self::Failed => ErrorStatus::UndoFailed,
         }
     }
 }
@@ -449,20 +465,45 @@ mod tests {
     }
 
     #[test]
-    fn test_set_result_to_error_status() {
-        assert_eq!(SetResult::Ok.to_error_status(), ErrorStatus::NoError);
-        assert_eq!(SetResult::NoAccess.to_error_status(), ErrorStatus::NoAccess);
+    fn set_phase_errors_map_exhaustively() {
+        fn test_status(error: SetTestError) -> ErrorStatus {
+            match error {
+                SetTestError::GeneralFailure => ErrorStatus::GenErr,
+                SetTestError::NoAccess => ErrorStatus::NoAccess,
+                SetTestError::NotWritable => ErrorStatus::NotWritable,
+                SetTestError::WrongType => ErrorStatus::WrongType,
+                SetTestError::WrongLength => ErrorStatus::WrongLength,
+                SetTestError::WrongEncoding => ErrorStatus::WrongEncoding,
+                SetTestError::WrongValue => ErrorStatus::WrongValue,
+                SetTestError::NoCreation => ErrorStatus::NoCreation,
+                SetTestError::InconsistentValue => ErrorStatus::InconsistentValue,
+                SetTestError::ResourceUnavailable => ErrorStatus::ResourceUnavailable,
+                SetTestError::InconsistentName => ErrorStatus::InconsistentName,
+            }
+        }
+
+        for error in [
+            SetTestError::GeneralFailure,
+            SetTestError::NoAccess,
+            SetTestError::NotWritable,
+            SetTestError::WrongType,
+            SetTestError::WrongLength,
+            SetTestError::WrongEncoding,
+            SetTestError::WrongValue,
+            SetTestError::NoCreation,
+            SetTestError::InconsistentValue,
+            SetTestError::ResourceUnavailable,
+            SetTestError::InconsistentName,
+        ] {
+            assert_eq!(error.to_error_status(), test_status(error));
+        }
         assert_eq!(
-            SetResult::NotWritable.to_error_status(),
-            ErrorStatus::NotWritable
-        );
-        assert_eq!(
-            SetResult::WrongType.to_error_status(),
-            ErrorStatus::WrongType
-        );
-        assert_eq!(
-            SetResult::CommitFailed.to_error_status(),
+            SetCommitError::Failed.to_error_status(),
             ErrorStatus::CommitFailed
+        );
+        assert_eq!(
+            SetUndoError::Failed.to_error_status(),
+            ErrorStatus::UndoFailed
         );
     }
 
@@ -491,12 +532,5 @@ mod tests {
         }
         let err = inner().unwrap_err();
         assert_eq!(err.message(), "no route");
-    }
-
-    #[test]
-    fn test_set_result_is_ok() {
-        assert!(SetResult::Ok.is_ok());
-        assert!(!SetResult::NoAccess.is_ok());
-        assert!(!SetResult::NotWritable.is_ok());
     }
 }

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `MibHandler::test_set` now returns a request-owned opaque
+  `PreparedSet` for each accepted varbind. Commit, undo, and free operate on
+  that state directly, removing the need for handler side tables. Explicit
+  async undo, free, and successful finalization callbacks perform normal
+  protocol cleanup. `Drop` provides idempotent synchronous reservation and
+  resource cleanup if a request is cancelled or panics; it cannot await
+  rollback or guarantee transactional atomicity after commit has started.
+  Test, commit, and undo callbacks use distinct result/error types so each can
+  only express statuses valid for its phase; test-phase backend failures map
+  explicitly to `genErr`.
 - Generated engine IDs now contain 17 opaque random octets instead of using
   documentation-only PEN 32473. Applications that use RFC 3411's recommended
   enterprise-specific layout should configure a stable engine ID under their
@@ -393,7 +403,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DISPLAY-HINT `t` (UTF-8) formatting used `String::from_utf8_lossy`, which substitutes U+FFFD for every invalid byte sequence; RFC 2579 Section 3.1 (3) mandates discarding trailing octets that do not form a valid UTF-8 character, not substituting them. Trailing invalid/incomplete sequences are now discarded; interior invalid sequences (followed by further valid content) still render as U+FFFD.
 - `Pdu::to_v1_trap()` stripped the `snmpTrapAddress.0` and `snmpTrapEnterprise.0` varbinds from the translated v1 trap after consuming them for the agent-addr and enterprise fields; RFC 3584 Section 3.2 rule (6) defines the SNMPv1 variable-bindings as the SNMPv2 bindings minus only the `sysUpTime.0`/`snmpTrapOID.0` prefix, so both varbinds are now retained in the translated trap's variable-bindings (while still populating agent-addr and enterprise as before).
 - `Pdu::to_v1_trap()` treated a trap OID of `snmpTraps.x` with `x = 0` or `x > 6` as a generic enterprise-specific trap with `enterprise` set to the full trap OID and `specific-trap` 0; such an OID is not one of the standard traps, so RFC 3584 Section 3.2 rules (1), (3), and (4) apply instead: `generic-trap` 6, `specific-trap` = the last sub-identifier, and `enterprise` = the trap OID minus its final sub-identifier. Translation of `snmpTraps.1` through `snmpTraps.6` is unchanged.
-- SET commit rollback set the failing binding's index as the error-index for both `commitFailed` and `undoFailed` Responses; RFC 3416 Section 4.2.5 specifies that `undoFailed` carries error-index zero (only `commitFailed` identifies the failed binding). An `undoFailed` Response now has error-index 0.
+- SET commit rollback set the failing binding's index as the error-index for both `commitFailed` and `undoFailed` Responses; RFC 3416 Section 4.2.5 specifies that native v2c/v3 `undoFailed` carries error-index zero (only `commitFailed` identifies the failed binding). An SNMPv1 downgrade to `genErr` retains the failed undo binding's index as required by RFC 2576.
 - Client accepted any PDU type as a response: a message echoing the request's own PDU type (or any other non-Response PDU) with a matching request-id was processed as a valid Response, though RFC 3416 Section 4.2 specifies only a Response-PDU may answer a request. Both the community (v1/v2c) and v3 receive paths now reject a non-Response PDU with `Error::MalformedResponse`. A v1/v2c response whose community does not echo the sent community is logged at warn but still accepted, matching net-snmp (proxies and some agents rewrite the community).
 - The v3 client ignored the RFC 3414 Section 3.2 step 7b timeliness check on responses: engine boots/time from a response only advanced the local notion, so a stale or replayed authenticated response was accepted. An authenticated response outside the time window is now rejected with `Error::Auth`, clearing the cached engine state and derived keys so the next call re-runs discovery. An authenticated notInTimeWindows Report used the compatibility `EngineState::resync()` path, including backward replacement, and propagated it to the shared `EngineCache`; this was not an RFC 3414 Section 2.3 timeliness transition and is removed in the next release. An unauthenticated Report remained forward-only so a spoofed Report could not drag the notion back.
 - `verify_message` bounds-checked `auth_offset + auth_len` only against the message length, so a `msgAuthenticationParameters` field longer than 48 octets (the SHA-512 MAC length, the largest any supported protocol produces) panicked slicing the internal zeros buffer — a remotely triggerable panic on malformed input. An `auth_len` above 48 now fails verification instead.

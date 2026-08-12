@@ -6,7 +6,10 @@ use std::pin::Pin;
 use crate::oid::Oid;
 use crate::value::Value;
 
-use super::{GetNextResult, GetResult, HandlerResult, RequestContext, SetResult};
+use super::{
+    GetNextResult, GetResult, HandlerResult, RequestContext, SetCommitResult, SetTestError,
+    SetTestResult, SetUndoResult,
+};
 
 /// Type alias for boxed async return type (dyn-compatible).
 ///
@@ -28,6 +31,81 @@ use super::{GetNextResult, GetResult, HandlerResult, RequestContext, SetResult};
 /// ```
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Request-owned state for one successfully tested SET varbind.
+///
+/// Implementations keep reservations, validated values, and rollback data in
+/// this object. The agent stores heterogeneous prepared objects until every
+/// varbind has passed [`MibHandler::test_set`], then drives the remaining
+/// phases in RFC order.
+///
+/// The explicit async terminal methods [`undo`](Self::undo), [`free`](Self::free),
+/// and [`finalize`](Self::finalize) perform protocol cleanup during normal
+/// execution. `Drop` is only a synchronous fallback for reservations and local
+/// resources if the request is cancelled or panics. It cannot await rollback
+/// and therefore cannot guarantee transactional atomicity once commit has
+/// started.
+///
+/// Terminal methods must disarm the `Drop` fallback *before* creating a future
+/// that can reach an `.await`. Store fallback state in an `Option`, call
+/// `take()` synchronously in the method body, then move the taken state into
+/// the returned future. `Drop` must be idempotent when that `Option` is already
+/// empty. The agent retains the prepared object while each callback runs and
+/// drops all still-owned objects in reverse varbind order on cancellation.
+pub trait PreparedSet: Send + 'static {
+    /// Apply the prepared change.
+    ///
+    /// The agent retains ownership of this object after a successful commit so
+    /// an earlier change can still be undone if a later binding fails. A
+    /// failure may follow partial mutation and is followed by [`undo`](Self::undo).
+    fn commit<'a>(
+        &'a mut self,
+        ctx: &'a RequestContext,
+        oid: &'a Oid,
+        value: &'a Value,
+    ) -> BoxFuture<'a, SetCommitResult>;
+
+    /// Roll back an attempted commit and release its reservation.
+    ///
+    /// Disarm synchronous fallback state before returning the future. On
+    /// cancellation, the future and then the still-owned prepared object are
+    /// dropped; `Drop` must tolerate the already-disarmed state.
+    fn undo<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, SetUndoResult> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Release a reservation whose commit was never attempted.
+    ///
+    /// Disarm synchronous fallback state before returning the future. Override
+    /// this when releasing a reservation must await I/O.
+    fn free<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// Release rollback data and reservations after every commit succeeds.
+    ///
+    /// This is the successful terminal path. It does not roll back the applied
+    /// value. As with `undo` and `free`, take `Option`-held fallback state
+    /// synchronously before returning a future that may await.
+    fn finalize<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
 /// Handler for SNMP MIB operations.
 ///
 /// Implement this trait to provide values for a subtree of OIDs.
@@ -42,9 +120,6 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # Optional Methods
 ///
 /// - [`test_set`](MibHandler::test_set): Validate SET operations (default: read-only)
-/// - [`commit_set`](MibHandler::commit_set): Apply SET operations (default: read-only)
-/// - [`undo_set`](MibHandler::undo_set): Roll back attempted SET operations
-/// - [`free_set`](MibHandler::free_set): Release uncommitted test-phase resources
 /// - [`handles`](MibHandler::handles): Custom OID matching logic
 ///
 /// # GET Implementation
@@ -84,17 +159,27 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// 1. **Test phase**: [`test_set`](MibHandler::test_set) is called for ALL varbinds
 ///    before any commits. Only a successful test enters pending state. If a test
-///    fails, [`free_set`](MibHandler::free_set) is called in reverse order for
-///    earlier successful tests. The failing test receives no cleanup callback.
+///    fails, [`PreparedSet::free`] cleans earlier successful states in reverse
+///    order. The failing test produces no state and receives no cleanup callback.
 ///
-/// 2. **Commit phase**: [`commit_set`](MibHandler::commit_set) is called for each
-///    varbind in order. A failed commit may have partially mutated state. On
-///    failure, [`undo_set`](MibHandler::undo_set) is called in reverse order for
-///    every attempted commit, including the failed attempt. Later bindings that
-///    passed testing but were never attempted receive [`free_set`](MibHandler::free_set)
-///    in reverse order. Cleanup continues if an `undo_set` call fails.
+/// 2. **Commit phase**: [`PreparedSet::commit`] is called for each varbind in
+///    order. A failed commit may have partially mutated state. On failure,
+///    [`PreparedSet::undo`] cleans every attempted transaction in reverse
+///    order, including the failed attempt. Later transactions whose commit was
+///    never attempted are cleaned by [`PreparedSet::free`] in reverse order.
+///    Cleanup continues if an `undo` call fails.
 ///
-/// By default, handlers are read-only and return [`SetResult::NotWritable`].
+/// 3. **Successful finalization**: after every commit succeeds,
+///    [`PreparedSet::finalize`] releases rollback data and reservations in
+///    reverse order without undoing committed values.
+///
+/// The prepared object is owned by the request, so implementations can keep
+/// reservations and rollback data directly in it instead of maintaining a
+/// side table. Explicit terminal callbacks are the normal protocol cleanup.
+/// Its [`Drop`] implementation is only a synchronous, idempotent fallback when
+/// a request future is cancelled or panics; it cannot perform async rollback.
+///
+/// By default, handlers are read-only and return [`SetTestError::NotWritable`].
 ///
 /// # Bounds
 ///
@@ -172,13 +257,15 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// ```rust
 /// use async_snmp::handler::{
-///     MibHandler, RequestContext, GetResult, GetNextResult, HandlerResult, SetResult, BoxFuture
+///     MibHandler, PreparedSet, RequestContext, GetResult, GetNextResult, HandlerResult,
+///     SetCommitError, SetCommitResult, SetTestError, SetTestResult, SetUndoResult, BoxFuture,
 /// };
 /// use async_snmp::{Oid, Value, VarBind, oid};
+/// use std::sync::Arc;
 /// use std::sync::atomic::{AtomicI32, Ordering};
 ///
 /// struct WritableHandler {
-///     counter: AtomicI32,
+///     counter: Arc<AtomicI32>,
 /// }
 ///
 /// impl MibHandler for WritableHandler {
@@ -219,32 +306,56 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///         _ctx: &'a RequestContext,
 ///         oid: &'a Oid,
 ///         value: &'a Value,
-///     ) -> BoxFuture<'a, SetResult> {
+///     ) -> BoxFuture<'a, SetTestResult> {
 ///         Box::pin(async move {
 ///             if oid != &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
-///                 return SetResult::NotWritable;
+///                 return Err(SetTestError::NotWritable);
 ///             }
 ///             // Validate the value type
 ///             match value {
-///                 Value::Integer(_) => SetResult::Ok,
-///                 _ => SetResult::WrongType,
+///                 Value::Integer(_) => Ok(Box::new(CounterUpdate {
+///                     counter: self.counter.clone(),
+///                     previous: None,
+///                 }) as Box<dyn PreparedSet>),
+///                 _ => Err(SetTestError::WrongType),
+///             }
+///         })
+///     }
+/// }
+///
+/// struct CounterUpdate {
+///     counter: Arc<AtomicI32>,
+///     previous: Option<i32>,
+/// }
+///
+/// impl PreparedSet for CounterUpdate {
+///     fn commit<'a>(
+///         &'a mut self,
+///         _ctx: &'a RequestContext,
+///         _oid: &'a Oid,
+///         value: &'a Value,
+///     ) -> BoxFuture<'a, SetCommitResult> {
+///         Box::pin(async move {
+///             if let Value::Integer(v) = value {
+///                 self.previous = Some(self.counter.swap(*v, Ordering::Relaxed));
+///                 Ok(())
+///             } else {
+///                 Err(SetCommitError::Failed)
 ///             }
 ///         })
 ///     }
 ///
-///     fn commit_set<'a>(
-///         &'a self,
+///     fn undo<'a>(
+///         &'a mut self,
 ///         _ctx: &'a RequestContext,
 ///         _oid: &'a Oid,
-///         value: &'a Value,
-///     ) -> BoxFuture<'a, SetResult> {
+///         _value: &'a Value,
+///     ) -> BoxFuture<'a, SetUndoResult> {
 ///         Box::pin(async move {
-///             if let Value::Integer(v) = value {
-///                 self.counter.store(*v, Ordering::Relaxed);
-///                 SetResult::Ok
-///             } else {
-///                 SetResult::CommitFailed
+///             if let Some(previous) = self.previous {
+///                 self.counter.store(previous, Ordering::Relaxed);
 ///             }
+///             Ok(())
 ///         })
 ///     }
 /// }
@@ -289,8 +400,12 @@ pub trait MibHandler: Send + Sync + 'static {
     ///
     /// Called for ALL varbinds before any commits. Must NOT modify persistent
     /// state. It may reserve locks or temporary resources when returning
-    /// `SetResult::Ok`. A non-`Ok` result must not leave resources for the
+    /// `Ok(prepared)`. The returned [`PreparedSet`] owns any reservation and
+    /// rollback data for this varbind. `Err` must not leave resources for the
     /// framework to release because only successful tests enter pending state.
+    /// If the test future acquires resources before it returns `Ok`, it must
+    /// keep them in its own cancellation-safe guard until ownership transfers
+    /// into the prepared object.
     ///
     /// Default implementation returns `NotWritable` (read-only handler).
     fn test_set<'a>(
@@ -298,65 +413,8 @@ pub trait MibHandler: Send + Sync + 'static {
         _ctx: &'a RequestContext,
         _oid: &'a Oid,
         _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        Box::pin(async { SetResult::NotWritable })
-    }
-
-    /// Commit a SET operation (phase 2 of two-phase commit).
-    ///
-    /// Only called after ALL `test_set` calls succeed. Should apply the change
-    /// and finalize any test-phase reservation on success. A non-`Ok` result
-    /// may follow partial mutation; `undo_set` will be called for this binding
-    /// and every earlier attempted binding in reverse order. Later tested
-    /// bindings whose commit was never attempted receive `free_set` instead.
-    ///
-    /// Default implementation returns `NotWritable` (read-only handler).
-    fn commit_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        _oid: &'a Oid,
-        _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        Box::pin(async { SetResult::NotWritable })
-    }
-
-    /// Undo an attempted SET operation (rollback on partial failure).
-    ///
-    /// Called after a `commit_set` failure for each binding whose commit was
-    /// attempted, including the binding that returned the failure. This is the
-    /// binding's terminal failure callback: restore the previous value and
-    /// release its test-phase resources. `free_set` will not also be called for
-    /// this binding. Cleanup is best-effort and continues in reverse attempt
-    /// order after an undo failure.
-    ///
-    /// Default implementation reports successful cleanup without doing work.
-    fn undo_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        _oid: &'a Oid,
-        _value: &'a Value,
-    ) -> BoxFuture<'a, SetResult> {
-        Box::pin(async { SetResult::Ok })
-    }
-
-    /// Free resources allocated during `test_set` when commit was not attempted.
-    ///
-    /// Called for successful tests when a later test fails, or for bindings
-    /// after a failed commit whose own commit was never attempted. This is the
-    /// binding's terminal failure callback and must release its test-phase
-    /// resources; it must not assume `commit_set` ran. Bindings whose commit was
-    /// attempted receive `undo_set` instead, never both callbacks.
-    ///
-    /// Called in reverse binding order.
-    ///
-    /// Default implementation does nothing.
-    fn free_set<'a>(
-        &'a self,
-        _ctx: &'a RequestContext,
-        _oid: &'a Oid,
-        _value: &'a Value,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
+    ) -> BoxFuture<'a, SetTestResult> {
+        Box::pin(async { Err(SetTestError::NotWritable) })
     }
 
     /// Check if this handler handles the given OID.

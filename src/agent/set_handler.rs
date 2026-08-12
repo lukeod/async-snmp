@@ -2,17 +2,15 @@
 //!
 //! Implements the SET phases modeled after net-snmp's approach:
 //!
-//! - **Test**: Validate each varbind via `test_set`. If any fails, call `free_set`
-//!   on all previously successful varbinds (in reverse order) to release resources,
-//!   then return the error.
-//! - **Commit**: Apply each varbind via `commit_set`. If any fails, call `undo_set`
-//!   on every attempted binding, including the failing binding, in reverse order;
-//!   call `free_set` on later tested bindings whose commit was never attempted.
-
-use std::sync::Arc;
+//! - **Test**: Each successful `test_set` returns request-owned prepared state.
+//!   If a later test fails, clean earlier states through `PreparedSet::free` in
+//!   reverse order.
+//! - **Commit**: Apply each prepared state via `PreparedSet::commit`. If one
+//!   fails, clean every attempted state through `PreparedSet::undo`, including
+//!   the failing binding, in reverse order; clean later states through `free`.
 
 use crate::error::{ErrorStatus, Result};
-use crate::handler::{MibHandler, RequestContext};
+use crate::handler::{PreparedSet, RequestContext};
 use crate::oid::Oid;
 use crate::pdu::Pdu;
 use crate::value::Value;
@@ -20,17 +18,43 @@ use crate::version::Version;
 
 use super::Agent;
 
+struct PendingSet<'a> {
+    prepared: Option<Box<dyn PreparedSet>>,
+    oid: &'a Oid,
+    value: &'a Value,
+}
+
+/// Owns all prepared states until their explicit terminal callback completes.
+///
+/// Manual popping makes cancellation and panic fallback order independent of
+/// collection/destructor implementation details.
+struct SetTransaction<'a> {
+    pending: Vec<PendingSet<'a>>,
+}
+
+impl Drop for SetTransaction<'_> {
+    fn drop(&mut self) {
+        while let Some(mut pending) = self.pending.pop() {
+            drop(pending.prepared.take());
+        }
+    }
+}
+
 impl Agent {
     /// Handle SET request with multi-phase commit protocol.
     ///
-    /// Per RFC 3416, SET operations should be atomic. We implement this via:
+    /// On normal completion, the RFC 3416 SET phases provide atomic rollback:
     /// 1. **Test phase**: Call `test_set` for ALL varbinds. If any fails,
-    ///    call `free_set` for all previously successful varbinds (in reverse
+    ///    call `PreparedSet::free` for all previously successful varbinds (in reverse
     ///    order) to release resources, then return the error.
-    /// 2. **Commit phase**: Call `commit_set` for each varbind. If any fails,
-    ///    call `undo_set` for every attempted binding, including the failing
-    ///    binding, in reverse order. Call `free_set` in reverse order for later
+    /// 2. **Commit phase**: Call `PreparedSet::commit` for each varbind. If any
+    ///    fails, call `PreparedSet::undo` for every attempted binding, including
+    ///    the failing binding, in reverse order. Call `PreparedSet::free` for later
     ///    tested bindings whose commit was never attempted.
+    ///
+    /// Cancellation or panic instead invokes synchronous `Drop` fallback in
+    /// reverse order. Since `Drop` cannot await protocol rollback, atomicity is
+    /// not guaranteed if interruption occurs after commit starts.
     ///
     /// Per RFC 3416 Section 4.2.5 step (1), the size of the Response (which
     /// echoes the request varbinds) is checked up front: if it would exceed the
@@ -41,14 +65,11 @@ impl Agent {
         // The message-envelope path performs an exact preflight encoding before
         // dispatch, so an oversized SET never reaches the test/commit phases.
 
-        // Track which handlers we need to commit/undo
-        struct PendingSet<'a> {
-            handler: &'a Arc<dyn MibHandler>,
-            oid: Oid,
-            value: Value,
-        }
-
-        let mut pending: Vec<PendingSet> = Vec::with_capacity(pdu.varbinds.len());
+        // The coordinator retains each object across async terminal callbacks.
+        // Its Drop fallback releases every still-owned object in reverse order.
+        let mut transaction = SetTransaction {
+            pending: Vec::with_capacity(pdu.varbinds.len()),
+        };
 
         // ========== PHASE 1: TEST ==========
         // Check VACM and call test_set for all varbinds
@@ -58,8 +79,14 @@ impl Agent {
                 && !vacm.check_access(ctx.write_view.as_ref(), &vb.oid)
             {
                 // Free resources for all previously successful varbinds
-                for p in pending.iter().rev() {
-                    p.handler.free_set(ctx, &p.oid, &p.value).await;
+                while let Some(index) = transaction.pending.len().checked_sub(1) {
+                    let p = &mut transaction.pending[index];
+                    p.prepared
+                        .as_mut()
+                        .expect("pending SET state must be present")
+                        .free(ctx, p.oid, p.value)
+                        .await;
+                    transaction.pending.pop();
                 }
                 // v2c/v3 report noAccess; v1 downgrades it to noSuchName.
                 let status = ErrorStatus::NoAccess;
@@ -75,8 +102,14 @@ impl Agent {
 
             if handler.is_none() {
                 // Free resources for all previously successful varbinds
-                for p in pending.iter().rev() {
-                    p.handler.free_set(ctx, &p.oid, &p.value).await;
+                while let Some(index) = transaction.pending.len().checked_sub(1) {
+                    let p = &mut transaction.pending[index];
+                    p.prepared
+                        .as_mut()
+                        .expect("pending SET state must be present")
+                        .free(ctx, p.oid, p.value)
+                        .await;
+                    transaction.pending.pop();
                 }
                 // No handler for this OID: v2c/v3 report notWritable; v1
                 // downgrades it to noSuchName.
@@ -90,77 +123,121 @@ impl Agent {
             }
 
             let handler = handler.unwrap();
-            let result = handler.handler.test_set(ctx, &vb.oid, &vb.value).await;
+            let prepared = match handler.handler.test_set(ctx, &vb.oid, &vb.value).await {
+                Ok(prepared) => prepared,
+                Err(result) => {
+                    // Free earlier successful reservations in reverse order.
+                    while let Some(index) = transaction.pending.len().checked_sub(1) {
+                        let p = &mut transaction.pending[index];
+                        p.prepared
+                            .as_mut()
+                            .expect("pending SET state must be present")
+                            .free(ctx, p.oid, p.value)
+                            .await;
+                        transaction.pending.pop();
+                    }
 
-            if !result.is_ok() {
-                // Free resources for all previously successful varbinds (reverse order)
-                for p in pending.iter().rev() {
-                    p.handler.free_set(ctx, &p.oid, &p.value).await;
+                    let status = result.to_error_status();
+                    let status = if ctx.version == Version::V1 {
+                        status.to_v1()
+                    } else {
+                        status
+                    };
+                    return Ok(pdu.to_error_response(status, (index + 1) as i32));
                 }
+            };
 
-                let status = result.to_error_status();
-                let status = if ctx.version == Version::V1 {
-                    status.to_v1()
-                } else {
-                    status
-                };
-                return Ok(pdu.to_error_response(status, (index + 1) as i32));
-            }
-
-            pending.push(PendingSet {
-                handler: &handler.handler,
-                oid: vb.oid.clone(),
-                value: vb.value.clone(),
+            transaction.pending.push(PendingSet {
+                prepared: Some(prepared),
+                oid: &vb.oid,
+                value: &vb.value,
             });
         }
 
         // ========== PHASE 2: COMMIT ==========
         // All tests passed, now commit each varbind
-        for (index, p) in pending.iter().enumerate() {
-            let result = p.handler.commit_set(ctx, &p.oid, &p.value).await;
+        for index in 0..transaction.pending.len() {
+            let p = &mut transaction.pending[index];
+            let result = p
+                .prepared
+                .as_mut()
+                .expect("pending SET state must be present")
+                .commit(ctx, p.oid, p.value)
+                .await;
 
-            if !result.is_ok() {
+            if let Err(commit_error) = result {
                 // A failed commit may have partially mutated state. Undo every
                 // attempted binding, including the failing one, in reverse order.
-                let mut undo_failed = false;
-                for attempted in pending[..=index].iter().rev() {
+                let mut undo_failure = None;
+                for (attempted_index, attempted) in
+                    transaction.pending[..=index].iter_mut().enumerate().rev()
+                {
                     let undo_result = attempted
-                        .handler
-                        .undo_set(ctx, &attempted.oid, &attempted.value)
+                        .prepared
+                        .as_mut()
+                        .expect("attempted SET state must be present")
+                        .undo(ctx, attempted.oid, attempted.value)
                         .await;
-                    if !undo_result.is_ok() {
-                        undo_failed = true;
-                        tracing::warn!(target: "async_snmp::agent", { oid = %attempted.oid }, "undo_set failed during rollback");
+                    if let Err(error) = undo_result {
+                        undo_failure.get_or_insert((error, attempted_index));
+                        tracing::warn!(target: "async_snmp::agent", { oid = %attempted.oid }, "prepared SET undo failed during rollback");
                     }
+                    drop(attempted.prepared.take());
                 }
 
                 // Later bindings passed test_set but were never committed, so
                 // release their test-phase resources without attempting undo.
-                for unattempted in pending[index + 1..].iter().rev() {
+                for unattempted in transaction.pending[index + 1..].iter_mut().rev() {
                     unattempted
-                        .handler
-                        .free_set(ctx, &unattempted.oid, &unattempted.value)
+                        .prepared
+                        .as_mut()
+                        .expect("unattempted SET state must be present")
+                        .free(ctx, unattempted.oid, unattempted.value)
                         .await;
+                    drop(unattempted.prepared.take());
                 }
 
-                let status = if undo_failed {
-                    ErrorStatus::UndoFailed
-                } else {
-                    ErrorStatus::CommitFailed
-                };
-                // RFC 3416 4.2.5: commitFailed carries the index of the failed
-                // binding; undoFailed carries error-index zero.
-                let error_index = if undo_failed { 0 } else { (index + 1) as i32 };
-                let status = if ctx.version == Version::V1 {
-                    status.to_v1()
-                } else {
-                    status
+                let (status, error_index) = match undo_failure {
+                    Some((error, failed_undo_index)) => {
+                        let status = error.to_error_status();
+                        if ctx.version == Version::V1 {
+                            // RFC 2576 maps undoFailed to v1 genErr; retain the
+                            // binding identity required by the v1 error.
+                            (status.to_v1(), (failed_undo_index + 1) as i32)
+                        } else {
+                            // RFC 3416 4.2.5: native undoFailed responses carry
+                            // error-index zero.
+                            (status, 0)
+                        }
+                    }
+                    None => {
+                        let status = commit_error.to_error_status();
+                        let status = if ctx.version == Version::V1 {
+                            status.to_v1()
+                        } else {
+                            status
+                        };
+                        // commitFailed, or its v1 genErr downgrade, identifies
+                        // the binding whose commit failed.
+                        (status, (index + 1) as i32)
+                    }
                 };
                 return Ok(pdu.to_error_response(status, error_index));
             }
         }
 
-        // All commits succeeded
+        // All commits succeeded. Explicitly finalize rollback state and
+        // reservations; Drop is only a cancellation/panic fallback.
+        while let Some(index) = transaction.pending.len().checked_sub(1) {
+            let p = &mut transaction.pending[index];
+            p.prepared
+                .as_mut()
+                .expect("pending SET state must be present")
+                .finalize(ctx, p.oid, p.value)
+                .await;
+            transaction.pending.pop();
+        }
+
         Ok(pdu.to_response())
     }
 }
@@ -177,8 +254,9 @@ mod tests {
     use crate::agent::Agent;
     use crate::error::ErrorStatus;
     use crate::handler::{
-        BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext,
-        SecurityModel, SetResult,
+        BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet,
+        RequestContext, SecurityModel, SetCommitError, SetCommitResult, SetTestError,
+        SetTestResult, SetUndoError, SetUndoResult,
     };
     use crate::message::SecurityLevel;
     use crate::oid;
@@ -186,11 +264,38 @@ mod tests {
     use crate::value::Value;
     use crate::varbind::VarBind;
     use crate::version::Version;
+    use tokio::sync::Semaphore;
 
     /// Handler that accepts `test_set` for .99999.1.0 but rejects .99999.2.0,
-    /// tracking `free_set` calls via an atomic counter.
+    /// tracking prepared-state `free` calls via an atomic counter.
     struct FreeSetTracker {
         free_count: Arc<AtomicU32>,
+    }
+
+    struct FreeTrackedSet {
+        free_count: Arc<AtomicU32>,
+    }
+
+    impl PreparedSet for FreeTrackedSet {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn free<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.free_count.fetch_add(1, Ordering::Relaxed);
+            })
+        }
     }
 
     impl MibHandler for FreeSetTracker {
@@ -215,34 +320,17 @@ mod tests {
             _ctx: &'a RequestContext,
             oid: &'a Oid,
             _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
+        ) -> BoxFuture<'a, SetTestResult> {
             Box::pin(async move {
                 // Accept .99999.1.0, reject .99999.2.0
                 if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0) {
-                    SetResult::WrongValue
+                    Err(SetTestError::WrongValue)
                 } else {
-                    SetResult::Ok
+                    Ok(Box::new(FreeTrackedSet {
+                        free_count: self.free_count.clone(),
+                    }) as Box<dyn PreparedSet>)
                 }
             })
-        }
-
-        fn commit_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            Box::pin(async { SetResult::Ok })
-        }
-
-        fn free_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, ()> {
-            self.free_count.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async {})
         }
     }
 
@@ -260,6 +348,89 @@ mod tests {
             read_view: None,
             write_view: None,
             msg_max_size: None,
+        }
+    }
+
+    struct GeneralFailureHandler;
+
+    struct NoopPreparedSet;
+
+    impl PreparedSet for NoopPreparedSet {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl MibHandler for GeneralFailureHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetTestResult> {
+            if oid == &set_oid(2) {
+                Box::pin(async { Err(SetTestError::GeneralFailure) })
+            } else {
+                Box::pin(async { Ok(Box::new(NoopPreparedSet) as Box<dyn PreparedSet>) })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn general_test_failure_maps_to_gen_err_and_failed_index_for_all_versions() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999),
+                Arc::new(GeneralFailureHandler),
+            )
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            vec![
+                VarBind::new(set_oid(1), Value::Integer(1)),
+                VarBind::new(set_oid(2), Value::Integer(2)),
+            ],
+        );
+
+        for version in [Version::V1, Version::V2c, Version::V3] {
+            let mut ctx = test_ctx();
+            ctx.version = version;
+            let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+            assert_eq!(
+                response.error_status(),
+                ErrorStatus::GenErr.as_i32(),
+                "status for {version:?}"
+            );
+            assert_eq!(response.error_index(), 2, "index for {version:?}");
         }
     }
 
@@ -282,7 +453,7 @@ mod tests {
         let ctx = test_ctx();
 
         // SET with two varbinds: first succeeds test_set, second fails.
-        // free_set should be called once (for the first varbind).
+        // PreparedSet::free should be called once (for the first varbind).
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
             1,
@@ -298,7 +469,7 @@ mod tests {
 
         // Should have error on varbind 2
         assert_eq!(response.error_index(), 2);
-        // free_set should have been called once for the first varbind
+        // PreparedSet::free should have been called once for the first varbind.
         assert_eq!(free_count.load(Ordering::Relaxed), 1);
     }
 
@@ -338,10 +509,26 @@ mod tests {
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
     }
 
-    /// Handler that always accepts test_set and counts commit_set invocations,
+    /// Handler that always accepts test_set and counts prepared commit invocations,
     /// used to prove the SET size check terminates before the commit phase.
     struct CommitTracker {
         commit_count: Arc<AtomicU32>,
+    }
+
+    struct CountedCommit {
+        commit_count: Arc<AtomicU32>,
+    }
+
+    impl PreparedSet for CountedCommit {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            self.commit_count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
     }
 
     impl MibHandler for CommitTracker {
@@ -366,18 +553,12 @@ mod tests {
             _ctx: &'a RequestContext,
             _oid: &'a Oid,
             _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            Box::pin(async { SetResult::Ok })
-        }
-
-        fn commit_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            self.commit_count.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { SetResult::Ok })
+        ) -> BoxFuture<'a, SetTestResult> {
+            Box::pin(async move {
+                Ok(Box::new(CountedCommit {
+                    commit_count: self.commit_count.clone(),
+                }) as Box<dyn PreparedSet>)
+            })
         }
     }
 
@@ -493,7 +674,7 @@ mod tests {
 
         let ctx = test_ctx();
 
-        // SET where the first varbind fails test_set. No free_set calls since
+        // SET where the first varbind fails test_set. No free calls since
         // there are no previously successful varbinds.
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
@@ -515,16 +696,95 @@ mod tests {
     /// Handler for exercising the complete commit-failure lifecycle. Every
     /// callback is recorded by OID, and commit/undo failures can be injected.
     struct CommitFailHandler {
+        fail_test_oid: Option<Oid>,
         fail_commit_oid: Oid,
-        fail_undo_oid: Option<Oid>,
+        fail_undo_oids: Vec<Oid>,
         calls: Arc<Mutex<SetLifecycleCalls>>,
+    }
+
+    struct FalliblePreparedSet {
+        prepared_oid: Oid,
+        fail_commit_oid: Oid,
+        fail_undo_oids: Vec<Oid>,
+        calls: Arc<Mutex<SetLifecycleCalls>>,
+    }
+
+    impl Drop for FalliblePreparedSet {
+        fn drop(&mut self) {
+            self.calls
+                .lock()
+                .unwrap()
+                .drop
+                .push(self.prepared_oid.clone());
+        }
+    }
+
+    impl PreparedSet for FalliblePreparedSet {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            assert_eq!(oid, &self.prepared_oid);
+            self.calls.lock().unwrap().commit.push(oid.clone());
+            let result = if oid == &self.fail_commit_oid {
+                Err(SetCommitError::Failed)
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async move {
+                assert_eq!(oid, &self.prepared_oid);
+                self.calls.lock().unwrap().undo.push(oid.clone());
+                if self.fail_undo_oids.contains(oid) {
+                    Err(SetUndoError::Failed)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn free<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                assert_eq!(oid, &self.prepared_oid);
+                self.calls.lock().unwrap().free.push(oid.clone());
+            })
+        }
+
+        fn finalize<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            assert_eq!(oid, &self.prepared_oid);
+            self.calls.lock().unwrap().finalize.push(oid.clone());
+            Box::pin(async {})
+        }
     }
 
     #[derive(Clone, Debug, Default)]
     struct SetLifecycleCalls {
+        test: Vec<Oid>,
         commit: Vec<Oid>,
         undo: Vec<Oid>,
         free: Vec<Oid>,
+        finalize: Vec<Oid>,
+        drop: Vec<Oid>,
     }
 
     impl MibHandler for CommitFailHandler {
@@ -547,50 +807,21 @@ mod tests {
         fn test_set<'a>(
             &'a self,
             _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            Box::pin(async { SetResult::Ok })
-        }
-
-        fn commit_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
             oid: &'a Oid,
             _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            self.calls.lock().unwrap().commit.push(oid.clone());
-            let result = if oid == &self.fail_commit_oid {
-                SetResult::CommitFailed
-            } else {
-                SetResult::Ok
-            };
-            Box::pin(async move { result })
-        }
-
-        fn undo_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, SetResult> {
-            self.calls.lock().unwrap().undo.push(oid.clone());
-            let result = if self.fail_undo_oid.as_ref() == Some(oid) {
-                SetResult::UndoFailed
-            } else {
-                SetResult::Ok
-            };
-            Box::pin(async move { result })
-        }
-
-        fn free_set<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            oid: &'a Oid,
-            _value: &'a Value,
-        ) -> BoxFuture<'a, ()> {
-            self.calls.lock().unwrap().free.push(oid.clone());
-            Box::pin(async {})
+        ) -> BoxFuture<'a, SetTestResult> {
+            self.calls.lock().unwrap().test.push(oid.clone());
+            if self.fail_test_oid.as_ref() == Some(oid) {
+                return Box::pin(async { Err(SetTestError::WrongValue) });
+            }
+            Box::pin(async move {
+                Ok(Box::new(FalliblePreparedSet {
+                    prepared_oid: oid.clone(),
+                    fail_commit_oid: self.fail_commit_oid.clone(),
+                    fail_undo_oids: self.fail_undo_oids.clone(),
+                    calls: self.calls.clone(),
+                }) as Box<dyn PreparedSet>)
+            })
         }
     }
 
@@ -609,13 +840,15 @@ mod tests {
     }
 
     async fn run_commit_scenario(
+        version: Version,
         fail_commit: u32,
-        fail_undo: Option<u32>,
+        fail_undos: &[u32],
     ) -> (Pdu, SetLifecycleCalls) {
         let calls = Arc::new(Mutex::new(SetLifecycleCalls::default()));
         let handler = Arc::new(CommitFailHandler {
+            fail_test_oid: None,
             fail_commit_oid: set_oid(fail_commit),
-            fail_undo_oid: fail_undo.map(set_oid),
+            fail_undo_oids: set_oids(fail_undos),
             calls: calls.clone(),
         });
 
@@ -635,7 +868,9 @@ mod tests {
             0,
             three_set_varbinds(),
         );
-        let response = agent.dispatch_request(&test_ctx(), &pdu).await.unwrap();
+        let mut ctx = test_ctx();
+        ctx.version = version;
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         let calls = calls.lock().unwrap().clone();
         (response, calls)
     }
@@ -650,9 +885,18 @@ mod tests {
     ) {
         assert_eq!(response.error_status(), ErrorStatus::CommitFailed.as_i32());
         assert_eq!(response.error_index(), failed_index);
+        assert_eq!(calls.test, set_oids(&[1, 2, 3]));
         assert_eq!(calls.commit, set_oids(expected_commits));
         assert_eq!(calls.undo, set_oids(expected_undos));
         assert_eq!(calls.free, set_oids(expected_frees));
+        assert!(calls.finalize.is_empty());
+        assert_eq!(calls.drop.len(), 3);
+        for oid in set_oids(&[1, 2, 3]) {
+            assert_eq!(
+                calls.drop.iter().filter(|dropped| **dropped == oid).count(),
+                1
+            );
+        }
 
         // Every successfully tested binding receives exactly one terminal
         // callback, and attempted/unattempted bindings never overlap.
@@ -669,44 +913,532 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_failure_at_first_undoes_failed_and_frees_trailing() {
-        let (response, calls) = run_commit_scenario(1, None).await;
+        let (response, calls) = run_commit_scenario(Version::V2c, 1, &[]).await;
         assert_commit_failure_lifecycle(&response, &calls, 1, &[1], &[1], &[3, 2]);
     }
 
     #[tokio::test]
     async fn test_commit_failure_in_middle_undoes_attempted_and_frees_trailing() {
-        let (response, calls) = run_commit_scenario(2, None).await;
+        let (response, calls) = run_commit_scenario(Version::V2c, 2, &[]).await;
         assert_commit_failure_lifecycle(&response, &calls, 2, &[1, 2], &[2, 1], &[3]);
     }
 
     #[tokio::test]
     async fn test_commit_failure_at_end_undoes_all_attempted() {
-        let (response, calls) = run_commit_scenario(3, None).await;
+        let (response, calls) = run_commit_scenario(Version::V2c, 3, &[]).await;
         assert_commit_failure_lifecycle(&response, &calls, 3, &[1, 2, 3], &[3, 2, 1], &[]);
     }
 
     #[tokio::test]
-    async fn test_undo_failure_during_rollback_reports_undo_failed() {
-        // The failing binding's undo fails first. Cleanup must still undo the
-        // earlier binding and free the trailing, never-attempted binding.
-        let (response, calls) = run_commit_scenario(2, Some(2)).await;
+    async fn commit_failure_mapping_uses_commit_binding_for_all_versions() {
+        for version in [Version::V1, Version::V2c, Version::V3] {
+            let (response, calls) = run_commit_scenario(version, 2, &[]).await;
+            let expected_status = if version == Version::V1 {
+                ErrorStatus::GenErr
+            } else {
+                ErrorStatus::CommitFailed
+            };
 
-        assert_eq!(response.error_status(), ErrorStatus::UndoFailed.as_i32());
-        assert_eq!(response.error_index(), 0);
-        assert_eq!(calls.commit, set_oids(&[1, 2]));
-        assert_eq!(calls.undo, set_oids(&[2, 1]));
-        assert_eq!(calls.free, set_oids(&[3]));
-        assert_eq!(calls.undo.len() + calls.free.len(), 3);
-        assert!(calls.undo.iter().all(|oid| !calls.free.contains(oid)));
+            assert_eq!(
+                response.error_status(),
+                expected_status.as_i32(),
+                "status for {version:?}"
+            );
+            assert_eq!(response.error_index(), 2, "index for {version:?}");
+            assert_eq!(calls.commit, set_oids(&[1, 2]));
+            assert_eq!(calls.undo, set_oids(&[2, 1]));
+            assert_eq!(calls.free, set_oids(&[3]));
+        }
     }
 
     #[tokio::test]
-    async fn test_all_commits_succeed_no_undo_or_free() {
-        let (response, calls) = run_commit_scenario(99, None).await;
+    async fn undo_failure_mapping_tracks_failed_undo_binding_for_all_versions() {
+        for failed_undo in [2, 1] {
+            for version in [Version::V1, Version::V2c, Version::V3] {
+                let (response, calls) = run_commit_scenario(version, 2, &[failed_undo]).await;
+                let (expected_status, expected_index) = if version == Version::V1 {
+                    (ErrorStatus::GenErr, failed_undo as i32)
+                } else {
+                    (ErrorStatus::UndoFailed, 0)
+                };
+
+                assert_eq!(
+                    response.error_status(),
+                    expected_status.as_i32(),
+                    "status for {version:?} with undo failure at {failed_undo}"
+                );
+                assert_eq!(
+                    response.error_index(),
+                    expected_index,
+                    "index for {version:?} with undo failure at {failed_undo}"
+                );
+                assert_eq!(calls.test, set_oids(&[1, 2, 3]));
+                assert_eq!(calls.commit, set_oids(&[1, 2]));
+                assert_eq!(calls.undo, set_oids(&[2, 1]));
+                assert_eq!(calls.free, set_oids(&[3]));
+                assert!(calls.finalize.is_empty());
+                assert_eq!(calls.undo.len() + calls.free.len(), 3);
+                assert!(calls.undo.iter().all(|oid| !calls.free.contains(oid)));
+                assert_eq!(calls.drop.len(), 3);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_undo_failures_report_first_failure_in_reverse_order() {
+        for version in [Version::V1, Version::V2c, Version::V3] {
+            let (response, calls) = run_commit_scenario(version, 2, &[1, 2]).await;
+            let (expected_status, expected_index) = if version == Version::V1 {
+                (ErrorStatus::GenErr, 2)
+            } else {
+                (ErrorStatus::UndoFailed, 0)
+            };
+
+            assert_eq!(
+                response.error_status(),
+                expected_status.as_i32(),
+                "status for {version:?}"
+            );
+            assert_eq!(
+                response.error_index(),
+                expected_index,
+                "index for {version:?}"
+            );
+            assert_eq!(calls.undo, set_oids(&[2, 1]));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_all_commits_succeed_finalize_in_reverse_order() {
+        let (response, calls) = run_commit_scenario(Version::V2c, 99, &[]).await;
 
         assert_eq!(response.error_status(), 0);
+        assert_eq!(calls.test, set_oids(&[1, 2, 3]));
         assert_eq!(calls.commit, set_oids(&[1, 2, 3]));
         assert!(calls.undo.is_empty());
         assert!(calls.free.is_empty());
+        assert_eq!(calls.finalize, set_oids(&[3, 2, 1]));
+        assert_eq!(calls.drop, set_oids(&[3, 2, 1]));
+    }
+
+    #[tokio::test]
+    async fn early_test_failure_frees_and_drops_only_earlier_prepared_state() {
+        let calls = Arc::new(Mutex::new(SetLifecycleCalls::default()));
+        let handler = Arc::new(CommitFailHandler {
+            fail_test_oid: Some(set_oid(2)),
+            fail_commit_oid: set_oid(99),
+            fail_undo_oids: Vec::new(),
+            calls: calls.clone(),
+        });
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            three_set_varbinds(),
+        );
+
+        let response = agent.dispatch_request(&test_ctx(), &pdu).await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(response.error_status(), ErrorStatus::WrongValue.as_i32());
+        assert_eq!(response.error_index(), 2);
+        assert_eq!(calls.test, set_oids(&[1, 2]));
+        assert!(calls.commit.is_empty());
+        assert!(calls.undo.is_empty());
+        assert!(calls.finalize.is_empty());
+        assert_eq!(calls.free, set_oids(&[1]));
+        assert_eq!(calls.drop, set_oids(&[1]));
+    }
+
+    type TypedEvents = Arc<Mutex<Vec<(u8, &'static str, i32, Oid)>>>;
+
+    struct TypedHandler<const TAG: u8> {
+        events: TypedEvents,
+    }
+
+    struct TypedPrepared<const TAG: u8> {
+        events: TypedEvents,
+        request_id: i32,
+        oid: Oid,
+    }
+
+    impl<const TAG: u8> PreparedSet for TypedPrepared<TAG> {
+        fn commit<'a>(
+            &'a mut self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            assert_eq!(ctx.request_id, self.request_id);
+            assert_eq!(oid, &self.oid);
+            self.events
+                .lock()
+                .unwrap()
+                .push((TAG, "commit", ctx.request_id, oid.clone()));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl<const TAG: u8> MibHandler for TypedHandler<TAG> {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetTestResult> {
+            self.events
+                .lock()
+                .unwrap()
+                .push((TAG, "test", ctx.request_id, oid.clone()));
+            let prepared = TypedPrepared::<TAG> {
+                events: self.events.clone(),
+                request_id: ctx.request_id,
+                oid: oid.clone(),
+            };
+            Box::pin(async move { Ok(Box::new(prepared) as Box<dyn PreparedSet>) })
+        }
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_handlers_keep_prepared_state_and_context_per_varbind() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 1),
+                Arc::new(TypedHandler::<1> {
+                    events: events.clone(),
+                }),
+            )
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999, 2),
+                Arc::new(TypedHandler::<2> {
+                    events: events.clone(),
+                }),
+            )
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            17,
+            0,
+            0,
+            vec![
+                VarBind::new(set_oid(1), Value::Integer(1)),
+                VarBind::new(set_oid(2), Value::Integer(2)),
+            ],
+        );
+        let mut ctx = test_ctx();
+        ctx.request_id = 17;
+
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        assert_eq!(response.error_status(), ErrorStatus::NoError.as_i32());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                (1, "test", 17, set_oid(1)),
+                (2, "test", 17, set_oid(2)),
+                (1, "commit", 17, set_oid(1)),
+                (2, "commit", 17, set_oid(2)),
+            ]
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum DropProbeMode {
+        BlockTest,
+        BlockCommit,
+        PanicCommit,
+        BlockFree,
+        BlockUndo,
+        BlockFinalize,
+    }
+
+    struct DropProbeHandler {
+        mode: DropProbeMode,
+        active: Arc<AtomicU32>,
+        drops: Arc<AtomicU32>,
+        drop_order: Arc<Mutex<Vec<Oid>>>,
+        callback_started: Arc<Semaphore>,
+        release_callback: Arc<Semaphore>,
+    }
+
+    struct DropProbePrepared {
+        mode: DropProbeMode,
+        oid: Oid,
+        active: Arc<AtomicU32>,
+        drops: Arc<AtomicU32>,
+        drop_order: Arc<Mutex<Vec<Oid>>>,
+        callback_started: Arc<Semaphore>,
+        release_callback: Arc<Semaphore>,
+    }
+
+    impl Drop for DropProbePrepared {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            self.drop_order.lock().unwrap().push(self.oid.clone());
+        }
+    }
+
+    impl PreparedSet for DropProbePrepared {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async move {
+                match self.mode {
+                    DropProbeMode::BlockCommit if self.oid == set_oid(1) => {
+                        self.callback_started.add_permits(1);
+                        self.release_callback
+                            .acquire()
+                            .await
+                            .expect("release semaphore remains open")
+                            .forget();
+                        Ok(())
+                    }
+                    DropProbeMode::PanicCommit if self.oid == set_oid(1) => {
+                        self.callback_started.add_permits(1);
+                        panic!("intentional prepared SET panic");
+                    }
+                    DropProbeMode::BlockUndo if self.oid == set_oid(3) => {
+                        Err(SetCommitError::Failed)
+                    }
+                    _ => Ok(()),
+                }
+            })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async move {
+                if matches!(self.mode, DropProbeMode::BlockUndo) && self.oid == set_oid(3) {
+                    self.callback_started.add_permits(1);
+                    self.release_callback
+                        .acquire()
+                        .await
+                        .expect("release semaphore remains open")
+                        .forget();
+                }
+                Ok(())
+            })
+        }
+
+        fn free<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                if matches!(self.mode, DropProbeMode::BlockFree) && self.oid == set_oid(3) {
+                    self.callback_started.add_permits(1);
+                    self.release_callback
+                        .acquire()
+                        .await
+                        .expect("release semaphore remains open")
+                        .forget();
+                }
+            })
+        }
+
+        fn finalize<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                if matches!(self.mode, DropProbeMode::BlockFinalize) && self.oid == set_oid(3) {
+                    self.callback_started.add_permits(1);
+                    self.release_callback
+                        .acquire()
+                        .await
+                        .expect("release semaphore remains open")
+                        .forget();
+                }
+            })
+        }
+    }
+
+    impl MibHandler for DropProbeHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetTestResult> {
+            Box::pin(async move {
+                if matches!(self.mode, DropProbeMode::BlockTest) && oid == &set_oid(4) {
+                    self.callback_started.add_permits(1);
+                    self.release_callback
+                        .acquire()
+                        .await
+                        .expect("release semaphore remains open")
+                        .forget();
+                }
+                if matches!(self.mode, DropProbeMode::BlockFree) && oid == &set_oid(4) {
+                    return Err(SetTestError::WrongValue);
+                }
+                self.active.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(DropProbePrepared {
+                    mode: self.mode,
+                    oid: oid.clone(),
+                    active: self.active.clone(),
+                    drops: self.drops.clone(),
+                    drop_order: self.drop_order.clone(),
+                    callback_started: self.callback_started.clone(),
+                    release_callback: self.release_callback.clone(),
+                }) as Box<dyn PreparedSet>)
+            })
+        }
+    }
+
+    async fn drop_probe(
+        mode: DropProbeMode,
+    ) -> (
+        tokio::task::JoinHandle<crate::Result<Pdu>>,
+        Arc<AtomicU32>,
+        Arc<AtomicU32>,
+        Arc<Mutex<Vec<Oid>>>,
+        Arc<Semaphore>,
+    ) {
+        let active = Arc::new(AtomicU32::new(0));
+        let drops = Arc::new(AtomicU32::new(0));
+        let drop_order = Arc::new(Mutex::new(Vec::new()));
+        let callback_started = Arc::new(Semaphore::new(0));
+        let release_callback = Arc::new(Semaphore::new(0));
+        let handler = Arc::new(DropProbeHandler {
+            mode,
+            active: active.clone(),
+            drops: drops.clone(),
+            drop_order: drop_order.clone(),
+            callback_started: callback_started.clone(),
+            release_callback,
+        });
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            (1..=if matches!(mode, DropProbeMode::BlockTest | DropProbeMode::BlockFree) {
+                4
+            } else {
+                3
+            })
+                .map(|index| VarBind::new(set_oid(index), Value::Integer(index as i32)))
+                .collect(),
+        );
+        let task = tokio::spawn(async move { agent.dispatch_request(&test_ctx(), &pdu).await });
+        (task, active, drops, drop_order, callback_started)
+    }
+
+    async fn assert_cancelled_reverse_fallback(mode: DropProbeMode) {
+        let (task, active, drops, drop_order, callback_started) = drop_probe(mode).await;
+        callback_started.acquire().await.unwrap().forget();
+        assert_eq!(active.load(Ordering::SeqCst), 3);
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        assert_eq!(*drop_order.lock().unwrap(), set_oids(&[3, 2, 1]));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_test_drops_prepared_states_in_reverse_order() {
+        assert_cancelled_reverse_fallback(DropProbeMode::BlockTest).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_every_request_owned_reservation_once() {
+        assert_cancelled_reverse_fallback(DropProbeMode::BlockCommit).await;
+    }
+
+    #[tokio::test]
+    async fn panic_drops_every_request_owned_reservation_once() {
+        let (task, active, drops, drop_order, callback_started) =
+            drop_probe(DropProbeMode::PanicCommit).await;
+        callback_started.acquire().await.unwrap().forget();
+        let error = task.await.unwrap_err();
+        assert!(error.is_panic());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        assert_eq!(*drop_order.lock().unwrap(), set_oids(&[3, 2, 1]));
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_async_free_drops_states_in_reverse_order() {
+        assert_cancelled_reverse_fallback(DropProbeMode::BlockFree).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_async_undo_drops_states_in_reverse_order() {
+        assert_cancelled_reverse_fallback(DropProbeMode::BlockUndo).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_async_finalize_drops_states_in_reverse_order() {
+        assert_cancelled_reverse_fallback(DropProbeMode::BlockFinalize).await;
     }
 }
