@@ -1,11 +1,13 @@
 use std::time::Duration;
 
+use async_snmp::message::Message;
 use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
-    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, Error, ErrorKind,
-    ErrorStatus, Oid, Pdu, RequestRegistration, Target, UdpControl, UdpHandle, UdpStats,
-    UdpTransport, Value, ValueKind, VarBind, Version, WalkAbortReason,
+    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, DecodeError,
+    DecodeErrorKind, DecodeErrorOrigin, Error, ErrorKind, ErrorStatus, Oid, Pdu,
+    RequestRegistration, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind,
+    VarBind, Version, WalkAbortReason,
 };
 #[cfg(feature = "agent")]
 use async_snmp::{
@@ -83,6 +85,27 @@ fn stable_value_and_error_kinds_are_public() {
     // The kind remains nameable when the feature-gated parent error does not.
     let agent_kind = ErrorKind::AgentAlreadyRunning;
     assert_eq!(agent_kind.to_string(), "agent_already_running");
+}
+
+#[test]
+fn decode_errors_are_public_structured_and_peer_free_for_standalone_input() {
+    let error = Message::decode(Bytes::from_static(&[0x31, 0x00])).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Decode);
+    assert!(matches!(
+        error.as_ref(),
+        Error::Decode(DecodeError {
+            origin: DecodeErrorOrigin::Packet,
+            offset: 0,
+            kind: DecodeErrorKind::UnexpectedTag {
+                expected: 0x30,
+                actual: 0x31,
+            },
+            peer: None,
+        })
+    ));
+    assert!(std::error::Error::source(error.as_ref()).is_some());
+    assert!(error.to_string().contains("packet offset 0"));
+    assert!(!error.to_string().contains("0.0.0.0:0"));
 }
 
 #[test]

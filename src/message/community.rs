@@ -242,12 +242,7 @@ impl CommunityMessage {
         policy: DecodePolicy,
         compatibility: CompatibilityPolicy,
     ) -> Result<DecodeOutcome<Self>> {
-        Self::decode_with_target_and_policies(
-            data,
-            crate::error::UNKNOWN_TARGET,
-            policy,
-            compatibility,
-        )
+        Self::decode_with_target_and_policies(data, None, policy, compatibility)
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
@@ -264,23 +259,28 @@ impl CommunityMessage {
         target: SocketAddr,
         policy: DecodePolicy,
     ) -> Result<DecodeOutcome<Self>> {
-        Self::decode_with_target_and_policies(data, target, policy, CompatibilityPolicy::default())
+        Self::decode_with_target_and_policies(
+            data,
+            Some(target),
+            policy,
+            CompatibilityPolicy::default(),
+        )
     }
 
     fn decode_with_target_and_policies(
         data: Bytes,
-        target: SocketAddr,
+        peer: Option<SocketAddr>,
         policy: DecodePolicy,
         compatibility: CompatibilityPolicy,
     ) -> Result<DecodeOutcome<Self>> {
         let mut decoder =
-            Decoder::with_target(data, target).with_compatibility_policy(compatibility);
+            Decoder::with_optional_peer(data, peer).with_compatibility_policy(compatibility);
         let mut seq = decoder.read_sequence()?;
 
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(version_num) }, "decode error");
-            seq.malformed()
+            seq.malformed(DecodeErrorKind::UnknownVersion(version_num))
         })?;
 
         let value = Self::decode_from_sequence(&mut seq, version)?;
@@ -292,15 +292,15 @@ impl CommunityMessage {
     pub(crate) fn decode_from_sequence(seq: &mut Decoder, version: Version) -> Result<Self> {
         if version == Version::V3 {
             tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(3) }, "decode error");
-            return Err(seq.malformed());
+            return Err(seq.malformed(DecodeErrorKind::UnknownVersion(3)));
         }
 
         let community = Community::from(seq.read_octet_string()?);
 
         // Peek at the PDU tag to dispatch between standard and TrapV1 layouts.
-        let pdu_tag = seq.peek_tag().ok_or_else(|| {
+        let pdu_tag = seq.peek_byte().ok_or_else(|| {
             tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), kind = %DecodeErrorKind::TruncatedData }, "truncated community message");
-            seq.malformed()
+            seq.malformed(DecodeErrorKind::TruncatedData)
         })?;
 
         let pdu = if pdu_tag == tag::pdu::TRAP_V1 {
@@ -309,7 +309,7 @@ impl CommunityMessage {
             // (tag 0xA7) instead. Reject a v1 Trap carried in a v2c message.
             if version != Version::V1 {
                 tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), version = ?version }, "v1 Trap PDU (0xA4) not valid in this version");
-                return Err(seq.malformed());
+                return Err(seq.malformed(DecodeErrorKind::UnknownPduType(pdu_tag)));
             }
             CommunityPdu::TrapV1(TrapV1Pdu::decode(seq)?)
         } else {
@@ -319,7 +319,7 @@ impl CommunityMessage {
             // in an SNMPv1 message (RFC 1157).
             if !crate::pdu::pdu_type_valid_for_version(pdu.pdu_type(), version) {
                 tracing::debug!(target: "async_snmp::ber", { offset = seq.offset(), version = ?version, pdu_type = %pdu.pdu_type() }, "PDU type not valid for SNMP version");
-                return Err(seq.malformed());
+                return Err(seq.malformed(DecodeErrorKind::UnknownPduType(pdu.pdu_type().tag())));
             }
             CommunityPdu::Standard(pdu)
         };
@@ -453,6 +453,33 @@ mod tests {
             assert_eq!(decoded.community().as_bytes(), b"private");
             assert_eq!(decoded.pdu().standard().unwrap().request_id, 123);
         }
+    }
+
+    #[test]
+    fn full_envelope_distinguishes_multi_octet_pdu_tag_from_missing_pdu() {
+        let mut encoded = raw_standard_message(Version::V2c, &Pdu::get_request(7, &[])).to_vec();
+        let pdu_offset = encoded
+            .iter()
+            .position(|byte| *byte == tag::pdu::GET_REQUEST)
+            .unwrap();
+        encoded[pdu_offset] = 0xbf;
+
+        let error = CommunityMessage::decode(Bytes::from(encoded)).unwrap_err();
+        assert!(matches!(&*error, Error::Decode(error)
+            if error.offset == pdu_offset
+                && error.kind == DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: 0xbf }));
+
+        let mut missing = EncodeBuf::new();
+        missing.push_sequence(|buf| {
+            buf.push_octet_string(b"public");
+            buf.push_integer(Version::V2c.as_i32());
+        });
+        let missing = missing.finish();
+        let missing_offset = missing.len();
+        let error = CommunityMessage::decode(missing).unwrap_err();
+        assert!(matches!(&*error, Error::Decode(error)
+            if error.offset == missing_offset
+                && error.kind == DecodeErrorKind::TruncatedData));
     }
 
     #[test]

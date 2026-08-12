@@ -7,7 +7,7 @@
 //! OIDs and returns [`crate::Error::InvalidOid`] rather than emitting invalid bytes.
 
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::{DecodeError, Error, Result};
 use smallvec::SmallVec;
 use std::fmt;
 
@@ -548,10 +548,7 @@ impl Oid {
             (2, first_subid - 80)
         };
         let arc2 = u32::try_from(arc2).map_err(|_| {
-            Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed()
+            Error::Decode(DecodeError::new(consumed, DecodeErrorKind::IntegerOverflow)).boxed()
         })?;
         arcs.push(arc1);
         arcs.push(arc2);
@@ -559,16 +556,27 @@ impl Oid {
         // Decode remaining arcs
         let mut i = consumed;
         while i < data.len() {
-            let (arc, bytes_consumed) = decode_subidentifier(&data[i..])?;
+            let (arc, bytes_consumed) =
+                decode_subidentifier(&data[i..]).map_err(|error| match *error {
+                    Error::Decode(mut error) => {
+                        error.offset = i.saturating_add(error.offset);
+                        Error::Decode(error).boxed()
+                    }
+                    other => Box::new(other),
+                })?;
             arcs.push(arc);
             i += bytes_consumed;
 
             // RFC 2578 Section 3.5: "at most 128 sub-identifiers in a value"
             if arcs.len() > MAX_OID_LEN {
                 tracing::debug!(target: "async_snmp::oid", { snmp.offset = %i, kind = %DecodeErrorKind::OidTooLong { count: arcs.len(), max: MAX_OID_LEN } }, "OID exceeds maximum arc count");
-                return Err(Error::MalformedResponse {
-                    target: UNKNOWN_TARGET,
-                }
+                return Err(Error::Decode(DecodeError::new(
+                    i,
+                    DecodeErrorKind::OidTooLong {
+                        count: arcs.len(),
+                        max: MAX_OID_LEN,
+                    },
+                ))
                 .boxed());
             }
         }
@@ -660,10 +668,7 @@ fn decode_first_subidentifier(data: &[u8]) -> Result<(u64, usize)> {
     loop {
         if i >= data.len() {
             tracing::debug!(target: "async_snmp::oid", { snmp.offset = %i, kind = %DecodeErrorKind::TruncatedData }, "unexpected end of data in OID subidentifier");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(Error::Decode(DecodeError::new(i, DecodeErrorKind::TruncatedData)).boxed());
         }
 
         let byte = data[i];
@@ -672,10 +677,9 @@ fn decode_first_subidentifier(data: &[u8]) -> Result<(u64, usize)> {
 
         if value > (MAX_FIRST_SUBIDENTIFIER - payload) >> 7 {
             tracing::debug!(target: "async_snmp::oid", { snmp.offset = %i, kind = %DecodeErrorKind::IntegerOverflow }, "combined first OID subidentifier overflow");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(
+                Error::Decode(DecodeError::new(i, DecodeErrorKind::IntegerOverflow)).boxed(),
+            );
         }
 
         value = (value << 7) | payload;
@@ -693,10 +697,7 @@ fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
     loop {
         if i >= data.len() {
             tracing::debug!(target: "async_snmp::oid", { snmp.offset = %i, kind = %DecodeErrorKind::TruncatedData }, "unexpected end of data in OID subidentifier");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(Error::Decode(DecodeError::new(i, DecodeErrorKind::TruncatedData)).boxed());
         }
 
         let byte = data[i];
@@ -705,10 +706,9 @@ fn decode_subidentifier(data: &[u8]) -> Result<(u32, usize)> {
         // Check for overflow before shifting
         if value > (u32::MAX >> 7) {
             tracing::debug!(target: "async_snmp::oid", { snmp.offset = %i, kind = %DecodeErrorKind::IntegerOverflow }, "OID subidentifier overflow");
-            return Err(Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed());
+            return Err(
+                Error::Decode(DecodeError::new(i, DecodeErrorKind::IntegerOverflow)).boxed(),
+            );
         }
 
         value = (value << 7) | u32::from(byte & 0x7F);

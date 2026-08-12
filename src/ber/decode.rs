@@ -4,11 +4,11 @@
 
 use std::net::SocketAddr;
 
-use super::length::decode_length;
+use super::length::decode_length_with_origin;
 use super::tag;
 use crate::compatibility::CompatibilityPolicy;
-use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::internal::{DecodeErrorKind, DecodeErrorOrigin};
+use crate::error::{DecodeError, Error, Result};
 use crate::oid::Oid;
 use bytes::Bytes;
 
@@ -16,7 +16,9 @@ use bytes::Bytes;
 pub struct Decoder {
     data: Bytes,
     offset: usize,
-    target: Option<SocketAddr>,
+    base_offset: usize,
+    origin: DecodeErrorOrigin,
+    peer: Option<SocketAddr>,
     compatibility: CompatibilityPolicy,
 }
 
@@ -26,17 +28,38 @@ impl Decoder {
         Self {
             data,
             offset: 0,
-            target: None,
+            base_offset: 0,
+            origin: DecodeErrorOrigin::Packet,
+            peer: None,
             compatibility: CompatibilityPolicy::default(),
         }
     }
 
     /// Create a decoder from bytes with a target address for error context.
     pub fn with_target(data: Bytes, target: SocketAddr) -> Self {
+        Self::with_optional_peer(data, Some(target))
+    }
+
+    pub(crate) fn with_optional_peer(data: Bytes, peer: Option<SocketAddr>) -> Self {
+        Self::with_context(data, 0, peer)
+    }
+
+    pub(crate) fn with_context(data: Bytes, base_offset: usize, peer: Option<SocketAddr>) -> Self {
+        Self::with_origin_context(data, base_offset, DecodeErrorOrigin::Packet, peer)
+    }
+
+    pub(crate) fn with_origin_context(
+        data: Bytes,
+        base_offset: usize,
+        origin: DecodeErrorOrigin,
+        peer: Option<SocketAddr>,
+    ) -> Self {
         Self {
             data,
             offset: 0,
-            target: Some(target),
+            base_offset,
+            origin,
+            peer,
             compatibility: CompatibilityPolicy::default(),
         }
     }
@@ -60,21 +83,30 @@ impl Decoder {
         Self::new(Bytes::copy_from_slice(data))
     }
 
-    /// Get the target address for error context.
-    pub(crate) fn target(&self) -> SocketAddr {
-        self.target.unwrap_or(UNKNOWN_TARGET)
+    /// Get the peer address, when decoding at a network boundary.
+    #[must_use]
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.peer
     }
 
-    /// Return a boxed `MalformedResponse` error for the current target.
-    pub(crate) fn malformed(&self) -> Box<crate::error::Error> {
-        Error::MalformedResponse {
-            target: self.target(),
-        }
-        .boxed()
+    /// Construct a decode error at the current packet-relative offset.
+    pub(crate) fn malformed(&self, kind: DecodeErrorKind) -> Box<Error> {
+        self.malformed_at(self.offset, kind)
     }
 
-    /// Get the current offset.
+    pub(crate) fn malformed_at(&self, offset: usize, kind: DecodeErrorKind) -> Box<Error> {
+        let mut error =
+            DecodeError::with_origin(self.origin, self.base_offset.saturating_add(offset), kind);
+        error.peer = self.peer;
+        Error::Decode(error).boxed()
+    }
+
+    /// Get the current packet-relative offset.
     pub fn offset(&self) -> usize {
+        self.base_offset.saturating_add(self.offset)
+    }
+
+    pub(crate) fn local_offset(&self) -> usize {
         self.offset
     }
 
@@ -114,7 +146,7 @@ impl Decoder {
     pub fn read_byte(&mut self) -> Result<u8> {
         if self.offset >= self.data.len() {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::TruncatedData }, "truncated data: unexpected end of input");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::TruncatedData));
         }
         let byte = self.data[self.offset];
         self.offset += 1;
@@ -129,15 +161,23 @@ impl Decoder {
     pub fn read_tag(&mut self) -> Result<u8> {
         let tag = self.read_byte()?;
         if tag & 0x1F == 0x1F {
-            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset - 1, kind = %DecodeErrorKind::UnexpectedTag { expected: 0, actual: tag } }, "multi-byte tag not supported");
-            return Err(self.malformed());
+            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset - 1, kind = %DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: tag } }, "multi-byte tag not supported");
+            return Err(self.malformed_at(
+                self.offset - 1,
+                DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: tag },
+            ));
         }
         Ok(tag)
     }
 
     /// Read a length and return (length, bytes consumed).
     pub fn read_length(&mut self) -> Result<usize> {
-        let (len, consumed) = decode_length(&self.data[self.offset..], self.offset, self.target)?;
+        let (len, consumed) = decode_length_with_origin(
+            &self.data[self.offset..],
+            self.base_offset.saturating_add(self.offset),
+            self.origin,
+            self.peer,
+        )?;
         self.offset += consumed;
         Ok(len)
     }
@@ -147,7 +187,10 @@ impl Decoder {
         // Use saturating_add to prevent overflow from bypassing bounds check
         if self.offset.saturating_add(len) > self.data.len() {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::InsufficientData { needed: len, available: self.remaining() } }, "insufficient data");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::InsufficientData {
+                needed: len,
+                available: self.remaining(),
+            }));
         }
         let bytes = self.data.slice(self.offset..self.offset + len);
         self.offset += len;
@@ -159,7 +202,13 @@ impl Decoder {
         let tag = self.read_tag()?;
         if tag != expected {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset - 1, kind = %DecodeErrorKind::UnexpectedTag { expected, actual: tag } }, "unexpected tag");
-            return Err(self.malformed());
+            return Err(self.malformed_at(
+                self.offset - 1,
+                DecodeErrorKind::UnexpectedTag {
+                    expected,
+                    actual: tag,
+                },
+            ));
         }
         self.read_length()
     }
@@ -182,7 +231,11 @@ impl Decoder {
         let value = self.read_signed_integer_value(len)?;
         if value < i64::from(minimum) || value > i64::from(maximum) {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::IntegerOutOfRange { value, minimum, maximum } }, "integer outside constrained range");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::IntegerOutOfRange {
+                value,
+                minimum,
+                maximum,
+            }));
         }
 
         Ok(value as i32)
@@ -195,7 +248,11 @@ impl Decoder {
         let value = self.read_signed_integer_value(len)?;
         if value < i64::from(i32::MIN) || value > i64::from(i32::MAX) {
             if !self.compatibility.truncate_numeric_values {
-                return Err(self.malformed());
+                return Err(self.malformed(DecodeErrorKind::IntegerOutOfRange {
+                    value,
+                    minimum: i32::MIN,
+                    maximum: i32::MAX,
+                }));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "numeric_truncation", numeric_type = "integer", encoded_length = len, value, normalized = value as i32, "accepted out-of-range generic INTEGER");
         }
@@ -207,12 +264,12 @@ impl Decoder {
     fn read_signed_integer_value(&mut self, len: usize) -> Result<i64> {
         if len == 0 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::ZeroLengthInteger }, "zero-length integer");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::ZeroLengthInteger));
         }
         if len > 8 {
             // Net-snmp accepts up to sizeof(long)=8 bytes for INTEGER; longer is truly malformed.
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::IntegerTooLong { length: len } }, "integer encoding too long");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::IntegerTooLong { length: len }));
         }
 
         let bytes = self.read_bytes(len)?;
@@ -239,7 +296,7 @@ impl Decoder {
     pub fn read_integer64_value(&mut self, len: usize) -> Result<u64> {
         if len == 0 {
             if !self.compatibility.empty_counter64_as_zero {
-                return Err(self.malformed());
+                return Err(self.malformed(DecodeErrorKind::ZeroLengthInteger));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "empty_counter64", snmp.offset = self.offset, normalized = 0_u64, "accepted zero-length Counter64");
             return Ok(0);
@@ -247,14 +304,14 @@ impl Decoder {
         if len > 9 {
             // 9 bytes max: 1 leading zero + 8 bytes for u64
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Integer64TooLong { length: len } }, "integer64 too long");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::Integer64TooLong { length: len }));
         }
 
         let bytes = self.read_bytes(len)?;
 
         if len == 9 && bytes[0] != 0x00 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Integer64MissingLeadingZero }, "9-octet integer64 missing leading zero");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::Integer64MissingLeadingZero));
         }
 
         let mut value: u64 = 0;
@@ -277,7 +334,11 @@ impl Decoder {
         let value = self.read_unsigned_integer_value(len)?;
         if value > u64::from(u32::MAX) {
             if !self.compatibility.truncate_numeric_values {
-                return Err(self.malformed());
+                return Err(self.malformed(DecodeErrorKind::UnsignedIntegerOutOfRange {
+                    value,
+                    minimum: 0,
+                    maximum: u32::MAX,
+                }));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "numeric_truncation", numeric_type = "unsigned32", encoded_length = len, value, normalized = value as u32, "accepted out-of-range generic Unsigned32");
         }
@@ -290,7 +351,11 @@ impl Decoder {
     pub(crate) fn read_bounded_unsigned32_value(&mut self, len: usize) -> Result<u32> {
         let value = self.read_unsigned_integer_value(len)?;
         if value > u64::from(u32::MAX) {
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::UnsignedIntegerOutOfRange {
+                value,
+                minimum: 0,
+                maximum: u32::MAX,
+            }));
         }
         Ok(value as u32)
     }
@@ -298,19 +363,19 @@ impl Decoder {
     fn read_unsigned_integer_value(&mut self, len: usize) -> Result<u64> {
         if len == 0 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::ZeroLengthInteger }, "zero-length integer");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::ZeroLengthInteger));
         }
         if len > 9 {
             // Net-snmp accepts up to sizeof(long)+1=9 bytes for unsigned32; longer is truly malformed.
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Unsigned32TooLong { length: len } }, "unsigned32 encoding too long");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::Unsigned32TooLong { length: len }));
         }
 
         let bytes = self.read_bytes(len)?;
 
         if len == 9 && bytes[0] != 0x00 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Unsigned32MissingLeadingZero }, "9-octet unsigned32 missing leading zero");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::Unsigned32MissingLeadingZero));
         }
 
         let mut value: u64 = 0;
@@ -331,7 +396,7 @@ impl Decoder {
         let len = self.expect_tag(tag::universal::NULL)?;
         if len != 0 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::InvalidNull }, "NULL with non-zero length");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::InvalidNull));
         }
         Ok(())
     }
@@ -346,12 +411,23 @@ impl Decoder {
     pub fn read_oid_value(&mut self, len: usize) -> Result<Oid> {
         if len == 0 {
             if !self.compatibility.empty_object_identifier {
-                return Err(self.malformed());
+                return Err(self.malformed(DecodeErrorKind::InvalidOid));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "empty_object_identifier", snmp.offset = self.offset, encoded_length = 0, "accepted zero-length OBJECT IDENTIFIER");
         }
         let bytes = self.read_bytes(len)?;
-        Oid::from_ber(&bytes).map_err(|_| self.malformed())
+        Oid::from_ber(&bytes).map_err(|error| match *error {
+            Error::Decode(mut error) => {
+                error.offset = self
+                    .base_offset
+                    .saturating_add(self.offset.saturating_sub(len))
+                    .saturating_add(error.offset);
+                error.origin = self.origin;
+                error.peer = self.peer;
+                Error::Decode(error).boxed()
+            }
+            other => Box::new(other),
+        })
     }
 
     /// Read a SEQUENCE, returning a decoder for its contents.
@@ -362,11 +438,14 @@ impl Decoder {
     /// Read a constructed type with a specific tag, returning a decoder for its contents.
     pub fn read_constructed(&mut self, expected_tag: u8) -> Result<Decoder> {
         let len = self.expect_tag(expected_tag)?;
+        let content_offset = self.base_offset.saturating_add(self.offset);
         let content = self.read_bytes(len)?;
         Ok(Decoder {
             data: content,
             offset: 0,
-            target: self.target,
+            base_offset: content_offset,
+            origin: self.origin,
+            peer: self.peer,
             compatibility: self.compatibility,
         })
     }
@@ -376,7 +455,7 @@ impl Decoder {
         let len = self.expect_tag(tag::application::IP_ADDRESS)?;
         if len != 4 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::InvalidIpAddressLength { length: len } }, "IP address must be 4 bytes");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::InvalidIpAddressLength { length: len }));
         }
         let bytes = self.read_bytes(4)?;
         Ok([bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -390,7 +469,7 @@ impl Decoder {
         let new_offset = self.offset.saturating_add(len);
         if new_offset > self.data.len() {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::TlvOverflow }, "TLV extends past end of data");
-            return Err(self.malformed());
+            return Err(self.malformed(DecodeErrorKind::TlvOverflow));
         }
         self.offset = new_offset;
         Ok(())
@@ -398,11 +477,14 @@ impl Decoder {
 
     /// Create a sub-decoder for a portion of the remaining data.
     pub fn sub_decoder(&mut self, len: usize) -> Result<Decoder> {
+        let content_offset = self.base_offset.saturating_add(self.offset);
         let content = self.read_bytes(len)?;
         Ok(Decoder {
             data: content,
             offset: 0,
-            target: self.target,
+            base_offset: content_offset,
+            origin: self.origin,
+            peer: self.peer,
             compatibility: self.compatibility,
         })
     }
@@ -467,11 +549,11 @@ mod tests {
 
         let mut tagged = Decoder::with_target(Bytes::from_static(&[0x06, 0x01, 0x80]), peer);
         let error = tagged.read_oid().unwrap_err();
-        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
+        assert!(matches!(&*error, Error::Decode(error) if error.peer == Some(peer)));
 
         let mut value = Decoder::with_target(Bytes::from_static(&[0x80]), peer);
         let error = value.read_oid_value(1).unwrap_err();
-        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
+        assert!(matches!(&*error, Error::Decode(error) if error.peer == Some(peer)));
     }
 
     #[test]
@@ -610,6 +692,42 @@ mod tests {
     }
 
     #[test]
+    fn unsigned32_range_error_preserves_u64_max_and_u32_bounds() {
+        let encoded = [0x42, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let policy = CompatibilityPolicy {
+            truncate_numeric_values: false,
+            ..CompatibilityPolicy::DEFAULT
+        };
+        let mut decoder = Decoder::from_slice(&encoded).with_compatibility_policy(policy);
+        let error = decoder.read_unsigned32(0x42).unwrap_err();
+        assert!(matches!(
+            error.as_ref(),
+            Error::Decode(DecodeError {
+                kind: DecodeErrorKind::UnsignedIntegerOutOfRange {
+                    value: u64::MAX,
+                    minimum: 0,
+                    maximum: u32::MAX,
+                },
+                ..
+            })
+        ));
+
+        let mut bounded = Decoder::from_slice(&encoded[2..]);
+        let error = bounded.read_bounded_unsigned32_value(8).unwrap_err();
+        assert!(matches!(
+            error.as_ref(),
+            Error::Decode(DecodeError {
+                kind: DecodeErrorKind::UnsignedIntegerOutOfRange {
+                    value: u64::MAX,
+                    minimum: 0,
+                    maximum: u32::MAX,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn test_counter64_nine_bytes_requires_leading_zero() {
         // 9-byte Counter64 with a non-zero first byte must be rejected (BER requires 0x00)
         // Tag 0x46 = Counter64
@@ -658,15 +776,15 @@ mod tests {
 
     #[test]
     fn test_read_bytes_rejects_oversized_length() {
-        // When length exceeds remaining data, should return MalformedResponse error
+        // When length exceeds remaining data, return a structured decode error.
         let mut dec = Decoder::from_slice(&[0x01, 0x02, 0x03]);
         // Try to read more bytes than available
         let result = dec.read_bytes(100);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error, got {err:?}"
+            matches!(*err, crate::error::Error::Decode(_)),
+            "expected Decode error, got {err:?}"
         );
     }
 
@@ -679,8 +797,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error, got {err:?}"
+            matches!(*err, crate::error::Error::Decode(_)),
+            "expected Decode error, got {err:?}"
         );
     }
 
@@ -692,10 +810,14 @@ mod tests {
         let result = dec.read_tag();
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            matches!(*err, crate::error::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error for multi-byte tag, got {err:?}"
-        );
+        assert!(matches!(
+            err.as_ref(),
+            Error::Decode(DecodeError {
+                offset: 0,
+                kind: DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: 0x1f },
+                ..
+            })
+        ));
 
         // 0x3F: constructed form with tag bits all set - also multi-byte
         let mut dec = Decoder::from_slice(&[0x3F, 0x02, 0x00]);

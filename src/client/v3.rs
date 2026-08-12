@@ -313,7 +313,11 @@ impl<T: Transport> Client<T> {
         // Decode and validate the candidate before parsing the plaintext PDU,
         // preserving USM-before-scoped-PDU processing order. Boots/time are
         // syntactically decoded but discarded as unauthenticated input.
-        let usm = UsmSecurityParams::decode_with_target(response.security_params.clone(), source)?;
+        let usm = UsmSecurityParams::decode_with_context(
+            response.security_params.clone(),
+            response.security_params_offset,
+            source,
+        )?;
         let engine_state = crate::v3::parse_discovery_response_with_msg_max_size(
             &response.security_params,
             response.global_data.msg_max_size,
@@ -323,10 +327,14 @@ impl<T: Transport> Client<T> {
             return Err(malformed());
         }
 
-        let RawMsgData::Plaintext(bytes) = &response.msg_data else {
+        let RawMsgData::Plaintext {
+            data: bytes,
+            offset,
+        } = &response.msg_data
+        else {
             return Err(malformed());
         };
-        let scoped_pdu = decode_scoped_pdu_with_consumption(bytes.clone(), source, None)?;
+        let scoped_pdu = decode_scoped_pdu_with_consumption(bytes.clone(), *offset, source, None)?;
 
         // Bind the Internal-class Report to the exact outstanding discovery
         // attempt only after Security Model processing and scoped-PDU parsing.
@@ -592,7 +600,7 @@ impl<T: Transport> Client<T> {
 
         tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
 
-        decode_scoped_pdu_with_consumption(plaintext, source, Some(priv_key.protocol()))
+        decode_scoped_pdu_with_consumption(plaintext, 0, source, Some(priv_key.protocol()))
     }
 
     fn validate_v3_candidate(
@@ -617,8 +625,11 @@ impl<T: Transport> Client<T> {
         let authenticated_message = response_data.slice(..envelope_len);
         let raw = decoded.value;
         let received_level = raw.security_level();
-        let Ok(usm) = UsmSecurityParams::decode_with_target(raw.security_params.clone(), source)
-        else {
+        let Ok(usm) = UsmSecurityParams::decode_with_context(
+            raw.security_params.clone(),
+            raw.security_params_offset,
+            source,
+        ) else {
             return Ok(Candidate::Reject);
         };
 
@@ -672,8 +683,8 @@ impl<T: Transport> Client<T> {
         }
 
         let scoped_pdu = match &raw.msg_data {
-            RawMsgData::Plaintext(bytes) => {
-                match decode_scoped_pdu_with_consumption(bytes.clone(), source, None) {
+            RawMsgData::Plaintext { data, offset } => {
+                match decode_scoped_pdu_with_consumption(data.clone(), *offset, source, None) {
                     Ok(scoped) => scoped,
                     Err(_) => return Ok(Candidate::Reject),
                 }

@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::{Error, Result};
 use crate::message::SecurityLevel;
 use crate::v3::validate_engine_id;
 
@@ -238,14 +238,27 @@ impl UsmSecurityParams {
 
     /// Decode from BER bytes.
     pub fn decode(data: Bytes) -> Result<Self> {
-        Self::decode_with_target(data, UNKNOWN_TARGET)
-    }
-
-    pub(crate) fn decode_with_target(data: Bytes, target: SocketAddr) -> Result<Self> {
-        let mut decoder = Decoder::with_target(data, target);
+        let mut decoder = Decoder::new(data);
         let params = Self::decode_from(&mut decoder)?;
         if !decoder.is_empty() {
-            return Err(decoder.malformed());
+            return Err(decoder.malformed(DecodeErrorKind::TrailingData {
+                remaining: decoder.remaining(),
+            }));
+        }
+        Ok(params)
+    }
+
+    pub(crate) fn decode_with_context(
+        data: Bytes,
+        base_offset: usize,
+        target: SocketAddr,
+    ) -> Result<Self> {
+        let mut decoder = Decoder::with_context(data, base_offset, Some(target));
+        let params = Self::decode_from(&mut decoder)?;
+        if !decoder.is_empty() {
+            return Err(decoder.malformed(DecodeErrorKind::TrailingData {
+                remaining: decoder.remaining(),
+            }));
         }
         Ok(params)
     }
@@ -268,13 +281,17 @@ impl UsmSecurityParams {
         let username = seq.read_octet_string()?;
         if username.len() > MAX_USER_NAME_LEN {
             tracing::debug!(target: "async_snmp::usm", { offset = seq.offset(), length = username.len(), kind = %DecodeErrorKind::InvalidUserNameLength { length: username.len() } }, "decode error");
-            return Err(seq.malformed());
+            return Err(seq.malformed(DecodeErrorKind::InvalidUserNameLength {
+                length: username.len(),
+            }));
         }
 
         let auth_params = seq.read_octet_string()?;
         let priv_params = seq.read_octet_string()?;
         if !seq.is_empty() {
-            return Err(seq.malformed());
+            return Err(seq.malformed(DecodeErrorKind::TrailingData {
+                remaining: seq.remaining(),
+            }));
         }
         let discovery = engine_id.is_empty();
 
@@ -557,10 +574,7 @@ mod tests {
 
         let result = UsmSecurityParams::decode(encoded);
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]
@@ -580,10 +594,7 @@ mod tests {
 
         let result = UsmSecurityParams::decode(encoded);
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]
@@ -739,10 +750,7 @@ mod tests {
 
         let result = UsmSecurityParams::decode(encoded);
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]

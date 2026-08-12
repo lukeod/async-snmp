@@ -61,7 +61,9 @@ impl VarBind {
         let oid = seq.read_oid()?;
         let value = Value::decode(&mut seq)?;
         if !seq.is_empty() {
-            return Err(seq.malformed());
+            return Err(seq.malformed(crate::error::DecodeErrorKind::TrailingData {
+                remaining: seq.remaining(),
+            }));
         }
         Ok(VarBind { oid, value })
     }
@@ -166,7 +168,7 @@ mod tests {
 
         let error = VarBind::decode(&mut decoder).unwrap_err();
 
-        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
+        assert!(matches!(&*error, Error::Decode(error) if error.peer == Some(peer)));
     }
 
     #[test]

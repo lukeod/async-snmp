@@ -148,7 +148,10 @@ pub(crate) fn sign_v3_message(
     let (auth_offset, auth_len) =
         UsmSecurityParams::find_auth_params_offset(message).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::v3", { kind = %EncodeErrorKind::MissingAuthParams }, "could not find auth params in outgoing V3 message");
-            Error::MalformedResponse { target }.boxed()
+            Error::InvalidMessage(
+                format!("could not locate authentication parameters for {target}").into(),
+            )
+            .boxed()
         })?;
     authenticate_message(auth_key, message, auth_offset, auth_len).map_err(|e| {
         tracing::debug!(target: "async_snmp::v3", { error = %e }, "failed to authenticate outgoing V3 message");

@@ -935,9 +935,9 @@ fn validate_discovered_engine_id(engine_id: &[u8]) -> Result<()> {
     // deriving unusable localized keys from it.
     if validate_engine_id(engine_id).is_err() {
         tracing::debug!(target: "async_snmp::engine", { length = engine_id.len() }, "discovery response contained invalid engine ID");
-        return Err(Error::MalformedResponse {
-            target: SocketAddr::from(([0, 0, 0, 0], 0)),
-        }
+        return Err(Error::InvalidMessage(
+            "discovery response contains an invalid authoritative engine ID".into(),
+        )
         .boxed());
     }
     Ok(())
@@ -1662,10 +1662,7 @@ mod tests {
         let encoded = usm.encode().unwrap();
 
         let result = parse_discovery_response(&encoded);
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::InvalidMessage(_)));
     }
 
     #[test]
@@ -1678,7 +1675,7 @@ mod tests {
         ] {
             assert!(matches!(
                 *parse_discovery_response(&raw_usm_with_engine_id(engine_id)).unwrap_err(),
-                Error::MalformedResponse { .. }
+                Error::InvalidMessage(_)
             ));
         }
     }

@@ -20,7 +20,7 @@ pub use v3::{
 use crate::ber::Decoder;
 use crate::compatibility::CompatibilityPolicy;
 use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::{DecodeError, Result};
 use crate::pdu::Pdu;
 use crate::version::Version;
 use bytes::Bytes;
@@ -63,7 +63,9 @@ pub(crate) fn finalize_envelope(
 ) -> Result<Option<DecodeAnomaly>> {
     if !sequence.is_empty() {
         tracing::debug!(target: "async_snmp::message", { remaining = sequence.remaining() }, "unconsumed field inside SNMP message envelope");
-        return Err(sequence.malformed());
+        return Err(sequence.malformed(DecodeErrorKind::TrailingData {
+            remaining: sequence.remaining(),
+        }));
     }
 
     let trailing_bytes = root.remaining();
@@ -72,12 +74,14 @@ pub(crate) fn finalize_envelope(
     }
     if policy == DecodePolicy::Strict {
         tracing::debug!(target: "async_snmp::message", { trailing_bytes }, "bytes follow SNMP message envelope");
-        return Err(root.malformed());
+        return Err(root.malformed(DecodeErrorKind::TrailingData {
+            remaining: trailing_bytes,
+        }));
     }
 
     // Stable event and field names let callers observe anomalies even when
     // using the legacy value-only `decode` convenience methods.
-    tracing::warn!(target: "async_snmp::message", anomaly = "trailing_bytes", trailing_bytes, peer = %root.target(), "accepted trailing bytes after SNMP message");
+    tracing::warn!(target: "async_snmp::message", anomaly = "trailing_bytes", trailing_bytes, peer = ?root.peer(), "accepted trailing bytes after SNMP message");
     Ok(Some(DecodeAnomaly { trailing_bytes }))
 }
 
@@ -156,7 +160,7 @@ impl Message {
         Self::decode_bounded_with_target_and_compatibility(
             data,
             input_len,
-            UNKNOWN_TARGET,
+            None,
             policy,
             compatibility,
         )
@@ -176,7 +180,7 @@ impl Message {
         Self::decode_bounded_with_target_and_compatibility(
             data,
             maximum,
-            target,
+            Some(target),
             policy,
             CompatibilityPolicy::default(),
         )
@@ -185,22 +189,29 @@ impl Message {
     fn decode_bounded_with_target_and_compatibility(
         data: Bytes,
         maximum: usize,
-        target: SocketAddr,
+        peer: Option<SocketAddr>,
         policy: DecodePolicy,
         compatibility: CompatibilityPolicy,
     ) -> Result<DecodeOutcome<Self>> {
         if data.len() > maximum {
-            tracing::debug!(target: "async_snmp::message", { received_size = data.len(), maximum, peer = %target }, "message exceeds receive limit");
-            return Err(Error::MalformedResponse { target }.boxed());
+            let mut error = DecodeError::new(
+                0,
+                DecodeErrorKind::MessageTooLarge {
+                    size: data.len(),
+                    maximum,
+                },
+            );
+            error.peer = peer;
+            return Err(crate::Error::Decode(error).boxed());
         }
         let mut decoder =
-            Decoder::with_target(data, target).with_compatibility_policy(compatibility);
+            Decoder::with_optional_peer(data, peer).with_compatibility_policy(compatibility);
         let mut seq = decoder.read_sequence()?;
 
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;
         let version = Version::from_i32(version_num).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::message", { offset = seq.offset(), kind = %DecodeErrorKind::UnknownVersion(version_num) }, "decode error");
-            seq.malformed()
+            seq.malformed(DecodeErrorKind::UnknownVersion(version_num))
         })?;
 
         let value = match version {
@@ -223,7 +234,7 @@ pub(crate) fn peek_version(data: Bytes, target: std::net::SocketAddr) -> Result<
     let version_num = seq.read_bounded_integer(0, i32::MAX)?;
     Version::from_i32(version_num).ok_or_else(|| {
         tracing::debug!(target: "async_snmp::message", { source = %target, kind = %DecodeErrorKind::UnknownVersion(version_num) }, "unknown SNMP version");
-        Error::MalformedResponse { target }.boxed()
+        seq.malformed(DecodeErrorKind::UnknownVersion(version_num))
     })
 }
 
@@ -284,7 +295,7 @@ mod tests {
             Message::decode_bounded_with_target(
                 encoded.clone(),
                 encoded_len,
-                UNKNOWN_TARGET,
+                "127.0.0.1:161".parse().unwrap(),
                 DecodePolicy::Compatible,
             )
             .is_ok()
@@ -293,7 +304,7 @@ mod tests {
             Message::decode_bounded_with_target(
                 encoded,
                 encoded_len - 1,
-                UNKNOWN_TARGET,
+                "127.0.0.1:161".parse().unwrap(),
                 DecodePolicy::Compatible,
             )
             .is_err()
@@ -370,7 +381,11 @@ mod tests {
         encoded[pdu_start + 1] += 2;
         encoded.splice(pdu_end..pdu_end, [0x05, 0x00]);
 
-        assert_peer_target(encoded);
+        assert_peer_decode(
+            encoded,
+            pdu_end,
+            DecodeErrorKind::TrailingData { remaining: 2 },
+        );
     }
 
     #[test]
@@ -409,18 +424,30 @@ mod tests {
             extra_varbind_field[length_offset] += 2;
         }
         extra_varbind_field.splice(varbind_end..varbind_end, [0x05, 0x00]);
-        assert_peer_target(extra_varbind_field);
+        assert_peer_decode(
+            extra_varbind_field,
+            varbind_end,
+            DecodeErrorKind::TrailingData { remaining: 2 },
+        );
 
         let mut malformed_oid = encoded.clone();
         malformed_oid[oid_start + oid_tlv.len() - 1] = 0x80;
-        assert_peer_target(malformed_oid);
+        assert_peer_decode(
+            malformed_oid,
+            oid_start + oid_tlv.len(),
+            DecodeErrorKind::TruncatedData,
+        );
 
         let mut constructed_octet_string = encoded;
         constructed_octet_string[null_start] = crate::ber::tag::universal::OCTET_STRING_CONSTRUCTED;
-        assert_peer_target(constructed_octet_string);
+        assert_peer_decode(
+            constructed_octet_string,
+            null_start,
+            DecodeErrorKind::ConstructedOctetString,
+        );
     }
 
-    fn assert_peer_target(encoded: Vec<u8>) {
+    fn assert_peer_decode(encoded: Vec<u8>, offset: usize, kind: DecodeErrorKind) {
         let peer: SocketAddr = "192.0.2.44:161".parse().unwrap();
         let len = encoded.len();
         let error = Message::decode_bounded_with_target(
@@ -430,6 +457,10 @@ mod tests {
             DecodePolicy::Compatible,
         )
         .unwrap_err();
-        assert!(matches!(&*error, Error::MalformedResponse { target } if *target == peer));
+        assert!(
+            matches!(&*error, crate::Error::Decode(error)
+                if error.peer == Some(peer) && error.offset == offset && error.kind == kind),
+            "expected offset {offset} and {kind:?}, got {error:?}"
+        );
     }
 }

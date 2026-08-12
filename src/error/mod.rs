@@ -3,6 +3,7 @@
 //! This module provides:
 //!
 //! - [`Error`] - The main error type covering all failure modes
+//! - [`DecodeError`] - Structured packet-decoding diagnostics
 //! - [`ConstructionStage`] - The phase active at a construction deadline
 //! - [`ErrorStatus`] - SNMP protocol errors returned by agents (RFC 3416)
 //! - [`WalkAbortReason`] - Reasons a walk operation was aborted
@@ -38,25 +39,298 @@ use std::time::Duration;
 use crate::oid::Oid;
 use crate::v3::ReportStatus;
 
-/// Placeholder target address used when no target is known.
-///
-/// This sentinel value (0.0.0.0:0) is used in error contexts where the
-/// target address cannot be determined (e.g., parsing failures before
-/// the source address is known).
-pub(crate) const UNKNOWN_TARGET: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-
-// Pattern for converting detailed internal errors to simplified public errors:
-//
-// tracing::debug!(
-//     target: "async_snmp::ber",  // or ::auth, ::crypto, etc.
-//     { snmp.offset = 42, snmp.decode_error = "ZeroLengthInteger" },
-//     "decode error details here"
-// );
-// return Err(Error::MalformedResponse { target }.boxed());
-
 /// Result type alias using the library's boxed Error type.
 pub type Result<T> = std::result::Result<T, Box<Error>>;
+
+/// Coordinate system used by a [`DecodeError`] offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecodeErrorOrigin {
+    /// Offset from the beginning of the received or standalone encoded message.
+    Packet,
+    /// Offset from the beginning of a decrypted SNMPv3 scoped-PDU plaintext.
+    DecryptedScopedPdu,
+}
+
+impl std::fmt::Display for DecodeErrorOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Packet => f.write_str("packet"),
+            Self::DecryptedScopedPdu => f.write_str("decrypted scoped-PDU plaintext"),
+        }
+    }
+}
+
+/// The specific reason packet decoding failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecodeErrorKind {
+    /// A TLV used a tag other than the required tag.
+    UnexpectedTag {
+        /// Required single-octet tag.
+        expected: u8,
+        /// Received single-octet tag.
+        actual: u8,
+    },
+    /// Input ended before the next required byte.
+    TruncatedData,
+    /// A BER length field is structurally invalid.
+    InvalidLength,
+    /// Indefinite-length BER is unsupported by SNMP.
+    IndefiniteLength,
+    /// An encoded integer cannot fit its BER intermediate representation.
+    IntegerOverflow,
+    /// An integer violates an ASN.1 field constraint.
+    IntegerOutOfRange {
+        /// Decoded integer.
+        value: i64,
+        /// Inclusive lower bound.
+        minimum: i32,
+        /// Inclusive upper bound.
+        maximum: i32,
+    },
+    /// An unsigned integer violates an ASN.1 field constraint.
+    UnsignedIntegerOutOfRange {
+        /// Complete decoded unsigned value.
+        value: u64,
+        /// Inclusive lower bound.
+        minimum: u32,
+        /// Inclusive upper bound.
+        maximum: u32,
+    },
+    /// An INTEGER-like value has no content octets.
+    ZeroLengthInteger,
+    /// The SNMP version number is unknown or invalid in this envelope.
+    UnknownVersion(i32),
+    /// The context-specific PDU tag is unknown or invalid for the version.
+    UnknownPduType(u8),
+    /// Constructed OCTET STRING encoding is unsupported.
+    ConstructedOctetString,
+    /// A required PDU or notification field is absent.
+    MissingPdu,
+    /// SNMPv3 message flags are internally inconsistent.
+    InvalidMsgFlags,
+    /// The SNMPv3 msgFlags OCTET STRING does not contain exactly one octet.
+    InvalidMsgFlagsLength {
+        /// Received content length.
+        length: usize,
+    },
+    /// The SNMPv3 security model is unsupported.
+    UnknownSecurityModel(i32),
+    /// A USM user name exceeds its ASN.1 size constraint.
+    InvalidUserNameLength {
+        /// Received name length in octets.
+        length: usize,
+    },
+    /// A NULL value has content octets.
+    InvalidNull,
+    /// An IpAddress value does not contain four octets.
+    InvalidIpAddressLength {
+        /// Received content length.
+        length: usize,
+    },
+    /// A BER long-form length uses too many length octets.
+    LengthTooLong {
+        /// Number of length octets.
+        octets: usize,
+    },
+    /// A Counter64 encoding uses too many content octets.
+    Integer64TooLong {
+        /// Received content length.
+        length: usize,
+    },
+    /// A declared TLV extends beyond its enclosing bytes.
+    TlvOverflow,
+    /// A fixed-size read exceeds its enclosing bytes.
+    InsufficientData {
+        /// Requested byte count.
+        needed: usize,
+        /// Remaining byte count.
+        available: usize,
+    },
+    /// An OBJECT IDENTIFIER is structurally invalid.
+    InvalidOid,
+    /// An OBJECT IDENTIFIER exceeds the supported arc count.
+    OidTooLong {
+        /// Decoded arc count.
+        count: usize,
+        /// Maximum supported arc count.
+        max: usize,
+    },
+    /// A signed INTEGER encoding uses too many content octets.
+    IntegerTooLong {
+        /// Received content length.
+        length: usize,
+    },
+    /// An Unsigned32 encoding uses too many content octets.
+    Unsigned32TooLong {
+        /// Received content length.
+        length: usize,
+    },
+    /// A nine-octet Counter64 lacks its required zero prefix.
+    Integer64MissingLeadingZero,
+    /// A nine-octet generic Unsigned32 input lacks its required zero prefix.
+    ///
+    /// The compatible generic-value decoder accepts the net-snmp unsigned
+    /// intermediate width of eight value octets plus one sign-protection
+    /// octet before applying the public `u32` representation.
+    Unsigned32MissingLeadingZero,
+    /// A tag selects BER's unsupported high-tag-number form.
+    UnsupportedMultiOctetTag {
+        /// First tag octet, whose low five bits are all set.
+        first_octet: u8,
+    },
+    /// Bytes remain inside an envelope that must be completely consumed.
+    TrailingData {
+        /// Number of unconsumed octets.
+        remaining: usize,
+    },
+    /// A received encoded message exceeds the configured receive limit.
+    MessageTooLarge {
+        /// Received encoded size.
+        size: usize,
+        /// Configured maximum encoded size.
+        maximum: usize,
+    },
+    /// An encoded value violates a protocol-level invariant.
+    InvalidValue,
+    /// The encoding form is recognized but unsupported.
+    UnsupportedEncoding,
+}
+
+impl std::fmt::Display for DecodeErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnexpectedTag { expected, actual } => {
+                write!(f, "expected tag 0x{expected:02X}, got 0x{actual:02X}")
+            }
+            Self::TruncatedData => f.write_str("unexpected end of data"),
+            Self::InvalidLength => f.write_str("invalid length encoding"),
+            Self::IndefiniteLength => f.write_str("indefinite length encoding not supported"),
+            Self::IntegerOverflow => f.write_str("integer overflow"),
+            Self::IntegerOutOfRange {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                f,
+                "integer {value} outside constrained range {minimum}..{maximum}"
+            ),
+            Self::UnsignedIntegerOutOfRange {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                f,
+                "unsigned integer {value} outside constrained range {minimum}..{maximum}"
+            ),
+            Self::ZeroLengthInteger => f.write_str("zero-length integer"),
+            Self::UnknownVersion(value) => write!(f, "unknown SNMP version: {value}"),
+            Self::UnknownPduType(tag) => write!(f, "unknown PDU type: 0x{tag:02X}"),
+            Self::ConstructedOctetString => {
+                f.write_str("constructed OCTET STRING is not supported")
+            }
+            Self::MissingPdu => f.write_str("missing PDU in message"),
+            Self::InvalidMsgFlags => f.write_str("invalid msgFlags"),
+            Self::InvalidMsgFlagsLength { length } => {
+                write!(f, "msgFlags must contain exactly one octet, got {length}")
+            }
+            Self::UnknownSecurityModel(model) => write!(f, "unknown security model: {model}"),
+            Self::InvalidUserNameLength { length } => {
+                write!(f, "msgUserName length {length} exceeds maximum 32")
+            }
+            Self::InvalidNull => f.write_str("NULL with non-zero length"),
+            Self::InvalidIpAddressLength { length } => {
+                write!(f, "IP address must be 4 bytes, got {length}")
+            }
+            Self::LengthTooLong { octets } => {
+                write!(f, "length encoding too long ({octets} octets)")
+            }
+            Self::Integer64TooLong { length } => write!(f, "integer64 too long: {length} bytes"),
+            Self::TlvOverflow => f.write_str("TLV extends past end of data"),
+            Self::InsufficientData { needed, available } => {
+                write!(f, "need {needed} bytes but only {available} remaining")
+            }
+            Self::InvalidOid => f.write_str("invalid object identifier"),
+            Self::OidTooLong { count, max } => {
+                write!(f, "OID has {count} arcs, exceeds maximum {max}")
+            }
+            Self::IntegerTooLong { length } => {
+                write!(f, "integer encoding too long: {length} bytes (max 8)")
+            }
+            Self::Unsigned32TooLong { length } => {
+                write!(f, "unsigned32 encoding too long: {length} bytes (max 9)")
+            }
+            Self::Integer64MissingLeadingZero => {
+                f.write_str("9-octet integer64 missing required leading zero byte")
+            }
+            Self::Unsigned32MissingLeadingZero => {
+                f.write_str("9-octet unsigned32 input missing required leading zero byte")
+            }
+            Self::UnsupportedMultiOctetTag { first_octet } => {
+                write!(
+                    f,
+                    "unsupported multi-octet tag starting with 0x{first_octet:02X}"
+                )
+            }
+            Self::TrailingData { remaining } => write!(f, "{remaining} unconsumed bytes"),
+            Self::MessageTooLarge { size, maximum } => {
+                write!(f, "message size {size} exceeds receive limit {maximum}")
+            }
+            Self::InvalidValue => f.write_str("invalid encoded value"),
+            Self::UnsupportedEncoding => f.write_str("unsupported encoding"),
+        }
+    }
+}
+
+/// A decoding failure with an explicit offset coordinate system.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("decode error at {origin} offset {offset}: {kind}{peer_suffix}", peer_suffix = peer.map(|value| format!(" from {value}")).unwrap_or_default())]
+pub struct DecodeError {
+    /// Coordinate system in which `offset` is measured.
+    pub origin: DecodeErrorOrigin,
+    /// Zero-based offset in `origin`.
+    pub offset: usize,
+    /// Structured failure reason.
+    pub kind: DecodeErrorKind,
+    /// Sending peer when decoding occurred at a network boundary.
+    pub peer: Option<SocketAddr>,
+}
+
+impl DecodeError {
+    /// Construct a standalone decode error without peer context.
+    #[must_use]
+    pub const fn new(offset: usize, kind: DecodeErrorKind) -> Self {
+        Self {
+            origin: DecodeErrorOrigin::Packet,
+            offset,
+            kind,
+            peer: None,
+        }
+    }
+
+    /// Construct a decode error in an explicit coordinate system.
+    #[must_use]
+    pub const fn with_origin(
+        origin: DecodeErrorOrigin,
+        offset: usize,
+        kind: DecodeErrorKind,
+    ) -> Self {
+        Self {
+            origin,
+            offset,
+            kind,
+            peer: None,
+        }
+    }
+
+    /// Attach the sending peer at a network boundary.
+    #[must_use]
+    pub const fn with_peer(mut self, peer: SocketAddr) -> Self {
+        self.peer = Some(peer);
+        self
+    }
+}
 
 /// Reason a walk operation was aborted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,7 +398,9 @@ pub enum ErrorKind {
     Auth,
     /// Terminal SNMPv3 Report.
     Report,
-    /// Malformed response.
+    /// Packet decoding failure.
+    Decode,
+    /// A decoded response violates operation semantics.
     MalformedResponse,
     /// Fixed-cardinality response-shape violation.
     ResponseShape,
@@ -156,6 +432,7 @@ impl ErrorKind {
             Self::Snmp => "snmp",
             Self::Auth => "authentication",
             Self::Report => "v3_report",
+            Self::Decode => "decode",
             Self::MalformedResponse => "malformed_response",
             Self::ResponseShape => "response_shape",
             Self::WalkAborted => "walk_aborted",
@@ -279,7 +556,15 @@ pub enum Error {
         status: Box<ReportStatus>,
     },
 
-    /// Malformed response from agent.
+    /// A packet could not be decoded.
+    #[error("{0}")]
+    Decode(
+        #[from]
+        #[source]
+        DecodeError,
+    ),
+
+    /// A decoded response violates operation-specific semantics.
     #[error("malformed response from {target}")]
     MalformedResponse { target: SocketAddr },
 
@@ -339,6 +624,7 @@ impl Error {
             Self::Snmp { .. } => ErrorKind::Snmp,
             Self::Auth { .. } => ErrorKind::Auth,
             Self::Report { .. } => ErrorKind::Report,
+            Self::Decode(_) => ErrorKind::Decode,
             Self::MalformedResponse { .. } => ErrorKind::MalformedResponse,
             Self::ResponseShape { .. } => ErrorKind::ResponseShape,
             Self::WalkAborted { .. } => ErrorKind::WalkAborted,
@@ -638,6 +924,10 @@ mod tests {
                 ErrorKind::MalformedResponse,
             ),
             (
+                Error::Decode(DecodeError::new(3, DecodeErrorKind::TruncatedData)),
+                ErrorKind::Decode,
+            ),
+            (
                 Error::ResponseShape {
                     target,
                     response: crate::client::FixedCardinalityResponse {
@@ -689,6 +979,7 @@ mod tests {
             (ErrorKind::Snmp, "snmp"),
             (ErrorKind::Auth, "authentication"),
             (ErrorKind::Report, "v3_report"),
+            (ErrorKind::Decode, "decode"),
             (ErrorKind::MalformedResponse, "malformed_response"),
             (ErrorKind::ResponseShape, "response_shape"),
             (ErrorKind::WalkAborted, "walk_aborted"),

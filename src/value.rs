@@ -1144,7 +1144,7 @@ impl Value {
             return Ok(value);
         }
         if !decoder.compatibility_policy().malformed_exception_payloads {
-            return Err(decoder.malformed());
+            return Err(decoder.malformed(DecodeErrorKind::InvalidValue));
         }
         let _ = decoder.read_bytes(len)?;
         tracing::warn!(target: "async_snmp::value", anomaly = "malformed_exception_payload", exception_type, payload_length = len, "discarded non-empty exception payload");
@@ -1153,6 +1153,7 @@ impl Value {
 
     /// Decode from BER.
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
+        let tag_offset = decoder.local_offset();
         let tag = decoder.read_tag()?;
         let len = decoder.read_length()?;
 
@@ -1167,7 +1168,10 @@ impl Value {
                     // The decoder is bounded to the enclosing varbind SEQUENCE,
                     // so compatible clamping cannot consume the next varbind.
                     if !decoder.compatibility_policy().clamp_bounded_strings {
-                        return Err(decoder.malformed());
+                        return Err(decoder.malformed(DecodeErrorKind::InsufficientData {
+                            needed: len,
+                            available,
+                        }));
                     }
                     tracing::warn!(target: "async_snmp::value", anomaly = "bounded_string_clamp", value_type = "octet_string", snmp.offset = decoder.offset(), declared_length = len, available_length = available, "clamped value length to enclosing varbind boundary");
                     available
@@ -1180,7 +1184,7 @@ impl Value {
             tag::universal::NULL => {
                 if len != 0 {
                     tracing::debug!(target: "async_snmp::value", { offset = decoder.offset(), kind = %DecodeErrorKind::InvalidNull }, "decode error");
-                    return Err(decoder.malformed());
+                    return Err(decoder.malformed(DecodeErrorKind::InvalidNull));
                 }
                 Ok(Value::Null)
             }
@@ -1191,7 +1195,9 @@ impl Value {
             tag::application::IP_ADDRESS => {
                 if len != 4 {
                     tracing::debug!(target: "async_snmp::value", { offset = decoder.offset(), length = len, kind = %DecodeErrorKind::InvalidIpAddressLength { length: len } }, "decode error");
-                    return Err(decoder.malformed());
+                    return Err(
+                        decoder.malformed(DecodeErrorKind::InvalidIpAddressLength { length: len })
+                    );
                 }
                 let data = decoder.read_bytes(4)?;
                 Ok(Value::IpAddress([data[0], data[1], data[2], data[3]]))
@@ -1212,7 +1218,10 @@ impl Value {
                 let available = decoder.remaining();
                 let len = if len > available {
                     if !decoder.compatibility_policy().clamp_bounded_strings {
-                        return Err(decoder.malformed());
+                        return Err(decoder.malformed(DecodeErrorKind::InsufficientData {
+                            needed: len,
+                            available,
+                        }));
                     }
                     tracing::warn!(target: "async_snmp::value", anomaly = "bounded_string_clamp", value_type = "opaque", snmp.offset = decoder.offset(), declared_length = len, available_length = available, "clamped value length to enclosing varbind boundary");
                     available
@@ -1247,7 +1256,7 @@ impl Value {
             // Net-snmp documents but does not parse constructed form; we follow suit.
             tag::universal::OCTET_STRING_CONSTRUCTED => {
                 tracing::debug!(target: "async_snmp::value", { offset = decoder.offset(), kind = %DecodeErrorKind::ConstructedOctetString }, "decode error");
-                Err(decoder.malformed())
+                Err(decoder.malformed_at(tag_offset, DecodeErrorKind::ConstructedOctetString))
             }
             _ => {
                 // Unknown tag - preserve for forward compatibility
@@ -1508,11 +1517,10 @@ mod tests {
             result.is_err(),
             "constructed OCTET STRING (0x24) should be rejected"
         );
-        // Verify error is MalformedResponse (detailed error kind is logged via tracing)
         let err = result.unwrap_err();
         assert!(
-            matches!(&*err, crate::Error::MalformedResponse { .. }),
-            "expected MalformedResponse error, got: {err:?}"
+            matches!(&*err, crate::Error::Decode(error) if error.kind == DecodeErrorKind::ConstructedOctetString),
+            "expected Decode error, got: {err:?}"
         );
     }
 
@@ -1528,9 +1536,7 @@ mod tests {
         for value in malformed_values {
             let mut decoder = Decoder::with_target(value, peer);
             let error = Value::decode(&mut decoder).unwrap_err();
-            assert!(
-                matches!(&*error, crate::Error::MalformedResponse { target } if *target == peer)
-            );
+            assert!(matches!(&*error, crate::Error::Decode(error) if error.peer == Some(peer)));
         }
     }
 

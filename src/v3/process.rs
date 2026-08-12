@@ -231,7 +231,11 @@ pub(crate) fn process_v3_inbound(
         }
     };
     let security_level = msg.global_data.msg_flags.security_level;
-    let usm_params = UsmSecurityParams::decode_with_target(msg.security_params.clone(), source)?;
+    let usm_params = UsmSecurityParams::decode_with_context(
+        msg.security_params.clone(),
+        msg.security_params_offset,
+        source,
+    )?;
 
     // Encodes the Report for `failure` (counting it first), unauthenticated
     // unless `auth_key` is given (notInTimeWindows, RFC 3414 3.2 Step 7a).
@@ -434,10 +438,10 @@ pub(crate) fn process_v3_inbound(
                 }
             };
 
-            decode_scoped_pdu_with_consumption(decrypted, source, Some(priv_key.protocol()))?
+            decode_scoped_pdu_with_consumption(decrypted, 0, source, Some(priv_key.protocol()))?
         }
-        RawMsgData::Plaintext(raw) => {
-            decode_scoped_pdu_with_consumption(raw.clone(), source, None)?
+        RawMsgData::Plaintext { data, offset } => {
+            decode_scoped_pdu_with_consumption(data.clone(), *offset, source, None)?
         }
     };
 
@@ -973,6 +977,68 @@ mod tests {
         assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
         assert_eq!(stats.not_in_time_windows.load(Ordering::Relaxed), 0);
         assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// Once valid authPriv input reaches scoped-PDU parsing, any structural
+    /// failure is measured in decrypted plaintext rather than packet bytes.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn inbound_decrypted_scoped_pdu_error_uses_plaintext_origin() {
+        use crate::error::DecodeErrorOrigin;
+        use crate::v3::{AuthProtocol, PrivProtocol, SaltCounter, UsmConfig};
+
+        let engine_id = local_engine_id();
+        let user = UsmUser::new("user").auth_priv(
+            AuthProtocol::Sha256,
+            b"auth-password",
+            PrivProtocol::Aes128,
+            b"priv-password",
+        );
+        let security = UsmConfig::new("user").auth_priv(
+            AuthProtocol::Sha256,
+            b"auth-password",
+            PrivProtocol::Aes128,
+            b"priv-password",
+        );
+        let keys = security.derive_keys(&engine_id).unwrap();
+        let auth_key = keys.auth_key.as_ref().unwrap();
+        let mut users = HashMap::new();
+        users.insert(Bytes::from_static(b"user"), user);
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let mut data = crate::v3::encode::encode_v3_message(
+            &Pdu::get_request(42, &[]),
+            1,
+            &engine_id,
+            7,
+            1000,
+            &security,
+            Some(&keys),
+            Some(&SaltCounter::from_value(1)),
+            true,
+            crate::UDP_RECEIVE_LIMITS.advertised(),
+        )
+        .unwrap();
+        let raw = RawV3Message::decode(Bytes::copy_from_slice(&data)).unwrap();
+        let RawMsgData::Encrypted(ciphertext) = raw.msg_data else {
+            panic!("authPriv encoder must produce ciphertext");
+        };
+        let ciphertext_offset = data
+            .windows(ciphertext.len())
+            .position(|window| window == ciphertext.as_ref())
+            .unwrap();
+        data[ciphertext_offset..ciphertext_offset + ciphertext.len()].fill(0);
+        let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data).unwrap();
+        data[auth_offset..auth_offset + auth_len].fill(0);
+        crate::v3::auth::authenticate_message(auth_key, &mut data, auth_offset, auth_len).unwrap();
+
+        let error = match process_v3_inbound(data.into(), &ctx, &V3Role::Authoritative) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed decrypted scoped PDU must fail"),
+        };
+        assert!(matches!(&*error, Error::Decode(error)
+            if error.origin == DecodeErrorOrigin::DecryptedScopedPdu
+                && error.peer == Some(ctx.source)));
     }
 
     /// Lower-level extra fields have no RFC 3414 failure counter. Once the

@@ -24,8 +24,8 @@ use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
 use crate::compatibility::CompatibilityPolicy;
-use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::internal::{DecodeErrorKind, DecodeErrorOrigin};
+use crate::error::{DecodeError, Error, Result};
 use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
 use crate::message_size::{MESSAGE_SIZE_MINIMUM, MessageSize};
 use crate::pdu::Pdu;
@@ -143,11 +143,8 @@ impl MsgFlags {
     /// Decode from byte.
     pub fn from_byte(byte: u8) -> Result<Self> {
         let security_level = SecurityLevel::from_flags(byte).ok_or_else(|| {
-            tracing::debug!(target: "async_snmp::v3", { byte, kind = %DecodeErrorKind::InvalidMsgFlags }, "decode error");
-            Error::MalformedResponse {
-                target: UNKNOWN_TARGET,
-            }
-            .boxed()
+            tracing::debug!(target: "async_snmp::v3", { byte }, "invalid msgFlags semantics");
+            Error::InvalidMessage("SNMPv3 privacy flag requires authentication".into()).boxed()
         })?;
         let reportable = byte & 0x04 != 0;
         Ok(Self {
@@ -255,22 +252,31 @@ impl MsgGlobalData {
             MessageSize::from_i32(msg_max_size_raw).expect("bounded msgMaxSize must construct");
 
         let flags_bytes = seq.read_octet_string()?;
+        let flags_offset = seq.local_offset().saturating_sub(flags_bytes.len());
         if flags_bytes.len() != 1 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), expected = 1, actual = flags_bytes.len() }, "invalid msgFlags length");
-            return Err(seq.malformed());
+            return Err(seq.malformed_at(
+                flags_offset,
+                DecodeErrorKind::InvalidMsgFlagsLength {
+                    length: flags_bytes.len(),
+                },
+            ));
         }
-        let msg_flags = MsgFlags::from_byte(flags_bytes[0]).map_err(|_| seq.malformed())?;
+        let msg_flags = MsgFlags::from_byte(flags_bytes[0])
+            .map_err(|_| seq.malformed_at(flags_offset, DecodeErrorKind::InvalidMsgFlags))?;
 
         let msg_security_model_raw = seq.read_bounded_integer(1, i32::MAX)?;
         // Reject unknown security models per RFC 3412 Section 7.2
         let msg_security_model =
             V3SecurityModel::from_i32(msg_security_model_raw).ok_or_else(|| {
                 tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), model = msg_security_model_raw, kind = %DecodeErrorKind::UnknownSecurityModel(msg_security_model_raw) }, "decode error");
-                seq.malformed()
+                seq.malformed(DecodeErrorKind::UnknownSecurityModel(msg_security_model_raw))
             })?;
 
         if !seq.is_empty() {
-            return Err(seq.malformed());
+            return Err(seq.malformed(DecodeErrorKind::TrailingData {
+                remaining: seq.remaining(),
+            }));
         }
 
         Ok(Self {
@@ -350,7 +356,9 @@ impl ScopedPdu {
         let pdu = Pdu::decode(&mut seq)?;
 
         if !seq.is_empty() {
-            return Err(seq.malformed());
+            return Err(seq.malformed(DecodeErrorKind::TrailingData {
+                remaining: seq.remaining(),
+            }));
         }
 
         Ok(Self {
@@ -367,10 +375,16 @@ impl ScopedPdu {
 /// may carry at most seven padding octets from their eight-octet CBC block.
 pub(crate) fn decode_scoped_pdu_with_consumption(
     data: Bytes,
+    base_offset: usize,
     source: SocketAddr,
     privacy: Option<crate::v3::PrivProtocol>,
 ) -> Result<ScopedPdu> {
-    let mut decoder = Decoder::with_target(data, source);
+    let origin = if privacy.is_some() {
+        DecodeErrorOrigin::DecryptedScopedPdu
+    } else {
+        DecodeErrorOrigin::Packet
+    };
+    let mut decoder = Decoder::with_origin_context(data, base_offset, origin, Some(source));
     let scoped = ScopedPdu::decode(&mut decoder)?;
     let maximum_suffix = match privacy {
         Some(crate::v3::PrivProtocol::Des | crate::v3::PrivProtocol::Des3) => 7,
@@ -382,7 +396,9 @@ pub(crate) fn decode_scoped_pdu_with_consumption(
         | None => 0,
     };
     if decoder.remaining() > maximum_suffix {
-        return Err(decoder.malformed());
+        return Err(decoder.malformed(DecodeErrorKind::TrailingData {
+            remaining: decoder.remaining(),
+        }));
     }
     Ok(scoped)
 }
@@ -469,13 +485,18 @@ impl V3Message {
         self.global_data.validate()?;
         let level = self.global_data.msg_flags.security_level;
         if level.requires_priv() != matches!(self.data, V3MessageData::Encrypted(_)) {
-            return Err(Error::Config(
+            return Err(Error::InvalidMessage(
                 "SNMPv3 privacy flag contradicts the msgData representation".into(),
             )
             .boxed());
         }
         let usm = crate::v3::UsmSecurityParams::decode(self.security_params.clone())?;
-        usm.validate_for_security_level(level)
+        self.validate_decoded_inbound_envelope(&usm)
+    }
+
+    fn validate_decoded_inbound_envelope(&self, usm: &crate::v3::UsmSecurityParams) -> Result<()> {
+        usm.validate_for_security_level(self.global_data.msg_flags.security_level)
+            .map_err(|error| Error::InvalidMessage(error.to_string().into()).boxed())
     }
 
     fn validate_outbound(&self) -> Result<()> {
@@ -592,7 +613,7 @@ impl V3Message {
         let version = seq.read_bounded_integer(0, i32::MAX)?;
         if version != 3 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), version, kind = %DecodeErrorKind::UnknownVersion(version) }, "decode error");
-            return Err(seq.malformed());
+            return Err(seq.malformed(DecodeErrorKind::UnknownVersion(version)));
         }
 
         let value = Self::decode_from_sequence(&mut seq)?;
@@ -612,6 +633,15 @@ impl V3Message {
 
         // msgSecurityParameters (OCTET STRING containing USM params)
         let security_params = seq.read_octet_string()?;
+        let security_params_offset = seq.offset().saturating_sub(security_params.len());
+        let mut security_decoder =
+            Decoder::with_context(security_params.clone(), security_params_offset, seq.peer());
+        let usm = crate::v3::UsmSecurityParams::decode_from(&mut security_decoder)?;
+        if !security_decoder.is_empty() {
+            return Err(security_decoder.malformed(DecodeErrorKind::TrailingData {
+                remaining: security_decoder.remaining(),
+            }));
+        }
 
         // msgData - either plaintext SEQUENCE or encrypted OCTET STRING
         let data = if global_data.msg_flags.security_level.requires_priv() {
@@ -629,9 +659,7 @@ impl V3Message {
             security_params,
             data,
         };
-        value
-            .validate_inbound_envelope()
-            .map_err(|_| seq.malformed())?;
+        value.validate_decoded_inbound_envelope(&usm)?;
         Ok(value)
     }
 
@@ -673,6 +701,7 @@ pub struct RawV3Message {
     pub(crate) global_data: MsgGlobalData,
     /// Security parameters (opaque, USM-encoded)
     pub(crate) security_params: Bytes,
+    pub(crate) security_params_offset: usize,
     /// Raw msgData, form selected by the received privacy flag
     pub(crate) msg_data: RawMsgData,
 }
@@ -681,7 +710,12 @@ pub struct RawV3Message {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawMsgData {
     /// Unparsed plaintext `ScopedPDU` TLV bytes (noAuthNoPriv or authNoPriv)
-    Plaintext(Bytes),
+    Plaintext {
+        /// Complete scoped-PDU TLV.
+        data: Bytes,
+        /// Packet-relative start of `data`.
+        offset: usize,
+    },
     /// Encrypted `ScopedPDU` ciphertext (authPriv)
     Encrypted(Bytes),
 }
@@ -703,7 +737,7 @@ impl RawV3Message {
     /// compatible-mode trailing-byte anomaly.
     pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
         let input_len = data.len();
-        Self::decode_bounded_with_target(data, input_len, UNKNOWN_TARGET, policy)
+        Self::decode_bounded(data, input_len, None, policy)
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
@@ -717,34 +751,56 @@ impl RawV3Message {
         target: SocketAddr,
         policy: DecodePolicy,
     ) -> Result<DecodeOutcome<Self>> {
+        Self::decode_bounded(data, maximum, Some(target), policy)
+    }
+
+    fn decode_bounded(
+        data: Bytes,
+        maximum: usize,
+        peer: Option<SocketAddr>,
+        policy: DecodePolicy,
+    ) -> Result<DecodeOutcome<Self>> {
         if data.len() > maximum {
-            tracing::debug!(target: "async_snmp::v3", { received_size = data.len(), maximum, peer = %target }, "message exceeds receive limit");
-            return Err(Error::MalformedResponse { target }.boxed());
+            let mut error = DecodeError::new(
+                0,
+                DecodeErrorKind::MessageTooLarge {
+                    size: data.len(),
+                    maximum,
+                },
+            );
+            error.peer = peer;
+            return Err(Error::Decode(error).boxed());
         }
-        let mut decoder = Decoder::with_target(data, target);
+        let mut decoder = Decoder::with_optional_peer(data, peer);
         let mut seq = decoder.read_sequence()?;
 
         let version = seq.read_bounded_integer(0, i32::MAX)?;
         if version != 3 {
             tracing::debug!(target: "async_snmp::v3", { offset = seq.offset(), version, kind = %DecodeErrorKind::UnknownVersion(version) }, "decode error");
-            return Err(seq.malformed());
+            return Err(seq.malformed(DecodeErrorKind::UnknownVersion(version)));
         }
 
         let global_data = MsgGlobalData::decode(&mut seq)?;
         let security_params = seq.read_octet_string()?;
+        let security_params_offset = seq.offset().saturating_sub(security_params.len());
 
         let msg_data = if global_data.msg_flags.security_level.requires_priv() {
             RawMsgData::Encrypted(seq.read_octet_string()?)
         } else {
             // Capture the complete plaintext ScopedPDU TLV unparsed.
-            let start = seq.offset();
+            let start = seq.local_offset();
+            let packet_offset = seq.offset();
             seq.skip_tlv()?;
-            RawMsgData::Plaintext(seq.as_bytes().slice(start..seq.offset()))
+            RawMsgData::Plaintext {
+                data: seq.as_bytes().slice(start..seq.local_offset()),
+                offset: packet_offset,
+            }
         };
 
         let value = Self {
             global_data,
             security_params,
+            security_params_offset,
             msg_data,
         };
         let anomaly = finalize_envelope(&seq, &decoder, policy)?;
@@ -971,7 +1027,7 @@ mod tests {
 
     #[test]
     fn scoped_pdu_suffix_rules_match_privacy_protocols() {
-        let source = UNKNOWN_TARGET;
+        let source = "127.0.0.1:161".parse().unwrap();
         for suffix in 0..=8 {
             let mut bytes = valid_scoped_bytes().to_vec();
             bytes.extend(std::iter::repeat_n(0, suffix));
@@ -979,6 +1035,7 @@ mod tests {
             assert_eq!(
                 decode_scoped_pdu_with_consumption(
                     bytes.clone(),
+                    0,
                     source,
                     Some(crate::v3::PrivProtocol::Des)
                 )
@@ -988,6 +1045,7 @@ mod tests {
             assert_eq!(
                 decode_scoped_pdu_with_consumption(
                     bytes.clone(),
+                    0,
                     source,
                     Some(crate::v3::PrivProtocol::Des3)
                 )
@@ -997,6 +1055,7 @@ mod tests {
             assert_eq!(
                 decode_scoped_pdu_with_consumption(
                     bytes.clone(),
+                    0,
                     source,
                     Some(crate::v3::PrivProtocol::Aes128)
                 )
@@ -1006,6 +1065,7 @@ mod tests {
             assert_eq!(
                 decode_scoped_pdu_with_consumption(
                     bytes.clone(),
+                    0,
                     source,
                     Some(crate::v3::PrivProtocol::Aes192)
                 )
@@ -1015,6 +1075,7 @@ mod tests {
             assert_eq!(
                 decode_scoped_pdu_with_consumption(
                     bytes.clone(),
+                    0,
                     source,
                     Some(crate::v3::PrivProtocol::Aes256)
                 )
@@ -1022,10 +1083,169 @@ mod tests {
                 suffix == 0
             );
             assert_eq!(
-                decode_scoped_pdu_with_consumption(bytes, source, None).is_ok(),
+                decode_scoped_pdu_with_consumption(bytes, 0, source, None).is_ok(),
                 suffix == 0
             );
         }
+    }
+
+    #[test]
+    fn decrypted_scoped_pdu_errors_use_plaintext_coordinates_and_retain_peer() {
+        let source = "192.0.2.80:161".parse().unwrap();
+        let mut plaintext = valid_scoped_bytes().to_vec();
+        let pdu_offset = plaintext
+            .iter()
+            .position(|byte| *byte == crate::ber::tag::pdu::GET_REQUEST)
+            .unwrap();
+        plaintext[pdu_offset] = 0xaf;
+
+        let error = decode_scoped_pdu_with_consumption(
+            Bytes::from(plaintext),
+            0,
+            source,
+            Some(crate::v3::PrivProtocol::Aes128),
+        )
+        .unwrap_err();
+        assert!(matches!(&*error, Error::Decode(error)
+            if error.origin == DecodeErrorOrigin::DecryptedScopedPdu
+                && error.offset == pdu_offset
+                && error.kind == DecodeErrorKind::UnknownPduType(0xaf)
+                && error.peer == Some(source)));
+        assert!(
+            error
+                .to_string()
+                .contains("decrypted scoped-PDU plaintext offset")
+        );
+    }
+
+    #[test]
+    fn decoded_v3_semantic_failures_are_not_structural_decode_errors() {
+        let global = MsgGlobalData::new(
+            7,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        )
+        .unwrap();
+        let security_params =
+            crate::v3::UsmSecurityParams::new(b"engine".as_slice(), 0, 0, Bytes::new())
+                .unwrap()
+                .with_auth_params([0_u8; 12].as_slice())
+                .unwrap()
+                .encode()
+                .unwrap();
+        let scoped = ScopedPdu::with_empty_context(Pdu::get_request(42, &[]));
+        let mut encoded = EncodeBuf::new();
+        encoded
+            .try_push_sequence(|buf| {
+                scoped.encode(buf)?;
+                buf.try_push_octet_string(&security_params)?;
+                global.encode(buf)?;
+                buf.push_integer(3);
+                Ok(())
+            })
+            .unwrap();
+
+        let error = V3Message::decode(encoded.finish()).unwrap_err();
+        assert!(matches!(&*error, Error::InvalidMessage(_)));
+    }
+
+    #[test]
+    fn full_v3_envelope_reports_multi_octet_pdu_tag_at_packet_offset() {
+        let global = MsgGlobalData::new(
+            7,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        )
+        .unwrap();
+        let message = V3Message::new(
+            global,
+            no_auth_security_params(),
+            ScopedPdu::with_empty_context(Pdu::get_request(42, &[])),
+        )
+        .unwrap();
+        let mut encoded = message.encode().unwrap().to_vec();
+        let pdu_offset = encoded
+            .iter()
+            .position(|byte| *byte == crate::ber::tag::pdu::GET_REQUEST)
+            .unwrap();
+        encoded[pdu_offset] = 0xbf;
+
+        let error = V3Message::decode(Bytes::from(encoded)).unwrap_err();
+        assert!(matches!(&*error, Error::Decode(error)
+            if error.origin == DecodeErrorOrigin::Packet
+                && error.offset == pdu_offset
+                && error.kind == DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: 0xbf }));
+    }
+
+    #[test]
+    fn v3_nested_decode_offsets_remain_packet_relative_across_raw_transitions() {
+        let global = MsgGlobalData::new(
+            7,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        )
+        .unwrap();
+        let message = V3Message::new(
+            global,
+            no_auth_security_params(),
+            ScopedPdu::with_empty_context(Pdu::get_request(42, &[])),
+        )
+        .unwrap();
+        let mut encoded = message.encode().unwrap().to_vec();
+        let pdu_offset = encoded
+            .iter()
+            .position(|byte| *byte == crate::ber::tag::pdu::GET_REQUEST)
+            .unwrap();
+        encoded[pdu_offset] = 0xaf;
+
+        let standalone = V3Message::decode(Bytes::from(encoded.clone())).unwrap_err();
+        assert!(matches!(&*standalone, Error::Decode(error)
+            if error.origin == DecodeErrorOrigin::Packet
+                && error.offset == pdu_offset
+                && error.kind == DecodeErrorKind::UnknownPduType(0xaf)
+                && error.peer.is_none()));
+
+        let raw = RawV3Message::decode(Bytes::from(encoded)).unwrap();
+        let RawMsgData::Plaintext { data, offset } = raw.msg_data else {
+            panic!("expected plaintext msgData");
+        };
+        let peer = "192.0.2.70:161".parse().unwrap();
+        let network = decode_scoped_pdu_with_consumption(data, offset, peer, None).unwrap_err();
+        assert!(matches!(&*network, Error::Decode(error)
+            if error.origin == DecodeErrorOrigin::Packet
+                && error.offset == pdu_offset
+                && error.kind == DecodeErrorKind::UnknownPduType(0xaf)
+                && error.peer == Some(peer)));
+    }
+
+    #[test]
+    fn v3_embedded_usm_decode_offset_is_packet_relative() {
+        let global = MsgGlobalData::new(
+            7,
+            crate::MessageSize::new(1472).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        )
+        .unwrap();
+        let security_params = no_auth_security_params();
+        let message = V3Message::new(
+            global,
+            security_params.clone(),
+            ScopedPdu::with_empty_context(Pdu::get_request(42, &[])),
+        )
+        .unwrap();
+        let mut encoded = message.encode().unwrap().to_vec();
+        let usm_offset = encoded
+            .windows(security_params.len())
+            .position(|window| window == security_params.as_ref())
+            .unwrap();
+        encoded[usm_offset] = 0x31;
+
+        let error = V3Message::decode(Bytes::from(encoded)).unwrap_err();
+        assert!(matches!(&*error, Error::Decode(error)
+            if error.origin == DecodeErrorOrigin::Packet
+                && error.offset == usm_offset
+                && error.kind == DecodeErrorKind::UnexpectedTag { expected: 0x30, actual: 0x31 }
+                && error.peer.is_none()));
     }
 
     #[test]
@@ -1233,7 +1453,7 @@ mod tests {
         assert_eq!(raw.msg_id(), 7);
         assert_eq!(raw.security_level(), SecurityLevel::AuthNoPriv);
         assert_eq!(raw.security_params.as_ref(), b"usm-params");
-        let RawMsgData::Plaintext(scoped) = raw.msg_data else {
+        let RawMsgData::Plaintext { data: scoped, .. } = raw.msg_data else {
             panic!("expected plaintext msgData");
         };
         assert_eq!(scoped.as_ref(), &[0x30, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]);
@@ -1280,7 +1500,7 @@ mod tests {
         let msg = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
 
         let raw = RawV3Message::decode(msg.encode().unwrap()).unwrap();
-        let RawMsgData::Plaintext(bytes) = raw.msg_data else {
+        let RawMsgData::Plaintext { data: bytes, .. } = raw.msg_data else {
             panic!("expected plaintext msgData");
         };
         let mut decoder = Decoder::new(bytes);
@@ -1340,12 +1560,11 @@ mod tests {
             .expect("msgFlags not found");
         bytes[pos + 2] = 0x02;
 
-        let result = RawV3Message::decode(Bytes::from(bytes));
-        assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        let error = RawV3Message::decode(Bytes::from(bytes)).unwrap_err();
+        assert!(matches!(&*error, Error::Decode(error)
+            if error.origin == DecodeErrorOrigin::Packet
+                && error.offset == pos + 2
+                && error.kind == DecodeErrorKind::InvalidMsgFlags));
     }
 
     /// Reserved and reportable flag bits do not alter the derived security
@@ -1593,10 +1812,7 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]
@@ -1641,7 +1857,7 @@ mod tests {
             let mut decoder = Decoder::new(buf.finish());
             assert!(matches!(
                 *MsgGlobalData::decode(&mut decoder).unwrap_err(),
-                Error::MalformedResponse { .. }
+                Error::Decode(_)
             ));
         }
     }
@@ -1683,10 +1899,7 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]
@@ -1706,10 +1919,7 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]
@@ -1777,10 +1987,7 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]
@@ -1800,10 +2007,7 @@ mod tests {
         let result = MsgGlobalData::decode(&mut decoder);
 
         assert!(result.is_err());
-        assert!(matches!(
-            *result.unwrap_err(),
-            Error::MalformedResponse { .. }
-        ));
+        assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
 
     #[test]

@@ -542,10 +542,11 @@ impl Pdu {
 
     /// Decode from BER (after tag has been peeked).
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
+        let tag_offset = decoder.local_offset();
         let tag = decoder.read_tag()?;
         let pdu_type = PduType::from_tag(tag).ok_or_else(|| {
             tracing::debug!(target: "async_snmp::pdu", { offset = decoder.offset(), tag = tag, kind = %DecodeErrorKind::UnknownPduType(tag) }, "decode error");
-            decoder.malformed()
+            decoder.malformed_at(tag_offset, DecodeErrorKind::UnknownPduType(tag))
         })?;
 
         // The SNMPv1 Trap PDU (tag 0xA4) has a distinct wire layout (RFC 1157
@@ -555,7 +556,7 @@ impl Pdu {
         // v1 Trap tag, which is rejected.
         if pdu_type == PduType::TrapV1 {
             tracing::debug!(target: "async_snmp::pdu", { offset = decoder.offset(), tag = tag }, "TrapV1 PDU tag not valid in generic PDU context");
-            return Err(decoder.malformed());
+            return Err(decoder.malformed_at(tag_offset, DecodeErrorKind::UnknownPduType(tag)));
         }
 
         let len = decoder.read_length()?;
@@ -568,7 +569,9 @@ impl Pdu {
         let mut second_field = pdu_decoder.read_bounded_integer(i32::MIN, i32::MAX)?;
         let varbinds = decode_varbind_list(&mut pdu_decoder)?;
         if !pdu_decoder.is_empty() {
-            return Err(pdu_decoder.malformed());
+            return Err(pdu_decoder.malformed(DecodeErrorKind::TrailingData {
+                remaining: pdu_decoder.remaining(),
+            }));
         }
 
         let body = if pdu_type == PduType::GetBulkRequest {
@@ -581,22 +584,24 @@ impl Pdu {
                         .compatibility_policy()
                         .normalize_negative_get_bulk_fields
                     {
-                        return Err(decoder.malformed());
+                        return Err(decoder.malformed(DecodeErrorKind::InvalidValue));
                     }
                     tracing::warn!(target: "async_snmp::pdu", anomaly = "negative_get_bulk_field", direction = "decode", field, value = *value, normalized = 0, "normalized negative GETBULK field");
                     *value = 0;
                 }
             }
-            let non_repeaters = u32::try_from(first_field).map_err(|_| pdu_decoder.malformed())?;
-            let max_repetitions =
-                u32::try_from(second_field).map_err(|_| pdu_decoder.malformed())?;
+            let non_repeaters = u32::try_from(first_field)
+                .map_err(|_| pdu_decoder.malformed(DecodeErrorKind::InvalidValue))?;
+            let max_repetitions = u32::try_from(second_field)
+                .map_err(|_| pdu_decoder.malformed(DecodeErrorKind::InvalidValue))?;
             PduBody::GetBulk {
                 non_repeaters,
                 max_repetitions,
             }
         } else {
-            let standard_type =
-                StandardPduType::try_from(pdu_type).map_err(|_| pdu_decoder.malformed())?;
+            let standard_type = StandardPduType::try_from(pdu_type).map_err(|_| {
+                pdu_decoder.malformed(DecodeErrorKind::UnknownPduType(pdu_type.tag()))
+            })?;
             PduBody::Standard {
                 pdu_type: standard_type,
                 error_status: first_field,
@@ -1122,12 +1127,20 @@ impl TrapV1Pdu {
                     expected: 0x40,
                     actual: agent_tag,
                 } }, "decode error");
-            return Err(pdu.malformed());
+            return Err(pdu.malformed_at(
+                pdu.local_offset() - 1,
+                DecodeErrorKind::UnexpectedTag {
+                    expected: tag::application::IP_ADDRESS,
+                    actual: agent_tag,
+                },
+            ));
         }
         let agent_len = pdu.read_length()?;
         if agent_len != 4 {
             tracing::debug!(target: "async_snmp::pdu", { offset = pdu.offset(), length = agent_len, kind = %DecodeErrorKind::InvalidIpAddressLength { length: agent_len } }, "decode error");
-            return Err(pdu.malformed());
+            return Err(
+                pdu.malformed(DecodeErrorKind::InvalidIpAddressLength { length: agent_len })
+            );
         }
         let agent_bytes = pdu.read_bytes(4)?;
         let agent_addr = [
@@ -1149,7 +1162,13 @@ impl TrapV1Pdu {
                     expected: 0x43,
                     actual: ts_tag,
                 } }, "decode error");
-            return Err(pdu.malformed());
+            return Err(pdu.malformed_at(
+                pdu.local_offset() - 1,
+                DecodeErrorKind::UnexpectedTag {
+                    expected: tag::application::TIMETICKS,
+                    actual: ts_tag,
+                },
+            ));
         }
         let ts_len = pdu.read_length()?;
         let time_stamp = pdu.read_bounded_unsigned32_value(ts_len)?;
@@ -1157,7 +1176,9 @@ impl TrapV1Pdu {
         // variable-bindings
         let varbinds = decode_varbind_list(&mut pdu)?;
         if !pdu.is_empty() {
-            return Err(pdu.malformed());
+            return Err(pdu.malformed(DecodeErrorKind::TrailingData {
+                remaining: pdu.remaining(),
+            }));
         }
 
         Ok(TrapV1Pdu {
@@ -1660,7 +1681,7 @@ mod tests {
         let mut strict = Decoder::new(encoded)
             .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
         let error = Pdu::decode(&mut strict).unwrap_err();
-        assert!(matches!(*error, Error::MalformedResponse { .. }));
+        assert!(matches!(*error, Error::Decode(_)));
     }
 
     #[test]
@@ -1675,7 +1696,7 @@ mod tests {
         let mut strict = Decoder::new(encoded)
             .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
         let error = Pdu::decode(&mut strict).unwrap_err();
-        assert!(matches!(*error, Error::MalformedResponse { .. }));
+        assert!(matches!(*error, Error::Decode(_)));
     }
 
     #[test]

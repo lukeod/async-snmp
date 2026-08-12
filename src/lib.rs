@@ -564,7 +564,10 @@ pub use client::{
 };
 pub use community::Community;
 pub use compatibility::CompatibilityPolicy;
-pub use error::{ConstructionStage, Error, ErrorKind, ErrorStatus, Result, WalkAbortReason};
+pub use error::{
+    ConstructionStage, DecodeError, DecodeErrorKind, DecodeErrorOrigin, Error, ErrorKind,
+    ErrorStatus, Result, WalkAbortReason,
+};
 #[cfg(feature = "agent")]
 pub use handler::{
     BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, OidTable,

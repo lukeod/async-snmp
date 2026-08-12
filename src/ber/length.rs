@@ -7,8 +7,8 @@
 
 use std::net::SocketAddr;
 
-use crate::error::internal::DecodeErrorKind;
-use crate::error::{Error, Result, UNKNOWN_TARGET};
+use crate::error::internal::{DecodeErrorKind, DecodeErrorOrigin};
+use crate::error::{DecodeError, Error, Result};
 
 /// Returns the number of bytes needed to encode a length value in BER.
 ///
@@ -211,11 +211,24 @@ pub fn decode_length(
     base_offset: usize,
     target: Option<SocketAddr>,
 ) -> Result<(usize, usize)> {
-    let target = target.unwrap_or(UNKNOWN_TARGET);
+    decode_length_with_origin(data, base_offset, DecodeErrorOrigin::Packet, target)
+}
+
+pub(crate) fn decode_length_with_origin(
+    data: &[u8],
+    base_offset: usize,
+    origin: DecodeErrorOrigin,
+    target: Option<SocketAddr>,
+) -> Result<(usize, usize)> {
+    let failure = |offset, kind| {
+        let mut error = DecodeError::with_origin(origin, offset, kind);
+        error.peer = target;
+        Error::Decode(error).boxed()
+    };
 
     if data.is_empty() {
         tracing::debug!(target: "async_snmp::ber", { snmp.offset = %base_offset, kind = %DecodeErrorKind::TruncatedData }, "truncated data: unexpected end of input in length");
-        return Err(Error::MalformedResponse { target }.boxed());
+        return Err(failure(base_offset, DecodeErrorKind::TruncatedData));
     }
 
     let first = data[0];
@@ -223,7 +236,7 @@ pub fn decode_length(
     if first == 0x80 {
         // Indefinite length - rejected per net-snmp behavior
         tracing::debug!(target: "async_snmp::ber", { snmp.offset = %base_offset, kind = %DecodeErrorKind::IndefiniteLength }, "indefinite length encoding not supported");
-        return Err(Error::MalformedResponse { target }.boxed());
+        return Err(failure(base_offset, DecodeErrorKind::IndefiniteLength));
     }
 
     if first & 0x80 == 0 {
@@ -235,18 +248,27 @@ pub fn decode_length(
 
         if num_octets == 0 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %base_offset, kind = %DecodeErrorKind::InvalidLength }, "invalid length encoding: zero octets in long form");
-            return Err(Error::MalformedResponse { target }.boxed());
+            return Err(failure(base_offset, DecodeErrorKind::InvalidLength));
         }
 
         if num_octets > 8 {
             // Net-snmp on 64-bit rejects > sizeof(long) = 8 length octets.
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %base_offset, kind = %DecodeErrorKind::LengthTooLong { octets: num_octets } }, "length encoding too long");
-            return Err(Error::MalformedResponse { target }.boxed());
+            return Err(failure(
+                base_offset,
+                DecodeErrorKind::LengthTooLong { octets: num_octets },
+            ));
         }
 
         if data.len() < 1 + num_octets {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %base_offset, kind = %DecodeErrorKind::InsufficientData { needed: 1 + num_octets, available: data.len() } }, "truncated data in length field");
-            return Err(Error::MalformedResponse { target }.boxed());
+            return Err(failure(
+                base_offset,
+                DecodeErrorKind::InsufficientData {
+                    needed: 1 + num_octets,
+                    available: data.len(),
+                },
+            ));
         }
 
         let mut len: usize = 0;
@@ -254,7 +276,7 @@ pub fn decode_length(
             len = len
                 .checked_mul(256)
                 .and_then(|value| value.checked_add(data[1 + i] as usize))
-                .ok_or_else(|| Error::MalformedResponse { target }.boxed())?;
+                .ok_or_else(|| failure(base_offset + i + 1, DecodeErrorKind::IntegerOverflow))?;
         }
 
         Ok((len, 1 + num_octets))

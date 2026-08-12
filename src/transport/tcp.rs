@@ -771,9 +771,30 @@ async fn read_ber_message(
         .map_err(|e| Error::Network { target, source: e }.boxed())?;
 
     let tag = tag_buf[0];
+    if tag & 0x1f == 0x1f {
+        tracing::debug!(target: "async_snmp::transport::tcp", { actual_tag = tag, %target }, "multi-byte tag not supported");
+        return Err(Error::Decode(
+            crate::DecodeError::new(
+                0,
+                crate::DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: tag },
+            )
+            .with_peer(target),
+        )
+        .boxed());
+    }
     if tag != 0x30 {
         tracing::debug!(target: "async_snmp::transport::tcp", { expected_tag = 0x30, actual_tag = tag, %target }, "invalid SNMP message tag");
-        return Err(Error::MalformedResponse { target }.boxed());
+        return Err(Error::Decode(
+            crate::DecodeError::new(
+                0,
+                crate::DecodeErrorKind::UnexpectedTag {
+                    expected: 0x30,
+                    actual: tag,
+                },
+            )
+            .with_peer(target),
+        )
+        .boxed());
     }
 
     // Read length
@@ -791,14 +812,27 @@ async fn read_ber_message(
         std::cmp::Ordering::Equal => {
             // Indefinite length - not supported
             tracing::debug!(target: "async_snmp::transport::tcp", { %target }, "indefinite length encoding not supported");
-            return Err(Error::MalformedResponse { target }.boxed());
+            return Err(Error::Decode(
+                crate::DecodeError::new(1, crate::DecodeErrorKind::IndefiniteLength)
+                    .with_peer(target),
+            )
+            .boxed());
         }
         std::cmp::Ordering::Greater => {
             // Long form: first byte indicates number of following length bytes
             let num_len_bytes = (first_len_byte[0] & 0x7F) as usize;
             if num_len_bytes > 4 {
                 tracing::debug!(target: "async_snmp::transport::tcp", { octets = num_len_bytes, %target }, "length encoding too long");
-                return Err(Error::MalformedResponse { target }.boxed());
+                return Err(Error::Decode(
+                    crate::DecodeError::new(
+                        1,
+                        crate::DecodeErrorKind::LengthTooLong {
+                            octets: num_len_bytes,
+                        },
+                    )
+                    .with_peer(target),
+                )
+                .boxed());
             }
 
             let mut len_bytes_buf = vec![0u8; num_len_bytes];
@@ -825,10 +859,26 @@ async fn read_ber_message(
     let total_len = 1usize
         .checked_add(len_bytes.len())
         .and_then(|header_len| header_len.checked_add(content_len))
-        .ok_or_else(|| Error::MalformedResponse { target }.boxed())?;
+        .ok_or_else(|| {
+            Error::Decode(
+                crate::DecodeError::new(1, crate::DecodeErrorKind::IntegerOverflow)
+                    .with_peer(target),
+            )
+            .boxed()
+        })?;
     if total_len > max_message_size {
         tracing::warn!(target: "async_snmp::transport::tcp", { size = total_len, max = max_message_size, %target }, "message size exceeds limit");
-        return Err(Error::MalformedResponse { target }.boxed());
+        return Err(Error::Decode(
+            crate::DecodeError::new(
+                0,
+                crate::DecodeErrorKind::MessageTooLarge {
+                    size: total_len,
+                    maximum: max_message_size,
+                },
+            )
+            .with_peer(target),
+        )
+        .boxed());
     }
 
     // Read content
@@ -1528,8 +1578,8 @@ mod tests {
         assert!(result.is_err(), "Should reject excessive claimed size");
         let err = result.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got: {err:?}"
+            matches!(*err, Error::Decode(_)),
+            "Expected Decode error, got: {err:?}"
         );
 
         server.await.unwrap();
@@ -1557,8 +1607,39 @@ mod tests {
         assert!(result.is_err(), "Should reject non-0x30 tag byte");
         let err = result.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got: {err:?}"
+            matches!(&*err, Error::Decode(error)
+                if error.offset == 0
+                    && error.kind == crate::DecodeErrorKind::UnexpectedTag { expected: 0x30, actual: 0x31 }
+                    && error.peer == Some(server_addr)),
+            "Expected Decode error, got: {err:?}"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_receive_reports_high_tag_number_form_at_network_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&[0xbf]).await.unwrap();
+        });
+
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+        let error = transport
+            .recv(RequestRegistration::v3(1, Duration::from_secs(5)))
+            .await
+            .expect_err("high-tag-number form must be rejected");
+
+        assert!(
+            matches!(&*error, Error::Decode(error)
+                if error.kind == crate::DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: 0xbf }
+                    && error.origin == crate::DecodeErrorOrigin::Packet
+                    && error.offset == 0
+                    && error.peer == Some(server_addr)),
+            "unexpected error: {error:?}"
         );
 
         server.await.unwrap();
@@ -1586,8 +1667,8 @@ mod tests {
         assert!(result.is_err(), "Should reject indefinite length encoding");
         let err = result.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got: {err:?}"
+            matches!(*err, Error::Decode(_)),
+            "Expected Decode error, got: {err:?}"
         );
 
         server.await.unwrap();
@@ -1623,8 +1704,8 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got: {err:?}"
+            matches!(*err, Error::Decode(_)),
+            "Expected Decode error, got: {err:?}"
         );
 
         server.await.unwrap();
@@ -1760,7 +1841,7 @@ mod tests {
         let error = read_ber_message(&mut client, server_addr, TOTAL_LEN - 1)
             .await
             .expect_err("one byte over total-message limit must be rejected");
-        assert!(matches!(*error, Error::MalformedResponse { .. }));
+        assert!(matches!(*error, Error::Decode(_)));
         server.await.unwrap();
     }
 
@@ -1808,8 +1889,8 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse error, got: {err:?}"
+            matches!(*err, Error::Decode(_)),
+            "Expected Decode error, got: {err:?}"
         );
 
         server.await.unwrap();
@@ -2229,8 +2310,8 @@ mod tests {
         let first = transport.request(&request, registration).await;
         let err = first.expect_err("malformed frame should error");
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "Expected MalformedResponse, got: {err:?}"
+            matches!(*err, Error::Decode(_)),
+            "Expected Decode error, got: {err:?}"
         );
 
         // The stream must now be flagged as poisoned.
