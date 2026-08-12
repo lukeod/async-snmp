@@ -456,10 +456,10 @@ impl Pdu {
                         "Response error_index does not identify a variable binding",
                     ));
                 }
-                if matches!(error_status, 0 | 1 | 15) {
+                if matches!(error_status, 0 | 1 | 15 | 16) {
                     if error_index != 0 {
                         return Err(invalid_outbound(
-                            "noError, tooBig, and undoFailed Responses require error_index zero",
+                            "noError, tooBig, undoFailed, and authorizationError Responses require error_index zero",
                         ));
                     }
                 } else if error_index == 0 {
@@ -1587,6 +1587,24 @@ mod tests {
         let mut decoder = Decoder::new(encoded);
         let decoded = Pdu::decode(&mut decoder);
         assert!(decoded.is_ok(), "error_index=0 should be valid");
+    }
+
+    #[test]
+    fn authorization_error_response_requires_zero_index() {
+        let request = Pdu::get_request(1, &[oid!(1, 3, 6, 1)]);
+        let valid = request.to_error_response(ErrorStatus::AuthorizationError, 0);
+        assert!(
+            valid
+                .validate_outbound(Version::V2c, PduDirection::Response)
+                .is_ok()
+        );
+
+        let invalid = request.to_error_response(ErrorStatus::AuthorizationError, 1);
+        assert!(
+            invalid
+                .validate_outbound(Version::V2c, PduDirection::Response)
+                .is_err()
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::v3::encode::encode_v3_response;
 use crate::v3::process::{UsmFailure, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
 
 use super::varbind::extract_notification_varbinds;
-use super::{Notification, ReceiverInner};
+use super::{Notification, NotificationMetadata, NotificationPduClass, ReceiverInner};
 use crate::v3::DerivedKeys;
 
 impl super::NotificationReceiver {
@@ -39,6 +39,19 @@ impl super::NotificationReceiver {
         let (_, community, pdu) = msg.into_parts();
         match pdu {
             crate::message::CommunityPdu::TrapV1(trap) => {
+                let metadata = NotificationMetadata {
+                    source,
+                    version: crate::Version::V1,
+                    username: None,
+                    security_level: None,
+                    pdu_class: NotificationPduClass::Trap,
+                    context_engine_id: Bytes::new(),
+                    context_name: Bytes::new(),
+                };
+                if !self.inner.accepts(&metadata) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v1 trap");
+                    return Ok(None);
+                }
                 Ok(Some(Notification::TrapV1 { community, trap }))
             }
             crate::message::CommunityPdu::Standard(_) => Ok(None),
@@ -71,6 +84,19 @@ impl super::NotificationReceiver {
             PduType::TrapV2 => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
+                let metadata = NotificationMetadata {
+                    source,
+                    version: crate::Version::V2c,
+                    username: None,
+                    security_level: None,
+                    pdu_class: NotificationPduClass::Trap,
+                    context_engine_id: Bytes::new(),
+                    context_name: Bytes::new(),
+                };
+                if !self.inner.accepts(&metadata) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c trap");
+                    return Ok(None);
+                }
                 Ok(Some(Notification::TrapV2c {
                     community: msg.community().clone(),
                     uptime,
@@ -82,6 +108,19 @@ impl super::NotificationReceiver {
             PduType::InformRequest => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
+                let metadata = NotificationMetadata {
+                    source,
+                    version: crate::Version::V2c,
+                    username: None,
+                    security_level: None,
+                    pdu_class: NotificationPduClass::Inform,
+                    context_engine_id: Bytes::new(),
+                    context_name: Bytes::new(),
+                };
+                if !self.inner.accepts(&metadata) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c Inform");
+                    return Ok(None);
+                }
                 let request_id = pdu.request_id;
 
                 let finalized = crate::response_finalizer::finalize_response(
@@ -189,10 +228,35 @@ impl super::NotificationReceiver {
         let context_name = scoped_pdu.context_name.clone();
         let pdu = &scoped_pdu.pdu;
 
+        let pdu_class = match pdu.pdu_type() {
+            PduType::TrapV2 => NotificationPduClass::Trap,
+            PduType::InformRequest => {
+                // The receiver of a Confirmed-class PDU is authoritative.
+                if usm_params.engine_id.as_ref() != self.inner.engine_id.as_ref() {
+                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v3 Inform localized to a foreign authoritative engine ID");
+                    return Ok(None);
+                }
+                NotificationPduClass::Inform
+            }
+            _ => return Ok(None),
+        };
+        let metadata = NotificationMetadata {
+            source,
+            version: crate::Version::V3,
+            username: Some(username.clone()),
+            security_level: Some(security_level),
+            pdu_class,
+            context_engine_id: context_engine_id.clone(),
+            context_name: context_name.clone(),
+        };
         match pdu.pdu_type() {
             PduType::TrapV2 => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
+                if !self.inner.accepts(&metadata) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
+                    return Ok(None);
+                }
                 Ok(Some(Notification::TrapV3 {
                     username,
                     context_engine_id,
@@ -205,21 +269,12 @@ impl super::NotificationReceiver {
                 }))
             }
             PduType::InformRequest => {
-                // RFC 3414 Section 1.5.1: the receiver of a Confirmed-class PDU
-                // is the authoritative engine, so an Inform must be localized to
-                // this receiver's local engine ID. Reject an Inform whose
-                // authoritative engine ID is a foreign (e.g. the sender's)
-                // engine: accepting one would acknowledge under, and sign the
-                // ack with keys localized to, an engine other than this
-                // receiver. Unconfirmed-class traps (handled above) remain under
-                // the remote authoritative engine ID and are unaffected.
-                if usm_params.engine_id.as_ref() != self.inner.engine_id.as_ref() {
-                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source }, "dropped v3 Inform localized to a foreign authoritative engine ID");
-                    return Ok(None);
-                }
-
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
+                if !self.inner.accepts(&metadata) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
+                    return Ok(None);
+                }
                 let request_id = pdu.request_id;
 
                 let finalized = crate::response_finalizer::finalize_response(

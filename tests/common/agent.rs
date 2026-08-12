@@ -69,6 +69,7 @@ impl TestAgent {
             .cancel(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .expect("failed to build test agent");
@@ -269,7 +270,11 @@ impl TestAgentBuilder {
             builder = builder.authoritative_engine(engine);
         }
 
-        let agent = builder.build().await.expect("failed to build test agent");
+        let agent = builder
+            .allow_all_access()
+            .build()
+            .await
+            .expect("failed to build test agent");
         let addr = agent.local_addr();
         let agent_handle = agent.clone();
 

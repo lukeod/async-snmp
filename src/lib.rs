@@ -573,8 +573,8 @@ pub use message_size::{
     ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
 };
 pub use notification::{
-    Notification, NotificationReceiver, NotificationReceiverBuilder, NotificationVarbindValidation,
-    validate_notification_varbinds,
+    Notification, NotificationMetadata, NotificationPduClass, NotificationReceiver,
+    NotificationReceiverBuilder, NotificationVarbindValidation, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
@@ -584,7 +584,7 @@ pub use transport::{
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, EngineCache, ParseProtocolError,
-    PersistedAuthoritativeEngine, PrivProtocol, UsmConfig, generate_engine_id,
+    PersistedAuthoritativeEngine, PrivProtocol, UsmConfig, UsmUser, generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{CryptoBackend, CryptoError, CryptoResult, LocalizedKey, MasterKey, MasterKeys};

@@ -43,6 +43,7 @@ async fn start_agent(
         .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
         .max_concurrent_requests(max_concurrent_requests)
         .without_builtin_handlers()
+        .allow_all_access()
         .build()
         .await
         .expect("agent should build");

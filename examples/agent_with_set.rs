@@ -187,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind("0.0.0.0:10161")
         .community(b"private")
         .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+        .allow_all_access()
         .build()
         .await?;
 

@@ -65,6 +65,7 @@ impl LossyAgent {
             .community(b"public")
             .cancel(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
+            .allow_all_access()
             .build()
             .await
             .expect("failed to build lossy agent");
@@ -134,6 +135,7 @@ impl SlowAgent {
             .community(b"public")
             .cancel(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
+            .allow_all_access()
             .build()
             .await
             .expect("failed to build slow agent");
@@ -205,6 +207,7 @@ impl PausableAgent {
             .community(b"public")
             .cancel(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
+            .allow_all_access()
             .build()
             .await
             .expect("failed to build pausable agent");

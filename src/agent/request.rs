@@ -55,7 +55,7 @@ impl Agent {
 
         // Counter64 is not part of the SNMPv1 data types. Decode it so the
         // receive path remains bounded and unambiguous, then silently drop the
-        // authenticated request before VACM resolution or handler dispatch.
+        // accepted request before authorization resolution or handler dispatch.
         if version == Version::V1
             && pdu
                 .varbinds
@@ -97,9 +97,6 @@ impl Agent {
             msg_max_size: None,
         };
 
-        // VACM resolution (if enabled)
-        self.resolve_vacm(&mut ctx);
-
         let encode = |response_pdu| {
             let response_msg = match version {
                 Version::V1 => CommunityMessage::v1(msg.community().clone(), response_pdu),
@@ -127,7 +124,19 @@ impl Agent {
             }
         }
 
-        let response_pdu = self.dispatch_request(&ctx, pdu).await?;
+        let response_pdu = if self.resolve_vacm(&mut ctx) {
+            self.dispatch_request(&ctx, pdu).await?
+        } else {
+            let (status, error_index) = if version == Version::V1 {
+                if pdu.varbinds.is_empty() {
+                    return Ok(None);
+                }
+                (crate::error::ErrorStatus::NoSuchName, 1)
+            } else {
+                (crate::error::ErrorStatus::AuthorizationError, 0)
+            };
+            pdu.to_error_response(status, error_index)
+        };
         let finalized = crate::response_finalizer::finalize_response(
             version,
             pdu,
@@ -245,9 +254,6 @@ impl Agent {
             msg_max_size: Some(global_data.msg_max_size.as_usize()),
         };
 
-        // VACM resolution (if enabled)
-        self.resolve_vacm(&mut ctx);
-
         // A successful SET echoes the request varbinds. Preserve the exact
         // preflight bytes so the authoritative boots/time tuple (and authPriv
         // salt) cannot be sampled independently after commit and cross a BER
@@ -272,7 +278,11 @@ impl Agent {
             None
         };
 
-        let response_pdu = self.dispatch_request(&ctx, pdu).await?;
+        let response_pdu = if self.resolve_vacm(&mut ctx) {
+            self.dispatch_request(&ctx, pdu).await?
+        } else {
+            pdu.to_error_response(crate::error::ErrorStatus::AuthorizationError, 0)
+        };
         if let Some((success_pdu, bytes)) = preflight_success
             && response_pdu == success_pdu
         {
@@ -293,30 +303,52 @@ impl Agent {
     }
 
     /// Populate VACM group and view fields on a request context.
-    fn resolve_vacm(&self, ctx: &mut RequestContext) {
-        if let Some(ref vacm) = self.inner.vacm
-            && let Some(group) = vacm.get_group(ctx.security_model, ctx.security_name.as_bytes())
-        {
-            ctx.group_name = Some(group.clone());
-            if let Some(access) = vacm.get_access(
-                group,
-                &ctx.context_name,
-                ctx.security_model,
-                ctx.security_level,
-            ) {
-                ctx.read_view = Some(access.read_view.clone());
-                ctx.write_view = Some(access.write_view.clone());
-            } else {
-                tracing::warn!(
-                    target: "async_snmp::agent",
-                    group = %String::from_utf8_lossy(group),
-                    context = %String::from_utf8_lossy(&ctx.context_name),
-                    security_model = ?ctx.security_model,
-                    security_level = ?ctx.security_level,
-                    "VACM group has no matching access entry, denying access"
-                );
+    fn resolve_vacm(&self, ctx: &mut RequestContext) -> bool {
+        let Some(vacm) = self.inner.authorization.vacm() else {
+            return true;
+        };
+        let Some(group) = vacm.get_group(ctx.security_model, ctx.security_name.as_bytes()) else {
+            tracing::warn!(target: "async_snmp::agent", security_model = ?ctx.security_model, "VACM has no group for accepted security name");
+            return false;
+        };
+        ctx.group_name = Some(group.clone());
+        let Some(access) = vacm.get_access(
+            group,
+            &ctx.context_name,
+            ctx.security_model,
+            ctx.security_level,
+        ) else {
+            tracing::warn!(
+                target: "async_snmp::agent",
+                group = %String::from_utf8_lossy(group),
+                context = %String::from_utf8_lossy(&ctx.context_name),
+                security_model = ?ctx.security_model,
+                security_level = ?ctx.security_level,
+                "VACM group has no matching access entry"
+            );
+            return false;
+        };
+
+        ctx.read_view = Some(access.read_view.clone());
+        ctx.write_view = Some(access.write_view.clone());
+        let required_view = match ctx.pdu_type {
+            PduType::GetRequest | PduType::GetNextRequest | PduType::GetBulkRequest => {
+                &access.read_view
             }
+            PduType::SetRequest => &access.write_view,
+            PduType::InformRequest => &access.notify_view,
+            _ => return false,
+        };
+        if required_view.is_empty() || !vacm.has_view(required_view) {
+            tracing::warn!(
+                target: "async_snmp::agent",
+                group = %String::from_utf8_lossy(group),
+                pdu_type = ?ctx.pdu_type,
+                "VACM access entry has no defined view for request class"
+            );
+            return false;
         }
+        true
     }
 }
 
@@ -449,9 +481,92 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
+            .allow_all_access()
             .build()
             .await
             .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum MissingVacmState {
+        Group,
+        Access,
+        View,
+    }
+
+    async fn vacm_denial_agent(state: MissingVacmState, callbacks: Arc<CallbackCounts>) -> Agent {
+        let builder = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks);
+        let builder = match state {
+            MissingVacmState::Group => builder.vacm(|vacm| vacm),
+            MissingVacmState::Access => {
+                builder.vacm(|vacm| vacm.group("public", SecurityModel::V2c, "readers"))
+            }
+            MissingVacmState::View => builder.vacm(|vacm| {
+                vacm.group("public", SecurityModel::V2c, "readers").access(
+                    "readers",
+                    SecurityModel::V2c,
+                    SecurityLevel::NoAuthNoPriv,
+                    |access| access.read_view("undefined"),
+                )
+            }),
+        };
+        builder.build().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_vacm_group_access_or_view_returns_authorization_error() {
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        for state in [
+            MissingVacmState::Group,
+            MissingVacmState::Access,
+            MissingVacmState::View,
+        ] {
+            let callbacks = Arc::new(CallbackCounts::default());
+            let agent = vacm_denial_agent(state, Arc::clone(&callbacks)).await;
+            let request =
+                community_request(Version::V2c, PduType::GetRequest, b"public", Value::Null);
+            let response = agent
+                .handle_v2c(request, source)
+                .await
+                .unwrap()
+                .expect("VACM denial returns a response");
+            let response = CommunityMessage::decode(response).unwrap();
+            let response = response.pdu().standard().unwrap();
+            assert_eq!(
+                response.error_status(),
+                crate::ErrorStatus::AuthorizationError.as_i32()
+            );
+            assert_eq!(response.error_index(), 0);
+            assert_no_callbacks(&callbacks);
+        }
+    }
+
+    #[tokio::test]
+    async fn vacm_denied_set_never_reaches_callbacks() {
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = vacm_denial_agent(MissingVacmState::Group, Arc::clone(&callbacks)).await;
+        let request = community_request(
+            Version::V2c,
+            PduType::SetRequest,
+            b"public",
+            Value::Integer(9),
+        );
+        let response = agent
+            .handle_v2c(request, "127.0.0.1:9999".parse().unwrap())
+            .await
+            .unwrap()
+            .expect("VACM denial returns a response");
+        let response = CommunityMessage::decode(response).unwrap();
+        let response = response.pdu().standard().unwrap();
+        assert_eq!(
+            response.error_status(),
+            crate::ErrorStatus::AuthorizationError.as_i32()
+        );
+        assert_eq!(response.error_index(), 0);
+        assert_no_callbacks(&callbacks);
     }
 
     fn assert_no_callbacks(callbacks: &CallbackCounts) {
@@ -550,6 +665,7 @@ mod tests {
             .max_message_size(max_message_size)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap()
@@ -784,6 +900,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", |u| u)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -817,6 +934,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", |u| u)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -833,6 +951,126 @@ mod tests {
 
         let decoded = V3Message::decode(response).unwrap();
         assert_eq!(decoded.pdu().unwrap().pdu_type(), PduType::Response);
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn unrestricted_agent_accepts_keyed_user_at_noauth_level() {
+        use crate::v3::AuthProtocol;
+
+        let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("keyed-user", |user| {
+                user.auth(AuthProtocol::Sha256, b"auth-password")
+            })
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pdu = Pdu::get_request(77, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]);
+        let request = build_noauth_pdu(&engine_id, b"keyed-user", &engine_id, 0, 0, pdu, 65507);
+        let response = agent
+            .handle_v3(request, "127.0.0.1:9999".parse().unwrap())
+            .await
+            .unwrap()
+            .expect("explicit unrestricted policy accepts the request");
+        let response = V3Message::decode(response).unwrap();
+        assert_eq!(
+            response.global_data.msg_flags.security_level,
+            SecurityLevel::NoAuthNoPriv
+        );
+        assert_eq!(response.pdu().unwrap().error_status(), 0);
+        assert_eq!(callbacks.get.load(Ordering::Relaxed), 1);
+        assert_eq!(agent.usm_unsupported_sec_levels(), 0);
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn vacm_denial_uses_actual_v3_level_without_usm_failure() {
+        use crate::v3::AuthProtocol;
+
+        let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("keyed-user", |user| {
+                user.auth(AuthProtocol::Sha256, b"auth-password")
+            })
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
+            .vacm(|vacm| {
+                vacm.group("keyed-user", SecurityModel::Usm, "operators")
+                    .access(
+                        "operators",
+                        SecurityModel::Usm,
+                        SecurityLevel::AuthNoPriv,
+                        |access| access.read_view("all"),
+                    )
+                    .view("all", |view| view.include(oid!(1, 3, 6)))
+            })
+            .build()
+            .await
+            .unwrap();
+        let request = build_noauth_pdu(
+            &engine_id,
+            b"keyed-user",
+            &engine_id,
+            0,
+            0,
+            Pdu::get_request(77, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+            65507,
+        );
+        let response = agent
+            .handle_v3(request, "127.0.0.1:9999".parse().unwrap())
+            .await
+            .unwrap()
+            .expect("authorization denial returns a protected response");
+        let response = V3Message::decode(response).unwrap();
+        assert_eq!(
+            response.global_data.msg_flags.security_level,
+            SecurityLevel::NoAuthNoPriv
+        );
+        let pdu = response.pdu().unwrap();
+        assert_eq!(
+            pdu.error_status(),
+            crate::ErrorStatus::AuthorizationError.as_i32()
+        );
+        assert_eq!(pdu.error_index(), 0);
+        assert_no_callbacks(&callbacks);
+        assert_eq!(agent.usm_unsupported_sec_levels(), 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_precedes_agent_authorization() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"\x80\x00\x00\x00\x01agenteng".to_vec())
+            .usm_user("user", |user| user)
+            .vacm(|vacm| vacm)
+            .build()
+            .await
+            .unwrap();
+        let request = V3Message::discovery_request(9, crate::UDP_RECEIVE_LIMITS.advertised())
+            .unwrap()
+            .encode()
+            .unwrap();
+        let response = agent
+            .handle_v3(request, "127.0.0.1:9999".parse().unwrap())
+            .await
+            .unwrap()
+            .expect("reportable discovery returns a Report");
+        let response = V3Message::decode(response).unwrap();
+        let pdu = response.pdu().unwrap();
+        assert_eq!(pdu.pdu_type(), PduType::Report);
+        assert_eq!(
+            pdu.varbinds[0].oid,
+            crate::v3::report_oids::unknown_engine_ids()
+        );
+        assert_eq!(agent.usm_unknown_engine_ids(), 1);
     }
 
     struct BoundarySetHandler {
@@ -930,6 +1168,7 @@ mod tests {
             .max_message_size(exact_limit)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler.clone())
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -970,6 +1209,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", |u| u)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -1000,6 +1240,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", |u| u)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -1041,6 +1282,7 @@ mod tests {
             .usm_user("trapuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -1083,6 +1325,7 @@ mod tests {
             .usm_user("trapuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .allow_all_access()
             .build()
             .await
             .unwrap();

@@ -29,14 +29,15 @@
 //!
 //! ```rust
 //! use async_snmp::agent::{Agent, SecurityModel, VacmBuilder};
-//! use async_snmp::oid;
+//! use async_snmp::{SecurityLevel, oid};
 //!
 //! # fn example() {
 //! let vacm = VacmBuilder::new()
 //!     // Map "public" community to "readonly_group"
 //!     .group("public", SecurityModel::V2c, "readonly_group")
 //!     // Grant read access to full_view
-//!     .access("readonly_group", |a| a.read_view("full_view"))
+//!     .access("readonly_group", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv,
+//!         |a| a.read_view("full_view"))
 //!     // Define what OIDs are in full_view
 //!     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
 //!     .build();
@@ -62,18 +63,16 @@
 //!     .group("admin", SecurityModel::Usm, "admins")
 //!
 //!     // Readers can only read
-//!     .access("readers", |a| a
+//!     .access("readers", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv, |a| a
 //!         .read_view("system_view"))
 //!
 //!     // Writers can read everything and write to ifAdminStatus
-//!     .access("writers", |a| a
+//!     .access("writers", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv, |a| a
 //!         .read_view("full_view")
 //!         .write_view("if_admin_view"))
 //!
 //!     // Admins require encryption and can read/write everything
-//!     .access("admins", |a| a
-//!         .security_model(SecurityModel::Usm)
-//!         .security_level(SecurityLevel::AuthPriv)
+//!     .access("admins", SecurityModel::Usm, SecurityLevel::AuthPriv, |a| a
 //!         .read_view("full_view")
 //!         .write_view("full_view"))
 //!
@@ -94,7 +93,7 @@
 //!
 //! ```rust
 //! use async_snmp::agent::View;
-//! use async_snmp::oid;
+//! use async_snmp::{SecurityLevel, oid};
 //!
 //! // Include all of system MIB except sysServices
 //! let view = View::new()
@@ -136,7 +135,7 @@
 //!
 //! ```rust,no_run
 //! use async_snmp::agent::{Agent, SecurityModel};
-//! use async_snmp::oid;
+//! use async_snmp::{SecurityLevel, oid};
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
 //! let agent = Agent::builder()
@@ -146,8 +145,10 @@
 //!     .vacm(|v| v
 //!         .group("public", SecurityModel::V2c, "readonly")
 //!         .group("private", SecurityModel::V2c, "readwrite")
-//!         .access("readonly", |a| a.read_view("all"))
-//!         .access("readwrite", |a| a.read_view("all").write_view("all"))
+//!         .access("readonly", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv,
+//!             |a| a.read_view("all"))
+//!         .access("readwrite", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv,
+//!             |a| a.read_view("all").write_view("all"))
 //!         .view("all", |v| v.include(oid!(1, 3, 6, 1))))
 //!     .build()
 //!     .await?;
@@ -582,9 +583,7 @@ pub struct VacmAccessEntry {
 ///
 /// let vacm = VacmBuilder::new()
 ///     .group("admin", SecurityModel::Usm, "admin_group")
-///     .access("admin_group", |a| a
-///         .security_model(SecurityModel::Usm)
-///         .security_level(SecurityLevel::AuthPriv)
+///     .access("admin_group", SecurityModel::Usm, SecurityLevel::AuthPriv, |a| a
 ///         .read_view("full_view")
 ///         .write_view("config_view")
 ///         .notify_view("trap_view"))
@@ -605,13 +604,17 @@ pub struct AccessEntryBuilder {
 }
 
 impl AccessEntryBuilder {
-    /// Create a new access entry builder for a group.
-    pub fn new(group_name: impl Into<Bytes>) -> Self {
+    /// Create an access entry with explicit security model and minimum level.
+    pub fn new(
+        group_name: impl Into<Bytes>,
+        security_model: impl Into<VacmSecurityModel>,
+        security_level: SecurityLevel,
+    ) -> Self {
         Self {
             group_name: group_name.into(),
             context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
+            security_model: security_model.into(),
+            security_level,
             context_match: ContextMatch::Exact,
             read_view: Bytes::new(),
             write_view: Bytes::new(),
@@ -631,7 +634,7 @@ impl AccessEntryBuilder {
 
     /// Set the security model this entry applies to.
     ///
-    /// Default is [`VacmSecurityModel::Any`] which matches all models.
+    /// The builder constructor requires an explicit initial model.
     #[must_use]
     pub fn security_model(mut self, model: impl Into<VacmSecurityModel>) -> Self {
         self.security_model = model.into();
@@ -641,7 +644,7 @@ impl AccessEntryBuilder {
     /// Set the minimum security level required.
     ///
     /// Requests with lower security levels will be denied access.
-    /// Default is [`SecurityLevel::NoAuthNoPriv`].
+    /// The builder constructor requires an explicit initial level.
     ///
     /// # Example
     ///
@@ -652,9 +655,8 @@ impl AccessEntryBuilder {
     ///
     /// let vacm = VacmBuilder::new()
     ///     .group("admin", SecurityModel::Usm, "secure_group")
-    ///     .access("secure_group", |a| a
+    ///     .access("secure_group", SecurityModel::Usm, SecurityLevel::AuthPriv, |a| a
     ///         // Require authentication and encryption
-    ///         .security_level(SecurityLevel::AuthPriv)
     ///         .read_view("full_view"))
     ///     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
     ///     .build();
@@ -810,6 +812,12 @@ impl VacmConfig {
         self.views.insert(name.into(), view);
     }
 
+    /// Return whether a non-empty view name is defined.
+    #[must_use]
+    pub(crate) fn has_view(&self, name: &[u8]) -> bool {
+        !name.is_empty() && self.views.contains_key(name)
+    }
+
     /// Resolve group name for a request.
     #[must_use]
     pub fn get_group(&self, model: SecurityModel, name: &[u8]) -> Option<&Bytes> {
@@ -912,10 +920,9 @@ impl VacmConfig {
 ///     .group("admin", SecurityModel::Usm, "admins")
 ///
 ///     // Step 2: Define access for each group
-///     .access("readers", |a| a
+///     .access("readers", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv, |a| a
 ///         .read_view("system_view"))
-///     .access("admins", |a| a
-///         .security_level(SecurityLevel::AuthPriv)
+///     .access("admins", SecurityModel::Usm, SecurityLevel::AuthPriv, |a| a
 ///         .read_view("full_view")
 ///         .write_view("full_view"))
 ///
@@ -990,9 +997,7 @@ impl VacmBuilder {
     ///
     /// let vacm = VacmBuilder::new()
     ///     .group("public", SecurityModel::V2c, "readers")
-    ///     .access("readers", |a| a
-    ///         .security_model(SecurityModel::V2c)
-    ///         .security_level(SecurityLevel::NoAuthNoPriv)
+    ///     .access("readers", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv, |a| a
     ///         .read_view("system_view")
     ///         // No write_view = read-only
     ///     )
@@ -1000,11 +1005,17 @@ impl VacmBuilder {
     ///     .build();
     /// ```
     #[must_use]
-    pub fn access<F>(mut self, group_name: impl Into<Bytes>, configure: F) -> Self
+    pub fn access<F>(
+        mut self,
+        group_name: impl Into<Bytes>,
+        security_model: impl Into<VacmSecurityModel>,
+        security_level: SecurityLevel,
+        configure: F,
+    ) -> Self
     where
         F: FnOnce(AccessEntryBuilder) -> AccessEntryBuilder,
     {
-        let builder = AccessEntryBuilder::new(group_name);
+        let builder = AccessEntryBuilder::new(group_name, security_model, security_level);
         let entry = configure(builder).build();
         self.config.add_access(entry);
         self
@@ -1342,23 +1353,61 @@ mod tests {
         let config = VacmBuilder::new()
             .group("public", SecurityModel::V2c, "readonly_group")
             .group("admin", SecurityModel::Usm, "admin_group")
-            .access("readonly_group", |a| {
-                a.context_prefix("")
-                    .security_model(VacmSecurityModel::Any)
-                    .security_level(SecurityLevel::NoAuthNoPriv)
-                    .read_view("full_view")
-            })
-            .access("admin_group", |a| {
-                a.security_model(SecurityModel::Usm)
-                    .security_level(SecurityLevel::AuthPriv)
-                    .read_view("full_view")
-                    .write_view("full_view")
-            })
+            .access(
+                "readonly_group",
+                VacmSecurityModel::Any,
+                SecurityLevel::NoAuthNoPriv,
+                |a| a.context_prefix("").read_view("full_view"),
+            )
+            .access(
+                "admin_group",
+                SecurityModel::Usm,
+                SecurityLevel::AuthPriv,
+                |a| a.read_view("full_view").write_view("full_view"),
+            )
             .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
             .build();
 
         assert!(config.get_group(SecurityModel::V2c, b"public").is_some());
         assert!(config.get_group(SecurityModel::Usm, b"admin").is_some());
+    }
+
+    #[test]
+    fn authpriv_user_can_have_distinct_authnopriv_and_authpriv_access() {
+        let config = VacmBuilder::new()
+            .group("operator", SecurityModel::Usm, "operators")
+            .access(
+                "operators",
+                SecurityModel::Usm,
+                SecurityLevel::AuthNoPriv,
+                |access| access.read_view("read"),
+            )
+            .access(
+                "operators",
+                SecurityModel::Usm,
+                SecurityLevel::AuthPriv,
+                |access| access.read_view("read").write_view("write"),
+            )
+            .view("read", |view| view.include(oid!(1, 3, 6)))
+            .view("write", |view| view.include(oid!(1, 3, 6, 1, 4, 1)))
+            .build();
+        let group = config.get_group(SecurityModel::Usm, b"operator").unwrap();
+
+        assert!(
+            config
+                .get_access(group, b"", SecurityModel::Usm, SecurityLevel::NoAuthNoPriv,)
+                .is_none()
+        );
+        let authenticated = config
+            .get_access(group, b"", SecurityModel::Usm, SecurityLevel::AuthNoPriv)
+            .unwrap();
+        assert_eq!(authenticated.read_view.as_ref(), b"read");
+        assert!(authenticated.write_view.is_empty());
+        let private = config
+            .get_access(group, b"", SecurityModel::Usm, SecurityLevel::AuthPriv)
+            .unwrap();
+        assert_eq!(private.read_view.as_ref(), b"read");
+        assert_eq!(private.write_view.as_ref(), b"write");
     }
 
     // RFC 3415 Section 4 preference order tests
@@ -1555,20 +1604,16 @@ mod tests {
             notify_view: Bytes::new(),
         });
 
-        // Query with AuthPriv - should get the AuthPriv entry (highest matching)
-        let access = config
-            .get_access(
-                b"test_group",
-                b"",
-                SecurityModel::V2c,
-                SecurityLevel::AuthPriv,
-            )
-            .expect("should find access entry");
-        assert_eq!(
-            access.read_view,
-            Bytes::from_static(b"authpriv_view"),
-            "should prefer higher security level"
-        );
+        for (level, expected_view) in [
+            (SecurityLevel::NoAuthNoPriv, b"noauth_view".as_slice()),
+            (SecurityLevel::AuthNoPriv, b"auth_view".as_slice()),
+            (SecurityLevel::AuthPriv, b"authpriv_view".as_slice()),
+        ] {
+            let access = config
+                .get_access(b"test_group", b"", SecurityModel::V2c, level)
+                .expect("should find access entry");
+            assert_eq!(access.read_view.as_ref(), expected_view);
+        }
     }
 
     #[test]

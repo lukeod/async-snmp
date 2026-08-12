@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .usm_user("readonly", |u| {
             u.auth(AuthProtocol::Sha256, b"readonlypass")
         })
+        .accept_all_notifications()
         .build()
         .await?;
 

@@ -1,7 +1,7 @@
 //! USM configuration types for `SNMPv3` authentication.
 //!
-//! These types store authentication and privacy settings for `SNMPv3` operations
-//! used by clients, Agents, notification receivers, and trap sinks.
+//! [`UsmConfig`] selects the exact credentials and context used for outbound
+//! messages. [`UsmUser`] describes the mechanisms an inbound user supports.
 
 use bytes::Bytes;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -49,6 +49,121 @@ pub struct UsmConfig {
     credentials: UsmCredentials,
     context_name: Bytes,
     crypto_backend: CryptoBackend,
+}
+
+/// USM user accepted by an inbound `SNMPv3` application.
+///
+/// Authentication and privacy protocols are capabilities, not a minimum
+/// accepted security level. A user with authentication and privacy keys also
+/// supports `authNoPriv` and `noAuthNoPriv`; the Agent or notification receiver
+/// applies its own authorization or acceptance policy to the packet's actual
+/// security level.
+///
+/// Unlike [`UsmConfig`], this type has no scoped-PDU context because inbound
+/// contexts come from the received message.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UsmUser {
+    config: UsmConfig,
+}
+
+impl UsmUser {
+    /// Create an inbound user supporting `noAuthNoPriv` only.
+    pub fn new(username: impl Into<Bytes>) -> Self {
+        Self {
+            config: UsmConfig::new(username),
+        }
+    }
+
+    /// Add password-backed authentication capability.
+    #[must_use]
+    pub fn auth(mut self, protocol: AuthProtocol, password: impl AsRef<[u8]>) -> Self {
+        self.config = self.config.auth(protocol, password);
+        self
+    }
+
+    /// Add password-backed authentication and privacy capability.
+    #[must_use]
+    pub fn auth_priv(
+        mut self,
+        auth_protocol: AuthProtocol,
+        auth_password: impl AsRef<[u8]>,
+        priv_protocol: PrivProtocol,
+        priv_password: impl AsRef<[u8]>,
+    ) -> Self {
+        self.config =
+            self.config
+                .auth_priv(auth_protocol, auth_password, priv_protocol, priv_password);
+        self
+    }
+
+    /// Select the cryptographic backend for this inbound user.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[must_use]
+    pub fn with_crypto_backend(mut self, backend: CryptoBackend) -> Self {
+        self.config = self.config.with_crypto_backend(backend);
+        self
+    }
+
+    /// Return the selected cryptographic backend.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[must_use]
+    pub fn crypto_backend(&self) -> CryptoBackend {
+        self.config.crypto_backend()
+    }
+
+    /// Use pre-computed master keys for this inbound user.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[must_use]
+    pub fn with_master_keys(mut self, master_keys: crate::v3::MasterKeys) -> Self {
+        self.config = self.config.with_master_keys(master_keys);
+        self
+    }
+
+    /// Return the configured username.
+    #[must_use]
+    pub fn username(&self) -> &Bytes {
+        self.config.username()
+    }
+
+    /// Return the configured authentication protocol, if any.
+    #[must_use]
+    pub fn auth_protocol(&self) -> Option<AuthProtocol> {
+        self.config.auth_protocol()
+    }
+
+    /// Return the configured privacy protocol, if any.
+    #[must_use]
+    pub fn priv_protocol(&self) -> Option<PrivProtocol> {
+        self.config.priv_protocol()
+    }
+
+    /// Return the strongest security level supported by this user.
+    ///
+    /// This is a capability, not a minimum accepted level.
+    #[must_use]
+    pub fn maximum_security_level(&self) -> SecurityLevel {
+        self.config.security_level()
+    }
+
+    pub(crate) fn validate_and_precompute(&mut self) -> CryptoResult<()> {
+        self.config.validate_and_precompute()
+    }
+
+    pub(crate) fn derive_keys(&self, engine_id: &[u8]) -> CryptoResult<DerivedKeys> {
+        self.config.derive_keys_inner(engine_id)
+    }
+}
+
+impl std::fmt::Debug for UsmUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsmUser")
+            .field("username", &String::from_utf8_lossy(self.username()))
+            .field("auth_protocol", &self.auth_protocol())
+            .field("priv_protocol", &self.priv_protocol())
+            .field("maximum_security_level", &self.maximum_security_level())
+            .field("crypto_backend", &self.config.crypto_backend)
+            .finish()
+    }
 }
 
 impl UsmConfig {

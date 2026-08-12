@@ -34,8 +34,9 @@
 //! # SNMPv3
 //!
 //! To receive V3 traps and `InformRequests`, configure USM credentials via
-//! the builder. Only notifications from registered usernames are accepted,
-//! at any security level including noAuthNoPriv:
+//! the builder. Configured mechanisms are capabilities, so a keyed user also
+//! supports lower levels including `noAuthNoPriv`. Select an explicit
+//! acceptance policy before building:
 //!
 //! ```rust,no_run
 //! use async_snmp::notification::NotificationReceiver;
@@ -58,6 +59,7 @@
 //!             b"privpass123",
 //!         )
 //!     })
+//!     .accept_all_notifications()
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -93,6 +95,7 @@
 //!             b"privpass123",
 //!         )
 //!     })
+//!     .accept_all_notifications()
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -154,7 +157,7 @@ use crate::v3::{AuthoritativeEngine, EngineState, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
-use crate::v3::UsmConfig;
+use crate::v3::UsmUser;
 pub use varbind::{NotificationVarbindValidation, validate_notification_varbinds};
 
 /// Maximum number of distinct remote authoritative engines whose timeliness
@@ -163,6 +166,37 @@ pub use varbind::{NotificationVarbindValidation, validate_notification_varbinds}
 /// localized per engine ID), so the table is bounded and the
 /// least-recently-updated engine is evicted when full.
 const MAX_REMOTE_ENGINES: usize = 8192;
+
+/// Notification PDU class presented to an acceptance policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationPduClass {
+    /// An unconfirmed v1 or v2-style trap.
+    Trap,
+    /// A confirmed Inform request.
+    Inform,
+}
+
+/// Successfully processed notification metadata evaluated before delivery or
+/// Inform acknowledgement.
+#[derive(Debug, Clone)]
+pub struct NotificationMetadata {
+    /// Datagram source address.
+    pub source: SocketAddr,
+    /// Protocol version.
+    pub version: Version,
+    /// USM username for v3, or `None` for community-based notifications.
+    pub username: Option<Bytes>,
+    /// Actual v3 wire security level, or `None` for v1/v2c.
+    pub security_level: Option<SecurityLevel>,
+    /// Trap or Inform classification.
+    pub pdu_class: NotificationPduClass,
+    /// Scoped-PDU context engine ID for v3, empty for v1/v2c.
+    pub context_engine_id: Bytes,
+    /// Scoped-PDU context name for v3, empty for v1/v2c.
+    pub context_name: Bytes,
+}
+
+type AcceptancePolicy = dyn Fn(&NotificationMetadata) -> bool + Send + Sync;
 
 /// Well-known OIDs for notification varbinds.
 pub mod oids {
@@ -241,15 +275,17 @@ pub mod oids {
 /// standard notification varbind validation policy, and USM credentials for
 /// v3. Community filtering and USM users are independent and may be combined;
 /// a single receiver then handles all versions on one port. Any USM user also
-/// requires a persisted [`AuthoritativeEngine`]. See the
+/// requires a persisted [`AuthoritativeEngine`] and an explicit notification
+/// acceptance policy. See the
 /// [module docs](crate::notification#mixed-versions-on-one-port).
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
-    usm_users: HashMap<Bytes, UsmConfig>,
+    usm_users: HashMap<Bytes, UsmUser>,
     communities: Vec<Community>,
     authoritative_engine: Option<AuthoritativeEngine>,
     varbind_validation: NotificationVarbindValidation,
     max_message_size: usize,
+    acceptance_policy: Option<Arc<AcceptancePolicy>>,
 }
 
 impl NotificationReceiverBuilder {
@@ -260,6 +296,7 @@ impl NotificationReceiverBuilder {
     /// - No USM users (v3 notifications rejected until users are added)
     /// - No authoritative engine (required when adding a USM user)
     /// - Tolerant notification varbind validation
+    /// - No explicit acceptance policy (required when adding a USM user)
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -269,6 +306,7 @@ impl NotificationReceiverBuilder {
             authoritative_engine: None,
             varbind_validation: NotificationVarbindValidation::Tolerant,
             max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
+            acceptance_policy: None,
         }
     }
 
@@ -310,9 +348,36 @@ impl NotificationReceiverBuilder {
         self
     }
 
+    /// Set the application policy evaluated after protocol and USM processing
+    /// but before delivery or Inform acknowledgement.
+    ///
+    /// A receiver with USM users must select this method or
+    /// [`accept_all_notifications`](Self::accept_all_notifications). Returning
+    /// `false` silently drops a trap and leaves an Inform unacknowledged.
+    #[must_use]
+    pub fn acceptance_policy(
+        mut self,
+        policy: impl Fn(&NotificationMetadata) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.acceptance_policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// Explicitly accept every successfully processed notification.
+    ///
+    /// For v3 this includes lower security levels supported by a configured
+    /// inbound user, including `noAuthNoPriv`.
+    #[must_use]
+    pub fn accept_all_notifications(mut self) -> Self {
+        self.acceptance_policy = Some(Arc::new(|_: &NotificationMetadata| true));
+        self
+    }
+
     /// Add a USM user for V3 authentication.
     ///
-    /// Adding any user requires a persisted [`AuthoritativeEngine`] before
+    /// Adding any user requires a persisted [`AuthoritativeEngine`] and an
+    /// explicit [`acceptance_policy`](Self::acceptance_policy) or
+    /// [`accept_all_notifications`](Self::accept_all_notifications) before
     /// [`build`](Self::build), because this receiver is authoritative for V3
     /// Inform exchanges.
     ///
@@ -339,6 +404,7 @@ impl NotificationReceiverBuilder {
     ///             b"privpassword",
     ///         )
     ///     })
+    ///     .accept_all_notifications()
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -347,10 +413,10 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
     where
-        F: FnOnce(UsmConfig) -> UsmConfig,
+        F: FnOnce(UsmUser) -> UsmUser,
     {
         let username_bytes: Bytes = username.into();
-        let config = configure(UsmConfig::new(username_bytes.clone()));
+        let config = configure(UsmUser::new(username_bytes.clone()));
         self.usm_users.insert(username_bytes, config);
         self
     }
@@ -458,11 +524,18 @@ impl NotificationReceiverBuilder {
 
     /// Build the notification receiver.
     ///
-    /// Returns a configuration error when USM credentials are invalid or a
-    /// USM user is configured without a persisted [`AuthoritativeEngine`].
-    /// Returns [`Error::RandomSource`] when a generated engine ID or required
-    /// privacy salt cannot be initialized.
+    /// Returns a configuration error when USM credentials are invalid, USM
+    /// users do not have an explicit acceptance policy, or a USM user is
+    /// configured without a persisted [`AuthoritativeEngine`]. Returns
+    /// [`Error::RandomSource`] when a generated engine ID or required privacy
+    /// salt cannot be initialized.
     pub async fn build(self) -> Result<NotificationReceiver> {
+        if !self.usm_users.is_empty() && self.acceptance_policy.is_none() {
+            return Err(Error::Config(
+                "a notification receiver with USM users requires an acceptance policy".into(),
+            )
+            .boxed());
+        }
         if self.max_message_size > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
             return Err(Error::Config(
                 format!(
@@ -477,7 +550,7 @@ impl NotificationReceiverBuilder {
         let requires_privacy = self
             .usm_users
             .values()
-            .any(|security| security.security_level().requires_priv());
+            .any(|security| security.maximum_security_level().requires_priv());
         let requires_authoritative_engine = !self.usm_users.is_empty();
         let PreparedAuthoritativeUsm {
             users: usm_users,
@@ -525,6 +598,7 @@ impl NotificationReceiverBuilder {
                 remote_engines: Mutex::new(HashMap::new()),
                 max_message_size: self.max_message_size,
                 snmp_silent_drops: AtomicU32::new(0),
+                acceptance_policy: self.acceptance_policy,
             }),
         })
     }
@@ -726,6 +800,7 @@ impl Notification {
 ///     .usm_user("trapuser", |u| {
 ///         u.auth(AuthProtocol::Sha1, b"authpassword")
 ///     })
+///     .accept_all_notifications()
 ///     .build()
 ///     .await?;
 /// # Ok(())
@@ -740,7 +815,7 @@ struct ReceiverInner {
     socket: UdpSocket,
     local_addr: SocketAddr,
     /// Configured USM users for V3 authentication
-    usm_users: HashMap<Bytes, UsmConfig>,
+    usm_users: HashMap<Bytes, UsmUser>,
     /// Accepted v1/v2c community strings. Empty means accept any community
     /// (community filtering is opt-in); otherwise a v1/v2c notification whose
     /// community matches none of these is dropped.
@@ -768,9 +843,16 @@ struct ReceiverInner {
     max_message_size: usize,
     /// Confirmed notifications dropped because even the alternate Response did not fit.
     snmp_silent_drops: AtomicU32,
+    acceptance_policy: Option<Arc<AcceptancePolicy>>,
 }
 
 impl ReceiverInner {
+    fn accepts(&self, metadata: &NotificationMetadata) -> bool {
+        self.acceptance_policy
+            .as_ref()
+            .is_none_or(|policy| policy(metadata))
+    }
+
     /// Return one coherent authoritative boots/time pair for the current instant.
     fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
         match &self.authoritative_engine {
@@ -876,6 +958,7 @@ impl NotificationReceiver {
                 remote_engines: Mutex::new(HashMap::new()),
                 max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
                 snmp_silent_drops: AtomicU32::new(0),
+                acceptance_policy: None,
             }),
         })
     }
@@ -1145,7 +1228,7 @@ mod tests {
             .usm_users
             .get(&Bytes::from_static(b"trapuser"))
             .unwrap();
-        assert_eq!(user.security_level(), SecurityLevel::AuthNoPriv);
+        assert_eq!(user.maximum_security_level(), SecurityLevel::AuthNoPriv);
     }
 
     #[tokio::test]
@@ -1153,6 +1236,7 @@ mod tests {
         let result = NotificationReceiver::builder()
             .bind("not a socket address")
             .usm_user("user", |user| user)
+            .accept_all_notifications()
             .build()
             .await;
 
@@ -1165,10 +1249,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v3_receiver_requires_explicit_acceptance_policy_before_bind() {
+        let result = NotificationReceiver::builder()
+            .bind("not a socket address")
+            .usm_user("user", |user| user)
+            .build()
+            .await;
+        let error = result.err().expect("missing receiver policy must fail");
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("requires an acceptance policy")
+        ));
+    }
+
+    #[tokio::test]
     async fn test_invalid_usm_user_is_rejected_before_bind() {
         let result = NotificationReceiver::builder()
             .bind("not a socket address")
             .usm_user("", |user| user)
+            .accept_all_notifications()
             .build()
             .await;
 
@@ -1421,6 +1520,24 @@ mod tests {
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    fn inform_user(level: SecurityLevel, username: &[u8]) -> crate::v3::UsmUser {
+        use crate::v3::PrivProtocol;
+
+        let username = Bytes::copy_from_slice(username);
+        match level {
+            SecurityLevel::NoAuthNoPriv => crate::v3::UsmUser::new(username),
+            SecurityLevel::AuthNoPriv => crate::v3::UsmUser::new(username)
+                .auth(AuthProtocol::Sha256, b"inform-auth-password"),
+            SecurityLevel::AuthPriv => crate::v3::UsmUser::new(username).auth_priv(
+                AuthProtocol::Sha256,
+                b"inform-auth-password",
+                PrivProtocol::Aes128,
+                b"inform-priv-password",
+            ),
+        }
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     fn build_v3_inform_at_level(
         engine_id: &[u8],
         username: &[u8],
@@ -1510,6 +1627,7 @@ mod tests {
             .usm_user("trapuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap()
@@ -1566,6 +1684,77 @@ mod tests {
             }
             other => panic!("expected TrapV3, got {other:?}"),
         }
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn receiver_policy_drops_lower_level_trap() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("trapuser", |user| {
+                user.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .acceptance_policy(|metadata: &NotificationMetadata| {
+                metadata.username.as_deref() == Some(b"trapuser")
+                    && metadata.security_level >= Some(SecurityLevel::AuthNoPriv)
+            })
+            .build()
+            .await
+            .unwrap();
+        let message = build_noauth_v3_trap(b"remote-sender-engine", b"trapuser");
+        let result = receiver
+            .handle_v3(message, "127.0.0.1:9999".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(receiver.usm_unsupported_sec_levels(), 0);
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn receiver_policy_drops_lower_level_inform_without_acknowledgement() {
+        let engine_id = b"my-receiver-engine".to_vec();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .engine_boots(1)
+            .usm_user("informuser", |user| {
+                user.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .acceptance_policy(|metadata: &NotificationMetadata| {
+                metadata.pdu_class == NotificationPduClass::Inform
+                    && metadata.security_level >= Some(SecurityLevel::AuthNoPriv)
+            })
+            .build()
+            .await
+            .unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let message = build_v3_notification(
+            crate::PduType::InformRequest,
+            &engine_id,
+            0,
+            0,
+            b"informuser",
+            None,
+        );
+        let result = receiver
+            .handle_v3(message, client.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let mut response = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                client.recv_from(&mut response),
+            )
+            .await
+            .is_err(),
+            "denied Inform must not be acknowledged"
+        );
+        assert_eq!(receiver.usm_unsupported_sec_levels(), 0);
     }
 
     /// RFC 3414 Section 3.2 Step 4 is unconditional: the user must exist in
@@ -1738,6 +1927,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -1772,6 +1962,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -1806,6 +1997,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -1956,6 +2148,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -1992,6 +2185,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2027,6 +2221,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2116,11 +2311,12 @@ mod tests {
             .len();
             assert!(alternate_len < candidate_len);
 
-            let config = inform_security(level, &username);
+            let config = inform_user(level, &username);
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
                 .usm_user(username.clone(), move |_| config)
+                .accept_all_notifications()
                 .max_message_size(candidate_len - 1)
                 .build()
                 .await
@@ -2149,11 +2345,12 @@ mod tests {
             );
             assert_eq!(receiver.snmp_silent_drops(), 0);
 
-            let config = inform_security(level, &username);
+            let config = inform_user(level, &username);
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
                 .usm_user(username.clone(), move |_| config)
+                .accept_all_notifications()
                 .max_message_size(1)
                 .build()
                 .await
@@ -2195,6 +2392,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2344,6 +2542,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .engine_id(b"my-receiver-engine".to_vec())
             .usm_user("plainuser", |u| u)
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2375,6 +2574,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2525,6 +2725,7 @@ mod tests {
                     b"privpass12345678",
                 )
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2576,6 +2777,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2649,6 +2851,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();
@@ -2712,6 +2915,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .accept_all_notifications()
             .build()
             .await
             .unwrap();

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
-use super::{DerivedKeys, UsmConfig};
+use super::{DerivedKeys, UsmUser};
 use crate::error::{Error, Result};
 use crate::message::{
     MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel,
@@ -161,7 +161,7 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) accepted_receive_size: usize,
     /// Local policy bound for outbound responses and Reports.
     pub(crate) outbound_limit: usize,
-    pub(crate) usm_users: &'a HashMap<Bytes, UsmConfig>,
+    pub(crate) usm_users: &'a HashMap<Bytes, UsmUser>,
     pub(crate) stats: &'a UsmStats,
     pub(crate) mpd: Option<MpdCounters<'a>>,
     pub(crate) source: SocketAddr,
@@ -451,7 +451,7 @@ mod tests {
 
     fn test_ctx<'a>(
         engine_id: &'a Bytes,
-        usm_users: &'a HashMap<Bytes, UsmConfig>,
+        usm_users: &'a HashMap<Bytes, UsmUser>,
         stats: &'a UsmStats,
         mpd: Option<MpdCounters<'a>>,
     ) -> V3LocalContext<'a> {
@@ -687,7 +687,7 @@ mod tests {
         let mut users = HashMap::new();
         users.insert(
             Bytes::from_static(b"user"),
-            UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678"),
+            UsmUser::new("user").auth(AuthProtocol::Sha1, "authpass12345678"),
         );
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
@@ -796,7 +796,7 @@ mod tests {
     fn test_foreign_engine_id_role_split() {
         let engine_id = local_engine_id();
         let mut users = HashMap::new();
-        users.insert(Bytes::from_static(b"user"), UsmConfig::new("user"));
+        users.insert(Bytes::from_static(b"user"), UsmUser::new("user"));
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
@@ -818,5 +818,70 @@ mod tests {
             matches!(outcome, V3Inbound::Message(_)),
             "receiver role must accept a noAuthNoPriv message under a remote engine ID"
         );
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn keyed_inbound_users_accept_supported_lower_security_levels() {
+        use crate::v3::{AuthProtocol, PrivProtocol, UsmConfig};
+
+        let engine_id = local_engine_id();
+        for user in [
+            UsmUser::new("user").auth(AuthProtocol::Sha256, b"auth-password"),
+            UsmUser::new("user").auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            ),
+        ] {
+            let mut users = HashMap::new();
+            users.insert(Bytes::from_static(b"user"), user);
+            let stats = UsmStats::default();
+            let ctx = test_ctx(&engine_id, &users, &stats, None);
+            let outcome = process_v3_inbound(
+                build_msg(&engine_id, b"user", true),
+                &ctx,
+                &V3Role::Authoritative,
+            )
+            .unwrap();
+            let V3Inbound::Message(message) = outcome else {
+                panic!("supported lower security level must be accepted");
+            };
+            assert_eq!(message.security_level, SecurityLevel::NoAuthNoPriv);
+            assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 0);
+        }
+
+        let inbound_user = UsmUser::new("user").auth_priv(
+            AuthProtocol::Sha256,
+            b"auth-password",
+            PrivProtocol::Aes128,
+            b"priv-password",
+        );
+        let mut users = HashMap::new();
+        users.insert(Bytes::from_static(b"user"), inbound_user);
+        let outbound = UsmConfig::new("user").auth(AuthProtocol::Sha256, b"auth-password");
+        let keys = outbound.derive_keys(&engine_id).unwrap();
+        let data = crate::v3::encode::encode_v3_message(
+            &Pdu::get_request(42, &[]),
+            1,
+            &engine_id,
+            7,
+            1000,
+            &outbound,
+            Some(&keys),
+            None,
+            true,
+            crate::UDP_RECEIVE_LIMITS.advertised(),
+        )
+        .unwrap();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let outcome = process_v3_inbound(data.into(), &ctx, &V3Role::Authoritative).unwrap();
+        let V3Inbound::Message(message) = outcome else {
+            panic!("authPriv-capable user must accept authNoPriv");
+        };
+        assert_eq!(message.security_level, SecurityLevel::AuthNoPriv);
+        assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 0);
     }
 }

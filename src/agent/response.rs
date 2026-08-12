@@ -137,6 +137,7 @@ mod tests {
             .community(b"public")
             .engine_boots(engine_boots)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(DummyHandler))
+            .allow_all_access()
             .build()
             .await
             .unwrap()
@@ -339,6 +340,7 @@ mod tests {
             .community(b"public")
             .max_message_size(1400)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(DummyHandler))
+            .allow_all_access()
             .build()
             .await
             .unwrap();

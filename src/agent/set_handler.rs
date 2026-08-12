@@ -54,7 +54,7 @@ impl Agent {
         // Check VACM and call test_set for all varbinds
         for (index, vb) in pdu.varbinds.iter().enumerate() {
             // VACM write access check
-            if let Some(ref vacm) = self.inner.vacm
+            if let Some(vacm) = self.inner.authorization.vacm()
                 && !vacm.check_access(ctx.write_view.as_ref(), &vb.oid)
             {
                 // Free resources for all previously successful varbinds
@@ -274,6 +274,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -312,6 +313,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -403,6 +405,7 @@ mod tests {
             .max_message_size(80)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -448,6 +451,7 @@ mod tests {
             .max_message_size(150)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -482,6 +486,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -618,6 +623,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .allow_all_access()
             .build()
             .await
             .unwrap();

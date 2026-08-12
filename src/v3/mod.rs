@@ -18,8 +18,8 @@
 //! increment are persisted before protocol use.
 //!
 //! Cargo features determine which crypto backends are available. Each
-//! [`UsmConfig`] selects a backend; RustCrypto remains the default when both
-//! backends are enabled.
+//! Each [`UsmConfig`] or [`UsmUser`] selects a backend; RustCrypto remains the
+//! default when both backends are enabled.
 
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 #[doc(hidden)]
@@ -67,7 +67,7 @@ pub use authoritative::{AuthoritativeEngine, PersistedAuthoritativeEngine};
 pub use config::DerivedKeys;
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 pub(crate) use config::DerivedKeys;
-pub use config::UsmConfig;
+pub use config::{UsmConfig, UsmUser};
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use crypto::{CryptoBackend, CryptoError, CryptoResult};
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]

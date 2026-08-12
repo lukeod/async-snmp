@@ -62,6 +62,7 @@
 //!         .bind("0.0.0.0:1161")
 //!         .community(b"public")
 //!         .handler(oid!(1, 3, 6, 1, 2, 1, 1), Arc::new(SystemMibHandler))
+//!         .allow_all_access()
 //!         .build()
 //!         .await?;
 //!
@@ -112,7 +113,7 @@ use crate::util::{
     prepare_authoritative_usm,
 };
 use crate::v3::process::UsmStats;
-use crate::v3::{AuthoritativeEngine, UsmConfig};
+use crate::v3::{AuthoritativeEngine, UsmUser};
 use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
 use crate::varbind::VarBind;
@@ -241,6 +242,23 @@ pub(crate) struct RegisteredHandler {
     pub(crate) handler: Arc<dyn MibHandler>,
 }
 
+/// Agent authorization policy selected by the builder.
+pub(crate) enum AgentAuthorization {
+    Unset,
+    Vacm(VacmConfig),
+    AllowAll,
+    Conflict,
+}
+
+impl AgentAuthorization {
+    pub(crate) fn vacm(&self) -> Option<&VacmConfig> {
+        match self {
+            Self::Vacm(vacm) => Some(vacm),
+            Self::Unset | Self::AllowAll | Self::Conflict => None,
+        }
+    }
+}
+
 /// Builder for [`Agent`].
 ///
 /// Use this builder to configure and construct an SNMP agent. The builder
@@ -249,13 +267,11 @@ pub(crate) struct RegisteredHandler {
 ///
 /// # Access Control
 ///
-/// By default, the agent operates in **permissive mode**: any authenticated
-/// request (valid community string for v1/v2c, valid USM credentials for v3)
-/// has full read and write access to all registered handlers.
-///
-/// For production deployments, use the [`vacm()`](AgentBuilder::vacm) method
-/// to configure View-based Access Control (RFC 3415), which allows fine-grained
-/// control over which security names can access which OID subtrees.
+/// An agent with an accepted community or USM user must explicitly select
+/// [`vacm()`](AgentBuilder::vacm) or
+/// [`allow_all_access()`](AgentBuilder::allow_all_access). USM authentication
+/// and privacy protocols are capabilities and do not establish an inbound
+/// minimum security level.
 ///
 /// # Minimal Example
 ///
@@ -280,6 +296,7 @@ pub(crate) struct RegisteredHandler {
 ///     .bind("0.0.0.0:1161")  // Use non-privileged port
 ///     .community(b"public")
 ///     .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MyHandler))
+///     .allow_all_access()
 ///     .build()
 ///     .await?;
 /// # Ok(())
@@ -288,13 +305,13 @@ pub(crate) struct RegisteredHandler {
 pub struct AgentBuilder {
     bind_addr: String,
     communities: Vec<crate::Community>,
-    usm_users: HashMap<Bytes, UsmConfig>,
+    usm_users: HashMap<Bytes, UsmUser>,
     handlers: Vec<RegisteredHandler>,
     authoritative_engine: Option<AuthoritativeEngine>,
     max_message_size: usize,
     max_concurrent_requests: Option<usize>,
     recv_buffer_size: Option<usize>,
-    vacm: Option<VacmConfig>,
+    authorization: AgentAuthorization,
     cancel: Option<CancellationToken>,
     trap_sinks: Vec<(NotificationSinkId, String, crate::client::Auth)>,
     inform_timeout: Duration,
@@ -323,7 +340,7 @@ impl AgentBuilder {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_concurrent_requests: Some(1000),
             recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
-            vacm: None,
+            authorization: AgentAuthorization::Unset,
             cancel: None,
             trap_sinks: Vec::new(),
             inform_timeout: Duration::from_secs(5),
@@ -344,13 +361,13 @@ impl AgentBuilder {
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to all IPv4 interfaces on standard port (requires privileges)
-    /// let agent = Agent::builder().bind("0.0.0.0:161").community(b"public").build().await?;
+    /// let agent = Agent::builder().bind("0.0.0.0:161").community(b"public").allow_all_access().build().await?;
     ///
     /// // Bind to localhost only on non-privileged port
-    /// let agent = Agent::builder().bind("127.0.0.1:1161").community(b"public").build().await?;
+    /// let agent = Agent::builder().bind("127.0.0.1:1161").community(b"public").allow_all_access().build().await?;
     ///
     /// // Bind to specific interface
-    /// let agent = Agent::builder().bind("192.168.1.100:161").community(b"public").build().await?;
+    /// let agent = Agent::builder().bind("192.168.1.100:161").community(b"public").allow_all_access().build().await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -362,10 +379,10 @@ impl AgentBuilder {
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to all interfaces (IPv6, with dual-stack on Linux)
-    /// let agent = Agent::builder().bind("[::]:161").community(b"public").build().await?;
+    /// let agent = Agent::builder().bind("[::]:161").community(b"public").allow_all_access().build().await?;
     ///
     /// // Bind to IPv6 localhost only
-    /// let agent = Agent::builder().bind("[::1]:1161").community(b"public").build().await?;
+    /// let agent = Agent::builder().bind("[::1]:1161").community(b"public").allow_all_access().build().await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -388,8 +405,9 @@ impl AgentBuilder {
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
-    ///     .community(b"public")   // Read-only access
-    ///     .community(b"private")  // Read-write access (with VACM)
+    ///     .community(b"public")
+    ///     .community(b"private")
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -413,6 +431,7 @@ impl AgentBuilder {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .communities(communities)
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -432,8 +451,11 @@ impl AgentBuilder {
 
     /// Add a USM user for `SNMPv3` authentication.
     ///
-    /// Configure authentication and privacy settings using the closure.
-    /// Multiple users can be added with different security levels.
+    /// Configure supported authentication and privacy mechanisms using the
+    /// closure. The strongest configured mechanism is available through
+    /// [`UsmUser::maximum_security_level`](crate::UsmUser::maximum_security_level),
+    /// but it is not a minimum: lower-level packets naming the user remain
+    /// valid USM input and are controlled by the Agent authorization policy.
     ///
     /// # Security Levels
     ///
@@ -456,11 +478,11 @@ impl AgentBuilder {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .authoritative_engine(engine)
-    ///     // Read-only user with authentication only
+    ///     // User capable of authentication
     ///     .usm_user("monitor", |u| {
     ///         u.auth(AuthProtocol::Sha256, b"monitorpass123")
     ///     })
-    ///     // Admin user with full encryption
+    ///     // User capable of authentication and privacy
     ///     .usm_user("admin", |u| {
     ///         u.auth_priv(
     ///             AuthProtocol::Sha256,
@@ -469,6 +491,7 @@ impl AgentBuilder {
     ///             b"adminpriv123",
     ///         )
     ///     })
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -477,10 +500,10 @@ impl AgentBuilder {
     #[must_use]
     pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
     where
-        F: FnOnce(UsmConfig) -> UsmConfig,
+        F: FnOnce(UsmUser) -> UsmUser,
     {
         let username_bytes: Bytes = username.into();
-        let config = configure(UsmConfig::new(username_bytes.clone()));
+        let config = configure(UsmUser::new(username_bytes.clone()));
         self.usm_users.insert(username_bytes, config);
         self
     }
@@ -509,6 +532,7 @@ impl AgentBuilder {
     ///     .bind("0.0.0.0:1161")
     ///     .authoritative_engine(engine)
     ///     .community(b"public")
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -626,6 +650,7 @@ impl AgentBuilder {
     ///     .community(b"public")
     ///     // Register handler for system MIB subtree
     ///     .handler(oid!(1, 3, 6, 1, 2, 1, 1), Arc::new(SystemHandler))
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -640,11 +665,13 @@ impl AgentBuilder {
     /// Configure VACM (View-based Access Control Model) using a builder function.
     ///
     /// When VACM is configured, all requests are checked against the configured
-    /// access control rules. Requests that don't have proper access are rejected
-    /// with `noAccess` error (v2c/v3) or `noSuchName` (v1).
+    /// access control rules. Missing groups, access rows, or views produce an
+    /// `authorizationError` with error-index zero for v2c/v3. OIDs outside an
+    /// existing view retain operation-specific `notInView` handling.
     ///
-    /// **Without VACM configuration, the agent operates in permissive mode**:
-    /// any authenticated request has full read/write access to all handlers.
+    /// VACM and [`allow_all_access`](Self::allow_all_access) are mutually
+    /// exclusive. An explicitly empty VACM configuration is a valid deny-all
+    /// policy.
     ///
     /// # Example
     ///
@@ -661,9 +688,9 @@ impl AgentBuilder {
     ///     .vacm(|v| v
     ///         .group("public", SecurityModel::V2c, "readonly_group")
     ///         .group("private", SecurityModel::V2c, "readwrite_group")
-    ///         .access("readonly_group", |a| a
+    ///         .access("readonly_group", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv, |a| a
     ///             .read_view("full_view"))
-    ///         .access("readwrite_group", |a| a
+    ///         .access("readwrite_group", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv, |a| a
     ///             .read_view("full_view")
     ///             .write_view("write_view"))
     ///         .view("full_view", |v| v
@@ -681,7 +708,33 @@ impl AgentBuilder {
         F: FnOnce(VacmBuilder) -> VacmBuilder,
     {
         let builder = VacmBuilder::new();
-        self.vacm = Some(configure(builder).build());
+        self.authorization = match self.authorization {
+            AgentAuthorization::Unset | AgentAuthorization::Vacm(_) => {
+                AgentAuthorization::Vacm(configure(builder).build())
+            }
+            AgentAuthorization::AllowAll | AgentAuthorization::Conflict => {
+                AgentAuthorization::Conflict
+            }
+        };
+        self
+    }
+
+    /// Explicitly allow every operation supported by an accepted identity.
+    ///
+    /// This escape hatch includes unauthenticated `noAuthNoPriv` requests that
+    /// name a configured USM user. Use [`vacm`](Self::vacm) to require minimum
+    /// security levels or restrict MIB views. The two selections are mutually
+    /// exclusive.
+    #[must_use]
+    pub fn allow_all_access(mut self) -> Self {
+        self.authorization = match self.authorization {
+            AgentAuthorization::Unset | AgentAuthorization::AllowAll => {
+                AgentAuthorization::AllowAll
+            }
+            AgentAuthorization::Vacm(_) | AgentAuthorization::Conflict => {
+                AgentAuthorization::Conflict
+            }
+        };
         self
     }
 
@@ -731,6 +784,7 @@ impl AgentBuilder {
     ///         PrivProtocol::Aes128,
     ///         "privpass",
     ///     ))
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -792,13 +846,30 @@ impl AgentBuilder {
 
     /// Build the agent.
     ///
-    /// Returns a configuration error when notification sink IDs are empty,
-    /// longer than 32 UTF-8 octets, or duplicated; USM credentials are invalid;
-    /// USM users or V3 trap sinks are configured without a persisted
-    /// [`AuthoritativeEngine`]; or the response-size limit exceeds the fixed UDP
-    /// receive capacity. Returns [`Error::RandomSource`] when a generated engine
-    /// ID or required privacy salt cannot be initialized.
+    /// Returns a configuration error when inbound identities do not have an
+    /// explicit access policy, VACM and unrestricted access are both selected,
+    /// notification sink IDs are empty, longer than 32 UTF-8 octets, or
+    /// duplicated; USM credentials are invalid; USM users or V3 trap sinks are
+    /// configured without a persisted [`AuthoritativeEngine`]; or the
+    /// response-size limit exceeds the fixed UDP receive capacity. Returns
+    /// [`Error::RandomSource`] when a generated engine ID or required privacy
+    /// salt cannot be initialized.
     pub async fn build(mut self) -> Result<Agent> {
+        if matches!(self.authorization, AgentAuthorization::Conflict) {
+            return Err(Error::Config(
+                "VACM and unrestricted Agent access are mutually exclusive".into(),
+            )
+            .boxed());
+        }
+        if (!self.communities.is_empty() || !self.usm_users.is_empty())
+            && matches!(self.authorization, AgentAuthorization::Unset)
+        {
+            return Err(Error::Config(
+                "an Agent with inbound identities requires vacm() or allow_all_access()".into(),
+            )
+            .boxed());
+        }
+
         let mut sink_ids = HashSet::with_capacity(self.trap_sinks.len());
         for (id, _, _) in &self.trap_sinks {
             id.validate()?;
@@ -833,7 +904,7 @@ impl AgentBuilder {
         let requires_privacy = self
             .usm_users
             .values()
-            .any(|security| security.security_level().requires_priv())
+            .any(|security| security.maximum_security_level().requires_priv())
             || self.trap_sinks.iter().any(|(_, _, auth)| {
                 matches!(auth, crate::client::Auth::Usm(security) if security.security_level().requires_priv())
             });
@@ -967,7 +1038,7 @@ impl AgentBuilder {
                 state,
                 salt_counter,
                 concurrency_limit,
-                vacm: self.vacm,
+                authorization: self.authorization,
                 cancel,
                 trap_sinks,
                 notification_id: std::sync::atomic::AtomicI32::new(1),
@@ -1063,12 +1134,12 @@ pub(crate) struct AgentInner {
     pub(crate) socket_state: UdpSocketState,
     pub(crate) local_addr: SocketAddr,
     pub(crate) communities: Vec<crate::Community>,
-    pub(crate) usm_users: HashMap<Bytes, UsmConfig>,
+    pub(crate) usm_users: HashMap<Bytes, UsmUser>,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
     pub(crate) salt_counter: Option<SaltCounter>,
     pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
-    pub(crate) vacm: Option<VacmConfig>,
+    pub(crate) authorization: AgentAuthorization,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
     /// Configured trap/inform destinations.
@@ -1093,6 +1164,7 @@ pub(crate) struct AgentInner {
 /// let agent = Agent::builder()
 ///     .bind("0.0.0.0:161")
 ///     .community(b"public")
+///     .allow_all_access()
 ///     .build()
 ///     .await?;
 ///
@@ -1658,7 +1730,7 @@ impl Agent {
 
         for (index, vb) in pdu.varbinds.iter().enumerate() {
             // VACM read access check
-            if let Some(ref vacm) = self.inner.vacm
+            if let Some(vacm) = self.inner.authorization.vacm()
                 && !vacm.check_access(ctx.read_view.as_ref(), &vb.oid)
             {
                 // v1: noSuchName, v2c/v3: noAccess or NoSuchObject
@@ -1931,7 +2003,7 @@ impl Agent {
                         search_from = next_vb.oid.clone();
                         continue;
                     }
-                    if let Some(ref vacm) = self.inner.vacm {
+                    if let Some(vacm) = self.inner.authorization.vacm() {
                         if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
                             return Ok(candidate);
                         }
@@ -2138,6 +2210,7 @@ mod tests {
                 }),
             )
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -2229,6 +2302,7 @@ mod tests {
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -2277,6 +2351,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -2294,6 +2369,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -2541,7 +2617,7 @@ mod tests {
             for (prefix, handler) in registrations {
                 builder = builder.handler(prefix, handler);
             }
-            let agent = builder.build().await.unwrap();
+            let agent = builder.allow_all_access().build().await.unwrap();
 
             let result = agent
                 .get_next_oid(&test_ctx(), &cursor)
@@ -2573,7 +2649,7 @@ mod tests {
                 )),
             );
         }
-        let agent = builder.build().await.unwrap();
+        let agent = builder.allow_all_access().build().await.unwrap();
         let result = agent
             .get_next_oid(&test_ctx(), &cursor)
             .await
@@ -2611,6 +2687,7 @@ mod tests {
             .without_builtin_handlers()
             .handler(prefix.clone(), Arc::new(first))
             .handler(prefix.clone(), Arc::new(later))
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -2661,6 +2738,7 @@ mod tests {
                     order.clone(),
                 )),
             )
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -2708,6 +2786,7 @@ mod tests {
                     order.clone(),
                 )),
             )
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -2771,6 +2850,7 @@ mod tests {
                 oid!(1, 3, 6, 1, 4, 1, 99999),
                 Arc::new(FailingBackendHandler),
             )
+            .allow_all_access()
             .build()
             .await
             .unwrap()
@@ -2920,7 +3000,12 @@ mod tests {
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .vacm(|v| {
                 v.group("public", SecurityModel::V2c, "readers")
-                    .access("readers", |a| a.read_view("restricted"))
+                    .access(
+                        "readers",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.read_view("restricted"),
+                    )
                     .view("restricted", |v| {
                         v.include(oid!(1, 3, 6, 1, 4, 1, 99999, 2))
                             .include(oid!(1, 3, 6, 1, 4, 1, 99999, 4))
@@ -3069,7 +3154,12 @@ mod tests {
             // returns under .99999 is denied.
             .vacm(|v| {
                 v.group("public", SecurityModel::V2c, "readers")
-                    .access("readers", |a| a.read_view("restricted"))
+                    .access(
+                        "readers",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.read_view("restricted"),
+                    )
                     .view("restricted", |v| v.include(oid!(1, 3, 6, 1, 4, 1, 88888)))
             })
             .build()
@@ -3145,6 +3235,7 @@ mod tests {
                 }),
             )
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3237,7 +3328,12 @@ mod tests {
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(ThreeOidHandler))
             .vacm(|v| {
                 v.group("public", SecurityModel::V2c, "readers")
-                    .access("readers", |a| a.read_view("gap"))
+                    .access(
+                        "readers",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.read_view("gap"),
+                    )
                     .view("gap", |v| {
                         v.include(oid!(1, 3, 6, 1, 4, 1, 99999, 1))
                             .include(oid!(1, 3, 6, 1, 4, 1, 99999, 3))
@@ -3318,6 +3414,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3357,6 +3454,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3430,6 +3528,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(Counter64Handler))
+            .allow_all_access()
             .build()
             .await
             .unwrap()
@@ -3499,6 +3598,7 @@ mod tests {
             .community(b"public")
             .max_message_size(65507) // agent allows large responses
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3560,6 +3660,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .engine_id(engine_id.clone())
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3609,6 +3710,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3637,6 +3739,7 @@ mod tests {
             .max_message_size(65507)
             .engine_id(vec![0x11u8; 17])
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3755,6 +3858,7 @@ mod tests {
             .max_message_size(65507)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MixedSizeHandler))
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3821,6 +3925,7 @@ mod tests {
             .max_message_size(65507)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MixedSizeHandler))
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3858,6 +3963,7 @@ mod tests {
             .max_message_size(65507)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MixedSizeHandler))
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -3900,6 +4006,7 @@ mod tests {
             .max_message_size(65507)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4054,6 +4161,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .authoritative_engine(engine)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4063,10 +4171,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_identities_require_explicit_authorization_before_bind() {
+        let result = Agent::builder()
+            .bind("not a socket address")
+            .community(b"public")
+            .build()
+            .await;
+        let error = result.err().expect("missing Agent policy must fail");
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("requires vacm() or allow_all_access()")
+        ));
+
+        let result = Agent::builder()
+            .bind("not a socket address")
+            .usm_user("user", |user| user)
+            .build()
+            .await;
+        let error = result.err().expect("missing Agent policy must fail");
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("requires vacm() or allow_all_access()")
+        ));
+    }
+
+    #[tokio::test]
+    async fn conflicting_agent_authorization_selections_are_rejected() {
+        for result in [
+            Agent::builder()
+                .bind("not a socket address")
+                .allow_all_access()
+                .vacm(|vacm| vacm)
+                .build()
+                .await,
+            Agent::builder()
+                .bind("not a socket address")
+                .vacm(|vacm| vacm)
+                .allow_all_access()
+                .build()
+                .await,
+        ] {
+            let error = result.err().expect("conflicting policies must fail");
+            assert!(matches!(
+                *error,
+                Error::Config(ref message) if message.contains("mutually exclusive")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_vacm_is_an_explicit_deny_all_policy() {
+        Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .vacm(|vacm| vacm)
+            .build()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_v3_agent_requires_authoritative_engine_before_bind() {
         let result = Agent::builder()
             .bind("not a socket address")
             .usm_user("user", |user| user)
+            .allow_all_access()
             .build()
             .await;
 
@@ -4103,6 +4272,7 @@ mod tests {
             .bind("not a socket address")
             .community(b"public")
             .authoritative_engine(engine)
+            .allow_all_access()
             .build()
             .await;
 
@@ -4120,6 +4290,7 @@ mod tests {
         let configured = Agent::builder()
             .bind("127.0.0.1:0")
             .communities([b"public".as_slice(), b"monitor"])
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4136,6 +4307,7 @@ mod tests {
         let result = Agent::builder()
             .bind("not a socket address")
             .usm_user("", |user| user)
+            .allow_all_access()
             .build()
             .await;
 
@@ -4186,6 +4358,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .max_concurrent_requests(Some(0))
+            .allow_all_access()
             .build()
             .await;
 
@@ -4199,6 +4372,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4211,6 +4385,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4240,6 +4415,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4260,6 +4436,7 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4306,6 +4483,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4333,6 +4511,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .without_builtin_handler(BuiltinMib::UsmStats)
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -4363,6 +4542,7 @@ mod tests {
             .max_message_size(80)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap()
@@ -4430,6 +4610,7 @@ mod tests {
             .max_message_size(150)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .without_builtin_handlers()
+            .allow_all_access()
             .build()
             .await
             .unwrap();

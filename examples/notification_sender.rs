@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b"privpass12345678",
             )
         })
+        .accept_all_notifications()
         .build()
         .await?;
     let recv_addr = receiver.local_addr();
@@ -84,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         // Configure trap sinks - agent sends to all of them
         .trap_sink("local-receiver", recv_addr.to_string(), Auth::v2c("public"))
+        .allow_all_access()
         .build()
         .await?;
 

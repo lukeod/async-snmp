@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
-use crate::v3::{AuthoritativeEngine, UsmConfig};
+use crate::v3::{AuthoritativeEngine, UsmUser};
 
 /// Behavior when no community strings are configured for an inbound role.
 #[derive(Clone, Copy)]
@@ -44,7 +44,7 @@ pub(crate) fn community_matches(
 
 /// Prepared USM users and authoritative engine state for an inbound role.
 pub(crate) struct PreparedAuthoritativeUsm {
-    pub(crate) users: HashMap<Bytes, UsmConfig>,
+    pub(crate) users: HashMap<Bytes, UsmUser>,
     pub(crate) authoritative_engine: Option<AuthoritativeEngine>,
     pub(crate) engine_id: Bytes,
     pub(crate) engine_boots: u32,
@@ -52,7 +52,7 @@ pub(crate) struct PreparedAuthoritativeUsm {
 
 /// Validate inbound USM users and prepare the local authoritative engine seed.
 pub(crate) fn prepare_authoritative_usm(
-    mut users: HashMap<Bytes, UsmConfig>,
+    mut users: HashMap<Bytes, UsmUser>,
     authoritative_engine: Option<AuthoritativeEngine>,
     requires_engine: bool,
     invalid_user_context: &str,

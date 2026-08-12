@@ -12,6 +12,8 @@ use async_snmp::{
     Auth, AuthoritativeEngine, Client, Pdu, PduType, Retry, SecurityLevel, Value, Version, oid,
 };
 use bytes::Bytes;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -175,9 +177,15 @@ async fn notification_varbind_validation_controls_trap_delivery() {
         }
     ));
 
+    let policy_calls = Arc::new(AtomicU32::new(0));
+    let policy_calls_for_receiver = Arc::clone(&policy_calls);
     let strict = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .varbind_validation(NotificationVarbindValidation::Strict)
+        .acceptance_policy(move |_| {
+            policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
+            true
+        })
         .build()
         .await
         .unwrap();
@@ -195,11 +203,13 @@ async fn notification_varbind_validation_controls_trap_delivery() {
             .is_err(),
         "strict receiver returned malformed-name Trap"
     );
+    assert_eq!(policy_calls.load(Ordering::Relaxed), 0);
     sender
         .send_to(&valid_sentinel_trap(999), strict_addr)
         .await
         .unwrap();
     assert_sentinel_received(recv_handle).await;
+    assert_eq!(policy_calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -434,6 +444,7 @@ async fn v3_trap_send_receive() {
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
+        .accept_all_notifications()
         .build()
         .await
         .unwrap();
@@ -491,6 +502,7 @@ async fn v3_inform_send_receive() {
                 b"privpass12345678",
             )
         })
+        .accept_all_notifications()
         .build()
         .await
         .unwrap();
@@ -670,6 +682,7 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
         .usm_user("user", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
+        .accept_all_notifications()
         .build()
         .await
         .unwrap();
@@ -702,6 +715,7 @@ async fn agent_v2c_trap_to_sink() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("v2c", recv_addr.to_string(), Auth::v2c("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -739,6 +753,7 @@ async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("lazy", recv_addr.to_string(), Auth::v2c("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -776,6 +791,7 @@ async fn agent_v2c_inform_to_sink() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("v2c", recv_addr.to_string(), Auth::v2c("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -820,6 +836,7 @@ async fn agent_v3_trap_to_sink() {
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
+        .accept_all_notifications()
         .build()
         .await
         .unwrap();
@@ -837,6 +854,7 @@ async fn agent_v3_trap_to_sink() {
             recv_addr.to_string(),
             Auth::usm("trapuser").auth(AuthProtocol::Sha256, "authpass12345678"),
         )
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -878,6 +896,7 @@ async fn agent_multiple_sinks() {
         .community(b"public")
         .trap_sink("first", addr1.to_string(), Auth::v2c("public"))
         .trap_sink("second", addr2.to_string(), Auth::v2c("trap-community"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -926,6 +945,7 @@ async fn agent_v1_trap_to_sink() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("v1", recv_addr.to_string(), Auth::v1("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -964,6 +984,7 @@ async fn agent_mixed_v1_v2c_sinks() {
         .community(b"public")
         .trap_sink("v1", addr_v1.to_string(), Auth::v1("v1comm"))
         .trap_sink("v2c", addr_v2.to_string(), Auth::v2c("v2comm"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1014,6 +1035,7 @@ async fn agent_no_sinks_is_noop() {
         .bind("127.0.0.1:0")
         .community(b"public")
         // No trap sinks configured
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1176,6 +1198,7 @@ async fn agent_inform_reports_failing_sink() {
         .trap_sink("dead", dead_addr.to_string(), Auth::v2c("public"))
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1206,6 +1229,7 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
         .trap_sink("live", live_addr.to_string(), Auth::v2c("public"))
         .inform_timeout(Duration::from_secs(2))
         .inform_retry(Retry::none())
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1244,6 +1268,7 @@ async fn dropping_inform_stream_cancels_retries() {
         .trap_sink("cancelled", target_addr.to_string(), Auth::v2c("public"))
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::fixed(2, Duration::ZERO))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1285,6 +1310,7 @@ async fn agent_inform_aggregate_restores_configuration_order() {
         .trap_sink("live", live_addr.to_string(), Auth::v2c("public"))
         .inform_timeout(Duration::from_millis(100))
         .inform_retry(Retry::none())
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1310,6 +1336,7 @@ async fn agent_trap_reports_total_conversion_failure() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("v1", sink_addr.to_string(), Auth::v1("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1347,6 +1374,7 @@ async fn agent_trap_reports_ordered_partial_success() {
         .community(b"public")
         .trap_sink("v1", v1_addr.to_string(), Auth::v1("public"))
         .trap_sink("v2c", v2_addr.to_string(), Auth::v2c("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1386,6 +1414,7 @@ async fn agent_v1_inform_is_explicitly_skipped() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("v1", sink_addr.to_string(), Auth::v1("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1411,6 +1440,7 @@ async fn agent_inform_stream_yields_skipped_sink() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("v1-skip", "127.0.0.1:9", Auth::v1("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();
@@ -1434,6 +1464,7 @@ async fn agent_best_effort_helpers_complete_after_failure_and_skip() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .trap_sink("v1", receiver.local_addr().to_string(), Auth::v1("public"))
+        .allow_all_access()
         .build()
         .await
         .unwrap();

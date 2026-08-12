@@ -112,8 +112,10 @@ impl Auth {
 
     /// Create an `SNMPv3` USM configuration.
     ///
-    /// Returns the shared [`UsmConfig`] used by clients, agents, notification
-    /// receivers, and trap sinks. `SNMPv3` supports three security levels:
+    /// Returns the outbound [`UsmConfig`] used by clients and trap sinks.
+    /// Inbound agents and notification receivers use [`crate::UsmUser`]
+    /// because configured mechanisms are capabilities rather than the exact
+    /// level of an incoming packet. `SNMPv3` supports three security levels:
     /// - noAuthNoPriv: username only (no security)
     /// - authNoPriv: username with authentication (integrity)
     /// - authPriv: username with authentication and encryption (confidentiality)

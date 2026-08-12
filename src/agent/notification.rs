@@ -490,6 +490,7 @@ impl super::Agent {
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
     ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     ///
@@ -598,6 +599,7 @@ impl super::Agent {
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
     ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
+    ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     ///
@@ -647,7 +649,7 @@ impl super::Agent {
 
     /// Resolve and apply the target sink's VACM notify view.
     fn notification_allowed(&self, sink: &TrapSink, trap_oid: &Oid, varbinds: &[VarBind]) -> bool {
-        let Some(vacm) = self.inner.vacm.as_ref() else {
+        let Some(vacm) = self.inner.authorization.vacm() else {
             return true;
         };
 
@@ -792,8 +794,8 @@ impl super::Agent {
 #[cfg(test)]
 mod tests {
     use super::{NotificationSinkId, SinkSkipReason, SinkStatus, TrapSink};
-    use crate::agent::{Agent, SecurityModel};
-    use crate::{Auth, AuthProtocol, Error, PrivProtocol, Value, VarBind, oid};
+    use crate::agent::{Agent, SecurityModel, VacmSecurityModel};
+    use crate::{Auth, AuthProtocol, Error, PrivProtocol, SecurityLevel, Value, VarBind, oid};
     use bytes::Bytes;
 
     fn test_sink(auth: impl Into<Auth>) -> TrapSink {
@@ -816,30 +818,40 @@ mod tests {
                     .group("v2-community", SecurityModel::V2c, "v2")
                     .group("context-user", SecurityModel::Usm, "context")
                     .group("security-user", SecurityModel::Usm, "security")
-                    .access("v1", |a| a.notify_view("all"))
-                    .access("v2", |a| a.notify_view("all"))
-                    .access("context", |a| {
-                        a.context_prefix("tenant/")
-                            .context_match_prefix()
-                            .security_model(SecurityModel::Usm)
-                            .notify_view("empty")
+                    .access("v1", SecurityModel::V1, SecurityLevel::NoAuthNoPriv, |a| {
+                        a.notify_view("all")
                     })
-                    .access("context", |a| {
-                        a.context_prefix("tenant/blue")
-                            .security_model(SecurityModel::Usm)
-                            .notify_view("all")
+                    .access("v2", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv, |a| {
+                        a.notify_view("all")
                     })
-                    .access("security", |a| {
-                        a.context_prefix("secure")
-                            .security_model(SecurityModel::Usm)
-                            .notify_view("empty")
-                    })
-                    .access("security", |a| {
-                        a.context_prefix("secure")
-                            .security_model(SecurityModel::Usm)
-                            .security_level(crate::message::SecurityLevel::AuthPriv)
-                            .notify_view("all")
-                    })
+                    .access(
+                        "context",
+                        SecurityModel::Usm,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| {
+                            a.context_prefix("tenant/")
+                                .context_match_prefix()
+                                .notify_view("empty")
+                        },
+                    )
+                    .access(
+                        "context",
+                        SecurityModel::Usm,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.context_prefix("tenant/blue").notify_view("all"),
+                    )
+                    .access(
+                        "security",
+                        SecurityModel::Usm,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.context_prefix("secure").notify_view("empty"),
+                    )
+                    .access(
+                        "security",
+                        SecurityModel::Usm,
+                        SecurityLevel::AuthPriv,
+                        |a| a.context_prefix("secure").notify_view("all"),
+                    )
                     .view("all", |view| view.include(oid!(1, 3, 6)))
                     .view("empty", |view| view)
             })
@@ -902,10 +914,30 @@ mod tests {
                     .group("missing", SecurityModel::V2c, "missing")
                     .group("empty", SecurityModel::V2c, "empty")
                     .group("no-access", SecurityModel::V2c, "no-access")
-                    .access("trap-denied", |a| a.notify_view("trap-view"))
-                    .access("extra-denied", |a| a.notify_view("extra-view"))
-                    .access("missing", |a| a.notify_view("not-defined"))
-                    .access("empty", |a| a)
+                    .access(
+                        "trap-denied",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.notify_view("trap-view"),
+                    )
+                    .access(
+                        "extra-denied",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.notify_view("extra-view"),
+                    )
+                    .access(
+                        "missing",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.notify_view("not-defined"),
+                    )
+                    .access(
+                        "empty",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a,
+                    )
                     .view("trap-view", |view| {
                         view.include(oid!(1, 3, 6)).exclude(denied_trap.clone())
                     })
@@ -947,7 +979,12 @@ mod tests {
             .vacm(|v| {
                 v.group("v1", SecurityModel::V1, "group")
                     .group("v2", SecurityModel::V2c, "group")
-                    .access("group", |a| a.notify_view("notification-only"))
+                    .access(
+                        "group",
+                        VacmSecurityModel::Any,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.notify_view("notification-only"),
+                    )
                     .view("notification-only", |view| {
                         view.include(trap_oid.clone()).include(extra_oid.clone())
                     })
@@ -982,8 +1019,18 @@ mod tests {
             .vacm(|v| {
                 v.group("allowed", SecurityModel::V2c, "allowed")
                     .group("denied", SecurityModel::V2c, "denied")
-                    .access("allowed", |a| a.notify_view("all"))
-                    .access("denied", |a| a.notify_view("empty"))
+                    .access(
+                        "allowed",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.notify_view("all"),
+                    )
+                    .access(
+                        "denied",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.notify_view("empty"),
+                    )
                     .view("all", |view| view.include(oid!(1, 3, 6)))
                     .view("empty", |view| view)
             })
@@ -1002,7 +1049,12 @@ mod tests {
             .trap_sink("denied", "127.0.0.1:9", Auth::v2c("denied"))
             .vacm(|v| {
                 v.group("denied", SecurityModel::V2c, "denied")
-                    .access("denied", |a| a.notify_view("empty"))
+                    .access(
+                        "denied",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.notify_view("empty"),
+                    )
                     .view("empty", |view| view)
             })
             .build()
@@ -1036,6 +1088,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .trap_sink("public", "127.0.0.1:9", Auth::v2c("public"))
+            .allow_all_access()
             .build()
             .await
             .unwrap();
@@ -1087,12 +1140,14 @@ mod tests {
         let agent_a = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
         let agent_b = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .allow_all_access()
             .build()
             .await
             .unwrap();
