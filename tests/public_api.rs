@@ -4,13 +4,13 @@ use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, Error, ErrorKind,
-    Oid, RequestRegistration, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value,
-    ValueKind, WalkAbortReason,
+    ErrorStatus, Oid, Pdu, RequestRegistration, Target, UdpControl, UdpHandle, UdpStats,
+    UdpTransport, Value, ValueKind, VarBind, Version, WalkAbortReason,
 };
 #[cfg(feature = "agent")]
 use async_snmp::{
     GetNextResult, GetResult, NotificationSendStream, NotificationSinkId, NotificationSinkSummary,
-    VarBind, oid,
+    oid,
 };
 use bytes::Bytes;
 
@@ -118,6 +118,122 @@ fn intentional_compatibility_surface_remains_available() {
 
     let result: async_snmp::Result<()> = Ok(());
     let _: std::result::Result<(), Box<async_snmp::Error>> = result;
+}
+
+#[test]
+fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
+    use async_snmp::ber::{EncodeBuf, tag};
+    use async_snmp::message::{
+        CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message,
+    };
+    use async_snmp::v3::UsmSecurityParams;
+
+    fn assert_invalid_message<T: std::fmt::Debug>(result: async_snmp::Result<T>) {
+        let error = result.unwrap_err();
+        assert!(matches!(error.as_ref(), Error::InvalidMessage(_)));
+        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
+    }
+
+    fn push_noncanonical_too_big(buf: &mut EncodeBuf, varbind: &VarBind) {
+        buf.try_push_constructed(tag::pdu::RESPONSE, |buf| {
+            buf.try_push_sequence(|buf| varbind.encode(buf))?;
+            buf.push_integer(0);
+            buf.push_integer(ErrorStatus::TooBig.as_i32());
+            buf.push_integer(7);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn raw_v2c_message(varbind: &VarBind) -> Bytes {
+        let mut buf = EncodeBuf::new();
+        buf.try_push_sequence(|buf| {
+            push_noncanonical_too_big(buf, varbind);
+            buf.try_push_octet_string(b"public")?;
+            buf.push_integer(Version::V2c.as_i32());
+            Ok(())
+        })
+        .unwrap();
+        buf.finish()
+    }
+
+    fn raw_v3_message(global: &MsgGlobalData, security_params: &[u8], varbind: &VarBind) -> Bytes {
+        let mut buf = EncodeBuf::new();
+        buf.try_push_sequence(|buf| {
+            buf.try_push_sequence(|buf| {
+                push_noncanonical_too_big(buf, varbind);
+                buf.try_push_octet_string(b"")?;
+                buf.try_push_octet_string(b"engine")?;
+                Ok(())
+            })?;
+            buf.try_push_octet_string(security_params)?;
+            global.encode(buf)?;
+            buf.push_integer(Version::V3.as_i32());
+            Ok(())
+        })
+        .unwrap();
+        buf.finish()
+    }
+
+    let varbinds = vec![VarBind::null(Oid::from_slice(&[1, 3, 6, 1]))];
+    let too_big = Pdu::response(7, ErrorStatus::TooBig.as_i32(), 0, varbinds.clone());
+
+    let mut pdu_buf = EncodeBuf::new();
+    pdu_buf.push_byte(0x5a);
+    assert_invalid_message(too_big.encode(&mut pdu_buf));
+    assert_eq!(pdu_buf.finish().as_ref(), &[0x5a]);
+
+    CommunityMessage::v1("public", too_big.clone())
+        .unwrap()
+        .encode()
+        .unwrap();
+    assert_invalid_message(CommunityMessage::v2c("public", too_big.clone()));
+    let decoded_v2c = CommunityMessage::decode(raw_v2c_message(&varbinds[0])).unwrap();
+    assert_invalid_message(decoded_v2c.encode());
+
+    let scoped = ScopedPdu::new(Bytes::from_static(b"engine"), Bytes::new(), too_big);
+    let mut scoped_buf = EncodeBuf::new();
+    scoped_buf.push_byte(0x5a);
+    assert_invalid_message(scoped.encode(&mut scoped_buf));
+    assert_eq!(scoped_buf.finish().as_ref(), &[0x5a]);
+    assert_invalid_message(scoped.encode_to_bytes());
+
+    let global = MsgGlobalData::new(
+        1,
+        async_snmp::MessageSize::new(65_507).unwrap(),
+        MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+    )
+    .unwrap();
+    let security_params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, Bytes::new())
+        .unwrap()
+        .encode()
+        .unwrap();
+    assert_invalid_message(V3Message::new(
+        global.clone(),
+        security_params.clone(),
+        scoped,
+    ));
+    let decoded_v3 =
+        V3Message::decode(raw_v3_message(&global, &security_params, &varbinds[0])).unwrap();
+    assert_invalid_message(decoded_v3.encode());
+
+    for version in [Version::V2c, Version::V3] {
+        let empty = Pdu::response(7, ErrorStatus::TooBig.as_i32(), 0, vec![]);
+        match version {
+            Version::V2c => {
+                CommunityMessage::v2c("public", empty)
+                    .unwrap()
+                    .encode()
+                    .unwrap();
+            }
+            Version::V3 => {
+                ScopedPdu::with_empty_context(empty)
+                    .encode_to_bytes()
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[cfg(feature = "agent")]

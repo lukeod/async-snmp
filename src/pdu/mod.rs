@@ -467,6 +467,14 @@ impl Pdu {
                         "this Response error_status requires a nonzero error_index",
                     ));
                 }
+                if version != Version::V1
+                    && error_status == ErrorStatus::TooBig.as_i32()
+                    && !self.varbinds.is_empty()
+                {
+                    return Err(invalid_outbound(
+                        "SNMPv2c and SNMPv3 tooBig Responses require an empty variable-binding list",
+                    ));
+                }
             }
             PduBody::Standard {
                 error_status,
@@ -1590,6 +1598,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_accepts_too_big_with_variable_bindings() {
+        let raw = RawPdu::response(
+            1,
+            ErrorStatus::TooBig.as_i32(),
+            0,
+            vec![VarBind::null(oid!(1, 3, 6, 1))],
+        );
+
+        let mut decoder = Decoder::new(raw.encode());
+        let decoded = Pdu::decode(&mut decoder).expect("received PDUs remain permissive");
+        assert_eq!(decoded.error_status(), ErrorStatus::TooBig.as_i32());
+        assert_eq!(decoded.error_index(), 0);
+        assert_eq!(decoded.varbinds.len(), 1);
+    }
+
+    #[test]
     fn authorization_error_response_requires_zero_index() {
         let request = Pdu::get_request(1, &[oid!(1, 3, 6, 1)]);
         let valid = request.to_error_response(ErrorStatus::AuthorizationError, 0);
@@ -1832,6 +1856,56 @@ mod tests {
                 .encode_for(&mut EncodeBuf::new(), Version::V1, PduDirection::Response,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn outbound_too_big_shape_depends_on_version() {
+        let with_varbind = Pdu::response(
+            1,
+            ErrorStatus::TooBig.as_i32(),
+            0,
+            vec![VarBind::null(oid!(1, 3, 6, 1))],
+        );
+
+        assert!(
+            with_varbind
+                .encode_for(&mut EncodeBuf::new(), Version::V1, PduDirection::Response)
+                .is_ok()
+        );
+        for version in [Version::V2c, Version::V3] {
+            assert!(
+                with_varbind
+                    .encode_for(&mut EncodeBuf::new(), version, PduDirection::Response)
+                    .is_err(),
+                "{version:?}"
+            );
+        }
+        assert!(with_varbind.encode(&mut EncodeBuf::new()).is_err());
+
+        let empty = Pdu::response(1, ErrorStatus::TooBig.as_i32(), 0, vec![]);
+        for version in [Version::V2c, Version::V3] {
+            assert!(
+                empty
+                    .encode_for(&mut EncodeBuf::new(), version, PduDirection::Response)
+                    .is_ok(),
+                "{version:?}"
+            );
+        }
+
+        let nonzero_index = Pdu::response(
+            1,
+            ErrorStatus::TooBig.as_i32(),
+            1,
+            vec![VarBind::null(oid!(1, 3, 6, 1))],
+        );
+        for version in [Version::V1, Version::V2c, Version::V3] {
+            assert!(
+                nonzero_index
+                    .encode_for(&mut EncodeBuf::new(), version, PduDirection::Response)
+                    .is_err(),
+                "{version:?}"
+            );
+        }
     }
 
     #[test]

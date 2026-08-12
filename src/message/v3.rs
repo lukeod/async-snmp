@@ -317,8 +317,14 @@ impl ScopedPdu {
         }
     }
 
+    fn validate_outbound(&self) -> Result<()> {
+        self.pdu
+            .validate_outbound(crate::Version::V3, self.pdu.outbound_direction())
+    }
+
     /// Encode to buffer after applying SNMPv3 outbound PDU validation.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.validate_outbound()?;
         buf.try_push_sequence(|buf| {
             self.pdu
                 .encode_for(buf, crate::Version::V3, self.pdu.outbound_direction())?;
@@ -403,6 +409,12 @@ pub enum V3MessageData {
 
 impl V3Message {
     /// Create a validated V3 message with plaintext scoped data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] when the scoped PDU violates SNMPv3
+    /// outbound invariants. Header and security-parameter contradictions are
+    /// also rejected.
     pub fn new(
         global_data: MsgGlobalData,
         security_params: Bytes,
@@ -413,7 +425,7 @@ impl V3Message {
             security_params,
             data: V3MessageData::Plaintext(scoped_pdu),
         };
-        value.validate()?;
+        value.validate_outbound()?;
         Ok(value)
     }
 
@@ -428,7 +440,7 @@ impl V3Message {
             security_params,
             data: V3MessageData::Encrypted(encrypted),
         };
-        value.validate()?;
+        value.validate_outbound()?;
         Ok(value)
     }
 
@@ -450,7 +462,10 @@ impl V3Message {
         &self.data
     }
 
-    fn validate(&self) -> Result<()> {
+    // Decode validates only the received envelope here. In particular, it must
+    // not impose outbound canonical-PDU rules on input accepted for
+    // interoperability.
+    fn validate_inbound_envelope(&self) -> Result<()> {
         self.global_data.validate()?;
         let level = self.global_data.msg_flags.security_level;
         if level.requires_priv() != matches!(self.data, V3MessageData::Encrypted(_)) {
@@ -461,6 +476,14 @@ impl V3Message {
         }
         let usm = crate::v3::UsmSecurityParams::decode(self.security_params.clone())?;
         usm.validate_for_security_level(level)
+    }
+
+    fn validate_outbound(&self) -> Result<()> {
+        self.validate_inbound_envelope()?;
+        if let V3MessageData::Plaintext(scoped_pdu) = &self.data {
+            scoped_pdu.validate_outbound()?;
+        }
+        Ok(())
     }
 
     /// Get the scoped PDU if available (plaintext only).
@@ -506,7 +529,7 @@ impl V3Message {
     /// 2. Compute HMAC over the entire encoded message
     /// 3. Replace the placeholder with the actual HMAC
     pub fn encode(&self) -> Result<Bytes> {
-        self.validate()?;
+        self.validate_outbound()?;
         let mut buf = EncodeBuf::new();
 
         buf.try_push_sequence(|buf| {
@@ -606,7 +629,9 @@ impl V3Message {
             security_params,
             data,
         };
-        value.validate().map_err(|_| seq.malformed())?;
+        value
+            .validate_inbound_envelope()
+            .map_err(|_| seq.malformed())?;
         Ok(value)
     }
 
@@ -830,6 +855,36 @@ mod tests {
         params.encode().unwrap()
     }
 
+    fn raw_too_big_message_with_varbind() -> Bytes {
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65_507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+        )
+        .unwrap();
+        let security_params = no_auth_security_params();
+        let varbinds = [crate::VarBind::null(oid!(1, 3, 6, 1))];
+        let mut buf = EncodeBuf::new();
+        buf.try_push_sequence(|buf| {
+            buf.push_sequence(|buf| {
+                buf.push_constructed(crate::ber::tag::pdu::RESPONSE, |buf| {
+                    crate::varbind::encode_varbind_list(buf, &varbinds).unwrap();
+                    buf.push_integer(0);
+                    buf.push_integer(crate::ErrorStatus::TooBig.as_i32());
+                    buf.push_integer(1);
+                });
+                buf.push_octet_string(b"");
+                buf.push_octet_string(b"engine");
+            });
+            buf.try_push_octet_string(&security_params)?;
+            global.encode(buf)?;
+            buf.push_integer(3);
+            Ok(())
+        })
+        .unwrap();
+        buf.finish()
+    }
+
     #[test]
     fn public_v3_constructors_and_encode_recheck_invariants() {
         let size = crate::MessageSize::new(65_507).unwrap();
@@ -870,6 +925,48 @@ mod tests {
         let mut message = V3Message::discovery_request(1, size).unwrap();
         message.global_data.msg_flags = MsgFlags::new(SecurityLevel::AuthPriv, true);
         assert!(message.encode().is_err());
+    }
+
+    #[test]
+    fn structured_v3_envelopes_reject_nonempty_too_big_response() {
+        let too_big = Pdu::response(
+            1,
+            crate::ErrorStatus::TooBig.as_i32(),
+            0,
+            vec![crate::VarBind::null(oid!(1, 3, 6, 1))],
+        );
+        let scoped = ScopedPdu::new(b"engine".as_slice(), Bytes::new(), too_big);
+        assert!(scoped.encode_to_bytes().is_err());
+
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65_507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+        )
+        .unwrap();
+        let error = V3Message::new(global, no_auth_security_params(), scoped).unwrap_err();
+        assert!(matches!(error.as_ref(), Error::InvalidMessage(_)));
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidMessage);
+
+        let empty = ScopedPdu::new(
+            b"engine".as_slice(),
+            Bytes::new(),
+            Pdu::response(1, crate::ErrorStatus::TooBig.as_i32(), 0, vec![]),
+        );
+        empty.encode_to_bytes().unwrap();
+    }
+
+    #[test]
+    fn v3_decode_remains_permissive_for_noncanonical_too_big_response() {
+        let decoded = V3Message::decode(raw_too_big_message_with_varbind())
+            .expect("receive path accepts the PDU");
+        let pdu = decoded.pdu().unwrap();
+        assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
+        assert_eq!(pdu.error_index(), 0);
+        assert_eq!(pdu.varbinds.len(), 1);
+        let error = decoded.encode().unwrap_err();
+        assert!(matches!(error.as_ref(), Error::InvalidMessage(_)));
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidMessage);
     }
 
     #[test]
@@ -932,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_rejects_malformed_pdu_without_mutating_it() {
+    fn constructor_rejects_malformed_pdu_without_mutating_it() {
         let pdu = Pdu {
             request_id: 1,
             body: crate::pdu::PduBody::GetBulk {
@@ -949,9 +1046,9 @@ mod tests {
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
         )
         .unwrap();
-        let message = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
-
-        assert!(message.encode().is_err());
+        let error = V3Message::new(global, no_auth_security_params(), scoped).unwrap_err();
+        assert!(matches!(error.as_ref(), Error::InvalidMessage(_)));
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidMessage);
         assert_eq!(pdu, original);
     }
 

@@ -394,6 +394,26 @@ mod tests {
         buf.finish()
     }
 
+    fn raw_response_message(
+        version: Version,
+        error_status: i32,
+        error_index: i32,
+        varbinds: &[VarBind],
+    ) -> Bytes {
+        let mut buf = EncodeBuf::new();
+        buf.push_sequence(|buf| {
+            buf.push_constructed(tag::pdu::RESPONSE, |buf| {
+                crate::varbind::encode_varbind_list(buf, varbinds).unwrap();
+                buf.push_integer(error_index);
+                buf.push_integer(error_status);
+                buf.push_integer(1);
+            });
+            buf.push_octet_string(b"public");
+            buf.push_integer(version.as_i32());
+        });
+        buf.finish()
+    }
+
     fn assert_invalid_message<T: std::fmt::Debug>(result: Result<T>) {
         assert!(matches!(&*result.unwrap_err(), Error::InvalidMessage(_)));
     }
@@ -458,6 +478,42 @@ mod tests {
             "public",
             standard_pdu(PduType::GetRequest, vec![]),
         ));
+    }
+
+    #[test]
+    fn structured_community_envelopes_enforce_version_specific_too_big_shape() {
+        let varbinds = vec![VarBind::null(oid!(1, 3, 6, 1))];
+        let too_big = Pdu::response(1, crate::ErrorStatus::TooBig.as_i32(), 0, varbinds.clone());
+
+        let v1 = CommunityMessage::v1("public", too_big.clone())
+            .expect("SNMPv1 tooBig retains the request variable bindings");
+        let v1 = CommunityMessage::decode(v1.encode().unwrap()).unwrap();
+        assert_eq!(v1.pdu().standard().unwrap().varbinds, varbinds);
+
+        assert_invalid_message(CommunityMessage::v2c("public", too_big));
+        CommunityMessage::v2c(
+            "public",
+            Pdu::response(1, crate::ErrorStatus::TooBig.as_i32(), 0, vec![]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    }
+
+    #[test]
+    fn community_decode_remains_permissive_for_noncanonical_too_big_response() {
+        let encoded = raw_response_message(
+            Version::V2c,
+            crate::ErrorStatus::TooBig.as_i32(),
+            0,
+            &[VarBind::null(oid!(1, 3, 6, 1))],
+        );
+
+        let decoded = CommunityMessage::decode(encoded).expect("receive path accepts the PDU");
+        let pdu = decoded.pdu().standard().unwrap();
+        assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
+        assert_eq!(pdu.varbinds.len(), 1);
+        assert_invalid_message(decoded.encode());
     }
 
     #[test]
@@ -614,11 +670,7 @@ mod tests {
             )
             .unwrap();
             let security_params = crate::v3::UsmSecurityParams::discovery().encode().unwrap();
-            assert_invalid_message(
-                V3Message::new(global, security_params, scoped)
-                    .unwrap()
-                    .encode(),
-            );
+            assert_invalid_message(V3Message::new(global, security_params, scoped));
             assert_eq!(pdu, original);
         }
     }

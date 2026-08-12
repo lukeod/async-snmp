@@ -119,6 +119,18 @@ mod tests {
         )
     }
 
+    fn encode_structured_response(version: Version, pdu: Pdu) -> Result<Bytes> {
+        match version {
+            Version::V1 | Version::V2c => {
+                crate::message::CommunityMessage::new(version, "public", pdu)?.encode()
+            }
+            Version::V3 => {
+                crate::message::ScopedPdu::new(Bytes::from_static(b"engine"), Bytes::new(), pdu)
+                    .encode_to_bytes()
+            }
+        }
+    }
+
     #[test]
     fn exact_candidate_boundaries_and_local_originator_minimum() {
         let request = request();
@@ -200,6 +212,52 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(result, FinalizedResponse::Alternate(_)));
+    }
+
+    #[test]
+    fn generated_alternates_pass_version_specific_structured_validation() {
+        for version in [Version::V1, Version::V2c, Version::V3] {
+            let request = request();
+            let candidate = Pdu::response(
+                request.request_id,
+                0,
+                0,
+                vec![VarBind::new(
+                    oid!(1, 3, 6, 1, 4, 1),
+                    Value::OctetString(Bytes::from(vec![0x55; 300])),
+                )],
+            );
+            let candidate_size = encode_structured_response(version, candidate.clone())
+                .unwrap()
+                .len();
+            let counter = AtomicU32::new(0);
+            let mut saw_alternate = false;
+            let result = finalize_response(
+                version,
+                &request,
+                candidate,
+                candidate_size - 1,
+                None,
+                &counter,
+                |pdu| {
+                    if pdu.error_status() == ErrorStatus::TooBig.as_i32() {
+                        saw_alternate = true;
+                        assert_eq!(pdu.error_index(), 0);
+                        if version == Version::V1 {
+                            assert_eq!(pdu.varbinds, request.varbinds);
+                        } else {
+                            assert!(pdu.varbinds.is_empty());
+                        }
+                    }
+                    encode_structured_response(version, pdu)
+                },
+            )
+            .unwrap();
+
+            assert!(saw_alternate, "{version:?}");
+            assert!(matches!(result, FinalizedResponse::Alternate(_)));
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]
