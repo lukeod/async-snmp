@@ -325,6 +325,82 @@ async fn default_request_rejects_capacity_before_receive_setup() {
     assert_eq!(transport.sends.load(Ordering::Relaxed), 0);
 }
 
+#[derive(Clone, Copy)]
+struct PendingSendTransport;
+
+impl Transport for PendingSendTransport {
+    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+        std::future::pending().await
+    }
+
+    async fn recv_with<T, F>(
+        &self,
+        _registration: RequestRegistration,
+        _validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+    {
+        panic!("receive is unused by the standalone-send test")
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    }
+
+    fn is_reliable(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn custom_transport_inherits_bounded_standalone_send() {
+    let mut send =
+        Box::pin(PendingSendTransport.send_with_timeout(b"notification", Duration::from_secs(5)));
+    assert!(futures::poll!(send.as_mut()).is_pending());
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let error = send.await.unwrap_err();
+    assert!(matches!(
+        *error,
+        Error::Timeout {
+            elapsed,
+            retries: 0,
+            ..
+        } if elapsed == Duration::from_secs(5)
+    ));
+}
+
+#[tokio::test]
+async fn zero_standalone_send_timeout_is_immediate() {
+    let error = PendingSendTransport
+        .send_with_timeout(b"notification", Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *error,
+        Error::Timeout {
+            elapsed: Duration::ZERO,
+            retries: 0,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn unrepresentable_standalone_send_timeout_is_rejected() {
+    let error = PendingSendTransport
+        .send_with_timeout(b"notification", Duration::MAX)
+        .await
+        .unwrap_err();
+    assert!(matches!(*error, Error::Config(_)));
+}
+
 #[tokio::test]
 async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
     let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));

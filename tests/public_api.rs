@@ -3,9 +3,9 @@ use std::time::Duration;
 use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
-    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Error, ErrorKind, Oid,
-    RequestRegistration, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind,
-    WalkAbortReason,
+    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, Error, ErrorKind,
+    Oid, RequestRegistration, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value,
+    ValueKind, WalkAbortReason,
 };
 #[cfg(feature = "agent")]
 use async_snmp::{
@@ -19,7 +19,9 @@ fn extensible_configs_support_default_plus_field_mutation() {
     let mut client = ClientConfig::default();
     client.auth = Auth::v1("private");
     client.request_timeout = Duration::from_secs(2);
+    client.send_timeout = Duration::from_secs(3);
     assert_eq!(client.request_timeout, Duration::from_secs(2));
+    assert_eq!(client.send_timeout, Duration::from_secs(3));
 
     let mut compatibility = CompatibilityPolicy::STRICT;
     compatibility.clamp_bounded_strings = true;
@@ -34,10 +36,15 @@ fn extensible_configs_support_default_plus_field_mutation() {
 fn timeout_apis_are_separate_and_public() {
     let _builder = Client::builder("example.invalid", Auth::v2c("public"))
         .request_timeout(Duration::from_secs(2))
+        .send_timeout(Duration::from_secs(3))
         .construction_timeout(Duration::from_secs(3));
     let _tcp_builder = async_snmp::TcpTransport::builder().connect_timeout(Duration::from_secs(4));
+    #[cfg(feature = "agent")]
+    let _agent_builder = async_snmp::Agent::builder().trap_send_timeout(Duration::from_secs(4));
 
     assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(5));
+    assert_eq!(DEFAULT_SEND_TIMEOUT, Duration::from_secs(5));
+    assert_eq!(ClientConfig::default().send_timeout, DEFAULT_SEND_TIMEOUT);
     assert_eq!(DEFAULT_CONSTRUCTION_TIMEOUT, Duration::from_secs(5));
 
     let error = Error::ConstructionTimeout {

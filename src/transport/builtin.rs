@@ -3,6 +3,7 @@ use crate::error::Result;
 use crate::message_size::ReceiveLimits;
 use bytes::Bytes;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 /// A runtime-selected library-maintained transport.
 ///
@@ -53,6 +54,13 @@ impl Transport for BuiltinTransport {
         match self {
             Self::Udp(transport) => transport.send(data).await,
             Self::Tcp(transport) => transport.send(data).await,
+        }
+    }
+
+    async fn send_with_timeout(&self, data: &[u8], timeout: Duration) -> Result<()> {
+        match self {
+            Self::Udp(transport) => transport.send_with_timeout(data, timeout).await,
+            Self::Tcp(transport) => transport.send_with_timeout(data, timeout).await,
         }
     }
 

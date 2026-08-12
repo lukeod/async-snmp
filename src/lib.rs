@@ -26,9 +26,11 @@
 //! [`Client::builder`] accepts a `(host, port)` tuple, a combined address
 //! string, or a [`std::net::SocketAddr`]. [`ClientBuilder::connect`] constructs
 //! a UDP transport; [`ClientBuilder::connect_tcp`] constructs a TCP transport.
-//! Request and construction timeouts are independent and default to five
-//! seconds. The construction timeout is one deadline covering name resolution
-//! and built-in transport creation.
+//! Request, standalone send, and construction timeouts are independent and
+//! default to five seconds. The standalone send timeout bounds unconfirmed
+//! traps, while informs use the request timeout while awaiting a response. The
+//! construction timeout is one deadline covering name resolution and built-in
+//! transport creation.
 //!
 //! ### SNMPv2c
 //!
@@ -434,7 +436,7 @@
 //! | UDP source correlation | off-target replies accepted with a warning | [`ClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`UdpStats::discarded_datagrams`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
 //! | [`CommunityResponsePolicy`] | `Exact` | V1/v2c response communities match byte-for-byte. Rewrite policies emit warnings when used; accepting rewrites from any source weakens spoof resistance, especially with permissive UDP source handling. |
 //! | [`ClientBuilder::allow_unauthenticated_v3_time_correction`] | off | Allows one correlated, packet-local correction from an unauthenticated time-window Report. The tuple is never trusted globally, but an injector can choose one packet's time fields. Use strict UDP source correlation where possible; tracing records protocol correction. |
-//! | [`ClientBuilder::request_timeout`] / [`ClientBuilder::construction_timeout`] | 5 seconds / 5 seconds | Request waiting and client construction are independent. Construction uses one absolute deadline across resolution and built-in transport creation; [`Error::Timeout`] remains request-only. Preconfigured transports and [`ClientBuilder::build_with_transport`] allow application-owned deadline policy. |
+//! | [`ClientBuilder::request_timeout`] / [`ClientBuilder::send_timeout`] / [`ClientBuilder::construction_timeout`] | 5 seconds each | Confirmed-request waiting, unconfirmed-notification sending, and client construction use independent total deadlines. Construction uses one absolute deadline across resolution and built-in transport creation. Preconfigured transports and [`ClientBuilder::build_with_transport`] allow application-owned deadline policy. |
 //!
 //! [`UdpStats`] exposes UDP `correlated_datagrams`, `expired_registrations`,
 //! `discarded_datagrams`, and `malformed_datagrams` counters for endpoint
@@ -555,10 +557,10 @@ pub use agent::{
 pub use client::{
     Auth, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_REQUEST_TIMEOUT, FixedCardinalityChunk, FixedCardinalityChunkError,
-    FixedCardinalityChunkStream, FixedCardinalityOperation, FixedCardinalityResponse, OidOrdering,
-    ResponseShapeAnomaly, ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk,
-    WalkMode, WalkStream,
+    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
+    FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
+    FixedCardinalityResponse, OidOrdering, ResponseShapeAnomaly, ResponseShapePolicy, Retry,
+    RetryBuilder, RetryConfigError, Target, Walk, WalkMode, WalkStream,
 };
 pub use community::Community;
 pub use compatibility::CompatibilityPolicy;

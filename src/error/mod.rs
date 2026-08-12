@@ -108,7 +108,7 @@ pub enum ConstructionStage {
 pub enum ErrorKind {
     /// Network I/O failure.
     Network,
-    /// Request timeout.
+    /// Request or standalone-send timeout.
     Timeout,
     /// Bounded client-construction timeout.
     ConstructionTimeout,
@@ -215,7 +215,7 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// Request timed out after retries.
+    /// Request or standalone send exceeded its operation deadline.
     #[error("timeout after {elapsed:?} waiting for {target} ({retries} retries)")]
     Timeout {
         target: SocketAddr,

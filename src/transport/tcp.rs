@@ -80,7 +80,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 #[cfg(test)]
 use tokio::time::timeout;
 
@@ -344,6 +344,13 @@ impl<'a> TcpTransactionGuard<'a> {
         }
     }
 
+    fn unarmed(inner: &'a TcpTransportInner) -> Self {
+        Self {
+            poisoned: &inner.poisoned,
+            armed: false,
+        }
+    }
+
     #[cfg(test)]
     fn for_test(poisoned: &'a AtomicBool) -> Self {
         Self {
@@ -354,6 +361,10 @@ impl<'a> TcpTransactionGuard<'a> {
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
     }
 }
 
@@ -473,6 +484,29 @@ impl Transport for TcpTransport {
         Ok(())
     }
 
+    async fn send_with_timeout(&self, data: &[u8], timeout: Duration) -> Result<()> {
+        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
+        let target = self.inner.target;
+        let deadline = transaction_deadline(timeout)?;
+        let mut stream = lock_stream_before(&self.inner, deadline, timeout).await?;
+
+        if self.inner.is_poisoned() {
+            return Err(Error::Closed { target }.boxed());
+        }
+
+        // `lock_stream_before` rejects an exhausted budget. Once the guarded
+        // write is polled, cancellation or expiry may leave partial stream I/O.
+        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
+        tokio::time::timeout_at(
+            deadline,
+            arm_when_polled(&mut transaction, write_message(&mut *stream, target, data)),
+        )
+        .await
+        .map_err(|_| timeout_error(target, timeout))??;
+        transaction.disarm();
+        Ok(())
+    }
+
     async fn recv_with<T, F>(&self, registration: RequestRegistration, validate: F) -> Result<T>
     where
         T: Send,
@@ -481,23 +515,29 @@ impl Transport for TcpTransport {
         let request_id = registration.request_id();
         let recv_timeout = registration.timeout();
         let target = self.inner.target;
-        tcp_deadline(recv_timeout, "TCP timeout")?;
-        let mut stream = self.inner.stream.clone().lock_owned().await;
+        let deadline = transaction_deadline(recv_timeout)?;
+        let mut stream = lock_stream_before(&self.inner, deadline, recv_timeout).await?;
 
         if self.inner.is_poisoned() {
             return Err(Error::Closed { target }.boxed());
         }
-        let deadline = transaction_deadline(recv_timeout)?;
-        let mut transaction = TcpTransactionGuard::new(&self.inner);
-        let result = read_validated_message(
-            &mut stream,
-            target,
-            self.inner.receive_limits.accepted(),
-            &registration,
+        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
+        let result = tokio::time::timeout_at(
             deadline,
-            validate,
+            arm_when_polled(
+                &mut transaction,
+                read_validated_message(
+                    &mut stream,
+                    target,
+                    self.inner.receive_limits.accepted(),
+                    &registration,
+                    validate,
+                ),
+            ),
         )
-        .await;
+        .await
+        .map_err(|_| CorrelatedReadError::Timeout)
+        .and_then(std::convert::identity);
         let value = finish_correlated_read(result, target, request_id, recv_timeout)?;
         transaction.disarm();
         Ok(value)
@@ -517,28 +557,37 @@ impl Transport for TcpTransport {
         let request_id = registration.request_id();
         let recv_timeout = registration.timeout();
         let target = self.inner.target;
-        tcp_deadline(recv_timeout, "TCP timeout")?;
-        let mut stream = self.inner.stream.clone().lock_owned().await;
+        let deadline = transaction_deadline(recv_timeout)?;
+        let mut stream = lock_stream_before(&self.inner, deadline, recv_timeout).await?;
 
         if self.inner.is_poisoned() {
             return Err(Error::Closed { target }.boxed());
         }
-        let deadline = transaction_deadline(recv_timeout)?;
-        let mut transaction = TcpTransactionGuard::new(&self.inner);
+        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
 
-        tokio::time::timeout_at(deadline, write_message(&mut *stream, target, data))
-            .await
-            .map_err(|_| timeout_error(target, recv_timeout))??;
-
-        let result = read_validated_message(
-            &mut stream,
-            target,
-            self.inner.receive_limits.accepted(),
-            &registration,
+        tokio::time::timeout_at(
             deadline,
-            validate,
+            arm_when_polled(&mut transaction, write_message(&mut *stream, target, data)),
         )
-        .await;
+        .await
+        .map_err(|_| timeout_error(target, recv_timeout))??;
+
+        let result = tokio::time::timeout_at(
+            deadline,
+            arm_when_polled(
+                &mut transaction,
+                read_validated_message(
+                    &mut stream,
+                    target,
+                    self.inner.receive_limits.accepted(),
+                    &registration,
+                    validate,
+                ),
+            ),
+        )
+        .await
+        .map_err(|_| CorrelatedReadError::Timeout)
+        .and_then(std::convert::identity);
         let value = finish_correlated_read(result, target, request_id, recv_timeout)?;
         transaction.disarm();
         Ok(value)
@@ -584,6 +633,28 @@ fn transaction_deadline(timeout: Duration) -> Result<tokio::time::Instant> {
     tcp_deadline(timeout, "TCP timeout")
 }
 
+async fn lock_stream_before(
+    inner: &TcpTransportInner,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+) -> Result<OwnedMutexGuard<TcpStream>> {
+    let target = inner.target;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timeout_error(target, timeout));
+    }
+
+    let stream = tokio::time::timeout_at(deadline, inner.stream.clone().lock_owned())
+        .await
+        .map_err(|_| timeout_error(target, timeout))?;
+
+    // A ready lock can win the timeout race at the boundary. Do not start I/O
+    // once the total budget is exhausted, and do not poison an untouched stream.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timeout_error(target, timeout));
+    }
+    Ok(stream)
+}
+
 fn timeout_error(target: SocketAddr, elapsed: Duration) -> Box<Error> {
     Error::Timeout {
         target,
@@ -591,6 +662,18 @@ fn timeout_error(target: SocketAddr, elapsed: Duration) -> Box<Error> {
         retries: 0,
     }
     .boxed()
+}
+
+async fn arm_when_polled<F>(transaction: &mut TcpTransactionGuard<'_>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::pin!(future);
+    std::future::poll_fn(|context| {
+        transaction.arm();
+        future.as_mut().poll(context)
+    })
+    .await
 }
 
 async fn write_message<W>(stream: &mut W, target: SocketAddr, data: &[u8]) -> Result<()>
@@ -612,7 +695,6 @@ async fn read_validated_message<T, F>(
     target: SocketAddr,
     max_message_size: usize,
     registration: &RequestRegistration,
-    deadline: tokio::time::Instant,
     mut validate: F,
 ) -> std::result::Result<T, CorrelatedReadError>
 where
@@ -620,11 +702,9 @@ where
 {
     let request_id = registration.request_id();
     loop {
-        let frame =
-            tokio::time::timeout_at(deadline, read_ber_message(stream, target, max_message_size))
-                .await
-                .map_err(|_| CorrelatedReadError::Timeout)?
-                .map_err(CorrelatedReadError::Framing)?;
+        let frame = read_ber_message(stream, target, max_message_size)
+            .await
+            .map_err(CorrelatedReadError::Framing)?;
 
         let Some(frame_id) = extract_request_id(&frame) else {
             tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "complete response frame has no extractable correlation ID");
@@ -1757,6 +1837,211 @@ mod tests {
         assert!(!transport.inner.is_poisoned());
 
         drop(held_lock);
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_request_deadline_includes_lock_wait_without_poisoning() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (first_read_tx, first_read_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 31];
+            socket.read_exact(&mut request).await.unwrap();
+            first_read_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+
+        let first_transport = transport.clone();
+        let first = tokio::spawn(async move {
+            first_transport
+                .request(
+                    &build_request_with_id(1),
+                    RequestRegistration::v3(1, Duration::from_secs(60)),
+                )
+                .await
+        });
+        first_read_rx.await.unwrap();
+        assert!(!first.is_finished());
+        assert!(!transport.inner.is_poisoned());
+
+        let second_data = build_request_with_id(2);
+        let mut second = Box::pin(transport.request(
+            &second_data,
+            RequestRegistration::v3(2, Duration::from_secs(5)),
+        ));
+        assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
+        assert!(!first.is_finished());
+        assert!(!transport.inner.is_poisoned());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = second.await.unwrap_err();
+        assert!(!first.is_finished());
+        assert!(matches!(
+            *error,
+            Error::Timeout {
+                elapsed,
+                retries: 0,
+                ..
+            } if elapsed == Duration::from_secs(5)
+        ));
+        assert!(
+            !transport.inner.is_poisoned(),
+            "expiry while queued did not touch the stream"
+        );
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_uses_remaining_budget_after_lock_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (request_read_tx, request_read_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 31];
+            socket.read_exact(&mut request).await.unwrap();
+            request_read_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+        let held_lock = transport.inner.stream.clone().lock_owned().await;
+
+        let request_data = build_request_with_id(1);
+        let mut request = Box::pin(transport.request(
+            &request_data,
+            RequestRegistration::v3(1, Duration::from_secs(10)),
+        ));
+        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
+        tokio::time::advance(Duration::from_secs(6)).await;
+        drop(held_lock);
+        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
+        request_read_rx.await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let error = request.await.unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert!(transport.inner.is_poisoned());
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_deadline_boundary_after_lock_acquisition_does_not_poison() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), socket.read_u8())
+                    .await
+                    .is_err(),
+                "an exact-boundary timeout must not write"
+            );
+        });
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+        let held_lock = transport.inner.stream.clone().lock_owned().await;
+
+        let data = build_request_with_id(1);
+        let mut request =
+            Box::pin(transport.request(&data, RequestRegistration::v3(1, Duration::from_secs(5))));
+        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drop(held_lock);
+
+        let error = request.await.unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert!(
+            !transport.inner.is_poisoned(),
+            "deadline won before the stream I/O future was polled"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn standalone_send_lock_timeout_and_cancellation_do_not_poison() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 31];
+            socket.read_exact(&mut request).await.unwrap();
+        });
+        let transport = TcpTransport::connect(server_addr).await.unwrap();
+        let held_lock = transport.inner.stream.clone().lock_owned().await;
+
+        let cancelled_transport = transport.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_transport
+                .send_with_timeout(&build_request_with_id(1), Duration::from_secs(30))
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(!transport.inner.is_poisoned());
+
+        let timed_data = build_request_with_id(2);
+        let mut timed = Box::pin(transport.send_with_timeout(&timed_data, Duration::from_secs(5)));
+        assert!(matches!(futures::poll!(timed.as_mut()), Poll::Pending));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = timed.await.unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert!(!transport.inner.is_poisoned());
+
+        drop(held_lock);
+        transport
+            .send_with_timeout(&build_request_with_id(3), Duration::from_secs(5))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn standalone_send_write_timeout_poisons_after_partial_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (touched_tx, touched_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.read_u8().await.unwrap();
+            touched_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_send_buffer_size(1024).unwrap();
+        let transport = TcpTransport::from_socket(
+            socket,
+            server_addr,
+            TcpOptions {
+                send_capacity: 16 * 1024 * 1024,
+                ..TcpOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let send_transport = transport.clone();
+        let send = tokio::spawn(async move {
+            let data = vec![0xaa; 16 * 1024 * 1024];
+            send_transport
+                .send_with_timeout(&data, Duration::from_secs(10))
+                .await
+        });
+        touched_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished(), "large write must remain partial");
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        let error = send.await.unwrap().unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert!(transport.inner.is_poisoned());
         server.abort();
     }
 

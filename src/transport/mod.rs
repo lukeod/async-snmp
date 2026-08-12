@@ -26,7 +26,6 @@ pub use udp::*;
 
 use crate::Community;
 use crate::ber::length::parse_ber_length;
-#[cfg(test)]
 use crate::error::Error;
 use crate::error::Result;
 use crate::message::DecodePolicy;
@@ -380,11 +379,56 @@ pub trait Transport: Send + Sync {
     ///
     /// Implementations that return a finite [`send_capacity`](Self::send_capacity)
     /// must reject larger data with
-    /// [`Error::OutboundMessageTooLarge`](crate::Error::OutboundMessageTooLarge)
+    /// [`Error::OutboundMessageTooLarge`]
     /// before performing transport I/O. This applies to direct `send` calls;
     /// the default [`request_with`](Self::request_with) implementation performs
     /// the same check for request/response exchanges.
     fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Send data under one total timeout.
+    ///
+    /// The timeout starts when this future is first polled and includes any
+    /// transport-internal queueing as well as the actual write. The default
+    /// implementation preserves compatibility for custom transports by
+    /// applying a deadline around [`send`](Self::send). Stream transports may
+    /// override this to distinguish expiry before stream I/O from expiry after
+    /// a partially completed write.
+    fn send_with_timeout(
+        &self,
+        data: &[u8],
+        timeout: Duration,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
+            checked_deadline(timeout, "transport send timeout")?;
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    Error::Config(
+                        "transport send timeout exceeds the representable deadline".into(),
+                    )
+                    .boxed()
+                })?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Timeout {
+                    target: self.peer_addr(),
+                    elapsed: timeout,
+                    retries: 0,
+                }
+                .boxed());
+            }
+            tokio::time::timeout_at(deadline, self.send(data))
+                .await
+                .map_err(|_| {
+                    Error::Timeout {
+                        target: self.peer_addr(),
+                        elapsed: timeout,
+                        retries: 0,
+                    }
+                    .boxed()
+                })?
+        }
+    }
 
     /// Receive one correlated response without additional validation.
     ///

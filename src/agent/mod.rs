@@ -311,6 +311,7 @@ pub struct AgentBuilder {
     authorization: AgentAuthorization,
     cancel: Option<CancellationToken>,
     trap_sinks: Vec<(NotificationSinkId, String, crate::client::Auth)>,
+    trap_send_timeout: Duration,
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
     disabled_builtins: HashSet<BuiltinMib>,
@@ -340,6 +341,7 @@ impl AgentBuilder {
             authorization: AgentAuthorization::Unset,
             cancel: None,
             trap_sinks: Vec::new(),
+            trap_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
             inform_timeout: Duration::from_secs(5),
             inform_retry: crate::client::Retry::default(),
             disabled_builtins: HashSet::new(),
@@ -798,9 +800,23 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the timeout for each unconfirmed trap send to a configured sink.
+    ///
+    /// Default is [`crate::DEFAULT_SEND_TIMEOUT`] (5 seconds). The timeout
+    /// includes local UDP socket queueing and send I/O for each sink. It only
+    /// affects `send_trap`; confirmed informs use
+    /// [`inform_timeout`](Self::inform_timeout) while waiting for a response.
+    #[must_use]
+    pub fn trap_send_timeout(mut self, timeout: Duration) -> Self {
+        self.trap_send_timeout = timeout;
+        self
+    }
+
     /// Set the timeout for inform requests sent to trap sinks.
     ///
-    /// Default is 5 seconds. Only affects `send_inform`, not `send_trap`.
+    /// Default is 5 seconds. This bounds each wait for an inform response and
+    /// only affects `send_inform`; unconfirmed trap sends use
+    /// [`trap_send_timeout`](Self::trap_send_timeout).
     #[must_use]
     pub fn inform_timeout(mut self, timeout: Duration) -> Self {
         self.inform_timeout = timeout;
@@ -852,6 +868,8 @@ impl AgentBuilder {
     /// [`Error::RandomSource`] when a generated engine ID or required privacy
     /// salt cannot be initialized.
     pub async fn build(mut self) -> Result<Agent> {
+        crate::transport::checked_deadline(self.trap_send_timeout, "trap send timeout")?;
+
         if matches!(self.authorization, AgentAuthorization::Conflict) {
             return Err(Error::Config(
                 "VACM and unrestricted Agent access are mutually exclusive".into(),
@@ -966,6 +984,7 @@ impl AgentBuilder {
                 id,
                 dest,
                 auth,
+                self.trap_send_timeout,
                 self.inform_timeout,
                 self.inform_retry.clone(),
             ));

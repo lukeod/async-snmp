@@ -155,6 +155,8 @@ pub(crate) struct TrapSink {
     /// Keys derived against the agent's `engine_id` for V3 trap sending.
     /// Lazily populated on first use.
     pub(crate) derived_keys: RwLock<Option<DerivedKeys>>,
+    /// Timeout for each unconfirmed trap datagram send.
+    trap_send_timeout: Duration,
     /// Inform request timeout and retry policy.
     inform_timeout: Duration,
     inform_retry: Retry,
@@ -170,6 +172,7 @@ impl TrapSink {
         id: NotificationSinkId,
         dest: SocketAddr,
         auth: Auth,
+        trap_send_timeout: Duration,
         inform_timeout: Duration,
         inform_retry: Retry,
     ) -> Self {
@@ -191,6 +194,7 @@ impl TrapSink {
                 community: community.clone(),
                 v3_security: None,
                 derived_keys: RwLock::new(None),
+                trap_send_timeout,
                 inform_timeout,
                 inform_retry,
                 inform_client: AsyncMutex::new(None),
@@ -201,6 +205,7 @@ impl TrapSink {
                 community: Community::default(),
                 v3_security: Some(security),
                 derived_keys: RwLock::new(None),
+                trap_send_timeout,
                 inform_timeout,
                 inform_retry,
                 inform_client: AsyncMutex::new(None),
@@ -751,14 +756,13 @@ impl super::Agent {
         }?;
 
         tracing::debug!(target: "async_snmp::agent", { snmp.sink_id = %sink.summary.id, snmp.dest = %sink.summary.dest, snmp.bytes = data.len() }, "sending trap");
-        self.inner
-            .socket
-            .send_to(&data, sink.summary.dest)
-            .await
-            .map_err(|e| Error::Network {
-                target: sink.summary.dest,
-                source: e,
-            })?;
+        send_datagram_with_timeout(
+            &self.inner.socket,
+            &data,
+            sink.summary.dest,
+            sink.trap_send_timeout,
+        )
+        .await?;
 
         Ok(())
     }
@@ -791,6 +795,41 @@ impl super::Agent {
     }
 }
 
+async fn send_datagram_with_timeout(
+    socket: &tokio::net::UdpSocket,
+    data: &[u8],
+    target: SocketAddr,
+    timeout: Duration,
+) -> Result<()> {
+    crate::transport::checked_deadline(timeout, "trap send timeout")?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            Error::Config("trap send timeout exceeds the representable deadline".into()).boxed()
+        })?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::Timeout {
+            target,
+            elapsed: timeout,
+            retries: 0,
+        }
+        .boxed());
+    }
+
+    tokio::time::timeout_at(deadline, socket.send_to(data, target))
+        .await
+        .map_err(|_| {
+            Error::Timeout {
+                target,
+                elapsed: timeout,
+                retries: 0,
+            }
+            .boxed()
+        })?
+        .map_err(|source| Error::Network { target, source }.boxed())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{NotificationSinkId, SinkSkipReason, SinkStatus, TrapSink};
@@ -804,6 +843,7 @@ mod tests {
             NotificationSinkId::from("test-sink"),
             "127.0.0.1:9".parse().unwrap(),
             auth.into(),
+            crate::client::DEFAULT_SEND_TIMEOUT,
             std::time::Duration::from_millis(10),
             crate::client::Retry::default(),
         )

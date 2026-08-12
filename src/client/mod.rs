@@ -128,6 +128,8 @@ pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Err
 
 /// Default timeout for SNMP requests.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default timeout for unconfirmed notification sends.
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default maximum OIDs per request.
 ///
@@ -220,6 +222,11 @@ pub struct ClientConfig {
     pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
     pub request_timeout: Duration,
+    /// Standalone send timeout (default: 5 seconds).
+    ///
+    /// This bounds unconfirmed notifications across transport queueing and
+    /// write I/O. Confirmed requests continue to use [`Self::request_timeout`].
+    pub send_timeout: Duration,
     /// Retry configuration (default: 3 retries, 1-second delay)
     pub retry: Retry,
     /// Maximum OIDs per request (default: 10)
@@ -263,6 +270,7 @@ impl Default for ClientConfig {
             decode_policy: crate::message::DecodePolicy::Compatible,
             community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            send_timeout: DEFAULT_SEND_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             response_shape_policy: ResponseShapePolicy::Compatible,
@@ -294,6 +302,7 @@ impl ClientConfig {
 
     pub(super) fn validate(&self) -> Result<()> {
         crate::transport::checked_deadline(self.request_timeout, "request timeout")?;
+        crate::transport::checked_deadline(self.send_timeout, "send timeout")?;
 
         if self.max_oids_per_request == 0 {
             return Err(
@@ -875,7 +884,10 @@ impl<T: Transport> Client<T> {
             let data = self.build_v3_trap_message(&pdu, msg_id)?;
             self.enforce_outbound_size(data.len(), None)?;
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.varbind_count = pdu.varbinds.len(), snmp.bytes = data.len() }, "sending V3 trap");
-            self.inner.transport.send(&data).await?;
+            self.inner
+                .transport
+                .send_with_timeout(&data, self.inner.config.send_timeout)
+                .await?;
         } else {
             let message = CommunityMessage::new(
                 self.inner.config.version(),
@@ -885,7 +897,10 @@ impl<T: Transport> Client<T> {
             let data = message.encode()?;
             self.enforce_outbound_size(data.len(), None)?;
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.bytes = data.len() }, "sending v2c trap");
-            self.inner.transport.send(&data).await?;
+            self.inner
+                .transport
+                .send_with_timeout(&data, self.inner.config.send_timeout)
+                .await?;
         }
 
         Ok(())
@@ -930,7 +945,10 @@ impl<T: Transport> Client<T> {
         let data = message.encode()?;
         self.enforce_outbound_size(data.len(), None)?;
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
-        self.inner.transport.send(&data).await?;
+        self.inner
+            .transport
+            .send_with_timeout(&data, self.inner.config.send_timeout)
+            .await?;
 
         Ok(())
     }
@@ -1507,6 +1525,77 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct SendTimeoutProbe {
+        timeouts: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl Transport for SendTimeoutProbe {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            panic!("client trap sending must use the bounded send contract")
+        }
+
+        async fn send_with_timeout(&self, _data: &[u8], timeout: Duration) -> Result<()> {
+            self.timeouts.lock().unwrap().push(timeout);
+            Ok(())
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:162".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_v2c_and_v3_traps_use_configured_send_timeout() {
+        let timeouts = Arc::new(Mutex::new(Vec::new()));
+        let trap_oid = crate::oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+        let send_timeout = Duration::from_secs(7);
+
+        for auth in [crate::Auth::v1("public"), crate::Auth::v2c("public")] {
+            let client = Client::new(
+                SendTimeoutProbe {
+                    timeouts: Arc::clone(&timeouts),
+                },
+                ClientConfig {
+                    auth,
+                    send_timeout,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            client.send_trap(&trap_oid, 0, vec![]).await.unwrap();
+        }
+
+        let authoritative_engine =
+            crate::AuthoritativeEngine::install(b"test-trap-engine".to_vec(), |_| {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        let v3_client = Client::new(
+            SendTimeoutProbe {
+                timeouts: Arc::clone(&timeouts),
+            },
+            ClientConfig {
+                auth: crate::Auth::usm("trapuser").into(),
+                send_timeout,
+                local_authoritative_engine: Some(authoritative_engine),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        v3_client.send_trap(&trap_oid, 0, vec![]).await.unwrap();
+
+        assert_eq!(*timeouts.lock().unwrap(), [send_timeout; 3]);
+    }
+
+    #[derive(Clone)]
     struct CapacityTransport {
         capacity: usize,
         requests: Arc<AtomicUsize>,
@@ -1828,6 +1917,13 @@ mod tests {
         assert_config_error(Client::new(
             transport.clone(),
             ClientConfig {
+                send_timeout: Duration::MAX,
+                ..ClientConfig::default()
+            },
+        ));
+        assert_config_error(Client::new(
+            transport.clone(),
+            ClientConfig {
                 max_oids_per_request: 0,
                 ..ClientConfig::default()
             },
@@ -1872,6 +1968,14 @@ mod tests {
             },
         )
         .expect("zero timeout remains an explicit immediate deadline");
+        Client::new(
+            transport.clone(),
+            ClientConfig {
+                send_timeout: Duration::ZERO,
+                ..ClientConfig::default()
+            },
+        )
+        .expect("zero send timeout remains an explicit immediate deadline");
 
         for auth in [
             Auth::v1("public"),

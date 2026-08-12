@@ -746,6 +746,57 @@ async fn agent_v2c_trap_to_sink() {
 }
 
 #[tokio::test]
+async fn agent_trap_send_timeout_is_bounded_and_reported() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let recv_addr = receiver.local_addr().unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .trap_sink("timed", recv_addr.to_string(), Auth::v2c("public"))
+        .trap_send_timeout(Duration::ZERO)
+        .allow_all_access()
+        .build()
+        .await
+        .unwrap();
+
+    let outcome = agent
+        .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
+        .await;
+    assert_eq!(outcome.len(), 1);
+    assert!(matches!(
+        &outcome.sinks()[0].status,
+        SinkStatus::Failed(error)
+            if matches!(
+                &**error,
+                async_snmp::Error::Timeout {
+                    target,
+                    elapsed: Duration::ZERO,
+                    retries: 0,
+                } if *target == recv_addr
+            )
+    ));
+
+    let mut buffer = [0_u8; 1];
+    assert_eq!(
+        receiver.try_recv_from(&mut buffer).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn agent_rejects_unrepresentable_trap_send_timeout() {
+    let error = expect_agent_build_error(
+        Agent::builder()
+            .bind("127.0.0.1:0")
+            .trap_send_timeout(Duration::MAX)
+            .build()
+            .await,
+        "unrepresentable trap send timeout was accepted",
+    );
+    assert!(matches!(*error, async_snmp::Error::Config(_)));
+}
+
+#[tokio::test]
 async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
     let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
     let recv_addr = receiver.local_addr();

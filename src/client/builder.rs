@@ -15,7 +15,7 @@ use crate::client::retry::Retry;
 use crate::client::walk::{OidOrdering, WalkMode};
 use crate::client::{
     Auth, ClientConfig, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT,
 };
 use crate::error::{ConstructionStage, Error, Result};
 use crate::transport::{
@@ -139,6 +139,7 @@ pub struct ClientBuilder {
     target: Target,
     auth: Auth,
     request_timeout: Duration,
+    send_timeout: Duration,
     construction_timeout: Duration,
     retry: Retry,
     max_oids_per_request: usize,
@@ -190,6 +191,7 @@ impl ClientBuilder {
             target: target.into(),
             auth: auth.into(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            send_timeout: DEFAULT_SEND_TIMEOUT,
             construction_timeout: DEFAULT_CONSTRUCTION_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
@@ -224,6 +226,17 @@ impl ClientBuilder {
     #[must_use]
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Set the timeout for standalone sends (default: 5 seconds).
+    ///
+    /// This bounds transport queueing and write I/O for unconfirmed traps.
+    /// Inform requests and other confirmed operations use
+    /// [`request_timeout`](Self::request_timeout) instead.
+    #[must_use]
+    pub fn send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
         self
     }
 
@@ -646,6 +659,7 @@ impl ClientBuilder {
             decode_policy: self.decode_policy,
             community_response_policy: self.community_response_policy,
             request_timeout: self.request_timeout,
+            send_timeout: self.send_timeout,
             retry: self.retry.clone(),
             max_oids_per_request: self.max_oids_per_request,
             response_shape_policy: self.response_shape_policy,
@@ -1042,12 +1056,14 @@ mod tests {
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::default());
         assert!(matches!(builder.target, Target::Address(ref s) if s == "192.168.1.1:161"));
         assert_eq!(builder.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(builder.send_timeout, DEFAULT_SEND_TIMEOUT);
         assert_eq!(builder.construction_timeout, DEFAULT_CONSTRUCTION_TIMEOUT);
         assert_eq!(
             ClientConfig::default().request_timeout,
             Duration::from_secs(5)
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(DEFAULT_SEND_TIMEOUT, Duration::from_secs(5));
         assert_eq!(DEFAULT_CONSTRUCTION_TIMEOUT, Duration::from_secs(5));
         assert_eq!(builder.retry.max_attempts(), 3);
         assert_eq!(builder.max_oids_per_request, DEFAULT_MAX_OIDS_PER_REQUEST);
@@ -1077,6 +1093,7 @@ mod tests {
         let cache = Arc::new(EngineCache::new());
         let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("private"))
             .request_timeout(Duration::from_secs(10))
+            .send_timeout(Duration::from_secs(8))
             .construction_timeout(Duration::from_secs(7))
             .retry(Retry::fixed(5, Duration::ZERO))
             .max_oids_per_request(20)
@@ -1091,6 +1108,8 @@ mod tests {
             .allow_unauthenticated_v3_time_correction(true);
 
         assert_eq!(builder.request_timeout, Duration::from_secs(10));
+        assert_eq!(builder.send_timeout, Duration::from_secs(8));
+        assert_eq!(builder.build_config().send_timeout, Duration::from_secs(8));
         assert_eq!(builder.construction_timeout, Duration::from_secs(7));
         assert_eq!(builder.retry.max_attempts(), 5);
         assert_eq!(builder.max_oids_per_request, 20);
