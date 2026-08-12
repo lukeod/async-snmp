@@ -116,6 +116,8 @@ pub enum ErrorKind {
     Closed,
     /// Duplicate live request identifier.
     RequestIdInUse,
+    /// Locally encoded message exceeds the effective outbound limit.
+    OutboundMessageTooLarge,
     /// SNMP protocol error status.
     Snmp,
     /// Authentication or authorization failure.
@@ -150,6 +152,7 @@ impl ErrorKind {
             Self::ConstructionTimeout => "construction_timeout",
             Self::Closed => "transport_closed",
             Self::RequestIdInUse => "request_id_in_use",
+            Self::OutboundMessageTooLarge => "outbound_message_too_large",
             Self::Snmp => "snmp",
             Self::Auth => "authentication",
             Self::Report => "v3_report",
@@ -242,6 +245,20 @@ pub enum Error {
     #[error("request ID {request_id} is already in use")]
     RequestIdInUse { request_id: i32 },
 
+    /// An exactly encoded message exceeds the effective local outbound limit.
+    ///
+    /// For SNMPv1/v2c and unconfirmed notifications, `limit` is the transport's
+    /// configured send capacity. For an SNMPv3 request after discovery, it is
+    /// the smaller of that capacity and the remote engine's advertised
+    /// `msgMaxSize`.
+    #[error("encoded outbound message size {size} exceeds limit {limit}")]
+    OutboundMessageTooLarge {
+        /// Exact encoded message size in octets.
+        size: usize,
+        /// Effective outbound limit in octets.
+        limit: usize,
+    },
+
     /// SNMP protocol error from agent.
     #[error("SNMP error from {target}: {status} at index {index}")]
     Snmp {
@@ -318,6 +335,7 @@ impl Error {
             Self::ConstructionTimeout { .. } => ErrorKind::ConstructionTimeout,
             Self::Closed { .. } => ErrorKind::Closed,
             Self::RequestIdInUse { .. } => ErrorKind::RequestIdInUse,
+            Self::OutboundMessageTooLarge { .. } => ErrorKind::OutboundMessageTooLarge,
             Self::Snmp { .. } => ErrorKind::Snmp,
             Self::Auth { .. } => ErrorKind::Auth,
             Self::Report { .. } => ErrorKind::Report,
@@ -592,6 +610,13 @@ mod tests {
                 ErrorKind::RequestIdInUse,
             ),
             (
+                Error::OutboundMessageTooLarge {
+                    size: 1500,
+                    limit: 1472,
+                },
+                ErrorKind::OutboundMessageTooLarge,
+            ),
+            (
                 Error::Snmp {
                     target,
                     status: ErrorStatus::GenErr,
@@ -657,6 +682,10 @@ mod tests {
             (ErrorKind::ConstructionTimeout, "construction_timeout"),
             (ErrorKind::Closed, "transport_closed"),
             (ErrorKind::RequestIdInUse, "request_id_in_use"),
+            (
+                ErrorKind::OutboundMessageTooLarge,
+                "outbound_message_too_large",
+            ),
             (ErrorKind::Snmp, "snmp"),
             (ErrorKind::Auth, "authentication"),
             (ErrorKind::Report, "v3_report"),

@@ -55,10 +55,12 @@ type PendingResponse<'a> = Pin<Box<dyn Future<Output = Result<Pdu>> + Send + 'a>
 /// Lazy sequential stream of wire-level GET or GETNEXT response leaves.
 ///
 /// A successful item is emitted for each request that reaches the wire and
-/// succeeds. If an agent returns `tooBig`, the affected range is bisected and
-/// successful child leaves are emitted independently. The stream performs no
-/// prefetch: it starts at most one request while being polled and does not start
-/// the next request until the caller polls again after an item is yielded.
+/// succeeds. If an agent returns `tooBig` or local outbound-size enforcement
+/// rejects a multi-OID request, the affected range is bisected and successful
+/// child leaves are emitted independently. The corresponding error on a
+/// single-OID range is terminal. The stream performs no prefetch: it starts at
+/// most one request while being polled and does not start the next request until
+/// the caller polls again after an item is yielded.
 ///
 /// A terminal error is emitted once, after which the stream is fused.
 #[must_use = "streams do nothing unless polled"]
@@ -275,9 +277,42 @@ impl<T: Transport> Stream for FixedCardinalityChunkStream<'_, T> {
                         ) =>
                 {
                     let middle = request_range.start + request_range.len() / 2;
-                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = middle }, "tooBig response, bisecting batch");
+                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = middle, snmp.limit_source = "remote_too_big" }, "agent tooBig response, bisecting batch");
                     this.ranges.push_front(middle..request_range.end);
                     this.ranges.push_front(request_range.start..middle);
+                }
+                Err(source)
+                    if request_range.len() > 1
+                        && matches!(&*source, Error::OutboundMessageTooLarge { .. }) =>
+                {
+                    let Error::OutboundMessageTooLarge { size, limit } = &*source else {
+                        unreachable!();
+                    };
+                    let middle = request_range.start + request_range.len() / 2;
+                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = middle, snmp.encoded_size = size, snmp.outbound_limit = limit, snmp.limit_source = "local_outbound" }, "local outbound limit exceeded, bisecting batch");
+                    this.ranges.push_front(middle..request_range.end);
+                    this.ranges.push_front(request_range.start..middle);
+                }
+                Err(source)
+                    if matches!(
+                        &*source,
+                        Error::Snmp {
+                            status: ErrorStatus::TooBig,
+                            ..
+                        }
+                    ) =>
+                {
+                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.limit_source = "remote_too_big" }, "agent tooBig response for indivisible batch");
+                    let error = this.terminal_error(request_range, source);
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Err(source) if matches!(&*source, Error::OutboundMessageTooLarge { .. }) => {
+                    let Error::OutboundMessageTooLarge { size, limit } = &*source else {
+                        unreachable!();
+                    };
+                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.encoded_size = size, snmp.outbound_limit = limit, snmp.limit_source = "local_outbound" }, "local outbound limit exceeded for indivisible batch");
+                    let error = this.terminal_error(request_range, source);
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Err(source) => {
                     let error = this.terminal_error(request_range, source);
@@ -327,6 +362,7 @@ mod tests {
         records: Arc<Mutex<Vec<RequestRecord>>>,
         sends: Arc<AtomicUsize>,
         allocations: Arc<AtomicUsize>,
+        send_capacity: usize,
     }
 
     impl ScriptTransport {
@@ -337,7 +373,13 @@ mod tests {
                 records: Arc::new(Mutex::new(Vec::new())),
                 sends: Arc::new(AtomicUsize::new(0)),
                 allocations: Arc::new(AtomicUsize::new(0)),
+                send_capacity: crate::MAX_UDP_PAYLOAD,
             }
+        }
+
+        fn with_send_capacity(mut self, send_capacity: usize) -> Self {
+            self.send_capacity = send_capacity;
+            self
         }
 
         fn records(&self) -> Vec<RequestRecord> {
@@ -433,6 +475,10 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn send_capacity(&self) -> usize {
+            self.send_capacity
         }
     }
 
@@ -540,6 +586,122 @@ mod tests {
                 .collect::<Vec<_>>(),
             [4, 2, 2]
         );
+    }
+
+    #[tokio::test]
+    async fn local_outbound_limit_bisects_splittable_get_before_send() {
+        let oids = test_oids(4);
+        let two_oid_size = CommunityMessage::v2c(
+            Bytes::from_static(b"public"),
+            Pdu::get_request(1, &oids[..2]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+        .len();
+        let four_oid_size =
+            CommunityMessage::v2c(Bytes::from_static(b"public"), Pdu::get_request(1, &oids))
+                .unwrap()
+                .encode()
+                .unwrap()
+                .len();
+        assert!(four_oid_size > two_oid_size);
+
+        let transport =
+            ScriptTransport::new([Action::Echo, Action::Echo]).with_send_capacity(two_oid_size);
+        let client = client(transport.clone(), 4, ResponseShapePolicy::Compatible);
+        let response = client.get_many(&oids).await.unwrap();
+
+        assert_eq!(response.varbinds.len(), 4);
+        assert_eq!(transport.sends.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            transport
+                .records()
+                .into_iter()
+                .map(|record| record.oids.len())
+                .collect::<Vec<_>>(),
+            [2, 2],
+            "the oversized four-OID parent must not reach transport send"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_outbound_limit_bisects_splittable_get_next_before_send() {
+        let oids = test_oids(4);
+        let two_oid_size = CommunityMessage::v2c(
+            Bytes::from_static(b"public"),
+            Pdu::get_next_request(1, &oids[..2]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+        .len();
+
+        let transport =
+            ScriptTransport::new([Action::Echo, Action::Echo]).with_send_capacity(two_oid_size);
+        let client = client(transport.clone(), 4, ResponseShapePolicy::Compatible);
+        let response = client.get_next_many(&oids).await.unwrap();
+
+        assert_eq!(response.operation, FixedCardinalityOperation::GetNext);
+        assert_eq!(response.varbinds.len(), 4);
+        assert_eq!(transport.sends.load(Ordering::Relaxed), 2);
+        assert!(
+            transport
+                .records()
+                .iter()
+                .all(|record| record.pdu_type == PduType::GetNextRequest)
+        );
+        assert_eq!(
+            transport
+                .records()
+                .into_iter()
+                .map(|record| record.oids.len())
+                .collect::<Vec<_>>(),
+            [2, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_too_big_on_singleton_is_terminal() {
+        let transport = ScriptTransport::new([Action::TooBig]);
+        let client = client(transport.clone(), 1, ResponseShapePolicy::Compatible);
+        let mut stream = client.get_many_chunks(&test_oids(1)).unwrap();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.failed_request_range, 0..1);
+        assert!(matches!(
+            *error.source,
+            Error::Snmp {
+                status: ErrorStatus::TooBig,
+                ..
+            }
+        ));
+        assert_eq!(transport.sends.load(Ordering::Relaxed), 1);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_outbound_limit_on_singleton_is_terminal_before_send() {
+        let oids = test_oids(1);
+        let encoded_size =
+            CommunityMessage::v2c(Bytes::from_static(b"public"), Pdu::get_request(1, &oids))
+                .unwrap()
+                .encode()
+                .unwrap()
+                .len();
+        let transport = ScriptTransport::new([]).with_send_capacity(encoded_size - 1);
+        let client = client(transport.clone(), 1, ResponseShapePolicy::Compatible);
+        let mut stream = client.get_many_chunks(&oids).unwrap();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.failed_request_range, 0..1);
+        assert!(matches!(
+            *error.source,
+            Error::OutboundMessageTooLarge { size, limit }
+                if size == encoded_size && limit == encoded_size - 1
+        ));
+        assert_eq!(transport.sends.load(Ordering::Relaxed), 0);
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

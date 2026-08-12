@@ -889,11 +889,24 @@ fn remove_orphaned_time(inner: &mut EngineCacheInner, engine_id: &Bytes) {
 /// The discovery response carries boots/time too, but this parser deliberately
 /// discards them because the discovery message is unauthenticated.
 pub fn parse_discovery_response(security_params: &Bytes) -> Result<EngineState> {
-    parse_discovery_response_with_limits(
-        security_params,
-        UDP_RECEIVE_LIMITS.advertised(),
-        UDP_RECEIVE_LIMITS.advertised(),
-    )
+    parse_discovery_response_with_msg_max_size(security_params, UDP_RECEIVE_LIMITS.advertised())
+}
+
+/// Extract engine identity and the peer's exact advertised receive capacity.
+///
+/// This preserves the remote protocol value independently of any local
+/// transport send capacity. Callers compute their effective outbound limit
+/// when a message has been exactly encoded.
+pub(crate) fn parse_discovery_response_with_msg_max_size(
+    security_params: &Bytes,
+    reported_msg_max_size: MessageSize,
+) -> Result<EngineState> {
+    let usm = UsmSecurityParams::decode(security_params.clone())?;
+    validate_discovered_engine_id(&usm.engine_id)?;
+    Ok(EngineState::discovered(
+        usm.engine_id,
+        reported_msg_max_size,
+    ))
 }
 
 /// Extract engine identity with explicit msgMaxSize and session limit.
@@ -907,23 +920,27 @@ pub fn parse_discovery_response_with_limits(
     session_max: MessageSize,
 ) -> Result<EngineState> {
     let usm = UsmSecurityParams::decode(security_params.clone())?;
-
-    // RFC 3411 Section 5: a valid SnmpEngineID is 5..=32 octets and is neither
-    // all-zero nor all-0xff. Reject discovery responses carrying an engine ID
-    // outside those bounds (including the empty ID) rather than caching it and
-    // deriving unusable localized keys from it.
-    if validate_engine_id(&usm.engine_id).is_err() {
-        tracing::debug!(target: "async_snmp::engine", { length = usm.engine_id.len() }, "discovery response contained invalid engine ID");
-        return Err(Error::MalformedResponse {
-            target: SocketAddr::from(([0, 0, 0, 0], 0)),
-        }
-        .boxed());
-    }
+    validate_discovered_engine_id(&usm.engine_id)?;
 
     Ok(EngineState::discovered(
         usm.engine_id,
         cap_msg_max_size(reported_msg_max_size, session_max),
     ))
+}
+
+fn validate_discovered_engine_id(engine_id: &[u8]) -> Result<()> {
+    // RFC 3411 Section 5: a valid SnmpEngineID is 5..=32 octets and is neither
+    // all-zero nor all-0xff. Reject discovery responses carrying an engine ID
+    // outside those bounds (including the empty ID) rather than caching it and
+    // deriving unusable localized keys from it.
+    if validate_engine_id(engine_id).is_err() {
+        tracing::debug!(target: "async_snmp::engine", { length = engine_id.len() }, "discovery response contained invalid engine ID");
+        return Err(Error::MalformedResponse {
+            target: SocketAddr::from(([0, 0, 0, 0], 0)),
+        }
+        .boxed());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1922,6 +1939,26 @@ mod tests {
             UDP_RECEIVE_LIMITS.advertised(), // Our session maximum
         );
         assert_eq!(state.msg_max_size, 65507);
+    }
+
+    #[test]
+    fn discovery_preserves_remote_capacity_independently_of_local_limits() {
+        let params =
+            UsmSecurityParams::new(Bytes::from_static(b"remote-engine"), 0, 0, Bytes::new())
+                .unwrap()
+                .encode()
+                .unwrap();
+        let reported = MessageSize::new(9000).unwrap();
+        let state = parse_discovery_response_with_msg_max_size(&params, reported).unwrap();
+        assert_eq!(state.msg_max_size, reported);
+
+        let capped = parse_discovery_response_with_limits(
+            &params,
+            reported,
+            MessageSize::new(1400).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capped.msg_max_size, 1400);
     }
 
     /// Test msgMaxSize capping with TCP transport maximum.

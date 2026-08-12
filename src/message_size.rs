@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::error::Error;
+
 /// RFC 3412 minimum value for `msgMaxSize`.
 pub const MESSAGE_SIZE_MINIMUM: usize = 484;
 /// RFC 3412 maximum value for `msgMaxSize`.
@@ -180,6 +182,15 @@ pub const UDP_RECEIVE_LIMITS: ReceiveLimits = ReceiveLimits {
     accepted: UDP_RECEIVE_BUFFER_SIZE,
 };
 
+/// Reject an exactly encoded message that exceeds an outbound capacity.
+pub(crate) fn enforce_outbound_size(size: usize, limit: usize) -> crate::error::Result<()> {
+    if size > limit {
+        Err(Error::OutboundMessageTooLarge { size, limit }.boxed())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +227,18 @@ mod tests {
         }
         assert!(ReceiveLimits::tcp(483).is_err());
         assert!(ReceiveLimits::tcp(i32::MAX as usize + 1).is_err());
+    }
+
+    #[test]
+    fn outbound_limit_is_inclusive() {
+        enforce_outbound_size(484, 484).unwrap();
+        let error = enforce_outbound_size(485, 484).unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::OutboundMessageTooLarge {
+                size: 485,
+                limit: 484
+            }
+        ));
     }
 }

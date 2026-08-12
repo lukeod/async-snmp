@@ -178,6 +178,7 @@ impl<T: Transport> Client<T> {
                 self.inner.transport.receive_limits().advertised(),
             )?;
             let discovery_data = discovery_msg.encode()?;
+            self.enforce_outbound_size(discovery_data.len(), None)?;
 
             let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout);
 
@@ -312,10 +313,9 @@ impl<T: Transport> Client<T> {
         // preserving USM-before-scoped-PDU processing order. Boots/time are
         // syntactically decoded but discarded as unauthenticated input.
         let usm = UsmSecurityParams::decode_with_target(response.security_params.clone(), source)?;
-        let engine_state = crate::v3::parse_discovery_response_with_limits(
+        let engine_state = crate::v3::parse_discovery_response_with_msg_max_size(
             &response.security_params,
             response.global_data.msg_max_size,
-            self.inner.transport.receive_limits().advertised(),
         )
         .map_err(|_| malformed())?;
         if !usm.username.is_empty() || !usm.auth_params.is_empty() || !usm.priv_params.is_empty() {
@@ -426,6 +426,7 @@ impl<T: Transport> Client<T> {
             // outbound size), so advertise the local transport capacity here.
             self.inner.transport.receive_limits().advertised(),
         )?;
+        self.enforce_outbound_size(data.len(), Some(engine.state.msg_max_size))?;
 
         Ok(EncodedV3Request {
             data,
@@ -1145,7 +1146,7 @@ mod tests {
     use std::future::ready;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[derive(Clone)]
@@ -1436,8 +1437,61 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DiscoveryLimitTransport {
+        peer: SocketAddr,
+        engine_id: Bytes,
+        remote_limit: crate::MessageSize,
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl Transport for DiscoveryLimitTransport {
+        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            ready(Ok(()))
+        }
+
+        fn recv(
+            &self,
+            registration: RequestRegistration,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            ready(Ok((
+                build_discovery_response_with_size(
+                    &self.engine_id,
+                    registration.request_id(),
+                    self.remote_limit,
+                ),
+                self.peer,
+            )))
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
     /// Build a minimal valid discovery response with the given engine ID.
     fn build_discovery_response(engine_id: &[u8], msg_id: i32) -> Bytes {
+        build_discovery_response_with_size(
+            engine_id,
+            msg_id,
+            crate::MessageSize::new(65507).unwrap(),
+        )
+    }
+
+    fn build_discovery_response_with_size(
+        engine_id: &[u8],
+        msg_id: i32,
+        msg_max_size: crate::MessageSize,
+    ) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
         use crate::pdu::Pdu;
         use crate::v3::UsmSecurityParams;
@@ -1457,7 +1511,7 @@ mod tests {
 
         let global = MsgGlobalData::new(
             msg_id,
-            crate::MessageSize::new(65507).unwrap(),
+            msg_max_size,
             MsgFlags::new(crate::message::SecurityLevel::NoAuthNoPriv, false),
         )
         .unwrap();
@@ -1498,6 +1552,45 @@ mod tests {
         let state = &engine.as_ref().unwrap().state;
         assert_eq!(state.engine_id.as_ref(), engine_id);
         assert!(state.trusted_time().is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_learns_remote_limit_and_rejects_oversized_request_before_second_send() {
+        let remote_limit = crate::MessageSize::new(crate::MESSAGE_SIZE_MINIMUM).unwrap();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let transport = DiscoveryLimitTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            engine_id: Bytes::from_static(b"limited-engine"),
+            remote_limit,
+            sends: Arc::clone(&sends),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).expect("valid client config");
+        let oversized = Pdu::set_request(
+            7,
+            vec![crate::VarBind::new(
+                oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+                crate::Value::OctetString(Bytes::from(vec![0; 512])),
+            )],
+        );
+
+        let error = client.send_v3_and_recv(oversized).await.unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::OutboundMessageTooLarge { limit, .. }
+                if limit == crate::MESSAGE_SIZE_MINIMUM
+        ));
+        assert_eq!(
+            sends.load(Ordering::Relaxed),
+            1,
+            "only discovery may reach transport send"
+        );
+        let engine = client.inner.engine.read().unwrap();
+        assert_eq!(engine.as_ref().unwrap().state.msg_max_size, remote_limit);
     }
 
     #[tokio::test]
@@ -1576,7 +1669,7 @@ mod response_validation_tests {
     use bytes::Bytes;
     use std::future::ready;
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
@@ -1586,6 +1679,8 @@ mod response_validation_tests {
         peer: SocketAddr,
         response: Bytes,
         max_size: u32,
+        send_size: usize,
+        sends: Arc<AtomicUsize>,
     }
 
     impl CannedTransport {
@@ -1594,17 +1689,24 @@ mod response_validation_tests {
                 peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
                 response,
                 max_size: crate::MAX_UDP_PAYLOAD as u32,
+                send_size: crate::MAX_UDP_PAYLOAD,
+                sends: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
 
     impl Transport for CannedTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
         }
 
         fn receive_limits(&self) -> crate::ReceiveLimits {
             crate::ReceiveLimits::udp(self.max_size as usize).unwrap()
+        }
+
+        fn send_capacity(&self) -> usize {
+            self.send_size
         }
 
         fn recv(
@@ -2136,6 +2238,8 @@ mod response_validation_tests {
             peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
             response: Bytes::new(),
             max_size: 1400,
+            send_size: crate::MAX_UDP_PAYLOAD,
+            sends: Arc::new(AtomicUsize::new(0)),
         };
         let config = ClientConfig {
             auth: crate::Auth::Usm(security.clone()),
@@ -2160,6 +2264,67 @@ mod response_validation_tests {
         assert_eq!(
             msg.global_data.msg_max_size, 1400,
             "request must advertise the local transport capacity, not the remote's cached 9000"
+        );
+        assert_eq!(
+            client.inner.transport.send_capacity(),
+            crate::MAX_UDP_PAYLOAD
+        );
+        let error = client
+            .enforce_outbound_size(9001, Some(crate::MessageSize::new(9000).unwrap()))
+            .unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::OutboundMessageTooLarge {
+                size: 9001,
+                limit: 9000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn v3_atomic_request_enforces_exact_remote_receive_boundary_before_send() {
+        let security = UsmConfig::new("user");
+        let response = build_response(PduType::Response, 123, 1, 1001, None);
+        let client = canned_client(response, 1, 1000, security.clone());
+
+        let pdu_with_encoded_size = |wanted: usize| {
+            (0..1024).find_map(|length| {
+                let pdu = Pdu::set_request(
+                    123,
+                    vec![crate::VarBind::new(
+                        oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+                        crate::Value::OctetString(Bytes::from(vec![0; length])),
+                    )],
+                );
+                let encoded = client.build_v3_message(&pdu, 99, None).unwrap();
+                (encoded.data.len() == wanted).then_some(pdu)
+            })
+        };
+        let exact_pdu = pdu_with_encoded_size(484).expect("construct exact-boundary request");
+        let oversized_pdu =
+            pdu_with_encoded_size(485).expect("construct one-byte-oversized request");
+
+        let remote_capacity = crate::MessageSize::new(484).unwrap();
+        let state =
+            EngineState::with_msg_max_size(Bytes::from_static(ENGINE_ID), 1, 1000, remote_capacity);
+        let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
+        *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
+
+        client.send_v3_and_recv(exact_pdu).await.unwrap();
+        assert_eq!(client.inner.transport.sends.load(Ordering::Relaxed), 1);
+
+        let error = client.send_v3_and_recv(oversized_pdu).await.unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::OutboundMessageTooLarge {
+                size: 485,
+                limit: 484
+            }
+        ));
+        assert_eq!(
+            client.inner.transport.sends.load(Ordering::Relaxed),
+            1,
+            "oversized request must be rejected before transport send"
         );
     }
 

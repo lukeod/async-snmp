@@ -344,6 +344,13 @@ pub enum Candidate<T> {
 /// without consuming the pending request or extending its deadline.
 pub trait Transport: Send + Sync {
     /// Send request data to the target.
+    ///
+    /// Implementations that return a finite [`send_capacity`](Self::send_capacity)
+    /// must reject larger data with
+    /// [`Error::OutboundMessageTooLarge`](crate::Error::OutboundMessageTooLarge)
+    /// before performing transport I/O. This applies to direct `send` calls;
+    /// the default [`request_with`](Self::request_with) implementation performs
+    /// the same check for request/response exchanges.
     fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     /// Receive one correlated response without additional validation.
@@ -434,6 +441,7 @@ pub trait Transport: Send + Sync {
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
         async move {
+            crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
             checked_deadline(registration.timeout(), "transport timeout")?;
 
             let mut receive = std::pin::pin!(self.recv_with(registration, validate));
@@ -479,6 +487,18 @@ pub trait Transport: Send + Sync {
     /// receive-side tolerance.
     fn receive_limits(&self) -> ReceiveLimits {
         UDP_RECEIVE_LIMITS
+    }
+
+    /// Maximum exact encoded message size this transport will send.
+    ///
+    /// This is independent of [`receive_limits`](Self::receive_limits), whose
+    /// advertised value describes what the local endpoint can receive. The
+    /// effectively unbounded default preserves the behavior of existing custom
+    /// transports. Implementors that override this with a finite limit must
+    /// enforce it in direct [`send`](Self::send) calls; the default request
+    /// helper enforces it before starting receive-side work.
+    fn send_capacity(&self) -> usize {
+        usize::MAX
     }
 }
 

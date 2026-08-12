@@ -135,6 +135,13 @@ impl Transport for BuiltinTransport {
             Self::Tcp(transport) => transport.receive_limits(),
         }
     }
+
+    fn send_capacity(&self) -> usize {
+        match self {
+            Self::Udp(transport) => transport.send_capacity(),
+            Self::Tcp(transport) => transport.send_capacity(),
+        }
+    }
 }
 
 #[cfg(test)]

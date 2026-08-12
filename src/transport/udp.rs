@@ -105,11 +105,10 @@ fn next_recv_error_backoff(current: Duration) -> Duration {
 /// Configuration for UDP transport.
 #[derive(Clone)]
 struct UdpTransportConfig {
-    /// Maximum message size for sending (default: 1472, fits Ethernet MTU).
-    ///
-    /// This affects the advertised msgMaxSize in `SNMPv3` requests. The receive
-    /// buffer is always sized to accept the maximum UDP datagram (65535 bytes).
-    max_message_size: usize,
+    /// Local receive capacity advertised in SNMPv3 messages.
+    local_receive_capacity: usize,
+    /// Maximum exact encoded datagram size sent by this transport.
+    send_capacity: usize,
     /// Log warning when response source differs from target (default: true)
     warn_on_source_mismatch: bool,
 }
@@ -117,7 +116,8 @@ struct UdpTransportConfig {
 impl Default for UdpTransportConfig {
     fn default() -> Self {
         Self {
-            max_message_size: 1472,
+            local_receive_capacity: 1472,
+            send_capacity: 1472,
             warn_on_source_mismatch: true,
         }
     }
@@ -353,13 +353,31 @@ impl UdpTransportBuilder {
         self
     }
 
-    /// Set maximum message size for sending (default: 1472 bytes).
+    /// Set both local receive advertisement and outbound send capacity.
     ///
-    /// This affects the advertised msgMaxSize in `SNMPv3` requests. The receive
-    /// buffer is always sized to accept any valid UDP datagram (65535 bytes).
+    /// The default for both is 1472 bytes. Prefer [`receive_capacity`](Self::receive_capacity)
+    /// and [`send_capacity`](Self::send_capacity) when the two limits differ.
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
-        self.config.max_message_size = size;
+        self.config.local_receive_capacity = size;
+        self.config.send_capacity = size;
+        self
+    }
+
+    /// Set the local receive capacity advertised as SNMPv3 `msgMaxSize`.
+    ///
+    /// UDP still uses a bounded full-size receive buffer for compatibility, but
+    /// does not advertise that additional tolerance.
+    #[must_use]
+    pub fn receive_capacity(mut self, size: usize) -> Self {
+        self.config.local_receive_capacity = size;
+        self
+    }
+
+    /// Set the maximum exact encoded datagram size sent by the transport.
+    #[must_use]
+    pub fn send_capacity(mut self, size: usize) -> Self {
+        self.config.send_capacity = size;
         self
     }
 
@@ -402,8 +420,19 @@ impl UdpTransportBuilder {
     pub async fn build(self) -> Result<UdpTransport> {
         // Validate before parsing or binding so invalid size configuration has
         // deterministic precedence and can never be narrowed on advertisement.
-        let receive_limits = ReceiveLimits::udp(self.config.max_message_size)
+        let receive_limits = ReceiveLimits::udp(self.config.local_receive_capacity)
             .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
+        if self.config.send_capacity > crate::MAX_UDP_PAYLOAD {
+            return Err(Error::Config(
+                format!(
+                    "UDP send capacity {} exceeds maximum payload {}",
+                    self.config.send_capacity,
+                    crate::MAX_UDP_PAYLOAD
+                )
+                .into(),
+            )
+            .boxed());
+        }
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
@@ -543,6 +572,7 @@ impl UdpHandle {
 
 impl Transport for UdpHandle {
     async fn send(&self, data: &[u8]) -> Result<()> {
+        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let _operation = self.inner.operations.read().await;
         self.ensure_open()?;
         self.send_datagram(data).await
@@ -558,6 +588,7 @@ impl Transport for UdpHandle {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
+        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let _operation = self.inner.operations.read().await;
         self.ensure_open()?;
 
@@ -598,6 +629,10 @@ impl Transport for UdpHandle {
         self.inner.receive_limits
     }
 
+    fn send_capacity(&self) -> usize {
+        self.inner.config.send_capacity
+    }
+
     fn is_reliable(&self) -> bool {
         false
     }
@@ -615,6 +650,7 @@ impl UdpHandle {
     }
 
     async fn send_datagram(&self, data: &[u8]) -> Result<()> {
+        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.bytes = data.len() }, "UDP send");
         self.inner
             .socket
@@ -774,6 +810,40 @@ mod tests {
             .unwrap();
         let handle = transport.handle("127.0.0.1:161".parse().unwrap()).unwrap();
         assert_eq!(handle.receive_limits().advertised().as_usize(), 8192);
+        assert_eq!(handle.send_capacity(), 8192);
+    }
+
+    #[tokio::test]
+    async fn receive_advertisement_and_send_capacity_are_independent() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpTransport::builder()
+            .bind("127.0.0.1:0")
+            .receive_capacity(4096)
+            .send_capacity(4)
+            .build()
+            .await
+            .unwrap();
+        let handle = transport.handle(server.local_addr().unwrap()).unwrap();
+
+        assert_eq!(handle.receive_limits().advertised().as_usize(), 4096);
+        assert_eq!(handle.send_capacity(), 4);
+
+        handle.send(&[1, 2, 3, 4]).await.unwrap();
+        let mut received = [0; 8];
+        let (length, _) = server.recv_from(&mut received).await.unwrap();
+        assert_eq!(&received[..length], &[1, 2, 3, 4]);
+
+        let error = handle.send(&[1, 2, 3, 4, 5]).await.unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::OutboundMessageTooLarge { size: 5, limit: 4 }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), server.recv_from(&mut received))
+                .await
+                .is_err(),
+            "oversized datagram must not reach the socket"
+        );
     }
 
     #[tokio::test]
@@ -792,6 +862,19 @@ mod tests {
             );
             assert!(error.to_string().contains("message size"));
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_send_capacity_is_rejected_before_bind_parsing() {
+        let error = UdpTransport::builder()
+            .bind("not a socket address")
+            .send_capacity(crate::MAX_UDP_PAYLOAD + 1)
+            .build()
+            .await
+            .err()
+            .expect("invalid send capacity must fail");
+        assert!(matches!(*error, Error::Config(_)));
+        assert!(error.to_string().contains("send capacity"));
     }
 
     #[tokio::test]
@@ -1040,12 +1123,11 @@ mod tests {
         );
     }
 
-    // A send failure after registration must reclaim the pending entries
-    // immediately rather than leaving them to expire or be swept
-    // by the periodic cleanup. An oversized datagram (larger than the maximum
-    // UDP payload) makes send_to fail synchronously, exercising that path.
+    // A local size failure after registration must reclaim the pending entries
+    // immediately rather than leaving them to expire or be swept by the
+    // periodic cleanup.
     #[tokio::test]
-    async fn send_failure_unregisters_pending_slot() {
+    async fn outbound_size_failure_unregisters_pending_slot() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
 
@@ -1053,15 +1135,20 @@ mod tests {
         let registration =
             RequestRegistration::v3(request_id, Duration::from_secs(30)).with_aliases([53, 54]);
 
-        // Payload beyond the maximum UDP datagram size; send_to returns EMSGSIZE.
-        let oversized = vec![0u8; 70_000];
+        let oversized = vec![0u8; 1473];
         let err = handle
             .request(&oversized, registration)
             .await
             .expect_err("oversized send should fail");
         assert!(
-            matches!(*err, Error::Network { .. }),
-            "expected Error::Network, got {err:?}"
+            matches!(
+                *err,
+                Error::OutboundMessageTooLarge {
+                    size: 1473,
+                    limit: 1472
+                }
+            ),
+            "expected local outbound-size error, got {err:?}"
         );
 
         // The slot must already be gone: a response for this id finds nothing.

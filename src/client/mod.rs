@@ -423,6 +423,23 @@ impl<T: Transport> Client<T> {
         matches!(self.inner.config.auth, Auth::Usm(_))
     }
 
+    /// Enforce the exact encoded size before transport I/O.
+    ///
+    /// SNMPv3 request/response exchanges additionally honor the remote
+    /// engine's learned receive capacity. Local receive advertisement is not
+    /// an outbound constraint.
+    pub(super) fn enforce_outbound_size(
+        &self,
+        encoded_size: usize,
+        remote_receive_capacity: Option<crate::MessageSize>,
+    ) -> Result<()> {
+        let transport_capacity = self.inner.transport.send_capacity();
+        let effective_limit = remote_receive_capacity
+            .map(crate::MessageSize::as_usize)
+            .map_or(transport_capacity, |remote| transport_capacity.min(remote));
+        crate::message_size::enforce_outbound_size(encoded_size, effective_limit)
+    }
+
     /// Send a request and wait for response (internal helper with pre-encoded data).
     #[instrument(
         level = "debug",
@@ -435,6 +452,7 @@ impl<T: Transport> Client<T> {
         )
     )]
     async fn send_and_recv(&self, request_id: i32, data: &[u8]) -> Result<Pdu> {
+        self.enforce_outbound_size(data.len(), None)?;
         let start = Instant::now();
         let mut last_error: Option<Box<Error>> = None;
         let max_attempts = if self.inner.transport.is_reliable() {
@@ -646,8 +664,11 @@ impl<T: Transport> Client<T> {
     ///
     /// All OIDs are validated when this method is called. No request is sent
     /// until the returned stream is polled, and after each item the next request
-    /// waits for another poll. An agent `tooBig` response bisects that request
-    /// range and exposes successful child leaves independently.
+    /// waits for another poll. An agent `tooBig` response or a local
+    /// [`Error::OutboundMessageTooLarge`] bisects a multi-OID request range and
+    /// exposes successful child leaves independently. Either error on a
+    /// single-OID range is terminal and is returned in
+    /// [`FixedCardinalityChunkError::source`].
     ///
     /// The stream emits one [`FixedCardinalityChunkError`] for a terminal
     /// failure, then remains fused. Dropping a chunk stream while a TCP request
@@ -843,6 +864,7 @@ impl<T: Transport> Client<T> {
             self.ensure_local_keys_derived()?;
             let msg_id = self.next_request_id();
             let data = self.build_v3_trap_message(&pdu, msg_id)?;
+            self.enforce_outbound_size(data.len(), None)?;
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.varbind_count = pdu.varbinds.len(), snmp.bytes = data.len() }, "sending V3 trap");
             self.inner.transport.send(&data).await?;
         } else {
@@ -852,6 +874,7 @@ impl<T: Transport> Client<T> {
                 pdu,
             )?;
             let data = message.encode()?;
+            self.enforce_outbound_size(data.len(), None)?;
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.bytes = data.len() }, "sending v2c trap");
             self.inner.transport.send(&data).await?;
         }
@@ -896,6 +919,7 @@ impl<T: Transport> Client<T> {
 
         let message = CommunityMessage::v1_trap(self.inner.config.community()?, trap)?;
         let data = message.encode()?;
+        self.enforce_outbound_size(data.len(), None)?;
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
         self.inner.transport.send(&data).await?;
 
@@ -1471,6 +1495,109 @@ mod tests {
     struct CountingTransport {
         sends: Arc<AtomicUsize>,
         allocations: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct CapacityTransport {
+        capacity: usize,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl Transport for CapacityTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv(
+            &self,
+            _registration: crate::transport::RequestRegistration,
+        ) -> Result<(Bytes, SocketAddr)> {
+            panic!("capacity test overrides request_with")
+        }
+
+        async fn request_with<U, F>(
+            &self,
+            _data: &[u8],
+            _registration: crate::transport::RequestRegistration,
+            _validate: F,
+        ) -> Result<U>
+        where
+            U: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<U>> + Send,
+        {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Err(Error::Config("capacity boundary reached transport".into()).boxed())
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+
+        fn send_capacity(&self) -> usize {
+            self.capacity
+        }
+    }
+
+    #[tokio::test]
+    async fn community_atomic_requests_enforce_exact_transport_boundary_before_send() {
+        for (version, auth) in [
+            (Version::V1, crate::Auth::v1("public")),
+            (Version::V2c, crate::Auth::v2c("public")),
+        ] {
+            let pdu = Pdu::get_request(7, &[crate::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
+            let exact_size =
+                CommunityMessage::new(version, Bytes::from_static(b"public"), pdu.clone())
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .len();
+
+            let exact_requests = Arc::new(AtomicUsize::new(0));
+            let exact_client = Client::new(
+                CapacityTransport {
+                    capacity: exact_size,
+                    requests: Arc::clone(&exact_requests),
+                },
+                ClientConfig {
+                    auth: auth.clone(),
+                    retry: crate::client::retry::Retry::none(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let error = exact_client.send_request(pdu.clone()).await.unwrap_err();
+            assert!(matches!(*error, Error::Config(_)));
+            assert_eq!(exact_requests.load(Ordering::Relaxed), 1);
+
+            let oversized_requests = Arc::new(AtomicUsize::new(0));
+            let oversized_client = Client::new(
+                CapacityTransport {
+                    capacity: exact_size - 1,
+                    requests: Arc::clone(&oversized_requests),
+                },
+                ClientConfig {
+                    auth,
+                    retry: crate::client::retry::Retry::none(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let error = oversized_client.send_request(pdu).await.unwrap_err();
+            assert!(matches!(
+                *error,
+                Error::OutboundMessageTooLarge { size, limit }
+                    if size == exact_size && limit == exact_size - 1
+            ));
+            assert_eq!(oversized_requests.load(Ordering::Relaxed), 0);
+        }
     }
 
     impl Transport for CountingTransport {

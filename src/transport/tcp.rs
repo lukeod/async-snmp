@@ -108,12 +108,18 @@ pub struct TcpOptions {
     ///
     /// Default: 10MB. Real SNMP messages rarely exceed a few KB.
     pub max_message_size: usize,
+    /// Maximum exact encoded message size to send.
+    ///
+    /// Default: 10MB. This is independent of the incoming framing and
+    /// SNMPv3 advertisement limit above.
+    pub send_capacity: usize,
 }
 
 impl Default for TcpOptions {
     fn default() -> Self {
         Self {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            send_capacity: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 }
@@ -173,6 +179,13 @@ impl TcpTransportBuilder {
         self
     }
 
+    /// Set the maximum exact encoded size for outgoing messages.
+    #[must_use]
+    pub fn send_capacity(mut self, size: usize) -> Self {
+        self.options.send_capacity = size;
+        self
+    }
+
     /// Connect to the target address.
     pub async fn connect(self, target: SocketAddr) -> Result<TcpTransport> {
         // Validate the deadline before normalizing limits or starting connect
@@ -222,6 +235,7 @@ impl TcpTransportBuilder {
                 target,
                 local_addr,
                 receive_limits,
+                send_capacity: self.options.send_capacity,
                 poisoned: AtomicBool::new(false),
             }),
         })
@@ -292,6 +306,8 @@ struct TcpTransportInner {
     local_addr: SocketAddr,
     /// One total-message bound shared by framing, decoding, and advertisement.
     receive_limits: ReceiveLimits,
+    /// Exact encoded outbound-message limit.
+    send_capacity: usize,
     /// Set once framing or transaction state may be ambiguous.
     ///
     /// TCP is a byte stream framed by BER length prefixes. Partial I/O,
@@ -433,6 +449,7 @@ impl TcpTransport {
                 target,
                 local_addr,
                 receive_limits,
+                send_capacity: options.send_capacity,
                 poisoned: AtomicBool::new(false),
             }),
         })
@@ -441,6 +458,7 @@ impl TcpTransport {
 
 impl Transport for TcpTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
+        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         // Do not arm the transaction until the lock is acquired: cancellation
         // while queued has not touched stream state and must leave it reusable.
         let mut stream = self.inner.stream.clone().lock_owned().await;
@@ -495,6 +513,7 @@ impl Transport for TcpTransport {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     {
+        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let request_id = registration.request_id();
         let recv_timeout = registration.timeout();
         let target = self.inner.target;
@@ -539,6 +558,10 @@ impl Transport for TcpTransport {
 
     fn receive_limits(&self) -> ReceiveLimits {
         self.inner.receive_limits
+    }
+
+    fn send_capacity(&self) -> usize {
+        self.inner.send_capacity
     }
 }
 
@@ -974,6 +997,53 @@ mod tests {
             transport.receive_limits().advertised().as_usize(),
             transport.inner.receive_limits.accepted()
         );
+    }
+
+    #[tokio::test]
+    async fn receive_advertisement_and_send_capacity_are_independent() {
+        let request = build_request_with_id(1);
+        let exact_limit = request.len();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (inspect_tx, inspect_rx) = tokio::sync::oneshot::channel();
+        let (inspected_tx, inspected_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            inspect_rx.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), socket.read_u8())
+                    .await
+                    .is_err(),
+                "oversized rejection must leave the TCP stream empty"
+            );
+            inspected_tx.send(()).unwrap();
+            let mut received = vec![0; exact_limit];
+            socket.read_exact(&mut received).await.unwrap();
+            received
+        });
+
+        let transport = TcpTransport::builder()
+            .max_message_size(4096)
+            .send_capacity(exact_limit)
+            .connect(server_addr)
+            .await
+            .unwrap();
+        assert_eq!(transport.receive_limits().advertised().as_usize(), 4096);
+        assert_eq!(transport.send_capacity(), exact_limit);
+
+        let mut oversized = request.clone();
+        oversized.push(0);
+        let error = transport.send(&oversized).await.unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::OutboundMessageTooLarge { size, limit }
+                if size == exact_limit + 1 && limit == exact_limit
+        ));
+        inspect_tx.send(()).unwrap();
+        inspected_rx.await.unwrap();
+
+        transport.send(&request).await.unwrap();
+        assert_eq!(server.await.unwrap(), request);
     }
 
     #[tokio::test]
@@ -1741,9 +1811,16 @@ mod tests {
         });
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_send_buffer_size(1024).unwrap();
-        let transport = TcpTransport::from_socket(socket, server_addr, TcpOptions::default())
-            .await
-            .unwrap();
+        let transport = TcpTransport::from_socket(
+            socket,
+            server_addr,
+            TcpOptions {
+                send_capacity: 16 * 1024 * 1024,
+                ..TcpOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         accepted_rx.await.unwrap();
 
         let send_transport = transport.clone();
@@ -1769,9 +1846,16 @@ mod tests {
         });
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_send_buffer_size(1024).unwrap();
-        let transport = TcpTransport::from_socket(socket, server_addr, TcpOptions::default())
-            .await
-            .unwrap();
+        let transport = TcpTransport::from_socket(
+            socket,
+            server_addr,
+            TcpOptions {
+                send_capacity: 16 * 1024 * 1024,
+                ..TcpOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let data = vec![0xaa; 16 * 1024 * 1024];
 
         let start = tokio::time::Instant::now();
