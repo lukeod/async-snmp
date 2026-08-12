@@ -186,7 +186,14 @@ impl UsmSecurityParams {
         Ok(())
     }
 
-    /// Validate the authentication/privacy fields against the message level.
+    /// Strictly validate authentication/privacy fields against a caller-selected
+    /// message level.
+    ///
+    /// This whole-value check is used for constructed messages and client
+    /// responses that must match the selected wire semantics. Agent and
+    /// notification-receiver processing that produces RFC 3414 failure counters
+    /// and Reports instead applies Section 3.2 in order, then permissively
+    /// ignores bounded fields above the requested security level.
     pub fn validate_for_security_level(&self, level: SecurityLevel) -> Result<()> {
         self.validate_common()?;
         let valid = match level {

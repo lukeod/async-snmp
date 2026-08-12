@@ -269,16 +269,15 @@ pub(crate) fn process_v3_inbound(
 
     // RFC 3414 Section 3.2 Step 3: engine-ID handling. An empty engine ID is
     // a discovery request (RFC 3414 Section 4); both cases answer with
-    // usmStatsUnknownEngineIDs.
+    // usmStatsUnknownEngineIDs. Do not validate authentication/privacy field
+    // relationships here: Steps 3 and 4 take precedence over those semantics.
     if usm_params.engine_id.is_empty() {
-        usm_params.validate_for_security_level(security_level)?;
         return fail(UsmFailure::UnknownEngineIds, None);
     }
     if validate_engine_id(&usm_params.engine_id).is_err() {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, length = usm_params.engine_id.len() }, "invalid engine ID");
         return fail(UsmFailure::UnknownEngineIds, None);
     }
-    usm_params.validate_for_security_level(security_level)?;
     let engine_is_local = usm_params.engine_id == *ctx.engine_id;
     if role.is_authoritative() && !engine_is_local {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "engine ID mismatch");
@@ -317,11 +316,14 @@ pub(crate) fn process_v3_inbound(
             .auth_key
             .as_ref()
             .expect("authenticated message without an auth key is rejected at Step 5");
-        let (auth_offset, auth_len) =
-            UsmSecurityParams::find_auth_params_offset(&data).ok_or_else(|| {
-                tracing::debug!(target: "async_snmp::v3", { source = %source }, "could not find auth params in message");
-                Error::Auth { target: source }.boxed()
-            })?;
+        let Some((auth_offset, auth_len)) = UsmSecurityParams::find_auth_params_offset(&data)
+        else {
+            // The USM sequence was structurally decoded above, so this is
+            // defensive. At Step 6 an unusable authentication field is
+            // authentication failure, not an uncounted local decode error.
+            tracing::debug!(target: "async_snmp::v3", { source = %source }, "could not locate authentication parameters");
+            return fail(UsmFailure::WrongDigests, None);
+        };
         if !verify_message(auth_key, &data, auth_offset, auth_len)
             .map_err(|_| Error::Auth { target: source }.boxed())?
         {
@@ -387,6 +389,27 @@ pub(crate) fn process_v3_inbound(
                 return Ok(V3Inbound::RemoteNotInTimeWindow);
             }
         }
+    }
+
+    // RFC 3414 does not assign a failure counter to extra auth/priv fields at
+    // a lower requested security level. Receive permissively after all
+    // applicable ordered steps have passed: the fields are bounded by the
+    // enclosing message limit, ignored, and made observable through tracing.
+    let ignored_auth_params = !security_level.requires_auth() && !usm_params.auth_params.is_empty();
+    let ignored_priv_params = !security_level.requires_priv() && !usm_params.priv_params.is_empty();
+    if ignored_auth_params || ignored_priv_params {
+        tracing::debug!(
+            target: "async_snmp::v3",
+            {
+                snmp.source = %source,
+                security_level = ?security_level,
+                ignored_auth_params,
+                auth_params_length = usm_params.auth_params.len(),
+                ignored_priv_params,
+                priv_params_length = usm_params.priv_params.len(),
+            },
+            "ignoring USM fields above requested security level"
+        );
     }
 
     // Parse (and for authPriv decrypt) the scoped PDU only after every
@@ -499,6 +522,75 @@ mod tests {
             .unwrap()
     }
 
+    /// Build a structurally valid message without applying outbound USM field
+    /// relationship validation. This models contradictory peer input for the
+    /// RFC 3414 Section 3.2 precedence tests.
+    fn build_raw_usm_msg(
+        engine_id: &[u8],
+        username: &[u8],
+        level: SecurityLevel,
+        reportable: bool,
+        auth_params: &[u8],
+        priv_params: &[u8],
+    ) -> Bytes {
+        let global = MsgGlobalData::new(
+            1,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(level, reportable),
+        )
+        .unwrap();
+        let mut usm = crate::ber::EncodeBuf::new();
+        usm.push_sequence(|buf| {
+            buf.push_octet_string(priv_params);
+            buf.push_octet_string(auth_params);
+            buf.push_octet_string(username);
+            buf.push_integer(1000);
+            buf.push_integer(7);
+            buf.push_octet_string(engine_id);
+        });
+
+        let mut message = crate::ber::EncodeBuf::new();
+        message.push_sequence(|buf| {
+            if level.requires_priv() {
+                buf.push_octet_string(b"ciphertext");
+            } else {
+                let scoped = ScopedPdu::new(
+                    Bytes::copy_from_slice(engine_id),
+                    Bytes::new(),
+                    Pdu::get_request(42, &[]),
+                )
+                .encode_to_bytes()
+                .unwrap();
+                buf.push_bytes(&scoped);
+            }
+            buf.push_octet_string(&usm.finish());
+            global.encode(buf).unwrap();
+            buf.push_integer(3);
+        });
+        message.finish()
+    }
+
+    fn assert_report(
+        outcome: V3Inbound,
+        expected_failure: UsmFailure,
+        expected_oid: Oid,
+        expected_count: u32,
+    ) {
+        let V3Inbound::Failed { failure, report } = outcome else {
+            panic!("expected USM failure");
+        };
+        assert_eq!(failure, expected_failure);
+        let report = V3Message::decode(report.expect("reportable failure gets a Report")).unwrap();
+        let pdu = report.pdu().expect("failure Report is plaintext");
+        assert_eq!(pdu.pdu_type(), PduType::Report);
+        assert_eq!(pdu.varbinds.len(), 1);
+        assert_eq!(pdu.varbinds[0].oid, expected_oid);
+        assert_eq!(
+            pdu.varbinds[0].value,
+            crate::Value::Counter32(expected_count)
+        );
+    }
+
     /// Patch the first occurrence of `pattern` in `data` at `offset` within
     /// the pattern to `value`.
     fn patch(data: &Bytes, pattern: &[u8], offset: usize, value: u8) -> Bytes {
@@ -609,6 +701,305 @@ mod tests {
         let pdu = report.pdu().unwrap();
         assert_eq!(pdu.pdu_type(), PduType::Report);
         assert_eq!(pdu.varbinds[0].oid, report_oids::unknown_engine_ids());
+    }
+
+    /// RFC 3414 Section 3.2 Step 3 precedes field semantics: even an empty
+    /// engine ID carrying auth/priv material at noAuthNoPriv is counted and
+    /// reported as unknownEngineID.
+    #[test]
+    fn empty_engine_id_precedes_contradictory_usm_fields() {
+        let engine_id = local_engine_id();
+        let users = HashMap::new();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let data = build_raw_usm_msg(
+            b"",
+            b"unexpected",
+            SecurityLevel::NoAuthNoPriv,
+            true,
+            b"unexpected-auth",
+            b"unexpected-priv",
+        );
+
+        let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
+        assert_report(
+            outcome,
+            UsmFailure::UnknownEngineIds,
+            report_oids::unknown_engine_ids(),
+            1,
+        );
+        assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// The authoritative engine's Step 3 foreign-ID failure likewise wins
+    /// over missing fields required by authPriv.
+    #[test]
+    fn foreign_engine_id_precedes_missing_auth_priv_fields() {
+        let engine_id = local_engine_id();
+        let users = HashMap::new();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let data = build_raw_usm_msg(
+            b"\x80\x00\x00\x00\x01remote",
+            b"nobody",
+            SecurityLevel::AuthPriv,
+            true,
+            b"",
+            b"",
+        );
+
+        let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
+        assert_report(
+            outcome,
+            UsmFailure::UnknownEngineIds,
+            report_oids::unknown_engine_ids(),
+            1,
+        );
+        assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// A notification receiver accepts a foreign authoritative engine ID, so
+    /// Step 4 unknown-user processing precedes contradictory required fields.
+    #[test]
+    fn receiver_unknown_user_precedes_missing_auth_priv_fields() {
+        let engine_id = local_engine_id();
+        let users = HashMap::new();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let data = build_raw_usm_msg(
+            b"\x80\x00\x00\x00\x01remote",
+            b"nobody",
+            SecurityLevel::AuthPriv,
+            true,
+            b"",
+            b"",
+        );
+        let remote_engines = Mutex::new(HashMap::new());
+        let role = V3Role::Receiver {
+            remote_engines: &remote_engines,
+            max_remote_engines: 16,
+        };
+
+        let outcome = process_v3_inbound(data, &ctx, &role).unwrap();
+        assert_report(
+            outcome,
+            UsmFailure::UnknownUserNames,
+            report_oids::unknown_user_names(),
+            1,
+        );
+        assert!(remote_engines.lock().unwrap().is_empty());
+        assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// RFC 3414 Step 4 wins once the engine ID is local, irrespective of
+    /// contradictory security fields.
+    #[test]
+    fn local_engine_unknown_user_precedes_missing_auth_priv_fields() {
+        let engine_id = local_engine_id();
+        let users = HashMap::new();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let data = build_raw_usm_msg(
+            &engine_id,
+            b"nobody",
+            SecurityLevel::AuthPriv,
+            true,
+            b"",
+            b"",
+        );
+
+        let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
+        assert_report(
+            outcome,
+            UsmFailure::UnknownUserNames,
+            report_oids::unknown_user_names(),
+            1,
+        );
+        assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// RFC 3414 Step 5 precedes authentication/privacy field processing.
+    #[test]
+    fn local_engine_unsupported_level_precedes_missing_auth_priv_fields() {
+        let engine_id = local_engine_id();
+        let mut users = HashMap::new();
+        users.insert(Bytes::from_static(b"user"), UsmUser::new("user"));
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let data = build_raw_usm_msg(&engine_id, b"user", SecurityLevel::AuthPriv, true, b"", b"");
+
+        let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
+        assert_report(
+            outcome,
+            UsmFailure::UnsupportedSecLevels,
+            report_oids::unsupported_sec_levels(),
+            1,
+        );
+        assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// At RFC 3414 Step 6, missing authentication material is a wrong digest;
+    /// an extra privacy field cannot turn it into an earlier generic error.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn local_engine_missing_auth_with_extra_priv_counts_wrong_digest() {
+        use crate::v3::AuthProtocol;
+
+        let engine_id = local_engine_id();
+        let mut users = HashMap::new();
+        users.insert(
+            Bytes::from_static(b"user"),
+            UsmUser::new("user").auth(AuthProtocol::Sha256, b"auth-password"),
+        );
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let data = build_raw_usm_msg(
+            &engine_id,
+            b"user",
+            SecurityLevel::AuthNoPriv,
+            true,
+            b"",
+            b"unexpected-priv",
+        );
+
+        let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
+        assert_report(
+            outcome,
+            UsmFailure::WrongDigests,
+            report_oids::wrong_digests(),
+            1,
+        );
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// An extra bounded privacy field does not invalidate an authNoPriv message
+    /// once the required authentication and timeliness checks succeed.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn authenticated_no_priv_message_permits_extra_privacy_field() {
+        use crate::v3::AuthProtocol;
+
+        let engine_id = local_engine_id();
+        let user = UsmUser::new("user").auth(AuthProtocol::Sha256, b"auth-password");
+        let keys = user.derive_keys(&engine_id).unwrap();
+        let auth_key = keys.auth_key.as_ref().unwrap();
+        let mut users = HashMap::new();
+        users.insert(Bytes::from_static(b"user"), user);
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let mut data = build_raw_usm_msg(
+            &engine_id,
+            b"user",
+            SecurityLevel::AuthNoPriv,
+            true,
+            &vec![0; auth_key.mac_len()],
+            b"ignored-privacy",
+        )
+        .to_vec();
+        let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data).unwrap();
+        crate::v3::auth::authenticate_message(auth_key, &mut data, auth_offset, auth_len).unwrap();
+
+        let outcome = process_v3_inbound(data.into(), &ctx, &V3Role::Authoritative).unwrap();
+        let V3Inbound::Message(message) = outcome else {
+            panic!("valid authNoPriv message with an extra privacy field must be accepted");
+        };
+        assert_eq!(message.security_level, SecurityLevel::AuthNoPriv);
+        assert_eq!(
+            message.usm_params.priv_params,
+            b"ignored-privacy".as_slice()
+        );
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.not_in_time_windows.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// Once authentication and timeliness pass, malformed required privacy
+    /// material is RFC 3414 Step 8 decryptionError.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn local_engine_malformed_privacy_material_counts_decryption_error() {
+        use crate::v3::{AuthProtocol, PrivProtocol};
+
+        let engine_id = local_engine_id();
+        let user = UsmUser::new("user").auth_priv(
+            AuthProtocol::Sha256,
+            b"auth-password",
+            PrivProtocol::Aes128,
+            b"priv-password",
+        );
+        let keys = user.derive_keys(&engine_id).unwrap();
+        let auth_key = keys.auth_key.as_ref().unwrap();
+        let mut users = HashMap::new();
+        users.insert(Bytes::from_static(b"user"), user);
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let mut data = build_raw_usm_msg(
+            &engine_id,
+            b"user",
+            SecurityLevel::AuthPriv,
+            true,
+            &vec![0; auth_key.mac_len()],
+            b"bad",
+        )
+        .to_vec();
+        let (auth_offset, auth_len) = UsmSecurityParams::find_auth_params_offset(&data).unwrap();
+        crate::v3::auth::authenticate_message(auth_key, &mut data, auth_offset, auth_len).unwrap();
+
+        let outcome = process_v3_inbound(data.into(), &ctx, &V3Role::Authoritative).unwrap();
+        assert_report(
+            outcome,
+            UsmFailure::DecryptionErrors,
+            report_oids::decryption_errors(),
+            1,
+        );
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.not_in_time_windows.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// Lower-level extra fields have no RFC 3414 failure counter. Once the
+    /// ordered engine and user checks pass, bounded extra fields are ignored.
+    #[test]
+    fn local_no_auth_message_permits_bounded_extra_security_fields() {
+        let engine_id = local_engine_id();
+        let mut users = HashMap::new();
+        users.insert(Bytes::from_static(b"user"), UsmUser::new("user"));
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let data = build_raw_usm_msg(
+            &engine_id,
+            b"user",
+            SecurityLevel::NoAuthNoPriv,
+            true,
+            b"ignored-auth",
+            b"ignored-priv",
+        );
+
+        let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
+        assert!(matches!(outcome, V3Inbound::Message(_)));
+        assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.wrong_digests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
     }
 
     #[test]
