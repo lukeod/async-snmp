@@ -81,6 +81,7 @@ fn community_notification_debug_is_redacted_for_every_variant() {
                 1234,
                 vec![],
             ),
+            decode_anomalies: Vec::new(),
         },
         Notification::TrapV2c {
             community: community.clone(),
@@ -88,6 +89,7 @@ fn community_notification_debug_is_redacted_for_every_variant() {
             trap_oid: trap_oid.clone(),
             varbinds: vec![],
             request_id: 413,
+            decode_anomalies: Vec::new(),
         },
         Notification::InformV2c {
             community,
@@ -95,6 +97,7 @@ fn community_notification_debug_is_redacted_for_every_variant() {
             trap_oid: trap_oid.clone(),
             varbinds: vec![],
             request_id: 414,
+            decode_anomalies: Vec::new(),
         },
     ];
 

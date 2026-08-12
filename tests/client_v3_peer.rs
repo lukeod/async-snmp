@@ -97,6 +97,21 @@ fn response_step(engine: TestV3Engine, value: &'static str) -> ScriptStep {
     })
 }
 
+fn trailing_lengths(error: &async_snmp::Error) -> Vec<usize> {
+    error
+        .response_metadata()
+        .expect("accepted response metadata")
+        .decode_anomalies
+        .iter()
+        .map(|anomaly| match anomaly {
+            async_snmp::DecodeAnomaly::TrailingBytes {
+                original_length, ..
+            } => *original_length,
+            other => panic!("expected trailing-byte anomaly, got {other:?}"),
+        })
+        .collect()
+}
+
 fn custom_client(
     transport: ScriptedTransport,
     level: SecurityLevel,
@@ -235,10 +250,23 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, policy: DecodePolicy) {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
     let peer_result = peer.finish().await;
     assert!(peer_result.is_ok(), "peer failed: {peer_result:?}");
-    assert_eq!(
-        result.unwrap().varbinds[0].value.as_str(),
-        Some("v3 suffix policy")
-    );
+    let result = result.unwrap();
+    assert_eq!(result.varbinds[0].value.as_str(), Some("v3 suffix policy"));
+    if policy == DecodePolicy::Compatible {
+        assert!(
+            matches!(
+                result.metadata.decode_anomalies.as_slice(),
+                [async_snmp::DecodeAnomaly::TrailingBytes {
+                    original_length: 1..,
+                    canonical_length: 0,
+                }]
+            ),
+            "level {level:?}: {:?}",
+            result.metadata.decode_anomalies
+        );
+    } else {
+        assert!(result.metadata.decode_anomalies.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -250,6 +278,53 @@ async fn v3_udp_client_suffix_policy_is_coherent() {
     ] {
         v3_udp_suffix_policy(level, DecodePolicy::Compatible).await;
         v3_udp_suffix_policy(level, DecodePolicy::Strict).await;
+    }
+}
+
+#[tokio::test]
+async fn v3_plaintext_and_authpriv_inner_anomaly_precedes_top_level_suffix() {
+    for level in [SecurityLevel::NoAuthNoPriv, SecurityLevel::AuthPriv] {
+        let engine = engine_for(level);
+        let response_engine = engine.clone();
+        let transport = ScriptedTransport::new(
+            engine.clone(),
+            vec![
+                discovery_step(engine),
+                ScriptStep::reply(move |request| {
+                    let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                        .oid
+                        .clone();
+                    let response = V3ReplyBuilder::response_to(request, &response_engine)
+                        .varbinds(vec![VarBind::new(oid, Value::Integer(9))])
+                        .first_integer_value_content(Bytes::from_static(&[1, 0, 0, 0, 9]))
+                        .build()?;
+                    let mut response = response.to_vec();
+                    response.extend_from_slice(&[0xcc, 0xcc]);
+                    Ok(Bytes::from(response))
+                }),
+            ],
+            213,
+            false,
+        );
+        let client = custom_client(transport, level, None);
+        let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+        assert!(
+            matches!(
+                response.metadata.decode_anomalies.as_slice(),
+                [
+                    async_snmp::DecodeAnomaly::SignedIntegerTruncation {
+                        encoded_length: 5,
+                        ..
+                    },
+                    async_snmp::DecodeAnomaly::TrailingBytes {
+                        original_length: 2,
+                        canonical_length: 0,
+                    }
+                ]
+            ),
+            "level {level:?}: {:?}",
+            response.metadata.decode_anomalies
+        );
     }
 }
 
@@ -1041,6 +1116,247 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
 }
 
 #[tokio::test]
+async fn v3_exchange_metadata_aggregates_discovery_correction_and_final_response() {
+    let level = SecurityLevel::AuthPriv;
+    let engine = engine_for(level);
+    let discovery_engine = engine.clone();
+    let correction_engine = engine.clone();
+    let response_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine,
+        vec![
+            ScriptStep::reply(move |request| {
+                let response = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?;
+                let mut response = response.to_vec();
+                response.push(0xa1);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::reply(move |request| {
+                let response = V3ReplyBuilder::report_to(
+                    request,
+                    &correction_engine,
+                    report_oids::not_in_time_windows(),
+                    2,
+                )
+                .security_level(SecurityLevel::AuthNoPriv)
+                .engine_boots(8)
+                .engine_time(10)
+                .build()?;
+                let mut response = response.to_vec();
+                response.extend_from_slice(&[0xa2, 0xa2]);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::reply(move |request| {
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                let response = V3ReplyBuilder::response_to(request, &response_engine)
+                    .engine_boots(8)
+                    .engine_time(10)
+                    .varbinds(vec![VarBind::new(oid, Value::Integer(7))])
+                    .build()?;
+                let mut response = response.to_vec();
+                response.extend_from_slice(&[0xa3, 0xa3, 0xa3]);
+                Ok(Bytes::from(response))
+            }),
+        ],
+        211,
+        false,
+    );
+    let client = custom_client(transport, level, None);
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    assert_eq!(
+        response.metadata.decode_anomalies,
+        [1, 2, 3]
+            .into_iter()
+            .map(|original_length| async_snmp::DecodeAnomaly::TrailingBytes {
+                original_length,
+                canonical_length: 0,
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn v3_exchange_errors_retain_discovery_and_correction_metadata() {
+    let level = SecurityLevel::AuthNoPriv;
+
+    let timeout_engine = engine_for(level);
+    let timeout_discovery_engine = timeout_engine.clone();
+    let timeout_correction_engine = timeout_engine.clone();
+    let timeout_transport = ScriptedTransport::new(
+        timeout_engine,
+        vec![
+            ScriptStep::reply(move |request| {
+                let mut response = V3ReplyBuilder::report_to(
+                    request,
+                    &timeout_discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?
+                .to_vec();
+                response.push(0xa1);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::reply(move |request| {
+                let mut response = V3ReplyBuilder::report_to(
+                    request,
+                    &timeout_correction_engine,
+                    report_oids::not_in_time_windows(),
+                    2,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(10)
+                .build()?
+                .to_vec();
+                response.extend_from_slice(&[0xa2, 0xa2]);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::silence(),
+        ],
+        401,
+        true,
+    );
+    let timeout_error = custom_client(timeout_transport, level, None)
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(timeout_error.kind(), async_snmp::ErrorKind::Timeout);
+    assert!(matches!(
+        timeout_error.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
+    assert_eq!(trailing_lengths(&timeout_error), [1, 2]);
+
+    let transport_engine = engine_for(level);
+    let transport_discovery_engine = transport_engine.clone();
+    let transport = ScriptedTransport::new(
+        transport_engine,
+        vec![
+            ScriptStep::reply(move |request| {
+                let mut response = V3ReplyBuilder::report_to(
+                    request,
+                    &transport_discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?
+                .to_vec();
+                response.push(0xb1);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::transport_error(async_snmp::Error::Closed {
+                target: "127.0.0.1:161".parse().unwrap(),
+            }),
+        ],
+        411,
+        true,
+    );
+    let transport_error = custom_client(transport, level, None)
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(transport_error.kind(), async_snmp::ErrorKind::Closed);
+    assert!(matches!(
+        transport_error.exchange_source(),
+        async_snmp::Error::Closed { .. }
+    ));
+    assert_eq!(trailing_lengths(&transport_error), [1]);
+
+    let local_engine = engine_for(level);
+    let local_discovery_engine = local_engine.clone();
+    let local_transport = ScriptedTransport::new(
+        local_engine,
+        vec![ScriptStep::reply(move |request| {
+            let mut response = V3ReplyBuilder::report_to(
+                request,
+                &local_discovery_engine,
+                report_oids::unknown_engine_ids(),
+                1,
+            )
+            .msg_max_size(484)
+            .build()?
+            .to_vec();
+            response.push(0xc1);
+            Ok(Bytes::from(response))
+        })],
+        421,
+        true,
+    );
+    let local_error = custom_client(local_transport, level, None)
+        .set(
+            &oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+            Value::OctetString(Bytes::from(vec![0; 1_024])),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        local_error.kind(),
+        async_snmp::ErrorKind::OutboundMessageTooLarge
+    );
+    assert!(matches!(
+        local_error.exchange_source(),
+        async_snmp::Error::OutboundMessageTooLarge { .. }
+    ));
+    assert_eq!(trailing_lengths(&local_error), [1]);
+}
+
+#[tokio::test]
+async fn v3_exchange_error_excludes_rejected_candidate_metadata() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let discovery_engine = engine.clone();
+    let transport = ScriptedTransport::new(
+        engine,
+        vec![
+            ScriptStep::replies(move |request| {
+                let mut rejected = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .msg_id(request.global_data.msg_id() + 1)
+                .build()?
+                .to_vec();
+                rejected.extend_from_slice(&[0xd9; 9]);
+
+                let mut accepted = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?
+                .to_vec();
+                accepted.push(0xd1);
+                Ok(vec![Bytes::from(rejected), Bytes::from(accepted)])
+            }),
+            ScriptStep::transport_error(async_snmp::Error::Closed {
+                target: "127.0.0.1:161".parse().unwrap(),
+            }),
+        ],
+        431,
+        true,
+    );
+    let error = custom_client(transport, level, None)
+        .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), async_snmp::ErrorKind::Closed);
+    assert_eq!(trailing_lengths(&error), [1]);
+}
+
+#[tokio::test]
 async fn v3_unauthenticated_time_report_compatibility_is_explicit() {
     let level = SecurityLevel::AuthNoPriv;
     let engine = engine_for(level);
@@ -1382,22 +1698,28 @@ async fn v3_repeated_unauthenticated_time_report_is_typed_and_bounded() {
         vec![
             discovery_step(engine),
             ScriptStep::reply(move |request| {
-                V3ReplyBuilder::report_to(
+                let report = V3ReplyBuilder::report_to(
                     request,
                     &first_report_engine,
                     report_oids::not_in_time_windows(),
                     4,
                 )
-                .build()
+                .build()?;
+                let mut report = report.to_vec();
+                report.push(0xb1);
+                Ok(Bytes::from(report))
             }),
             ScriptStep::reply(move |request| {
-                V3ReplyBuilder::report_to(
+                let report = V3ReplyBuilder::report_to(
                     request,
                     &second_report_engine,
                     report_oids::not_in_time_windows(),
                     5,
                 )
-                .build()
+                .build()?;
+                let mut report = report.to_vec();
+                report.extend_from_slice(&[0xb2, 0xb2]);
+                Ok(Bytes::from(report))
             }),
         ],
         187,
@@ -1412,8 +1734,18 @@ async fn v3_repeated_unauthenticated_time_report_is_typed_and_bounded() {
         .unwrap_err();
     assert!(matches!(
         &*err,
-        async_snmp::Error::Report { status, .. }
+        async_snmp::Error::Report { status, metadata, .. }
             if matches!(status.as_ref(), ReportStatus::NotInTimeWindow { counter: 5 })
+                && metadata.decode_anomalies == vec![
+                    async_snmp::DecodeAnomaly::TrailingBytes {
+                        original_length: 1,
+                        canonical_length: 0,
+                    },
+                    async_snmp::DecodeAnomaly::TrailingBytes {
+                        original_length: 2,
+                        canonical_length: 0,
+                    },
+                ]
     ));
     assert_eq!(log.len(), 3, "only one compatibility packet is allowed");
 }

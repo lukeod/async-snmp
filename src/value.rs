@@ -1138,6 +1138,7 @@ impl Value {
         decoder: &mut Decoder,
         len: usize,
         exception_type: &'static str,
+        exception_kind: crate::compatibility::ExceptionKind,
         value: Self,
     ) -> Result<Self> {
         if len == 0 {
@@ -1148,6 +1149,13 @@ impl Value {
         }
         let _ = decoder.read_bytes(len)?;
         tracing::warn!(target: "async_snmp::value", anomaly = "malformed_exception_payload", exception_type, payload_length = len, "discarded non-empty exception payload");
+        decoder.record_anomaly(
+            crate::compatibility::DecodeAnomaly::MalformedExceptionPayload {
+                kind: exception_kind,
+                original_length: len,
+                canonical_length: 0,
+            },
+        );
         Ok(value)
     }
 
@@ -1174,6 +1182,13 @@ impl Value {
                         }));
                     }
                     tracing::warn!(target: "async_snmp::value", anomaly = "bounded_string_clamp", value_type = "octet_string", snmp.offset = decoder.offset(), declared_length = len, available_length = available, "clamped value length to enclosing varbind boundary");
+                    decoder.record_anomaly(
+                        crate::compatibility::DecodeAnomaly::BoundedStringClamp {
+                            kind: crate::compatibility::BoundedStringKind::OctetString,
+                            declared_length: len,
+                            canonical_length: available,
+                        },
+                    );
                     available
                 } else {
                     len
@@ -1224,6 +1239,13 @@ impl Value {
                         }));
                     }
                     tracing::warn!(target: "async_snmp::value", anomaly = "bounded_string_clamp", value_type = "opaque", snmp.offset = decoder.offset(), declared_length = len, available_length = available, "clamped value length to enclosing varbind boundary");
+                    decoder.record_anomaly(
+                        crate::compatibility::DecodeAnomaly::BoundedStringClamp {
+                            kind: crate::compatibility::BoundedStringKind::Opaque,
+                            declared_length: len,
+                            canonical_length: available,
+                        },
+                    );
                     available
                 } else {
                     len
@@ -1243,15 +1265,27 @@ impl Value {
                 let value = decoder.read_unsigned32_value(len)?;
                 Ok(Value::UInteger32(value))
             }
-            tag::context::NO_SUCH_OBJECT => {
-                Self::decode_exception(decoder, len, "no_such_object", Value::NoSuchObject)
-            }
-            tag::context::NO_SUCH_INSTANCE => {
-                Self::decode_exception(decoder, len, "no_such_instance", Value::NoSuchInstance)
-            }
-            tag::context::END_OF_MIB_VIEW => {
-                Self::decode_exception(decoder, len, "end_of_mib_view", Value::EndOfMibView)
-            }
+            tag::context::NO_SUCH_OBJECT => Self::decode_exception(
+                decoder,
+                len,
+                "no_such_object",
+                crate::compatibility::ExceptionKind::NoSuchObject,
+                Value::NoSuchObject,
+            ),
+            tag::context::NO_SUCH_INSTANCE => Self::decode_exception(
+                decoder,
+                len,
+                "no_such_instance",
+                crate::compatibility::ExceptionKind::NoSuchInstance,
+                Value::NoSuchInstance,
+            ),
+            tag::context::END_OF_MIB_VIEW => Self::decode_exception(
+                decoder,
+                len,
+                "end_of_mib_view",
+                crate::compatibility::ExceptionKind::EndOfMibView,
+                Value::EndOfMibView,
+            ),
             // Reject constructed OCTET STRING (0x24).
             // Net-snmp documents but does not parse constructed form; we follow suit.
             tag::universal::OCTET_STRING_CONSTRUCTED => {

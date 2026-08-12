@@ -12,7 +12,8 @@ pub use auth::{Auth, CommunityVersion};
 pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target};
 pub use chunks::{FixedCardinalityChunk, FixedCardinalityChunkError, FixedCardinalityChunkStream};
 pub use response_shape::{
-    FixedCardinalityOperation, FixedCardinalityResponse, ResponseShapeAnomaly, ResponseShapePolicy,
+    BulkResponse, FixedCardinalityOperation, FixedCardinalityResponse, ResponseMetadata,
+    ResponseShapeAnomaly, ResponseShapePolicy,
 };
 pub use retry::{Retry, RetryBuilder, RetryConfigError};
 
@@ -92,7 +93,10 @@ pub use crate::v3::DerivedKeys;
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 use crate::v3::DerivedKeys;
 pub use crate::v3::UsmConfig;
-pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
+pub use walk::{
+    BulkWalk, BulkWalkWithMetadata, OidOrdering, Walk, WalkCollection, WalkError, WalkItem,
+    WalkMode, WalkStream, WalkStreamWithMetadata, WalkWithMetadata,
+};
 
 // ============================================================================
 // Shared helpers
@@ -102,7 +106,11 @@ pub use walk::{BulkWalk, OidOrdering, Walk, WalkMode, WalkStream};
 ///
 /// Returns `Some(err)` if the PDU carries an SNMP error status, `None` otherwise.
 /// The `error_index` field is 1-based; 0 means the error applies to the whole PDU.
-pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Error>> {
+pub(crate) fn pdu_to_snmp_error(
+    pdu: &Pdu,
+    target: SocketAddr,
+    metadata: ResponseMetadata,
+) -> Option<Box<Error>> {
     if !pdu.is_error() {
         return None;
     }
@@ -110,13 +118,14 @@ pub(crate) fn pdu_to_snmp_error(pdu: &Pdu, target: SocketAddr) -> Option<Box<Err
     let oid = (pdu.error_index() as usize)
         .checked_sub(1)
         .and_then(|idx| pdu.varbinds.get(idx))
-        .map(|vb| vb.oid.clone());
+        .map(|vb| Box::new(vb.oid.clone()));
     Some(
         Error::Snmp {
             target,
             status,
             index: pdu.error_index().try_into().unwrap_or(0),
             oid,
+            metadata: Box::new(metadata),
         }
         .boxed(),
     )
@@ -147,6 +156,12 @@ pub const DEFAULT_MAX_REPETITIONS: u32 = 25;
 /// Generic over transport type, with `UdpHandle` as default.
 pub struct Client<T: Transport = UdpHandle> {
     inner: Arc<ClientInner<T>>,
+}
+
+#[derive(Debug)]
+pub(super) struct DecodedResponse {
+    pub(super) pdu: Pdu,
+    pub(super) decode_anomalies: Vec<crate::DecodeAnomaly>,
 }
 
 impl<T: Transport> Clone for Client<T> {
@@ -468,7 +483,7 @@ impl<T: Transport> Client<T> {
             snmp.elapsed_ms = tracing::field::Empty,
         )
     )]
-    async fn send_and_recv(&self, request_id: i32, data: &[u8]) -> Result<Pdu> {
+    async fn send_and_recv(&self, request_id: i32, data: &[u8]) -> Result<DecodedResponse> {
         self.enforce_outbound_size(data.len(), None)?;
         let start = Instant::now();
         let mut last_error: Option<Box<Error>> = None;
@@ -545,18 +560,25 @@ impl<T: Transport> Client<T> {
                     {
                         return Ok(Candidate::Reject);
                     }
-                    Ok(Candidate::Accept(response_pdu))
+                    Ok(Candidate::Accept(DecodedResponse {
+                        pdu: response_pdu,
+                        decode_anomalies: decoded.anomalies,
+                    }))
                 })
                 .await
             {
-                Ok(response_pdu) => {
-                    if let Some(err) = pdu_to_snmp_error(&response_pdu, self.peer_addr()) {
+                Ok(response) => {
+                    if let Some(err) = pdu_to_snmp_error(
+                        &response.pdu,
+                        self.peer_addr(),
+                        ResponseMetadata::from_decode_anomalies(response.decode_anomalies.clone()),
+                    ) {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                         return Err(err);
                     }
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
-                    return Ok(response_pdu);
+                    return Ok(response);
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
                     last_error = Some(e);
@@ -595,7 +617,7 @@ impl<T: Transport> Client<T> {
     }
 
     /// Send a standard request (GET, GETNEXT, SET) and wait for response.
-    async fn send_request(&self, pdu: Pdu) -> Result<Pdu> {
+    async fn send_request(&self, pdu: Pdu) -> Result<DecodedResponse> {
         // Dispatch to V3 handler if configured
         if self.is_v3() {
             return self.send_v3_and_recv(pdu).await;
@@ -612,7 +634,7 @@ impl<T: Transport> Client<T> {
         let data = message.encode()?;
         let response = self.send_and_recv(request_id, &data).await?;
 
-        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu_type(), snmp.varbind_count = response.varbinds.len(), snmp.error_status = response.error_status(), snmp.error_index = response.error_index() }, "received {} response", response.pdu_type());
+        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu.pdu_type(), snmp.varbind_count = response.pdu.varbinds.len(), snmp.error_status = response.pdu.error_status(), snmp.error_index = response.pdu.error_index() }, "received {} response", response.pdu.pdu_type());
 
         Ok(response)
     }
@@ -642,12 +664,14 @@ impl<T: Transport> Client<T> {
         let request_id = self.next_request_id();
         let pdu = Pdu::get_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
-        self.apply_response_shape_policy(classify(
+        let mut classified = classify(
             RequestShape::Get(std::slice::from_ref(oid)),
-            response.varbinds,
+            response.pdu.varbinds,
             0,
             0,
-        ))
+        );
+        classified.metadata.decode_anomalies = response.decode_anomalies;
+        self.apply_response_shape_policy(classified)
     }
 
     /// GET multiple OIDs.
@@ -708,12 +732,14 @@ impl<T: Transport> Client<T> {
         let request_id = self.next_request_id();
         let pdu = Pdu::get_next_request(request_id, std::slice::from_ref(oid));
         let response = self.send_request(pdu).await?;
-        self.apply_response_shape_policy(classify(
+        let mut classified = classify(
             RequestShape::GetNext(std::slice::from_ref(oid)),
-            response.varbinds,
+            response.pdu.varbinds,
             0,
             0,
-        ))
+        );
+        classified.metadata.decode_anomalies = response.decode_anomalies;
+        self.apply_response_shape_policy(classified)
     }
 
     /// GETNEXT for multiple OIDs.
@@ -762,12 +788,9 @@ impl<T: Transport> Client<T> {
             vec![VarBind::new(requested[0].0.clone(), requested[0].1.clone())],
         );
         let response = self.send_request(pdu).await?;
-        self.apply_response_shape_policy(classify(
-            RequestShape::Set(&requested),
-            response.varbinds,
-            0,
-            0,
-        ))
+        let mut classified = classify(RequestShape::Set(&requested), response.pdu.varbinds, 0, 0);
+        classified.metadata.decode_anomalies = response.decode_anomalies;
+        self.apply_response_shape_policy(classified)
     }
 
     /// SET multiple OIDs in a single atomic PDU.
@@ -825,12 +848,9 @@ impl<T: Transport> Client<T> {
             .collect();
         let pdu = Pdu::set_request(request_id, vbs);
         let response = self.send_request(pdu).await?;
-        self.apply_response_shape_policy(classify(
-            RequestShape::Set(varbinds),
-            response.varbinds,
-            0,
-            0,
-        ))
+        let mut classified = classify(RequestShape::Set(varbinds), response.pdu.varbinds, 0, 0);
+        classified.metadata.decode_anomalies = response.decode_anomalies;
+        self.apply_response_shape_policy(classified)
     }
 
     /// Send a trap (fire-and-forget).
@@ -968,6 +988,9 @@ impl<T: Transport> Client<T> {
     /// * `trap_oid` - The trap OID (snmpTrapOID.0 value)
     /// * `uptime` - sysUpTime.0 value in hundredths of seconds
     /// * `varbinds` - Additional variable bindings (appended after the prefix)
+    ///
+    /// This convenience method intentionally discards accepted wire-deviation
+    /// metadata. Use [`Self::send_inform_with_metadata`] when it is needed.
     #[instrument(skip(self, varbinds), err, fields(snmp.target = %self.peer_addr(), snmp.trap_oid = %trap_oid))]
     pub async fn send_inform(
         &self,
@@ -975,6 +998,20 @@ impl<T: Transport> Client<T> {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> Result<()> {
+        self.send_inform_with_metadata(trap_oid, uptime, varbinds)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send an Inform and retain metadata from discovery, correction Reports,
+    /// and the acknowledgement in exchange order.
+    #[instrument(skip(self, varbinds), err, fields(snmp.target = %self.peer_addr(), snmp.trap_oid = %trap_oid))]
+    pub async fn send_inform_with_metadata(
+        &self,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> Result<ResponseMetadata> {
         if self.inner.config.version() == Version::V1 {
             return Err(Error::Config("v1 inform sending not supported".into()).boxed());
         }
@@ -983,13 +1020,17 @@ impl<T: Transport> Client<T> {
         let pdu = Pdu::inform_request(request_id, uptime, trap_oid, varbinds);
         let expected_varbinds = pdu.varbinds.clone();
         let response = self.send_request(pdu).await?;
-        if response.varbinds != expected_varbinds {
+        if response.pdu.varbinds != expected_varbinds {
+            let metadata = ResponseMetadata::from_decode_anomalies(response.decode_anomalies);
             return Err(Error::MalformedResponse {
                 target: self.peer_addr(),
             }
-            .boxed());
+            .boxed()
+            .with_prior_response_metadata(&metadata));
         }
-        Ok(())
+        Ok(ResponseMetadata::from_decode_anomalies(
+            response.decode_anomalies,
+        ))
     }
 
     /// GETBULK request (SNMPv2c/v3 only).
@@ -1032,6 +1073,10 @@ impl<T: Transport> Client<T> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// This convenience method discards accepted response metadata. Use
+    /// [`Self::get_bulk_with_metadata`] when compatibility deviations must be
+    /// retained.
     #[instrument(skip(self, oids), err, fields(
         snmp.target = %self.peer_addr(),
         snmp.oid_count = oids.len(),
@@ -1044,6 +1089,19 @@ impl<T: Transport> Client<T> {
         non_repeaters: u32,
         max_repetitions: u32,
     ) -> Result<Vec<VarBind>> {
+        Ok(self
+            .get_bulk_with_metadata(oids, non_repeaters, max_repetitions)
+            .await?
+            .varbinds)
+    }
+
+    /// GETBULK with accepted wire deviations retained as response metadata.
+    pub async fn get_bulk_with_metadata(
+        &self,
+        oids: &[Oid],
+        non_repeaters: u32,
+        max_repetitions: u32,
+    ) -> Result<BulkResponse> {
         Pdu::checked_get_bulk_fields(non_repeaters, max_repetitions)?;
         let request_id = self.next_request_id();
         let pdu = Pdu::get_bulk(
@@ -1053,7 +1111,12 @@ impl<T: Transport> Client<T> {
             oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
         )?;
         let response = self.send_request(pdu).await?;
-        Ok(response.varbinds)
+        Ok(BulkResponse {
+            varbinds: response.pdu.varbinds,
+            metadata: ResponseMetadata {
+                decode_anomalies: response.decode_anomalies,
+            },
+        })
     }
 
     /// Walk an OID subtree.
@@ -1064,6 +1127,8 @@ impl<T: Transport> Client<T> {
     /// - `WalkMode::GetBulk`: Always uses GETBULK (fails on V1)
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
+    /// This convenience stream intentionally discards decode metadata; use
+    /// [`Self::walk_with_metadata`] to retain it.
     /// The walk terminates when an OID outside the subtree is encountered or
     /// when `EndOfMibView` is returned. All consumption methods observe this same
     /// GETNEXT/GETBULK sequence. A scalar instance OID is not retrieved as a
@@ -1110,12 +1175,22 @@ impl<T: Transport> Client<T> {
         )
     }
 
+    /// Auto-selected walk retaining per-item and aggregate decode metadata.
+    pub fn walk_with_metadata(&self, oid: Oid) -> Result<WalkStreamWithMetadata<T>>
+    where
+        T: 'static,
+    {
+        self.walk(oid).map(WalkStreamWithMetadata::new)
+    }
+
     /// Walk an OID subtree using GETNEXT.
     ///
     /// This method always uses GETNEXT regardless of the client's `WalkMode` configuration.
     /// For auto-selection based on version and mode, use [`walk()`](Self::walk) instead.
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
+    /// This convenience stream intentionally discards decode metadata; use
+    /// [`Self::walk_getnext_with_metadata`] to retain it.
     /// The walk terminates when an OID outside the subtree is encountered or
     /// when `EndOfMibView` is returned. All consumption methods observe this same
     /// GETNEXT sequence. A scalar instance OID is not retrieved as a fallback;
@@ -1148,9 +1223,19 @@ impl<T: Transport> Client<T> {
         Walk::new(self.clone(), oid, ordering, max_results)
     }
 
+    /// GETNEXT walk retaining per-item and aggregate decode metadata.
+    pub fn walk_getnext_with_metadata(&self, oid: Oid) -> WalkWithMetadata<T>
+    where
+        T: 'static,
+    {
+        WalkWithMetadata::new(self.walk_getnext(oid))
+    }
+
     /// Walk an OID subtree using GETBULK (more efficient than GETNEXT).
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
+    /// This convenience stream intentionally discards decode metadata; use
+    /// [`Self::bulk_walk_with_metadata`] to retain it.
     /// Uses GETBULK internally with `non_repeaters=0`, fetching `max_repetitions`
     /// values per request for efficient table traversal. All consumption methods
     /// observe this same GETBULK sequence. A scalar instance OID is not retrieved
@@ -1194,6 +1279,19 @@ impl<T: Transport> Client<T> {
         let ordering = self.inner.config.oid_ordering;
         let max_results = self.inner.config.max_walk_results;
         BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
+    }
+
+    /// GETBULK walk retaining per-item and aggregate decode metadata.
+    pub fn bulk_walk_with_metadata(
+        &self,
+        oid: Oid,
+        max_repetitions: u32,
+    ) -> Result<BulkWalkWithMetadata<T>>
+    where
+        T: 'static,
+    {
+        self.bulk_walk(oid, max_repetitions)
+            .map(BulkWalkWithMetadata::new)
     }
 
     /// Walk an OID subtree using the client's configured `max_repetitions`.
@@ -2480,6 +2578,119 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[derive(Clone)]
+    struct InformMetadataTransport {
+        pending: Arc<Mutex<VecDeque<Pdu>>>,
+        malformed_echo: bool,
+    }
+
+    impl Transport for InformMetadataTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let message = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            self.pending
+                .lock()
+                .unwrap()
+                .push_back(message.pdu().standard().unwrap().clone());
+            async { Ok(()) }
+        }
+
+        fn recv(
+            &self,
+            _registration: crate::transport::RequestRegistration,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            let request = self.pending.lock().unwrap().pop_front().unwrap();
+            let malformed_echo = self.malformed_echo;
+            async move {
+                let mut varbinds = request.varbinds;
+                if malformed_echo {
+                    varbinds.pop();
+                }
+                let response = Pdu::response(request.request_id, 0, 0, varbinds);
+                let message =
+                    CommunityMessage::v2c(Bytes::from_static(b"public"), response).unwrap();
+                let mut encoded = message.encode().unwrap().to_vec();
+                encoded.extend_from_slice(&[0xaa, 0xbb]);
+                Ok((Bytes::from(encoded), "127.0.0.1:161".parse().unwrap()))
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn inform_metadata_api_retains_acknowledgement_anomalies() {
+        let client = Client::new(
+            InformMetadataTransport {
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+                malformed_echo: false,
+            },
+            ClientConfig {
+                auth: crate::Auth::v2c("public"),
+                retry: Retry::none(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let metadata = client
+            .send_inform_with_metadata(
+                &Oid::from_slice(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                123,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.decode_anomalies,
+            vec![crate::DecodeAnomaly::TrailingBytes {
+                original_length: 2,
+                canonical_length: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_inform_acknowledgement_retains_decode_anomalies() {
+        let client = Client::new(
+            InformMetadataTransport {
+                pending: Arc::new(Mutex::new(VecDeque::new())),
+                malformed_echo: true,
+            },
+            ClientConfig {
+                auth: crate::Auth::v2c("public"),
+                retry: Retry::none(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = client
+            .send_inform_with_metadata(
+                &Oid::from_slice(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                123,
+                vec![],
+            )
+            .await
+            .expect_err("a malformed acknowledgement must be rejected");
+
+        assert_eq!(error.kind(), crate::ErrorKind::MalformedResponse);
+        assert_eq!(
+            error.response_metadata().unwrap().decode_anomalies,
+            vec![crate::DecodeAnomaly::TrailingBytes {
+                original_length: 2,
+                canonical_length: 0,
+            }]
+        );
     }
 
     #[tokio::test]

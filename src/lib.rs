@@ -407,8 +407,9 @@
 //!
 //! [`CompatibilityPolicy`] contains six controls.
 //! [`CompatibilityPolicy::DEFAULT`] enables the first five listed below and
-//! leaves malformed exception payloads disabled. Every accepted deviation emits
-//! a tracing warning with a stable `anomaly` field.
+//! leaves malformed exception payloads disabled. Every accepted deviation is
+//! returned as a typed [`DecodeAnomaly`] in [`message::DecodeOutcome::anomalies`]
+//! and emits a tracing warning with a stable `anomaly` field.
 //! [`CompatibilityPolicy::STRICT`] disables all six controls.
 //!
 //! | `CompatibilityPolicy` field | Default | Scope and boundary |
@@ -429,7 +430,7 @@
 //!
 //! | Control | Default | Scope, tradeoff, and observation |
 //! |---|---|---|
-//! | [`message::DecodePolicy`] | `Compatible` | Accepts only bytes after a fully consumed top-level message TLV. The outcome records their count and a stable `trailing_bytes` warning is emitted; `Strict` rejects them. [`ClientBuilder::decode_policy`] applies the same selection to transport correlation and full client decoding. Both modes reject unconsumed fields inside the declared envelope. TCP frames one declared TLV at a time, so adjacent stream messages are not suffixes. |
+//! | [`message::DecodePolicy`] | `Compatible` | Accepts only bytes after a fully consumed top-level message TLV. The outcome appends [`DecodeAnomaly::TrailingBytes`] and a stable `trailing_bytes` warning is emitted; `Strict` rejects them. [`ClientBuilder::decode_policy`] applies the same selection to transport correlation and full client decoding. Both modes reject unconsumed fields inside the declared envelope. TCP frames one declared TLV at a time, so adjacent stream messages are not suffixes. |
 //! | [`ResponseShapePolicy`] | `Compatible` | Fixed-cardinality operations preserve all received varbinds and return bounded anomalies for count, OID, successor, or SET-echo problems. `Strict` returns [`Error::ResponseShape`] with the same data and diagnostics. |
 //! | [`NotificationVarbindValidation`] | `Tolerant` | V2c/v3 TrapV2 and Inform prefixes may use non-standard names, but still require `TimeTicks` then `ObjectIdentifier` values. `Strict` also requires the RFC names and order. Rejected notifications are dropped, rejected Informs are not acknowledged, and validation failures are traced. |
 //! | [`WalkMode`], [`OidOrdering`], and walk limits | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires [`ClientBuilder::max_walk_results`] to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
@@ -444,6 +445,24 @@
 //! anomaly counter for every policy above; malformed-input acceptance,
 //! correlation decisions, and protocol corrections are observed through their
 //! tracing events or returned diagnostics as documented.
+//!
+//! Network clients retain decode anomalies in [`ResponseMetadata`], ordered by
+//! accepted message within an exchange (v3 discovery, correction Reports, then
+//! the final response). Within a v3 message the deterministic logical order is
+//! outer header/security fields, plaintext or decrypted scoped-PDU fields, and
+//! finally a top-level datagram suffix. Response-derived [`Error::Snmp`] and
+//! [`Error::Report`] carry the same metadata; local transport, configuration,
+//! and construction errors do not synthesize response metadata.
+//!
+//! Fixed GET/GETNEXT/SET responses expose metadata through
+//! [`FixedCardinalityResponse::metadata`]; GETBULK and Inform callers use
+//! [`Client::get_bulk_with_metadata`] and [`Client::send_inform_with_metadata`].
+//! Metadata-preserving walk streams expose per-item anomalies exactly once and
+//! a cumulative [`WalkCollection::metadata`] that also includes non-yielding
+//! terminal responses. The shorter Inform and walk methods intentionally
+//! discard this metadata. Notification acceptance policies receive
+//! it through [`NotificationMetadata::decode_anomalies`], and delivered
+//! notifications retain it through [`Notification::decode_anomalies`].
 //!
 //! ### Strict low-level inspection and client controls
 //!
@@ -555,15 +574,18 @@ pub use agent::{
     VacmBuilder, VacmConfig, VacmSecurityModel, View,
 };
 pub use client::{
-    Auth, BulkWalk, Client, ClientBuilder, ClientConfig, CommunityVersion,
-    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
+    Auth, BulkResponse, BulkWalk, BulkWalkWithMetadata, Client, ClientBuilder, ClientConfig,
+    CommunityVersion, DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST,
+    DEFAULT_MAX_REPETITIONS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
     FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
-    FixedCardinalityResponse, OidOrdering, ResponseShapeAnomaly, ResponseShapePolicy, Retry,
-    RetryBuilder, RetryConfigError, Target, Walk, WalkMode, WalkStream,
+    FixedCardinalityResponse, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
+    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk, WalkCollection,
+    WalkError, WalkItem, WalkMode, WalkStream, WalkStreamWithMetadata, WalkWithMetadata,
 };
 pub use community::Community;
-pub use compatibility::CompatibilityPolicy;
+pub use compatibility::{
+    BoundedStringKind, CompatibilityPolicy, DecodeAnomaly, ExceptionKind, GetBulkField,
+};
 pub use error::{
     ConstructionStage, DecodeError, DecodeErrorKind, DecodeErrorOrigin, Error, ErrorKind,
     ErrorStatus, Result, WalkAbortReason,

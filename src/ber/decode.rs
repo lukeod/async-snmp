@@ -2,27 +2,29 @@
 //!
 //! Zero-copy decoding using `Bytes` to avoid allocations.
 
+use std::cell::RefCell;
 use std::net::SocketAddr;
 
 use super::length::decode_length_with_origin;
 use super::tag;
-use crate::compatibility::CompatibilityPolicy;
+use crate::compatibility::{CompatibilityPolicy, DecodeAnomaly};
 use crate::error::internal::{DecodeErrorKind, DecodeErrorOrigin};
 use crate::error::{DecodeError, Error, Result};
 use crate::oid::Oid;
 use bytes::Bytes;
 
 /// BER decoder that reads from a byte buffer.
-pub struct Decoder {
+pub struct Decoder<'a> {
     data: Bytes,
     offset: usize,
     base_offset: usize,
     origin: DecodeErrorOrigin,
     peer: Option<SocketAddr>,
     compatibility: CompatibilityPolicy,
+    anomalies: Option<&'a RefCell<Vec<DecodeAnomaly>>>,
 }
 
-impl Decoder {
+impl Decoder<'static> {
     /// Create a new decoder from bytes.
     pub fn new(data: Bytes) -> Self {
         Self {
@@ -32,6 +34,7 @@ impl Decoder {
             origin: DecodeErrorOrigin::Packet,
             peer: None,
             compatibility: CompatibilityPolicy::default(),
+            anomalies: None,
         }
     }
 
@@ -61,7 +64,58 @@ impl Decoder {
             origin,
             peer,
             compatibility: CompatibilityPolicy::default(),
+            anomalies: None,
         }
+    }
+
+    /// Create a decoder from a byte slice (copies the data).
+    #[must_use]
+    pub fn from_slice(data: &[u8]) -> Self {
+        Self::new(Bytes::copy_from_slice(data))
+    }
+}
+
+impl<'a> Decoder<'a> {
+    pub(crate) fn with_anomaly_sink<'b>(
+        self,
+        anomalies: &'b RefCell<Vec<DecodeAnomaly>>,
+    ) -> Decoder<'b> {
+        Decoder {
+            data: self.data,
+            offset: self.offset,
+            base_offset: self.base_offset,
+            origin: self.origin,
+            peer: self.peer,
+            compatibility: self.compatibility,
+            anomalies: Some(anomalies),
+        }
+    }
+
+    pub(crate) fn record_anomaly(&self, anomaly: DecodeAnomaly) {
+        if let Some(anomalies) = self.anomalies {
+            anomalies.borrow_mut().push(anomaly);
+        }
+    }
+
+    pub(crate) fn decoder_for(
+        &self,
+        data: Bytes,
+        base_offset: usize,
+        origin: DecodeErrorOrigin,
+    ) -> Decoder<'a> {
+        Decoder {
+            data,
+            offset: 0,
+            base_offset,
+            origin,
+            peer: self.peer,
+            compatibility: self.compatibility,
+            anomalies: self.anomalies,
+        }
+    }
+
+    pub(crate) fn decoder_for_same_origin(&self, data: Bytes, base_offset: usize) -> Decoder<'a> {
+        self.decoder_for(data, base_offset, self.origin)
     }
 
     /// Apply an explicit malformed-input compatibility policy.
@@ -75,12 +129,6 @@ impl Decoder {
     #[must_use]
     pub fn compatibility_policy(&self) -> CompatibilityPolicy {
         self.compatibility
-    }
-
-    /// Create a decoder from a byte slice (copies the data).
-    #[must_use]
-    pub fn from_slice(data: &[u8]) -> Self {
-        Self::new(Bytes::copy_from_slice(data))
     }
 
     /// Get the peer address, when decoding at a network boundary.
@@ -255,6 +303,11 @@ impl Decoder {
                 }));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "numeric_truncation", numeric_type = "integer", encoded_length = len, value, normalized = value as i32, "accepted out-of-range generic INTEGER");
+            self.record_anomaly(DecodeAnomaly::SignedIntegerTruncation {
+                encoded_length: len,
+                original: value,
+                canonical: value as i32,
+            });
         }
         Ok(value as i32)
     }
@@ -299,6 +352,10 @@ impl Decoder {
                 return Err(self.malformed(DecodeErrorKind::ZeroLengthInteger));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "empty_counter64", snmp.offset = self.offset, normalized = 0_u64, "accepted zero-length Counter64");
+            self.record_anomaly(DecodeAnomaly::EmptyCounter64 {
+                original_length: 0,
+                canonical: 0,
+            });
             return Ok(0);
         }
         if len > 9 {
@@ -341,6 +398,11 @@ impl Decoder {
                 }));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "numeric_truncation", numeric_type = "unsigned32", encoded_length = len, value, normalized = value as u32, "accepted out-of-range generic Unsigned32");
+            self.record_anomaly(DecodeAnomaly::Unsigned32Truncation {
+                encoded_length: len,
+                original: value,
+                canonical: value as u32,
+            });
         }
 
         Ok(value as u32)
@@ -414,6 +476,10 @@ impl Decoder {
                 return Err(self.malformed(DecodeErrorKind::InvalidOid));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "empty_object_identifier", snmp.offset = self.offset, encoded_length = 0, "accepted zero-length OBJECT IDENTIFIER");
+            self.record_anomaly(DecodeAnomaly::EmptyObjectIdentifier {
+                original_length: 0,
+                canonical_arc_count: 0,
+            });
         }
         let bytes = self.read_bytes(len)?;
         Oid::from_ber(&bytes).map_err(|error| match *error {
@@ -431,12 +497,12 @@ impl Decoder {
     }
 
     /// Read a SEQUENCE, returning a decoder for its contents.
-    pub fn read_sequence(&mut self) -> Result<Decoder> {
+    pub fn read_sequence(&mut self) -> Result<Decoder<'a>> {
         self.read_constructed(tag::universal::SEQUENCE)
     }
 
     /// Read a constructed type with a specific tag, returning a decoder for its contents.
-    pub fn read_constructed(&mut self, expected_tag: u8) -> Result<Decoder> {
+    pub fn read_constructed(&mut self, expected_tag: u8) -> Result<Decoder<'a>> {
         let len = self.expect_tag(expected_tag)?;
         let content_offset = self.base_offset.saturating_add(self.offset);
         let content = self.read_bytes(len)?;
@@ -447,6 +513,7 @@ impl Decoder {
             origin: self.origin,
             peer: self.peer,
             compatibility: self.compatibility,
+            anomalies: self.anomalies,
         })
     }
 
@@ -476,7 +543,7 @@ impl Decoder {
     }
 
     /// Create a sub-decoder for a portion of the remaining data.
-    pub fn sub_decoder(&mut self, len: usize) -> Result<Decoder> {
+    pub fn sub_decoder(&mut self, len: usize) -> Result<Decoder<'a>> {
         let content_offset = self.base_offset.saturating_add(self.offset);
         let content = self.read_bytes(len)?;
         Ok(Decoder {
@@ -486,6 +553,7 @@ impl Decoder {
             origin: self.origin,
             peer: self.peer,
             compatibility: self.compatibility,
+            anomalies: self.anomalies,
         })
     }
 

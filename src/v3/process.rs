@@ -17,8 +17,8 @@ use bytes::Bytes;
 use super::{DerivedKeys, UsmUser};
 use crate::error::{Error, Result};
 use crate::message::{
-    MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel,
-    decode_scoped_pdu_with_consumption,
+    MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, combine_staged_v3_anomalies,
+    decode_scoped_pdu_with_anomalies,
 };
 use crate::message_size::MessageSize;
 use crate::oid::Oid;
@@ -174,6 +174,7 @@ pub(crate) struct V3InboundMessage {
     pub(crate) scoped_pdu: ScopedPdu,
     pub(crate) security_level: SecurityLevel,
     pub(crate) derived_keys: DerivedKeys,
+    pub(crate) decode_anomalies: Vec<crate::DecodeAnomaly>,
 }
 
 /// Outcome of inbound USM processing.
@@ -206,13 +207,13 @@ pub(crate) fn process_v3_inbound(
 ) -> Result<V3Inbound> {
     let source = ctx.source;
 
-    let msg = match RawV3Message::decode_bounded_with_target(
+    let decoded = match RawV3Message::decode_bounded_with_target(
         data.clone(),
         ctx.accepted_receive_size,
         source,
         crate::message::DecodePolicy::Compatible,
     ) {
-        Ok(outcome) => outcome.value,
+        Ok(outcome) => outcome,
         Err(e) => {
             // RFC 3412 Section 7.2.4/7.2.7: invalid msgFlags and unknown
             // security models are counted before the message is discarded.
@@ -230,6 +231,19 @@ pub(crate) fn process_v3_inbound(
             return Err(e);
         }
     };
+    let trailing_bytes = decoded
+        .anomalies
+        .iter()
+        .find_map(|anomaly| match anomaly {
+            crate::DecodeAnomaly::TrailingBytes {
+                original_length, ..
+            } => Some(*original_length),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let authenticated_data = data.slice(..data.len() - trailing_bytes);
+    let mut decode_anomalies = decoded.anomalies;
+    let msg = decoded.value;
     let security_level = msg.global_data.msg_flags.security_level;
     let usm_params = UsmSecurityParams::decode_with_context(
         msg.security_params.clone(),
@@ -328,7 +342,7 @@ pub(crate) fn process_v3_inbound(
             tracing::debug!(target: "async_snmp::v3", { source = %source }, "could not locate authentication parameters");
             return fail(UsmFailure::WrongDigests, None);
         };
-        if !verify_message(auth_key, &data, auth_offset, auth_len)
+        if !verify_message(auth_key, &authenticated_data, auth_offset, auth_len)
             .map_err(|_| Error::Auth { target: source }.boxed())?
         {
             tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "authentication failed");
@@ -419,7 +433,7 @@ pub(crate) fn process_v3_inbound(
     // Parse (and for authPriv decrypt) the scoped PDU only after every
     // security check has passed. The msgData form is tied to the received
     // privacy flag by RawV3Message::decode, so the match is total.
-    let scoped_pdu = match &msg.msg_data {
+    let scoped_outcome = match &msg.msg_data {
         RawMsgData::Encrypted(encrypted_data) => {
             let priv_key = derived_keys
                 .priv_key
@@ -438,12 +452,14 @@ pub(crate) fn process_v3_inbound(
                 }
             };
 
-            decode_scoped_pdu_with_consumption(decrypted, 0, source, Some(priv_key.protocol()))?
+            decode_scoped_pdu_with_anomalies(decrypted, 0, source, Some(priv_key.protocol()))?
         }
         RawMsgData::Plaintext { data, offset } => {
-            decode_scoped_pdu_with_consumption(data.clone(), *offset, source, None)?
+            decode_scoped_pdu_with_anomalies(data.clone(), *offset, source, None)?
         }
     };
+    decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, scoped_outcome.anomalies);
+    let scoped_pdu = scoped_outcome.value;
 
     Ok(V3Inbound::Message(Box::new(V3InboundMessage {
         global_data: msg.global_data,
@@ -451,6 +467,7 @@ pub(crate) fn process_v3_inbound(
         scoped_pdu,
         security_level,
         derived_keys,
+        decode_anomalies,
     })))
 }
 

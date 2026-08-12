@@ -4,6 +4,116 @@
 //! process-global state, and each interoperability deviation can be enabled
 //! independently. Structured outbound encoders always require canonical data.
 
+/// An SNMP exception syntax whose non-empty payload was discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExceptionKind {
+    /// `noSuchObject`.
+    NoSuchObject,
+    /// `noSuchInstance`.
+    NoSuchInstance,
+    /// `endOfMibView`.
+    EndOfMibView,
+}
+
+/// An OCTET STRING-like syntax whose declared length was clamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BoundedStringKind {
+    /// Universal OCTET STRING.
+    OctetString,
+    /// SNMP application Opaque.
+    Opaque,
+}
+
+/// A GETBULK field normalized from a negative wire value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GetBulkField {
+    /// The non-repeaters field.
+    NonRepeaters,
+    /// The max-repetitions field.
+    MaxRepetitions,
+}
+
+/// Observable non-canonical input accepted by compatibility decoding.
+///
+/// Collections preserve deterministic decode-observation order. Variants contain the original and
+/// canonical lengths or values needed to describe the lossy normalization.
+/// They deliberately do not contain offsets: packet-relative positions cannot
+/// describe anomalies found in decrypted scoped-PDU plaintext without a second
+/// coordinate system.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecodeAnomaly {
+    /// An out-of-range generic INTEGER was narrowed to `i32`.
+    SignedIntegerTruncation {
+        /// BER content length.
+        encoded_length: usize,
+        /// Complete decoded wire value.
+        original: i64,
+        /// Public canonical representation.
+        canonical: i32,
+    },
+    /// An out-of-range generic Unsigned32 was narrowed to `u32`.
+    Unsigned32Truncation {
+        /// BER content length.
+        encoded_length: usize,
+        /// Complete decoded wire value.
+        original: u64,
+        /// Public canonical representation.
+        canonical: u32,
+    },
+    /// A zero-length Counter64 was normalized to zero.
+    EmptyCounter64 {
+        /// Wire content length.
+        original_length: usize,
+        /// Canonical numeric value.
+        canonical: u64,
+    },
+    /// A zero-length OBJECT IDENTIFIER was normalized to an empty OID.
+    EmptyObjectIdentifier {
+        /// Wire content length.
+        original_length: usize,
+        /// Number of arcs in the normalized OID.
+        canonical_arc_count: usize,
+    },
+    /// An over-declared bounded string was clamped to its enclosing varbind.
+    BoundedStringClamp {
+        /// String syntax.
+        kind: BoundedStringKind,
+        /// Declared wire length.
+        declared_length: usize,
+        /// Retained content length.
+        canonical_length: usize,
+    },
+    /// A negative GETBULK field was normalized to zero.
+    NegativeGetBulkField {
+        /// Affected field.
+        field: GetBulkField,
+        /// Signed wire value.
+        original: i32,
+        /// Canonical field value.
+        canonical: u32,
+    },
+    /// A non-empty exception payload was discarded.
+    MalformedExceptionPayload {
+        /// Exception syntax.
+        kind: ExceptionKind,
+        /// Wire payload length.
+        original_length: usize,
+        /// Canonical payload length.
+        canonical_length: usize,
+    },
+    /// Bytes after the declared top-level message were discarded.
+    TrailingBytes {
+        /// Packet suffix length.
+        original_length: usize,
+        /// Canonical suffix length.
+        canonical_length: usize,
+    },
+}
+
 /// Policy for known, unambiguous interoperability deviations.
 ///
 /// [`Default`] preserves the established receive behavior except that

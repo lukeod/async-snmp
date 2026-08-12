@@ -560,6 +560,7 @@ impl Pdu {
         }
 
         let len = decoder.read_length()?;
+        let compatibility = decoder.compatibility_policy();
         let mut pdu_decoder = decoder.sub_decoder(len)?;
 
         // These are protocol Integer32 fields, so decode the complete width
@@ -580,13 +581,19 @@ impl Pdu {
                 ("max_repetitions", &mut second_field),
             ] {
                 if *value < 0 {
-                    if !decoder
-                        .compatibility_policy()
-                        .normalize_negative_get_bulk_fields
-                    {
-                        return Err(decoder.malformed(DecodeErrorKind::InvalidValue));
+                    if !compatibility.normalize_negative_get_bulk_fields {
+                        return Err(pdu_decoder.malformed(DecodeErrorKind::InvalidValue));
                     }
                     tracing::warn!(target: "async_snmp::pdu", anomaly = "negative_get_bulk_field", direction = "decode", field, value = *value, normalized = 0, "normalized negative GETBULK field");
+                    pdu_decoder.record_anomaly(crate::DecodeAnomaly::NegativeGetBulkField {
+                        field: match field {
+                            "non_repeaters" => crate::GetBulkField::NonRepeaters,
+                            "max_repetitions" => crate::GetBulkField::MaxRepetitions,
+                            _ => unreachable!("fixed GETBULK field name"),
+                        },
+                        original: *value,
+                        canonical: 0,
+                    });
                     *value = 0;
                 }
             }

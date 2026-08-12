@@ -162,6 +162,13 @@ impl V3RequestLog {
 }
 
 fn encode_raw_scoped_pdu(scoped: &ScopedPdu) -> Result<Bytes, String> {
+    encode_raw_scoped_pdu_with_first_integer(scoped, None)
+}
+
+fn encode_raw_scoped_pdu_with_first_integer(
+    scoped: &ScopedPdu,
+    first_integer_value_content: Option<&[u8]>,
+) -> Result<Bytes, String> {
     let (tag, first_field, second_field) = match scoped.pdu.body {
         PduBody::Standard {
             pdu_type,
@@ -184,8 +191,17 @@ fn encode_raw_scoped_pdu(scoped: &ScopedPdu) -> Result<Bytes, String> {
     buf.try_push_sequence(|buf| {
         buf.try_push_constructed(tag, |buf| {
             buf.try_push_sequence(|buf| {
-                for varbind in scoped.pdu.varbinds.iter().rev() {
-                    varbind.encode(buf)?;
+                for (index, varbind) in scoped.pdu.varbinds.iter().enumerate().rev() {
+                    if index == 0
+                        && let Some(content) = first_integer_value_content
+                    {
+                        buf.try_push_sequence(|buf| {
+                            buf.push_bytes(&raw_ber::integer_from_content(content));
+                            buf.push_oid(&varbind.oid)
+                        })?;
+                    } else {
+                        varbind.encode(buf)?;
+                    }
                 }
                 Ok(())
             })?;
@@ -228,9 +244,17 @@ fn encode_raw_plaintext_message(
     scoped: &ScopedPdu,
 ) -> Result<Vec<u8>, String> {
     let scoped = encode_raw_scoped_pdu(scoped)?;
+    encode_raw_plaintext_message_bytes(global, security_params, &scoped)
+}
+
+fn encode_raw_plaintext_message_bytes(
+    global: &MsgGlobalData,
+    security_params: &[u8],
+    scoped: &[u8],
+) -> Result<Vec<u8>, String> {
     let mut buf = EncodeBuf::new();
     buf.try_push_sequence(|buf| {
-        buf.push_bytes(&scoped);
+        buf.push_bytes(scoped);
         buf.push_octet_string(security_params);
         global.encode(buf)?;
         buf.push_integer(3);
@@ -275,6 +299,7 @@ pub struct V3ReplyBuilder {
     signing_user: Option<UsmConfig>,
     key_engine_id: Option<Bytes>,
     ciphertext_override: Option<Bytes>,
+    first_integer_value_content_override: Option<Bytes>,
     context_engine_id: Bytes,
     context_name: Bytes,
     pdu: Pdu,
@@ -302,6 +327,7 @@ impl V3ReplyBuilder {
             signing_user: engine.user_for(request.usm.username()).cloned(),
             key_engine_id: None,
             ciphertext_override: None,
+            first_integer_value_content_override: None,
             context_engine_id: scoped.context_engine_id.clone(),
             context_name: scoped.context_name.clone(),
             pdu: scoped.pdu.to_response(),
@@ -407,6 +433,12 @@ impl V3ReplyBuilder {
         self
     }
 
+    /// Override the first varbind INTEGER BER content.
+    pub fn first_integer_value_content(mut self, content: impl Into<Bytes>) -> Self {
+        self.first_integer_value_content_override = Some(content.into());
+        self
+    }
+
     pub fn context_engine_id(mut self, context_engine_id: impl Into<Bytes>) -> Self {
         self.context_engine_id = context_engine_id.into();
         self
@@ -474,7 +506,10 @@ impl V3ReplyBuilder {
                 .as_ref()
                 .and_then(|keys| keys.priv_key.as_ref())
                 .ok_or_else(|| "no privacy key configured for encrypted reply".to_string())?;
-            let scoped_bytes = encode_raw_scoped_pdu(&scoped)?;
+            let scoped_bytes = encode_raw_scoped_pdu_with_first_integer(
+                &scoped,
+                self.first_integer_value_content_override.as_deref(),
+            )?;
             let (ciphertext, generated_priv_params) = priv_key
                 .encrypt(
                     &scoped_bytes,
@@ -515,7 +550,15 @@ impl V3ReplyBuilder {
                 &auth_params,
                 &priv_params,
             );
-            encode_raw_plaintext_message(&global, &usm, &scoped)?
+            if self.first_integer_value_content_override.is_some() {
+                let scoped = encode_raw_scoped_pdu_with_first_integer(
+                    &scoped,
+                    self.first_integer_value_content_override.as_deref(),
+                )?;
+                encode_raw_plaintext_message_bytes(&global, &usm, &scoped)?
+            } else {
+                encode_raw_plaintext_message(&global, &usm, &scoped)?
+            }
         };
         if let Some(flags) = self.raw_msg_flags {
             raw_ber::patch_msg_flags(&mut encoded, flags)?;

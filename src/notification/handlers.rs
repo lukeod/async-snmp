@@ -27,7 +27,13 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        let msg = CommunityMessage::decode_with_target(data, source)?;
+        let decoded = CommunityMessage::decode_with_target_and_policy(
+            data,
+            source,
+            crate::message::DecodePolicy::Compatible,
+        )?;
+        let decode_anomalies = decoded.anomalies;
+        let msg = decoded.value;
 
         if !crate::util::community_matches(
             &self.inner.communities,
@@ -49,12 +55,17 @@ impl super::NotificationReceiver {
                     pdu_class: NotificationPduClass::Trap,
                     context_engine_id: Bytes::new(),
                     context_name: Bytes::new(),
+                    decode_anomalies: decode_anomalies.clone(),
                 };
                 if !self.inner.accepts(&metadata) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v1 trap");
                     return Ok(None);
                 }
-                Ok(Some(Notification::TrapV1 { community, trap }))
+                Ok(Some(Notification::TrapV1 {
+                    community,
+                    trap,
+                    decode_anomalies,
+                }))
             }
             crate::message::CommunityPdu::Standard(_) => Ok(None),
         }
@@ -76,7 +87,13 @@ impl super::NotificationReceiver {
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<Notification>> {
-        let msg = CommunityMessage::decode_with_target(data, source)?;
+        let decoded = CommunityMessage::decode_with_target_and_policy(
+            data,
+            source,
+            crate::message::DecodePolicy::Compatible,
+        )?;
+        let decode_anomalies = decoded.anomalies;
+        let msg = decoded.value;
 
         if !crate::util::community_matches(
             &self.inner.communities,
@@ -104,6 +121,7 @@ impl super::NotificationReceiver {
                     pdu_class: NotificationPduClass::Trap,
                     context_engine_id: Bytes::new(),
                     context_name: Bytes::new(),
+                    decode_anomalies: decode_anomalies.clone(),
                 };
                 if !self.inner.accepts(&metadata) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c trap");
@@ -115,6 +133,7 @@ impl super::NotificationReceiver {
                     trap_oid,
                     varbinds,
                     request_id: pdu.request_id,
+                    decode_anomalies,
                 }))
             }
             PduType::InformRequest => {
@@ -128,6 +147,7 @@ impl super::NotificationReceiver {
                     pdu_class: NotificationPduClass::Inform,
                     context_engine_id: Bytes::new(),
                     context_name: Bytes::new(),
+                    decode_anomalies: decode_anomalies.clone(),
                 };
                 if !self.inner.accepts(&metadata) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c Inform");
@@ -163,6 +183,7 @@ impl super::NotificationReceiver {
                     trap_oid,
                     varbinds,
                     request_id,
+                    decode_anomalies,
                 }))
             }
             _ => Ok(None), // Not a notification PDU
@@ -242,6 +263,7 @@ impl super::NotificationReceiver {
         let usm_params = &inbound.usm_params;
         let scoped_pdu = &inbound.scoped_pdu;
         let security_level = inbound.security_level;
+        let decode_anomalies = inbound.decode_anomalies.clone();
         let username = usm_params.username.clone();
 
         let context_engine_id = scoped_pdu.context_engine_id.clone();
@@ -268,6 +290,7 @@ impl super::NotificationReceiver {
             pdu_class,
             context_engine_id: context_engine_id.clone(),
             context_name: context_name.clone(),
+            decode_anomalies: decode_anomalies.clone(),
         };
         match pdu.pdu_type() {
             PduType::TrapV2 => {
@@ -286,6 +309,7 @@ impl super::NotificationReceiver {
                     trap_oid,
                     varbinds,
                     request_id: pdu.request_id,
+                    decode_anomalies,
                 }))
             }
             PduType::InformRequest => {
@@ -338,6 +362,7 @@ impl super::NotificationReceiver {
                     trap_oid,
                     varbinds,
                     request_id,
+                    decode_anomalies,
                 }))
             }
             _ => Ok(None),

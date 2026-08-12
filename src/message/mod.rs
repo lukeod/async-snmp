@@ -11,14 +11,16 @@ mod community;
 mod v3;
 
 pub use community::{CommunityMessage, CommunityPdu};
-pub(crate) use v3::{MpdFailure, classify_mpd_failure, decode_scoped_pdu_with_consumption};
+pub(crate) use v3::{
+    MpdFailure, classify_mpd_failure, combine_staged_v3_anomalies, decode_scoped_pdu_with_anomalies,
+};
 pub use v3::{
     MsgFlags, MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message,
     V3MessageData, V3SecurityModel,
 };
 
 use crate::ber::Decoder;
-use crate::compatibility::CompatibilityPolicy;
+use crate::compatibility::{CompatibilityPolicy, DecodeAnomaly};
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{DecodeError, Result};
 use crate::pdu::Pdu;
@@ -40,27 +42,21 @@ pub enum DecodePolicy {
     Strict,
 }
 
-/// Observable non-canonical input accepted by compatible decoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecodeAnomaly {
-    /// Number of bytes following the fully consumed top-level message TLV.
-    pub trailing_bytes: usize,
-}
-
 /// A decoded value together with compatible-mode anomaly metadata.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub struct DecodeOutcome<T> {
     /// Decoded value.
     pub value: T,
-    /// Input anomaly, if compatible decoding accepted a packet suffix.
-    pub anomaly: Option<DecodeAnomaly>,
+    /// Accepted deviations in stable wire/decode order.
+    pub anomalies: Vec<DecodeAnomaly>,
 }
 
 pub(crate) fn finalize_envelope(
     sequence: &Decoder,
     root: &Decoder,
     policy: DecodePolicy,
-) -> Result<Option<DecodeAnomaly>> {
+) -> Result<()> {
     if !sequence.is_empty() {
         tracing::debug!(target: "async_snmp::message", { remaining = sequence.remaining() }, "unconsumed field inside SNMP message envelope");
         return Err(sequence.malformed(DecodeErrorKind::TrailingData {
@@ -70,7 +66,7 @@ pub(crate) fn finalize_envelope(
 
     let trailing_bytes = root.remaining();
     if trailing_bytes == 0 {
-        return Ok(None);
+        return Ok(());
     }
     if policy == DecodePolicy::Strict {
         tracing::debug!(target: "async_snmp::message", { trailing_bytes }, "bytes follow SNMP message envelope");
@@ -82,7 +78,11 @@ pub(crate) fn finalize_envelope(
     // Stable event and field names let callers observe anomalies even when
     // using the legacy value-only `decode` convenience methods.
     tracing::warn!(target: "async_snmp::message", anomaly = "trailing_bytes", trailing_bytes, peer = ?root.peer(), "accepted trailing bytes after SNMP message");
-    Ok(Some(DecodeAnomaly { trailing_bytes }))
+    root.record_anomaly(DecodeAnomaly::TrailingBytes {
+        original_length: trailing_bytes,
+        canonical_length: 0,
+    });
+    Ok(())
 }
 
 /// Decoded SNMP message (any version).
@@ -131,7 +131,8 @@ impl Message {
     /// The complete declared message SEQUENCE is always required. A suffix
     /// after that SEQUENCE is accepted and emits the stable
     /// `async_snmp::message` `trailing_bytes` anomaly event. Use
-    /// [`Message::decode_with_policy`] to retain anomaly metadata.
+    /// [`Message::decode_with_policy`] to retain accepted anomaly metadata;
+    /// this convenience method discards it.
     pub fn decode(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
     }
@@ -143,6 +144,9 @@ impl Message {
 
     /// Decode using an explicit malformed-input compatibility policy and the
     /// default compatible top-level consumption policy.
+    ///
+    /// Accepted anomaly metadata is discarded. Use [`Self::decode_with_policies`]
+    /// to retain it.
     pub fn decode_with_compatibility_policy(
         data: Bytes,
         compatibility: CompatibilityPolicy,
@@ -167,6 +171,9 @@ impl Message {
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
+    ///
+    /// Accepted BER/value compatibility anomaly metadata is discarded. Use
+    /// [`Self::decode_with_policies`] with [`DecodePolicy::Strict`] to retain it.
     pub fn decode_strict(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
@@ -204,8 +211,10 @@ impl Message {
             error.peer = peer;
             return Err(crate::Error::Decode(error).boxed());
         }
-        let mut decoder =
-            Decoder::with_optional_peer(data, peer).with_compatibility_policy(compatibility);
+        let anomalies = std::cell::RefCell::new(Vec::new());
+        let mut decoder = Decoder::with_optional_peer(data, peer)
+            .with_compatibility_policy(compatibility)
+            .with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;
@@ -220,8 +229,13 @@ impl Message {
             }
             Version::V3 => Message::V3(V3Message::decode_from_sequence(&mut seq)?),
         };
-        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
-        Ok(DecodeOutcome { value, anomaly })
+        finalize_envelope(&seq, &decoder, policy)?;
+        drop(seq);
+        drop(decoder);
+        Ok(DecodeOutcome {
+            value,
+            anomalies: anomalies.into_inner(),
+        })
     }
 }
 
@@ -254,6 +268,290 @@ impl From<V3Message> for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tlv(tag: u8, content: impl AsRef<[u8]>) -> Vec<u8> {
+        let content = content.as_ref();
+        let mut encoded = vec![tag];
+        if content.len() < 128 {
+            encoded.push(content.len() as u8);
+        } else if content.len() <= usize::from(u16::MAX) {
+            encoded.push(0x82);
+            encoded.extend_from_slice(&(content.len() as u16).to_be_bytes());
+        } else {
+            panic!("test TLV is too large");
+        }
+        encoded.extend_from_slice(content);
+        encoded
+    }
+
+    fn compatibility_message(
+        pdu_tag: u8,
+        first_field: &[u8],
+        second_field: &[u8],
+        values: &[Vec<u8>],
+        trailing: &[u8],
+    ) -> Bytes {
+        let mut varbinds = Vec::new();
+        for value in values {
+            let mut varbind = tlv(0x06, [0x2b]);
+            varbind.extend_from_slice(value);
+            varbinds.extend_from_slice(&tlv(0x30, varbind));
+        }
+        let varbinds = tlv(0x30, varbinds);
+        let mut pdu = tlv(0x02, [1]);
+        pdu.extend_from_slice(first_field);
+        pdu.extend_from_slice(second_field);
+        pdu.extend_from_slice(&varbinds);
+        let pdu = tlv(pdu_tag, pdu);
+
+        let mut message = tlv(0x02, [1]);
+        message.extend_from_slice(&tlv(0x04, b"public"));
+        message.extend_from_slice(&pdu);
+        let mut message = tlv(0x30, message);
+        message.extend_from_slice(trailing);
+        Bytes::from(message)
+    }
+
+    #[test]
+    fn every_compatibility_flag_reports_an_individual_typed_anomaly() {
+        let cases = [
+            (
+                vec![0x02, 0x05, 1, 0, 0, 0, 0],
+                DecodeAnomaly::SignedIntegerTruncation {
+                    encoded_length: 5,
+                    original: 1_i64 << 32,
+                    canonical: 0,
+                },
+            ),
+            (
+                vec![0x42, 0x05, 1, 0, 0, 0, 0],
+                DecodeAnomaly::Unsigned32Truncation {
+                    encoded_length: 5,
+                    original: 1_u64 << 32,
+                    canonical: 0,
+                },
+            ),
+            (
+                vec![0x46, 0],
+                DecodeAnomaly::EmptyCounter64 {
+                    original_length: 0,
+                    canonical: 0,
+                },
+            ),
+            (
+                vec![0x06, 0],
+                DecodeAnomaly::EmptyObjectIdentifier {
+                    original_length: 0,
+                    canonical_arc_count: 0,
+                },
+            ),
+            (
+                vec![0x04, 3, 0xaa],
+                DecodeAnomaly::BoundedStringClamp {
+                    kind: crate::BoundedStringKind::OctetString,
+                    declared_length: 3,
+                    canonical_length: 1,
+                },
+            ),
+            (
+                vec![0x44, 3, 0xaa],
+                DecodeAnomaly::BoundedStringClamp {
+                    kind: crate::BoundedStringKind::Opaque,
+                    declared_length: 3,
+                    canonical_length: 1,
+                },
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let encoded = compatibility_message(0xa2, &[0x02, 1, 0], &[0x02, 1, 0], &[value], &[]);
+            let outcome = Message::decode_with_policies(
+                encoded.clone(),
+                DecodePolicy::Compatible,
+                CompatibilityPolicy::DEFAULT,
+            )
+            .unwrap();
+            assert_eq!(outcome.anomalies, vec![expected]);
+            assert!(
+                Message::decode_with_policies(
+                    encoded,
+                    DecodePolicy::Compatible,
+                    CompatibilityPolicy::STRICT,
+                )
+                .is_err()
+            );
+        }
+
+        let exception_policy = CompatibilityPolicy {
+            malformed_exception_payloads: true,
+            ..CompatibilityPolicy::STRICT
+        };
+        for (tag, kind) in [
+            (0x80, crate::ExceptionKind::NoSuchObject),
+            (0x81, crate::ExceptionKind::NoSuchInstance),
+            (0x82, crate::ExceptionKind::EndOfMibView),
+        ] {
+            let encoded = compatibility_message(
+                0xa2,
+                &[0x02, 1, 0],
+                &[0x02, 1, 0],
+                &[vec![tag, 2, 0xaa, 0xbb]],
+                &[],
+            );
+            assert_eq!(
+                Message::decode_with_policies(
+                    encoded.clone(),
+                    DecodePolicy::Compatible,
+                    exception_policy,
+                )
+                .unwrap()
+                .anomalies,
+                vec![DecodeAnomaly::MalformedExceptionPayload {
+                    kind,
+                    original_length: 2,
+                    canonical_length: 0,
+                }]
+            );
+            assert!(
+                Message::decode_with_policies(
+                    encoded,
+                    DecodePolicy::Compatible,
+                    CompatibilityPolicy::STRICT,
+                )
+                .is_err()
+            );
+        }
+
+        for (first, second, field, original) in [
+            (
+                [0x02, 1, 0xff],
+                [0x02, 1, 0],
+                crate::GetBulkField::NonRepeaters,
+                -1,
+            ),
+            (
+                [0x02, 1, 0],
+                [0x02, 1, 0xfe],
+                crate::GetBulkField::MaxRepetitions,
+                -2,
+            ),
+        ] {
+            let encoded = compatibility_message(0xa5, &first, &second, &[], &[]);
+            assert_eq!(
+                Message::decode_with_policy(encoded.clone(), DecodePolicy::Compatible)
+                    .unwrap()
+                    .anomalies,
+                vec![DecodeAnomaly::NegativeGetBulkField {
+                    field,
+                    original,
+                    canonical: 0,
+                }]
+            );
+            assert!(
+                Message::decode_with_policies(
+                    encoded,
+                    DecodePolicy::Compatible,
+                    CompatibilityPolicy::STRICT,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_anomalies_preserve_decode_order_and_strict_modes_reject() {
+        let policy = CompatibilityPolicy {
+            malformed_exception_payloads: true,
+            ..CompatibilityPolicy::DEFAULT
+        };
+        let encoded = compatibility_message(
+            0xa5,
+            &[0x02, 1, 0xff],
+            &[0x02, 1, 0xfe],
+            &[
+                vec![0x02, 0x05, 1, 0, 0, 0, 0],
+                vec![0x46, 0],
+                vec![0x06, 0],
+                vec![0x04, 3, 0xaa],
+                vec![0x80, 2, 0xaa, 0xbb],
+            ],
+            &[0x05, 0],
+        );
+        let outcome =
+            Message::decode_with_policies(encoded.clone(), DecodePolicy::Compatible, policy)
+                .unwrap();
+        assert_eq!(
+            outcome.anomalies,
+            vec![
+                DecodeAnomaly::SignedIntegerTruncation {
+                    encoded_length: 5,
+                    original: 1_i64 << 32,
+                    canonical: 0,
+                },
+                DecodeAnomaly::EmptyCounter64 {
+                    original_length: 0,
+                    canonical: 0,
+                },
+                DecodeAnomaly::EmptyObjectIdentifier {
+                    original_length: 0,
+                    canonical_arc_count: 0,
+                },
+                DecodeAnomaly::BoundedStringClamp {
+                    kind: crate::BoundedStringKind::OctetString,
+                    declared_length: 3,
+                    canonical_length: 1,
+                },
+                DecodeAnomaly::MalformedExceptionPayload {
+                    kind: crate::ExceptionKind::NoSuchObject,
+                    original_length: 2,
+                    canonical_length: 0,
+                },
+                DecodeAnomaly::NegativeGetBulkField {
+                    field: crate::GetBulkField::NonRepeaters,
+                    original: -1,
+                    canonical: 0,
+                },
+                DecodeAnomaly::NegativeGetBulkField {
+                    field: crate::GetBulkField::MaxRepetitions,
+                    original: -2,
+                    canonical: 0,
+                },
+                DecodeAnomaly::TrailingBytes {
+                    original_length: 2,
+                    canonical_length: 0,
+                },
+            ]
+        );
+        assert!(
+            Message::decode_with_policies(encoded.clone(), DecodePolicy::Strict, policy).is_err()
+        );
+        assert!(
+            Message::decode_with_policies(
+                encoded,
+                DecodePolicy::Compatible,
+                CompatibilityPolicy::STRICT,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn anomaly_collection_is_allocation_free_when_empty_and_input_bounded_when_dense() {
+        let canonical = CommunityMessage::v2c("public", Pdu::response(1, 0, 0, Vec::new()))
+            .unwrap()
+            .encode()
+            .unwrap();
+        let clean = Message::decode_with_policy(canonical, DecodePolicy::Compatible).unwrap();
+        assert!(clean.anomalies.is_empty());
+        assert_eq!(clean.anomalies.capacity(), 0);
+
+        let values = vec![vec![0x46, 0]; 1_024];
+        let encoded = compatibility_message(0xa2, &[0x02, 1, 0], &[0x02, 1, 0], &values, &[]);
+        let encoded_len = encoded.len();
+        let dense = Message::decode_with_policy(encoded, DecodePolicy::Compatible).unwrap();
+        assert_eq!(dense.anomalies.len(), values.len());
+        assert!(dense.anomalies.len() <= encoded_len / 2);
+    }
 
     #[test]
     fn malformed_exception_compatibility_policy_reaches_message_values() {
@@ -321,14 +619,14 @@ mod tests {
         assert_eq!(
             Message::decode_with_policy(encoded.clone(), DecodePolicy::Compatible)
                 .unwrap()
-                .anomaly,
-            None
+                .anomalies,
+            Vec::<DecodeAnomaly>::new()
         );
         assert_eq!(
             CommunityMessage::decode_with_policy(encoded.clone(), DecodePolicy::Strict)
                 .unwrap()
-                .anomaly,
-            None
+                .anomalies,
+            Vec::<DecodeAnomaly>::new()
         );
 
         let mut suffix = encoded.to_vec();
@@ -337,18 +635,20 @@ mod tests {
         assert_eq!(
             Message::decode_with_policy(suffix.clone(), DecodePolicy::Compatible)
                 .unwrap()
-                .anomaly
-                .unwrap()
-                .trailing_bytes,
-            4
+                .anomalies,
+            vec![DecodeAnomaly::TrailingBytes {
+                original_length: 4,
+                canonical_length: 0,
+            }]
         );
         assert_eq!(
             CommunityMessage::decode_with_policy(suffix.clone(), DecodePolicy::Compatible)
                 .unwrap()
-                .anomaly
-                .unwrap()
-                .trailing_bytes,
-            4
+                .anomalies,
+            vec![DecodeAnomaly::TrailingBytes {
+                original_length: 4,
+                canonical_length: 0,
+            }]
         );
         assert!(Message::decode_strict(suffix.clone()).is_err());
         assert!(CommunityMessage::decode_strict(suffix).is_err());

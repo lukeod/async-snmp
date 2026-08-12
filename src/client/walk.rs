@@ -46,6 +46,37 @@ use crate::varbind::VarBind;
 use crate::version::Version;
 
 use super::Client;
+use super::response_shape::{BulkResponse, ResponseMetadata};
+
+/// One walked binding plus anomalies accepted since the preceding item.
+///
+/// GETNEXT associates one response with one item. GETBULK associates response
+/// metadata with the first yielded binding from that response, so flattening a
+/// walk never duplicates anomalies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkItem {
+    pub varbind: VarBind,
+    pub metadata: ResponseMetadata,
+}
+
+/// A collected walk and the anomaly aggregate for every accepted response,
+/// including responses that terminate without yielding a binding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkCollection {
+    pub varbinds: Vec<VarBind>,
+    pub metadata: ResponseMetadata,
+}
+
+/// Terminal failure from a metadata-preserving walk.
+#[derive(Debug, thiserror::Error)]
+#[error("walk failed: {source}")]
+pub struct WalkError {
+    /// The protocol, response-shape, walk-policy, or transport failure.
+    #[source]
+    pub source: Box<Error>,
+    /// Every accepted response anomaly observed before termination.
+    pub metadata: ResponseMetadata,
+}
 
 /// Walk operation mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -195,6 +226,7 @@ pub struct Walk<T: Transport> {
     /// Count of results returned so far.
     count: usize,
     done: bool,
+    metadata: ResponseMetadata,
     pending: Option<
         Pin<
             Box<
@@ -221,6 +253,7 @@ impl<T: Transport> Walk<T> {
             max_results,
             count: 0,
             done: false,
+            metadata: ResponseMetadata::default(),
             pending: None,
         }
     }
@@ -228,10 +261,8 @@ impl<T: Transport> Walk<T> {
 
 impl_stream_helpers!(Walk<T>);
 
-impl<T: Transport + 'static> Stream for Walk<T> {
-    type Item = Result<VarBind>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl<T: Transport + 'static> Walk<T> {
+    fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
         if self.done {
             return Poll::Ready(None);
         }
@@ -257,12 +288,15 @@ impl<T: Transport + 'static> Stream for Walk<T> {
 
                 match result {
                     Ok(response) if result_limit.is_some() && response.varbinds.is_empty() => {
+                        self.metadata.append(response.metadata);
                         self.done = true;
                         Poll::Ready(None)
                     }
-                    Ok(response)
+                    Ok(mut response)
                         if response.anomalies.is_empty() && response.varbinds.len() == 1 =>
                     {
+                        let item_metadata = std::mem::take(&mut response.metadata);
+                        self.metadata.append(item_metadata.clone());
                         let vb = response.varbinds.into_iter().next().unwrap();
                         let target = self.client.peer_addr();
                         let base_oid = self.base_oid.clone();
@@ -291,9 +325,13 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                         self.current_oid = vb.oid.clone();
                         self.count += 1;
 
-                        Poll::Ready(Some(Ok(vb)))
+                        Poll::Ready(Some(Ok(WalkItem {
+                            varbind: vb,
+                            metadata: item_metadata,
+                        })))
                     }
                     Ok(response) => {
+                        self.metadata.append(response.metadata.clone());
                         self.done = true;
                         Poll::Ready(Some(Err(Error::ResponseShape {
                             target: self.client.peer_addr(),
@@ -302,6 +340,9 @@ impl<T: Transport + 'static> Stream for Walk<T> {
                         .boxed())))
                     }
                     Err(e) => {
+                        if let Some(metadata) = e.response_metadata().cloned() {
+                            self.metadata.append(metadata);
+                        }
                         if self.client.inner.config.version() == Version::V1
                             && matches!(
                                 &*e,
@@ -324,6 +365,19 @@ impl<T: Transport + 'static> Stream for Walk<T> {
     }
 }
 
+impl<T: Transport + 'static> Stream for Walk<T> {
+    type Item = Result<VarBind>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.poll_next_with_metadata(cx) {
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item.varbind))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Async stream for walking an OID subtree using GETBULK.
 ///
 /// Created by [`Client::bulk_walk()`].
@@ -339,9 +393,11 @@ pub struct BulkWalk<T: Transport> {
     /// Count of results returned so far.
     count: usize,
     done: bool,
+    metadata: ResponseMetadata,
+    deferred_item_metadata: ResponseMetadata,
     /// Buffered results from the last GETBULK response
     buffer: VecDeque<VarBind>,
-    pending: Option<Pin<Box<dyn std::future::Future<Output = Result<Vec<VarBind>>> + Send>>>,
+    pending: Option<Pin<Box<dyn std::future::Future<Output = Result<BulkResponse>> + Send>>>,
 }
 
 impl<T: Transport> BulkWalk<T> {
@@ -363,6 +419,8 @@ impl<T: Transport> BulkWalk<T> {
             max_results,
             count: 0,
             done: false,
+            metadata: ResponseMetadata::default(),
+            deferred_item_metadata: ResponseMetadata::default(),
             buffer: VecDeque::new(),
             pending: None,
         })
@@ -371,10 +429,8 @@ impl<T: Transport> BulkWalk<T> {
 
 impl_stream_helpers!(BulkWalk<T>);
 
-impl<T: Transport + 'static> Stream for BulkWalk<T> {
-    type Item = Result<VarBind>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl<T: Transport + 'static> BulkWalk<T> {
+    fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
         loop {
             if self.done {
                 return Poll::Ready(None);
@@ -412,7 +468,10 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                 self.current_oid = vb.oid.clone();
                 self.count += 1;
 
-                return Poll::Ready(Some(Ok(vb)));
+                return Poll::Ready(Some(Ok(WalkItem {
+                    varbind: vb,
+                    metadata: std::mem::take(&mut self.deferred_item_metadata),
+                })));
             }
 
             // Buffer exhausted, need to fetch more
@@ -425,7 +484,10 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                     self.max_repetitions
                 };
 
-                let fut = Box::pin(async move { client.get_bulk(&[oid], 0, max_rep).await });
+                let fut =
+                    Box::pin(
+                        async move { client.get_bulk_with_metadata(&[oid], 0, max_rep).await },
+                    );
                 self.pending = Some(fut);
             }
 
@@ -437,16 +499,21 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                     self.pending = None;
 
                     match result {
-                        Ok(varbinds) => {
-                            if varbinds.is_empty() {
+                        Ok(response) => {
+                            self.metadata.append(response.metadata.clone());
+                            self.deferred_item_metadata.append(response.metadata);
+                            if response.varbinds.is_empty() {
                                 self.done = true;
                                 return Poll::Ready(None);
                             }
 
-                            self.buffer = varbinds.into();
+                            self.buffer = response.varbinds.into();
                             // Continue loop to process buffer
                         }
-                        Err(e) => {
+                        Err(mut e) => {
+                            let accepted_metadata =
+                                e.response_metadata().cloned().unwrap_or_default();
+                            self.metadata.append(accepted_metadata.clone());
                             // On tooBig, degrade instead of aborting (RFC 3416
                             // 4.2.3): halve max-repetitions down to a floor of 1
                             // and retry the same position. Only surface the error
@@ -461,6 +528,7 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                                     }
                                 )
                             {
+                                self.deferred_item_metadata.append(accepted_metadata);
                                 let reduced = (self.max_repetitions / 2).max(1);
                                 tracing::debug!(target: "async_snmp::client", { peer = %self.client.peer_addr(), snmp.max_repetitions = self.max_repetitions, snmp.reduced_max_repetitions = reduced }, "tooBig response, reducing max-repetitions and retrying");
                                 self.max_repetitions = reduced;
@@ -468,12 +536,129 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
                                 continue;
                             }
 
+                            e = e.with_prior_response_metadata(&self.deferred_item_metadata);
                             self.done = true;
                             return Poll::Ready(Some(Err(e)));
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+impl<T: Transport + 'static> Stream for BulkWalk<T> {
+    type Item = Result<VarBind>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.poll_next_with_metadata(cx) {
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item.varbind))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// GETNEXT walk stream that retains decode metadata.
+/// Terminal items use [`WalkError`] so both the source error and the cumulative
+/// accepted-response metadata remain available.
+#[must_use = "streams do nothing unless polled"]
+pub struct WalkWithMetadata<T: Transport> {
+    inner: Walk<T>,
+}
+
+impl<T: Transport> WalkWithMetadata<T> {
+    pub(crate) fn new(inner: Walk<T>) -> Self {
+        Self { inner }
+    }
+
+    /// Aggregate metadata observed so far, including non-yielding terminal responses.
+    pub fn metadata(&self) -> &ResponseMetadata {
+        &self.inner.metadata
+    }
+}
+
+impl<T: Transport + 'static> WalkWithMetadata<T> {
+    pub async fn next(&mut self) -> Option<std::result::Result<WalkItem, WalkError>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+
+    pub async fn collect(mut self) -> std::result::Result<WalkCollection, WalkError> {
+        let mut varbinds = Vec::new();
+        while let Some(item) = self.next().await {
+            varbinds.push(item?.varbind);
+        }
+        Ok(WalkCollection {
+            varbinds,
+            metadata: self.inner.metadata,
+        })
+    }
+}
+
+impl<T: Transport + 'static> Stream for WalkWithMetadata<T> {
+    type Item = std::result::Result<WalkItem, WalkError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.poll_next_with_metadata(cx) {
+            Poll::Ready(Some(Err(source))) => Poll::Ready(Some(Err(WalkError {
+                source,
+                metadata: self.inner.metadata.clone(),
+            }))),
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// GETBULK walk stream that retains decode metadata without duplicating it
+/// across bindings returned by the same response.
+#[must_use = "streams do nothing unless polled"]
+pub struct BulkWalkWithMetadata<T: Transport> {
+    inner: BulkWalk<T>,
+}
+
+impl<T: Transport> BulkWalkWithMetadata<T> {
+    pub(crate) fn new(inner: BulkWalk<T>) -> Self {
+        Self { inner }
+    }
+
+    /// Aggregate metadata observed so far, including non-yielding terminal responses.
+    pub fn metadata(&self) -> &ResponseMetadata {
+        &self.inner.metadata
+    }
+}
+
+impl<T: Transport + 'static> BulkWalkWithMetadata<T> {
+    pub async fn next(&mut self) -> Option<std::result::Result<WalkItem, WalkError>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+
+    pub async fn collect(mut self) -> std::result::Result<WalkCollection, WalkError> {
+        let mut varbinds = Vec::new();
+        while let Some(item) = self.next().await {
+            varbinds.push(item?.varbind);
+        }
+        Ok(WalkCollection {
+            varbinds,
+            metadata: self.inner.metadata,
+        })
+    }
+}
+
+impl<T: Transport + 'static> Stream for BulkWalkWithMetadata<T> {
+    type Item = std::result::Result<WalkItem, WalkError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.poll_next_with_metadata(cx) {
+            Poll::Ready(Some(Err(source))) => Poll::Ready(Some(Err(WalkError {
+                source,
+                metadata: self.inner.metadata.clone(),
+            }))),
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -559,6 +744,57 @@ impl<T: Transport + 'static> Stream for WalkStream<T> {
         match self.get_mut() {
             WalkStream::GetNext(walk) => Pin::new(walk).poll_next(cx),
             WalkStream::GetBulk(bulk_walk) => Pin::new(bulk_walk).poll_next(cx),
+        }
+    }
+}
+
+/// Auto-selected GETNEXT/GETBULK walk stream with decode metadata.
+pub enum WalkStreamWithMetadata<T: Transport> {
+    GetNext(WalkWithMetadata<T>),
+    GetBulk(BulkWalkWithMetadata<T>),
+}
+
+impl<T: Transport> WalkStreamWithMetadata<T> {
+    pub(crate) fn new(inner: WalkStream<T>) -> Self {
+        match inner {
+            WalkStream::GetNext(walk) => Self::GetNext(WalkWithMetadata::new(walk)),
+            WalkStream::GetBulk(walk) => Self::GetBulk(BulkWalkWithMetadata::new(walk)),
+        }
+    }
+
+    /// Aggregate metadata observed so far.
+    pub fn metadata(&self) -> &ResponseMetadata {
+        match self {
+            Self::GetNext(walk) => walk.metadata(),
+            Self::GetBulk(walk) => walk.metadata(),
+        }
+    }
+}
+
+impl<T: Transport + 'static> WalkStreamWithMetadata<T> {
+    pub async fn next(&mut self) -> Option<std::result::Result<WalkItem, WalkError>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+
+    pub async fn collect(mut self) -> std::result::Result<WalkCollection, WalkError> {
+        let mut varbinds = Vec::new();
+        while let Some(item) = self.next().await {
+            varbinds.push(item?.varbind);
+        }
+        Ok(WalkCollection {
+            varbinds,
+            metadata: self.metadata().clone(),
+        })
+    }
+}
+
+impl<T: Transport + 'static> Stream for WalkStreamWithMetadata<T> {
+    type Item = std::result::Result<WalkItem, WalkError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::GetNext(walk) => Pin::new(walk).poll_next(cx),
+            Self::GetBulk(walk) => Pin::new(walk).poll_next(cx),
         }
     }
 }
@@ -1134,7 +1370,9 @@ mod tests {
     #[derive(Debug)]
     enum WalkReply {
         Response(Vec<VarBind>),
+        ResponseWithSuffix(Vec<VarBind>, usize),
         Status(ErrorStatus),
+        StatusWithSuffix(ErrorStatus, usize),
         Timeout,
         Closed,
     }
@@ -1188,35 +1426,43 @@ mod tests {
             let peer = target_addr();
 
             async move {
-                match reply {
-                    WalkReply::Response(varbinds) => {
-                        let pdu = Pdu::response(request_id, 0, 0, varbinds);
-                        let message = match version {
-                            Version::V1 => CommunityMessage::v1(Bytes::from_static(b"public"), pdu),
-                            Version::V2c => {
-                                CommunityMessage::v2c(Bytes::from_static(b"public"), pdu)
-                            }
-                            Version::V3 => unreachable!("scripted walk uses community versions"),
-                        }
-                        .unwrap();
-                        Ok((message.encode().unwrap(), peer))
+                let encode_response = |varbinds, suffix_len| {
+                    let pdu = Pdu::response(request_id, 0, 0, varbinds);
+                    let message = match version {
+                        Version::V1 => CommunityMessage::v1(Bytes::from_static(b"public"), pdu),
+                        Version::V2c => CommunityMessage::v2c(Bytes::from_static(b"public"), pdu),
+                        Version::V3 => unreachable!("scripted walk uses community versions"),
                     }
-                    WalkReply::Status(status) => {
-                        let (error_index, varbinds) = if status == ErrorStatus::NoSuchName {
-                            (1, vec![VarBind::null(walk_base())])
-                        } else {
-                            (0, vec![])
-                        };
-                        let pdu = Pdu::response(request_id, status.as_i32(), error_index, varbinds);
-                        let message = match version {
-                            Version::V1 => CommunityMessage::v1(Bytes::from_static(b"public"), pdu),
-                            Version::V2c => {
-                                CommunityMessage::v2c(Bytes::from_static(b"public"), pdu)
-                            }
-                            Version::V3 => unreachable!("scripted walk uses community versions"),
-                        }
-                        .unwrap();
-                        Ok((message.encode().unwrap(), peer))
+                    .unwrap();
+                    let mut encoded = message.encode().unwrap().to_vec();
+                    encoded.extend(std::iter::repeat_n(0xa5, suffix_len));
+                    Ok((Bytes::from(encoded), peer))
+                };
+                let encode_status = |status: ErrorStatus, suffix_len| {
+                    let (error_index, varbinds) = if status == ErrorStatus::TooBig {
+                        (0, vec![])
+                    } else {
+                        (1, vec![VarBind::null(walk_base())])
+                    };
+                    let pdu = Pdu::response(request_id, status.as_i32(), error_index, varbinds);
+                    let message = match version {
+                        Version::V1 => CommunityMessage::v1(Bytes::from_static(b"public"), pdu),
+                        Version::V2c => CommunityMessage::v2c(Bytes::from_static(b"public"), pdu),
+                        Version::V3 => unreachable!("scripted walk uses community versions"),
+                    }
+                    .unwrap();
+                    let mut encoded = message.encode().unwrap().to_vec();
+                    encoded.extend(std::iter::repeat_n(0xa5, suffix_len));
+                    Ok((Bytes::from(encoded), peer))
+                };
+                match reply {
+                    WalkReply::Response(varbinds) => encode_response(varbinds, 0),
+                    WalkReply::ResponseWithSuffix(varbinds, suffix_len) => {
+                        encode_response(varbinds, suffix_len)
+                    }
+                    WalkReply::Status(status) => encode_status(status, 0),
+                    WalkReply::StatusWithSuffix(status, suffix_len) => {
+                        encode_status(status, suffix_len)
                     }
                     WalkReply::Timeout => Err(Error::Timeout {
                         target: peer,
@@ -1289,6 +1535,77 @@ mod tests {
 
     fn detailed_requests(requests: &DetailedRequestLog) -> Vec<(PduType, Option<u32>)> {
         requests.lock().unwrap().clone()
+    }
+
+    fn trailing(length: usize) -> crate::DecodeAnomaly {
+        crate::DecodeAnomaly::TrailingBytes {
+            original_length: length,
+            canonical_length: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn getnext_metadata_items_and_aggregate_include_terminal_response() {
+        let (client, _) = scripted_walk_client(
+            Version::V2c,
+            10,
+            vec![
+                WalkReply::ResponseWithSuffix(vec![walk_binding(1)], 1),
+                WalkReply::ResponseWithSuffix(vec![out_of_subtree_binding()], 2),
+            ],
+        );
+        let mut walk = client.walk_getnext_with_metadata(walk_base());
+        let item = walk.next().await.unwrap().unwrap();
+        assert_eq!(item.varbind, walk_binding(1));
+        assert_eq!(item.metadata.decode_anomalies, vec![trailing(1)]);
+        assert!(walk.next().await.is_none());
+        assert_eq!(
+            walk.metadata().decode_anomalies,
+            vec![trailing(1), trailing(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_walk_metadata_is_not_duplicated_across_one_response() {
+        let (client, _) = scripted_walk_client(
+            Version::V2c,
+            10,
+            vec![
+                WalkReply::ResponseWithSuffix(vec![walk_binding(1), walk_binding(2)], 1),
+                WalkReply::ResponseWithSuffix(vec![out_of_subtree_binding()], 2),
+            ],
+        );
+        let mut walk = client.bulk_walk_with_metadata(walk_base(), 8).unwrap();
+        let first = walk.next().await.unwrap().unwrap();
+        let second = walk.next().await.unwrap().unwrap();
+        assert_eq!(first.metadata.decode_anomalies, vec![trailing(1)]);
+        assert!(second.metadata.decode_anomalies.is_empty());
+        assert!(walk.next().await.is_none());
+        assert_eq!(
+            walk.metadata().decode_anomalies,
+            vec![trailing(1), trailing(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_walk_protocol_error_retains_response_metadata() {
+        let (client, _) = scripted_walk_client(
+            Version::V2c,
+            10,
+            vec![WalkReply::StatusWithSuffix(ErrorStatus::GenErr, 3)],
+        );
+        let error = client
+            .walk_getnext_with_metadata(walk_base())
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            &*error.source,
+            Error::Snmp { metadata, .. }
+                if metadata.decode_anomalies == vec![trailing(3)]
+        ));
+        assert_eq!(error.metadata.decode_anomalies, vec![trailing(3)]);
     }
 
     #[tokio::test]

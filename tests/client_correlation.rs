@@ -262,6 +262,17 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: Decode
         result.varbinds[0].value,
         Value::OctetString(Bytes::from_static(b"suffix policy"))
     );
+    if policy == DecodePolicy::Compatible {
+        assert!(matches!(
+            result.metadata.decode_anomalies.as_slice(),
+            [async_snmp::DecodeAnomaly::TrailingBytes {
+                original_length: 1..,
+                canonical_length: 0,
+            }]
+        ));
+    } else {
+        assert!(result.metadata.decode_anomalies.is_empty());
+    }
     server.await.unwrap();
 }
 

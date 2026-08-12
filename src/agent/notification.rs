@@ -312,6 +312,9 @@ pub struct SinkOutcome {
     pub sink: NotificationSinkSummary,
     /// The delivery status for this sink.
     pub status: SinkStatus,
+    /// Accepted response deviations for an Inform exchange. Empty for traps,
+    /// skipped sinks, and local failures that consumed no response.
+    pub metadata: crate::client::ResponseMetadata,
 }
 
 type PendingSinkOutcome<'a> = Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>>;
@@ -467,6 +470,7 @@ impl super::Agent {
                 SinkOutcome {
                     sink: sink.summary.clone(),
                     status,
+                    metadata: crate::client::ResponseMetadata::default(),
                 }
             }) as PendingSinkOutcome<'_>);
         }
@@ -559,22 +563,32 @@ impl super::Agent {
             let trap_oid = Arc::clone(&trap_oid);
             let varbinds = Arc::clone(&varbinds);
             pending.push(Box::pin(async move {
-                let status = if sink.summary.version == Version::V1 {
-                    SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
+                let (status, metadata) = if sink.summary.version == Version::V1 {
+                    (
+                        SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1),
+                        crate::client::ResponseMetadata::default(),
+                    )
                 } else if !self.notification_allowed(sink, &trap_oid, &varbinds) {
-                    SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+                    (
+                        SinkStatus::Skipped(SinkSkipReason::NotInNotifyView),
+                        crate::client::ResponseMetadata::default(),
+                    )
                 } else {
                     match self
                         .send_inform_to_sink(sink, &trap_oid, uptime, &varbinds)
                         .await
                     {
-                        Ok(()) => SinkStatus::Succeeded,
-                        Err(error) => SinkStatus::Failed(error),
+                        Ok(metadata) => (SinkStatus::Succeeded, metadata),
+                        Err(error) => {
+                            let metadata = error.response_metadata().cloned().unwrap_or_default();
+                            (SinkStatus::Failed(error), metadata)
+                        }
                     }
                 };
                 SinkOutcome {
                     sink: sink.summary.clone(),
                     status,
+                    metadata,
                 }
             }) as PendingSinkOutcome<'_>);
         }
@@ -592,7 +606,9 @@ impl super::Agent {
     /// V1 trap sinks are explicitly reported as skipped because v1 does not
     /// support informs. For a V3 sink, the receiver is authoritative; the
     /// cached client discovers and uses the sink's engine identity and trusted
-    /// time rather than the Agent's local authoritative state.
+    /// time rather than the Agent's local authoritative state. Each
+    /// [`SinkOutcome::metadata`] retains accepted deviations from that sink's
+    /// complete Inform exchange.
     ///
     /// # Example
     ///
@@ -774,13 +790,11 @@ impl super::Agent {
         trap_oid: &Oid,
         uptime: u32,
         varbinds: &[VarBind],
-    ) -> Result<()> {
+    ) -> Result<crate::client::ResponseMetadata> {
         let client = sink.get_or_create_inform_client().await?;
         client
-            .send_inform(trap_oid, uptime, varbinds.to_vec())
-            .await?;
-
-        Ok(())
+            .send_inform_with_metadata(trap_oid, uptime, varbinds.to_vec())
+            .await
     }
 
     /// Generate a notification request/message ID.

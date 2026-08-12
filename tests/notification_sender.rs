@@ -2,6 +2,9 @@
 
 #![cfg(feature = "agent")]
 
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+mod common;
+
 use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::message::CommunityMessage;
 use async_snmp::notification::{Notification, NotificationReceiver, NotificationVarbindValidation};
@@ -16,6 +19,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+use common::v3::{ScriptStep, ScriptedV3Peer, TestV3Engine, V3ReplyBuilder};
 
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 fn test_authoritative_engine(engine_id: Vec<u8>) -> AuthoritativeEngine {
@@ -579,7 +585,9 @@ async fn v1_trap_send_receive() {
         .unwrap();
 
     match notification {
-        Notification::TrapV1 { community, trap } => {
+        Notification::TrapV1 {
+            community, trap, ..
+        } => {
             assert_eq!(community.as_bytes(), b"public");
             assert_eq!(trap.generic_trap, GenericTrap::LinkDown);
             assert_eq!(trap.time_stamp, 5000);
@@ -619,7 +627,9 @@ async fn v1_trap_send_v1_trap_explicit() {
         .unwrap();
 
     match notification {
-        Notification::TrapV1 { community, trap } => {
+        Notification::TrapV1 {
+            community, trap, ..
+        } => {
             assert_eq!(community.as_bytes(), b"public");
             assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
             assert_eq!(trap.agent_addr, [10, 0, 0, 1]);
@@ -1012,7 +1022,9 @@ async fn agent_v1_trap_to_sink() {
         .unwrap();
 
     match notification {
-        Notification::TrapV1 { community, trap } => {
+        Notification::TrapV1 {
+            community, trap, ..
+        } => {
             assert_eq!(community.as_bytes(), b"public");
             assert_eq!(trap.generic_trap, GenericTrap::WarmStart);
             assert_eq!(trap.time_stamp, 1000);
@@ -1056,7 +1068,9 @@ async fn agent_mixed_v1_v2c_sinks() {
 
     // V1 sink gets a TrapV1
     match n1 {
-        Notification::TrapV1 { community, trap } => {
+        Notification::TrapV1 {
+            community, trap, ..
+        } => {
             assert_eq!(community.as_bytes(), b"v1comm");
             assert_eq!(trap.generic_trap, GenericTrap::LinkUp);
             assert_eq!(trap.time_stamp, 777);
@@ -1263,6 +1277,173 @@ async fn agent_inform_reports_failing_sink() {
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].sink.dest(), dead_addr);
     assert!(matches!(&failures[0].status, SinkStatus::Failed(_)));
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
+    let level = SecurityLevel::AuthNoPriv;
+    let peer_engine = TestV3Engine::new(Bytes::from_static(b"\x80\x00\x7e\xd9\x05inform-metadata"))
+        .boots_time(7, 100)
+        .user(async_snmp::UsmConfig::new("informuser").with_master_keys(
+            async_snmp::MasterKeys::new(AuthProtocol::Sha256, b"authpass12345678").unwrap(),
+        ));
+    let discovery_engine = peer_engine.clone();
+    let correction_engine = peer_engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        peer_engine,
+        vec![
+            ScriptStep::reply(move |request| {
+                let mut response = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    async_snmp::v3::report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?
+                .to_vec();
+                response.push(0xa1);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::reply(move |request| {
+                let mut response = V3ReplyBuilder::report_to(
+                    request,
+                    &correction_engine,
+                    async_snmp::v3::report_oids::not_in_time_windows(),
+                    2,
+                )
+                .security_level(level)
+                .engine_boots(8)
+                .engine_time(10)
+                .build()?
+                .to_vec();
+                response.extend_from_slice(&[0xa2, 0xa2]);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::silence(),
+        ],
+    )
+    .await;
+
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .authoritative_engine(no_op_authoritative_engine(b"agent-inform-metadata"))
+        .trap_sink(
+            "metadata",
+            peer.addr().to_string(),
+            Auth::usm("informuser").auth(AuthProtocol::Sha256, "authpass12345678"),
+        )
+        .inform_timeout(Duration::from_millis(50))
+        .inform_retry(Retry::none())
+        .allow_all_access()
+        .build()
+        .await
+        .unwrap();
+
+    let outcome = agent
+        .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2), 0, vec![])
+        .await;
+    let sink = &outcome.sinks()[0];
+    let SinkStatus::Failed(error) = &sink.status else {
+        panic!("corrected Inform unexpectedly succeeded")
+    };
+    assert_eq!(error.kind(), async_snmp::ErrorKind::Timeout);
+    assert_eq!(sink.metadata, *error.response_metadata().unwrap());
+    assert_eq!(
+        sink.metadata
+            .decode_anomalies
+            .iter()
+            .map(|anomaly| match anomaly {
+                async_snmp::DecodeAnomaly::TrailingBytes {
+                    original_length, ..
+                } => *original_length,
+                other => panic!("expected trailing-byte anomaly, got {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    peer.finish().await.unwrap();
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
+    let peer_engine = TestV3Engine::new(Bytes::from_static(
+        b"\x80\x00\x7e\xd9\x05inform-malformed-ack",
+    ))
+    .boots_time(7, 100)
+    .user(async_snmp::UsmConfig::new("informuser").with_master_keys(
+        async_snmp::MasterKeys::new(AuthProtocol::Sha256, b"authpass12345678").unwrap(),
+    ));
+    let discovery_engine = peer_engine.clone();
+    let response_engine = peer_engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        peer_engine,
+        vec![
+            ScriptStep::reply(move |request| {
+                let mut response = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    async_snmp::v3::report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?
+                .to_vec();
+                response.push(0xa1);
+                Ok(Bytes::from(response))
+            }),
+            ScriptStep::reply(move |request| {
+                let mut response = V3ReplyBuilder::response_to(request, &response_engine)
+                    .varbinds(vec![])
+                    .build()?
+                    .to_vec();
+                response.extend_from_slice(&[0xa2, 0xa2]);
+                Ok(Bytes::from(response))
+            }),
+        ],
+    )
+    .await;
+
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .authoritative_engine(no_op_authoritative_engine(b"agent-malformed-inform"))
+        .trap_sink(
+            "malformed",
+            peer.addr().to_string(),
+            Auth::usm("informuser").auth(AuthProtocol::Sha256, "authpass12345678"),
+        )
+        .inform_timeout(Duration::from_millis(50))
+        .inform_retry(Retry::none())
+        .allow_all_access()
+        .build()
+        .await
+        .unwrap();
+
+    let outcome = agent
+        .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2), 0, vec![])
+        .await;
+    let sink = &outcome.sinks()[0];
+    let SinkStatus::Failed(error) = &sink.status else {
+        panic!("malformed Inform acknowledgement unexpectedly succeeded")
+    };
+    assert_eq!(error.kind(), async_snmp::ErrorKind::MalformedResponse);
+    assert_eq!(sink.metadata, *error.response_metadata().unwrap());
+    assert_eq!(
+        sink.metadata
+            .decode_anomalies
+            .iter()
+            .map(|anomaly| match anomaly {
+                async_snmp::DecodeAnomaly::TrailingBytes {
+                    original_length, ..
+                } => *original_length,
+                other => panic!("expected trailing-byte anomaly, got {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    peer.finish().await.unwrap();
 }
 
 #[tokio::test]

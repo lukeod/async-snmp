@@ -193,7 +193,9 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
 
     // Version-specific handling
     match notification {
-        Notification::TrapV1 { community, trap } => {
+        Notification::TrapV1 {
+            community, trap, ..
+        } => {
             println!("  Type: SNMPv1 Trap");
             println!(
                 "  Community: {}",

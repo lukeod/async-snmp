@@ -196,6 +196,8 @@ pub struct NotificationMetadata {
     pub context_engine_id: Bytes,
     /// Scoped-PDU context name for v3, empty for v1/v2c.
     pub context_name: Bytes,
+    /// Accepted BER/value deviations from the received message, in decode order.
+    pub decode_anomalies: Vec<crate::DecodeAnomaly>,
 }
 
 type AcceptancePolicy = dyn Fn(&NotificationMetadata) -> bool + Send + Sync;
@@ -629,6 +631,8 @@ pub enum Notification {
         community: Community,
         /// The trap PDU
         trap: TrapV1Pdu,
+        /// Accepted BER/value deviations from the received message.
+        decode_anomalies: Vec<crate::DecodeAnomaly>,
     },
 
     /// `SNMPv2c` Trap (unconfirmed notification).
@@ -643,6 +647,8 @@ pub enum Notification {
         varbinds: Vec<VarBind>,
         /// Original request ID (for logging/correlation)
         request_id: i32,
+        /// Accepted BER/value deviations from the received message.
+        decode_anomalies: Vec<crate::DecodeAnomaly>,
     },
 
     /// `SNMPv3` Trap (unconfirmed notification).
@@ -665,6 +671,8 @@ pub enum Notification {
         varbinds: Vec<VarBind>,
         /// Original request ID
         request_id: i32,
+        /// Accepted BER/value deviations from the received message.
+        decode_anomalies: Vec<crate::DecodeAnomaly>,
     },
 
     /// `InformRequest` (confirmed notification) - v2c.
@@ -681,6 +689,8 @@ pub enum Notification {
         varbinds: Vec<VarBind>,
         /// Request ID (used in response)
         request_id: i32,
+        /// Accepted BER/value deviations from the received message.
+        decode_anomalies: Vec<crate::DecodeAnomaly>,
     },
 
     /// `InformRequest` (confirmed notification) - v3.
@@ -705,10 +715,34 @@ pub enum Notification {
         varbinds: Vec<VarBind>,
         /// Request ID
         request_id: i32,
+        /// Accepted BER/value deviations from the received message.
+        decode_anomalies: Vec<crate::DecodeAnomaly>,
     },
 }
 
 impl Notification {
+    /// Accepted BER/value deviations from the received message, in decode order.
+    #[must_use]
+    pub fn decode_anomalies(&self) -> &[crate::DecodeAnomaly] {
+        match self {
+            Self::TrapV1 {
+                decode_anomalies, ..
+            }
+            | Self::TrapV2c {
+                decode_anomalies, ..
+            }
+            | Self::TrapV3 {
+                decode_anomalies, ..
+            }
+            | Self::InformV2c {
+                decode_anomalies, ..
+            }
+            | Self::InformV3 {
+                decode_anomalies, ..
+            } => decode_anomalies,
+        }
+    }
+
     /// Get the trap/notification OID.
     ///
     /// For `TrapV1`, this is derived from enterprise + generic/specific trap.
@@ -1161,6 +1195,7 @@ mod tests {
         let notification = Notification::TrapV1 {
             community: Community::from(Bytes::from_static(b"public")),
             trap,
+            decode_anomalies: Vec::new(),
         };
 
         assert!(!notification.is_confirmed());
@@ -1177,6 +1212,7 @@ mod tests {
             trap_oid: oids::link_up(),
             varbinds: vec![],
             request_id: 1,
+            decode_anomalies: Vec::new(),
         };
 
         assert!(!notification.is_confirmed());
@@ -1193,6 +1229,7 @@ mod tests {
             trap_oid: oids::cold_start(),
             varbinds: vec![],
             request_id: 42,
+            decode_anomalies: Vec::new(),
         };
 
         assert!(notification.is_confirmed());
@@ -1335,6 +1372,7 @@ mod tests {
             trap_oid: oids::warm_start(),
             varbinds: vec![],
             request_id: 100,
+            decode_anomalies: Vec::new(),
         };
 
         assert!(notification.is_confirmed());
@@ -1354,6 +1392,7 @@ mod tests {
             trap_oid: oids::cold_start(),
             varbinds: vec![],
             request_id: 1,
+            decode_anomalies: Vec::new(),
         };
         assert_eq!(trap_v3.security_level(), Some(SecurityLevel::AuthPriv));
 
@@ -1366,6 +1405,7 @@ mod tests {
             trap_oid: oids::cold_start(),
             varbinds: vec![],
             request_id: 1,
+            decode_anomalies: Vec::new(),
         };
         assert_eq!(
             inform_v3.security_level(),
@@ -1378,6 +1418,7 @@ mod tests {
             trap_oid: oids::cold_start(),
             varbinds: vec![],
             request_id: 1,
+            decode_anomalies: Vec::new(),
         };
         assert_eq!(trap_v2c.security_level(), None);
     }
@@ -1396,6 +1437,7 @@ mod tests {
         let notification = Notification::TrapV1 {
             community: Community::from(Bytes::from_static(b"public")),
             trap,
+            decode_anomalies: Vec::new(),
         };
 
         assert_eq!(
@@ -3125,6 +3167,86 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, Some(Notification::TrapV2c { .. })));
+    }
+
+    #[tokio::test]
+    async fn community_receiver_exposes_trailing_anomalies_in_notification_and_metadata() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let policy_observed = std::sync::Arc::clone(&observed);
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .acceptance_policy(move |metadata| {
+                *policy_observed.lock().unwrap() = metadata.decode_anomalies.clone();
+                true
+            })
+            .build()
+            .await
+            .unwrap();
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        for (version, mut encoded) in [
+            (crate::Version::V1, build_v1_trap(b"public").to_vec()),
+            (crate::Version::V2c, build_v2c_trap(b"public").to_vec()),
+        ] {
+            encoded.extend_from_slice(&[0x05, 0]);
+            let notification = match version {
+                crate::Version::V1 => receiver.handle_v1(Bytes::from(encoded), source).await,
+                crate::Version::V2c => receiver.handle_v2c(Bytes::from(encoded), source).await,
+                crate::Version::V3 => unreachable!(),
+            }
+            .unwrap()
+            .unwrap();
+            let expected = [crate::DecodeAnomaly::TrailingBytes {
+                original_length: 2,
+                canonical_length: 0,
+            }];
+            assert_eq!(notification.decode_anomalies(), expected);
+            assert_eq!(observed.lock().unwrap().as_slice(), expected);
+        }
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn v3_receiver_exposes_trailing_anomalies_at_all_security_levels() {
+        let engine_id = Bytes::from_static(b"\x80\x00\x00\x00\x01anomalyrecv");
+        let username = Bytes::from_static(b"anomalyuser");
+
+        for level in [
+            SecurityLevel::NoAuthNoPriv,
+            SecurityLevel::AuthNoPriv,
+            SecurityLevel::AuthPriv,
+        ] {
+            let (message, _, _) = build_v3_inform_at_level(
+                &engine_id,
+                &username,
+                level,
+                crate::UDP_RECEIVE_LIMITS.advertised(),
+            );
+            let config = inform_user(level, &username);
+            let receiver = NotificationReceiver::builder()
+                .bind("127.0.0.1:0")
+                .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
+                .usm_user(username.clone(), move |_| config)
+                .accept_all_notifications()
+                .build()
+                .await
+                .unwrap();
+            let source_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut message = message.to_vec();
+            message.extend_from_slice(&[0x05, 0]);
+            let notification = receiver
+                .handle_v3(Bytes::from(message), source_socket.local_addr().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                notification.decode_anomalies(),
+                [crate::DecodeAnomaly::TrailingBytes {
+                    original_length: 2,
+                    canonical_length: 0,
+                }]
+            );
+        }
     }
 
     #[tokio::test]

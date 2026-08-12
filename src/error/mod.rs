@@ -375,8 +375,8 @@ pub enum ConstructionStage {
 
 /// Payload-free classification of a top-level [`Error`].
 ///
-/// This is a shallow structural classification. It does not define
-/// retryability, severity, or root cause.
+/// This does not define retryability or severity. Exchange metadata wrappers
+/// report the underlying failure's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -465,17 +465,17 @@ impl std::fmt::Display for ErrorKind {
 /// Use pattern matching to handle specific error conditions:
 ///
 /// ```
-/// use async_snmp::{Error, ErrorStatus};
+/// use async_snmp::{Error, ErrorKind, ErrorStatus};
 ///
 /// fn is_retriable(error: &Error) -> bool {
-///     matches!(error,
-///         Error::Timeout { .. } |
-///         Error::Network { .. }
+///     matches!(error.kind(),
+///         ErrorKind::Timeout |
+///         ErrorKind::Network
 ///     )
 /// }
 ///
 /// fn is_access_error(error: &Error) -> bool {
-///     matches!(error,
+///     matches!(error.exchange_source(),
 ///         Error::Snmp { status: ErrorStatus::NoAccess | ErrorStatus::AuthorizationError, .. } |
 ///         Error::Auth { .. }
 ///     )
@@ -484,6 +484,23 @@ impl std::fmt::Display for ErrorKind {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// An exchange consumed one or more accepted responses before ending in an
+    /// error that has no response metadata of its own.
+    ///
+    /// [`Error::kind`] reports the wrapped error's kind, and the wrapped error
+    /// remains available through both `source` and [`Error::exchange_source`].
+    /// SNMP protocol errors, terminal Reports, and response-shape errors retain
+    /// metadata in their existing structured fields instead of using this
+    /// wrapper.
+    #[error("{source}")]
+    Exchange {
+        /// Underlying local, transport, authentication, or semantic failure.
+        #[source]
+        source: Box<Error>,
+        /// Accepted deviations in exchange order before the failure.
+        metadata: Box<crate::client::ResponseMetadata>,
+    },
+
     /// Network failure (connection refused, unreachable, etc.)
     #[error("network error communicating with {target}: {source}")]
     Network {
@@ -542,7 +559,10 @@ pub enum Error {
         target: SocketAddr,
         status: ErrorStatus,
         index: u32,
-        oid: Option<Oid>,
+        oid: Option<Box<Oid>>,
+        /// Accepted deviations in all messages consumed by the exchange before
+        /// this response-derived protocol error.
+        metadata: Box<crate::client::ResponseMetadata>,
     },
 
     /// Authentication/authorization failed.
@@ -554,6 +574,9 @@ pub enum Error {
     Report {
         target: SocketAddr,
         status: Box<ReportStatus>,
+        /// Accepted deviations in all messages consumed by the exchange,
+        /// including this terminal Report.
+        metadata: Box<crate::client::ResponseMetadata>,
     },
 
     /// A packet could not be decoded.
@@ -615,6 +638,7 @@ impl Error {
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
         match self {
+            Self::Exchange { source, .. } => source.kind(),
             Self::Network { .. } => ErrorKind::Network,
             Self::Timeout { .. } => ErrorKind::Timeout,
             Self::ConstructionTimeout { .. } => ErrorKind::ConstructionTimeout,
@@ -634,6 +658,63 @@ impl Error {
             Self::AgentAlreadyRunning => ErrorKind::AgentAlreadyRunning,
             Self::InvalidMessage(_) => ErrorKind::InvalidMessage,
             Self::InvalidOid(_) => ErrorKind::InvalidOid,
+        }
+    }
+
+    /// Return metadata retained from accepted responses in this operation.
+    ///
+    /// Protocol errors and response-shape failures expose their native
+    /// metadata through the same accessor. Errors that occurred before any
+    /// response was accepted return `None`.
+    #[must_use]
+    pub fn response_metadata(&self) -> Option<&crate::client::ResponseMetadata> {
+        match self {
+            Self::Exchange { metadata, .. }
+            | Self::Snmp { metadata, .. }
+            | Self::Report { metadata, .. } => Some(metadata.as_ref()),
+            Self::ResponseShape { response, .. } => Some(&response.metadata),
+            _ => None,
+        }
+    }
+
+    /// Return the underlying failure carried by an exchange metadata wrapper.
+    ///
+    /// For errors that do not need the wrapper, this returns `self`.
+    #[must_use]
+    pub fn exchange_source(&self) -> &Error {
+        match self {
+            Self::Exchange { source, .. } => source.exchange_source(),
+            _ => self,
+        }
+    }
+
+    pub(crate) fn with_prior_response_metadata(
+        mut self: Box<Self>,
+        prior: &crate::client::ResponseMetadata,
+    ) -> Box<Self> {
+        if prior.decode_anomalies.is_empty() {
+            return self;
+        }
+
+        match self.as_mut() {
+            Self::Exchange { metadata, .. }
+            | Self::Snmp { metadata, .. }
+            | Self::Report { metadata, .. } => {
+                let mut combined = prior.clone();
+                combined.append(std::mem::take(metadata.as_mut()));
+                **metadata = combined;
+                self
+            }
+            Self::ResponseShape { response, .. } => {
+                let mut combined = prior.clone();
+                combined.append(std::mem::take(&mut response.metadata));
+                response.metadata = combined;
+                self
+            }
+            _ => Box::new(Self::Exchange {
+                source: self,
+                metadata: Box::new(prior.clone()),
+            }),
         }
     }
 
@@ -864,6 +945,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exchange_metadata_wrapper_preserves_kind_source_and_metadata() {
+        let target = "127.0.0.1:161".parse().unwrap();
+        let metadata = crate::client::ResponseMetadata::from_decode_anomalies(vec![
+            crate::DecodeAnomaly::TrailingBytes {
+                original_length: 3,
+                canonical_length: 0,
+            },
+        ]);
+        let error = Error::Closed { target }
+            .boxed()
+            .with_prior_response_metadata(&metadata);
+
+        assert_eq!(error.kind(), ErrorKind::Closed);
+        assert!(matches!(error.exchange_source(), Error::Closed { .. }));
+        assert_eq!(error.response_metadata(), Some(&metadata));
+        let source = std::error::Error::source(error.as_ref())
+            .expect("wrapper must preserve the standard error source chain");
+        assert_eq!(source.to_string(), Error::Closed { target }.to_string());
+    }
+
+    #[test]
     fn error_kind_exhaustively_maps_non_agent_variants() {
         let target = "127.0.0.1:161".parse().unwrap();
         let cases = vec![
@@ -907,7 +1009,8 @@ mod tests {
                     target,
                     status: ErrorStatus::GenErr,
                     index: 1,
-                    oid: Some(Oid::from_slice(&[1, 3, 6, 1])),
+                    oid: Some(Box::new(Oid::from_slice(&[1, 3, 6, 1]))),
+                    metadata: Box::new(crate::client::ResponseMetadata::default()),
                 },
                 ErrorKind::Snmp,
             ),
@@ -916,6 +1019,7 @@ mod tests {
                 Error::Report {
                     target,
                     status: Box::new(crate::v3::ReportStatus::UnknownEngineId { counter: 1 }),
+                    metadata: Box::new(crate::client::ResponseMetadata::default()),
                 },
                 ErrorKind::Report,
             ),
@@ -934,6 +1038,7 @@ mod tests {
                         operation: crate::client::FixedCardinalityOperation::Get,
                         varbinds: Vec::new(),
                         anomalies: Vec::new(),
+                        metadata: crate::client::ResponseMetadata::default(),
                     },
                 },
                 ErrorKind::ResponseShape,

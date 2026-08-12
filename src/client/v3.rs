@@ -8,8 +8,8 @@ use crate::error::internal::{AuthErrorKind, CryptoErrorKind};
 use crate::error::{Error, Result};
 use crate::format::hex;
 use crate::message::{
-    RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message,
-    decode_scoped_pdu_with_consumption,
+    RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message, combine_staged_v3_anomalies,
+    decode_scoped_pdu_with_anomalies,
 };
 use crate::pdu::{Pdu, PduType};
 use crate::transport::{Candidate, RequestRegistration, Transport};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{Span, instrument};
 
-use super::{Client, ClientEngine};
+use super::{Client, ClientEngine, DecodedResponse, ResponseMetadata};
 
 struct EncodedV3Request {
     data: Vec<u8>,
@@ -42,6 +42,12 @@ struct ValidatedV3Response {
     received_level: SecurityLevel,
     scoped_pdu: ScopedPdu,
     authenticated_generation: Option<Arc<()>>,
+    decode_anomalies: Vec<crate::DecodeAnomaly>,
+}
+
+struct DiscoveryResponse {
+    engine_state: EngineState,
+    metadata: ResponseMetadata,
 }
 
 fn check_and_update_engine_timeliness(
@@ -71,7 +77,7 @@ fn check_and_update_engine_timeliness(
 impl<T: Transport> Client<T> {
     /// Ensure engine ID is discovered for V3 operations.
     #[instrument(level = "debug", skip(self), fields(snmp.target = %self.peer_addr()))]
-    pub(super) async fn ensure_engine_discovered(&self) -> Result<()> {
+    pub(super) async fn ensure_engine_discovered(&self) -> Result<ResponseMetadata> {
         // Fast path: already discovered.
         {
             let engine = self
@@ -80,7 +86,7 @@ impl<T: Transport> Client<T> {
                 .read()
                 .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
             if engine.is_some() {
-                return Ok(());
+                return Ok(ResponseMetadata::default());
             }
         }
 
@@ -106,7 +112,16 @@ impl<T: Transport> Client<T> {
     /// source-address policy is controlled by
     /// [`ClientBuilder::strict_source`](crate::ClientBuilder::strict_source) or
     /// by the supplied transport handle.
+    ///
+    /// This convenience method discards accepted discovery-response metadata.
+    /// Use [`Self::rediscover_engine_with_metadata`] to retain it.
     pub async fn rediscover_engine(&self) -> Result<()> {
+        self.rediscover_engine_with_metadata().await.map(|_| ())
+    }
+
+    /// Discover and replace the authoritative engine while retaining accepted
+    /// wire deviations from the discovery Report.
+    pub async fn rediscover_engine_with_metadata(&self) -> Result<ResponseMetadata> {
         if !self.is_v3() {
             return Err(Error::Config("engine discovery requires SNMPv3".into()).boxed());
         }
@@ -116,7 +131,10 @@ impl<T: Transport> Client<T> {
     }
 
     /// Load or discover an engine while `discovery_lock` is held.
-    async fn discover_engine_locked(&self, replace_cached_identity: bool) -> Result<()> {
+    async fn discover_engine_locked(
+        &self,
+        replace_cached_identity: bool,
+    ) -> Result<ResponseMetadata> {
         // Re-check after acquiring the lock: a previous waiter may have
         // completed ordinary discovery while we were blocked. Explicit
         // rediscovery always reaches the peer even with a live identity.
@@ -127,7 +145,7 @@ impl<T: Transport> Client<T> {
                 .read()
                 .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
             if engine.is_some() {
-                return Ok(());
+                return Ok(ResponseMetadata::default());
             }
         }
 
@@ -152,7 +170,7 @@ impl<T: Transport> Client<T> {
                 .write()
                 .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
             *engine = Some(ClientEngine::new(cached_state, derived_keys));
-            return Ok(());
+            return Ok(ResponseMetadata::default());
         }
 
         // Perform discovery with retry (same policy as normal requests)
@@ -165,7 +183,7 @@ impl<T: Transport> Client<T> {
             self.inner.config.retry.max_attempts()
         };
 
-        let mut engine_state_opt: Option<EngineState> = None;
+        let mut discovery_opt: Option<DiscoveryResponse> = None;
 
         'discovery: for attempt in 0..=max_attempts {
             if attempt > 0 {
@@ -195,15 +213,15 @@ impl<T: Transport> Client<T> {
                     ) else {
                         return Ok(Candidate::Reject);
                     };
-                    match self.validate_discovery_response(&decoded.value, msg_id, source) {
-                        Ok(state) => Ok(Candidate::Accept(state)),
+                    match self.validate_discovery_response(decoded, msg_id, source) {
+                        Ok(response) => Ok(Candidate::Accept(response)),
                         Err(_) => Ok(Candidate::Reject),
                     }
                 })
                 .await
             {
-                Ok(engine_state) => {
-                    engine_state_opt = Some(engine_state);
+                Ok(discovery) => {
+                    discovery_opt = Some(discovery);
                     break 'discovery;
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
@@ -220,7 +238,7 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let engine_state = engine_state_opt.ok_or_else(|| {
+        let discovery = discovery_opt.ok_or_else(|| {
             Error::Timeout {
                 target: self.peer_addr(),
                 elapsed: start.elapsed(),
@@ -228,79 +246,87 @@ impl<T: Transport> Client<T> {
             }
             .boxed()
         })?;
+        let engine_state = discovery.engine_state;
+        let metadata = discovery.metadata;
         tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size.as_usize() }, "discovered engine identity");
 
-        let security = self
-            .inner
-            .config
-            .usm_config()
-            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+        let install_result: Result<()> = (|| {
+            let security = self
+                .inner
+                .config
+                .usm_config()
+                .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
-        // Prepare replacement keys before changing either the live generation
-        // or its cache mapping. Ordinary discovery must first resolve any
-        // canonical state already installed by another client sharing the
-        // cache, then derive keys for that identity.
-        let replacement_keys = if replace_cached_identity {
-            Some(
-                security
-                    .derive_keys(&engine_state.engine_id)
-                    .map_err(|e| Error::Config(e.to_string().into()).boxed())?,
-            )
-        } else {
-            None
-        };
+            // Prepare replacement keys before changing either the live generation
+            // or its cache mapping. Ordinary discovery must first resolve any
+            // canonical state already installed by another client sharing the
+            // cache, then derive keys for that identity.
+            let replacement_keys = if replace_cached_identity {
+                Some(
+                    security
+                        .derive_keys(&engine_state.engine_id)
+                        .map_err(|e| Error::Config(e.to_string().into()).boxed())?,
+                )
+            } else {
+                None
+            };
 
-        if let Some(derived_keys) = replacement_keys {
-            // Lock the live generation before publishing its cache mapping.
-            // This matches the live-then-cache lock order used by authenticated
-            // timeliness updates and prevents clones from observing a new
-            // mapping alongside the old identity-localized keys. Reloading the
-            // cache state also adopts trusted time already shared by another
-            // target for the newly discovered engine ID.
+            if let Some(derived_keys) = replacement_keys {
+                // Lock the live generation before publishing its cache mapping.
+                // This matches the live-then-cache lock order used by authenticated
+                // timeliness updates and prevents clones from observing a new
+                // mapping alongside the old identity-localized keys. Reloading the
+                // cache state also adopts trusted time already shared by another
+                // target for the newly discovered engine ID.
+                let mut engine = self
+                    .inner
+                    .engine
+                    .write()
+                    .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
+                let engine_state = if let Some(cache) = &self.inner.engine_cache {
+                    cache.replace_target(self.peer_addr(), engine_state)?
+                } else {
+                    engine_state
+                };
+                *engine = Some(ClientEngine::new(engine_state, derived_keys));
+                return Ok(());
+            }
+
+            // A concurrent client sharing this cache may already have installed a
+            // newer identity/time generation. Merge ordinary discovery without
+            // replacing an active target mapping, then derive keys for the
+            // canonical identity.
+            let engine_state = if let Some(cache) = &self.inner.engine_cache {
+                cache.insert(self.peer_addr(), engine_state.clone());
+                cache.get(&self.peer_addr()).unwrap_or(engine_state)
+            } else {
+                engine_state
+            };
+            let derived_keys = security
+                .derive_keys(&engine_state.engine_id)
+                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
             let mut engine = self
                 .inner
                 .engine
                 .write()
                 .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-            let engine_state = if let Some(cache) = &self.inner.engine_cache {
-                cache.replace_target(self.peer_addr(), engine_state)?
-            } else {
-                engine_state
-            };
             *engine = Some(ClientEngine::new(engine_state, derived_keys));
-            return Ok(());
-        }
+            Ok(())
+        })();
 
-        // A concurrent client sharing this cache may already have installed a
-        // newer identity/time generation. Merge ordinary discovery without
-        // replacing an active target mapping, then derive keys for the
-        // canonical identity.
-        let engine_state = if let Some(cache) = &self.inner.engine_cache {
-            cache.insert(self.peer_addr(), engine_state.clone());
-            cache.get(&self.peer_addr()).unwrap_or(engine_state)
-        } else {
-            engine_state
-        };
-        let derived_keys = security
-            .derive_keys(&engine_state.engine_id)
-            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-        let mut engine = self
-            .inner
-            .engine
-            .write()
-            .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-        *engine = Some(ClientEngine::new(engine_state, derived_keys));
+        install_result.map_err(|error| error.with_prior_response_metadata(&metadata))?;
 
-        Ok(())
+        Ok(metadata)
     }
 
     fn validate_discovery_response(
         &self,
-        response: &RawV3Message,
+        decoded: crate::message::DecodeOutcome<RawV3Message>,
         expected_msg_id: i32,
         source: std::net::SocketAddr,
-    ) -> Result<EngineState> {
+    ) -> Result<DiscoveryResponse> {
         let malformed = || Error::MalformedResponse { target: source }.boxed();
+        let response = decoded.value;
 
         // Discovery is deliberately unauthenticated. Authenticated or private
         // messages are not an alternative discovery response shape. RFC 3412
@@ -334,7 +360,9 @@ impl<T: Transport> Client<T> {
         else {
             return Err(malformed());
         };
-        let scoped_pdu = decode_scoped_pdu_with_consumption(bytes.clone(), *offset, source, None)?;
+        let scoped = decode_scoped_pdu_with_anomalies(bytes.clone(), *offset, source, None)?;
+        let decode_anomalies = combine_staged_v3_anomalies(decoded.anomalies, scoped.anomalies);
+        let scoped_pdu = scoped.value;
 
         // Bind the Internal-class Report to the exact outstanding discovery
         // attempt only after Security Model processing and scoped-PDU parsing.
@@ -356,7 +384,10 @@ impl<T: Transport> Client<T> {
             return Err(malformed());
         }
 
-        Ok(engine_state)
+        Ok(DiscoveryResponse {
+            engine_state,
+            metadata: ResponseMetadata::from_decode_anomalies(decode_anomalies),
+        })
     }
 
     fn refresh_engine_from_cache(&self) -> Result<()> {
@@ -564,7 +595,7 @@ impl<T: Transport> Client<T> {
         ciphertext: &Bytes,
         usm_params: &UsmSecurityParams,
         source: std::net::SocketAddr,
-    ) -> Result<ScopedPdu> {
+    ) -> Result<crate::message::DecodeOutcome<ScopedPdu>> {
         tracing::trace!(target: "async_snmp::client", { ciphertext_len = ciphertext.len() }, "decrypting response");
 
         let engine = self
@@ -600,7 +631,7 @@ impl<T: Transport> Client<T> {
 
         tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
 
-        decode_scoped_pdu_with_consumption(plaintext, 0, source, Some(priv_key.protocol()))
+        decode_scoped_pdu_with_anomalies(plaintext, 0, source, Some(priv_key.protocol()))
     }
 
     fn validate_v3_candidate(
@@ -620,9 +651,19 @@ impl<T: Transport> Client<T> {
         ) else {
             return Ok(Candidate::Reject);
         };
-        let envelope_len =
-            response_data.len() - decoded.anomaly.map_or(0, |anomaly| anomaly.trailing_bytes);
+        let trailing_bytes = decoded
+            .anomalies
+            .iter()
+            .find_map(|anomaly| match anomaly {
+                crate::DecodeAnomaly::TrailingBytes {
+                    original_length, ..
+                } => Some(*original_length),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let envelope_len = response_data.len() - trailing_bytes;
         let authenticated_message = response_data.slice(..envelope_len);
+        let mut decode_anomalies = decoded.anomalies;
         let raw = decoded.value;
         let received_level = raw.security_level();
         let Ok(usm) = UsmSecurityParams::decode_with_context(
@@ -682,9 +723,9 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let scoped_pdu = match &raw.msg_data {
+        let scoped_outcome = match &raw.msg_data {
             RawMsgData::Plaintext { data, offset } => {
-                match decode_scoped_pdu_with_consumption(data.clone(), *offset, source, None) {
+                match decode_scoped_pdu_with_anomalies(data.clone(), *offset, source, None) {
                     Ok(scoped) => scoped,
                     Err(_) => return Ok(Candidate::Reject),
                 }
@@ -697,6 +738,8 @@ impl<T: Transport> Client<T> {
                 }
             }
         };
+        decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, scoped_outcome.anomalies);
+        let scoped_pdu = scoped_outcome.value;
 
         if !msg_ids.contains(&raw.global_data.msg_id) {
             return Ok(Candidate::Reject);
@@ -722,6 +765,7 @@ impl<T: Transport> Client<T> {
             authenticated_generation: received_level
                 .requires_auth()
                 .then_some(validated_generation),
+            decode_anomalies,
         }))
     }
 
@@ -738,7 +782,7 @@ impl<T: Transport> Client<T> {
             snmp.elapsed_ms = tracing::field::Empty,
         )
     )]
-    pub(super) async fn send_v3_and_recv(&self, pdu: Pdu) -> Result<Pdu> {
+    pub(super) async fn send_v3_and_recv(&self, pdu: Pdu) -> Result<DecodedResponse> {
         let start = Instant::now();
 
         // Validate the caller's structured PDU before engine discovery, which
@@ -751,13 +795,14 @@ impl<T: Transport> Client<T> {
             crate::pdu::PduDirection::Request,
         )?;
 
-        self.ensure_engine_discovered().await?;
+        let mut exchange_metadata = self.ensure_engine_discovered().await?;
 
         let security = self
             .inner
             .config
             .usm_config()
-            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+            .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())
+            .map_err(|error| error.with_prior_response_metadata(&exchange_metadata))?;
         let security_level = security.security_level();
 
         let max_timeout_retries = if self.inner.transport.is_reliable() {
@@ -784,7 +829,9 @@ impl<T: Transport> Client<T> {
             // available to a timeout retransmission.
             let msg_id = self.next_request_id();
             let engine_time_override = packet_local_engine_time.take();
-            let request = self.build_v3_message(&pdu, msg_id, engine_time_override.as_ref())?;
+            let request = self
+                .build_v3_message(&pdu, msg_id, engine_time_override.as_ref())
+                .map_err(|error| error.with_prior_response_metadata(&exchange_metadata))?;
 
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type(), snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type());
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
@@ -815,6 +862,9 @@ impl<T: Transport> Client<T> {
                     let response_usm = validated.usm;
                     let received_level = validated.received_level;
                     let scoped_pdu = validated.scoped_pdu;
+                    let message_metadata =
+                        ResponseMetadata::from_decode_anomalies(validated.decode_anomalies);
+                    exchange_metadata.append(message_metadata);
 
                     // Publish candidate timeliness state only after every deep
                     // validation check has accepted the response.
@@ -832,12 +882,22 @@ impl<T: Transport> Client<T> {
                     }
                     if let Some(validated_generation) = validated.authenticated_generation {
                         let publication = {
-                            let mut engine = self.inner.engine.write().map_err(|_| {
-                                Error::Config("engine lock poisoned".into()).boxed()
-                            })?;
-                            let engine = engine.as_mut().ok_or_else(|| {
-                                Error::Config("engine not discovered".into()).boxed()
-                            })?;
+                            let mut engine = self
+                                .inner
+                                .engine
+                                .write()
+                                .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())
+                                .map_err(|error| {
+                                    error.with_prior_response_metadata(&exchange_metadata)
+                                })?;
+                            let engine = engine
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    Error::Config("engine not discovered".into()).boxed()
+                                })
+                                .map_err(|error| {
+                                    error.with_prior_response_metadata(&exchange_metadata)
+                                })?;
                             if !Arc::ptr_eq(&engine.generation, &validated_generation) {
                                 None
                             } else {
@@ -855,13 +915,15 @@ impl<T: Transport> Client<T> {
                             return Err(Error::MalformedResponse {
                                 target: self.peer_addr(),
                             }
-                            .boxed());
+                            .boxed()
+                            .with_prior_response_metadata(&exchange_metadata));
                         };
                         if !timely {
                             return Err(Error::Auth {
                                 target: self.peer_addr(),
                             }
-                            .boxed());
+                            .boxed()
+                            .with_prior_response_metadata(&exchange_metadata));
                         }
                     }
 
@@ -875,6 +937,7 @@ impl<T: Transport> Client<T> {
                                 target: self.peer_addr(),
                             }
                             .boxed()
+                            .with_prior_response_metadata(&exchange_metadata)
                         })?;
 
                         if matches!(status, ReportStatus::NotInTimeWindow { .. })
@@ -928,6 +991,7 @@ impl<T: Transport> Client<T> {
                         return Err(Error::Report {
                             target: self.peer_addr(),
                             status: Box::new(status),
+                            metadata: Box::new(exchange_metadata),
                         }
                         .boxed());
                     }
@@ -942,14 +1006,19 @@ impl<T: Transport> Client<T> {
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
-                        .boxed());
+                        .boxed()
+                        .with_prior_response_metadata(&exchange_metadata));
                     }
 
                     // Validate engine ID matches our cached engine state
                     {
-                        let engine =
-                            self.inner.engine.read().map_err(|_| {
-                                Error::Config("engine lock poisoned".into()).boxed()
+                        let engine = self
+                            .inner
+                            .engine
+                            .read()
+                            .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())
+                            .map_err(|error| {
+                                error.with_prior_response_metadata(&exchange_metadata)
                             })?;
                         if let Some(ref engine) = *engine
                             && response_usm.engine_id != engine.state.engine_id
@@ -960,7 +1029,8 @@ impl<T: Transport> Client<T> {
                             return Err(Error::MalformedResponse {
                                 target: self.peer_addr(),
                             }
-                            .boxed());
+                            .boxed()
+                            .with_prior_response_metadata(&exchange_metadata));
                         }
                     }
 
@@ -972,7 +1042,8 @@ impl<T: Transport> Client<T> {
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
-                        .boxed());
+                        .boxed()
+                        .with_prior_response_metadata(&exchange_metadata));
                     }
 
                     // RFC 3412 Section 7.2: an ordinary Response must match
@@ -986,7 +1057,8 @@ impl<T: Transport> Client<T> {
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
-                        .boxed());
+                        .boxed()
+                        .with_prior_response_metadata(&exchange_metadata));
                     }
 
                     let response_pdu = scoped_pdu.pdu;
@@ -999,7 +1071,8 @@ impl<T: Transport> Client<T> {
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
-                        .boxed());
+                        .boxed()
+                        .with_prior_response_metadata(&exchange_metadata));
                     }
 
                     // Validate request ID
@@ -1008,20 +1081,28 @@ impl<T: Transport> Client<T> {
                         return Err(Error::MalformedResponse {
                             target: self.peer_addr(),
                         }
-                        .boxed());
+                        .boxed()
+                        .with_prior_response_metadata(&exchange_metadata));
                     }
 
                     tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type(), snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status(), snmp.error_index = response_pdu.error_index() }, "received V3 {} response", response_pdu.pdu_type());
 
                     // Check for SNMP error
-                    if let Some(err) = super::pdu_to_snmp_error(&response_pdu, self.peer_addr()) {
+                    if let Some(err) = super::pdu_to_snmp_error(
+                        &response_pdu,
+                        self.peer_addr(),
+                        exchange_metadata.clone(),
+                    ) {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                         return Err(err);
                     }
 
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
-                    return Ok(response_pdu);
+                    return Ok(DecodedResponse {
+                        pdu: response_pdu,
+                        decode_anomalies: exchange_metadata.decode_anomalies,
+                    });
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
                     // A spoofable compatibility tuple is authorized for one
@@ -1045,7 +1126,7 @@ impl<T: Transport> Client<T> {
                 }
                 Err(e) => {
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
-                    return Err(e);
+                    return Err(e.with_prior_response_metadata(&exchange_metadata));
                 }
             }
         }
@@ -1060,7 +1141,8 @@ impl<T: Transport> Client<T> {
             elapsed,
             retries: timeout_retries,
         }
-        .boxed())
+        .boxed()
+        .with_prior_response_metadata(&exchange_metadata))
     }
 
     /// Ensure keys are derived against the local engine ID for V3 trap sending.

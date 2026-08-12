@@ -373,18 +373,30 @@ impl ScopedPdu {
 ///
 /// Plaintext and AES-CFB data must end exactly after the TLV. DES and 3DES
 /// may carry at most seven padding octets from their eight-octet CBC block.
-pub(crate) fn decode_scoped_pdu_with_consumption(
+#[cfg(test)]
+fn decode_scoped_pdu_with_consumption(
     data: Bytes,
     base_offset: usize,
     source: SocketAddr,
     privacy: Option<crate::v3::PrivProtocol>,
 ) -> Result<ScopedPdu> {
+    Ok(decode_scoped_pdu_with_anomalies(data, base_offset, source, privacy)?.value)
+}
+
+pub(crate) fn decode_scoped_pdu_with_anomalies(
+    data: Bytes,
+    base_offset: usize,
+    source: SocketAddr,
+    privacy: Option<crate::v3::PrivProtocol>,
+) -> Result<DecodeOutcome<ScopedPdu>> {
     let origin = if privacy.is_some() {
         DecodeErrorOrigin::DecryptedScopedPdu
     } else {
         DecodeErrorOrigin::Packet
     };
-    let mut decoder = Decoder::with_origin_context(data, base_offset, origin, Some(source));
+    let anomalies = std::cell::RefCell::new(Vec::new());
+    let mut decoder = Decoder::with_origin_context(data, base_offset, origin, Some(source))
+        .with_anomaly_sink(&anomalies);
     let scoped = ScopedPdu::decode(&mut decoder)?;
     let maximum_suffix = match privacy {
         Some(crate::v3::PrivProtocol::Des | crate::v3::PrivProtocol::Des3) => 7,
@@ -400,7 +412,29 @@ pub(crate) fn decode_scoped_pdu_with_consumption(
             remaining: decoder.remaining(),
         }));
     }
-    Ok(scoped)
+    drop(decoder);
+    Ok(DecodeOutcome {
+        value: scoped,
+        anomalies: anomalies.into_inner(),
+    })
+}
+
+/// Combine a raw outer-envelope decode with the subsequently decoded scoped
+/// PDU. The order matches full plaintext decoding: outer header/security
+/// fields, scoped-PDU (or decrypted plaintext) fields, then a top-level suffix.
+pub(crate) fn combine_staged_v3_anomalies(
+    mut outer: Vec<crate::DecodeAnomaly>,
+    inner: Vec<crate::DecodeAnomaly>,
+) -> Vec<crate::DecodeAnomaly> {
+    let suffix = matches!(
+        outer.last(),
+        Some(crate::DecodeAnomaly::TrailingBytes { .. })
+    )
+    .then(|| outer.pop())
+    .flatten();
+    outer.extend(inner);
+    outer.extend(suffix);
+    outer
 }
 
 /// `SNMPv3` message.
@@ -582,7 +616,8 @@ impl V3Message {
     /// should use [`RawV3Message::decode`] so authentication and timeliness can
     /// precede scoped-PDU parsing. A suffix after the complete message emits
     /// the stable `async_snmp::message` `trailing_bytes` anomaly event; use
-    /// [`Self::decode_with_policy`] to retain the anomaly metadata.
+    /// [`Self::decode_with_policy`] to retain accepted anomaly metadata; this
+    /// convenience method discards it.
     pub fn decode(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
     }
@@ -594,6 +629,9 @@ impl V3Message {
     }
 
     /// Decode using an explicit malformed-input compatibility policy.
+    ///
+    /// Accepted anomaly metadata is discarded. Use [`Self::decode_with_policies`]
+    /// to retain it.
     pub fn decode_with_compatibility_policy(
         data: Bytes,
         compatibility: CompatibilityPolicy,
@@ -607,7 +645,10 @@ impl V3Message {
         policy: DecodePolicy,
         compatibility: CompatibilityPolicy,
     ) -> Result<DecodeOutcome<Self>> {
-        let mut decoder = Decoder::new(data).with_compatibility_policy(compatibility);
+        let anomalies = std::cell::RefCell::new(Vec::new());
+        let mut decoder = Decoder::new(data)
+            .with_compatibility_policy(compatibility)
+            .with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
         let version = seq.read_bounded_integer(0, i32::MAX)?;
@@ -617,11 +658,19 @@ impl V3Message {
         }
 
         let value = Self::decode_from_sequence(&mut seq)?;
-        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
-        Ok(DecodeOutcome { value, anomaly })
+        finalize_envelope(&seq, &decoder, policy)?;
+        drop(seq);
+        drop(decoder);
+        Ok(DecodeOutcome {
+            value,
+            anomalies: anomalies.into_inner(),
+        })
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
+    ///
+    /// Accepted BER/value compatibility anomaly metadata is discarded. Use
+    /// [`Self::decode_with_policies`] with [`DecodePolicy::Strict`] to retain it.
     pub fn decode_strict(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
@@ -635,7 +684,7 @@ impl V3Message {
         let security_params = seq.read_octet_string()?;
         let security_params_offset = seq.offset().saturating_sub(security_params.len());
         let mut security_decoder =
-            Decoder::with_context(security_params.clone(), security_params_offset, seq.peer());
+            seq.decoder_for_same_origin(security_params.clone(), security_params_offset);
         let usm = crate::v3::UsmSecurityParams::decode_from(&mut security_decoder)?;
         if !security_decoder.is_empty() {
             return Err(security_decoder.malformed(DecodeErrorKind::TrailingData {
@@ -728,7 +777,7 @@ impl RawV3Message {
     /// rejected here, before any authentication or PDU processing. A suffix
     /// after the complete message emits the stable `async_snmp::message`
     /// `trailing_bytes` anomaly event; use [`Self::decode_with_policy`] to
-    /// retain the anomaly metadata.
+    /// retain accepted anomaly metadata; this convenience method discards it.
     pub fn decode(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
     }
@@ -741,6 +790,9 @@ impl RawV3Message {
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
+    ///
+    /// Accepted outer-envelope anomaly metadata is discarded. Use
+    /// [`Self::decode_with_policy`] with [`DecodePolicy::Strict`] to retain it.
     pub fn decode_strict(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
@@ -771,7 +823,8 @@ impl RawV3Message {
             error.peer = peer;
             return Err(Error::Decode(error).boxed());
         }
-        let mut decoder = Decoder::with_optional_peer(data, peer);
+        let anomalies = std::cell::RefCell::new(Vec::new());
+        let mut decoder = Decoder::with_optional_peer(data, peer).with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
         let version = seq.read_bounded_integer(0, i32::MAX)?;
@@ -803,8 +856,13 @@ impl RawV3Message {
             security_params_offset,
             msg_data,
         };
-        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
-        Ok(DecodeOutcome { value, anomaly })
+        finalize_envelope(&seq, &decoder, policy)?;
+        drop(seq);
+        drop(decoder);
+        Ok(DecodeOutcome {
+            value,
+            anomalies: anomalies.into_inner(),
+        })
     }
 
     /// Get the decoded global header.
@@ -882,6 +940,40 @@ pub(crate) fn classify_mpd_failure(data: Bytes) -> Option<MpdFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_plaintext_and_authpriv_anomaly_order_places_top_level_suffix_last() {
+        let outer_field = crate::DecodeAnomaly::SignedIntegerTruncation {
+            encoded_length: 5,
+            original: i32::MAX as i64 + 1,
+            canonical: i32::MIN,
+        };
+        let inner_field = crate::DecodeAnomaly::EmptyCounter64 {
+            original_length: 0,
+            canonical: 0,
+        };
+        let suffix = crate::DecodeAnomaly::TrailingBytes {
+            original_length: 2,
+            canonical_length: 0,
+        };
+        let expected = vec![outer_field.clone(), inner_field.clone(), suffix.clone()];
+
+        // Plaintext staged decoding must match the observation order of the
+        // full decoder. authPriv uses the same logical order, with decrypted
+        // plaintext occupying the scoped-PDU position.
+        for combined in [
+            combine_staged_v3_anomalies(
+                vec![outer_field.clone(), suffix.clone()],
+                vec![inner_field.clone()],
+            ),
+            combine_staged_v3_anomalies(
+                vec![outer_field.clone(), suffix.clone()],
+                vec![inner_field.clone()],
+            ),
+        ] {
+            assert_eq!(combined, expected);
+        }
+    }
     use crate::oid;
 
     fn valid_scoped_bytes() -> Bytes {
@@ -1647,40 +1739,46 @@ mod tests {
         assert_eq!(
             RawV3Message::decode_with_policy(valid.clone(), DecodePolicy::Compatible)
                 .unwrap()
-                .anomaly,
-            None
+                .anomalies,
+            Vec::<crate::DecodeAnomaly>::new()
         );
         assert_eq!(
             V3Message::decode_with_policy(valid.clone(), DecodePolicy::Strict)
                 .unwrap()
-                .anomaly,
-            None
+                .anomalies,
+            Vec::<crate::DecodeAnomaly>::new()
         );
         assert_eq!(
             crate::message::Message::decode_with_policy(valid.clone(), DecodePolicy::Strict)
                 .unwrap()
-                .anomaly,
-            None
+                .anomalies,
+            Vec::<crate::DecodeAnomaly>::new()
         );
         let mut with_root_trailing = valid.to_vec();
         with_root_trailing.extend_from_slice(&[0x05, 0]);
         let with_root_trailing = Bytes::from(with_root_trailing);
 
-        for anomaly in [
+        for anomalies in [
             RawV3Message::decode_with_policy(with_root_trailing.clone(), DecodePolicy::Compatible)
                 .unwrap()
-                .anomaly,
+                .anomalies,
             V3Message::decode_with_policy(with_root_trailing.clone(), DecodePolicy::Compatible)
                 .unwrap()
-                .anomaly,
+                .anomalies,
             crate::message::Message::decode_with_policy(
                 with_root_trailing.clone(),
                 DecodePolicy::Compatible,
             )
             .unwrap()
-            .anomaly,
+            .anomalies,
         ] {
-            assert_eq!(anomaly.unwrap().trailing_bytes, 2);
+            assert_eq!(
+                anomalies,
+                vec![crate::DecodeAnomaly::TrailingBytes {
+                    original_length: 2,
+                    canonical_length: 0,
+                }]
+            );
         }
 
         assert!(RawV3Message::decode_strict(with_root_trailing.clone()).is_err());

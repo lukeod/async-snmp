@@ -21,6 +21,32 @@ pub enum FixedCardinalityOperation {
     Set,
 }
 
+/// Metadata retained from decoding one or more network responses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseMetadata {
+    /// Accepted BER/value deviations in response and decode order.
+    pub decode_anomalies: Vec<crate::DecodeAnomaly>,
+}
+
+impl ResponseMetadata {
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.decode_anomalies.append(&mut other.decode_anomalies);
+    }
+
+    pub(crate) fn from_decode_anomalies(decode_anomalies: Vec<crate::DecodeAnomaly>) -> Self {
+        Self { decode_anomalies }
+    }
+}
+
+/// A GETBULK response and its wire-decode metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkResponse {
+    /// Every decoded binding in received order.
+    pub varbinds: Vec<VarBind>,
+    /// Wire-decode metadata.
+    pub metadata: ResponseMetadata,
+}
+
 /// A decoded fixed-cardinality response and its shape diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedCardinalityResponse {
@@ -29,6 +55,8 @@ pub struct FixedCardinalityResponse {
     pub varbinds: Vec<VarBind>,
     /// Shape anomalies. Empty means the response exactly satisfied the request shape.
     pub anomalies: Vec<ResponseShapeAnomaly>,
+    /// Accepted BER/value deviations from the wire response, in decode order.
+    pub metadata: ResponseMetadata,
 }
 
 impl FixedCardinalityResponse {
@@ -37,6 +65,7 @@ impl FixedCardinalityResponse {
             operation,
             varbinds: Vec::new(),
             anomalies: Vec::new(),
+            metadata: ResponseMetadata::default(),
         }
     }
 
@@ -196,6 +225,7 @@ pub(crate) fn classify(
             operation,
             varbinds,
             anomalies,
+            metadata: ResponseMetadata::default(),
         };
     }
 
@@ -268,6 +298,7 @@ pub(crate) fn classify(
         operation,
         varbinds,
         anomalies,
+        metadata: ResponseMetadata::default(),
     }
 }
 
@@ -308,6 +339,7 @@ mod tests {
             operation: FixedCardinalityOperation::Get,
             varbinds,
             anomalies,
+            metadata: ResponseMetadata::default(),
         }
     }
 

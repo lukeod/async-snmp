@@ -218,7 +218,7 @@ impl CommunityMessage {
     ///
     /// Suffix acceptance emits the stable `async_snmp::message`
     /// `trailing_bytes` anomaly event. Use [`Self::decode_with_policy`] to
-    /// retain the anomaly metadata.
+    /// retain accepted anomaly metadata; this convenience method discards it.
     pub fn decode(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
     }
@@ -229,6 +229,9 @@ impl CommunityMessage {
     }
 
     /// Decode using an explicit malformed-input compatibility policy.
+    ///
+    /// Accepted anomaly metadata is discarded. Use [`Self::decode_with_policies`]
+    /// to retain it.
     pub fn decode_with_compatibility_policy(
         data: Bytes,
         compatibility: CompatibilityPolicy,
@@ -246,15 +249,19 @@ impl CommunityMessage {
     }
 
     /// Decode while requiring the input to contain exactly one message TLV.
+    ///
+    /// Accepted BER/value compatibility anomaly metadata is discarded. Use
+    /// [`Self::decode_with_policies`] with [`DecodePolicy::Strict`] to retain it.
     pub fn decode_strict(data: Bytes) -> Result<Self> {
         Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
 
+    #[cfg(feature = "agent")]
     pub(crate) fn decode_with_target(data: Bytes, target: SocketAddr) -> Result<Self> {
         Ok(Self::decode_with_target_and_policy(data, target, DecodePolicy::Compatible)?.value)
     }
 
-    fn decode_with_target_and_policy(
+    pub(crate) fn decode_with_target_and_policy(
         data: Bytes,
         target: SocketAddr,
         policy: DecodePolicy,
@@ -273,8 +280,10 @@ impl CommunityMessage {
         policy: DecodePolicy,
         compatibility: CompatibilityPolicy,
     ) -> Result<DecodeOutcome<Self>> {
-        let mut decoder =
-            Decoder::with_optional_peer(data, peer).with_compatibility_policy(compatibility);
+        let anomalies = std::cell::RefCell::new(Vec::new());
+        let mut decoder = Decoder::with_optional_peer(data, peer)
+            .with_compatibility_policy(compatibility)
+            .with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
         let version_num = seq.read_bounded_integer(0, i32::MAX)?;
@@ -284,8 +293,13 @@ impl CommunityMessage {
         })?;
 
         let value = Self::decode_from_sequence(&mut seq, version)?;
-        let anomaly = finalize_envelope(&seq, &decoder, policy)?;
-        Ok(DecodeOutcome { value, anomaly })
+        finalize_envelope(&seq, &decoder, policy)?;
+        drop(seq);
+        drop(decoder);
+        Ok(DecodeOutcome {
+            value,
+            anomalies: anomalies.into_inner(),
+        })
     }
 
     /// Decode from a sequence decoder where version has already been read.

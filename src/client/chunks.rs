@@ -15,7 +15,7 @@ use crate::pdu::{Pdu, PduType};
 use crate::transport::Transport;
 
 use super::response_shape::{RequestShape, classify};
-use super::{Client, FixedCardinalityOperation, FixedCardinalityResponse};
+use super::{Client, DecodedResponse, FixedCardinalityOperation, FixedCardinalityResponse};
 
 /// One successful wire-level leaf of a chunked GET or GETNEXT operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +27,9 @@ pub struct FixedCardinalityChunk {
     /// Bindings and shape diagnostics for this leaf.
     ///
     /// Anomaly request and response indices are global to the original chunked
-    /// operation rather than local to this response.
+    /// operation rather than local to this response. Metadata also includes
+    /// recovered ancestor `tooBig` responses observed since the preceding
+    /// successful leaf, so each accepted response is represented once.
     pub response: FixedCardinalityResponse,
 }
 
@@ -50,7 +52,7 @@ pub struct FixedCardinalityChunkError {
     pub source: Box<Error>,
 }
 
-type PendingResponse<'a> = Pin<Box<dyn Future<Output = Result<Pdu>> + Send + 'a>>;
+type PendingResponse<'a> = Pin<Box<dyn Future<Output = Result<DecodedResponse>> + Send + 'a>>;
 
 /// Lazy sequential stream of wire-level GET or GETNEXT response leaves.
 ///
@@ -62,7 +64,9 @@ type PendingResponse<'a> = Pin<Box<dyn Future<Output = Result<Pdu>> + Send + 'a>
 /// most one request while being polled and does not start the next request until
 /// the caller polls again after an item is yielded.
 ///
-/// A terminal error is emitted once, after which the stream is fused.
+/// A terminal error is emitted once, after which the stream is fused. Its
+/// source retains any recovered response metadata not already emitted with a
+/// successful leaf.
 #[must_use = "streams do nothing unless polled"]
 pub struct FixedCardinalityChunkStream<'a, T: Transport> {
     client: &'a Client<T>,
@@ -73,6 +77,7 @@ pub struct FixedCardinalityChunkStream<'a, T: Transport> {
     pending: Option<PendingResponse<'a>>,
     completed_request_count: usize,
     completed_response_count: usize,
+    deferred_metadata: super::ResponseMetadata,
     done: bool,
 }
 
@@ -101,6 +106,7 @@ impl<'a, T: Transport> FixedCardinalityChunkStream<'a, T> {
             pending: None,
             completed_request_count: 0,
             completed_response_count: 0,
+            deferred_metadata: super::ResponseMetadata::default(),
             done: false,
         })
     }
@@ -133,6 +139,8 @@ impl<'a, T: Transport> FixedCardinalityChunkStream<'a, T> {
                             FixedCardinalityResponse::empty(self.operation),
                         ));
                         *failed_response = complete_response;
+                    } else {
+                        source = source.with_prior_response_metadata(&response.metadata);
                     }
                     return Err(source);
                 }
@@ -173,8 +181,10 @@ impl<'a, T: Transport> FixedCardinalityChunkStream<'a, T> {
     fn terminal_error(
         &mut self,
         failed_request_range: Range<usize>,
-        source: Box<Error>,
+        mut source: Box<Error>,
     ) -> FixedCardinalityChunkError {
+        source = source.with_prior_response_metadata(&self.deferred_metadata);
+        self.deferred_metadata = super::ResponseMetadata::default();
         self.done = true;
         self.ranges.clear();
         FixedCardinalityChunkError {
@@ -192,6 +202,9 @@ impl FixedCardinalityResponse {
         debug_assert_eq!(self.operation, response.operation);
         self.varbinds.extend(response.varbinds);
         self.anomalies.extend(response.anomalies);
+        self.metadata
+            .decode_anomalies
+            .extend(response.metadata.decode_anomalies);
     }
 }
 
@@ -223,7 +236,8 @@ impl<T: Transport> Stream for FixedCardinalityChunkStream<'_, T> {
                 .expect("a pending request must have an active range");
 
             match result {
-                Ok(pdu) => {
+                Ok(decoded) => {
+                    let pdu = decoded.pdu;
                     debug_assert_eq!(pdu.pdu_type(), PduType::Response);
                     let response_range = this.completed_response_count
                         ..this.completed_response_count + pdu.varbinds.len();
@@ -238,12 +252,17 @@ impl<T: Transport> Stream for FixedCardinalityChunkStream<'_, T> {
                             unreachable!("SET does not use the chunk stream")
                         }
                     };
-                    let response = classify(
+                    let mut response = classify(
                         request,
                         pdu.varbinds,
                         request_range.start,
                         response_range.start,
                     );
+                    response.metadata = std::mem::take(&mut this.deferred_metadata);
+                    response
+                        .metadata
+                        .decode_anomalies
+                        .extend(decoded.decode_anomalies);
 
                     if this.client.inner.config.response_shape_policy
                         == super::ResponseShapePolicy::Strict
@@ -276,6 +295,9 @@ impl<T: Transport> Stream for FixedCardinalityChunkStream<'_, T> {
                             }
                         ) =>
                 {
+                    if let Some(metadata) = source.response_metadata().cloned() {
+                        this.deferred_metadata.append(metadata);
+                    }
                     let middle = request_range.start + request_range.len() / 2;
                     tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = middle, snmp.limit_source = "remote_too_big" }, "agent tooBig response, bisecting batch");
                     this.ranges.push_front(middle..request_range.end);
@@ -337,10 +359,13 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::time::{Duration, timeout};
 
+    #[derive(Clone)]
     enum Action {
         Echo,
+        EchoWithSuffix(usize),
         Response(Vec<VarBind>),
         TooBig,
+        TooBigWithSuffix(usize),
         Fail,
     }
 
@@ -431,8 +456,12 @@ mod tests {
                     return Err(Error::Closed { target: peer }.boxed());
                 }
 
+                let suffix_length = match action {
+                    Action::EchoWithSuffix(length) | Action::TooBigWithSuffix(length) => length,
+                    _ => 0,
+                };
                 let pdu = match action {
-                    Action::Echo => {
+                    Action::Echo | Action::EchoWithSuffix(_) => {
                         let varbinds = pending
                             .record
                             .oids
@@ -448,7 +477,7 @@ mod tests {
                         Pdu::response(pending.request_id, 0, 0, varbinds)
                     }
                     Action::Response(varbinds) => Pdu::response(pending.request_id, 0, 0, varbinds),
-                    Action::TooBig => Pdu::response(
+                    Action::TooBig | Action::TooBigWithSuffix(_) => Pdu::response(
                         pending.request_id,
                         ErrorStatus::TooBig.as_i32(),
                         0,
@@ -457,7 +486,9 @@ mod tests {
                     Action::Fail => unreachable!(),
                 };
                 let message = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
-                Ok((message.encode().unwrap(), peer))
+                let mut encoded = message.encode().unwrap().to_vec();
+                encoded.extend(std::iter::repeat_n(0xa5, suffix_length));
+                Ok((Bytes::from(encoded), peer))
             }
         }
 
@@ -485,6 +516,19 @@ mod tests {
     fn test_oids(count: u32) -> Vec<Oid> {
         (0..count)
             .map(|index| Oid::from_slice(&[1, 3, 6, 1, 4, 1, 999, index]))
+            .collect()
+    }
+
+    fn trailing_lengths(metadata: &crate::client::ResponseMetadata) -> Vec<usize> {
+        metadata
+            .decode_anomalies
+            .iter()
+            .map(|anomaly| match anomaly {
+                crate::DecodeAnomaly::TrailingBytes {
+                    original_length, ..
+                } => *original_length,
+                other => panic!("expected trailing-byte anomaly, got {other:?}"),
+            })
             .collect()
     }
 
@@ -585,6 +629,73 @@ mod tests {
                 .map(|record| record.oids.len())
                 .collect::<Vec<_>>(),
             [4, 2, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn too_big_metadata_is_carried_once_into_successful_children_and_aggregate() {
+        let actions = [
+            Action::TooBigWithSuffix(1),
+            Action::EchoWithSuffix(2),
+            Action::EchoWithSuffix(3),
+        ];
+        let stream_client = client(
+            ScriptTransport::new(actions.clone()),
+            4,
+            ResponseShapePolicy::Compatible,
+        );
+        let mut stream = stream_client.get_many_chunks(&test_oids(4)).unwrap();
+
+        let left = stream.next().await.unwrap().unwrap();
+        assert_eq!(trailing_lengths(&left.response.metadata), [1, 2]);
+        let right = stream.next().await.unwrap().unwrap();
+        assert_eq!(trailing_lengths(&right.response.metadata), [3]);
+
+        let aggregate_client = client(
+            ScriptTransport::new(actions),
+            4,
+            ResponseShapePolicy::Compatible,
+        );
+        let aggregate = aggregate_client.get_many(&test_oids(4)).await.unwrap();
+        assert_eq!(trailing_lengths(&aggregate.metadata), [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn too_big_metadata_is_carried_once_into_terminal_child_failure() {
+        let transport = ScriptTransport::new([Action::TooBigWithSuffix(1), Action::Fail]);
+        let client = client(transport, 4, ResponseShapePolicy::Compatible);
+        let mut stream = client.get_many_chunks(&test_oids(4)).unwrap();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.source.kind(), crate::ErrorKind::Closed);
+        assert!(matches!(
+            error.source.exchange_source(),
+            Error::Closed { .. }
+        ));
+        assert_eq!(
+            trailing_lengths(error.source.response_metadata().unwrap()),
+            [1]
+        );
+    }
+
+    #[tokio::test]
+    async fn too_big_metadata_merges_into_terminal_snmp_error_without_wrapper() {
+        let transport =
+            ScriptTransport::new([Action::TooBigWithSuffix(1), Action::TooBigWithSuffix(2)]);
+        let client = client(transport, 2, ResponseShapePolicy::Compatible);
+        let mut stream = client.get_many_chunks(&test_oids(2)).unwrap();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error.source.as_ref(),
+            Error::Snmp {
+                status: ErrorStatus::TooBig,
+                ..
+            }
+        ));
+        assert_eq!(
+            trailing_lengths(error.source.response_metadata().unwrap()),
+            [1, 2]
         );
     }
 
