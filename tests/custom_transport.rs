@@ -251,6 +251,77 @@ async fn default_request_registers_before_an_immediate_response() {
         transport.inner.unmatched_responses.load(Ordering::Relaxed),
         0
     );
+    assert_eq!(
+        transport.send_capacity(),
+        usize::MAX,
+        "existing custom transports remain effectively unbounded by default"
+    );
+}
+
+#[derive(Clone)]
+struct FiniteCapacityTransport {
+    receive_starts: Arc<AtomicUsize>,
+    sends: Arc<AtomicUsize>,
+}
+
+impl Transport for FiniteCapacityTransport {
+    async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
+        if data.len() > self.send_capacity() {
+            return Err(Error::OutboundMessageTooLarge {
+                size: data.len(),
+                limit: self.send_capacity(),
+            }
+            .boxed());
+        }
+        self.sends.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn recv_with<T, F>(
+        &self,
+        _registration: RequestRegistration,
+        _validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+    {
+        self.receive_starts.fetch_add(1, Ordering::Relaxed);
+        Err(Error::Config("receive started".into()).boxed())
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    }
+
+    fn is_reliable(&self) -> bool {
+        true
+    }
+
+    fn send_capacity(&self) -> usize {
+        4
+    }
+}
+
+#[tokio::test]
+async fn default_request_rejects_capacity_before_receive_setup() {
+    let transport = FiniteCapacityTransport {
+        receive_starts: Arc::new(AtomicUsize::new(0)),
+        sends: Arc::new(AtomicUsize::new(0)),
+    };
+    let registration = RequestRegistration::v3(1, Duration::from_secs(1));
+
+    let error = transport.request(b"12345", registration).await.unwrap_err();
+    assert!(matches!(
+        *error,
+        Error::OutboundMessageTooLarge { size: 5, limit: 4 }
+    ));
+    assert_eq!(transport.receive_starts.load(Ordering::Relaxed), 0);
+    assert_eq!(transport.sends.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
