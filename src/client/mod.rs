@@ -9,7 +9,7 @@ mod v3;
 mod walk;
 
 pub use auth::{Auth, CommunityVersion};
-pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target};
+pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target, TargetClientBuilder};
 pub use chunks::{FixedCardinalityChunk, FixedCardinalityChunkError, FixedCardinalityChunkStream};
 pub use response_shape::{
     BulkResponse, FixedCardinalityOperation, FixedCardinalityResponse, ResponseMetadata,
@@ -21,8 +21,9 @@ pub use retry::{Retry, RetryBuilder, RetryConfigError};
 impl Client<UdpHandle> {
     /// Create a new SNMP client builder.
     ///
-    /// This is the single entry point for client construction, supporting all
-    /// SNMP versions (v1, v2c, v3) through the [`Auth`] enum.
+    /// This convenience entry point configures a library-maintained target
+    /// transport. Use [`ClientBuilder::new`] when supplying an existing
+    /// transport or reusing protocol/client policy across targets.
     ///
     /// # Example
     ///
@@ -55,8 +56,8 @@ impl Client<UdpHandle> {
     ///     client.shutdown().await;
     /// }
     /// ```
-    pub fn builder(target: impl Into<Target>, auth: impl Into<Auth>) -> ClientBuilder {
-        ClientBuilder::new(target, auth)
+    pub fn builder(target: impl Into<Target>, auth: impl Into<Auth>) -> TargetClientBuilder {
+        ClientBuilder::new(auth).target(target)
     }
 
     /// Snapshot cumulative statistics for this client's UDP endpoint.
@@ -361,10 +362,10 @@ impl ClientConfig {
 impl<T: Transport> Client<T> {
     /// Create a new client with the given transport and config.
     ///
-    /// For most use cases, prefer [`Client::builder()`] which provides a more
-    /// ergonomic API. Use this constructor when you need fine-grained control
-    /// over transport configuration (e.g., TCP connection timeout, keepalive
-    /// settings) or when using a custom [`Transport`] implementation.
+    /// For most use cases, prefer [`Client::builder()`] for a library-created
+    /// transport or [`ClientBuilder::build_with_transport`] for an existing or
+    /// custom [`Transport`]. Use this lower-level constructor when configuring
+    /// the client directly with [`ClientConfig`].
     ///
     /// # Errors
     ///

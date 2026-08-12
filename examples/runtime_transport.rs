@@ -1,6 +1,8 @@
 //! Select a configured built-in transport at runtime.
 
-use async_snmp::{Auth, BuiltinTransport, Client, RuntimeClient, TcpTransport, UdpTransport, oid};
+use async_snmp::{
+    Auth, BuiltinTransport, ClientBuilder, RuntimeClient, TcpTransport, UdpTransport, oid,
+};
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -33,7 +35,7 @@ async fn main() -> async_snmp::Result<()> {
     };
 
     let client: RuntimeClient =
-        Client::builder("unused.invalid", Auth::v2c("public")).build_with_transport(transport)?;
+        ClientBuilder::new(Auth::v2c("public")).build_with_transport(transport)?;
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
     println!("{response:?}");
     Ok(())

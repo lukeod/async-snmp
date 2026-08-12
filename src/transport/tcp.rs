@@ -56,7 +56,7 @@
 //!
 //! ```rust,no_run
 //! use async_snmp::transport::TcpTransport;
-//! use async_snmp::{Client, ClientConfig};
+//! use async_snmp::{Auth, ClientBuilder};
 //! use std::time::Duration;
 //!
 //! # async fn example() -> async_snmp::Result<()> {
@@ -65,7 +65,8 @@
 //!     Duration::from_secs(5)
 //! ).await?;
 //!
-//! let client = Client::new(transport, ClientConfig::default())?;
+//! let client = ClientBuilder::new(Auth::v2c("public"))
+//!     .build_with_transport(transport)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -281,7 +282,7 @@ impl Default for TcpTransportBuilder {
 ///
 /// ```rust,no_run
 /// use async_snmp::transport::TcpTransport;
-/// use async_snmp::{Client, ClientConfig};
+/// use async_snmp::{Auth, ClientBuilder};
 /// use std::time::Duration;
 ///
 /// # async fn example() -> async_snmp::Result<()> {
@@ -290,7 +291,8 @@ impl Default for TcpTransportBuilder {
 ///     Duration::from_secs(5)
 /// ).await?;
 ///
-/// let client = Client::new(transport, ClientConfig::default())?;
+/// let client = ClientBuilder::new(Auth::v2c("public"))
+///     .build_with_transport(transport)?;
 /// # Ok(())
 /// # }
 /// ```

@@ -1,8 +1,8 @@
 //! New unified client builder.
 //!
-//! This module provides the [`ClientBuilder`] type, a single entry point for
-//! constructing SNMP clients with any authentication mode (v1/v2c community
-//! or v3 USM).
+//! [`ClientBuilder`] configures authentication and client policy independently
+//! of transport construction. [`TargetClientBuilder`] adds the target-only
+//! policy used to construct built-in UDP and TCP transports.
 
 use std::fmt;
 use std::future::Future;
@@ -105,10 +105,15 @@ impl From<SocketAddr> for Target {
     }
 }
 
-/// Builder for constructing SNMP clients.
+/// Builder for SNMP protocol and client configuration.
 ///
-/// This is the single entry point for client construction. It supports all
-/// SNMP versions (v1, v2c, v3) through the [`Auth`] enum.
+/// This builder deliberately has no target or built-in transport settings.
+/// Call [`target`](Self::target) to configure library-created UDP or TCP
+/// transport, or [`build_with_transport`](Self::build_with_transport) when the
+/// caller already owns any type that implements [`Transport`]. Shared
+/// [`UdpTransport`] socket owners are the exception: call
+/// [`TargetClientBuilder::build_with`] to resolve a target and derive a
+/// per-target [`UdpHandle`].
 ///
 /// # Example
 ///
@@ -118,29 +123,40 @@ impl From<SocketAddr> for Target {
 ///
 /// # async fn example() -> async_snmp::Result<()> {
 /// // Simple v2c client
-/// let client = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+/// let client = ClientBuilder::new(Auth::v2c("public"))
+///     .target("192.168.1.1:161")
 ///     .connect().await?;
 ///
 /// // Using separate host and port (convenient for IPv6)
-/// let client = ClientBuilder::new(("fe80::1", 161), Auth::v2c("public"))
+/// let client = ClientBuilder::new(Auth::v2c("public"))
+///     .target(("fe80::1", 161))
 ///     .connect().await?;
 ///
 /// // v3 client with authentication
-/// let client = ClientBuilder::new("192.168.1.1:161",
+/// let client = ClientBuilder::new(
 ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"))
 ///     .request_timeout(Duration::from_secs(10))
 ///     .retry(Retry::fixed(5, Duration::ZERO))
+///     .target("192.168.1.1:161")
 ///     .connect().await?;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
+///
+/// Target-only policy cannot be attached to a preconfigured transport:
+///
+/// ```compile_fail
+/// use async_snmp::{Auth, ClientBuilder};
+/// use std::time::Duration;
+///
+/// let builder = ClientBuilder::new(Auth::v2c("public"))
+///     .construction_timeout(Duration::from_secs(2));
+/// ```
+#[derive(Debug, Clone)]
 pub struct ClientBuilder {
-    target: Target,
     auth: Auth,
     request_timeout: Duration,
     send_timeout: Duration,
-    construction_timeout: Duration,
     retry: Retry,
     max_oids_per_request: usize,
     decode_policy: crate::message::DecodePolicy,
@@ -151,10 +167,34 @@ pub struct ClientBuilder {
     oid_ordering: OidOrdering,
     max_walk_results: Option<usize>,
     engine_cache: Option<Arc<EngineCache>>,
-    strict_source: bool,
     community_response_policy: CommunityResponsePolicy,
     allow_unauthenticated_v3_time_correction: bool,
     local_authoritative_engine: Option<AuthoritativeEngine>,
+}
+
+/// Builder for constructing a client using a library-maintained target
+/// transport.
+///
+/// This state is entered with [`ClientBuilder::target`]. Target resolution,
+/// UDP source validation, and construction deadlines apply only here and
+/// cannot be configured on a preconstructed transport.
+///
+/// A target builder cannot silently discard its transport settings by
+/// switching to a preconfigured transport:
+///
+/// ```compile_fail
+/// use async_snmp::{TargetClientBuilder, TcpTransport};
+///
+/// fn invalid(builder: TargetClientBuilder, transport: TcpTransport) {
+///     let _ = builder.build_with_transport(transport);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct TargetClientBuilder {
+    client: ClientBuilder,
+    target: Target,
+    construction_timeout: Duration,
+    strict_source: bool,
 }
 
 impl ClientBuilder {
@@ -162,11 +202,6 @@ impl ClientBuilder {
     ///
     /// # Arguments
     ///
-    /// * `target` - The target address. Accepts a string (e.g., `"192.168.1.1"` or
-    ///   `"192.168.1.1:161"`), a `(host, port)` tuple (e.g., `("fe80::1", 161)`),
-    ///   or a [`SocketAddr`](std::net::SocketAddr). Port defaults to 161 if not
-    ///   specified. IPv6 addresses are supported as bare (`::1`) or bracketed
-    ///   (`[::1]:162`) forms.
     /// * `auth` - Authentication configuration (community or USM)
     ///
     /// # Example
@@ -175,25 +210,23 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder};
     ///
     /// // Using Auth::default() for v2c with "public" community
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::default());
+    /// let builder = ClientBuilder::new(Auth::default());
     ///
     /// // Using separate host and port
-    /// let builder = ClientBuilder::new(("192.168.1.1", 161), Auth::default());
+    /// let builder = ClientBuilder::new(Auth::default()).target(("192.168.1.1", 161));
     ///
     /// // Using Auth::v1() for SNMPv1
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v1("private"));
+    /// let builder = ClientBuilder::new(Auth::v1("private"));
     ///
     /// // Using Auth::usm() for SNMPv3
-    /// let builder = ClientBuilder::new("192.168.1.1:161",
+    /// let builder = ClientBuilder::new(
     ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"));
     /// ```
-    pub fn new(target: impl Into<Target>, auth: impl Into<Auth>) -> Self {
+    pub fn new(auth: impl Into<Auth>) -> Self {
         Self {
-            target: target.into(),
             auth: auth.into(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
-            construction_timeout: DEFAULT_CONSTRUCTION_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             decode_policy: crate::message::DecodePolicy::Compatible,
@@ -204,10 +237,23 @@ impl ClientBuilder {
             oid_ordering: OidOrdering::Strict,
             max_walk_results: None,
             engine_cache: None,
-            strict_source: false,
             community_response_policy: CommunityResponsePolicy::Exact,
             allow_unauthenticated_v3_time_correction: false,
             local_authoritative_engine: None,
+        }
+    }
+
+    /// Configure a target for a library-created UDP or TCP transport.
+    ///
+    /// The target accepts address strings, `(host, port)` tuples, and
+    /// [`SocketAddr`]. Strings without an explicit port default to 161.
+    #[must_use]
+    pub fn target(self, target: impl Into<Target>) -> TargetClientBuilder {
+        TargetClientBuilder {
+            client: self,
+            target: target.into(),
+            construction_timeout: DEFAULT_CONSTRUCTION_TIMEOUT,
+            strict_source: false,
         }
     }
 
@@ -222,7 +268,7 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder};
     /// use std::time::Duration;
     ///
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = ClientBuilder::new(Auth::v2c("public"))
     ///     .request_timeout(Duration::from_secs(10));
     /// ```
     #[must_use]
@@ -242,17 +288,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the total timeout for client construction (default: 5 seconds).
-    ///
-    /// One absolute deadline is shared by target resolution and any UDP bind or
-    /// TCP connect work. This setting has no effect on requests after the client
-    /// has been constructed. [`Duration::ZERO`] is an immediate deadline.
-    #[must_use]
-    pub fn construction_timeout(mut self, timeout: Duration) -> Self {
-        self.construction_timeout = timeout;
-        self
-    }
-
     /// Set the retry configuration (default: 3 retries, 1-second delay).
     ///
     /// On timeout, the client resends the request up to this many times before
@@ -268,19 +303,19 @@ impl ClientBuilder {
     /// use std::time::Duration;
     ///
     /// // No retries
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .retry(Retry::none());
     ///
     /// // 5 retries with no delay (immediate retry on timeout)
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .retry(Retry::fixed(5, Duration::ZERO));
     ///
     /// // Fixed delay between retries
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .retry(Retry::fixed(3, Duration::from_millis(200)));
     ///
     /// // Exponential backoff with jitter
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .retry(Retry::exponential(5)
     ///         .max_delay(Duration::from_secs(5))
     ///         .jitter(0.25)
@@ -306,11 +341,11 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder};
     ///
     /// // For devices with limited request handling capacity
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_oids_per_request(5);
     ///
     /// // For high-capacity devices, increase to reduce round-trips
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_oids_per_request(50);
     /// ```
     #[must_use]
@@ -388,11 +423,11 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder};
     ///
     /// // Lower value for agents with small response buffers or lossy networks
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_repetitions(10);
     ///
     /// // Higher value for fast local network walks
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_repetitions(50);
     /// ```
     #[must_use]
@@ -413,11 +448,11 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder, WalkMode};
     ///
     /// // Force GETNEXT for devices with broken GETBULK implementation
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .walk_mode(WalkMode::GetNext);
     ///
     /// // Force GETBULK for faster walks (only v2c/v3)
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .walk_mode(WalkMode::GetBulk);
     /// ```
     #[must_use]
@@ -443,7 +478,7 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder, OidOrdering};
     ///
     /// // Use relaxed ordering with a safety limit
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .oid_ordering(OidOrdering::AllowNonIncreasing)
     ///     .max_walk_results(10_000);
     /// ```
@@ -467,7 +502,7 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder};
     ///
     /// // Limit walks to at most 10,000 results
-    /// let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .max_walk_results(10_000);
     /// ```
     #[must_use]
@@ -494,7 +529,7 @@ impl ClientBuilder {
     /// let engine = AuthoritativeEngine::install(b"my-engine-id".to_vec(), |_| {
     ///     Ok::<(), Infallible>(())
     /// }).unwrap();
-    /// let builder = ClientBuilder::new(("192.168.1.1", 162),
+    /// let builder = async_snmp::Client::builder(("192.168.1.1", 162),
     ///     Auth::usm("trapuser").auth(AuthProtocol::Sha256, "password"))
     ///     .local_authoritative_engine(engine);
     /// ```
@@ -524,11 +559,11 @@ impl ClientBuilder {
     /// let cache = Arc::new(EngineCache::new());
     ///
     /// // Multiple clients can share the same cache
-    /// let builder1 = ClientBuilder::new("192.168.1.1:161",
+    /// let builder1 = async_snmp::Client::builder("192.168.1.1:161",
     ///     Auth::usm("admin").auth(AuthProtocol::Sha256, "password"))
     ///     .engine_cache(cache.clone());
     ///
-    /// let builder2 = ClientBuilder::new("192.168.1.2:161",
+    /// let builder2 = async_snmp::Client::builder("192.168.1.2:161",
     ///     Auth::usm("admin").auth(AuthProtocol::Sha256, "password"))
     ///     .engine_cache(cache.clone());
     /// ```
@@ -538,30 +573,14 @@ impl ClientBuilder {
         self
     }
 
-    /// Require UDP responses to originate from the configured target.
-    ///
-    /// By default, a UDP source mismatch only logs a warning, which permits
-    /// multihomed agents to reply
-    /// from another address. Enabling this option drops off-target datagrams
-    /// while leaving the request pending for a response from the configured
-    /// target. The policy applies to discovery and ordinary exchanges made by
-    /// [`connect`](Self::connect) or [`build_with`](Self::build_with).
-    ///
-    /// TCP is inherently connected to one peer. Clients constructed with a
-    /// custom transport configure source policy on that transport instead.
-    #[must_use]
-    pub fn strict_source(mut self, strict: bool) -> Self {
-        self.strict_source = strict;
-        self
-    }
-
     /// Set the v1/v2c response-community correlation policy.
     ///
     /// Exact byte matching is the default while UDP source checking remains
     /// permissive. `AllowMismatchFromTarget` supports proxies that rewrite the
     /// community but requires rewritten responses to come from the configured
     /// target. `AllowMismatchFromAnySource` explicitly accepts both identity
-    /// mismatches and weakens spoof resistance. [`strict_source`](Self::strict_source)
+    /// mismatches and weakens spoof resistance.
+    /// [`TargetClientBuilder::strict_source`]
     /// remains independent and always rejects off-target UDP responses.
     #[must_use]
     pub fn community_response_policy(mut self, policy: CommunityResponsePolicy) -> Self {
@@ -582,7 +601,7 @@ impl ClientBuilder {
     ///
     /// Enabling this weakens spoof resistance: an attacker able to inject a
     /// matching Report can choose the time fields on one outbound authenticated
-    /// packet. Use [`strict_source`](Self::strict_source) for UDP when the
+    /// packet. Use [`TargetClientBuilder::strict_source`] for UDP when the
     /// device does not legitimately reply from another address.
     #[must_use]
     pub fn allow_unauthenticated_v3_time_correction(mut self, allow: bool) -> Self {
@@ -601,6 +620,229 @@ impl ClientBuilder {
         config.validate_and_precompute()?;
         self.auth = config.auth;
         Ok(())
+    }
+
+    /// Build a client around an already-created transport implementation.
+    ///
+    /// This accepts any [`Transport`], including a [`TcpTransport`], a
+    /// per-target [`UdpHandle`], a [`BuiltinTransport`](crate::BuiltinTransport),
+    /// or a custom transport.
+    /// The supplied transport owns its peer address, source-validation policy,
+    /// construction, and any construction deadline. This path performs no
+    /// target resolution or socket creation.
+    ///
+    /// A shared [`UdpTransport`] is a socket owner rather than a per-target
+    /// [`Transport`]. Use [`TargetClientBuilder::build_with`] to resolve the
+    /// target and create its [`UdpHandle`] on that shared socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client configuration is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::{Auth, ClientBuilder, TcpTransport};
+    ///
+    /// # async fn example() -> async_snmp::Result<()> {
+    /// let target = "192.0.2.1:161".parse().unwrap();
+    /// let transport = TcpTransport::connect(target).await?;
+    /// let client = ClientBuilder::new(Auth::v2c("public"))
+    ///     .build_with_transport(transport)?;
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build_with_transport<T: Transport>(self, transport: T) -> Result<Client<T>> {
+        self.build_inner(transport)
+    }
+
+    /// Build `ClientConfig` from the builder settings.
+    fn build_config(&self) -> ClientConfig {
+        ClientConfig {
+            auth: self.auth.clone(),
+            decode_policy: self.decode_policy,
+            compatibility_policy: self.compatibility_policy,
+            community_response_policy: self.community_response_policy,
+            request_timeout: self.request_timeout,
+            send_timeout: self.send_timeout,
+            retry: self.retry.clone(),
+            max_oids_per_request: self.max_oids_per_request,
+            response_shape_policy: self.response_shape_policy,
+            allow_unauthenticated_v3_time_correction: self.allow_unauthenticated_v3_time_correction,
+            walk_mode: self.walk_mode,
+            oid_ordering: self.oid_ordering,
+            max_walk_results: self.max_walk_results,
+            max_repetitions: self.max_repetitions,
+            local_authoritative_engine: self.local_authoritative_engine.clone(),
+        }
+    }
+
+    /// Build the client with the given transport.
+    fn build_inner<T: Transport>(self, transport: T) -> Result<Client<T>> {
+        let config = self.build_config();
+
+        if let Some(cache) = self.engine_cache {
+            Client::with_engine_cache(transport, config, cache)
+        } else {
+            Client::new(transport, config)
+        }
+    }
+}
+
+impl TargetClientBuilder {
+    #[cfg(test)]
+    fn validate(&self) -> Result<()> {
+        self.client.validate()
+    }
+
+    #[cfg(test)]
+    fn build_config(&self) -> ClientConfig {
+        self.client.build_config()
+    }
+
+    /// Replace the target while retaining all client and target policies.
+    #[must_use]
+    pub fn target(mut self, target: impl Into<Target>) -> Self {
+        self.target = target.into();
+        self
+    }
+
+    /// Set the total timeout for client construction (default: 5 seconds).
+    ///
+    /// One absolute deadline is shared by target resolution and any UDP bind or
+    /// TCP connect work. This setting has no effect on requests after the
+    /// client has been constructed. [`Duration::ZERO`] is an immediate
+    /// deadline.
+    #[must_use]
+    pub fn construction_timeout(mut self, timeout: Duration) -> Self {
+        self.construction_timeout = timeout;
+        self
+    }
+
+    /// Require UDP responses to originate from the configured target.
+    ///
+    /// By default, a UDP source mismatch only logs a warning, which permits
+    /// multihomed agents to reply from another address. Enabling this option
+    /// drops off-target datagrams while leaving the request pending for a
+    /// response from the configured target. TCP is inherently connected to one
+    /// peer.
+    #[must_use]
+    pub fn strict_source(mut self, strict: bool) -> Self {
+        self.strict_source = strict;
+        self
+    }
+
+    /// Set the confirmed-request timeout.
+    #[must_use]
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.client = self.client.request_timeout(timeout);
+        self
+    }
+
+    /// Set the standalone-send timeout.
+    #[must_use]
+    pub fn send_timeout(mut self, timeout: Duration) -> Self {
+        self.client = self.client.send_timeout(timeout);
+        self
+    }
+
+    /// Set request retry policy.
+    #[must_use]
+    pub fn retry(mut self, retry: impl Into<Retry>) -> Self {
+        self.client = self.client.retry(retry);
+        self
+    }
+
+    /// Set the maximum OIDs encoded in one request.
+    #[must_use]
+    pub fn max_oids_per_request(mut self, max: usize) -> Self {
+        self.client = self.client.max_oids_per_request(max);
+        self
+    }
+
+    /// Set BER decoding policy.
+    #[must_use]
+    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
+        self.client = self.client.decode_policy(policy);
+        self
+    }
+
+    /// Set protocol compatibility policy.
+    #[must_use]
+    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
+        self.client = self.client.compatibility_policy(policy);
+        self
+    }
+
+    /// Select strict decoding and compatibility policies.
+    #[must_use]
+    pub fn strict_decoding(mut self) -> Self {
+        self.client = self.client.strict_decoding();
+        self
+    }
+
+    /// Set response-shape validation policy.
+    #[must_use]
+    pub fn response_shape_policy(mut self, policy: crate::client::ResponseShapePolicy) -> Self {
+        self.client = self.client.response_shape_policy(policy);
+        self
+    }
+
+    /// Set the default GETBULK max-repetitions value.
+    #[must_use]
+    pub fn max_repetitions(mut self, max: u32) -> Self {
+        self.client = self.client.max_repetitions(max);
+        self
+    }
+
+    /// Set walk operation mode.
+    #[must_use]
+    pub fn walk_mode(mut self, mode: WalkMode) -> Self {
+        self.client = self.client.walk_mode(mode);
+        self
+    }
+
+    /// Set walk OID ordering policy.
+    #[must_use]
+    pub fn oid_ordering(mut self, ordering: OidOrdering) -> Self {
+        self.client = self.client.oid_ordering(ordering);
+        self
+    }
+
+    /// Bound the number of results returned by a walk.
+    #[must_use]
+    pub fn max_walk_results(mut self, limit: usize) -> Self {
+        self.client = self.client.max_walk_results(limit);
+        self
+    }
+
+    /// Set the local authoritative engine for notifications.
+    #[must_use]
+    pub fn local_authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
+        self.client = self.client.local_authoritative_engine(engine);
+        self
+    }
+
+    /// Use a shared SNMPv3 engine cache.
+    #[must_use]
+    pub fn engine_cache(mut self, cache: Arc<EngineCache>) -> Self {
+        self.client = self.client.engine_cache(cache);
+        self
+    }
+
+    /// Set v1/v2c response-community correlation policy.
+    #[must_use]
+    pub fn community_response_policy(mut self, policy: CommunityResponsePolicy) -> Self {
+        self.client = self.client.community_response_policy(policy);
+        self
+    }
+
+    /// Allow packet-local correction from an unauthenticated v3 time report.
+    #[must_use]
+    pub fn allow_unauthenticated_v3_time_correction(mut self, allow: bool) -> Self {
+        self.client = self.client.allow_unauthenticated_v3_time_correction(allow);
+        self
     }
 
     /// Resolve all target addresses, defaulting to port 161.
@@ -678,38 +920,6 @@ impl ClientBuilder {
         .boxed())
     }
 
-    /// Build `ClientConfig` from the builder settings.
-    fn build_config(&self) -> ClientConfig {
-        ClientConfig {
-            auth: self.auth.clone(),
-            decode_policy: self.decode_policy,
-            compatibility_policy: self.compatibility_policy,
-            community_response_policy: self.community_response_policy,
-            request_timeout: self.request_timeout,
-            send_timeout: self.send_timeout,
-            retry: self.retry.clone(),
-            max_oids_per_request: self.max_oids_per_request,
-            response_shape_policy: self.response_shape_policy,
-            allow_unauthenticated_v3_time_correction: self.allow_unauthenticated_v3_time_correction,
-            walk_mode: self.walk_mode,
-            oid_ordering: self.oid_ordering,
-            max_walk_results: self.max_walk_results,
-            max_repetitions: self.max_repetitions,
-            local_authoritative_engine: self.local_authoritative_engine.clone(),
-        }
-    }
-
-    /// Build the client with the given transport.
-    fn build_inner<T: Transport>(self, transport: T) -> Result<Client<T>> {
-        let config = self.build_config();
-
-        if let Some(cache) = self.engine_cache {
-            Client::with_engine_cache(transport, config, cache)
-        } else {
-            Client::new(transport, config)
-        }
-    }
-
     /// Connect via UDP (default).
     ///
     /// Creates a new UDP socket for this client. Each call allocates a
@@ -728,7 +938,7 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder};
     ///
     /// # async fn example() -> async_snmp::Result<()> {
-    /// let client = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let client = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .connect()
     ///     .await?;
     /// # Ok(())
@@ -758,7 +968,7 @@ impl ClientBuilder {
     ///
     /// # async fn example() -> async_snmp::Result<()> {
     /// let (client, control) =
-    ///     ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    ///     async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///         .connect_with_control()
     ///         .await?;
     ///
@@ -795,7 +1005,7 @@ impl ClientBuilder {
         B: FnOnce(&'static str) -> BFut,
         BFut: Future<Output = Result<UdpTransport>>,
     {
-        self.validate_and_precompute()?;
+        self.client.validate_and_precompute()?;
         let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
         let addr = self.resolve_targets_with(&deadline, resolver).await?[0];
         // Match bind address to target address family for cross-platform
@@ -811,15 +1021,18 @@ impl ClientBuilder {
             .await?;
         let control = transport.control();
         let handle = transport.handle(addr)?.strict_source(self.strict_source);
-        let client = self.build_inner(handle)?;
+        let client = self.client.build_inner(handle)?;
         Ok((client, control))
     }
 
-    /// Build a client using a shared UDP transport.
+    /// Build a per-target client handle on a shared UDP transport.
     ///
-    /// Resolves the builder's target and creates a handle for the first address
-    /// compatible with the given transport. All clients sharing a transport use
-    /// one socket and one recv loop.
+    /// This method specifically accepts a preconstructed [`UdpTransport`]
+    /// socket owner. It resolves the builder's target and creates a
+    /// [`UdpHandle`] for the first compatible address. All clients built this
+    /// way share one socket and one recv loop. For an arbitrary already-created
+    /// type that implements [`Transport`], use
+    /// [`ClientBuilder::build_with_transport`] instead.
     ///
     /// # Errors
     ///
@@ -835,9 +1048,9 @@ impl ClientBuilder {
     /// # async fn example() -> async_snmp::Result<()> {
     /// let transport = UdpTransport::bind("0.0.0.0:0").await?;
     ///
-    /// let client1 = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let client1 = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .build_with(&transport).await?;
-    /// let client2 = ClientBuilder::new("192.168.1.2:161", Auth::v2c("public"))
+    /// let client2 = async_snmp::Client::builder("192.168.1.2:161", Auth::v2c("public"))
     ///     .build_with(&transport).await?;
     /// # Ok(())
     /// # }
@@ -864,40 +1077,12 @@ impl ClientBuilder {
         R: FnOnce(String, u16) -> RFut,
         RFut: Future<Output = Result<Vec<SocketAddr>>>,
     {
-        self.validate_and_precompute()?;
+        self.client.validate_and_precompute()?;
         let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
         let candidates = self.resolve_targets_with(&deadline, resolver).await?;
         let handle = Self::select_udp_handle(transport, &self.target, &candidates)?
             .strict_source(self.strict_source);
-        self.build_inner(handle)
-    }
-
-    /// Build a client around an already-created transport.
-    ///
-    /// The supplied transport owns its peer address and any source-validation
-    /// policy. The builder target, [`strict_source`](Self::strict_source), and
-    /// [`construction_timeout`](Self::construction_timeout) settings are not
-    /// applied, and this method does not resolve an address or create a socket.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the client configuration is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use async_snmp::{Auth, ClientBuilder};
-    /// use async_snmp::transport::TcpTransport;
-    ///
-    /// # async fn example() -> async_snmp::Result<()> {
-    /// let transport = TcpTransport::connect("192.168.1.1:161".parse().unwrap()).await?;
-    /// let client = ClientBuilder::new("unused.invalid", Auth::v2c("public"))
-    ///     .build_with_transport(transport)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn build_with_transport<T: Transport>(self, transport: T) -> Result<Client<T>> {
-        self.build_inner(transport)
+        self.client.build_inner(handle)
     }
 
     /// Connect via TCP.
@@ -915,9 +1100,10 @@ impl ClientBuilder {
     /// connection attempts share the configured construction timeout.
     ///
     /// For advanced TCP configuration (connection timeout, keepalive, buffer
-    /// sizes), construct a [`TcpTransport`] directly and use [`Client::new()`].
-    /// [`TcpTransport::connect`] remains unbounded for applications that own a
-    /// different deadline policy.
+    /// sizes), construct a [`TcpTransport`] directly and pass it to
+    /// [`ClientBuilder::build_with_transport`]. [`TcpTransport::connect`]
+    /// remains unbounded for applications that own a different deadline
+    /// policy.
     ///
     /// # Errors
     ///
@@ -929,7 +1115,7 @@ impl ClientBuilder {
     /// use async_snmp::{Auth, ClientBuilder};
     ///
     /// # async fn example() -> async_snmp::Result<()> {
-    /// let client = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"))
+    /// let client = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .connect_tcp()
     ///     .await?;
     /// # Ok(())
@@ -962,7 +1148,7 @@ impl ClientBuilder {
         C: FnMut(SocketAddr) -> CFut,
         CFut: Future<Output = Result<TcpTransport>>,
     {
-        self.validate_and_precompute()?;
+        self.client.validate_and_precompute()?;
         let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
         let candidates = self.resolve_targets_with(&deadline, resolver).await?;
         let mut last_error = None;
@@ -972,7 +1158,7 @@ impl ClientBuilder {
                 .run(ConstructionStage::Connect, connector(address))
                 .await
             {
-                Ok(transport) => return self.build_inner(transport),
+                Ok(transport) => return self.client.build_inner(transport),
                 Err(error) if matches!(*error, Error::ConstructionTimeout { .. }) => {
                     return Err(error);
                 }
@@ -1080,11 +1266,9 @@ mod tests {
 
     #[test]
     fn test_builder_defaults() {
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::default());
-        assert!(matches!(builder.target, Target::Address(ref s) if s == "192.168.1.1:161"));
+        let builder = ClientBuilder::new(Auth::default());
         assert_eq!(builder.request_timeout, DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(builder.send_timeout, DEFAULT_SEND_TIMEOUT);
-        assert_eq!(builder.construction_timeout, DEFAULT_CONSTRUCTION_TIMEOUT);
         assert_eq!(
             ClientConfig::default().request_timeout,
             Duration::from_secs(5)
@@ -1103,7 +1287,6 @@ mod tests {
         assert_eq!(builder.oid_ordering, OidOrdering::Strict);
         assert!(builder.max_walk_results.is_none());
         assert!(builder.engine_cache.is_none());
-        assert!(!builder.strict_source);
         assert_eq!(
             builder.community_response_policy,
             CommunityResponsePolicy::Exact
@@ -1113,15 +1296,19 @@ mod tests {
             ClientConfig::default().community_response_policy
         );
         assert!(!builder.allow_unauthenticated_v3_time_correction);
+
+        let target = builder.target("192.168.1.1:161");
+        assert!(matches!(target.target, Target::Address(ref s) if s == "192.168.1.1:161"));
+        assert_eq!(target.construction_timeout, DEFAULT_CONSTRUCTION_TIMEOUT);
+        assert!(!target.strict_source);
     }
 
     #[test]
     fn test_builder_with_options() {
         let cache = Arc::new(EngineCache::new());
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("private"))
+        let builder = ClientBuilder::new(Auth::v2c("private"))
             .request_timeout(Duration::from_secs(10))
             .send_timeout(Duration::from_secs(8))
-            .construction_timeout(Duration::from_secs(7))
             .retry(Retry::fixed(5, Duration::ZERO))
             .max_oids_per_request(20)
             .response_shape_policy(crate::client::ResponseShapePolicy::Strict)
@@ -1130,33 +1317,39 @@ mod tests {
             .oid_ordering(OidOrdering::AllowNonIncreasing)
             .max_walk_results(1000)
             .engine_cache(cache.clone())
+            .target("192.168.1.1:161")
+            .construction_timeout(Duration::from_secs(7))
             .strict_source(true)
             .community_response_policy(CommunityResponsePolicy::AllowMismatchFromTarget)
             .allow_unauthenticated_v3_time_correction(true);
 
-        assert_eq!(builder.request_timeout, Duration::from_secs(10));
-        assert_eq!(builder.send_timeout, Duration::from_secs(8));
-        assert_eq!(builder.build_config().send_timeout, Duration::from_secs(8));
-        assert_eq!(builder.construction_timeout, Duration::from_secs(7));
-        assert_eq!(builder.retry.max_attempts(), 5);
-        assert_eq!(builder.max_oids_per_request, 20);
+        assert_eq!(builder.client.request_timeout, Duration::from_secs(10));
+        assert_eq!(builder.client.send_timeout, Duration::from_secs(8));
         assert_eq!(
-            builder.build_config().response_shape_policy,
+            builder.client.build_config().send_timeout,
+            Duration::from_secs(8)
+        );
+        assert_eq!(builder.construction_timeout, Duration::from_secs(7));
+        assert_eq!(builder.client.retry.max_attempts(), 5);
+        assert_eq!(builder.client.max_oids_per_request, 20);
+        assert_eq!(
+            builder.client.build_config().response_shape_policy,
             crate::client::ResponseShapePolicy::Strict
         );
-        assert_eq!(builder.max_repetitions, 50);
-        assert_eq!(builder.walk_mode, WalkMode::GetNext);
-        assert_eq!(builder.oid_ordering, OidOrdering::AllowNonIncreasing);
-        assert_eq!(builder.max_walk_results, Some(1000));
-        assert!(builder.engine_cache.is_some());
+        assert_eq!(builder.client.max_repetitions, 50);
+        assert_eq!(builder.client.walk_mode, WalkMode::GetNext);
+        assert_eq!(builder.client.oid_ordering, OidOrdering::AllowNonIncreasing);
+        assert_eq!(builder.client.max_walk_results, Some(1000));
+        assert!(builder.client.engine_cache.is_some());
         assert!(builder.strict_source);
         assert_eq!(
-            builder.community_response_policy,
+            builder.client.community_response_policy,
             CommunityResponsePolicy::AllowMismatchFromTarget
         );
-        assert!(builder.allow_unauthenticated_v3_time_correction);
+        assert!(builder.client.allow_unauthenticated_v3_time_correction);
         assert!(
             builder
+                .client
                 .build_config()
                 .allow_unauthenticated_v3_time_correction
         );
@@ -1170,7 +1363,7 @@ mod tests {
         let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let connector_attempts = Arc::clone(&attempts);
 
-        let client = ClientBuilder::new("device.example", Auth::v2c("public"))
+        let client = Client::builder("device.example", Auth::v2c("public"))
             .connect_tcp_with(
                 move |_, _| async move { Ok(vec![unreachable, reachable]) },
                 move |address| {
@@ -1202,7 +1395,7 @@ mod tests {
         let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let connector_attempts = Arc::clone(&attempts);
 
-        let error = ClientBuilder::new("device.example", Auth::v2c("public"))
+        let error = Client::builder("device.example", Auth::v2c("public"))
             .connect_tcp_with(
                 move |_, _| async move { Ok(vec![first, last]) },
                 move |address| {
@@ -1229,7 +1422,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pending_tcp_connect_uses_construction_deadline_and_diagnostics() {
-        let future = ClientBuilder::new("device.example:1161", Auth::v2c("public"))
+        let future = Client::builder("device.example:1161", Auth::v2c("public"))
             .request_timeout(Duration::from_secs(91))
             .construction_timeout(Duration::from_secs(5))
             .connect_tcp_with(
@@ -1261,7 +1454,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn resolution_and_tcp_connect_share_one_total_budget() {
-        let future = ClientBuilder::new("device.example", Auth::v2c("public"))
+        let future = Client::builder("device.example", Auth::v2c("public"))
             .construction_timeout(Duration::from_secs(5))
             .connect_tcp_with(
                 |_, _| async {
@@ -1293,7 +1486,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn udp_resolution_uses_construction_deadline() {
-        let future = ClientBuilder::new("device.example", Auth::v2c("public"))
+        let future = Client::builder("device.example", Auth::v2c("public"))
             .construction_timeout(Duration::from_secs(3))
             .connect_with_control_using(
                 |_, _| std::future::pending::<Result<Vec<SocketAddr>>>(),
@@ -1320,7 +1513,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn udp_bind_uses_remaining_construction_deadline() {
-        let future = ClientBuilder::new("192.0.2.1", Auth::v2c("public"))
+        let future = Client::builder("192.0.2.1", Auth::v2c("public"))
             .construction_timeout(Duration::from_secs(2))
             .connect_with_control_using(
                 |_, _| async { panic!("numeric targets must not invoke the resolver") },
@@ -1350,7 +1543,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
 
-        let client = ClientBuilder::new(address, Auth::v2c("public"))
+        let client = Client::builder(address, Auth::v2c("public"))
             .construction_timeout(Duration::from_secs(5))
             .connect_tcp()
             .await
@@ -1363,7 +1556,7 @@ mod tests {
     async fn unrepresentable_construction_timeout_precedes_resolution() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let error = ClientBuilder::new("device.example", Auth::v2c("public"))
+        let error = Client::builder("device.example", Auth::v2c("public"))
             .construction_timeout(Duration::MAX)
             .connect_tcp_with(
                 move |_, _| {
@@ -1384,7 +1577,7 @@ mod tests {
     async fn zero_construction_timeout_is_immediate() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let error = ClientBuilder::new("device.example", Auth::v2c("public"))
+        let error = Client::builder("device.example", Auth::v2c("public"))
             .construction_timeout(Duration::ZERO)
             .connect_tcp_with(
                 move |_, _| {
@@ -1410,11 +1603,11 @@ mod tests {
 
     #[test]
     fn request_and_construction_settings_are_independent() {
-        let builder = ClientBuilder::new("unused.invalid", Auth::v2c("public"))
+        let builder = Client::builder("192.0.2.1", Auth::v2c("public"))
             .request_timeout(Duration::from_secs(11))
             .construction_timeout(Duration::from_secs(17));
         assert_eq!(
-            builder.build_config().request_timeout,
+            builder.client.build_config().request_timeout,
             Duration::from_secs(11)
         );
         assert_eq!(builder.construction_timeout, Duration::from_secs(17));
@@ -1422,14 +1615,13 @@ mod tests {
 
     #[test]
     fn test_validate_community_ok() {
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::v2c("public"));
+        let builder = ClientBuilder::new(Auth::v2c("public"));
         assert!(builder.validate().is_ok());
     }
 
     #[test]
     fn test_validate_zero_max_oids_per_request_error() {
-        let builder =
-            ClientBuilder::new("192.168.1.1:161", Auth::v2c("public")).max_oids_per_request(0);
+        let builder = ClientBuilder::new(Auth::v2c("public")).max_oids_per_request(0);
         let err = builder.validate().unwrap_err();
         assert!(matches!(
             *err,
@@ -1481,7 +1673,7 @@ mod tests {
         let transport = CustomTransport {
             calls: Arc::clone(&calls),
         };
-        let client = ClientBuilder::new("unused.invalid", Auth::v2c("private"))
+        let client = ClientBuilder::new(Auth::v2c("private"))
             .request_timeout(Duration::from_secs(9))
             .retry(Retry::none())
             .max_oids_per_request(7)
@@ -1511,16 +1703,15 @@ mod tests {
         ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        let invalid = ClientBuilder::new("unused.invalid", Auth::v2c("public"))
+        let invalid = ClientBuilder::new(Auth::v2c("public"))
             .max_oids_per_request(0)
             .build_with_transport(transport.clone());
         assert!(matches!(invalid, Err(ref error) if matches!(&**error, Error::Config(_))));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        let invalid_usm = ClientBuilder::new(
-            "unused.invalid",
-            Auth::Usm(UsmConfig::new("").auth(AuthProtocol::Sha256, b"password")),
-        )
+        let invalid_usm = ClientBuilder::new(Auth::Usm(
+            UsmConfig::new("").auth(AuthProtocol::Sha256, b"password"),
+        ))
         .build_with_transport(transport);
         assert!(matches!(
             invalid_usm,
@@ -1530,26 +1721,101 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn preconfigured_custom_and_builtin_transports_cover_all_versions() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let custom = CustomTransport {
+            calls: Arc::clone(&calls),
+        };
+        let endpoint = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let peer = "127.0.0.1:161".parse().unwrap();
+
+        for (auth, expected) in [
+            (Auth::v1("private"), crate::Version::V1),
+            (Auth::v2c("public"), crate::Version::V2c),
+            (Auth::usm("operator").into(), crate::Version::V3),
+        ] {
+            let custom_client = ClientBuilder::new(auth.clone())
+                .build_with_transport(custom.clone())
+                .unwrap();
+            assert_eq!(custom_client.version(), expected);
+
+            let builtin = crate::BuiltinTransport::from(endpoint.handle(peer).unwrap());
+            let builtin_client = ClientBuilder::new(auth)
+                .build_with_transport(builtin)
+                .unwrap();
+            assert_eq!(builtin_client.version(), expected);
+        }
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn client_builder_reuse_and_target_override_preserve_last_setting() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = ClientBuilder::new(Auth::v2c("public")).request_timeout(Duration::from_secs(7));
+
+        let custom = base
+            .clone()
+            .build_with_transport(CustomTransport {
+                calls: Arc::clone(&calls),
+            })
+            .unwrap();
+        assert_eq!(custom.inner.config.request_timeout, Duration::from_secs(7));
+
+        let targeted = base
+            .target("192.0.2.1:161")
+            .request_timeout(Duration::from_secs(11))
+            .target("192.0.2.2:1161");
+        assert_eq!(targeted.client.request_timeout, Duration::from_secs(11));
+        assert_eq!(
+            targeted.target,
+            Target::Address("192.0.2.2:1161".to_owned())
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn target_resolution_errors_are_confined_to_builtin_construction() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        ClientBuilder::new(Auth::v2c("public"))
+            .build_with_transport(CustomTransport {
+                calls: Arc::clone(&calls),
+            })
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let endpoint = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let error = ClientBuilder::new(Auth::v2c("public"))
+            .target("unresolvable.invalid")
+            .build_with_resolver(&endpoint, |_, _| async {
+                Err(Error::Config("synthetic resolution failure".into()).boxed())
+            })
+            .await
+            .err()
+            .expect("synthetic resolution error must be returned");
+        assert!(error.to_string().contains("synthetic resolution failure"));
+    }
+
     #[test]
     fn test_validate_local_authoritative_engine() {
         let engine = AuthoritativeEngine::install(b"valid-engine".to_vec(), |_| {
             Ok::<(), std::convert::Infallible>(())
         })
         .unwrap();
-        let valid = ClientBuilder::new("192.168.1.1:162", Auth::usm("trapuser"))
-            .local_authoritative_engine(engine);
+        let valid = ClientBuilder::new(Auth::usm("trapuser")).local_authoritative_engine(engine);
         assert!(valid.validate().is_ok());
     }
 
     #[test]
     fn test_validate_usm_no_auth_no_priv_ok() {
-        let builder = ClientBuilder::new("192.168.1.1:161", Auth::usm("readonly"));
+        let builder = ClientBuilder::new(Auth::usm("readonly"));
         assert!(builder.validate().is_ok());
     }
 
     #[test]
     fn test_validate_usm_auth_no_priv_ok() {
-        let builder = ClientBuilder::new(
+        let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm("admin").auth(AuthProtocol::Sha256, "authpass"),
         );
@@ -1558,7 +1824,7 @@ mod tests {
 
     #[test]
     fn test_validate_usm_auth_priv_ok() {
-        let builder = ClientBuilder::new(
+        let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm("admin").auth_priv(
                 AuthProtocol::Sha256,
@@ -1572,7 +1838,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_usm_config() {
-        let builder = ClientBuilder::new(
+        let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm("admin").auth(AuthProtocol::Sha256, "pass"),
         );
@@ -1583,7 +1849,7 @@ mod tests {
     #[test]
     fn test_validate_master_keys_configs() {
         let auth_only = MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
-        let builder = ClientBuilder::new(
+        let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm("user").with_master_keys(auth_only),
         );
@@ -1593,7 +1859,7 @@ mod tests {
             .unwrap()
             .with_privacy(PrivProtocol::Aes128, b"privpass")
             .unwrap();
-        let builder = ClientBuilder::new(
+        let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm("user").with_master_keys(auth_priv),
         );
@@ -1602,7 +1868,7 @@ mod tests {
 
     #[test]
     fn test_build_config_preserves_v3_context_name() {
-        let builder = ClientBuilder::new(
+        let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm("admin")
                 .auth(AuthProtocol::Sha256, "authpass")
@@ -1619,7 +1885,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_host_port_tuple() {
-        let builder = ClientBuilder::new(("fe80::1", 161), Auth::default());
+        let builder = Client::builder(("fe80::1", 161), Auth::default());
         assert!(matches!(
             builder.target,
             Target::HostPort(ref h, 161) if h == "fe80::1"
@@ -1628,7 +1894,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_string_host_port_tuple() {
-        let builder = ClientBuilder::new(("switch.local".to_string(), 162), Auth::v2c("public"));
+        let builder = Client::builder(("switch.local".to_string(), 162), Auth::v2c("public"));
         assert!(matches!(
             builder.target,
             Target::HostPort(ref h, 162) if h == "switch.local"
@@ -1676,7 +1942,8 @@ mod tests {
             "192.0.2.1:161".parse().unwrap(),
         ];
 
-        let handle = ClientBuilder::select_udp_handle(&transport, &target, &candidates).unwrap();
+        let handle =
+            TargetClientBuilder::select_udp_handle(&transport, &target, &candidates).unwrap();
         assert_eq!(handle.peer_addr(), candidates[1]);
     }
 
@@ -1689,7 +1956,7 @@ mod tests {
             "[2001:db8::2]:161".parse().unwrap(),
         ];
 
-        let error = ClientBuilder::select_udp_handle(&transport, &target, &candidates)
+        let error = TargetClientBuilder::select_udp_handle(&transport, &target, &candidates)
             .err()
             .expect("IPv6-only candidates must be rejected for an IPv4 transport");
         assert!(matches!(*error, Error::Config(_)));
@@ -1702,14 +1969,15 @@ mod tests {
         let target = Target::from("example.invalid");
         let candidates = ["[::ffff:192.0.2.1]:161".parse().unwrap()];
 
-        let handle = ClientBuilder::select_udp_handle(&transport, &target, &candidates).unwrap();
+        let handle =
+            TargetClientBuilder::select_udp_handle(&transport, &target, &candidates).unwrap();
         assert_eq!(handle.peer_addr(), "192.0.2.1:161".parse().unwrap());
     }
 
     #[tokio::test]
     async fn test_build_with_rejects_explicit_native_ipv6_for_ipv4_transport() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let error = ClientBuilder::new("[2001:db8::1]:161", Auth::v2c("public"))
+        let error = Client::builder("[2001:db8::1]:161", Auth::v2c("public"))
             .build_with(&transport)
             .await
             .err()
@@ -1722,28 +1990,28 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_target_socket_addr() {
         let addr: SocketAddr = "10.0.0.1:162".parse().unwrap();
-        let builder = ClientBuilder::new(addr, Auth::default());
+        let builder = Client::builder(addr, Auth::default());
         let resolved = builder.resolve_targets().await.unwrap();
         assert_eq!(resolved, vec![addr]);
     }
 
     #[tokio::test]
     async fn test_resolve_target_host_port_ipv4() {
-        let builder = ClientBuilder::new(("192.168.1.1", 162), Auth::default());
+        let builder = Client::builder(("192.168.1.1", 162), Auth::default());
         let addrs = builder.resolve_targets().await.unwrap();
         assert_eq!(addrs, vec!["192.168.1.1:162".parse().unwrap()]);
     }
 
     #[tokio::test]
     async fn test_resolve_target_host_port_ipv6() {
-        let builder = ClientBuilder::new(("::1", 161), Auth::default());
+        let builder = Client::builder(("::1", 161), Auth::default());
         let addrs = builder.resolve_targets().await.unwrap();
         assert_eq!(addrs, vec!["[::1]:161".parse().unwrap()]);
     }
 
     #[tokio::test]
     async fn test_resolve_target_string_still_works() {
-        let builder = ClientBuilder::new("10.0.0.1:162", Auth::default());
+        let builder = Client::builder("10.0.0.1:162", Auth::default());
         let addrs = builder.resolve_targets().await.unwrap();
         assert_eq!(addrs, vec!["10.0.0.1:162".parse().unwrap()]);
     }
@@ -1790,7 +2058,7 @@ mod tests {
 
     #[test]
     fn decoding_policy_defaults_strict_preset_and_targeted_override() {
-        let default = ClientBuilder::new("127.0.0.1:161", Auth::v2c("public")).build_config();
+        let default = ClientBuilder::new(Auth::v2c("public")).build_config();
         assert_eq!(
             default.decode_policy,
             crate::message::DecodePolicy::Compatible
@@ -1802,7 +2070,7 @@ mod tests {
 
         let mut targeted = crate::CompatibilityPolicy::STRICT;
         targeted.empty_counter64_as_zero = true;
-        let configured = ClientBuilder::new("127.0.0.1:161", Auth::v2c("public"))
+        let configured = ClientBuilder::new(Auth::v2c("public"))
             .strict_decoding()
             .compatibility_policy(targeted)
             .build_config();

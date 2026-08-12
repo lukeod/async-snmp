@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use async_snmp::{
-    Auth, BoundedStringKind, Candidate, Client, CompatibilityPolicy, DecodeAnomaly, Error,
+    Auth, BoundedStringKind, Candidate, ClientBuilder, CompatibilityPolicy, DecodeAnomaly, Error,
     Notification, NotificationReceiver, Oid, RequestRegistration, Retry, Transport, Value,
 };
 use bytes::Bytes;
@@ -187,7 +187,7 @@ fn raw_v2c_trap(request_id: i32, extra_value: Vec<u8>) -> Bytes {
 async fn community_clients_apply_default_strict_and_targeted_value_policies() {
     let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
     for auth in [Auth::v1("public"), Auth::v2c("public")] {
-        let default = Client::builder("127.0.0.1:161", auth.clone())
+        let default = ClientBuilder::new(auth.clone())
             .retry(Retry::none())
             .build_with_transport(CommunityPolicyTransport::new(false))
             .unwrap();
@@ -200,7 +200,7 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
             }]
         ));
 
-        let strict = Client::builder("127.0.0.1:161", auth.clone())
+        let strict = ClientBuilder::new(auth.clone())
             .compatibility_policy(CompatibilityPolicy::STRICT)
             .retry(Retry::none())
             .build_with_transport(CommunityPolicyTransport::new(true))
@@ -217,7 +217,7 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
 
         let mut targeted = CompatibilityPolicy::STRICT;
         targeted.truncate_numeric_values = true;
-        let targeted = Client::builder("127.0.0.1:161", auth)
+        let targeted = ClientBuilder::new(auth)
             .compatibility_policy(targeted)
             .retry(Retry::none())
             .build_with_transport(CommunityPolicyTransport::new(false))
@@ -241,14 +241,14 @@ async fn community_client_applies_only_targeted_bounded_string_clamping() {
     let mut targeted = CompatibilityPolicy::STRICT;
     targeted.clamp_bounded_strings = true;
 
-    let rejects_unselected = Client::builder("127.0.0.1:161", Auth::v2c("public"))
+    let rejects_unselected = ClientBuilder::new(Auth::v2c("public"))
         .compatibility_policy(targeted)
         .retry(Retry::none())
         .build_with_transport(CommunityPolicyTransport::new(false))
         .unwrap();
     assert!(rejects_unselected.get(&oid).await.is_err());
 
-    let accepts_selected = Client::builder("127.0.0.1:161", Auth::v2c("public"))
+    let accepts_selected = ClientBuilder::new(Auth::v2c("public"))
         .compatibility_policy(targeted)
         .retry(Retry::none())
         .build_with_transport(CommunityPolicyTransport::with_values(vec![vec![

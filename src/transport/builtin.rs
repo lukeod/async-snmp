@@ -15,7 +15,7 @@ use std::time::Duration;
 /// Custom transports should continue to use `Client<T>` directly.
 ///
 /// ```rust,no_run
-/// use async_snmp::{Auth, BuiltinTransport, Client, RuntimeClient, TcpTransport};
+/// use async_snmp::{Auth, BuiltinTransport, ClientBuilder, RuntimeClient, TcpTransport};
 ///
 /// # async fn example() -> async_snmp::Result<()> {
 /// let target = "192.0.2.1:161".parse().unwrap();
@@ -23,7 +23,7 @@ use std::time::Duration;
 ///     .max_message_size(256 * 1024)
 ///     .connect(target)
 ///     .await?;
-/// let client: RuntimeClient = Client::builder("unused.invalid", Auth::v2c("public"))
+/// let client: RuntimeClient = ClientBuilder::new(Auth::v2c("public"))
 ///     .build_with_transport(BuiltinTransport::from(transport))?;
 /// # let _ = client;
 /// # Ok(())

@@ -24,13 +24,19 @@
 //! ## Client setup
 //!
 //! [`Client::builder`] accepts a `(host, port)` tuple, a combined address
-//! string, or a [`std::net::SocketAddr`]. [`ClientBuilder::connect`] constructs
-//! a UDP transport; [`ClientBuilder::connect_tcp`] constructs a TCP transport.
+//! string, or a [`std::net::SocketAddr`]. [`TargetClientBuilder::connect`] constructs
+//! a UDP transport; [`TargetClientBuilder::connect_tcp`] constructs a TCP transport.
 //! Request, standalone send, and construction timeouts are independent and
 //! default to five seconds. The standalone send timeout bounds unconfirmed
 //! traps, while informs use the request timeout while awaiting a response. The
 //! construction timeout is one deadline covering name resolution and built-in
-//! transport creation.
+//! transport creation. For a preconfigured transport, use
+//! [`ClientBuilder::new`] with authentication and client policy only, then call
+//! [`ClientBuilder::build_with_transport`], which accepts any type implementing
+//! [`Transport`]; transport construction and its deadline remain
+//! application-owned. A preconstructed shared [`UdpTransport`] is a socket
+//! owner rather than a per-target transport, so pair it with a target through
+//! [`TargetClientBuilder::build_with`] to derive a [`UdpHandle`].
 //!
 //! ### SNMPv2c
 //!
@@ -172,8 +178,8 @@
 //!
 //! ### Shared UDP transport
 //!
-//! [`ClientBuilder::connect`] gives each client its own UDP endpoint.
-//! [`ClientBuilder::build_with`] instead creates a per-target client handle on
+//! [`TargetClientBuilder::connect`] gives each client its own UDP endpoint.
+//! [`TargetClientBuilder::build_with`] instead creates a per-target client handle on
 //! an existing [`UdpTransport`]. Clients built from the same transport share
 //! its socket, receive task, statistics, and lifecycle. Responses are
 //! correlated by request identity; v1/v2c also applies version and community
@@ -442,10 +448,10 @@
 //! | [`ResponseShapePolicy`] | `Compatible` | Fixed-cardinality operations preserve all received varbinds and return bounded anomalies for count, OID, successor, or SET-echo problems. `Strict` returns [`Error::ResponseShape`] with the same data and diagnostics. |
 //! | [`NotificationVarbindValidation`] | `Tolerant` | V2c/v3 TrapV2 and Inform prefixes may use non-standard names, but still require `TimeTicks` then `ObjectIdentifier` values. `Strict` also requires the RFC names and order. Rejected notifications are dropped, rejected Informs are not acknowledged, and validation failures are traced. |
 //! | [`WalkMode`], [`OidOrdering`], and walk limits | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires [`ClientBuilder::max_walk_results`] to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
-//! | UDP source correlation | off-target replies accepted with a warning | [`ClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`UdpStats::discarded_datagrams`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
+//! | UDP source correlation | off-target replies accepted with a warning | [`TargetClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`UdpStats::discarded_datagrams`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
 //! | [`CommunityResponsePolicy`] | `Exact` | V1/v2c response communities match byte-for-byte. Rewrite policies emit warnings when used; accepting rewrites from any source weakens spoof resistance, especially with permissive UDP source handling. |
 //! | [`ClientBuilder::allow_unauthenticated_v3_time_correction`] | off | Allows one correlated, packet-local correction from an unauthenticated time-window Report. The tuple is never trusted globally, but an injector can choose one packet's time fields. Use strict UDP source correlation where possible; tracing records protocol correction. |
-//! | [`ClientBuilder::request_timeout`] / [`ClientBuilder::send_timeout`] / [`ClientBuilder::construction_timeout`] | 5 seconds each | Confirmed-request waiting, unconfirmed-notification sending, and client construction use independent total deadlines. Construction uses one absolute deadline across resolution and built-in transport creation. Preconfigured transports and [`ClientBuilder::build_with_transport`] allow application-owned deadline policy. |
+//! | Request, send, and construction timeouts | 5 seconds each | [`ClientBuilder::request_timeout`] and [`ClientBuilder::send_timeout`] configure client I/O. [`TargetClientBuilder::construction_timeout`] uses one absolute deadline across resolution and built-in transport creation. Preconfigured transports and [`ClientBuilder::build_with_transport`] leave construction deadlines to the application. |
 //!
 //! [`UdpStats`] exposes UDP `correlated_datagrams`, `expired_registrations`,
 //! `discarded_datagrams`, and `malformed_datagrams` counters for endpoint
@@ -591,8 +597,9 @@ pub use client::{
     DEFAULT_MAX_REPETITIONS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
     FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
     FixedCardinalityResponse, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
-    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, Walk, WalkCollection,
-    WalkError, WalkItem, WalkMode, WalkStream, WalkStreamWithMetadata, WalkWithMetadata,
+    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder, Walk,
+    WalkCollection, WalkError, WalkItem, WalkMode, WalkStream, WalkStreamWithMetadata,
+    WalkWithMetadata,
 };
 pub use community::Community;
 pub use compatibility::{

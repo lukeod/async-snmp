@@ -6,11 +6,12 @@
 //!
 //! Key concepts:
 //! - UdpTransport: A single UDP socket shared across multiple clients
-//! - `.build_with(&transport).await`: Creates a client using the shared transport
+//! - `TargetClientBuilder::build_with(&transport)`: Resolves each target and
+//!   derives its `UdpHandle` from the preconstructed shared socket
 //! - Correlation: Community responses use request-id, version, and community;
 //!   V3 uses the outer msgID (the PDU request-id is distinct)
 //! - Source policy: Opt-in strict matching is available through
-//!   `ClientBuilder::strict_source()` or `UdpHandle::strict_source()`
+//!   `TargetClientBuilder::strict_source()` or `UdpHandle::strict_source()`
 //! - Engine cache: Share V3 target identities and trusted engine time
 //! - Endpoint stats: counters are observable through the transport or clients
 //!

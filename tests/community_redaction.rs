@@ -60,8 +60,9 @@ fn auth_message_decode_outcome_and_builder_debug_are_transitively_redacted() {
     assert_redacted(&outcome);
     assert!(format!("{outcome:?}").contains("412"));
 
-    let builder =
-        ClientBuilder::new(("192.0.2.44", 1161), auth).request_timeout(Duration::from_secs(17));
+    let builder = ClientBuilder::new(auth)
+        .request_timeout(Duration::from_secs(17))
+        .target(("192.0.2.44", 1161));
     assert_redacted(&builder);
     let builder_debug = format!("{builder:?}");
     assert!(builder_debug.contains("192.0.2.44"));

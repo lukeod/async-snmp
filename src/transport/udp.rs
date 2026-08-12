@@ -33,11 +33,16 @@
 //! community policy before consuming a response. The pending map is sharded by
 //! request ID.
 //!
-//! `connect()` creates a dedicated `UdpTransport` per client. `build_with()`
-//! shares one `UdpTransport` across many clients. The demultiplexing logic is
-//! the same in both cases; sharing avoids duplicating the socket and recv task.
+//! `connect()` creates a dedicated UDP endpoint per client.
+//! [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with)
+//! instead accepts a preconstructed `UdpTransport` socket owner and derives a
+//! per-target `UdpHandle`; it is distinct from target-free
+//! [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport),
+//! which accepts an arbitrary type that already implements `Transport`. The
+//! demultiplexing logic is the same in both UDP cases; sharing avoids
+//! duplicating the socket and recv task.
 //! Dedicated endpoints are drop-managed by default. Call
-//! [`ClientBuilder::connect_with_control`](crate::ClientBuilder::connect_with_control)
+//! [`TargetClientBuilder::connect_with_control`](crate::TargetClientBuilder::connect_with_control)
 //! or [`UdpTransport::control`] only when orderly endpoint-wide shutdown is
 //! required.
 //!

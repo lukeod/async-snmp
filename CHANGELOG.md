@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `ClientBuilder::new` now takes authentication only and contains
+  protocol/client policy. `ClientBuilder::target` produces a
+  `TargetClientBuilder` for built-in UDP/TCP construction, including target,
+  strict-source, and construction-timeout policy. Any already-created
+  `Transport` implementation, including `TcpTransport`, `UdpHandle`,
+  `BuiltinTransport`, and custom transports, uses
+  `ClientBuilder::build_with_transport` without a placeholder target. A shared
+  `UdpTransport` socket owner instead uses `TargetClientBuilder::build_with` to
+  resolve the target and derive its per-target handle.
 - **Breaking:** Notification acceptance policies now receive a borrowed
   `NotificationEnvelope` containing source, community or USM security,
   context, class, uptime, trap OID, application varbinds, request ID, and decode
@@ -55,16 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   increment paths. `UdpHandle`, UDP clients, transports, and `UdpControl`
   expose shared read-only statistics. `UdpControl` is the cloneable,
   endpoint-wide shutdown capability available through `UdpTransport::control`
-  and `ClientBuilder::connect_with_control`; direct `UdpTransport::shutdown`
+  and `TargetClientBuilder::connect_with_control`; direct `UdpTransport::shutdown`
   is removed. Completed shutdown prevents later registration and socket I/O.
 - **Breaking:** `UdpTransport::handle` now returns `Result<UdpHandle>` and rejects
   native IPv6 targets for IPv4 sockets during construction. IPv4-mapped targets
-  are normalized for IPv4 sockets, and `ClientBuilder::build_with` considers all
+  are normalized for IPv4 sockets, and `TargetClientBuilder::build_with` considers all
   resolved addresses in order until one is compatible with the shared socket.
 - **Breaking:** Request and construction deadlines are now independent.
   `ClientBuilder::request_timeout`, `ClientConfig::request_timeout`, and
   `DEFAULT_REQUEST_TIMEOUT` replace the former timeout names. The builder-only
-  `construction_timeout` defaults to `DEFAULT_CONSTRUCTION_TIMEOUT` (five
+  `TargetClientBuilder::construction_timeout` defaults to
+  `DEFAULT_CONSTRUCTION_TIMEOUT` (five
   seconds) and applies one absolute deadline across resolution, UDP bind, and
   TCP connect. Construction expiry reports the original `Target` and active
   `ConstructionStage`. `TcpTransportBuilder::connect_timeout` replaces its
@@ -126,8 +136,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Client::new` and `Client::with_engine_cache` now return `Result` and reject
   zero request batch sizes, SNMPv1 forced GETBULK walks, and unbounded relaxed
   OID ordering before I/O. `ClientBuilder::build_with_transport` constructs a
-  validated client around a custom or preconfigured transport; shared UDP
-  sockets continue to use `build_with`.
+  validated client around any already-created `Transport` implementation;
+  preconstructed shared `UdpTransport` socket owners continue to use
+  `TargetClientBuilder::build_with` to create a per-target `UdpHandle`.
 - SNMPv1/v2c responses now require byte-for-byte community equality by default,
   even when UDP source checking is permissive. Rejected responses leave the
   pending request and original deadline intact. Explicit target-only and

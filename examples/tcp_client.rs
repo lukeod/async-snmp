@@ -20,7 +20,7 @@
 //!   docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
 
 use async_snmp::{
-    Auth, AuthProtocol, Client, ClientConfig, PrivProtocol, ResponseShapePolicy, Retry,
+    Auth, AuthProtocol, Client, ClientBuilder, PrivProtocol, ResponseShapePolicy, Retry,
     TcpTransport, Transport, oid,
 };
 use std::net::SocketAddr;
@@ -80,12 +80,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Remote: {}", transport.peer_addr());
             println!("  Reliable: {}", transport.is_reliable()); // Always true for TCP
 
-            // Use Client::new for manual transport construction
-            let mut config = ClientConfig::default();
-            config.auth = Auth::v2c("public");
-            config.request_timeout = Duration::from_secs(10);
-            config.response_shape_policy = ResponseShapePolicy::Strict;
-            let client = Client::new(transport, config)?;
+            // Configure client policy independently of the preconstructed transport.
+            let client = ClientBuilder::new(Auth::v2c("public"))
+                .request_timeout(Duration::from_secs(10))
+                .response_shape_policy(ResponseShapePolicy::Strict)
+                .build_with_transport(transport)?;
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
                 Ok(response) => println!("sysName: {:?}", response.varbinds[0].value),
@@ -109,10 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(transport) => {
             println!("Connected with {}s timeout", connect_timeout.as_secs());
 
-            let mut config = ClientConfig::default();
-            config.auth = Auth::v2c("public");
-            config.request_timeout = Duration::from_secs(10);
-            let client = Client::new(transport, config)?;
+            let client = ClientBuilder::new(Auth::v2c("public"))
+                .request_timeout(Duration::from_secs(10))
+                .build_with_transport(transport)?;
 
             // Walk system subtree over TCP
             let walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;

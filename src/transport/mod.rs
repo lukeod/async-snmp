@@ -11,9 +11,10 @@
 //! | Scenario | Approach |
 //! |----------|---------|
 //! | Single target or few targets | [`Client::builder().connect()`](crate::Client::builder) - each client gets its own socket |
-//! | Many targets from one process | Share a [`UdpTransport`] via [`build_with()`](crate::ClientBuilder::build_with) - one socket, one recv loop |
-//! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::ClientBuilder::connect_tcp) |
-//! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then call [`build_with_transport()`](crate::ClientBuilder::build_with_transport) |
+//! | Many UDP targets from one process | Pass a preconstructed [`UdpTransport`] socket owner to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) - each target gets a handle on one socket and recv loop |
+//! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::TargetClientBuilder::connect_tcp) |
+//! | Preconstruct or implement any client transport | Pass the [`Transport`] implementation to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) without a target |
+//! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) |
 
 mod builtin;
 mod tcp;

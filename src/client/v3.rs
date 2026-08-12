@@ -110,7 +110,7 @@ impl<T: Transport> Client<T> {
     /// same live engine state. Independently constructed clients retain their
     /// own established identity until explicitly rediscovered. For UDP,
     /// source-address policy is controlled by
-    /// [`ClientBuilder::strict_source`](crate::ClientBuilder::strict_source) or
+    /// [`TargetClientBuilder::strict_source`](crate::TargetClientBuilder::strict_source) or
     /// by the supplied transport handle.
     ///
     /// This convenience method discards accepted discovery-response metadata.
