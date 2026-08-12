@@ -19,6 +19,7 @@ use crate::v3::{
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{Span, instrument};
 
@@ -40,7 +41,7 @@ struct ValidatedV3Response {
     usm: UsmSecurityParams,
     received_level: SecurityLevel,
     scoped_pdu: ScopedPdu,
-    authenticated: bool,
+    authenticated_generation: Option<Arc<()>>,
 }
 
 fn check_and_update_engine_timeliness(
@@ -50,20 +51,20 @@ fn check_and_update_engine_timeliness(
     engine_id: &[u8],
     msg_boots: u32,
     msg_time: u32,
-) -> bool {
-    if let Some(cache) = cache
-        && let Some((timely, cached_state)) =
-            cache.check_and_update_timeliness(&target, state, engine_id, msg_boots, msg_time)
-    {
+) -> Option<bool> {
+    if state.engine_id.as_ref() != engine_id {
+        return None;
+    }
+
+    if let Some(cache) = cache {
+        let (timely, cached_state) =
+            cache.check_and_update_timeliness(&target, state, engine_id, msg_boots, msg_time)?;
         state.merge_from(&cached_state);
-        return timely;
+        return Some(timely);
     }
 
     let timely = state.check_and_update_timeliness(msg_boots, msg_time);
-    if timely && let Some(cache) = cache {
-        cache.insert(target, state.clone());
-    }
-    timely
+    Some(timely)
 }
 
 // V3-specific Client implementation
@@ -150,10 +151,7 @@ impl<T: Transport> Client<T> {
                 .engine
                 .write()
                 .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-            *engine = Some(ClientEngine {
-                state: cached_state,
-                derived_keys,
-            });
+            *engine = Some(ClientEngine::new(cached_state, derived_keys));
             return Ok(());
         }
 
@@ -267,10 +265,7 @@ impl<T: Transport> Client<T> {
             } else {
                 engine_state
             };
-            *engine = Some(ClientEngine {
-                state: engine_state,
-                derived_keys,
-            });
+            *engine = Some(ClientEngine::new(engine_state, derived_keys));
             return Ok(());
         }
 
@@ -292,10 +287,7 @@ impl<T: Transport> Client<T> {
             .engine
             .write()
             .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-        *engine = Some(ClientEngine {
-            state: engine_state,
-            derived_keys,
-        });
+        *engine = Some(ClientEngine::new(engine_state, derived_keys));
 
         Ok(())
     }
@@ -453,7 +445,7 @@ impl<T: Transport> Client<T> {
         response_data: &[u8],
         response_usm: &UsmSecurityParams,
         received_level: SecurityLevel,
-    ) -> Result<()> {
+    ) -> Result<Arc<()>> {
         let security = self
             .inner
             .config
@@ -483,23 +475,22 @@ impl<T: Transport> Client<T> {
             .boxed());
         }
 
-        {
-            let engine = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-            let engine_matches = engine
-                .as_ref()
-                .is_some_and(|engine| engine.state.engine_id == response_usm.engine_id);
-            if !engine_matches {
-                tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "USM authoritative engine does not select the cached localized keys");
-                return Err(Error::Auth {
-                    target: self.peer_addr(),
-                }
-                .boxed());
+        let engine = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
+        let engine = engine
+            .as_ref()
+            .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?;
+        if engine.state.engine_id != response_usm.engine_id {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "USM authoritative engine does not select the cached localized keys");
+            return Err(Error::Auth {
+                target: self.peer_addr(),
             }
+            .boxed());
         }
+        let generation = Arc::clone(&engine.generation);
 
         if !received_level.requires_auth() {
             if security.security_level().requires_auth()
@@ -511,20 +502,12 @@ impl<T: Transport> Client<T> {
                 }
                 .boxed());
             }
-            return Ok(());
+            return Ok(generation);
         }
 
         tracing::trace!(target: "async_snmp::client", "verifying HMAC authentication on response");
 
-        let engine = self
-            .inner
-            .engine
-            .read()
-            .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-        let derived = &engine
-            .as_ref()
-            .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?
-            .derived_keys;
+        let derived = &engine.derived_keys;
         let auth_key = derived.auth_key.as_ref().ok_or_else(|| {
             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %AuthErrorKind::NoAuthKey }, "authentication failed");
             Error::Auth {
@@ -562,7 +545,7 @@ impl<T: Transport> Client<T> {
         }
 
         tracing::trace!(target: "async_snmp::client", { auth_params_offset = offset, auth_params_len = len }, "HMAC verification successful");
-        Ok(())
+        Ok(generation)
     }
 
     /// Decrypt an encrypted scoped PDU and parse it.
@@ -634,13 +617,12 @@ impl<T: Transport> Client<T> {
             return Ok(Candidate::Reject);
         };
 
-        if let Err(error) = self.verify_response_security(&response_data, &usm, received_level) {
-            return if matches!(*error, Error::Config(_)) {
-                Err(error)
-            } else {
-                Ok(Candidate::Reject)
+        let validated_generation =
+            match self.verify_response_security(&response_data, &usm, received_level) {
+                Ok(generation) => generation,
+                Err(error) if matches!(*error, Error::Config(_)) => return Err(error),
+                Err(_) => return Ok(Candidate::Reject),
             };
-        }
 
         if received_level.requires_auth() {
             let local_state = self
@@ -649,7 +631,13 @@ impl<T: Transport> Client<T> {
                 .read()
                 .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?
                 .as_ref()
-                .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?
+                .filter(|engine| Arc::ptr_eq(&engine.generation, &validated_generation))
+                .ok_or_else(|| {
+                    Error::Auth {
+                        target: self.peer_addr(),
+                    }
+                    .boxed()
+                })?
                 .state
                 .clone();
             let timely = self
@@ -715,7 +703,9 @@ impl<T: Transport> Client<T> {
             usm,
             received_level,
             scoped_pdu,
-            authenticated: received_level.requires_auth(),
+            authenticated_generation: received_level
+                .requires_auth()
+                .then_some(validated_generation),
         }))
     }
 
@@ -812,33 +802,43 @@ impl<T: Transport> Client<T> {
                     // Publish candidate timeliness state only after every deep
                     // validation check has accepted the response.
                     #[cfg(test)]
-                    if validated.authenticated && engine_time_override.is_some() {
+                    if validated.authenticated_generation.is_some() {
                         let hook = self
                             .inner
-                            .deferred_authenticated_update_hook
+                            .authenticated_response_validated_hook
                             .read()
-                            .expect("deferred update hook lock poisoned")
+                            .expect("authenticated response hook lock poisoned")
                             .clone();
                         if let Some(hook) = hook {
                             hook();
                         }
                     }
-                    if validated.authenticated {
-                        let timely = {
+                    if let Some(validated_generation) = validated.authenticated_generation {
+                        let publication = {
                             let mut engine = self.inner.engine.write().map_err(|_| {
                                 Error::Config("engine lock poisoned".into()).boxed()
                             })?;
                             let engine = engine.as_mut().ok_or_else(|| {
                                 Error::Config("engine not discovered".into()).boxed()
                             })?;
-                            check_and_update_engine_timeliness(
-                                &mut engine.state,
-                                self.inner.engine_cache.as_deref(),
-                                self.peer_addr(),
-                                &response_usm.engine_id,
-                                response_usm.engine_boots,
-                                response_usm.engine_time,
-                            )
+                            if !Arc::ptr_eq(&engine.generation, &validated_generation) {
+                                None
+                            } else {
+                                check_and_update_engine_timeliness(
+                                    &mut engine.state,
+                                    self.inner.engine_cache.as_deref(),
+                                    self.peer_addr(),
+                                    &response_usm.engine_id,
+                                    response_usm.engine_boots,
+                                    response_usm.engine_time,
+                                )
+                            }
+                        };
+                        let Some(timely) = publication else {
+                            return Err(Error::MalformedResponse {
+                                target: self.peer_addr(),
+                            }
+                            .boxed());
                         };
                         if !timely {
                             return Err(Error::Auth {
@@ -1271,7 +1271,7 @@ mod tests {
             5000,
         );
 
-        assert!(!timely);
+        assert_eq!(timely, None);
         assert!(cache.get(&target).is_none());
         assert!(cache.is_empty());
     }
@@ -1289,22 +1289,28 @@ mod tests {
             .expect("cached identity");
         assert!(initially_timely);
 
-        assert!(check_and_update_engine_timeliness(
-            &mut state,
-            Some(&cache),
-            target,
-            &engine_id,
-            1,
-            1400,
-        ));
-        assert!(!check_and_update_engine_timeliness(
-            &mut state,
-            Some(&cache),
-            target,
-            &engine_id,
-            1,
-            1100,
-        ));
+        assert_eq!(
+            check_and_update_engine_timeliness(
+                &mut state,
+                Some(&cache),
+                target,
+                &engine_id,
+                1,
+                1400,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            check_and_update_engine_timeliness(
+                &mut state,
+                Some(&cache),
+                target,
+                &engine_id,
+                1,
+                1100,
+            ),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1320,10 +1326,8 @@ mod tests {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
             let derived_keys = security.derive_keys(&state.engine_id).unwrap();
-            *client.inner.engine.write().expect("engine lock poisoned") = Some(ClientEngine {
-                state,
-                derived_keys,
-            });
+            *client.inner.engine.write().expect("engine lock poisoned") =
+                Some(ClientEngine::new(state, derived_keys));
         }
 
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
@@ -1354,10 +1358,8 @@ mod tests {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine-a"), 1, 42);
             let derived_keys = security.derive_keys(&state.engine_id).unwrap();
-            *client.inner.engine.write().expect("engine lock poisoned") = Some(ClientEngine {
-                state,
-                derived_keys,
-            });
+            *client.inner.engine.write().expect("engine lock poisoned") =
+                Some(ClientEngine::new(state, derived_keys));
         }
 
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
@@ -1574,8 +1576,8 @@ mod response_validation_tests {
     use bytes::Bytes;
     use std::future::ready;
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     /// Transport that answers every request with one canned response.
@@ -1696,7 +1698,77 @@ mod response_validation_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RediscoveryRaceTransport {
+        peer: SocketAddr,
+        next_request_id: Arc<AtomicI32>,
+    }
+
+    impl RediscoveryRaceTransport {
+        fn new() -> Self {
+            Self {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+                next_request_id: Arc::new(AtomicI32::new(200)),
+            }
+        }
+    }
+
+    impl Transport for RediscoveryRaceTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&self, _registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
+            Err(Error::Config("RediscoveryRaceTransport uses request()".into()).boxed())
+        }
+
+        async fn request_with<U, F>(
+            &self,
+            data: &[u8],
+            _registration: RequestRegistration,
+            mut validate: F,
+        ) -> Result<U>
+        where
+            U: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
+        {
+            let request = V3Message::decode(Bytes::copy_from_slice(data)).unwrap();
+            let usm = UsmSecurityParams::decode(request.security_params.clone()).unwrap();
+            let response = if usm.engine_id.is_empty() {
+                build_rediscovery_race_discovery_response(request)
+            } else {
+                build_rediscovery_race_authenticated_response(request)
+            };
+            match validate(response, self.peer)? {
+                Candidate::Accept(value) => Ok(value),
+                Candidate::Reject => Err(Error::Timeout {
+                    target: self.peer,
+                    elapsed: Duration::ZERO,
+                    retries: 0,
+                }
+                .boxed()),
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn alloc_request_id(&self) -> i32 {
+            self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
     const ENGINE_ID: &[u8] = b"engine";
+    const REPLACEMENT_ENGINE_ID: &[u8] = b"replacement-engine";
 
     /// Build a v3 response message under ENGINE_ID for user "user". With
     /// `auth_password` the message is authNoPriv and HMAC-signed; otherwise
@@ -1753,6 +1825,80 @@ mod response_validation_tests {
             }
             None => msg.encode().unwrap(),
         }
+    }
+
+    fn build_rediscovery_race_authenticated_response(request: V3Message) -> Bytes {
+        let msg_id = request.global_data.msg_id;
+        let scoped_request = match request.data {
+            V3MessageData::Plaintext(scoped) => scoped,
+            V3MessageData::Encrypted(_) => panic!("expected authNoPriv request"),
+        };
+        let global = MsgGlobalData::new(
+            msg_id,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::AuthNoPriv, false),
+        )
+        .unwrap();
+        let auth_key =
+            LocalizedKey::from_password(AuthProtocol::Sha1, b"authpass12345678", ENGINE_ID)
+                .unwrap();
+        let usm = UsmSecurityParams::new(
+            Bytes::from_static(ENGINE_ID),
+            1,
+            1100,
+            Bytes::from_static(b"user"),
+        )
+        .unwrap()
+        .with_auth_placeholder(auth_key.mac_len())
+        .unwrap();
+        let scoped = ScopedPdu::new(
+            scoped_request.context_engine_id,
+            scoped_request.context_name,
+            Pdu::response(scoped_request.pdu.request_id, 0, 0, vec![]),
+        );
+        let mut response = V3Message::new(global, usm.encode().unwrap(), scoped)
+            .unwrap()
+            .encode()
+            .unwrap()
+            .to_vec();
+        let (offset, len) = UsmSecurityParams::find_auth_params_offset(&response).unwrap();
+        authenticate_message(&auth_key, &mut response, offset, len).unwrap();
+        Bytes::from(response)
+    }
+
+    fn build_rediscovery_race_discovery_response(request: V3Message) -> Bytes {
+        let global = MsgGlobalData::new(
+            request.global_data.msg_id,
+            crate::MessageSize::new(65507).unwrap(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+        )
+        .unwrap();
+        let usm = UsmSecurityParams::new(
+            Bytes::from_static(REPLACEMENT_ENGINE_ID),
+            9,
+            9000,
+            Bytes::new(),
+        )
+        .unwrap();
+        let report = Pdu::standard(
+            crate::pdu::StandardPduType::Report,
+            1,
+            0,
+            0,
+            vec![crate::VarBind::new(
+                crate::v3::report_oids::unknown_engine_ids(),
+                crate::Value::Counter32(1),
+            )],
+        );
+        let scoped = ScopedPdu::new(
+            Bytes::from_static(REPLACEMENT_ENGINE_ID),
+            Bytes::new(),
+            report,
+        );
+        V3Message::new(global, usm.encode().unwrap(), scoped)
+            .unwrap()
+            .encode()
+            .unwrap()
     }
 
     fn build_deferred_update_response(request_data: &[u8], response_number: u32) -> Bytes {
@@ -1841,10 +1987,7 @@ mod response_validation_tests {
         {
             let state = EngineState::new(Bytes::from_static(ENGINE_ID), engine_boots, engine_time);
             let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
-            *client.inner.engine.write().unwrap() = Some(ClientEngine {
-                state,
-                derived_keys,
-            });
+            *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
         }
         client
     }
@@ -1865,19 +2008,20 @@ mod response_validation_tests {
         let state = EngineState::new(Bytes::from_static(ENGINE_ID), 1, 1000);
         let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
         cache.insert(client.peer_addr(), state.clone());
-        *client.inner.engine.write().unwrap() = Some(ClientEngine {
-            state,
-            derived_keys,
-        });
+        *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
 
         let (candidate_checked_tx, candidate_checked_rx) = std::sync::mpsc::channel();
         let (advancement_complete_tx, advancement_complete_rx) = std::sync::mpsc::channel();
         let advancement_complete_rx = std::sync::Mutex::new(advancement_complete_rx);
+        let first_authenticated_response = AtomicBool::new(true);
         *client
             .inner
-            .deferred_authenticated_update_hook
+            .authenticated_response_validated_hook
             .write()
             .unwrap() = Some(Arc::new(move || {
+            if !first_authenticated_response.swap(false, Ordering::SeqCst) {
+                return;
+            }
             candidate_checked_tx
                 .send(())
                 .expect("candidate-check waiter dropped");
@@ -1925,6 +2069,63 @@ mod response_validation_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v3_rediscovery_between_validation_and_publication_preserves_new_generation() {
+        let transport = RediscoveryRaceTransport::new();
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let cache = Arc::new(EngineCache::new());
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(security.clone()),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let client = Client::with_engine_cache(transport, config, cache.clone())
+            .expect("valid client config");
+        let state = EngineState::new(Bytes::from_static(ENGINE_ID), 1, 1000);
+        let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
+        cache.insert(client.peer_addr(), state.clone());
+        *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
+
+        let response_validated = Arc::new(Barrier::new(2));
+        let allow_publication = Arc::new(Barrier::new(2));
+        let hook_response_validated = Arc::clone(&response_validated);
+        let hook_allow_publication = Arc::clone(&allow_publication);
+        *client
+            .inner
+            .authenticated_response_validated_hook
+            .write()
+            .unwrap() = Some(Arc::new(move || {
+            hook_response_validated.wait();
+            hook_allow_publication.wait();
+        }));
+
+        let stale_client = client.clone();
+        let stale_request = tokio::spawn(async move {
+            stale_client
+                .send_v3_and_recv(Pdu::get_request(1, &[oid!(1, 3, 6, 1, 1)]))
+                .await
+        });
+        tokio::task::spawn_blocking(move || response_validated.wait())
+            .await
+            .expect("response-validation barrier waiter panicked");
+
+        let rediscovery = client.rediscover_engine().await;
+        tokio::task::spawn_blocking(move || allow_publication.wait())
+            .await
+            .expect("publication barrier waiter panicked");
+        rediscovery.expect("rediscovery should install the replacement engine");
+
+        let err = stale_request.await.unwrap().unwrap_err();
+        assert!(matches!(*err, Error::MalformedResponse { .. }));
+        let engine = client.inner.engine.read().unwrap();
+        let state = &engine.as_ref().unwrap().state;
+        assert_eq!(state.engine_id(), REPLACEMENT_ENGINE_ID);
+        assert!(state.trusted_time().is_none());
+        let cached = cache.get(&client.peer_addr()).unwrap();
+        assert_eq!(cached.engine_id(), REPLACEMENT_ENGINE_ID);
+        assert!(cached.trusted_time().is_none());
+    }
+
     /// RFC 3412 Section 6.3: an outgoing request advertises the manager's own
     /// receive capacity (the transport's `max_message_size`), not the remote
     /// engine's cached advertised limit.
@@ -1950,10 +2151,7 @@ mod response_validation_tests {
                 crate::MessageSize::new(9000).unwrap(),
             );
             let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
-            *client.inner.engine.write().unwrap() = Some(ClientEngine {
-                state,
-                derived_keys,
-            });
+            *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
         }
 
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);

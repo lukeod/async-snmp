@@ -158,6 +158,18 @@ impl<T: Transport> Clone for Client<T> {
 struct ClientEngine {
     state: EngineState,
     derived_keys: DerivedKeys,
+    /// Unique identity for this installed live engine generation.
+    generation: Arc<()>,
+}
+
+impl ClientEngine {
+    fn new(state: EngineState, derived_keys: DerivedKeys) -> Self {
+        Self {
+            state,
+            derived_keys,
+            generation: Arc::new(()),
+        }
+    }
 }
 
 struct ClientInner<T: Transport> {
@@ -174,7 +186,7 @@ struct ClientInner<T: Transport> {
     /// Keys derived against the local authoritative engine ID for V3 traps.
     local_derived_keys: RwLock<Option<DerivedKeys>>,
     #[cfg(test)]
-    deferred_authenticated_update_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    authenticated_response_validated_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Client configuration.
@@ -363,7 +375,7 @@ impl<T: Transport> Client<T> {
                 discovery_lock: AsyncMutex::new(()),
                 local_derived_keys: RwLock::new(None),
                 #[cfg(test)]
-                deferred_authenticated_update_hook: RwLock::new(None),
+                authenticated_response_validated_hook: RwLock::new(None),
             }),
         })
     }
