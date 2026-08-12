@@ -145,12 +145,14 @@ use std::time::Instant;
 use crate::Community;
 use bytes::Bytes;
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::instrument;
 
 use crate::error::{Error, Result};
 use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
+use crate::udp_responder::UdpResponder;
 use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, prepare_authoritative_usm};
 use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, EngineState, SaltCounter};
@@ -581,11 +583,13 @@ impl NotificationReceiverBuilder {
             target: bind_addr,
             source: e,
         })?;
+        let udp_responder = UdpResponder::new(&socket);
 
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {
                 authoritative_engine,
                 socket,
+                udp_responder,
                 local_addr,
                 usm_users,
                 communities: self.communities,
@@ -599,6 +603,7 @@ impl NotificationReceiverBuilder {
                 max_message_size: self.max_message_size,
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: self.acceptance_policy,
+                recv_gate: AsyncMutex::new(()),
             }),
         })
     }
@@ -813,6 +818,7 @@ pub struct NotificationReceiver {
 struct ReceiverInner {
     authoritative_engine: Option<AuthoritativeEngine>,
     socket: UdpSocket,
+    udp_responder: UdpResponder,
     local_addr: SocketAddr,
     /// Configured USM users for V3 authentication
     usm_users: HashMap<Bytes, UsmUser>,
@@ -844,6 +850,8 @@ struct ReceiverInner {
     /// Confirmed notifications dropped because even the alternate Response did not fit.
     snmp_silent_drops: AtomicU32,
     acceptance_policy: Option<Arc<AcceptancePolicy>>,
+    /// Fairly serializes cloned `recv` calls so each datagram has one waiter.
+    recv_gate: AsyncMutex<()>,
 }
 
 impl ReceiverInner {
@@ -939,6 +947,7 @@ impl NotificationReceiver {
             target: bind_addr,
             source: e,
         })?;
+        let udp_responder = UdpResponder::new(&socket);
 
         let engine_id = crate::v3::generate_engine_id()?;
 
@@ -946,6 +955,7 @@ impl NotificationReceiver {
             inner: Arc::new(ReceiverInner {
                 authoritative_engine: None,
                 socket,
+                udp_responder,
                 local_addr,
                 usm_users: HashMap::new(),
                 communities: Vec::new(),
@@ -959,6 +969,7 @@ impl NotificationReceiver {
                 max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: None,
+                recv_gate: AsyncMutex::new(()),
             }),
         })
     }
@@ -1050,25 +1061,32 @@ impl NotificationReceiver {
     /// Returns the notification and the source address.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn recv(&self) -> Result<(Notification, SocketAddr)> {
+        // Tokio's mutex queues callers in FIFO order. Keeping the guard while
+        // malformed/non-notification datagrams are skipped prevents a later
+        // cloned receiver from overtaking the earlier call.
+        let _recv_guard = self.inner.recv_gate.lock().await;
         let mut buf = vec![0u8; crate::UDP_RECEIVE_BUFFER_SIZE];
 
         loop {
-            let (len, source) =
-                self.inner
-                    .socket
-                    .recv_from(&mut buf)
-                    .await
-                    .map_err(|e| Error::Network {
-                        target: self.inner.local_addr,
-                        source: e,
-                    })?;
-
-            if len > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
-                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, received_size = len, advertised_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
+            let received = self
+                .inner
+                .udp_responder
+                .recv(&self.inner.socket, &mut buf)
+                .await
+                .map_err(|source| Error::Network {
+                    target: self.inner.local_addr,
+                    source,
+                })?;
+            let source = received.source;
+            if received.len > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
+                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, received_size = received.len, advertised_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
             }
-            let data = Bytes::copy_from_slice(&buf[..len]);
+            let data = Bytes::copy_from_slice(&buf[..received.len]);
 
-            match self.parse_and_respond(data, source).await {
+            match self
+                .parse_and_respond(data, source, received.destination)
+                .await
+            {
                 Ok(Some(notification)) => return Ok((notification, source)),
                 Ok(None) => {} // Not a notification PDU, ignore
                 Err(e) => {
@@ -1086,12 +1104,25 @@ impl NotificationReceiver {
         &self,
         data: Bytes,
         source: SocketAddr,
+        response_source: Option<crate::udp_responder::DestinationMetadata>,
     ) -> Result<Option<Notification>> {
         match crate::message::peek_version(data.clone(), source)? {
             Version::V1 => self.handle_v1(data, source).await,
-            Version::V2c => self.handle_v2c(data, source).await,
-            Version::V3 => self.handle_v3(data, source).await,
+            Version::V2c => self.handle_v2c_at(data, source, response_source).await,
+            Version::V3 => self.handle_v3_at(data, source, response_source).await,
         }
+    }
+
+    async fn send_response(
+        &self,
+        data: &[u8],
+        destination: SocketAddr,
+        source: Option<crate::udp_responder::DestinationMetadata>,
+    ) -> std::io::Result<()> {
+        self.inner
+            .udp_responder
+            .send_to(&self.inner.socket, data, destination, source)
+            .await
     }
 }
 
@@ -3021,9 +3052,13 @@ mod tests {
     }
 
     fn build_v2c_trap(community: &[u8]) -> Bytes {
+        build_v2c_trap_with_request_id(community, 1)
+    }
+
+    fn build_v2c_trap_with_request_id(community: &[u8], request_id: i32) -> Bytes {
         use crate::message::CommunityMessage;
         use crate::pdu::Pdu;
-        let pdu = Pdu::trap_v2(1, 100, &oids::cold_start(), vec![]);
+        let pdu = Pdu::trap_v2(request_id, 100, &oids::cold_start(), vec![]);
         CommunityMessage::v2c(Bytes::copy_from_slice(community), pdu)
             .unwrap()
             .encode()
@@ -3267,5 +3302,192 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receiver.snmp_silent_drops(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wildcard_ipv4_inform_reply_uses_received_destination_as_source() {
+        let receiver = NotificationReceiver::bind("0.0.0.0:0").await.unwrap();
+        let destination = SocketAddr::from(([127, 0, 0, 2], receiver.local_addr().port()));
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let receive_task = tokio::spawn(async move { receiver.recv().await });
+        client
+            .send_to(&build_v2c_inform(b"public"), destination)
+            .await
+            .unwrap();
+
+        let mut response = [0_u8; 1024];
+        let (_, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut response),
+        )
+        .await
+        .expect("wildcard receiver did not acknowledge Inform")
+        .unwrap();
+        assert_eq!(source.ip(), destination.ip());
+
+        let (notification, peer) = receive_task.await.unwrap().unwrap();
+        assert!(matches!(notification, Notification::InformV2c { .. }));
+        let client_addr = client.local_addr().unwrap();
+        assert_eq!(peer.port(), client_addr.port());
+        assert_eq!(peer.ip().to_canonical(), client_addr.ip().to_canonical());
+    }
+
+    #[tokio::test]
+    async fn concurrent_cloned_recv_waiters_preserve_fifo_without_stalling() {
+        use std::task::Poll;
+
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let destination = receiver.local_addr();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Hold the gate while each future is polled once. This deterministically
+        // establishes the FIFO waiter order before the datagram burst arrives.
+        let gate = receiver.inner.recv_gate.lock().await;
+        let first_receiver = receiver.clone();
+        let second_receiver = receiver.clone();
+        let third_receiver = receiver.clone();
+        let mut first = Box::pin(first_receiver.recv());
+        let mut second = Box::pin(second_receiver.recv());
+        let mut third = Box::pin(third_receiver.recv());
+        assert!(matches!(futures::poll!(&mut first), Poll::Pending));
+        assert!(matches!(futures::poll!(&mut second), Poll::Pending));
+        assert!(matches!(futures::poll!(&mut third), Poll::Pending));
+
+        for request_id in [11, 12, 13] {
+            client
+                .send_to(
+                    &build_v2c_trap_with_request_id(b"public", request_id),
+                    destination,
+                )
+                .await
+                .unwrap();
+        }
+        drop(gate);
+
+        let results = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            futures::join!(first, second, third)
+        })
+        .await
+        .expect("concurrent recv waiters stalled");
+        let request_ids = [results.0, results.1, results.2].map(|result| match result.unwrap().0 {
+            Notification::TrapV2c { request_id, .. } => request_id,
+            other => panic!("unexpected notification: {other:?}"),
+        });
+        assert_eq!(request_ids, [11, 12, 13]);
+    }
+
+    /// A dual-stack IPv6 wildcard socket receives this IPv4 datagram through
+    /// an IPv4-mapped address. The two loopback aliases make source selection
+    /// deterministic without requiring host network configuration.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wildcard_ipv6_dual_stack_inform_reply_preserves_mapped_destination() {
+        let receiver = NotificationReceiver::bind("[::]:0").await.unwrap();
+        let destination = SocketAddr::from(([127, 0, 0, 2], receiver.local_addr().port()));
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let receive_task = tokio::spawn(async move { receiver.recv().await });
+        client
+            .send_to(&build_v2c_inform(b"public"), destination)
+            .await
+            .unwrap();
+
+        let mut response = [0_u8; 1024];
+        let (_, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut response),
+        )
+        .await
+        .expect("dual-stack wildcard receiver did not acknowledge Inform")
+        .unwrap();
+        assert_eq!(source.ip(), destination.ip());
+
+        let (notification, peer) = receive_task.await.unwrap().unwrap();
+        assert!(matches!(notification, Notification::InformV2c { .. }));
+        let client_addr = client.local_addr().unwrap();
+        assert_eq!(peer.port(), client_addr.port());
+        assert_eq!(peer.ip().to_canonical(), client_addr.ip().to_canonical());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wildcard_ipv6_report_uses_received_destination_as_source() {
+        let receiver = NotificationReceiver::builder()
+            .bind("[::]:0")
+            .engine_id(b"test-report-source".to_vec())
+            .build()
+            .await
+            .unwrap();
+        let destination = SocketAddr::new(
+            std::net::Ipv6Addr::LOCALHOST.into(),
+            receiver.local_addr().port(),
+        );
+        let client = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+
+        let receive_task = tokio::spawn(async move { receiver.recv().await });
+        client
+            .send_to(&build_v3_discovery_request(42, true), destination)
+            .await
+            .unwrap();
+
+        let mut report = [0_u8; 1024];
+        let (_, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut report),
+        )
+        .await
+        .expect("wildcard receiver did not return discovery Report")
+        .unwrap();
+        assert_eq!(source.ip(), destination.ip());
+
+        receive_task.abort();
+        let _ = receive_task.await;
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "crypto-rustcrypto", feature = "crypto-fips")
+    ))]
+    #[tokio::test]
+    async fn wildcard_ipv4_v3_inform_reply_uses_received_destination_as_source() {
+        let receiver = NotificationReceiver::builder()
+            .bind("0.0.0.0:0")
+            .engine_id(b"wildcard-inform-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("informuser", |user| {
+                user.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .accept_all_notifications()
+            .build()
+            .await
+            .unwrap();
+        let destination = SocketAddr::from(([127, 0, 0, 2], receiver.local_addr().port()));
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let message = build_authed_v3_inform(
+            b"wildcard-inform-engine",
+            1,
+            0,
+            b"informuser",
+            b"authpass12345678",
+            AuthProtocol::Sha1,
+        );
+
+        let receive_task = tokio::spawn(async move { receiver.recv().await });
+        client.send_to(&message, destination).await.unwrap();
+
+        let mut response = [0_u8; 1024];
+        let (_, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut response),
+        )
+        .await
+        .expect("wildcard receiver did not acknowledge v3 Inform")
+        .unwrap();
+        assert_eq!(source.ip(), destination.ip());
+
+        let (notification, _) = receive_task.await.unwrap().unwrap();
+        assert!(matches!(notification, Notification::InformV3 { .. }));
     }
 }

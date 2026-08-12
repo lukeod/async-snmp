@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
+use crate::udp_responder::DestinationMetadata;
+
 use crate::error::{Error, Result};
 use crate::message::{CommunityMessage, MsgGlobalData};
 use crate::pdu::{Pdu, PduType};
@@ -59,10 +61,20 @@ impl super::NotificationReceiver {
     }
 
     /// Handle `SNMPv2c` message.
+    #[cfg(test)]
     pub(super) async fn handle_v2c(
         &self,
         data: Bytes,
         source: SocketAddr,
+    ) -> Result<Option<Notification>> {
+        self.handle_v2c_at(data, source, None).await
+    }
+
+    pub(super) async fn handle_v2c_at(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        response_source: Option<DestinationMetadata>,
     ) -> Result<Option<Notification>> {
         let msg = CommunityMessage::decode_with_target(data, source)?;
 
@@ -134,9 +146,7 @@ impl super::NotificationReceiver {
                 )?;
 
                 if let Some(response_bytes) = finalized.into_bytes() {
-                    self.inner
-                        .socket
-                        .send_to(&response_bytes, source)
+                    self.send_response(&response_bytes, source, response_source)
                         .await
                         .map_err(|e| Error::Network {
                             target: source,
@@ -166,10 +176,20 @@ impl super::NotificationReceiver {
     /// receiver's engine ID use the authoritative time window (Step 7a),
     /// traps under a remote authoritative engine ID use per-engine
     /// timeliness state (Step 7b).
+    #[cfg(test)]
     pub(super) async fn handle_v3(
         &self,
         data: Bytes,
         source: SocketAddr,
+    ) -> Result<Option<Notification>> {
+        self.handle_v3_at(data, source, None).await
+    }
+
+    pub(super) async fn handle_v3_at(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        response_source: Option<DestinationMetadata>,
     ) -> Result<Option<Notification>> {
         let (our_boots, our_time) = self.inner.authoritative_boots_time()?;
         let usm_ctx = V3LocalContext {
@@ -196,7 +216,7 @@ impl super::NotificationReceiver {
                 // is diagnosable at the default log level.
                 tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.failure = ?failure }, "USM processing failed for inbound message");
                 if let Some(report) = report {
-                    if let Err(e) = self.inner.socket.send_to(&report, source).await {
+                    if let Err(e) = self.send_response(&report, source, response_source).await {
                         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to send USM report");
                     } else {
                         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent USM report");
@@ -298,9 +318,7 @@ impl super::NotificationReceiver {
                 )?;
 
                 if let Some(response_bytes) = finalized.into_bytes() {
-                    self.inner
-                        .socket
-                        .send_to(&response_bytes, source)
+                    self.send_response(&response_bytes, source, response_source)
                         .await
                         .map_err(|e| Error::Network {
                             target: source,

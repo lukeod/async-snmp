@@ -1,6 +1,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, doc(auto_cfg))]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! # async-snmp
 //!
@@ -531,6 +531,7 @@ pub mod pdu;
 pub mod prelude;
 mod response_finalizer;
 pub mod transport;
+mod udp_responder;
 pub mod v3;
 pub mod value;
 pub mod varbind;

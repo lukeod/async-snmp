@@ -98,16 +98,13 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
-use std::io::IoSliceMut;
-
-use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
-
 use crate::error::{Error, ErrorStatus, Result};
 use crate::handler::{GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext};
 use crate::message_size::{MessageSize, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS};
 use crate::oid;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduBody, PduType};
+use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{
     EmptyCommunityPolicy, PreparedAuthoritativeUsm, bind_udp_socket, community_matches,
     prepare_authoritative_usm,
@@ -943,11 +940,7 @@ impl AgentBuilder {
             source: e,
         })?;
 
-        let socket_state =
-            UdpSocketState::new(UdpSockRef::from(&socket)).map_err(|e| Error::Network {
-                target: bind_addr,
-                source: e,
-            })?;
+        let udp_responder = UdpResponder::new(&socket);
 
         let cancel = self.cancel.unwrap_or_default();
 
@@ -1030,7 +1023,7 @@ impl AgentBuilder {
         Ok(Agent {
             inner: Arc::new(AgentInner {
                 socket: Arc::new(socket),
-                socket_state,
+                udp_responder,
                 local_addr,
                 communities: self.communities,
                 usm_users,
@@ -1131,7 +1124,7 @@ impl AgentState {
 /// Inner state shared across agent clones.
 pub(crate) struct AgentInner {
     pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) socket_state: UdpSocketState,
+    pub(crate) udp_responder: UdpResponder,
     pub(crate) local_addr: SocketAddr,
     pub(crate) communities: Vec<crate::Community>,
     pub(crate) usm_users: HashMap<Bytes, UsmUser>,
@@ -1468,65 +1461,61 @@ impl Agent {
                 }
             };
 
-            // UDP GRO can place multiple datagrams in one receive buffer. Each
-            // stride-delimited datagram is an independent SNMP request.
-            for range in datagram_ranges(recv_meta.len, recv_meta.stride) {
-                let data = Bytes::copy_from_slice(&buf[range]);
-                if data.len() > UDP_RECEIVE_LIMITS.advertised().as_usize() {
-                    tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, received_size = data.len(), advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
-                }
-                let agent = self.clone();
-
-                let permit = if let Some(ref sem) = self.inner.concurrency_limit {
-                    loop {
-                        tokio::select! {
-                            biased;
-                            () = self.inner.cancel.cancelled() => {
-                                tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
-                                break 'service Ok(());
-                            }
-                            result = request_tasks.join_next(), if !request_tasks.is_empty() => {
-                                if let Some(result) = result {
-                                    log_task_result(result);
-                                }
-                            }
-                            result = sem.clone().acquire_owned() => {
-                                break Some(result.expect("semaphore closed"));
-                            }
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let task_cancel = request_tasks.cancellation_token();
-                request_tasks.spawn(async move {
-                    let _permit = permit;
-
-                    // This is the only cooperative cancellation boundary. Once
-                    // handle_request is entered, its handler lifecycle and response
-                    // attempt must run to completion and must never be aborted.
-                    if task_cancel.is_cancelled() {
-                        return;
-                    }
-
-                    if let Err(error) = agent.update_engine_time() {
-                        tracing::warn!(target: "async_snmp::agent", %error, "could not persist authoritative engine time transition");
-                    }
-
-                    match agent.handle_request(data, recv_meta.addr).await {
-                        Ok(Some(response_bytes)) => {
-                            if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
-                                tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "failed to send response");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.addr, error = %e }, "error handling request");
-                        }
-                    }
-                });
+            let data = Bytes::copy_from_slice(&buf[..recv_meta.len]);
+            if data.len() > UDP_RECEIVE_LIMITS.advertised().as_usize() {
+                tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, received_size = data.len(), advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
             }
+            let agent = self.clone();
+
+            let permit = if let Some(ref sem) = self.inner.concurrency_limit {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = self.inner.cancel.cancelled() => {
+                            tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
+                            break 'service Ok(());
+                        }
+                        result = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                            if let Some(result) = result {
+                                log_task_result(result);
+                            }
+                        }
+                        result = sem.clone().acquire_owned() => {
+                            break Some(result.expect("semaphore closed"));
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+
+            let task_cancel = request_tasks.cancellation_token();
+            request_tasks.spawn(async move {
+                let _permit = permit;
+
+                // This is the only cooperative cancellation boundary. Once
+                // handle_request is entered, its handler lifecycle and response
+                // attempt must run to completion and must never be aborted.
+                if task_cancel.is_cancelled() {
+                    return;
+                }
+
+                if let Err(error) = agent.update_engine_time() {
+                    tracing::warn!(target: "async_snmp::agent", %error, "could not persist authoritative engine time transition");
+                }
+
+                match agent.handle_request(data, recv_meta.source).await {
+                    Ok(Some(response_bytes)) => {
+                        if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
+                            tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "failed to send response");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "error handling request");
+                    }
+                }
+            });
         };
 
         request_tasks.cancel();
@@ -1537,65 +1526,29 @@ impl Agent {
         run_result
     }
 
-    async fn recv_packet(&self, buf: &mut [u8]) -> Result<RecvMeta> {
-        let mut iov = [IoSliceMut::new(buf)];
-        let mut meta = [RecvMeta::default()];
-
-        loop {
-            self.inner
-                .socket
-                .readable()
-                .await
-                .map_err(|e| Error::Network {
+    async fn recv_packet(&self, buf: &mut [u8]) -> Result<ReceivedDatagram> {
+        self.inner
+            .udp_responder
+            .recv(&self.inner.socket, buf)
+            .await
+            .map_err(|source| {
+                Error::Network {
                     target: self.inner.local_addr,
-                    source: e,
-                })?;
-
-            let result = self.inner.socket.try_io(tokio::io::Interest::READABLE, || {
-                let sref = UdpSockRef::from(&*self.inner.socket);
-                self.inner.socket_state.recv(sref, &mut iov, &mut meta)
-            });
-
-            match result {
-                Ok(n) if n > 0 => return Ok(meta[0]),
-                Ok(_) => { /* fall thru to next `loop {}` iteration */ }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { /* fall thru to next `loop {}` iteration */
+                    source,
                 }
-                Err(e) => {
-                    return Err(Error::Network {
-                        target: self.inner.local_addr,
-                        source: e,
-                    }
-                    .boxed());
-                }
-            }
-        }
+                .boxed()
+            })
     }
 
-    async fn send_response(&self, data: &[u8], recv_meta: &RecvMeta) -> std::io::Result<()> {
-        let transmit = Transmit {
-            destination: recv_meta.addr,
-            ecn: None,
-            contents: data,
-            segment_size: None,
-            src_ip: recv_meta.dst_ip,
-        };
-
-        loop {
-            self.inner.socket.writable().await?;
-
-            let result = self.inner.socket.try_io(tokio::io::Interest::WRITABLE, || {
-                let sref = UdpSockRef::from(&*self.inner.socket);
-                self.inner.socket_state.try_send(sref, &transmit)
-            });
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { /* fall thru to next `loop {}` iteration */
-                }
-                Err(e) => return Err(e),
-            }
-        }
+    async fn send_response(
+        &self,
+        data: &[u8],
+        recv_meta: &ReceivedDatagram,
+    ) -> std::io::Result<()> {
+        self.inner
+            .udp_responder
+            .reply(&self.inner.socket, data, recv_meta)
+            .await
     }
 
     /// Process a single request and return the response bytes.
@@ -2062,13 +2015,6 @@ impl Agent {
     }
 }
 
-fn datagram_ranges(len: usize, stride: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
-    let stride = if stride == 0 { len.max(1) } else { stride };
-    (0..len.max(1))
-        .step_by(stride)
-        .map(move |start| start..start.saturating_add(stride).min(len))
-}
-
 impl Clone for Agent {
     fn clone(&self) -> Self {
         Self {
@@ -2131,33 +2077,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    struct CountingHandler {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl MibHandler for CountingHandler {
-        fn get<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
-            Box::pin(async move {
-                self.calls.fetch_add(1, Ordering::Relaxed);
-                Ok(GetResult::Value(Value::Integer(42)))
-            })
-        }
-
-        fn get_next<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _oid: &'a Oid,
-        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
-            Box::pin(async move { Ok(GetNextResult::EndOfMibView) })
-        }
-    }
-
     fn test_ctx() -> RequestContext {
         RequestContext {
             source: "127.0.0.1:12345".parse().unwrap(),
@@ -2183,116 +2102,6 @@ mod tests {
         })
         .await
         .expect("agent run state did not change");
-    }
-
-    #[test]
-    fn coalesced_datagram_ranges_follow_stride_and_keep_short_tail() {
-        assert_eq!(
-            datagram_ranges(10, 4).collect::<Vec<_>>(),
-            [0..4, 4..8, 8..10]
-        );
-        let empty = datagram_ranges(0, 0).collect::<Vec<_>>();
-        assert_eq!(empty.len(), 1);
-        assert_eq!(empty[0], 0..0);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn udp_gro_dispatches_each_coalesced_request() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let agent = Agent::builder()
-            .bind("127.0.0.1:0")
-            .community(b"public")
-            .handler(
-                oid!(1, 3, 6),
-                Arc::new(CountingHandler {
-                    calls: Arc::clone(&calls),
-                }),
-            )
-            .without_builtin_handlers()
-            .allow_all_access()
-            .build()
-            .await
-            .unwrap();
-        let run_agent = agent.clone();
-        let run_task = tokio::spawn(async move { run_agent.run().await });
-        wait_for_run_state(&agent, true).await;
-
-        let request = |request_id| {
-            crate::message::CommunityMessage::new(
-                Version::V2c,
-                Bytes::from_static(b"public"),
-                Pdu::get_request(request_id, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]),
-            )
-            .unwrap()
-            .encode()
-            .unwrap()
-        };
-        let first = request(17);
-        let second = request(18);
-        assert_eq!(first.len(), second.len());
-        let mut coalesced = Vec::with_capacity(first.len() + second.len());
-        coalesced.extend_from_slice(&first);
-        coalesced.extend_from_slice(&second);
-
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket_state = UdpSocketState::new(UdpSockRef::from(&client)).unwrap();
-        assert!(socket_state.max_gso_segments() >= 2);
-        let transmit = Transmit {
-            destination: agent.local_addr(),
-            ecn: None,
-            contents: &coalesced,
-            segment_size: Some(first.len()),
-            src_ip: None,
-        };
-        loop {
-            client.writable().await.unwrap();
-            match client.try_io(tokio::io::Interest::WRITABLE, || {
-                socket_state.try_send(UdpSockRef::from(&client), &transmit)
-            }) {
-                Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("failed to send segmented requests: {error}"),
-            }
-        }
-
-        let mut response_ids = HashSet::new();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            let mut response = [0_u8; UDP_RECEIVE_BUFFER_SIZE];
-            while response_ids.len() < 2 {
-                client.readable().await.unwrap();
-                let mut meta = [RecvMeta::default()];
-                let result = {
-                    let mut iov = [IoSliceMut::new(&mut response)];
-                    client.try_io(tokio::io::Interest::READABLE, || {
-                        socket_state.recv(UdpSockRef::from(&client), &mut iov, &mut meta)
-                    })
-                };
-                match result {
-                    Ok(count) => {
-                        for recv_meta in &meta[..count] {
-                            for range in datagram_ranges(recv_meta.len, recv_meta.stride) {
-                                let message = crate::message::CommunityMessage::decode(
-                                    Bytes::copy_from_slice(&response[range]),
-                                )
-                                .unwrap();
-                                response_ids.insert(message.pdu().standard().unwrap().request_id);
-                            }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => panic!("failed to receive responses: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("agent did not respond to both coalesced requests");
-
-        assert_eq!(response_ids, HashSet::from([17, 18]));
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-
-        agent.cancel().cancel();
-        run_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2344,6 +2153,46 @@ mod tests {
             agent.run().await.is_ok(),
             "a later call must acquire the guard"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wildcard_agent_reply_uses_received_destination_as_source() {
+        let agent = Agent::builder()
+            .bind("0.0.0.0:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let destination = SocketAddr::from(([127, 0, 0, 2], agent.local_addr().port()));
+        let run_agent = agent.clone();
+        let run_task = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+
+        let request = crate::message::CommunityMessage::new(
+            Version::V2c,
+            Bytes::from_static(b"public"),
+            Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&request, destination).await.unwrap();
+
+        let mut response = [0_u8; 2048];
+        let (_, source) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response))
+                .await
+                .expect("wildcard agent did not respond")
+                .unwrap();
+        assert_eq!(source.ip(), destination.ip());
+
+        agent.cancel().cancel();
+        run_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
