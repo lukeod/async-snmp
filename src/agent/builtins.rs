@@ -307,6 +307,8 @@ mod tests {
             authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
             max_message_size: 1472,
             local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
+            decode_policy: crate::message::DecodePolicy::Compatible,
+            compatibility_policy: crate::CompatibilityPolicy::default(),
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(10),
             snmp_unknown_security_models: AtomicU32::new(20),

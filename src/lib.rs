@@ -399,9 +399,9 @@
 //! Interoperability deviations are independent controls rather than a global
 //! "permissive" mode. Defaults either preserve a bounded, unambiguous value or
 //! narrowly accommodate common agent behavior. Security-sensitive relaxations
-//! are off by default. [`CompatibilityPolicy`] is supplied to low-level message
-//! decode calls; it is **not** a client-wide or receiver-wide setting. Outbound
-//! structured encoders always require canonical protocol data.
+//! are off by default. [`CompatibilityPolicy`] can be supplied to low-level
+//! decode calls or configured per network role. Outbound structured encoders
+//! always require canonical protocol data.
 //!
 //! ### Malformed BER and value normalization
 //!
@@ -430,7 +430,7 @@
 //!
 //! | Control | Default | Scope, tradeoff, and observation |
 //! |---|---|---|
-//! | [`message::DecodePolicy`] | `Compatible` | Accepts only bytes after a fully consumed top-level message TLV. The outcome appends [`DecodeAnomaly::TrailingBytes`] and a stable `trailing_bytes` warning is emitted; `Strict` rejects them. [`ClientBuilder::decode_policy`] applies the same selection to transport correlation and full client decoding. Both modes reject unconsumed fields inside the declared envelope. TCP frames one declared TLV at a time, so adjacent stream messages are not suffixes. |
+//! | [`message::DecodePolicy`] | `Compatible` | Accepts only bytes after a fully consumed top-level message TLV. The outcome appends [`DecodeAnomaly::TrailingBytes`] and a stable `trailing_bytes` warning is emitted; `Strict` rejects them. Client, Agent, and notification-receiver builders apply the selection to their full inbound path; client transport correlation uses the same selection. Both modes reject unconsumed fields inside the declared envelope. TCP frames one declared TLV at a time, so adjacent stream messages are not suffixes. |
 //! | [`ResponseShapePolicy`] | `Compatible` | Fixed-cardinality operations preserve all received varbinds and return bounded anomalies for count, OID, successor, or SET-echo problems. `Strict` returns [`Error::ResponseShape`] with the same data and diagnostics. |
 //! | [`NotificationVarbindValidation`] | `Tolerant` | V2c/v3 TrapV2 and Inform prefixes may use non-standard names, but still require `TimeTicks` then `ObjectIdentifier` values. `Strict` also requires the RFC names and order. Rejected notifications are dropped, rejected Informs are not acknowledged, and validation failures are traced. |
 //! | [`WalkMode`], [`OidOrdering`], and walk limits | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires [`ClientBuilder::max_walk_results`] to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
@@ -464,12 +464,14 @@
 //! it through [`NotificationMetadata::decode_anomalies`], and delivered
 //! notifications retain it through [`Notification::decode_anomalies`].
 //!
-//! ### Strict low-level inspection and client controls
+//! ### Strict low-level inspection and network-role controls
 //!
 //! Low-level strict decoding requires both exact envelope consumption and the
-//! strict malformed-input policy. Client controls must be selected separately;
-//! setting [`CompatibilityPolicy::STRICT`] does not make ordinary network
-//! clients globally BER-strict.
+//! strict malformed-input policy. [`ClientBuilder::strict_decoding`],
+//! [`agent::AgentBuilder::strict_decoding`], and
+//! [`notification::NotificationReceiverBuilder::strict_decoding`] select both
+//! together. The independent setters support strict envelopes with a targeted
+//! value workaround, or compatible envelopes with otherwise strict values.
 //!
 //! ```rust,no_run
 //! use async_snmp::{
@@ -488,6 +490,7 @@
 //! }
 //!
 //! let _client = Client::builder("192.0.2.1:161", Auth::v2c("public"))
+//!     .strict_decoding()
 //!     .response_shape_policy(ResponseShapePolicy::Strict)
 //!     .strict_source(true)
 //!     .community_response_policy(CommunityResponsePolicy::Exact)
@@ -496,9 +499,8 @@
 //!
 //! ### Targeted workarounds
 //!
-//! Start from strict low-level behavior and enable only deviations confirmed for
-//! a specific agent. Configure client behavior independently rather than using
-//! a broad compatibility preset.
+//! Start from strict behavior and enable only deviations confirmed for a
+//! specific peer.
 //!
 //! ```rust,no_run
 //! use async_snmp::{Auth, Client, CompatibilityPolicy, WalkMode, message::Message};
@@ -516,6 +518,8 @@
 //! }
 //!
 //! let _client = Client::builder("192.0.2.2:161", Auth::v2c("public"))
+//!     .strict_decoding()
+//!     .compatibility_policy(value_policy)
 //!     .walk_mode(WalkMode::GetNext);
 //! # let _ = (value_policy, decode_agent_packet);
 //! ```

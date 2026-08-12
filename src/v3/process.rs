@@ -18,7 +18,7 @@ use super::{DerivedKeys, UsmUser};
 use crate::error::{Error, Result};
 use crate::message::{
     MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, combine_staged_v3_anomalies,
-    decode_scoped_pdu_with_anomalies,
+    decode_scoped_pdu_with_policies,
 };
 use crate::message_size::MessageSize;
 use crate::oid::Oid;
@@ -159,6 +159,10 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) local_receive_capacity: MessageSize,
     /// Hard total-message bound for inbound decoding.
     pub(crate) accepted_receive_size: usize,
+    /// Top-level message envelope consumption policy.
+    pub(crate) decode_policy: crate::message::DecodePolicy,
+    /// BER/value malformed-input compatibility policy.
+    pub(crate) compatibility_policy: crate::CompatibilityPolicy,
     /// Local policy bound for outbound responses and Reports.
     pub(crate) outbound_limit: usize,
     pub(crate) usm_users: &'a HashMap<Bytes, UsmUser>,
@@ -207,11 +211,12 @@ pub(crate) fn process_v3_inbound(
 ) -> Result<V3Inbound> {
     let source = ctx.source;
 
-    let decoded = match RawV3Message::decode_bounded_with_target(
+    let decoded = match RawV3Message::decode_bounded_with_target_and_compatibility(
         data.clone(),
         ctx.accepted_receive_size,
         source,
-        crate::message::DecodePolicy::Compatible,
+        ctx.decode_policy,
+        ctx.compatibility_policy,
     ) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -245,10 +250,11 @@ pub(crate) fn process_v3_inbound(
     let mut decode_anomalies = decoded.anomalies;
     let msg = decoded.value;
     let security_level = msg.global_data.msg_flags.security_level;
-    let usm_params = UsmSecurityParams::decode_with_context(
+    let usm_params = UsmSecurityParams::decode_with_context_and_compatibility(
         msg.security_params.clone(),
         msg.security_params_offset,
         source,
+        ctx.compatibility_policy,
     )?;
 
     // Encodes the Report for `failure` (counting it first), unauthenticated
@@ -452,11 +458,21 @@ pub(crate) fn process_v3_inbound(
                 }
             };
 
-            decode_scoped_pdu_with_anomalies(decrypted, 0, source, Some(priv_key.protocol()))?
+            decode_scoped_pdu_with_policies(
+                decrypted,
+                0,
+                source,
+                Some(priv_key.protocol()),
+                ctx.compatibility_policy,
+            )?
         }
-        RawMsgData::Plaintext { data, offset } => {
-            decode_scoped_pdu_with_anomalies(data.clone(), *offset, source, None)?
-        }
+        RawMsgData::Plaintext { data, offset } => decode_scoped_pdu_with_policies(
+            data.clone(),
+            *offset,
+            source,
+            None,
+            ctx.compatibility_policy,
+        )?,
     };
     decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, scoped_outcome.anomalies);
     let scoped_pdu = scoped_outcome.value;
@@ -505,6 +521,8 @@ mod tests {
             engine_time: 1000,
             local_receive_capacity: MessageSize::new(8192).unwrap(),
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
+            decode_policy: crate::message::DecodePolicy::Compatible,
+            compatibility_policy: crate::CompatibilityPolicy::default(),
             outbound_limit: 8192,
             usm_users,
             stats,

@@ -8,8 +8,8 @@ use async_snmp::message::{DecodePolicy, ScopedPdu, SecurityLevel, V3Message, V3M
 use async_snmp::transport::Transport;
 use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
-    Auth, Client, ClientConfig, EngineCache, ErrorStatus, MasterKeys, ReceiveLimits, Retry,
-    UsmConfig, Value, VarBind, oid,
+    Auth, Client, ClientConfig, CompatibilityPolicy, EngineCache, ErrorStatus, MasterKeys,
+    ReceiveLimits, Retry, UsmConfig, Value, VarBind, oid,
 };
 use bytes::Bytes;
 use common::v3::{
@@ -325,6 +325,73 @@ async fn v3_plaintext_and_authpriv_inner_anomaly_precedes_top_level_suffix() {
             "level {level:?}: {:?}",
             response.metadata.decode_anomalies
         );
+    }
+}
+
+async fn v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
+    level: SecurityLevel,
+    compatibility: CompatibilityPolicy,
+) {
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let accept_malformed = compatibility.truncate_numeric_values;
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::replies(move |request| {
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                let malformed = V3ReplyBuilder::response_to(request, &response_engine)
+                    .varbinds(vec![VarBind::new(oid.clone(), Value::Integer(9))])
+                    .first_integer_value_content(Bytes::from_static(&[1, 0, 0, 0, 9]))
+                    .build()?;
+                if accept_malformed {
+                    Ok(vec![malformed])
+                } else {
+                    let canonical = V3ReplyBuilder::response_to(request, &response_engine)
+                        .varbinds(vec![VarBind::new(oid, Value::Integer(9))])
+                        .build()?;
+                    Ok(vec![malformed, canonical])
+                }
+            }),
+        ],
+    )
+    .await;
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .compatibility_policy(compatibility)
+        .request_timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    peer.finish().await.unwrap();
+    if accept_malformed {
+        assert!(matches!(
+            response.metadata.decode_anomalies.as_slice(),
+            [async_snmp::DecodeAnomaly::SignedIntegerTruncation {
+                encoded_length: 5,
+                ..
+            }]
+        ));
+    } else {
+        assert!(response.metadata.decode_anomalies.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn v3_client_supports_strict_and_targeted_value_policy_for_plaintext_and_authpriv() {
+    let mut targeted = CompatibilityPolicy::STRICT;
+    targeted.truncate_numeric_values = true;
+    for level in [SecurityLevel::NoAuthNoPriv, SecurityLevel::AuthPriv] {
+        v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(level, targeted).await;
+        v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
+            level,
+            CompatibilityPolicy::STRICT,
+        )
+        .await;
     }
 }
 

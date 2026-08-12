@@ -248,12 +248,14 @@ impl UsmSecurityParams {
         Ok(params)
     }
 
-    pub(crate) fn decode_with_context(
+    pub(crate) fn decode_with_context_and_compatibility(
         data: Bytes,
         base_offset: usize,
         target: SocketAddr,
+        compatibility: crate::CompatibilityPolicy,
     ) -> Result<Self> {
-        let mut decoder = Decoder::with_context(data, base_offset, Some(target));
+        let mut decoder = Decoder::with_context(data, base_offset, Some(target))
+            .with_compatibility_policy(compatibility);
         let params = Self::decode_from(&mut decoder)?;
         if !decoder.is_empty() {
             return Err(decoder.malformed(DecodeErrorKind::TrailingData {

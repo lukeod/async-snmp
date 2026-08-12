@@ -256,25 +256,7 @@ impl CommunityMessage {
         Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
 
-    #[cfg(feature = "agent")]
-    pub(crate) fn decode_with_target(data: Bytes, target: SocketAddr) -> Result<Self> {
-        Ok(Self::decode_with_target_and_policy(data, target, DecodePolicy::Compatible)?.value)
-    }
-
-    pub(crate) fn decode_with_target_and_policy(
-        data: Bytes,
-        target: SocketAddr,
-        policy: DecodePolicy,
-    ) -> Result<DecodeOutcome<Self>> {
-        Self::decode_with_target_and_policies(
-            data,
-            Some(target),
-            policy,
-            CompatibilityPolicy::default(),
-        )
-    }
-
-    fn decode_with_target_and_policies(
+    pub(crate) fn decode_with_target_and_policies(
         data: Bytes,
         peer: Option<SocketAddr>,
         policy: DecodePolicy,

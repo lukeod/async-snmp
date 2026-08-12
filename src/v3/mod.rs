@@ -72,7 +72,7 @@ pub use config::{UsmConfig, UsmUser};
 pub use crypto::{CryptoBackend, CryptoError, CryptoResult};
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 pub(crate) use crypto::{CryptoBackend, CryptoError, CryptoResult};
-pub(crate) use engine::parse_discovery_response_with_msg_max_size;
+pub(crate) use engine::discovered_engine_state;
 pub use engine::report_oids;
 pub use engine::{
     EngineCache, EngineState, MAX_ENGINE_ID_LEN, MAX_ENGINE_TIME, MIN_ENGINE_ID_LEN, TIME_WINDOW,

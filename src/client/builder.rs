@@ -144,6 +144,7 @@ pub struct ClientBuilder {
     retry: Retry,
     max_oids_per_request: usize,
     decode_policy: crate::message::DecodePolicy,
+    compatibility_policy: crate::CompatibilityPolicy,
     response_shape_policy: crate::client::ResponseShapePolicy,
     max_repetitions: u32,
     walk_mode: WalkMode,
@@ -196,6 +197,7 @@ impl ClientBuilder {
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             decode_policy: crate::message::DecodePolicy::Compatible,
+            compatibility_policy: crate::CompatibilityPolicy::default(),
             response_shape_policy: crate::client::ResponseShapePolicy::Compatible,
             max_repetitions: DEFAULT_MAX_REPETITIONS,
             walk_mode: WalkMode::Auto,
@@ -327,6 +329,30 @@ impl ClientBuilder {
     #[must_use]
     pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
         self.decode_policy = policy;
+        self
+    }
+
+    /// Set BER/value interoperability handling (default: compatible).
+    ///
+    /// Each field of [`crate::CompatibilityPolicy`] controls one known
+    /// malformed-input deviation. This policy is applied to v1/v2c responses
+    /// and to every staged v3 decode, including discovery, Reports, security
+    /// parameters, plaintext scoped PDUs, and decrypted scoped PDUs.
+    #[must_use]
+    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
+        self.compatibility_policy = policy;
+        self
+    }
+
+    /// Require a canonical top-level envelope and canonical BER/value input.
+    ///
+    /// This is convenience for selecting [`crate::message::DecodePolicy::Strict`]
+    /// and [`crate::CompatibilityPolicy::STRICT`] together. Either policy can
+    /// subsequently be replaced independently for a targeted device quirk.
+    #[must_use]
+    pub fn strict_decoding(mut self) -> Self {
+        self.decode_policy = crate::message::DecodePolicy::Strict;
+        self.compatibility_policy = crate::CompatibilityPolicy::STRICT;
         self
     }
 
@@ -657,6 +683,7 @@ impl ClientBuilder {
         ClientConfig {
             auth: self.auth.clone(),
             decode_policy: self.decode_policy,
+            compatibility_policy: self.compatibility_policy,
             community_response_policy: self.community_response_policy,
             request_timeout: self.request_timeout,
             send_timeout: self.send_timeout,
@@ -1759,5 +1786,30 @@ mod tests {
     #[test]
     fn test_split_host_port_hostname_with_port() {
         assert_eq!(split_host_port("switch.local:162"), ("switch.local", 162));
+    }
+
+    #[test]
+    fn decoding_policy_defaults_strict_preset_and_targeted_override() {
+        let default = ClientBuilder::new("127.0.0.1:161", Auth::v2c("public")).build_config();
+        assert_eq!(
+            default.decode_policy,
+            crate::message::DecodePolicy::Compatible
+        );
+        assert_eq!(
+            default.compatibility_policy,
+            crate::CompatibilityPolicy::DEFAULT
+        );
+
+        let mut targeted = crate::CompatibilityPolicy::STRICT;
+        targeted.empty_counter64_as_zero = true;
+        let configured = ClientBuilder::new("127.0.0.1:161", Auth::v2c("public"))
+            .strict_decoding()
+            .compatibility_policy(targeted)
+            .build_config();
+        assert_eq!(
+            configured.decode_policy,
+            crate::message::DecodePolicy::Strict
+        );
+        assert_eq!(configured.compatibility_policy, targeted);
     }
 }

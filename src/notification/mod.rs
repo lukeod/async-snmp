@@ -289,6 +289,8 @@ pub struct NotificationReceiverBuilder {
     authoritative_engine: Option<AuthoritativeEngine>,
     varbind_validation: NotificationVarbindValidation,
     max_message_size: usize,
+    decode_policy: crate::message::DecodePolicy,
+    compatibility_policy: crate::CompatibilityPolicy,
     acceptance_policy: Option<Arc<AcceptancePolicy>>,
 }
 
@@ -310,6 +312,8 @@ impl NotificationReceiverBuilder {
             authoritative_engine: None,
             varbind_validation: NotificationVarbindValidation::Tolerant,
             max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
+            decode_policy: crate::message::DecodePolicy::Compatible,
+            compatibility_policy: crate::CompatibilityPolicy::default(),
             acceptance_policy: None,
         }
     }
@@ -349,6 +353,34 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
+        self
+    }
+
+    /// Set top-level notification-envelope handling (default: compatible).
+    ///
+    /// Compatible mode accepts a bounded suffix after one declared SNMP
+    /// message and exposes a trailing-byte anomaly. Strict mode rejects it.
+    #[must_use]
+    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
+        self.decode_policy = policy;
+        self
+    }
+
+    /// Set BER/value interoperability handling (default: compatible).
+    ///
+    /// The policy applies to v1/v2c notifications and every staged v3 decode,
+    /// including security parameters and plaintext or decrypted scoped PDUs.
+    #[must_use]
+    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
+        self.compatibility_policy = policy;
+        self
+    }
+
+    /// Require canonical top-level envelopes and canonical BER/value input.
+    #[must_use]
+    pub fn strict_decoding(mut self) -> Self {
+        self.decode_policy = crate::message::DecodePolicy::Strict;
+        self.compatibility_policy = crate::CompatibilityPolicy::STRICT;
         self
     }
 
@@ -603,6 +635,8 @@ impl NotificationReceiverBuilder {
                 usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(HashMap::new()),
                 max_message_size: self.max_message_size,
+                decode_policy: self.decode_policy,
+                compatibility_policy: self.compatibility_policy,
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: self.acceptance_policy,
                 recv_gate: AsyncMutex::new(()),
@@ -881,6 +915,8 @@ struct ReceiverInner {
     remote_engines: Mutex<HashMap<Bytes, EngineState>>,
     /// Local outbound response policy limit.
     max_message_size: usize,
+    decode_policy: crate::message::DecodePolicy,
+    compatibility_policy: crate::CompatibilityPolicy,
     /// Confirmed notifications dropped because even the alternate Response did not fit.
     snmp_silent_drops: AtomicU32,
     acceptance_policy: Option<Arc<AcceptancePolicy>>,
@@ -1001,6 +1037,8 @@ impl NotificationReceiver {
                 usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(HashMap::new()),
                 max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
+                decode_policy: crate::message::DecodePolicy::Compatible,
+                compatibility_policy: crate::CompatibilityPolicy::default(),
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: None,
                 recv_gate: AsyncMutex::new(()),
@@ -1012,6 +1050,18 @@ impl NotificationReceiver {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
+    }
+
+    /// Return the configured top-level notification-envelope policy.
+    #[must_use]
+    pub fn decode_policy(&self) -> crate::message::DecodePolicy {
+        self.inner.decode_policy
+    }
+
+    /// Return the configured BER/value compatibility policy.
+    #[must_use]
+    pub fn compatibility_policy(&self) -> crate::CompatibilityPolicy {
+        self.inner.compatibility_policy
     }
 
     /// Get the local engine ID.
@@ -1171,6 +1221,34 @@ impl Clone for NotificationReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn decoding_policy_defaults_strict_preset_and_targeted_override() {
+        let default = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            default.decode_policy(),
+            crate::message::DecodePolicy::Compatible
+        );
+        assert_eq!(
+            default.compatibility_policy(),
+            crate::CompatibilityPolicy::DEFAULT
+        );
+
+        let mut targeted = crate::CompatibilityPolicy::STRICT;
+        targeted.empty_counter64_as_zero = true;
+        let configured = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .strict_decoding()
+            .compatibility_policy(targeted)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            configured.decode_policy(),
+            crate::message::DecodePolicy::Strict
+        );
+        assert_eq!(configured.compatibility_policy(), targeted);
+    }
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::Value;
     use crate::message::SecurityLevel;
@@ -3152,6 +3230,55 @@ mod tests {
             .unwrap()
     }
 
+    fn push_malformed_integer_varbind(buf: &mut crate::ber::EncodeBuf) -> crate::Result<()> {
+        buf.try_push_sequence(|buf| {
+            buf.push_bytes(&[0x02, 0x05, 1, 0, 0, 0, 9]);
+            buf.push_oid(&oid!(1, 3, 6, 1, 4, 1, 9999, 1, 0))
+        })
+    }
+
+    fn build_notification_with_malformed_integer(version: crate::Version) -> Bytes {
+        let mut buf = crate::ber::EncodeBuf::new();
+        buf.try_push_sequence(|buf| {
+            match version {
+                crate::Version::V1 => {
+                    buf.try_push_constructed(crate::ber::tag::pdu::TRAP_V1, |buf| {
+                        buf.try_push_sequence(push_malformed_integer_varbind)?;
+                        buf.push_unsigned32(crate::ber::tag::application::TIMETICKS, 123);
+                        buf.push_integer(0);
+                        buf.push_integer(0);
+                        buf.push_ip_address([127, 0, 0, 1]);
+                        buf.push_oid(&oid!(1, 3, 6, 1, 4, 1, 9999))
+                    })?;
+                }
+                crate::Version::V2c => {
+                    buf.try_push_constructed(crate::ber::tag::pdu::TRAP_V2, |buf| {
+                        buf.try_push_sequence(|buf| {
+                            push_malformed_integer_varbind(buf)?;
+                            crate::VarBind::new(
+                                oids::snmp_trap_oid(),
+                                crate::Value::ObjectIdentifier(oids::cold_start()),
+                            )
+                            .encode(buf)?;
+                            crate::VarBind::new(oids::sys_uptime(), crate::Value::TimeTicks(123))
+                                .encode(buf)
+                        })?;
+                        buf.push_integer(0);
+                        buf.push_integer(0);
+                        buf.push_integer(41);
+                        Ok(())
+                    })?;
+                }
+                crate::Version::V3 => unreachable!(),
+            }
+            buf.push_octet_string(b"public");
+            buf.push_integer(version.as_i32());
+            Ok(())
+        })
+        .unwrap();
+        buf.finish()
+    }
+
     #[tokio::test]
     async fn test_v2c_trap_matching_community_accepted() {
         let receiver = NotificationReceiver::builder()
@@ -3205,6 +3332,73 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn strict_receiver_rejects_suffixes_for_v1_and_v2c() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .strict_decoding()
+            .build()
+            .await
+            .unwrap();
+        let source = "127.0.0.1:9999".parse().unwrap();
+        for (version, mut packet) in [
+            (crate::Version::V1, build_v1_trap(b"public").to_vec()),
+            (crate::Version::V2c, build_v2c_trap(b"public").to_vec()),
+        ] {
+            packet.extend_from_slice(&[0x05, 0]);
+            let result = match version {
+                crate::Version::V1 => receiver.handle_v1(Bytes::from(packet), source).await,
+                crate::Version::V2c => receiver.handle_v2c(Bytes::from(packet), source).await,
+                crate::Version::V3 => unreachable!(),
+            };
+            assert!(result.is_err(), "strict {version:?} accepted a suffix");
+        }
+    }
+
+    #[tokio::test]
+    async fn community_receiver_supports_strict_and_targeted_value_policy() {
+        let source = "127.0.0.1:9999".parse().unwrap();
+        for version in [crate::Version::V1, crate::Version::V2c] {
+            let strict = NotificationReceiver::builder()
+                .bind("127.0.0.1:0")
+                .compatibility_policy(crate::CompatibilityPolicy::STRICT)
+                .build()
+                .await
+                .unwrap();
+            let packet = build_notification_with_malformed_integer(version);
+            let result = match version {
+                crate::Version::V1 => strict.handle_v1(packet, source).await,
+                crate::Version::V2c => strict.handle_v2c(packet, source).await,
+                crate::Version::V3 => unreachable!(),
+            };
+            assert!(result.is_err());
+
+            let mut targeted = crate::CompatibilityPolicy::STRICT;
+            targeted.truncate_numeric_values = true;
+            let receiver = NotificationReceiver::builder()
+                .bind("127.0.0.1:0")
+                .compatibility_policy(targeted)
+                .build()
+                .await
+                .unwrap();
+            let packet = build_notification_with_malformed_integer(version);
+            let notification = match version {
+                crate::Version::V1 => receiver.handle_v1(packet, source).await,
+                crate::Version::V2c => receiver.handle_v2c(packet, source).await,
+                crate::Version::V3 => unreachable!(),
+            }
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                notification.decode_anomalies(),
+                [crate::DecodeAnomaly::SignedIntegerTruncation {
+                    encoded_length: 5,
+                    ..
+                }]
+            ));
+        }
+    }
+
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn v3_receiver_exposes_trailing_anomalies_at_all_security_levels() {
@@ -3246,6 +3440,41 @@ mod tests {
                     canonical_length: 0,
                 }]
             );
+        }
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn strict_v3_receiver_rejects_suffixes_at_all_security_levels() {
+        let engine_id = Bytes::from_static(b"\x80\x00\x00\x00\x01strictrecv");
+        let username = Bytes::from_static(b"strictuser");
+        for level in [
+            SecurityLevel::NoAuthNoPriv,
+            SecurityLevel::AuthNoPriv,
+            SecurityLevel::AuthPriv,
+        ] {
+            let (message, _, _) = build_v3_inform_at_level(
+                &engine_id,
+                &username,
+                level,
+                crate::UDP_RECEIVE_LIMITS.advertised(),
+            );
+            let config = inform_user(level, &username);
+            let receiver = NotificationReceiver::builder()
+                .bind("127.0.0.1:0")
+                .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
+                .usm_user(username.clone(), move |_| config)
+                .accept_all_notifications()
+                .strict_decoding()
+                .build()
+                .await
+                .unwrap();
+            let mut message = message.to_vec();
+            message.extend_from_slice(&[0x05, 0]);
+            let result = receiver
+                .handle_v3(Bytes::from(message), "127.0.0.1:9999".parse().unwrap())
+                .await;
+            assert!(result.is_err(), "strict {level:?} accepted a suffix");
         }
     }
 

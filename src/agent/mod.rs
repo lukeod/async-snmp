@@ -306,6 +306,8 @@ pub struct AgentBuilder {
     handlers: Vec<RegisteredHandler>,
     authoritative_engine: Option<AuthoritativeEngine>,
     max_message_size: usize,
+    decode_policy: crate::message::DecodePolicy,
+    compatibility_policy: crate::CompatibilityPolicy,
     max_concurrent_requests: Option<usize>,
     recv_buffer_size: Option<usize>,
     authorization: AgentAuthorization,
@@ -336,6 +338,8 @@ impl AgentBuilder {
             handlers: Vec::new(),
             authoritative_engine: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            decode_policy: crate::message::DecodePolicy::Compatible,
+            compatibility_policy: crate::CompatibilityPolicy::default(),
             max_concurrent_requests: Some(1000),
             recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
             authorization: AgentAuthorization::Unset,
@@ -583,6 +587,34 @@ impl AgentBuilder {
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
+        self
+    }
+
+    /// Set top-level request-envelope handling (default: compatible).
+    ///
+    /// Compatible mode accepts a bounded suffix after one declared SNMP
+    /// message and reports it as a decode anomaly. Strict mode rejects it.
+    #[must_use]
+    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
+        self.decode_policy = policy;
+        self
+    }
+
+    /// Set BER/value interoperability handling (default: compatible).
+    ///
+    /// The policy applies to community requests and every staged v3 decode,
+    /// including security parameters and plaintext or decrypted scoped PDUs.
+    #[must_use]
+    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
+        self.compatibility_policy = policy;
+        self
+    }
+
+    /// Require canonical top-level envelopes and canonical BER/value input.
+    #[must_use]
+    pub fn strict_decoding(mut self) -> Self {
+        self.decode_policy = crate::message::DecodePolicy::Strict;
+        self.compatibility_policy = crate::CompatibilityPolicy::STRICT;
         self
     }
 
@@ -1001,6 +1033,8 @@ impl AgentBuilder {
             authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
             max_message_size: self.max_message_size,
             local_receive_capacity,
+            decode_policy: self.decode_policy,
+            compatibility_policy: self.compatibility_policy,
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(0),
             snmp_unknown_security_models: AtomicU32::new(0),
@@ -1081,6 +1115,10 @@ pub(crate) struct AgentState {
     pub(crate) max_message_size: usize,
     /// Wire-valid `msgMaxSize` advertising this agent's UDP receive capacity.
     pub(crate) local_receive_capacity: MessageSize,
+    /// Inbound top-level envelope consumption policy.
+    pub(crate) decode_policy: crate::message::DecodePolicy,
+    /// Inbound BER/value malformed-input compatibility policy.
+    pub(crate) compatibility_policy: crate::CompatibilityPolicy,
     /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
     /// their ASN.1 representation is invalid for the received SNMP version
     pub(crate) snmp_in_asn_parse_errs: AtomicU32,
@@ -1198,6 +1236,18 @@ impl Agent {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
+    }
+
+    /// Return the configured top-level request-envelope policy.
+    #[must_use]
+    pub fn decode_policy(&self) -> crate::message::DecodePolicy {
+        self.inner.state.decode_policy
+    }
+
+    /// Return the configured BER/value compatibility policy.
+    #[must_use]
+    pub fn compatibility_policy(&self) -> crate::CompatibilityPolicy {
+        self.inner.state.compatibility_policy
     }
 
     /// Iterate over credential-free notification sink summaries in configuration order.
@@ -2051,6 +2101,34 @@ mod tests {
     };
     use crate::message::SecurityLevel;
     use crate::oid;
+
+    #[tokio::test]
+    async fn decoding_policy_defaults_strict_preset_and_targeted_override() {
+        let default = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
+        assert_eq!(
+            default.decode_policy(),
+            crate::message::DecodePolicy::Compatible
+        );
+        assert_eq!(
+            default.compatibility_policy(),
+            crate::CompatibilityPolicy::DEFAULT
+        );
+
+        let mut targeted = crate::CompatibilityPolicy::STRICT;
+        targeted.empty_counter64_as_zero = true;
+        let configured = Agent::builder()
+            .bind("127.0.0.1:0")
+            .strict_decoding()
+            .compatibility_policy(targeted)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            configured.decode_policy(),
+            crate::message::DecodePolicy::Strict
+        );
+        assert_eq!(configured.compatibility_policy(), targeted);
+    }
 
     struct TestHandler;
 

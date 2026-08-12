@@ -39,7 +39,13 @@ impl Agent {
         source: SocketAddr,
         version: Version,
     ) -> Result<Option<Bytes>> {
-        let msg = CommunityMessage::decode_with_target(data, source)?;
+        let msg = CommunityMessage::decode_with_target_and_policies(
+            data,
+            Some(source),
+            self.inner.state.decode_policy,
+            self.inner.state.compatibility_policy,
+        )?
+        .value;
 
         // Validate community
         if !self.validate_community(msg.community().as_bytes()) {
@@ -161,6 +167,8 @@ impl Agent {
             engine_time: state.engine_time.load(Ordering::Relaxed),
             local_receive_capacity: state.local_receive_capacity,
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
+            decode_policy: state.decode_policy,
+            compatibility_policy: state.compatibility_policy,
             outbound_limit: state.max_message_size,
             usm_users: &self.inner.usm_users,
             stats: &state.usm_stats,
@@ -476,6 +484,32 @@ mod tests {
         )
     }
 
+    fn community_set_with_integer_content(version: Version, content: &[u8]) -> Bytes {
+        let mut buf = crate::ber::EncodeBuf::new();
+        buf.try_push_sequence(|buf| {
+            buf.try_push_constructed(PduType::SetRequest.tag(), |buf| {
+                buf.try_push_sequence(|buf| {
+                    buf.try_push_sequence(|buf| {
+                        let mut encoded = vec![crate::ber::tag::universal::INTEGER];
+                        encoded.push(u8::try_from(content.len()).unwrap());
+                        encoded.extend_from_slice(content);
+                        buf.push_bytes(&encoded);
+                        buf.push_oid(&oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0))
+                    })
+                })?;
+                buf.push_integer(0);
+                buf.push_integer(0);
+                buf.push_integer(41);
+                Ok(())
+            })?;
+            buf.push_octet_string(b"public");
+            buf.push_integer(version.as_i32());
+            Ok(())
+        })
+        .unwrap();
+        buf.finish()
+    }
+
     async fn community_test_agent(callbacks: Arc<CallbackCounts>) -> Agent {
         Agent::builder()
             .bind("127.0.0.1:0")
@@ -485,6 +519,80 @@ mod tests {
             .build()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn community_agent_envelope_policy_covers_v1_and_v2c() {
+        let source = "127.0.0.1:9999".parse().unwrap();
+        for version in [Version::V1, Version::V2c] {
+            let callbacks = Arc::new(CallbackCounts::default());
+            let strict = Agent::builder()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
+                .allow_all_access()
+                .strict_decoding()
+                .build()
+                .await
+                .unwrap();
+            let mut request =
+                community_request(version, PduType::GetRequest, b"public", Value::Null).to_vec();
+            request.extend_from_slice(&[0x05, 0]);
+            let result = match version {
+                Version::V1 => strict.handle_v1(Bytes::from(request), source).await,
+                Version::V2c => strict.handle_v2c(Bytes::from(request), source).await,
+                Version::V3 => unreachable!(),
+            };
+            assert!(result.is_err(), "strict {version:?} accepted a suffix");
+        }
+    }
+
+    #[tokio::test]
+    async fn community_agent_supports_strict_and_targeted_value_policy() {
+        let source = "127.0.0.1:9999".parse().unwrap();
+        for version in [Version::V1, Version::V2c] {
+            let strict_callbacks = Arc::new(CallbackCounts::default());
+            let strict = Agent::builder()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .handler(oid!(1, 3, 6, 1, 4, 1, 99999), strict_callbacks.clone())
+                .allow_all_access()
+                .compatibility_policy(crate::CompatibilityPolicy::STRICT)
+                .build()
+                .await
+                .unwrap();
+            let request = community_set_with_integer_content(version, &[1, 0, 0, 0, 9]);
+            let result = match version {
+                Version::V1 => strict.handle_v1(request, source).await,
+                Version::V2c => strict.handle_v2c(request, source).await,
+                Version::V3 => unreachable!(),
+            };
+            assert!(result.is_err());
+            assert_eq!(strict_callbacks.test_set.load(Ordering::Relaxed), 0);
+
+            let mut targeted = crate::CompatibilityPolicy::STRICT;
+            targeted.truncate_numeric_values = true;
+            let callbacks = Arc::new(CallbackCounts::default());
+            let agent = Agent::builder()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
+                .allow_all_access()
+                .compatibility_policy(targeted)
+                .build()
+                .await
+                .unwrap();
+            let request = community_set_with_integer_content(version, &[1, 0, 0, 0, 9]);
+            let response = match version {
+                Version::V1 => agent.handle_v1(request, source).await,
+                Version::V2c => agent.handle_v2c(request, source).await,
+                Version::V3 => unreachable!(),
+            }
+            .unwrap();
+            assert!(response.is_some());
+            assert_eq!(callbacks.test_set.load(Ordering::Relaxed), 1);
+            assert_eq!(callbacks.commit_set.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -888,6 +996,28 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn strict_v3_agent_rejects_message_suffix() {
+        let engine_id = b"\x80\x00\x00\x00\x01strictagt".to_vec();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("noauthuser", |user| user)
+            .allow_all_access()
+            .strict_decoding()
+            .build()
+            .await
+            .unwrap();
+        let mut request = build_noauth_msg(&engine_id, b"noauthuser", &engine_id).to_vec();
+        request.extend_from_slice(&[0x05, 0]);
+        assert!(
+            agent
+                .handle_v3(Bytes::from(request), "127.0.0.1:9999".parse().unwrap())
+                .await
+                .is_err()
+        );
     }
 
     /// RFC 3413 Section 3.2: a request whose scopedPDU contextEngineID names an

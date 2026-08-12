@@ -27,10 +27,11 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Notification>> {
-        let decoded = CommunityMessage::decode_with_target_and_policy(
+        let decoded = CommunityMessage::decode_with_target_and_policies(
             data,
-            source,
-            crate::message::DecodePolicy::Compatible,
+            Some(source),
+            self.inner.decode_policy,
+            self.inner.compatibility_policy,
         )?;
         let decode_anomalies = decoded.anomalies;
         let msg = decoded.value;
@@ -87,10 +88,11 @@ impl super::NotificationReceiver {
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<Notification>> {
-        let decoded = CommunityMessage::decode_with_target_and_policy(
+        let decoded = CommunityMessage::decode_with_target_and_policies(
             data,
-            source,
-            crate::message::DecodePolicy::Compatible,
+            Some(source),
+            self.inner.decode_policy,
+            self.inner.compatibility_policy,
         )?;
         let decode_anomalies = decoded.anomalies;
         let msg = decoded.value;
@@ -219,6 +221,8 @@ impl super::NotificationReceiver {
             engine_time: our_time,
             local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
+            decode_policy: self.inner.decode_policy,
+            compatibility_policy: self.inner.compatibility_policy,
             outbound_limit: self.inner.max_message_size,
             usm_users: &self.inner.usm_users,
             stats: &self.inner.usm_stats,

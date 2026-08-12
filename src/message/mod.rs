@@ -12,7 +12,7 @@ mod v3;
 
 pub use community::{CommunityMessage, CommunityPdu};
 pub(crate) use v3::{
-    MpdFailure, classify_mpd_failure, combine_staged_v3_anomalies, decode_scoped_pdu_with_anomalies,
+    MpdFailure, classify_mpd_failure, combine_staged_v3_anomalies, decode_scoped_pdu_with_policies,
 };
 pub use v3::{
     MsgFlags, MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message,
@@ -178,6 +178,7 @@ impl Message {
         Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
 
+    #[cfg(test)]
     pub(crate) fn decode_bounded_with_target(
         data: Bytes,
         maximum: usize,
@@ -193,7 +194,7 @@ impl Message {
         )
     }
 
-    fn decode_bounded_with_target_and_compatibility(
+    pub(crate) fn decode_bounded_with_target_and_compatibility(
         data: Bytes,
         maximum: usize,
         peer: Option<SocketAddr>,

@@ -383,11 +383,28 @@ fn decode_scoped_pdu_with_consumption(
     Ok(decode_scoped_pdu_with_anomalies(data, base_offset, source, privacy)?.value)
 }
 
-pub(crate) fn decode_scoped_pdu_with_anomalies(
+#[cfg(test)]
+fn decode_scoped_pdu_with_anomalies(
     data: Bytes,
     base_offset: usize,
     source: SocketAddr,
     privacy: Option<crate::v3::PrivProtocol>,
+) -> Result<DecodeOutcome<ScopedPdu>> {
+    decode_scoped_pdu_with_policies(
+        data,
+        base_offset,
+        source,
+        privacy,
+        CompatibilityPolicy::default(),
+    )
+}
+
+pub(crate) fn decode_scoped_pdu_with_policies(
+    data: Bytes,
+    base_offset: usize,
+    source: SocketAddr,
+    privacy: Option<crate::v3::PrivProtocol>,
+    compatibility: CompatibilityPolicy,
 ) -> Result<DecodeOutcome<ScopedPdu>> {
     let origin = if privacy.is_some() {
         DecodeErrorOrigin::DecryptedScopedPdu
@@ -396,6 +413,7 @@ pub(crate) fn decode_scoped_pdu_with_anomalies(
     };
     let anomalies = std::cell::RefCell::new(Vec::new());
     let mut decoder = Decoder::with_origin_context(data, base_offset, origin, Some(source))
+        .with_compatibility_policy(compatibility)
         .with_anomaly_sink(&anomalies);
     let scoped = ScopedPdu::decode(&mut decoder)?;
     let maximum_suffix = match privacy {
@@ -797,13 +815,14 @@ impl RawV3Message {
         Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
 
-    pub(crate) fn decode_bounded_with_target(
+    pub(crate) fn decode_bounded_with_target_and_compatibility(
         data: Bytes,
         maximum: usize,
         target: SocketAddr,
         policy: DecodePolicy,
+        compatibility: CompatibilityPolicy,
     ) -> Result<DecodeOutcome<Self>> {
-        Self::decode_bounded(data, maximum, Some(target), policy)
+        Self::decode_bounded_with_compatibility(data, maximum, Some(target), policy, compatibility)
     }
 
     fn decode_bounded(
@@ -811,6 +830,22 @@ impl RawV3Message {
         maximum: usize,
         peer: Option<SocketAddr>,
         policy: DecodePolicy,
+    ) -> Result<DecodeOutcome<Self>> {
+        Self::decode_bounded_with_compatibility(
+            data,
+            maximum,
+            peer,
+            policy,
+            CompatibilityPolicy::default(),
+        )
+    }
+
+    fn decode_bounded_with_compatibility(
+        data: Bytes,
+        maximum: usize,
+        peer: Option<SocketAddr>,
+        policy: DecodePolicy,
+        compatibility: CompatibilityPolicy,
     ) -> Result<DecodeOutcome<Self>> {
         if data.len() > maximum {
             let mut error = DecodeError::new(
@@ -824,7 +859,9 @@ impl RawV3Message {
             return Err(Error::Decode(error).boxed());
         }
         let anomalies = std::cell::RefCell::new(Vec::new());
-        let mut decoder = Decoder::with_optional_peer(data, peer).with_anomaly_sink(&anomalies);
+        let mut decoder = Decoder::with_optional_peer(data, peer)
+            .with_compatibility_policy(compatibility)
+            .with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
         let version = seq.read_bounded_integer(0, i32::MAX)?;

@@ -233,6 +233,9 @@ pub struct ClientConfig {
     /// mapping. Strict mode rejects such datagrams. TCP still treats each
     /// declared message TLV as one stream frame.
     pub decode_policy: crate::message::DecodePolicy,
+    /// BER/value malformed-input compatibility policy (default: established
+    /// permissive receive behavior).
+    pub compatibility_policy: crate::CompatibilityPolicy,
     /// Policy for correlating v1/v2c response communities (default: exact).
     pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
@@ -283,6 +286,7 @@ impl Default for ClientConfig {
         Self {
             auth: Auth::default(),
             decode_policy: crate::message::DecodePolicy::Compatible,
+            compatibility_policy: crate::CompatibilityPolicy::default(),
             community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
@@ -430,6 +434,18 @@ impl<T: Transport> Client<T> {
         self.inner.config.version()
     }
 
+    /// Return the configured top-level response-envelope policy.
+    #[must_use]
+    pub fn decode_policy(&self) -> crate::message::DecodePolicy {
+        self.inner.config.decode_policy
+    }
+
+    /// Return the configured BER/value compatibility policy.
+    #[must_use]
+    pub fn compatibility_policy(&self) -> crate::CompatibilityPolicy {
+        self.inner.config.compatibility_policy
+    }
+
     /// Returns the configured SNMPv3 USM security level.
     ///
     /// Returns `None` for SNMPv1 and SNMPv2c clients. For SNMPv3 clients, the
@@ -526,11 +542,12 @@ impl<T: Transport> Client<T> {
                 .transport
                 .request_with(data, registration, |response_data, source| {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response candidate");
-                    let Ok(decoded) = Message::decode_bounded_with_target(
+                    let Ok(decoded) = Message::decode_bounded_with_target_and_compatibility(
                         response_data,
                         self.inner.transport.receive_limits().accepted(),
-                        source,
+                        Some(source),
                         self.inner.config.decode_policy,
+                        self.inner.config.compatibility_policy,
                     ) else {
                         return Ok(Candidate::Reject);
                     };

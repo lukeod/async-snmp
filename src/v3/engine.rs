@@ -902,11 +902,17 @@ pub(crate) fn parse_discovery_response_with_msg_max_size(
     reported_msg_max_size: MessageSize,
 ) -> Result<EngineState> {
     let usm = UsmSecurityParams::decode(security_params.clone())?;
-    validate_discovered_engine_id(&usm.engine_id)?;
-    Ok(EngineState::discovered(
-        usm.engine_id,
-        reported_msg_max_size,
-    ))
+    discovered_engine_state(usm.engine_id, reported_msg_max_size)
+}
+
+/// Construct discovery state from security parameters already decoded under
+/// the receiving role's selected compatibility policy.
+pub(crate) fn discovered_engine_state(
+    engine_id: Bytes,
+    reported_msg_max_size: MessageSize,
+) -> Result<EngineState> {
+    validate_discovered_engine_id(&engine_id)?;
+    Ok(EngineState::discovered(engine_id, reported_msg_max_size))
 }
 
 /// Extract engine identity with explicit msgMaxSize and session limit.

@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::format::hex;
 use crate::message::{
     RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message, combine_staged_v3_anomalies,
-    decode_scoped_pdu_with_anomalies,
+    decode_scoped_pdu_with_policies,
 };
 use crate::pdu::{Pdu, PduType};
 use crate::transport::{Candidate, RequestRegistration, Transport};
@@ -205,11 +205,12 @@ impl<T: Transport> Client<T> {
                 .inner
                 .transport
                 .request_with(&discovery_data, registration, |data, source| {
-                    let Ok(decoded) = RawV3Message::decode_bounded_with_target(
+                    let Ok(decoded) = RawV3Message::decode_bounded_with_target_and_compatibility(
                         data,
                         self.inner.transport.receive_limits().accepted(),
                         source,
                         self.inner.config.decode_policy,
+                        self.inner.config.compatibility_policy,
                     ) else {
                         return Ok(Candidate::Reject);
                     };
@@ -339,13 +340,14 @@ impl<T: Transport> Client<T> {
         // Decode and validate the candidate before parsing the plaintext PDU,
         // preserving USM-before-scoped-PDU processing order. Boots/time are
         // syntactically decoded but discarded as unauthenticated input.
-        let usm = UsmSecurityParams::decode_with_context(
+        let usm = UsmSecurityParams::decode_with_context_and_compatibility(
             response.security_params.clone(),
             response.security_params_offset,
             source,
+            self.inner.config.compatibility_policy,
         )?;
-        let engine_state = crate::v3::parse_discovery_response_with_msg_max_size(
-            &response.security_params,
+        let engine_state = crate::v3::discovered_engine_state(
+            usm.engine_id.clone(),
             response.global_data.msg_max_size,
         )
         .map_err(|_| malformed())?;
@@ -360,7 +362,13 @@ impl<T: Transport> Client<T> {
         else {
             return Err(malformed());
         };
-        let scoped = decode_scoped_pdu_with_anomalies(bytes.clone(), *offset, source, None)?;
+        let scoped = decode_scoped_pdu_with_policies(
+            bytes.clone(),
+            *offset,
+            source,
+            None,
+            self.inner.config.compatibility_policy,
+        )?;
         let decode_anomalies = combine_staged_v3_anomalies(decoded.anomalies, scoped.anomalies);
         let scoped_pdu = scoped.value;
 
@@ -631,7 +639,13 @@ impl<T: Transport> Client<T> {
 
         tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
 
-        decode_scoped_pdu_with_anomalies(plaintext, 0, source, Some(priv_key.protocol()))
+        decode_scoped_pdu_with_policies(
+            plaintext,
+            0,
+            source,
+            Some(priv_key.protocol()),
+            self.inner.config.compatibility_policy,
+        )
     }
 
     fn validate_v3_candidate(
@@ -643,11 +657,12 @@ impl<T: Transport> Client<T> {
         expected_pdu_id: i32,
         expected_level: SecurityLevel,
     ) -> Result<Candidate<ValidatedV3Response>> {
-        let Ok(decoded) = RawV3Message::decode_bounded_with_target(
+        let Ok(decoded) = RawV3Message::decode_bounded_with_target_and_compatibility(
             response_data.clone(),
             self.inner.transport.receive_limits().accepted(),
             source,
             self.inner.config.decode_policy,
+            self.inner.config.compatibility_policy,
         ) else {
             return Ok(Candidate::Reject);
         };
@@ -666,10 +681,11 @@ impl<T: Transport> Client<T> {
         let mut decode_anomalies = decoded.anomalies;
         let raw = decoded.value;
         let received_level = raw.security_level();
-        let Ok(usm) = UsmSecurityParams::decode_with_context(
+        let Ok(usm) = UsmSecurityParams::decode_with_context_and_compatibility(
             raw.security_params.clone(),
             raw.security_params_offset,
             source,
+            self.inner.config.compatibility_policy,
         ) else {
             return Ok(Candidate::Reject);
         };
@@ -725,7 +741,13 @@ impl<T: Transport> Client<T> {
 
         let scoped_outcome = match &raw.msg_data {
             RawMsgData::Plaintext { data, offset } => {
-                match decode_scoped_pdu_with_anomalies(data.clone(), *offset, source, None) {
+                match decode_scoped_pdu_with_policies(
+                    data.clone(),
+                    *offset,
+                    source,
+                    None,
+                    self.inner.config.compatibility_policy,
+                ) {
                     Ok(scoped) => scoped,
                     Err(_) => return Ok(Candidate::Reject),
                 }
