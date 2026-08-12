@@ -4,7 +4,7 @@
 
 mod common;
 
-use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
+use async_snmp::message::{DecodePolicy, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
 use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
@@ -184,6 +184,140 @@ async fn v3_scripted_udp_success_at_all_security_levels() {
     ] {
         udp_success_at_level(level).await;
     }
+}
+
+async fn v3_udp_suffix_policy(level: SecurityLevel, policy: DecodePolicy) {
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::replies(move |request| {
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    .oid
+                    .clone();
+                let response = V3ReplyBuilder::response_to(request, &response_engine)
+                    .varbinds(vec![VarBind::new(
+                        oid.clone(),
+                        Value::OctetString(Bytes::from_static(b"v3 suffix policy")),
+                    )])
+                    .build()?;
+                let mut suffixed = response.to_vec();
+                // The appended packet has a plausible different msgID. The
+                // correlation parser must never continue into it.
+                let plausible = V3ReplyBuilder::response_to(request, &response_engine)
+                    .msg_id(request.global_data.msg_id().wrapping_add(1))
+                    .varbinds(vec![VarBind::new(
+                        oid,
+                        Value::OctetString(Bytes::from_static(b"suffix decoy")),
+                    )])
+                    .build()?;
+                suffixed.extend_from_slice(&plausible);
+                let replies = if policy == DecodePolicy::Strict {
+                    vec![Bytes::from(suffixed), response]
+                } else {
+                    vec![Bytes::from(suffixed)]
+                };
+                Ok(replies)
+            }),
+        ],
+    )
+    .await;
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .decode_policy(policy)
+        .request_timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
+    let peer_result = peer.finish().await;
+    assert!(peer_result.is_ok(), "peer failed: {peer_result:?}");
+    assert_eq!(
+        result.unwrap().varbinds[0].value.as_str(),
+        Some("v3 suffix policy")
+    );
+}
+
+#[tokio::test]
+async fn v3_udp_client_suffix_policy_is_coherent() {
+    for level in [
+        SecurityLevel::NoAuthNoPriv,
+        SecurityLevel::AuthNoPriv,
+        SecurityLevel::AuthPriv,
+    ] {
+        v3_udp_suffix_policy(level, DecodePolicy::Compatible).await;
+        v3_udp_suffix_policy(level, DecodePolicy::Strict).await;
+    }
+}
+
+async fn v3_udp_discovery_suffix_policy(policy: DecodePolicy) {
+    let level = SecurityLevel::AuthNoPriv;
+    let engine = engine_for(level);
+    let discovery_engine = engine.clone();
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine,
+        vec![
+            ScriptStep::replies(move |request| {
+                let response = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?;
+                let decoy = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    2,
+                )
+                .msg_id(request.global_data.msg_id().wrapping_add(1))
+                .build()?;
+                let mut suffixed = response.to_vec();
+                suffixed.extend_from_slice(&decoy);
+                Ok(if policy == DecodePolicy::Strict {
+                    vec![Bytes::from(suffixed), response]
+                } else {
+                    vec![Bytes::from(suffixed)]
+                })
+            }),
+            response_step(response_engine, "discovery suffix policy"),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .decode_policy(policy)
+        .request_timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    let requests = log.snapshot();
+    let peer_result = peer.finish().await;
+
+    assert!(peer_result.is_ok(), "peer failed: {peer_result:?}");
+    assert_eq!(
+        result.varbinds[0].value.as_str(),
+        Some("discovery suffix policy")
+    );
+    assert_eq!(
+        requests.len(),
+        2,
+        "rejecting a suffixed discovery candidate must not resend discovery"
+    );
+}
+
+#[tokio::test]
+async fn v3_udp_discovery_obeys_suffix_policy() {
+    v3_udp_discovery_suffix_policy(DecodePolicy::Compatible).await;
+    v3_udp_discovery_suffix_policy(DecodePolicy::Strict).await;
 }
 
 #[tokio::test]

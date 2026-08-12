@@ -1,4 +1,4 @@
-use async_snmp::message::{CommunityMessage, Message};
+use async_snmp::message::{CommunityMessage, DecodePolicy, Message};
 use async_snmp::{Auth, Client, Oid, Pdu, Retry, Value, VarBind};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -197,4 +197,81 @@ async fn non_utf8_community_correlates_udp_response() {
         Value::OctetString(Bytes::from_static(b"matched"))
     );
     server.await.unwrap();
+}
+
+async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: DecodePolicy) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = socket.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        let (len, source) = socket.recv_from(&mut buf).await.unwrap();
+        let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let request_id = request.into_pdu().unwrap().request_id;
+        let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
+        let response = CommunityMessage::new(
+            version.into(),
+            "public",
+            Pdu::response(
+                request_id,
+                0,
+                0,
+                vec![VarBind::new(
+                    oid,
+                    Value::OctetString(Bytes::from_static(b"suffix policy")),
+                )],
+            ),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let mut suffixed = response.to_vec();
+        // This is itself a plausible SNMP message carrying another ID. It must
+        // remain opaque suffix data during correlation.
+        suffixed.extend_from_slice(
+            CommunityMessage::new(
+                version.into(),
+                "public",
+                Pdu::response(request_id.wrapping_add(1), 0, 0, Vec::new()),
+            )
+            .unwrap()
+            .encode()
+            .unwrap()
+            .as_ref(),
+        );
+        socket.send_to(&suffixed, source).await.unwrap();
+        if policy == DecodePolicy::Strict {
+            socket.send_to(&response, source).await.unwrap();
+        }
+    });
+
+    let auth = match version {
+        async_snmp::CommunityVersion::V1 => Auth::v1("public"),
+        async_snmp::CommunityVersion::V2c => Auth::v2c("public"),
+    };
+    let result = Client::builder(peer, auth)
+        .decode_policy(policy)
+        .request_timeout(Duration::from_secs(2))
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap()
+        .get(&Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.varbinds[0].value,
+        Value::OctetString(Bytes::from_static(b"suffix policy"))
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_client_suffix_policy_is_coherent_for_v1_and_v2c() {
+    for version in [
+        async_snmp::CommunityVersion::V1,
+        async_snmp::CommunityVersion::V2c,
+    ] {
+        udp_suffix_policy(version, DecodePolicy::Compatible).await;
+        udp_suffix_policy(version, DecodePolicy::Strict).await;
+    }
 }

@@ -1243,6 +1243,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_strict_envelope_policy_applies_to_each_framed_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 31];
+            stream.read_exact(&mut request).await.unwrap();
+            // Back-to-back top-level TLVs are two TCP frames, not one message
+            // with a suffix. Strict policy accepts the first framed response.
+            stream.write_all(&build_response_with_id(77)).await.unwrap();
+            stream.write_all(&build_response_with_id(78)).await.unwrap();
+        });
+
+        let transport = TcpTransport::connect(addr).await.unwrap();
+        let registration = RequestRegistration::community(
+            77,
+            Duration::from_secs(2),
+            crate::CommunityVersion::V2c,
+            Bytes::from_static(b"public"),
+            super::super::CommunityResponsePolicy::Exact,
+        )
+        .with_decode_policy(crate::message::DecodePolicy::Strict);
+        let (response, _) = transport
+            .request(&build_request_with_id(77), registration)
+            .await
+            .unwrap();
+        assert_eq!(response.as_ref(), build_response_with_id(77));
+        assert!(!transport.inner.is_poisoned());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn tcp_skips_stale_id_then_accepts_primary_id() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

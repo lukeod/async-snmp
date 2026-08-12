@@ -29,6 +29,7 @@ use crate::ber::length::parse_ber_length;
 #[cfg(test)]
 use crate::error::Error;
 use crate::error::Result;
+use crate::message::DecodePolicy;
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_LIMITS};
 use crate::version::{CommunityVersion, Version};
 use bytes::Bytes;
@@ -161,6 +162,8 @@ pub struct RequestRegistration {
     timeout: Duration,
     /// Protocol-specific response identity.
     correlation: ResponseCorrelation,
+    /// Top-level SNMP message consumption policy used by correlation.
+    decode_policy: DecodePolicy,
     /// Prior transmission IDs that may still receive a response for this operation.
     aliases: Vec<i32>,
 }
@@ -183,6 +186,7 @@ impl RequestRegistration {
                 community: community.into(),
                 policy,
             },
+            decode_policy: DecodePolicy::Compatible,
             aliases: Vec::new(),
         }
     }
@@ -194,6 +198,7 @@ impl RequestRegistration {
             request_id,
             timeout,
             correlation: ResponseCorrelation::V3,
+            decode_policy: DecodePolicy::Compatible,
             aliases: Vec::new(),
         }
     }
@@ -204,6 +209,7 @@ impl RequestRegistration {
             request_id,
             timeout,
             correlation: ResponseCorrelation::Unchecked,
+            decode_policy: DecodePolicy::Compatible,
             aliases: Vec::new(),
         }
     }
@@ -221,6 +227,26 @@ impl RequestRegistration {
             }
         }
         self
+    }
+
+    /// Select the top-level message consumption policy for correlation.
+    ///
+    /// The default is [`DecodePolicy::Compatible`], matching the client decode
+    /// default. Compatible correlation accepts a bounded UDP datagram suffix
+    /// after one complete declared SNMP message TLV as an explicit deviation
+    /// from RFC 3417's one-message-per-datagram mapping. Strict correlation
+    /// rejects such a suffix before invoking the response validator. In either
+    /// mode, identity fields are read only from the declared top-level envelope.
+    #[must_use]
+    pub const fn with_decode_policy(mut self, policy: DecodePolicy) -> Self {
+        self.decode_policy = policy;
+        self
+    }
+
+    /// Top-level message consumption policy used by correlation.
+    #[must_use]
+    pub const fn decode_policy(&self) -> DecodePolicy {
+        self.decode_policy
     }
 
     /// Primary request ID (v1/v2c) or message ID (v3).
@@ -262,14 +288,17 @@ impl RequestRegistration {
             return ResponseIdentity::Match;
         }
 
-        let Some(response_id) = extract_request_id(data) else {
+        let Some(envelope) = CorrelationEnvelope::parse(data, self.decode_policy) else {
+            return ResponseIdentity::Reject;
+        };
+        let Some(response_id) = envelope.request_id() else {
             return ResponseIdentity::Reject;
         };
         if response_id != self.request_id && !self.aliases.contains(&response_id) {
             return ResponseIdentity::Reject;
         }
 
-        self.correlation.evaluate(data, source_is_target)
+        self.correlation.evaluate(envelope, source_is_target)
     }
 }
 
@@ -286,7 +315,11 @@ pub enum ResponseIdentity {
 }
 
 impl ResponseCorrelation {
-    fn evaluate(&self, data: &[u8], source_is_target: bool) -> ResponseIdentity {
+    fn evaluate(
+        &self,
+        envelope: CorrelationEnvelope<'_>,
+        source_is_target: bool,
+    ) -> ResponseIdentity {
         #[cfg(test)]
         if matches!(self, Self::Unchecked) {
             return ResponseIdentity::Match;
@@ -298,14 +331,14 @@ impl ResponseCorrelation {
             policy,
         } = self
         else {
-            return if extract_message_version(data) == Some(Version::V3) {
+            return if envelope.version == Version::V3 {
                 ResponseIdentity::Match
             } else {
                 ResponseIdentity::Reject
             };
         };
 
-        let Some((actual_version, actual_community)) = extract_community_identity(data) else {
+        let Some((actual_version, actual_community)) = envelope.community_identity() else {
             return ResponseIdentity::Reject;
         };
         if actual_version != *version {
@@ -515,60 +548,85 @@ pub(crate) fn checked_deadline(timeout: Duration, description: &str) -> Result<I
 // Correlation envelope extraction (shared between transports)
 // ============================================================================
 
-/// Extract a checked protocol version and return the position after its BER
-/// INTEGER plus the exact outer content end.
-fn extract_message_envelope(data: &[u8]) -> Option<(Version, usize, usize)> {
-    if data.first().copied()? != 0x30 {
-        return None;
-    }
-    let (outer_len, outer_len_bytes) = parse_ber_length(data.get(1..)?)?;
-    let content_start = 1usize.checked_add(outer_len_bytes)?;
-    let content_end = content_start.checked_add(outer_len)?;
-    if content_end != data.len() {
-        return None;
-    }
-
-    let mut pos = content_start;
-    if *data.get(pos)? != 0x02 {
-        return None;
-    }
-    pos = pos.checked_add(1)?;
-    let (version_len, version_len_bytes) = parse_ber_length(data.get(pos..)?)?;
-    pos = pos.checked_add(version_len_bytes)?;
-    let version_end = pos.checked_add(version_len)?;
-    if version_end > content_end || version_len == 0 || version_len > 4 {
-        return None;
-    }
-    let version = Version::from_i32(decode_ber_signed_integer(data.get(pos..version_end)?))?;
-    Some((version, version_end, content_end))
+/// One checked top-level SNMP message envelope used for shallow correlation.
+///
+/// `data` ends at the declared outer SEQUENCE boundary, even when the received
+/// datagram contains a compatible suffix. Nested correlation parsing therefore
+/// cannot inspect or match bytes outside that envelope.
+#[derive(Clone, Copy)]
+struct CorrelationEnvelope<'a> {
+    data: &'a [u8],
+    version: Version,
+    after_version: usize,
 }
 
-fn extract_message_version(data: &[u8]) -> Option<Version> {
-    extract_message_envelope(data).map(|(version, _, _)| version)
+impl<'a> CorrelationEnvelope<'a> {
+    fn parse(data: &'a [u8], policy: DecodePolicy) -> Option<Self> {
+        if data.first().copied()? != 0x30 {
+            return None;
+        }
+        let (outer_len, outer_len_bytes) = parse_ber_length(data.get(1..)?)?;
+        let content_start = 1usize.checked_add(outer_len_bytes)?;
+        let content_end = content_start.checked_add(outer_len)?;
+        if content_end > data.len() || (policy == DecodePolicy::Strict && content_end != data.len())
+        {
+            return None;
+        }
+
+        let data = data.get(..content_end)?;
+
+        let mut pos = content_start;
+        if *data.get(pos)? != 0x02 {
+            return None;
+        }
+        pos = pos.checked_add(1)?;
+        let (version_len, version_len_bytes) = parse_ber_length(data.get(pos..)?)?;
+        pos = pos.checked_add(version_len_bytes)?;
+        let version_end = pos.checked_add(version_len)?;
+        if version_end > content_end || version_len == 0 || version_len > 4 {
+            return None;
+        }
+        let version = Version::from_i32(decode_ber_signed_integer(data.get(pos..version_end)?))?;
+        Some(Self {
+            data,
+            version,
+            after_version: version_end,
+        })
+    }
+
+    fn community_identity(self) -> Option<(Version, &'a [u8])> {
+        if !matches!(self.version, Version::V1 | Version::V2c) {
+            return None;
+        }
+
+        let data = self.data;
+        let mut pos = self.after_version;
+        if *data.get(pos)? != 0x04 {
+            return None;
+        }
+        pos = pos.checked_add(1)?;
+        let (community_len, community_len_bytes) = parse_ber_length(data.get(pos..)?)?;
+        pos = pos.checked_add(community_len_bytes)?;
+        let community_end = pos.checked_add(community_len)?;
+        Some((self.version, data.get(pos..community_end)?))
+    }
+
+    fn request_id(self) -> Option<i32> {
+        match self.version {
+            Version::V1 | Version::V2c => extract_v1v2c_request_id(self.data, self.after_version),
+            Version::V3 => extract_v3_msg_id(self.data, self.after_version),
+        }
+    }
 }
 
 /// Extract a checked v1/v2c version and borrowed community without allocating.
 ///
-/// All length arithmetic is checked and the outer BER frame must exactly cover
-/// the supplied packet. Malformed, truncated, v3, and overlong envelopes do not
-/// produce an identity match.
+/// The default compatible policy mirrors [`extract_request_id`]. Returned
+/// bytes are always borrowed from the declared top-level envelope, never from
+/// a datagram suffix.
+#[cfg(test)]
 pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])> {
-    let (version, mut pos, content_end) = extract_message_envelope(data)?;
-    if !matches!(version, Version::V1 | Version::V2c) {
-        return None;
-    }
-
-    if *data.get(pos)? != 0x04 {
-        return None;
-    }
-    pos = pos.checked_add(1)?;
-    let (community_len, community_len_bytes) = parse_ber_length(data.get(pos..)?)?;
-    pos = pos.checked_add(community_len_bytes)?;
-    let community_end = pos.checked_add(community_len)?;
-    if community_end > content_end {
-        return None;
-    }
-    Some((version, data.get(pos..community_end)?))
+    CorrelationEnvelope::parse(data, DecodePolicy::Compatible)?.community_identity()
 }
 
 // ============================================================================
@@ -587,17 +645,15 @@ pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])
 /// - SEQUENCE { INTEGER version(3), SEQUENCE msgGlobalData { INTEGER msgID, ... }, ... }
 /// - msgID in msgGlobalData is used for correlation
 ///
-/// We need to navigate through BER encoding to find the appropriate ID.
+/// We navigate only within the first complete declared top-level envelope to
+/// find the appropriate ID. A bounded datagram suffix is ignored here so the
+/// registered strict/compatible policy can decide whether to accept it.
 pub(crate) fn extract_request_id(data: &[u8]) -> Option<i32> {
-    let (version, pos, content_end) = extract_message_envelope(data)?;
-    match version {
-        Version::V1 | Version::V2c => extract_v1v2c_request_id(data, pos, content_end),
-        Version::V3 => extract_v3_msg_id(data, pos, content_end),
-    }
+    CorrelationEnvelope::parse(data, DecodePolicy::Compatible)?.request_id()
 }
 
 /// Extract msgID from V3 message starting at msgGlobalData position.
-fn extract_v3_msg_id(data: &[u8], mut pos: usize, outer_end: usize) -> Option<i32> {
+fn extract_v3_msg_id(data: &[u8], mut pos: usize) -> Option<i32> {
     // msgGlobalData SEQUENCE
     if *data.get(pos)? != 0x30 {
         return None;
@@ -606,9 +662,7 @@ fn extract_v3_msg_id(data: &[u8], mut pos: usize, outer_end: usize) -> Option<i3
     let (global_len, consumed) = parse_ber_length(data.get(pos..)?)?;
     pos = pos.checked_add(consumed)?;
     let global_end = pos.checked_add(global_len)?;
-    if global_end > outer_end {
-        return None;
-    }
+    data.get(pos..global_end)?;
 
     // First INTEGER inside msgGlobalData is msgID. Its complete encoding must
     // be contained by msgGlobalData rather than merely appearing later in the
@@ -628,7 +682,7 @@ fn extract_v3_msg_id(data: &[u8], mut pos: usize, outer_end: usize) -> Option<i3
 }
 
 /// Extract `request_id` from V1/V2c message starting at community position.
-fn extract_v1v2c_request_id(data: &[u8], mut pos: usize, outer_end: usize) -> Option<i32> {
+fn extract_v1v2c_request_id(data: &[u8], mut pos: usize) -> Option<i32> {
     // Community (OCTET STRING)
     if *data.get(pos)? != 0x04 {
         return None;
@@ -637,9 +691,7 @@ fn extract_v1v2c_request_id(data: &[u8], mut pos: usize, outer_end: usize) -> Op
     let (community_len, consumed) = parse_ber_length(data.get(pos..)?)?;
     pos = pos.checked_add(consumed)?;
     pos = pos.checked_add(community_len)?;
-    if pos > outer_end {
-        return None;
-    }
+    data.get(..pos)?;
 
     // PDU (context-specific, e.g., 0xA2 for Response)
     let pdu_tag = *data.get(pos)?;
@@ -650,9 +702,7 @@ fn extract_v1v2c_request_id(data: &[u8], mut pos: usize, outer_end: usize) -> Op
     let (pdu_len, consumed) = parse_ber_length(data.get(pos..)?)?;
     pos = pos.checked_add(consumed)?;
     let pdu_end = pos.checked_add(pdu_len)?;
-    if pdu_end > outer_end {
-        return None;
-    }
+    data.get(pos..pdu_end)?;
 
     // The complete request-id INTEGER must be contained by the PDU. Structural
     // and security validation beyond this shallow identity stays in the caller
@@ -757,6 +807,41 @@ mod request_id_tests {
 mod extract_tests {
     use super::*;
 
+    const V1_RESPONSE: &[u8] = &[
+        0x30, 0x1b, 0x02, 0x01, 0x00, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa2, 0x0e,
+        0x02, 0x01, 0x2a, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x03, 0x30, 0x01, 0x00,
+    ];
+    const V2C_RESPONSE: &[u8] = &[
+        0x30, 0x1c, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa2, 0x0f,
+        0x02, 0x02, 0x30, 0x39, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x03, 0x30, 0x01, 0x00,
+    ];
+    const V3_RESPONSE: &[u8] = &[
+        0x30, 0x33, 0x02, 0x01, 0x03, 0x30, 0x11, 0x02, 0x02, 0x30, 0x39, 0x02, 0x03, 0x00, 0xff,
+        0xe3, 0x04, 0x01, 0x04, 0x02, 0x01, 0x03, 0x04, 0x00, 0x30, 0x1b, 0x04, 0x00, 0x04, 0x00,
+        0xa2, 0x15, 0x02, 0x02, 0x30, 0x39, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x09, 0x30,
+        0x07, 0x06, 0x03, 0x2b, 0x06, 0x01, 0x05, 0x00,
+    ];
+
+    fn registration_for(version: Version) -> RequestRegistration {
+        match version {
+            Version::V1 => RequestRegistration::community(
+                42,
+                Duration::from_secs(1),
+                CommunityVersion::V1,
+                Bytes::from_static(b"public"),
+                CommunityResponsePolicy::Exact,
+            ),
+            Version::V2c => RequestRegistration::community(
+                12345,
+                Duration::from_secs(1),
+                CommunityVersion::V2c,
+                Bytes::from_static(b"public"),
+                CommunityResponsePolicy::Exact,
+            ),
+            Version::V3 => RequestRegistration::v3(12345, Duration::from_secs(1)),
+        }
+    }
+
     #[test]
     fn test_extract_request_id_v2c() {
         // A minimal SNMP v2c GET response with request_id = 12345
@@ -854,5 +939,75 @@ mod extract_tests {
         ];
 
         assert_eq!(extract_request_id(&malicious), None);
+    }
+
+    #[test]
+    fn correlation_policy_handles_suffixes_for_all_versions() {
+        for (version, packet) in [
+            (Version::V1, V1_RESPONSE),
+            (Version::V2c, V2C_RESPONSE),
+            (Version::V3, V3_RESPONSE),
+        ] {
+            let mut suffixed = packet.to_vec();
+            suffixed.extend_from_slice(V2C_RESPONSE);
+
+            assert_eq!(
+                registration_for(version).evaluate_response_identity(&suffixed, true),
+                ResponseIdentity::Match,
+                "compatible {version:?} correlation rejected a declared envelope with a suffix"
+            );
+            assert_eq!(
+                registration_for(version)
+                    .with_decode_policy(DecodePolicy::Strict)
+                    .evaluate_response_identity(&suffixed, true),
+                ResponseIdentity::Reject,
+                "strict {version:?} correlation accepted a datagram suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn correlation_never_uses_plausible_identity_from_suffix() {
+        let mut first = V1_RESPONSE.to_vec();
+        first.extend_from_slice(V2C_RESPONSE);
+
+        assert_eq!(extract_request_id(&first), Some(42));
+        assert_eq!(
+            registration_for(Version::V2c).evaluate_response_identity(&first, true),
+            ResponseIdentity::Reject,
+            "the v2c ID in the suffix must not correlate"
+        );
+
+        let version_only_envelope = [0x30, 0x03, 0x02, 0x01, 0x01];
+        let mut missing_identity = version_only_envelope.to_vec();
+        missing_identity.extend_from_slice(V2C_RESPONSE);
+        assert_eq!(extract_request_id(&missing_identity), None);
+        assert_eq!(
+            registration_for(Version::V2c).evaluate_response_identity(&missing_identity, true),
+            ResponseIdentity::Reject,
+            "correlation must not continue parsing beyond the declared envelope"
+        );
+    }
+
+    #[test]
+    fn malformed_truncated_and_oversized_envelopes_never_correlate() {
+        let malformed_packets: &[&[u8]] = &[
+            &[],
+            &[0x31, 0x00],
+            &[0x30, 0x80],
+            &[0x30, 0x05, 0x02, 0x01, 0x01],
+            &[0x30, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            &[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff, 0x02, 0x01, 0x01],
+        ];
+
+        for packet in malformed_packets {
+            assert_eq!(extract_request_id(packet), None);
+            for version in [Version::V1, Version::V2c, Version::V3] {
+                assert_eq!(
+                    registration_for(version).evaluate_response_identity(packet, true),
+                    ResponseIdentity::Reject
+                );
+            }
+        }
     }
 }

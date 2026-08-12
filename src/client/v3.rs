@@ -180,7 +180,8 @@ impl<T: Transport> Client<T> {
             let discovery_data = discovery_msg.encode()?;
             self.enforce_outbound_size(discovery_data.len(), None)?;
 
-            let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout);
+            let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout)
+                .with_decode_policy(self.inner.config.decode_policy);
 
             match self
                 .inner
@@ -190,7 +191,7 @@ impl<T: Transport> Client<T> {
                         data,
                         self.inner.transport.receive_limits().accepted(),
                         source,
-                        crate::message::DecodePolicy::Compatible,
+                        self.inner.config.decode_policy,
                     ) else {
                         return Ok(Candidate::Reject);
                     };
@@ -607,10 +608,13 @@ impl<T: Transport> Client<T> {
             response_data.clone(),
             self.inner.transport.receive_limits().accepted(),
             source,
-            crate::message::DecodePolicy::Compatible,
+            self.inner.config.decode_policy,
         ) else {
             return Ok(Candidate::Reject);
         };
+        let envelope_len =
+            response_data.len() - decoded.anomaly.map_or(0, |anomaly| anomaly.trailing_bytes);
+        let authenticated_message = response_data.slice(..envelope_len);
         let raw = decoded.value;
         let received_level = raw.security_level();
         let Ok(usm) = UsmSecurityParams::decode_with_target(raw.security_params.clone(), source)
@@ -619,7 +623,7 @@ impl<T: Transport> Client<T> {
         };
 
         let validated_generation =
-            match self.verify_response_security(&response_data, &usm, received_level) {
+            match self.verify_response_security(&authenticated_message, &usm, received_level) {
                 Ok(generation) => generation,
                 Err(error) if matches!(*error, Error::Config(_)) => return Err(error),
                 Err(_) => return Ok(Candidate::Reject),
@@ -775,6 +779,7 @@ impl<T: Transport> Client<T> {
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
 
             let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout)
+                .with_decode_policy(self.inner.config.decode_policy)
                 .with_aliases(msg_id_window.iter().copied());
             msg_id_window.push(msg_id);
 

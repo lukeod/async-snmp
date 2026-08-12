@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_snmp::message::DecodePolicy;
 use async_snmp::{
-    Candidate, CommunityResponsePolicy, CommunityVersion, Error, RequestRegistration,
-    ResponseIdentity, Transport,
+    Auth, Candidate, Client, ClientConfig, CommunityResponsePolicy, CommunityVersion, Error, Oid,
+    RequestRegistration, ResponseIdentity, Retry, Transport,
 };
 use bytes::Bytes;
 use tokio::sync::oneshot;
@@ -501,4 +502,77 @@ fn response_identity_covers_protocols_ids_and_malformed_envelopes() {
         v2c.evaluate_response_identity(&overlong_id, true),
         ResponseIdentity::Reject
     );
+}
+
+#[derive(Clone)]
+struct RegistrationPolicyProbe {
+    policies: Arc<Mutex<Vec<DecodePolicy>>>,
+}
+
+impl Transport for RegistrationPolicyProbe {
+    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+        Ok(())
+    }
+
+    async fn recv_with<T, F>(
+        &self,
+        _registration: RequestRegistration,
+        _validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+    {
+        Err(Error::Config("policy probe uses request_with".into()).boxed())
+    }
+
+    async fn request_with<T, F>(
+        &self,
+        _data: &[u8],
+        registration: RequestRegistration,
+        _validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+    {
+        self.policies
+            .lock()
+            .unwrap()
+            .push(registration.decode_policy());
+        Err(Error::Config("policy captured".into()).boxed())
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    }
+
+    fn is_reliable(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn custom_transport_observes_client_decode_policy_in_registration() {
+    let policies = Arc::new(Mutex::new(Vec::new()));
+    let transport = RegistrationPolicyProbe {
+        policies: Arc::clone(&policies),
+    };
+    let mut config = ClientConfig::default();
+    config.auth = Auth::v2c("public");
+    config.decode_policy = DecodePolicy::Strict;
+    config.retry = Retry::none();
+    let client = Client::new(transport, config).unwrap();
+
+    let error = client
+        .get(&Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(*error, Error::Config(ref message) if message.as_ref() == "policy captured"));
+    assert_eq!(*policies.lock().unwrap(), vec![DecodePolicy::Strict]);
 }

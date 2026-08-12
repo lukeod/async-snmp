@@ -968,6 +968,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn strict_suffix_rejection_preserves_registration_and_deadline() {
+        let core = Arc::new(UdpCore::new());
+        let target = test_addr();
+        let request_id = 501;
+        let prior_request_id = 500;
+        let registration = core
+            .register(
+                RequestRegistration::community(
+                    request_id,
+                    Duration::from_secs(5),
+                    crate::CommunityVersion::V2c,
+                    Bytes::from_static(b"public"),
+                    CommunityResponsePolicy::Exact,
+                )
+                .with_decode_policy(crate::message::DecodePolicy::Strict)
+                .with_aliases([prior_request_id]),
+                target,
+                false,
+            )
+            .unwrap();
+        let original_deadline = registration.owner.deadline;
+        let clean = community_packet(request_id, b"public");
+        let mut suffixed = community_packet(prior_request_id, b"public").to_vec();
+        suffixed.extend_from_slice(b"suffix");
+
+        assert!(!core.deliver(prior_request_id, Bytes::from(suffixed), target));
+        {
+            let pending = core.shard(request_id).pending.lock().unwrap();
+            let PendingEntry::Slot(slot) = pending.get(&request_id).unwrap() else {
+                panic!("expected retained pending slot");
+            };
+            assert!(Arc::ptr_eq(&slot.owner, &registration.owner));
+            assert_eq!(slot.owner.deadline, original_deadline);
+            assert!(slot.responses.is_empty());
+        }
+        {
+            let pending = core.shard(prior_request_id).pending.lock().unwrap();
+            let PendingEntry::Alias { primary, owner } = pending.get(&prior_request_id).unwrap()
+            else {
+                panic!("expected retained retry alias");
+            };
+            assert_eq!(*primary, request_id);
+            assert!(Arc::ptr_eq(owner, &registration.owner));
+            assert_eq!(owner.deadline, original_deadline);
+        }
+        assert_eq!(core.pending_counts(), (1, 1));
+        assert_eq!(core.stats().discarded_datagrams, 1);
+        assert_eq!(core.stats().expired_registrations, 0);
+
+        assert!(core.deliver(request_id, clean.clone(), target));
+        let (accepted, source) = core.wait_for_response(&registration, target).await.unwrap();
+        assert_eq!(accepted, clean);
+        assert_eq!(source, target);
+        assert_eq!(core.pending_counts(), (0, 1));
+        assert_eq!(core.stats().correlated_datagrams, 1);
+        assert_eq!(core.stats().expired_registrations, 0);
+        drop(registration);
+        assert_eq!(core.pending_counts(), (0, 0));
+    }
+
     #[test]
     fn strict_source_rejection_keeps_owned_slot() {
         let core = Arc::new(UdpCore::new());

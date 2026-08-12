@@ -142,6 +142,7 @@ pub struct ClientBuilder {
     construction_timeout: Duration,
     retry: Retry,
     max_oids_per_request: usize,
+    decode_policy: crate::message::DecodePolicy,
     response_shape_policy: crate::client::ResponseShapePolicy,
     max_repetitions: u32,
     walk_mode: WalkMode,
@@ -192,6 +193,7 @@ impl ClientBuilder {
             construction_timeout: DEFAULT_CONSTRUCTION_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
+            decode_policy: crate::message::DecodePolicy::Compatible,
             response_shape_policy: crate::client::ResponseShapePolicy::Compatible,
             max_repetitions: DEFAULT_MAX_REPETITIONS,
             walk_mode: WalkMode::Auto,
@@ -299,6 +301,19 @@ impl ClientBuilder {
     #[must_use]
     pub fn max_oids_per_request(mut self, max: usize) -> Self {
         self.max_oids_per_request = max;
+        self
+    }
+
+    /// Set top-level response-envelope handling (default: compatible).
+    ///
+    /// Compatible mode accepts a bounded suffix following one complete
+    /// declared SNMP message in a UDP datagram. Strict mode rejects the whole
+    /// datagram. This is a device-compatibility allowance: RFC 3417 specifies
+    /// one SNMP message per UDP datagram. Correlation and full response decoding
+    /// use this same policy.
+    #[must_use]
+    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
+        self.decode_policy = policy;
         self
     }
 
@@ -628,6 +643,7 @@ impl ClientBuilder {
     fn build_config(&self) -> ClientConfig {
         ClientConfig {
             auth: self.auth.clone(),
+            decode_policy: self.decode_policy,
             community_response_policy: self.community_response_policy,
             request_timeout: self.request_timeout,
             retry: self.retry.clone(),

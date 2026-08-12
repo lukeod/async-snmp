@@ -209,6 +209,13 @@ struct ClientInner<T: Transport> {
 pub struct ClientConfig {
     /// Authentication and corresponding SNMP version (default: V2c "public").
     pub auth: Auth,
+    /// Top-level response-envelope consumption policy (default: compatible).
+    ///
+    /// Compatible mode accepts bounded bytes after one complete declared SNMP
+    /// message in a UDP datagram despite RFC 3417's one-message-per-datagram
+    /// mapping. Strict mode rejects such datagrams. TCP still treats each
+    /// declared message TLV as one stream frame.
+    pub decode_policy: crate::message::DecodePolicy,
     /// Policy for correlating v1/v2c response communities (default: exact).
     pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
@@ -253,6 +260,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             auth: Auth::default(),
+            decode_policy: crate::message::DecodePolicy::Compatible,
             community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             retry: Retry::default(),
@@ -481,7 +489,8 @@ impl<T: Transport> Client<T> {
                 community_version,
                 community.clone(),
                 self.inner.config.community_response_policy,
-            );
+            )
+            .with_decode_policy(self.inner.config.decode_policy);
 
             // Send request and wait for response as a single unit. Combining the
             // two lets reliable transports (TCP) own their stream lock for the
@@ -497,7 +506,7 @@ impl<T: Transport> Client<T> {
                         response_data,
                         self.inner.transport.receive_limits().accepted(),
                         source,
-                        crate::message::DecodePolicy::Compatible,
+                        self.inner.config.decode_policy,
                     ) else {
                         return Ok(Candidate::Reject);
                     };
