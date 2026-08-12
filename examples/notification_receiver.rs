@@ -3,7 +3,12 @@
 //! This example demonstrates receiving SNMP notifications:
 //! - TrapV1: SNMPv1 format traps
 //! - TrapV2c/TrapV3: SNMPv2c and SNMPv3 traps
-//! - InformRequest: Confirmed notifications (auto-response)
+//! - InformRequest: Confirmed notifications (response attempted before delivery)
+//!
+//! V1/v2c communities and content are cleartext. Without a configured
+//! community allowlist they are unverified; an allowlist adds no message
+//! integrity. V3 username, context, and content are authenticated only at
+//! authNoPriv/authPriv and are spoofable at noAuthNoPriv.
 //!
 //! Run with: cargo run --example notification_receiver
 //!
@@ -18,8 +23,10 @@
 //!   snmptrap -v 3 -u trapuser -l authPriv -a SHA -A authpass123 \
 //!       -x AES -X privpass123 localhost:1163 '' SNMPv2-MIB::warmStart
 
-use async_snmp::notification::{Notification, NotificationReceiver, oids};
-use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+use async_snmp::notification::{
+    Notification, NotificationAcceptance, NotificationEnvelope, NotificationReceiver, oids,
+};
+use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol, SecurityLevel};
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -62,7 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let authenticated_receiver = NotificationReceiver::builder()
         .bind("0.0.0.0:1163")
         .authoritative_engine(engine)
-        // Configure USM user for authenticated traps/informs
+        // Configure authentication/privacy capabilities. A keyed user also
+        // supports noAuthNoPriv, so the policy below enforces the minimum.
         .usm_user("trapuser", |u| {
             u.auth_priv(
                 AuthProtocol::Sha1,
@@ -75,7 +83,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .usm_user("readonly", |u| {
             u.auth(AuthProtocol::Sha256, b"readonlypass")
         })
-        .accept_all_notifications()
+        // This synchronous policy runs after applicable USM processing and
+        // notification-prefix validation, but before any Inform response. It
+        // can inspect all normalized content; keep it bounded and non-blocking.
+        .acceptance_policy(|notification: &NotificationEnvelope<'_>| {
+            if notification.security_level >= Some(SecurityLevel::AuthNoPriv)
+                && notification
+                    .trap_oid()
+                    .is_ok_and(|oid| oid.starts_with(&oids::snmp_traps()))
+            {
+                NotificationAcceptance::Accept
+            } else {
+                NotificationAcceptance::Reject
+            }
+        })
         .build()
         .await?;
 
@@ -90,7 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("--- Community-Filtered Receiver ---\n");
 
-    // Community filtering is opt-in. Once one or more communities are
+    // Communities are cleartext and provide no message integrity. Filtering is
+    // opt-in. Once one or more communities are
     // configured, v1/v2c notifications whose community matches none of them
     // are dropped (a dropped inform is not acknowledged). Comparison is
     // constant-time. This does not affect v3, which is gated by USM.
@@ -241,7 +263,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             request_id,
             ..
         } => {
-            println!("  Type: SNMPv2c Inform (response sent automatically)");
+            println!("  Type: SNMPv2c Inform (response attempted before delivery)");
             println!(
                 "  Community: {}",
                 String::from_utf8_lossy(community.as_bytes())
@@ -257,7 +279,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             request_id,
             ..
         } => {
-            println!("  Type: SNMPv3 Inform (response sent automatically)");
+            println!("  Type: SNMPv3 Inform (response attempted before delivery)");
             println!("  Security Level: {security_level:?}");
             println!("  Username: {}", String::from_utf8_lossy(username));
             println!("  Context Engine ID: {:?}", context_engine_id.as_ref());

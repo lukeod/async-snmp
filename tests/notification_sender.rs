@@ -7,7 +7,9 @@ mod common;
 
 use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::message::CommunityMessage;
-use async_snmp::notification::{Notification, NotificationReceiver, NotificationVarbindValidation};
+use async_snmp::notification::{
+    Notification, NotificationAcceptance, NotificationReceiver, NotificationVarbindValidation,
+};
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 use async_snmp::v3::{AuthProtocol, PrivProtocol};
 use async_snmp::varbind::VarBind;
@@ -188,9 +190,9 @@ async fn notification_varbind_validation_controls_trap_delivery() {
     let strict = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .varbind_validation(NotificationVarbindValidation::Strict)
-        .acceptance_policy(move |_| {
+        .acceptance_policy(move |_: &async_snmp::NotificationEnvelope<'_>| {
             policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
-            true
+            NotificationAcceptance::Accept
         })
         .build()
         .await

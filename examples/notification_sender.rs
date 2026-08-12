@@ -12,10 +12,10 @@
 //! Run with: cargo run --example notification_sender --features agent
 
 use async_snmp::agent::{Agent, NotificationOutcome, SinkStatus};
-use async_snmp::notification::{Notification, NotificationReceiver};
+use async_snmp::notification::{Notification, NotificationAcceptance, NotificationReceiver};
 use async_snmp::v3::AuthoritativeEngine;
 use async_snmp::varbind::VarBind;
-use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, Value, oid};
+use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, SecurityLevel, Value, oid};
 use std::time::Duration;
 
 #[tokio::main]
@@ -45,7 +45,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b"privpass12345678",
             )
         })
-        .accept_all_notifications()
+        // This local demo also receives cleartext v2c messages. For v3, require
+        // authentication because configured keyed users also support spoofable
+        // noAuthNoPriv input.
+        .acceptance_policy(|notification| match notification.security_level {
+            None => NotificationAcceptance::Accept,
+            Some(level) if level >= SecurityLevel::AuthNoPriv => NotificationAcceptance::Accept,
+            Some(_) => NotificationAcceptance::Reject,
+        })
         .build()
         .await?;
     let recv_addr = receiver.local_addr();

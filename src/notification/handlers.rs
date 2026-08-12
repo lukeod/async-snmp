@@ -17,7 +17,7 @@ use crate::v3::encode::encode_v3_response;
 use crate::v3::process::{UsmFailure, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
 
 use super::varbind::extract_notification_varbinds;
-use super::{Notification, NotificationMetadata, NotificationPduClass, ReceiverInner};
+use super::{Notification, NotificationPduClass, ReceiverInner};
 use crate::v3::DerivedKeys;
 
 impl super::NotificationReceiver {
@@ -48,25 +48,16 @@ impl super::NotificationReceiver {
         let (_, community, pdu) = msg.into_parts();
         match pdu {
             crate::message::CommunityPdu::TrapV1(trap) => {
-                let metadata = NotificationMetadata {
-                    source,
-                    version: crate::Version::V1,
-                    username: None,
-                    security_level: None,
-                    pdu_class: NotificationPduClass::Trap,
-                    context_engine_id: Bytes::new(),
-                    context_name: Bytes::new(),
-                    decode_anomalies: decode_anomalies.clone(),
-                };
-                if !self.inner.accepts(&metadata) {
-                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v1 trap");
-                    return Ok(None);
-                }
-                Ok(Some(Notification::TrapV1 {
+                let notification = Notification::TrapV1 {
                     community,
                     trap,
                     decode_anomalies,
-                }))
+                };
+                if !self.inner.accepts(source, &notification) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v1 trap");
+                    return Ok(None);
+                }
+                Ok(Some(notification))
             }
             crate::message::CommunityPdu::Standard(_) => Ok(None),
         }
@@ -115,47 +106,36 @@ impl super::NotificationReceiver {
             PduType::TrapV2 => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
-                let metadata = NotificationMetadata {
-                    source,
-                    version: crate::Version::V2c,
-                    username: None,
-                    security_level: None,
-                    pdu_class: NotificationPduClass::Trap,
-                    context_engine_id: Bytes::new(),
-                    context_name: Bytes::new(),
-                    decode_anomalies: decode_anomalies.clone(),
-                };
-                if !self.inner.accepts(&metadata) {
-                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c trap");
-                    return Ok(None);
-                }
-                Ok(Some(Notification::TrapV2c {
+                let notification = Notification::TrapV2c {
                     community: msg.community().clone(),
                     uptime,
                     trap_oid,
                     varbinds,
                     request_id: pdu.request_id,
                     decode_anomalies,
-                }))
+                };
+                if !self.inner.accepts(source, &notification) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c trap");
+                    return Ok(None);
+                }
+                Ok(Some(notification))
             }
             PduType::InformRequest => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
-                let metadata = NotificationMetadata {
-                    source,
-                    version: crate::Version::V2c,
-                    username: None,
-                    security_level: None,
-                    pdu_class: NotificationPduClass::Inform,
-                    context_engine_id: Bytes::new(),
-                    context_name: Bytes::new(),
-                    decode_anomalies: decode_anomalies.clone(),
+                let request_id = pdu.request_id;
+                let notification = Notification::InformV2c {
+                    community: msg.community().clone(),
+                    uptime,
+                    trap_oid,
+                    varbinds,
+                    request_id,
+                    decode_anomalies,
                 };
-                if !self.inner.accepts(&metadata) {
+                if !self.inner.accepts(source, &notification) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c Inform");
                     return Ok(None);
                 }
-                let request_id = pdu.request_id;
 
                 let finalized = crate::response_finalizer::finalize_response(
                     crate::Version::V2c,
@@ -179,14 +159,7 @@ impl super::NotificationReceiver {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "Inform response and tooBig alternate exceed max message size");
                 }
 
-                Ok(Some(Notification::InformV2c {
-                    community: msg.community().clone(),
-                    uptime,
-                    trap_oid,
-                    varbinds,
-                    request_id,
-                    decode_anomalies,
-                }))
+                Ok(Some(notification))
             }
             _ => Ok(None), // Not a notification PDU
         }
@@ -286,25 +259,11 @@ impl super::NotificationReceiver {
             }
             _ => return Ok(None),
         };
-        let metadata = NotificationMetadata {
-            source,
-            version: crate::Version::V3,
-            username: Some(username.clone()),
-            security_level: Some(security_level),
-            pdu_class,
-            context_engine_id: context_engine_id.clone(),
-            context_name: context_name.clone(),
-            decode_anomalies: decode_anomalies.clone(),
-        };
         match pdu.pdu_type() {
             PduType::TrapV2 => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
-                if !self.inner.accepts(&metadata) {
-                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
-                    return Ok(None);
-                }
-                Ok(Some(Notification::TrapV3 {
+                let notification = Notification::TrapV3 {
                     username,
                     context_engine_id,
                     context_name,
@@ -314,16 +273,32 @@ impl super::NotificationReceiver {
                     varbinds,
                     request_id: pdu.request_id,
                     decode_anomalies,
-                }))
+                };
+                if !self.inner.accepts(source, &notification) {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
+                    return Ok(None);
+                }
+                Ok(Some(notification))
             }
             PduType::InformRequest => {
                 let (uptime, trap_oid, varbinds) =
                     extract_notification_varbinds(pdu, self.inner.varbind_validation)?;
-                if !self.inner.accepts(&metadata) {
+                let request_id = pdu.request_id;
+                let notification = Notification::InformV3 {
+                    username,
+                    context_engine_id: context_engine_id.clone(),
+                    context_name: context_name.clone(),
+                    security_level,
+                    uptime,
+                    trap_oid,
+                    varbinds,
+                    request_id,
+                    decode_anomalies,
+                };
+                if !self.inner.accepts(source, &notification) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
                     return Ok(None);
                 }
-                let request_id = pdu.request_id;
 
                 let finalized = crate::response_finalizer::finalize_response(
                     crate::Version::V3,
@@ -357,17 +332,7 @@ impl super::NotificationReceiver {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "V3 Inform response and tooBig alternate exceed max message size");
                 }
 
-                Ok(Some(Notification::InformV3 {
-                    username,
-                    context_engine_id,
-                    context_name,
-                    security_level,
-                    uptime,
-                    trap_oid,
-                    varbinds,
-                    request_id,
-                    decode_anomalies,
-                }))
+                Ok(Some(notification))
             }
             _ => Ok(None),
         }

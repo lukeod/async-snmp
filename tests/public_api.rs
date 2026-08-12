@@ -18,6 +18,39 @@ use async_snmp::{
 use bytes::Bytes;
 
 #[test]
+fn notification_acceptance_policy_surface_is_public() {
+    use async_snmp::{
+        NotificationAcceptance, NotificationAcceptanceError, NotificationAcceptancePolicy,
+        NotificationAcceptanceResult, NotificationEnvelope, NotificationReceiver,
+    };
+
+    fn accepts_public_policy(_policy: impl NotificationAcceptancePolicy) {}
+
+    accepts_public_policy(
+        |notification: &NotificationEnvelope<'_>| -> NotificationAcceptanceResult {
+            if notification
+                .security_level
+                .is_some_and(|level| level.requires_auth())
+            {
+                Ok(NotificationAcceptance::Accept)
+            } else {
+                Err(NotificationAcceptanceError::new(
+                    "authenticated notification required",
+                ))
+            }
+        },
+    );
+
+    let _infallible = NotificationReceiver::builder()
+        .acceptance_policy(|_: &NotificationEnvelope<'_>| NotificationAcceptance::Reject);
+    let _fallible = NotificationReceiver::builder().try_acceptance_policy(
+        |_: &NotificationEnvelope<'_>| -> NotificationAcceptanceResult {
+            Ok(NotificationAcceptance::Reject)
+        },
+    );
+}
+
+#[test]
 fn extensible_configs_support_default_plus_field_mutation() {
     let mut client = ClientConfig::default();
     client.auth = Auth::v1("private");

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Notification acceptance policies now receive a borrowed
+  `NotificationEnvelope` containing source, community or USM security,
+  context, class, uptime, trap OID, application varbinds, request ID, and decode
+  anomalies. Policies return `NotificationAcceptance`; evaluation occurs after
+  applicable protocol authentication/decryption and prefix validation but
+  before an Inform response attempt or delivery. Rejection, policy error, and
+  panic withhold the response. Acceptance attempts the response before
+  delivery, except response-size finalization can increment `snmpSilentDrops`
+  and still deliver without sending one. V1/v2c community/content remain
+  cleartext, and v3 identity/context/content are authenticated only at
+  authNoPriv/authPriv; `accept_all_notifications` also accepts spoofable
+  noAuthNoPriv input.
 - **Breaking:** `MibHandler::test_set` now returns a request-owned opaque
   `PreparedSet` for each accepted varbind. Commit, undo, and free operate on
   that state directly, removing the need for handler side tables. Explicit

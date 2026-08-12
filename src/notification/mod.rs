@@ -9,6 +9,11 @@
 //!
 //! Receive v1/v2c notifications. A receiver constructed with `bind` has no
 //! USM user table, so v3 notifications are rejected; see below for v3.
+//! V1/v2c community strings are carried in cleartext and provide no message
+//! integrity. With no configured community allowlist, the reported community
+//! and notification content are unverified and spoofable. An allowlist proves
+//! only that the cleartext value matched a configured entry; it does not make
+//! the message cryptographically authenticated.
 //!
 //! ```rust,no_run
 //! use async_snmp::notification::{NotificationReceiver, Notification};
@@ -36,11 +41,14 @@
 //! To receive V3 traps and `InformRequests`, configure USM credentials via
 //! the builder. Configured mechanisms are capabilities, so a keyed user also
 //! supports lower levels including `noAuthNoPriv`. Select an explicit
-//! acceptance policy before building:
+//! acceptance policy before building. Only `authNoPriv` and `authPriv`
+//! authenticate the USM username, scoped context, and notification content;
+//! every such field in a `noAuthNoPriv` message is an unverified, spoofable
+//! claim.
 //!
 //! ```rust,no_run
-//! use async_snmp::notification::NotificationReceiver;
-//! use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+//! use async_snmp::notification::{NotificationAcceptance, NotificationReceiver};
+//! use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol, SecurityLevel};
 //! use std::convert::Infallible;
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
@@ -59,7 +67,13 @@
 //!             b"privpass123",
 //!         )
 //!     })
-//!     .accept_all_notifications()
+//!     .acceptance_policy(|notification| {
+//!         if notification.security_level >= Some(SecurityLevel::AuthNoPriv) {
+//!             NotificationAcceptance::Accept
+//!         } else {
+//!             NotificationAcceptance::Reject
+//!         }
+//!     })
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -74,8 +88,8 @@
 //! together — configuring one does not disable the other:
 //!
 //! ```rust,no_run
-//! use async_snmp::notification::NotificationReceiver;
-//! use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+//! use async_snmp::notification::{NotificationAcceptance, NotificationReceiver};
+//! use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol, SecurityLevel};
 //! use std::convert::Infallible;
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
@@ -95,25 +109,34 @@
 //!             b"privpass123",
 //!         )
 //!     })
-//!     .accept_all_notifications()
+//!     .acceptance_policy(|notification| match notification.security_level {
+//!         None => NotificationAcceptance::Accept, // community allowlist matched
+//!         Some(level) if level >= SecurityLevel::AuthNoPriv => {
+//!             NotificationAcceptance::Accept
+//!         }
+//!         Some(_) => NotificationAcceptance::Reject,
+//!     })
 //!     .build()
 //!     .await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The two mechanisms confer very different trust (a `public` v2c trap versus
-//! an authPriv v3 trap arrive on the same socket). Each [`Notification`]
-//! variant carries how it was authenticated — the community for v1/v2c, the
-//! username and [`security_level`](Notification::security_level) for v3 — so
-//! branch on the variant when `recv` returns to apply per-version policy.
+//! The two mechanisms confer very different assurance. V1/v2c community and
+//! content are cleartext; without an allowlist they are unverified, while a
+//! match checks only the cleartext community value. V3 username, context, and
+//! content are authenticated at `authNoPriv` or `authPriv`, but remain
+//! spoofable at `noAuthNoPriv`. Each [`Notification`] carries the community or
+//! username and [`security_level`](Notification::security_level), so branch on
+//! those fields when applying per-version policy.
 //!
 //! # SNMPv3 authoritative roles
 //!
-//! The sender of an unconfirmed V3 trap is authoritative. The receiver verifies
-//! the trap against per-sender engine state and reports the received security
-//! level to the application. For a V3 Inform, this receiver is authoritative:
-//! the Inform must be localized to its stable engine ID, and the automatic
+//! The sender of an unconfirmed V3 trap is authoritative. The receiver applies
+//! per-sender engine processing and reports the received security level to the
+//! application; authentication of identity and content occurs only at
+//! `authNoPriv` or `authPriv`. For a V3 Inform, this receiver is authoritative:
+//! the Inform must be localized to its stable engine ID, and any generated
 //! Response uses its current coherent boots/time rather than echoing the
 //! incoming tuple. Configuring any USM user therefore requires a persisted
 //! [`AuthoritativeEngine`].
@@ -132,6 +155,30 @@
 //! returned by [`NotificationReceiver::recv`]. A rejected Inform is not
 //! acknowledged. This policy does not affect SNMPv1 traps, community or USM
 //! checks, SNMPv3 engine correlation, or outbound PDU construction.
+//!
+//! # Application acceptance and Inform acknowledgement
+//!
+//! [`NotificationReceiverBuilder::acceptance_policy`] receives one borrowed
+//! [`NotificationEnvelope`] after the transport, community or USM identity,
+//! scoped context, notification class, prefix, uptime, trap OID, varbinds, and
+//! decode anomalies are known, though their authentication assurance still
+//! depends on the version, allowlist, and security level described above.
+//! Returning [`NotificationAcceptance::Reject`]
+//! drops the notification and withholds an Inform response. Policy errors and
+//! panics have the same behavior. After acceptance, an Inform response is
+//! finalized and, when encodable within the effective response limit, sent
+//! before [`NotificationReceiver::recv`] delivers the notification. If both
+//! the ordinary response and its `tooBig` alternate exceed that limit, no
+//! response is sent, [`NotificationReceiver::snmp_silent_drops`] increments,
+//! and the accepted notification is still delivered. The response attempt
+//! therefore does not guarantee that the originator received an
+//! acknowledgement.
+//!
+//! [`NotificationReceiverBuilder::accept_all_notifications`] is the explicit
+//! auto-accept convenience for receivers with USM users. It also accepts
+//! spoofable `noAuthNoPriv` messages, so use a policy that requires at least
+//! [`SecurityLevel::AuthNoPriv`] when authenticated identity and content are
+//! required.
 
 mod handlers;
 mod varbind;
@@ -178,29 +225,275 @@ pub enum NotificationPduClass {
     Inform,
 }
 
-/// Successfully processed notification metadata evaluated before delivery or
-/// Inform acknowledgement.
-#[derive(Debug, Clone)]
-pub struct NotificationMetadata {
-    /// Datagram source address.
+/// Decision returned by a [`NotificationAcceptancePolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationAcceptance {
+    /// Deliver the notification and attempt a response when it is an Inform.
+    ///
+    /// The response is attempted before delivery, but response-size
+    /// finalization can increment `snmpSilentDrops` and deliver the accepted
+    /// notification without sending a response.
+    Accept,
+    /// Drop the notification without acknowledging it.
+    Reject,
+}
+
+/// Application-policy failure while evaluating a notification.
+///
+/// Policy failures reject the notification and are emitted through tracing;
+/// they are not returned from [`NotificationReceiver::recv`] because that
+/// method continues waiting for the next acceptable datagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationAcceptanceError {
+    message: Box<str>,
+}
+
+impl NotificationAcceptanceError {
+    /// Create an application-policy error with a diagnostic message.
+    pub fn new(message: impl Into<Box<str>>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Return the diagnostic message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for NotificationAcceptanceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NotificationAcceptanceError {}
+
+/// Result returned by a fallible [`NotificationAcceptancePolicy`].
+pub type NotificationAcceptanceResult =
+    std::result::Result<NotificationAcceptance, NotificationAcceptanceError>;
+
+/// A borrowed, normalized view of one fully processed notification.
+///
+/// Protocol decoding, configured community filtering, applicable USM
+/// authentication/decryption, and standard notification-prefix validation
+/// finish before this envelope is created. Its fields have the assurance
+/// indicated by [`security_level`](Self::security_level): v1/v2c community and
+/// content are cleartext and, without an allowlist, unverified; v3 username,
+/// context, and content are authenticated only at
+/// [`SecurityLevel::AuthNoPriv`] or [`SecurityLevel::AuthPriv`] and are
+/// spoofable at [`SecurityLevel::NoAuthNoPriv`]. The policy decision is made
+/// before any Inform response attempt or delivery.
+#[derive(Debug, Clone, Copy)]
+pub struct NotificationEnvelope<'a> {
+    /// Datagram source address; SNMP does not cryptographically authenticate it.
     pub source: SocketAddr,
     /// Protocol version.
     pub version: Version,
-    /// USM username for v3, or `None` for community-based notifications.
-    pub username: Option<Bytes>,
+    /// Community for v1/v2c, or `None` for v3.
+    ///
+    /// The value is cleartext. Without a configured community allowlist it is
+    /// an unverified claim; an allowlist checks equality but provides no
+    /// message integrity.
+    pub community: Option<&'a Community>,
+    /// USM username for v3, or `None` for v1/v2c.
+    ///
+    /// Authenticated only when `security_level` is `AuthNoPriv` or `AuthPriv`;
+    /// spoofable when it is `NoAuthNoPriv`.
+    pub username: Option<&'a [u8]>,
     /// Actual v3 wire security level, or `None` for v1/v2c.
     pub security_level: Option<SecurityLevel>,
     /// Trap or Inform classification.
     pub pdu_class: NotificationPduClass,
-    /// Scoped-PDU context engine ID for v3, empty for v1/v2c.
-    pub context_engine_id: Bytes,
-    /// Scoped-PDU context name for v3, empty for v1/v2c.
-    pub context_name: Bytes,
+    /// Scoped-PDU context engine ID for v3, or `None` for v1/v2c.
+    ///
+    /// Authenticated only at `AuthNoPriv` or `AuthPriv`; spoofable at
+    /// `NoAuthNoPriv`.
+    pub context_engine_id: Option<&'a [u8]>,
+    /// Scoped-PDU context name for v3, or `None` for v1/v2c.
+    ///
+    /// Authenticated only at `AuthNoPriv` or `AuthPriv`; spoofable at
+    /// `NoAuthNoPriv`.
+    pub context_name: Option<&'a [u8]>,
+    /// sysUpTime.0, or the v1 trap timestamp, in hundredths of a second.
+    ///
+    /// This content is authenticated only for v3 `AuthNoPriv`/`AuthPriv`.
+    pub uptime: u32,
+    /// Notification-specific variable bindings, excluding the standard v2/v3
+    /// uptime and trap-OID prefix.
+    ///
+    /// This content is authenticated only for v3 `AuthNoPriv`/`AuthPriv`.
+    pub varbinds: &'a [VarBind],
+    /// Request ID for v2c/v3 notifications, or `None` for v1 traps.
+    pub request_id: Option<i32>,
     /// Accepted BER/value deviations from the received message, in decode order.
-    pub decode_anomalies: Vec<crate::DecodeAnomaly>,
+    pub decode_anomalies: &'a [crate::DecodeAnomaly],
+    notification: &'a Notification,
 }
 
-type AcceptancePolicy = dyn Fn(&NotificationMetadata) -> bool + Send + Sync;
+impl<'a> NotificationEnvelope<'a> {
+    fn new(source: SocketAddr, notification: &'a Notification) -> Self {
+        match notification {
+            Notification::TrapV1 {
+                community,
+                trap,
+                decode_anomalies,
+            } => Self {
+                source,
+                version: Version::V1,
+                community: Some(community),
+                username: None,
+                security_level: None,
+                pdu_class: NotificationPduClass::Trap,
+                context_engine_id: None,
+                context_name: None,
+                uptime: trap.time_stamp,
+                varbinds: &trap.varbinds,
+                request_id: None,
+                decode_anomalies,
+                notification,
+            },
+            Notification::TrapV2c {
+                community,
+                uptime,
+                varbinds,
+                request_id,
+                decode_anomalies,
+                ..
+            }
+            | Notification::InformV2c {
+                community,
+                uptime,
+                varbinds,
+                request_id,
+                decode_anomalies,
+                ..
+            } => Self {
+                source,
+                version: Version::V2c,
+                community: Some(community),
+                username: None,
+                security_level: None,
+                pdu_class: if notification.is_confirmed() {
+                    NotificationPduClass::Inform
+                } else {
+                    NotificationPduClass::Trap
+                },
+                context_engine_id: None,
+                context_name: None,
+                uptime: *uptime,
+                varbinds,
+                request_id: Some(*request_id),
+                decode_anomalies,
+                notification,
+            },
+            Notification::TrapV3 {
+                username,
+                context_engine_id,
+                context_name,
+                security_level,
+                uptime,
+                varbinds,
+                request_id,
+                decode_anomalies,
+                ..
+            }
+            | Notification::InformV3 {
+                username,
+                context_engine_id,
+                context_name,
+                security_level,
+                uptime,
+                varbinds,
+                request_id,
+                decode_anomalies,
+                ..
+            } => Self {
+                source,
+                version: Version::V3,
+                community: None,
+                username: Some(username),
+                security_level: Some(*security_level),
+                pdu_class: if notification.is_confirmed() {
+                    NotificationPduClass::Inform
+                } else {
+                    NotificationPduClass::Trap
+                },
+                context_engine_id: Some(context_engine_id),
+                context_name: Some(context_name),
+                uptime: *uptime,
+                varbinds,
+                request_id: Some(*request_id),
+                decode_anomalies,
+                notification,
+            },
+        }
+    }
+
+    /// Return the normalized notification OID.
+    ///
+    /// V1 trap OIDs are derived from the generic/specific trap fields and can
+    /// fail when a decoded enterprise-specific trap cannot form a valid OID.
+    /// Like the rest of the notification content, this value is authenticated
+    /// only for v3 `AuthNoPriv`/`AuthPriv` messages.
+    pub fn trap_oid(&self) -> Result<Oid> {
+        self.notification.trap_oid()
+    }
+
+    /// Return the complete version-specific notification.
+    ///
+    /// Consult [`Self::security_level`] before treating v3 identity, context,
+    /// or content as authenticated. V1/v2c values have no cryptographic
+    /// integrity.
+    #[must_use]
+    pub fn notification(&self) -> &'a Notification {
+        self.notification
+    }
+}
+
+/// Synchronous application policy evaluated before notification delivery and
+/// any Inform response attempt.
+///
+/// The blanket implementation accepts fallible closures with the same
+/// signature. A policy error or panic is contained by the receiver and treated as
+/// [`NotificationAcceptance::Reject`]. Keeping this decision synchronous means
+/// it has no independent timeout or cancellation lifecycle; applications that
+/// need external state should expose a bounded in-memory snapshot to the
+/// policy.
+pub trait NotificationAcceptancePolicy: Send + Sync + 'static {
+    /// Decide whether a fully processed notification should be accepted.
+    fn evaluate(&self, notification: &NotificationEnvelope<'_>) -> NotificationAcceptanceResult;
+}
+
+impl<F> NotificationAcceptancePolicy for F
+where
+    F: Fn(&NotificationEnvelope<'_>) -> NotificationAcceptanceResult + Send + Sync + 'static,
+{
+    fn evaluate(&self, notification: &NotificationEnvelope<'_>) -> NotificationAcceptanceResult {
+        self(notification)
+    }
+}
+
+struct AcceptAllNotifications;
+
+impl NotificationAcceptancePolicy for AcceptAllNotifications {
+    fn evaluate(&self, _notification: &NotificationEnvelope<'_>) -> NotificationAcceptanceResult {
+        Ok(NotificationAcceptance::Accept)
+    }
+}
+
+struct InfallibleAcceptancePolicy<F>(F);
+
+impl<F> NotificationAcceptancePolicy for InfallibleAcceptancePolicy<F>
+where
+    F: Fn(&NotificationEnvelope<'_>) -> NotificationAcceptance + Send + Sync + 'static,
+{
+    fn evaluate(&self, notification: &NotificationEnvelope<'_>) -> NotificationAcceptanceResult {
+        Ok(self.0(notification))
+    }
+}
 
 /// Well-known OIDs for notification varbinds.
 pub mod oids {
@@ -291,7 +584,7 @@ pub struct NotificationReceiverBuilder {
     max_message_size: usize,
     decode_policy: crate::message::DecodePolicy,
     compatibility_policy: crate::CompatibilityPolicy,
-    acceptance_policy: Option<Arc<AcceptancePolicy>>,
+    acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
 }
 
 impl NotificationReceiverBuilder {
@@ -349,7 +642,10 @@ impl NotificationReceiverBuilder {
     /// The default is the maximum UDP payload. Values below the SNMPv3
     /// advertisement minimum are permitted as response/drop policy and are not
     /// copied into outgoing V3 `msgMaxSize`, which remains this receiver's local
-    /// receive capacity.
+    /// receive capacity. If neither an accepted Inform's ordinary response nor
+    /// its `tooBig` alternate fits the effective limit, the receiver increments
+    /// [`NotificationReceiver::snmp_silent_drops`], sends no response, and
+    /// still delivers the notification.
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
@@ -384,17 +680,36 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Set the application policy evaluated after protocol and USM processing
-    /// but before delivery or Inform acknowledgement.
+    /// Set the application policy evaluated after protocol processing and
+    /// notification-prefix validation, but before delivery or any Inform
+    /// response attempt.
     ///
-    /// A receiver with USM users must select this method or
+    /// A receiver with USM users must select this method,
+    /// [`try_acceptance_policy`](Self::try_acceptance_policy), or
     /// [`accept_all_notifications`](Self::accept_all_notifications). Returning
-    /// `false` silently drops a trap and leaves an Inform unacknowledged.
+    /// [`NotificationAcceptance::Reject`] silently drops a trap and leaves an
+    /// Inform unacknowledged. Policy panics are contained and have the same
+    /// rejection behavior. Acceptance causes an Inform response attempt before
+    /// delivery; response-size finalization may instead count a silent drop and
+    /// deliver the accepted notification without sending a response.
     #[must_use]
     pub fn acceptance_policy(
         mut self,
-        policy: impl Fn(&NotificationMetadata) -> bool + Send + Sync + 'static,
+        policy: impl Fn(&NotificationEnvelope<'_>) -> NotificationAcceptance + Send + Sync + 'static,
     ) -> Self {
+        self.acceptance_policy = Some(Arc::new(InfallibleAcceptancePolicy(policy)));
+        self
+    }
+
+    /// Set a fallible application acceptance policy.
+    ///
+    /// Evaluation occurs at the same point as
+    /// [`acceptance_policy`](Self::acceptance_policy). An error is traced and
+    /// rejects the notification without acknowledging an Inform. The policy is
+    /// evaluated before response finalization, so it cannot observe whether an
+    /// accepted Inform's response fits the effective response limit.
+    #[must_use]
+    pub fn try_acceptance_policy(mut self, policy: impl NotificationAcceptancePolicy) -> Self {
         self.acceptance_policy = Some(Arc::new(policy));
         self
     }
@@ -402,17 +717,21 @@ impl NotificationReceiverBuilder {
     /// Explicitly accept every successfully processed notification.
     ///
     /// For v3 this includes lower security levels supported by a configured
-    /// inbound user, including `noAuthNoPriv`.
+    /// inbound user, including `noAuthNoPriv`. At that level the username,
+    /// context, and notification content are unverified and spoofable. Prefer
+    /// [`acceptance_policy`](Self::acceptance_policy) with a minimum
+    /// [`SecurityLevel::AuthNoPriv`] when authenticated input is required.
     #[must_use]
     pub fn accept_all_notifications(mut self) -> Self {
-        self.acceptance_policy = Some(Arc::new(|_: &NotificationMetadata| true));
+        self.acceptance_policy = Some(Arc::new(AcceptAllNotifications));
         self
     }
 
-    /// Add a USM user for V3 authentication.
+    /// Add a USM user for V3 processing.
     ///
     /// Adding any user requires a persisted [`AuthoritativeEngine`] and an
-    /// explicit [`acceptance_policy`](Self::acceptance_policy) or
+    /// explicit [`acceptance_policy`](Self::acceptance_policy),
+    /// [`try_acceptance_policy`](Self::try_acceptance_policy), or
     /// [`accept_all_notifications`](Self::accept_all_notifications) before
     /// [`build`](Self::build), because this receiver is authoritative for V3
     /// Inform exchanges.
@@ -420,8 +739,8 @@ impl NotificationReceiverBuilder {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use async_snmp::notification::NotificationReceiver;
-    /// use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol};
+    /// use async_snmp::notification::{NotificationAcceptance, NotificationReceiver};
+    /// use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol, SecurityLevel};
     /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
@@ -440,7 +759,13 @@ impl NotificationReceiverBuilder {
     ///             b"privpassword",
     ///         )
     ///     })
-    ///     .accept_all_notifications()
+    ///     .acceptance_policy(|notification| {
+    ///         if notification.security_level >= Some(SecurityLevel::AuthNoPriv) {
+    ///             NotificationAcceptance::Accept
+    ///         } else {
+    ///             NotificationAcceptance::Reject
+    ///         }
+    ///     })
     ///     .build()
     ///     .await?;
     /// # Ok(())
@@ -461,7 +786,10 @@ impl NotificationReceiverBuilder {
     ///
     /// Community filtering is opt-in. With no community configured the
     /// receiver accepts v1/v2c notifications under any community and surfaces
-    /// the community on the returned [`Notification`] for caller-side policy.
+    /// the unverified community on the returned [`Notification`] for
+    /// caller-side policy. Community strings are cleartext and do not provide
+    /// message integrity. An allowlist confirms only that the received value
+    /// matched one of the configured entries.
     /// Once one or more communities are configured, a v1/v2c notification
     /// whose community matches none of them is dropped and never returned
     /// from [`NotificationReceiver::recv`]; a dropped inform is not
@@ -656,12 +984,18 @@ impl Default for NotificationReceiverBuilder {
 /// This enum represents all types of SNMP notifications that can be received:
 /// - `SNMPv1` Trap (different PDU structure)
 /// - SNMPv2c/v3 Trap (standard PDU with sysUpTime.0 and snmpTrapOID.0)
-/// - `InformRequest` (confirmed notification, response will be sent automatically)
+/// - `InformRequest` (confirmed notification, with a response attempted after
+///   application acceptance and before delivery)
+///
+/// V1/v2c community and content are cleartext and have no cryptographic
+/// integrity; without a configured community allowlist they are unverified.
+/// V3 username, context, and content are authenticated only at `AuthNoPriv` or
+/// `AuthPriv`; all are spoofable at `NoAuthNoPriv`.
 #[derive(Debug, Clone)]
 pub enum Notification {
     /// `SNMPv1` Trap with unique PDU structure.
     TrapV1 {
-        /// Community string used for authentication
+        /// Cleartext community string; unverified without a configured allowlist.
         community: Community,
         /// The trap PDU
         trap: TrapV1Pdu,
@@ -671,7 +1005,7 @@ pub enum Notification {
 
     /// `SNMPv2c` Trap (unconfirmed notification).
     TrapV2c {
-        /// Community string used for authentication
+        /// Cleartext community string; unverified without a configured allowlist.
         community: Community,
         /// sysUpTime.0 value (hundredths of seconds since agent init)
         uptime: u32,
@@ -687,15 +1021,15 @@ pub enum Notification {
 
     /// `SNMPv3` Trap (unconfirmed notification).
     TrapV3 {
-        /// Username from USM
+        /// Username from USM; authenticated only at `AuthNoPriv`/`AuthPriv`.
         username: Bytes,
-        /// Context engine ID
+        /// Context engine ID; authenticated only at `AuthNoPriv`/`AuthPriv`.
         context_engine_id: Bytes,
-        /// Context name
+        /// Context name; authenticated only at `AuthNoPriv`/`AuthPriv`.
         context_name: Bytes,
-        /// Security level the message was received at. A `NoAuthNoPriv`
-        /// notification is unauthenticated: its username is an unverified
-        /// claim. Callers requiring authentication must check this.
+        /// Security level the message was received at. At `NoAuthNoPriv`, the
+        /// username, context, and notification content are unverified and
+        /// spoofable. Callers requiring authentication must check this.
         security_level: SecurityLevel,
         /// sysUpTime.0 value
         uptime: u32,
@@ -711,9 +1045,12 @@ pub enum Notification {
 
     /// `InformRequest` (confirmed notification) - v2c.
     ///
-    /// A response is automatically sent when this notification is received.
+    /// When returned by [`NotificationReceiver`], application acceptance
+    /// occurred first and the receiver attempted the response before delivery.
+    /// Response-size finalization may instead have counted an
+    /// `snmpSilentDrops` size drop and delivered the value without sending one.
     InformV2c {
-        /// Community string
+        /// Cleartext community string; unverified without a configured allowlist.
         community: Community,
         /// sysUpTime.0 value
         uptime: u32,
@@ -729,17 +1066,20 @@ pub enum Notification {
 
     /// `InformRequest` (confirmed notification) - v3.
     ///
-    /// A response is automatically sent when this notification is received.
+    /// When returned by [`NotificationReceiver`], application acceptance
+    /// occurred first and the receiver attempted the response before delivery.
+    /// Response-size finalization may instead have counted an
+    /// `snmpSilentDrops` size drop and delivered the value without sending one.
     InformV3 {
-        /// Username from USM
+        /// Username from USM; authenticated only at `AuthNoPriv`/`AuthPriv`.
         username: Bytes,
-        /// Context engine ID
+        /// Context engine ID; authenticated only at `AuthNoPriv`/`AuthPriv`.
         context_engine_id: Bytes,
-        /// Context name
+        /// Context name; authenticated only at `AuthNoPriv`/`AuthPriv`.
         context_name: Bytes,
-        /// Security level the message was received at. A `NoAuthNoPriv`
-        /// notification is unauthenticated: its username is an unverified
-        /// claim. Callers requiring authentication must check this.
+        /// Security level the message was received at. At `NoAuthNoPriv`, the
+        /// username, context, and notification content are unverified and
+        /// spoofable. Callers requiring authentication must check this.
         security_level: SecurityLevel,
         /// sysUpTime.0 value
         uptime: u32,
@@ -816,9 +1156,10 @@ impl Notification {
     /// Get the security level the notification was received at.
     ///
     /// Returns `None` for v1/v2c notifications (community-based, no USM
-    /// security level). For v3 notifications, `NoAuthNoPriv` means the
-    /// message was not authenticated and its username is an unverified
-    /// claim.
+    /// security level); their community and content are cleartext and not
+    /// cryptographically authenticated. For v3 notifications,
+    /// `NoAuthNoPriv` means the username, context, and content are unverified
+    /// and spoofable. `AuthNoPriv` and `AuthPriv` authenticate those fields.
     pub fn security_level(&self) -> Option<SecurityLevel> {
         match self {
             Notification::TrapV1 { .. }
@@ -850,7 +1191,10 @@ impl Notification {
 /// SNMP Notification Receiver.
 ///
 /// Listens for incoming SNMP notifications (traps and informs) on a UDP socket.
-/// For `InformRequest` notifications, automatically sends a Response-PDU.
+/// For accepted `InformRequest` notifications, finalizes and attempts a
+/// Response-PDU before delivery. If the response and its `tooBig` alternate
+/// exceed the effective response limit, it sends neither, increments
+/// [`Self::snmp_silent_drops`], and still delivers the notification.
 ///
 /// # V3 Authentication
 ///
@@ -858,8 +1202,8 @@ impl Notification {
 /// configure USM credentials and persisted authoritative engine state:
 ///
 /// ```rust,no_run
-/// use async_snmp::notification::NotificationReceiver;
-/// use async_snmp::{AuthProtocol, AuthoritativeEngine};
+/// use async_snmp::notification::{NotificationAcceptance, NotificationReceiver};
+/// use async_snmp::{AuthProtocol, AuthoritativeEngine, SecurityLevel};
 /// use std::convert::Infallible;
 ///
 /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
@@ -873,7 +1217,13 @@ impl Notification {
 ///     .usm_user("trapuser", |u| {
 ///         u.auth(AuthProtocol::Sha1, b"authpassword")
 ///     })
-///     .accept_all_notifications()
+///     .acceptance_policy(|notification| {
+///         if notification.security_level >= Some(SecurityLevel::AuthNoPriv) {
+///             NotificationAcceptance::Accept
+///         } else {
+///             NotificationAcceptance::Reject
+///         }
+///     })
 ///     .build()
 ///     .await?;
 /// # Ok(())
@@ -919,16 +1269,30 @@ struct ReceiverInner {
     compatibility_policy: crate::CompatibilityPolicy,
     /// Confirmed notifications dropped because even the alternate Response did not fit.
     snmp_silent_drops: AtomicU32,
-    acceptance_policy: Option<Arc<AcceptancePolicy>>,
+    acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
     /// Fairly serializes cloned `recv` calls so each datagram has one waiter.
     recv_gate: AsyncMutex<()>,
 }
 
 impl ReceiverInner {
-    fn accepts(&self, metadata: &NotificationMetadata) -> bool {
-        self.acceptance_policy
-            .as_ref()
-            .is_none_or(|policy| policy(metadata))
+    fn accepts(&self, source: SocketAddr, notification: &Notification) -> bool {
+        let Some(policy) = &self.acceptance_policy else {
+            return true;
+        };
+        let envelope = NotificationEnvelope::new(source, notification);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| policy.evaluate(&envelope)))
+        {
+            Ok(Ok(NotificationAcceptance::Accept)) => true,
+            Ok(Ok(NotificationAcceptance::Reject)) => false,
+            Ok(Err(error)) => {
+                tracing::error!(target: "async_snmp::notification", { snmp.source = %source, error = %error }, "notification acceptance policy failed; rejected notification");
+                false
+            }
+            Err(_) => {
+                tracing::error!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy panicked; rejected notification");
+                false
+            }
+        }
     }
 
     /// Return one coherent authoritative boots/time pair for the current instant.
@@ -960,8 +1324,9 @@ impl NotificationReceiver {
     ///
     /// This counter changes only when a confirmed Inform response is oversized
     /// and its exact empty-varbind `tooBig` alternate also exceeds the effective
-    /// local/originator limit. Authentication, engine-boots, and unrelated
-    /// receive failures do not affect it.
+    /// local/originator limit. The accepted Inform is still delivered in this
+    /// case even though no response is sent. Authentication, engine-boots, and
+    /// unrelated receive failures do not affect it.
     #[must_use]
     pub fn snmp_silent_drops(&self) -> u32 {
         self.inner.snmp_silent_drops.load(Ordering::Relaxed)
@@ -979,6 +1344,11 @@ impl NotificationReceiver {
     /// Section 3.2 Step 4). To receive v3 notifications, use
     /// [`NotificationReceiver::builder()`] and register users with
     /// `usm_user`.
+    ///
+    /// This path configures no community allowlist. Received v1/v2c community
+    /// strings and content are therefore cleartext, unverified, and spoofable;
+    /// use [`NotificationReceiverBuilder::community`] to require a configured
+    /// community value.
     ///
     /// # Example
     ///
@@ -1139,8 +1509,25 @@ impl NotificationReceiver {
 
     /// Receive a notification.
     ///
-    /// This method blocks until a notification is received. For `InformRequest`
-    /// notifications, a Response-PDU is automatically sent back to the sender.
+    /// This method blocks until a notification passes protocol processing,
+    /// prefix validation, and the application acceptance policy. Policy
+    /// rejection, error, or panic drops the notification and withholds an
+    /// Inform response while this method continues waiting.
+    ///
+    /// For an accepted `InformRequest`, the receiver finalizes and attempts a
+    /// Response-PDU before returning. A successful send completes before
+    /// delivery. If the response and exact `tooBig` alternate both exceed the
+    /// effective response limit, however, no response is sent,
+    /// [`Self::snmp_silent_drops`] increments, and this method still returns
+    /// the accepted notification. Return therefore does not prove that the
+    /// originator received an acknowledgement.
+    ///
+    /// V1/v2c community and content are cleartext and unverified unless a
+    /// community allowlist was configured. Even an allowlist match provides no
+    /// cryptographic integrity. V3 username, context, and content are
+    /// authenticated only at [`SecurityLevel::AuthNoPriv`] or
+    /// [`SecurityLevel::AuthPriv`] and remain spoofable at
+    /// [`SecurityLevel::NoAuthNoPriv`].
     ///
     /// Returns the notification and the source address.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
@@ -1337,6 +1724,12 @@ mod tests {
             builder.varbind_validation,
             NotificationVarbindValidation::Strict
         );
+    }
+
+    #[test]
+    fn acceptance_policy_ignored_argument_is_inferred() {
+        let _builder = NotificationReceiverBuilder::new()
+            .acceptance_policy(|_| NotificationAcceptance::Accept);
     }
 
     #[tokio::test]
@@ -1847,9 +2240,14 @@ mod tests {
             .usm_user("trapuser", |user| {
                 user.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
-            .acceptance_policy(|metadata: &NotificationMetadata| {
-                metadata.username.as_deref() == Some(b"trapuser")
-                    && metadata.security_level >= Some(SecurityLevel::AuthNoPriv)
+            .acceptance_policy(|notification: &NotificationEnvelope<'_>| {
+                if notification.username == Some(b"trapuser")
+                    && notification.security_level >= Some(SecurityLevel::AuthNoPriv)
+                {
+                    NotificationAcceptance::Accept
+                } else {
+                    NotificationAcceptance::Reject
+                }
             })
             .build()
             .await
@@ -1874,9 +2272,14 @@ mod tests {
             .usm_user("informuser", |user| {
                 user.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
-            .acceptance_policy(|metadata: &NotificationMetadata| {
-                metadata.pdu_class == NotificationPduClass::Inform
-                    && metadata.security_level >= Some(SecurityLevel::AuthNoPriv)
+            .acceptance_policy(|notification: &NotificationEnvelope<'_>| {
+                if notification.pdu_class == NotificationPduClass::Inform
+                    && notification.security_level >= Some(SecurityLevel::AuthNoPriv)
+                {
+                    NotificationAcceptance::Accept
+                } else {
+                    NotificationAcceptance::Reject
+                }
             })
             .build()
             .await
@@ -2463,11 +2866,37 @@ mod tests {
             assert!(alternate_len < candidate_len);
 
             let config = inform_user(level, &username);
+            let policy_calls = Arc::new(AtomicU32::new(0));
+            let policy_calls_for_receiver = Arc::clone(&policy_calls);
+            let policy_engine_id = engine_id.clone();
+            let policy_username = username.clone();
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
                 .usm_user(username.clone(), move |_| config)
-                .accept_all_notifications()
+                .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
+                    assert_eq!(notification.version, Version::V3);
+                    assert_eq!(notification.community, None);
+                    assert_eq!(notification.username, Some(policy_username.as_ref()));
+                    assert_eq!(notification.security_level, Some(level));
+                    assert_eq!(notification.pdu_class, NotificationPduClass::Inform);
+                    assert_eq!(
+                        notification.context_engine_id,
+                        Some(policy_engine_id.as_ref())
+                    );
+                    assert_eq!(notification.context_name, Some(b"".as_slice()));
+                    assert_eq!(notification.uptime, 1000);
+                    assert_eq!(notification.trap_oid().unwrap(), oids::cold_start());
+                    assert!(notification.varbinds.is_empty());
+                    assert_eq!(notification.request_id, Some(1));
+                    assert!(notification.decode_anomalies.is_empty());
+                    assert!(matches!(
+                        notification.notification(),
+                        Notification::InformV3 { .. }
+                    ));
+                    policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
+                    NotificationAcceptance::Accept
+                })
                 .max_message_size(candidate_len - 1)
                 .build()
                 .await
@@ -2495,6 +2924,7 @@ mod tests {
                 crate::UDP_RECEIVE_LIMITS.advertised()
             );
             assert_eq!(receiver.snmp_silent_drops(), 0);
+            assert_eq!(policy_calls.load(Ordering::Relaxed), 1);
 
             let config = inform_user(level, &username);
             let receiver = NotificationReceiver::builder()
@@ -2646,7 +3076,22 @@ mod tests {
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_trap_wrong_digest_increments_counter() {
-        let receiver = remote_trap_receiver().await;
+        let policy_calls = Arc::new(AtomicU32::new(0));
+        let policy_calls_for_receiver = Arc::clone(&policy_calls);
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(b"my-receiver-engine".to_vec())
+            .engine_boots(1)
+            .usm_user("trapuser", |u| {
+                u.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .acceptance_policy(move |_: &NotificationEnvelope<'_>| {
+                policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
+                NotificationAcceptance::Accept
+            })
+            .build()
+            .await
+            .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let msg = build_v3_notification(
@@ -2659,6 +3104,7 @@ mod tests {
         );
         assert!(receiver.handle_v3(msg, source).await.is_err());
         assert_eq!(receiver.usm_wrong_digests(), 1);
+        assert_eq!(policy_calls.load(Ordering::Relaxed), 0);
     }
 
     /// RFC 3414 Section 3.2 Step 4: an authenticated message for a user not
@@ -2865,6 +3311,8 @@ mod tests {
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn test_v3_decryption_error_increments_counter() {
+        let policy_calls = Arc::new(AtomicU32::new(0));
+        let policy_calls_for_receiver = Arc::clone(&policy_calls);
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"my-receiver-engine".to_vec())
@@ -2876,7 +3324,10 @@ mod tests {
                     b"privpass12345678",
                 )
             })
-            .accept_all_notifications()
+            .acceptance_policy(move |_: &NotificationEnvelope<'_>| {
+                policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
+                NotificationAcceptance::Accept
+            })
             .build()
             .await
             .unwrap();
@@ -2886,6 +3337,7 @@ mod tests {
             build_v3_trap_bad_ciphertext(b"remote-sender-engine", b"privuser", b"authpass12345678");
         assert!(receiver.handle_v3(msg, source).await.is_err());
         assert_eq!(receiver.usm_decryption_errors(), 1);
+        assert_eq!(policy_calls.load(Ordering::Relaxed), 0);
     }
 
     /// RFC 3414 Section 3.2 Step 5 precedes Step 6: an authPriv message for
@@ -3302,9 +3754,9 @@ mod tests {
         let policy_observed = std::sync::Arc::clone(&observed);
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
-            .acceptance_policy(move |metadata| {
-                *policy_observed.lock().unwrap() = metadata.decode_anomalies.clone();
-                true
+            .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
+                *policy_observed.lock().unwrap() = notification.decode_anomalies.to_vec();
+                NotificationAcceptance::Accept
             })
             .build()
             .await
@@ -3533,13 +3985,60 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn acceptance_envelope_normalizes_v1_transport_security_and_content() {
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
+                assert_eq!(notification.source, source);
+                assert_eq!(notification.version, Version::V1);
+                assert_eq!(
+                    notification.community.map(Community::as_bytes),
+                    Some(b"public".as_slice())
+                );
+                assert_eq!(notification.username, None);
+                assert_eq!(notification.security_level, None);
+                assert_eq!(notification.pdu_class, NotificationPduClass::Trap);
+                assert_eq!(notification.context_engine_id, None);
+                assert_eq!(notification.context_name, None);
+                assert_eq!(notification.uptime, 12_345);
+                assert_eq!(notification.trap_oid().unwrap(), oids::cold_start());
+                assert!(notification.varbinds.is_empty());
+                assert_eq!(notification.request_id, None);
+                assert!(notification.decode_anomalies.is_empty());
+                assert!(matches!(
+                    notification.notification(),
+                    Notification::TrapV1 { .. }
+                ));
+                NotificationAcceptance::Accept
+            })
+            .build()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver
+                .handle_v1(build_v1_trap(b"public"), source)
+                .await
+                .unwrap(),
+            Some(Notification::TrapV1 { .. })
+        ));
+    }
+
     /// An inform rejected by the community filter is dropped before the ack is
     /// built, so no Response datagram is sent to the source.
     #[tokio::test]
     async fn test_v2c_inform_wrong_community_dropped_without_ack() {
+        let policy_calls = Arc::new(AtomicU32::new(0));
+        let policy_calls_for_receiver = Arc::clone(&policy_calls);
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
+            .acceptance_policy(move |_: &NotificationEnvelope<'_>| {
+                policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
+                NotificationAcceptance::Accept
+            })
             .build()
             .await
             .unwrap();
@@ -3560,6 +4059,139 @@ mod tests {
         )
         .await;
         assert!(recv.is_err(), "a filtered inform must not be acknowledged");
+        assert_eq!(policy_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn acceptance_policy_can_reject_v2c_inform_by_arbitrary_content_without_ack() {
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = client.local_addr().unwrap();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
+                let inspected = notification.source == source
+                    && notification.version == Version::V2c
+                    && notification.community.map(Community::as_bytes)
+                        == Some(b"public".as_slice())
+                    && notification.username.is_none()
+                    && notification.security_level.is_none()
+                    && notification.pdu_class == NotificationPduClass::Inform
+                    && notification.context_engine_id.is_none()
+                    && notification.context_name.is_none()
+                    && notification.uptime == 100
+                    && notification
+                        .trap_oid()
+                        .is_ok_and(|oid| oid == oids::cold_start())
+                    && notification.request_id == Some(1)
+                    && notification.varbinds.len() == 1
+                    && notification.varbinds[0].oid == oid!(1, 3, 6, 1, 4, 1, 99999, 1)
+                    && notification.decode_anomalies.is_empty();
+                if inspected {
+                    NotificationAcceptance::Reject
+                } else {
+                    NotificationAcceptance::Accept
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let result = receiver
+            .handle_v2c(build_oversized_v2c_inform(b"public"), source)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let mut buf = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                client.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "content-rejected Inform must not be acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_policy_error_rejects_inform_without_ack() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .try_acceptance_policy(|_: &NotificationEnvelope<'_>| {
+                Err(NotificationAcceptanceError::new(
+                    "policy backend unavailable",
+                ))
+            })
+            .build()
+            .await
+            .unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let result = receiver
+            .handle_v2c(build_v2c_inform(b"public"), client.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let mut buf = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                client.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "failed policy must not acknowledge an Inform"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_policy_panic_rejects_inform_and_recv_continues_to_next_datagram() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_for_receiver = Arc::clone(&calls);
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .acceptance_policy(move |_: &NotificationEnvelope<'_>| {
+                if calls_for_receiver.fetch_add(1, Ordering::Relaxed) == 0 {
+                    panic!("policy failure");
+                }
+                NotificationAcceptance::Accept
+            })
+            .build()
+            .await
+            .unwrap();
+        let receiver_addr = receiver.local_addr();
+        let receive = tokio::spawn(async move { receiver.recv().await });
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        sender
+            .send_to(&build_v2c_inform(b"public"), receiver_addr)
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                sender.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "panicking policy must not acknowledge an Inform"
+        );
+
+        sender
+            .send_to(&build_v2c_trap(b"public"), receiver_addr)
+            .await
+            .unwrap();
+        let (notification, source) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+                .await
+                .expect("receiver did not continue after policy panic")
+                .unwrap()
+                .unwrap();
+        assert_eq!(source, sender.local_addr().unwrap());
+        assert!(matches!(notification, Notification::TrapV2c { .. }));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     /// A matching inform is still acknowledged (the filter does not suppress
@@ -3583,7 +4215,7 @@ mod tests {
         assert!(matches!(result, Some(Notification::InformV2c { .. })));
 
         let mut buf = vec![0u8; 4096];
-        let (len, _) = tokio::time::timeout(
+        let (len, ack_source) = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             client.recv_from(&mut buf),
         )
@@ -3591,6 +4223,16 @@ mod tests {
         .expect("a matching inform must be acknowledged")
         .unwrap();
         assert!(len > 0);
+        assert_eq!(ack_source, receiver.local_addr());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                client.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "one accepted Inform must produce exactly one acknowledgement"
+        );
     }
 
     #[tokio::test]

@@ -302,6 +302,14 @@
 //! originators use the remote responder as authoritative and do not need local
 //! engine state.
 //!
+//! Notification trust depends on the wire security level. V1/v2c community
+//! strings and content are cleartext; a receiver without a configured
+//! community allowlist reports them as unverified claims, while an allowlist
+//! checks only the cleartext value and adds no message integrity. V3 username,
+//! scoped context, and notification content are authenticated only at
+//! [`SecurityLevel::AuthNoPriv`] or [`SecurityLevel::AuthPriv`]; they are
+//! spoofable at [`SecurityLevel::NoAuthNoPriv`].
+//!
 //! ## Tracing
 //!
 //! The library uses the `tracing` crate for structured logging. Client
@@ -461,7 +469,7 @@
 //! a cumulative [`WalkCollection::metadata`] that also includes non-yielding
 //! terminal responses. The shorter Inform and walk methods intentionally
 //! discard this metadata. Notification acceptance policies receive
-//! it through [`NotificationMetadata::decode_anomalies`], and delivered
+//! it through [`NotificationEnvelope::decode_anomalies`], and delivered
 //! notifications retain it through [`Notification::decode_anomalies`].
 //!
 //! ### Strict low-level inspection and network-role controls
@@ -606,8 +614,10 @@ pub use message_size::{
     ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
 };
 pub use notification::{
-    Notification, NotificationMetadata, NotificationPduClass, NotificationReceiver,
-    NotificationReceiverBuilder, NotificationVarbindValidation, validate_notification_varbinds,
+    Notification, NotificationAcceptance, NotificationAcceptanceError,
+    NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationEnvelope,
+    NotificationPduClass, NotificationReceiver, NotificationReceiverBuilder,
+    NotificationVarbindValidation, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
