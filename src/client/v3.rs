@@ -972,7 +972,7 @@ impl<T: Transport> Client<T> {
                             // transport reliability. A corrected message is a
                             // new request and receives fresh message and PDU IDs.
                             correction_used = true;
-                            pdu.request_id = self.next_request_id();
+                            pdu.set_request_id(self.next_request_id());
                             msg_id_window.clear();
                             Span::current().record("snmp.protocol_correction", true);
                             tracing::debug!(target: "async_snmp::client", { snmp.report_status = %status }, "sending SNMPv3 protocol correction");
@@ -999,7 +999,7 @@ impl<T: Transport> Client<T> {
                                 boots: response_usm.engine_boots,
                                 time: response_usm.engine_time,
                             });
-                            pdu.request_id = self.next_request_id();
+                            pdu.set_request_id(self.next_request_id());
                             msg_id_window.clear();
                             Span::current().record("snmp.protocol_correction", true);
                             tracing::debug!(target: "async_snmp::client", { snmp.report_status = %status }, "sending packet-local SNMPv3 compatibility correction");

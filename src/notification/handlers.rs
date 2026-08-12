@@ -140,7 +140,7 @@ impl super::NotificationReceiver {
                 let finalized = crate::response_finalizer::finalize_response(
                     crate::Version::V2c,
                     pdu,
-                    pdu.to_response(),
+                    pdu.to_response(crate::Version::V2c)?,
                     self.inner.max_message_size,
                     None,
                     &self.inner.snmp_silent_drops,
@@ -303,7 +303,7 @@ impl super::NotificationReceiver {
                 let finalized = crate::response_finalizer::finalize_response(
                     crate::Version::V3,
                     pdu,
-                    pdu.to_response(),
+                    pdu.to_response(crate::Version::V3)?,
                     self.inner.max_message_size,
                     Some(global_data.msg_max_size.as_usize()),
                     &self.inner.snmp_silent_drops,

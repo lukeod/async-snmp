@@ -291,7 +291,7 @@ fn bench_client_construction(c: &mut Criterion) {
 /// Benchmark request ID generation and message encoding overhead
 fn bench_request_overhead(c: &mut Criterion) {
     use async_snmp::message::CommunityMessage;
-    use async_snmp::pdu::Pdu;
+    use async_snmp::pdu::{RequestPdu, ResponsePdu};
     use async_snmp::version::Version;
     use bytes::Bytes;
 
@@ -302,7 +302,7 @@ fn bench_request_overhead(c: &mut Criterion) {
 
     group.bench_function("encode_get_request", |b| {
         b.iter(|| {
-            let pdu = Pdu::get_request(12345, &oids);
+            let pdu = RequestPdu::get(Version::V2c, 12345, &oids).unwrap();
             let msg =
                 CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
             black_box(msg.encode())
@@ -310,14 +310,17 @@ fn bench_request_overhead(c: &mut Criterion) {
     });
 
     // Measure response decoding (no network)
-    let request = Pdu::get_request(12345, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
-    let mut response_pdu = request.to_response();
-    response_pdu.varbinds = vec![async_snmp::varbind::VarBind::new(
-        oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
-        async_snmp::value::Value::OctetString(Bytes::from_static(
-            b"Linux test-host 5.15.0-generic",
-        )),
-    )];
+    let response_pdu = ResponsePdu::success(
+        Version::V2c,
+        12345,
+        vec![async_snmp::varbind::VarBind::new(
+            oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+            async_snmp::value::Value::OctetString(Bytes::from_static(
+                b"Linux test-host 5.15.0-generic",
+            )),
+        )],
+    )
+    .unwrap();
     let msg =
         CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), response_pdu).unwrap();
     let encoded = msg.encode().unwrap();

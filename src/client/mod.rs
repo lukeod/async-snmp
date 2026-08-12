@@ -74,7 +74,7 @@ use crate::error::ErrorStatus;
 use crate::error::{Error, Result};
 use crate::message::{CommunityMessage, Message, SecurityLevel};
 use crate::oid::Oid;
-use crate::pdu::{Pdu, PduType, TrapV1Pdu};
+use crate::pdu::{GetBulkPdu, NotificationPdu, Pdu, PduType, RequestPdu, TrapV1Notification};
 use crate::transport::{Candidate, Transport, UdpHandle, UdpStats};
 use crate::v3::{EngineCache, EngineState, SaltCounter};
 use crate::value::Value;
@@ -679,7 +679,12 @@ impl<T: Transport> Client<T> {
     #[instrument(skip(self), err, fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
     pub async fn get(&self, oid: &Oid) -> Result<FixedCardinalityResponse> {
         let request_id = self.next_request_id();
-        let pdu = Pdu::get_request(request_id, std::slice::from_ref(oid));
+        let pdu = RequestPdu::get(
+            self.inner.config.version(),
+            request_id,
+            std::slice::from_ref(oid),
+        )?
+        .into_raw();
         let response = self.send_request(pdu).await?;
         let mut classified = classify(
             RequestShape::Get(std::slice::from_ref(oid)),
@@ -747,7 +752,12 @@ impl<T: Transport> Client<T> {
     #[instrument(skip(self), err, fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
     pub async fn get_next(&self, oid: &Oid) -> Result<FixedCardinalityResponse> {
         let request_id = self.next_request_id();
-        let pdu = Pdu::get_next_request(request_id, std::slice::from_ref(oid));
+        let pdu = RequestPdu::get_next(
+            self.inner.config.version(),
+            request_id,
+            std::slice::from_ref(oid),
+        )?
+        .into_raw();
         let response = self.send_request(pdu).await?;
         let mut classified = classify(
             RequestShape::GetNext(std::slice::from_ref(oid)),
@@ -800,10 +810,12 @@ impl<T: Transport> Client<T> {
     pub async fn set(&self, oid: &Oid, value: Value) -> Result<FixedCardinalityResponse> {
         let request_id = self.next_request_id();
         let requested = [(oid.clone(), value)];
-        let pdu = Pdu::set_request(
+        let pdu = RequestPdu::set(
+            self.inner.config.version(),
             request_id,
             vec![VarBind::new(requested[0].0.clone(), requested[0].1.clone())],
-        );
+        )?
+        .into_raw();
         let response = self.send_request(pdu).await?;
         let mut classified = classify(RequestShape::Set(&requested), response.pdu.varbinds, 0, 0);
         classified.metadata.decode_anomalies = response.decode_anomalies;
@@ -863,7 +875,7 @@ impl<T: Transport> Client<T> {
             .iter()
             .map(|(oid, value)| VarBind::new(oid.clone(), value.clone()))
             .collect();
-        let pdu = Pdu::set_request(request_id, vbs);
+        let pdu = RequestPdu::set(self.inner.config.version(), request_id, vbs)?.into_raw();
         let response = self.send_request(pdu).await?;
         let mut classified = classify(RequestShape::Set(varbinds), response.pdu.varbinds, 0, 0);
         classified.metadata.decode_anomalies = response.decode_anomalies;
@@ -905,22 +917,30 @@ impl<T: Transport> Client<T> {
             };
             // request_id is unused in the v1 wire format, use 0 to avoid
             // wasting a slot in the request_id sequence.
-            let pdu = Pdu::trap_v2(0, uptime, trap_oid, varbinds);
-            let trap = pdu.to_v1_trap(local_ip).ok_or_else(|| {
+            let pdu = NotificationPdu::trap_v2(Version::V2c, 0, uptime, trap_oid, varbinds)?;
+            let trap = pdu.as_raw().to_v1_trap(local_ip).ok_or_else(|| {
                 Error::Config("cannot convert trap to v1 (Counter64 varbind?)".into()).boxed()
             })?;
-            return self.send_v1_trap(trap).await;
+            return self
+                .send_v1_trap(TrapV1Notification::try_from_raw(trap)?)
+                .await;
         }
 
         let request_id = self.next_request_id();
-        let pdu = Pdu::trap_v2(request_id, uptime, trap_oid, varbinds);
+        let pdu = NotificationPdu::trap_v2(
+            self.inner.config.version(),
+            request_id,
+            uptime,
+            trap_oid,
+            varbinds,
+        )?;
 
         if self.is_v3() {
             self.ensure_local_keys_derived()?;
             let msg_id = self.next_request_id();
-            let data = self.build_v3_trap_message(&pdu, msg_id)?;
+            let data = self.build_v3_trap_message(pdu.as_raw(), msg_id)?;
             self.enforce_outbound_size(data.len(), None)?;
-            tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.varbind_count = pdu.varbinds.len(), snmp.bytes = data.len() }, "sending V3 trap");
+            tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.varbind_count = pdu.as_raw().varbinds().len(), snmp.bytes = data.len() }, "sending V3 trap");
             self.inner
                 .transport
                 .send_with_timeout(&data, self.inner.config.send_timeout)
@@ -945,7 +965,7 @@ impl<T: Transport> Client<T> {
 
     /// Send an `SNMPv1` trap with explicit v1 PDU fields.
     ///
-    /// This is a lower-level method that accepts a pre-built [`TrapV1Pdu`],
+    /// This is a lower-level method that accepts a validated [`TrapV1Notification`],
     /// giving full control over enterprise OID, `agent_addr`, `generic_trap`,
     /// `specific_trap`, and `time_stamp` fields.
     ///
@@ -955,30 +975,30 @@ impl<T: Transport> Client<T> {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use async_snmp::{Auth, Client, TrapV1Pdu, GenericTrap, oid};
+    /// # use async_snmp::{Auth, Client, TrapV1Notification, GenericTrap, oid};
     /// # async fn example() -> async_snmp::Result<()> {
     /// let client = Client::builder("192.168.1.100:162", Auth::v1("public"))
     ///     .connect().await?;
     ///
-    /// let trap = TrapV1Pdu::new(
+    /// let trap = TrapV1Notification::new(
     ///     oid!(1, 3, 6, 1, 4, 1, 9999),  // enterprise
     ///     [192, 168, 1, 1],               // agent address
     ///     GenericTrap::ColdStart,
     ///     0,
     ///     12345,                          // uptime in centiseconds
     ///     vec![],
-    /// );
+    /// )?;
     /// client.send_v1_trap(trap).await?;
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(skip(self, trap), err, fields(snmp.target = %self.peer_addr(), snmp.generic_trap = %trap.generic_trap))]
-    pub async fn send_v1_trap(&self, trap: TrapV1Pdu) -> Result<()> {
+    #[instrument(skip(self, trap), err, fields(snmp.target = %self.peer_addr(), snmp.generic_trap = %trap.as_raw().generic_trap()))]
+    pub async fn send_v1_trap(&self, trap: TrapV1Notification) -> Result<()> {
         if self.inner.config.version() != Version::V1 {
             return Err(Error::Config("send_v1_trap requires a V1 client".into()).boxed());
         }
 
-        let message = CommunityMessage::v1_trap(self.inner.config.community()?, trap)?;
+        let message = CommunityMessage::v1_trap(self.inner.config.community()?, trap.into_raw())?;
         let data = message.encode()?;
         self.enforce_outbound_size(data.len(), None)?;
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
@@ -1034,9 +1054,15 @@ impl<T: Transport> Client<T> {
         }
 
         let request_id = self.next_request_id();
-        let pdu = Pdu::inform_request(request_id, uptime, trap_oid, varbinds);
-        let expected_varbinds = pdu.varbinds.clone();
-        let response = self.send_request(pdu).await?;
+        let pdu = NotificationPdu::inform(
+            self.inner.config.version(),
+            request_id,
+            uptime,
+            trap_oid,
+            varbinds,
+        )?;
+        let expected_varbinds = pdu.as_raw().varbinds().to_vec();
+        let response = self.send_request(pdu.into_raw()).await?;
         if response.pdu.varbinds != expected_varbinds {
             let metadata = ResponseMetadata::from_decode_anomalies(response.decode_anomalies);
             return Err(Error::MalformedResponse {
@@ -1121,12 +1147,14 @@ impl<T: Transport> Client<T> {
     ) -> Result<BulkResponse> {
         Pdu::checked_get_bulk_fields(non_repeaters, max_repetitions)?;
         let request_id = self.next_request_id();
-        let pdu = Pdu::get_bulk(
+        let pdu = GetBulkPdu::new(
+            self.inner.config.version(),
             request_id,
             non_repeaters,
             max_repetitions,
             oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
-        )?;
+        )?
+        .into_raw();
         let response = self.send_request(pdu).await?;
         Ok(BulkResponse {
             varbinds: response.pdu.varbinds,
@@ -1920,7 +1948,10 @@ mod tests {
     async fn invalid_oid_is_not_sent() {
         fn assert_invalid<T>(result: Result<T>) {
             match result {
-                Err(error) => assert!(matches!(&*error, Error::InvalidOid(_))),
+                Err(error) => assert!(
+                    matches!(&*error, Error::InvalidOid(_)),
+                    "expected InvalidOid, got {error:?}"
+                ),
                 Ok(_) => panic!("invalid OID operation succeeded"),
             }
         }
@@ -1959,24 +1990,14 @@ mod tests {
         );
         assert_invalid(client.send_inform(&invalid, 1, vec![]).await);
 
-        let v1_client = Client::new(
-            transport.clone(),
-            ClientConfig {
-                auth: crate::Auth::v1("public"),
-                retry: crate::client::retry::Retry::none(),
-                ..Default::default()
-            },
-        )
-        .expect("valid client config");
-        let trap = TrapV1Pdu::new(
+        assert_invalid(TrapV1Notification::new(
             invalid.clone(),
             [127, 0, 0, 1],
             crate::pdu::GenericTrap::EnterpriseSpecific,
             1,
             1,
             vec![],
-        );
-        assert_invalid(v1_client.send_v1_trap(trap).await);
+        ));
 
         // The uncached V3 client must reject malformed request PDUs before
         // engine discovery can write its own packet to the transport.

@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_snmp::message::{CommunityMessage, DecodePolicy, Message};
 use async_snmp::{
     Auth, ClientBuilder, Community, CommunityResponsePolicy, CommunityVersion, GenericTrap,
-    Notification, Pdu, RequestRegistration, TrapV1Pdu, oid,
+    Notification, Pdu, RequestPdu, RequestRegistration, TrapV1Pdu, Version, oid,
 };
 use bytes::Bytes;
 
@@ -21,7 +21,9 @@ fn assert_redacted(value: &impl Debug) {
 }
 
 fn request_pdu(request_id: i32) -> Pdu {
-    Pdu::get_request(request_id, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)])
+    RequestPdu::get(Version::V2c, request_id, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)])
+        .unwrap()
+        .into_raw()
 }
 
 #[test]
@@ -73,7 +75,7 @@ fn community_notification_debug_is_redacted_for_every_variant() {
     let notifications = [
         Notification::TrapV1 {
             community: community.clone(),
-            trap: TrapV1Pdu::new(
+            trap: TrapV1Pdu::from_raw_parts(
                 oid!(1, 3, 6, 1, 4, 1, 4242),
                 [192, 0, 2, 9],
                 GenericTrap::LinkDown,

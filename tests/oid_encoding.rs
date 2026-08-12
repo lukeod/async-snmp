@@ -4,7 +4,8 @@ use async_snmp::message::{
 };
 use async_snmp::v3::UsmSecurityParams;
 use async_snmp::{
-    CompatibilityPolicy, Error, GenericTrap, Oid, Pdu, PduType, TrapV1Pdu, Value, VarBind,
+    CompatibilityPolicy, Error, GenericTrap, NotificationPdu, Oid, Pdu, PduBody, PduType,
+    RequestPdu, StandardPduType, TrapV1Pdu, Value, VarBind, Version,
 };
 use bytes::Bytes;
 
@@ -21,7 +22,10 @@ fn invalid_oids() -> Vec<Oid> {
 
 fn assert_invalid<T>(result: async_snmp::Result<T>) {
     match result {
-        Err(error) => assert!(matches!(&*error, Error::InvalidOid(_))),
+        Err(error) => assert!(
+            matches!(&*error, Error::InvalidOid(_)),
+            "expected InvalidOid, got {error:?}"
+        ),
         Ok(_) => panic!("invalid OID was encoded"),
     }
 }
@@ -35,13 +39,22 @@ fn assert_invalid_message<T>(result: async_snmp::Result<T>) {
 
 fn pdu_with(pdu_type: PduType, varbind: VarBind) -> Pdu {
     if pdu_type == PduType::GetBulkRequest {
-        Pdu::get_bulk(7, 0, 10, vec![varbind]).unwrap()
-    } else {
-        Pdu::standard(
-            async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap(),
+        Pdu::from_raw_parts(
             7,
-            0,
-            0,
+            PduBody::GetBulk {
+                non_repeaters: 0,
+                max_repetitions: 10,
+            },
+            vec![varbind],
+        )
+    } else {
+        Pdu::from_raw_parts(
+            7,
+            PduBody::Standard {
+                pdu_type: StandardPduType::try_from(pdu_type).unwrap(),
+                error_status: 0,
+                error_index: 0,
+            },
             vec![varbind],
         )
     }
@@ -81,20 +94,12 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             PduType::Response,
         ] {
             let pdu = pdu_with(pdu_type, invalid_name.clone());
-            let mut buf = EncodeBuf::new();
-            assert_invalid(pdu.encode(&mut buf));
-            assert!(buf.is_empty());
-
             if pdu_type == PduType::Report {
                 // Report is not a valid v2c PDU, so envelope validation
                 // intentionally takes precedence over the nested invalid OID.
                 assert_invalid_message(CommunityMessage::v2c("public", pdu.clone()));
             } else {
-                assert_invalid(
-                    CommunityMessage::v2c("public", pdu.clone())
-                        .unwrap()
-                        .encode(),
-                );
+                assert_invalid(CommunityMessage::v2c("public", pdu.clone()));
             }
 
             let scoped = ScopedPdu::new(Bytes::new(), Bytes::new(), pdu);
@@ -105,14 +110,10 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             )
             .unwrap();
             let security_params = UsmSecurityParams::discovery().encode().unwrap();
-            assert_invalid(
-                V3Message::new(global, security_params, scoped)
-                    .unwrap()
-                    .encode(),
-            );
+            assert_invalid(V3Message::new(global, security_params, scoped));
         }
 
-        let trap = TrapV1Pdu::new(
+        let trap = TrapV1Pdu::from_raw_parts(
             oid.clone(),
             [127, 0, 0, 1],
             GenericTrap::EnterpriseSpecific,
@@ -120,12 +121,10 @@ fn invalid_oid_matrix_is_rejected_across_structured_encoders() {
             10,
             vec![],
         );
-        assert_invalid(CommunityMessage::v1_trap("public", trap).unwrap().encode());
+        assert_invalid(CommunityMessage::v1_trap("public", trap));
 
-        let trap_v2 = Pdu::trap_v2(7, 10, &oid, vec![]);
-        assert_invalid(CommunityMessage::v2c("public", trap_v2).unwrap().encode());
-        let inform = Pdu::inform_request(7, 10, &oid, vec![]);
-        assert_invalid(CommunityMessage::v2c("public", inform).unwrap().encode());
+        assert_invalid(NotificationPdu::trap_v2(Version::V2c, 7, 10, &oid, vec![]));
+        assert_invalid(NotificationPdu::inform(Version::V2c, 7, 10, &oid, vec![]));
     }
 }
 
@@ -146,13 +145,13 @@ fn valid_oid_boundaries_preserve_identity() {
         let content = oid.to_ber().unwrap();
         assert_eq!(Oid::from_ber(&content).unwrap(), oid);
 
-        let pdu = Pdu::get_request(7, std::slice::from_ref(&oid));
+        let pdu = RequestPdu::get(Version::V2c, 7, std::slice::from_ref(&oid)).unwrap();
         let bytes = CommunityMessage::v2c("public", pdu)
             .unwrap()
             .encode()
             .unwrap();
         let decoded = CommunityMessage::decode(bytes).unwrap();
-        assert_eq!(decoded.into_pdu().unwrap().varbinds[0].oid, oid);
+        assert_eq!(decoded.into_pdu().unwrap().varbinds()[0].oid, oid);
     }
 }
 
@@ -170,7 +169,7 @@ fn root_two_u32_arc_boundaries_have_exact_ber_encodings() {
         assert_eq!(oid.to_ber_checked().unwrap(), expected);
         assert_eq!(Oid::from_ber(expected).unwrap(), oid);
 
-        let pdu = Pdu::get_request(7, std::slice::from_ref(&oid));
+        let pdu = RequestPdu::get(Version::V2c, 7, std::slice::from_ref(&oid)).unwrap();
         let encoded = CommunityMessage::v2c("public", pdu)
             .unwrap()
             .encode()
@@ -183,7 +182,7 @@ fn root_two_u32_arc_boundaries_have_exact_ber_encodings() {
             "structured message omitted exact BER for {oid}"
         );
         let decoded = CommunityMessage::decode(encoded).unwrap();
-        assert_eq!(decoded.into_pdu().unwrap().varbinds[0].oid, oid);
+        assert_eq!(decoded.into_pdu().unwrap().varbinds()[0].oid, oid);
     }
 }
 

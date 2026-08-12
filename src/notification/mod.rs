@@ -2854,7 +2854,9 @@ mod tests {
                     "127.0.0.1:9999".parse().unwrap(),
                 )
             };
-            let candidate_len = encode(inform_pdu.to_response()).unwrap().len();
+            let candidate_len = encode(inform_pdu.to_response(Version::V2c).unwrap())
+                .unwrap()
+                .len();
             let alternate_len = encode(Pdu::response(
                 inform_pdu.request_id,
                 crate::ErrorStatus::TooBig.as_i32(),
@@ -3293,7 +3295,7 @@ mod tests {
         .with_priv_params(Bytes::from_static(b"bad"))
         .unwrap();
 
-        let msg = V3Message::new_encrypted(
+        let msg = V3Message::new_with_opaque_encrypted_scoped_pdu(
             global,
             usm_params.encode().unwrap(),
             Bytes::from_static(b"not-a-valid-ciphertext"),

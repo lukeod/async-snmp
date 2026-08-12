@@ -11,7 +11,9 @@ use futures_core::Stream;
 
 use crate::error::{Error, ErrorStatus, Result};
 use crate::oid::Oid;
-use crate::pdu::{Pdu, PduType};
+#[cfg(test)]
+use crate::pdu::Pdu;
+use crate::pdu::{PduType, RequestPdu};
 use crate::transport::Transport;
 
 use super::response_shape::{RequestShape, classify};
@@ -164,10 +166,11 @@ impl<'a, T: Transport> FixedCardinalityChunkStream<'a, T> {
             let request_id = client.next_request_id();
             let pdu = match operation {
                 FixedCardinalityOperation::Get => {
-                    Pdu::get_request(request_id, &oids[request_range])
+                    RequestPdu::get(client.version(), request_id, &oids[request_range])?.into_raw()
                 }
                 FixedCardinalityOperation::GetNext => {
-                    Pdu::get_next_request(request_id, &oids[request_range])
+                    RequestPdu::get_next(client.version(), request_id, &oids[request_range])?
+                        .into_raw()
                 }
                 FixedCardinalityOperation::Set => {
                     unreachable!("SET does not use the chunk stream")

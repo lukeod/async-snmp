@@ -95,7 +95,7 @@ impl Agent {
                 } else {
                     status
                 };
-                return Ok(pdu.to_error_response(status, (index + 1) as i32));
+                return pdu.to_error_response(ctx.version, status, index + 1);
             }
 
             let handler = self.find_handler(&vb.oid);
@@ -119,7 +119,7 @@ impl Agent {
                 } else {
                     status
                 };
-                return Ok(pdu.to_error_response(status, (index + 1) as i32));
+                return pdu.to_error_response(ctx.version, status, index + 1);
             }
 
             let handler = handler.unwrap();
@@ -143,7 +143,7 @@ impl Agent {
                     } else {
                         status
                     };
-                    return Ok(pdu.to_error_response(status, (index + 1) as i32));
+                    return pdu.to_error_response(ctx.version, status, index + 1);
                 }
             };
 
@@ -222,7 +222,11 @@ impl Agent {
                         (status, (index + 1) as i32)
                     }
                 };
-                return Ok(pdu.to_error_response(status, error_index));
+                return pdu.to_error_response(
+                    ctx.version,
+                    status,
+                    usize::try_from(error_index).unwrap_or(0),
+                );
             }
         }
 
@@ -238,7 +242,7 @@ impl Agent {
             transaction.pending.pop();
         }
 
-        Ok(pdu.to_response())
+        pdu.to_response(ctx.version)
     }
 }
 

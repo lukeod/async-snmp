@@ -7,9 +7,8 @@
 mod common;
 
 use async_snmp::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
-use async_snmp::pdu::{Pdu, PduType};
+use async_snmp::pdu::{PduType, RequestPdu};
 use async_snmp::v3::{AuthProtocol, PrivProtocol, ReportStatus, UsmSecurityParams};
-use async_snmp::varbind::VarBind;
 use async_snmp::{Auth, Client, Error, Retry, Value, oid};
 use bytes::Bytes;
 use common::{TestAgentBuilder, V3User};
@@ -478,13 +477,12 @@ fn build_raw_v3_get(engine_id: Bytes, username: Bytes) -> Bytes {
     } else {
         UsmSecurityParams::new(engine_id, 0, 0, username).unwrap()
     };
-    let pdu = Pdu::standard(
-        async_snmp::pdu::StandardPduType::GetRequest,
+    let pdu = RequestPdu::get(
+        async_snmp::Version::V3,
         1,
-        0,
-        0,
-        vec![VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), Value::Null)],
-    );
+        &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)],
+    )
+    .unwrap();
     let scoped = ScopedPdu::with_empty_context(pdu);
     let global = MsgGlobalData::new(
         1,
@@ -533,7 +531,7 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     assert_eq!(pdu1.pdu_type(), PduType::Report, "expected Report PDU");
 
     // The varbind should be usmStatsUnknownEngineIDs (1.3.6.1.6.3.15.1.1.4.0) with value 1
-    let vb1 = &pdu1.varbinds[0];
+    let vb1 = &pdu1.varbinds()[0];
     assert_eq!(
         vb1.oid,
         oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0),
@@ -560,7 +558,7 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     let pdu2 = decoded2.pdu().unwrap();
     assert_eq!(pdu2.pdu_type(), PduType::Report);
 
-    let vb2 = &pdu2.varbinds[0];
+    let vb2 = &pdu2.varbinds()[0];
     assert_eq!(
         vb2.oid,
         oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0),
@@ -602,7 +600,7 @@ async fn report_pdu_counter_matches_agent_counter_unknown_user() {
     let pdu = decoded.pdu().unwrap();
     assert_eq!(pdu.pdu_type(), PduType::Report, "expected Report PDU");
 
-    let vb = &pdu.varbinds[0];
+    let vb = &pdu.varbinds()[0];
     // The OID should be usmStatsUnknownUserNames (1.3.6.1.6.3.15.1.1.3.0)
     assert_eq!(
         vb.oid,

@@ -9,7 +9,9 @@ mod common;
 
 use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::oid::Oid;
-use async_snmp::pdu::{GenericTrap, Pdu, PduType, StandardPduType, TrapV1Pdu};
+use async_snmp::pdu::{
+    GenericTrap, OutboundPdu, Pdu, PduBody, PduType, StandardPduType, TrapV1Notification, TrapV1Pdu,
+};
 use async_snmp::transport::UdpTransport;
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
@@ -125,6 +127,12 @@ fn arb_value() -> impl Strategy<Value = Value> {
     ]
 }
 
+fn arb_set_value() -> impl Strategy<Value = Value> {
+    arb_value().prop_filter("SET requires a concrete value", |value| {
+        !matches!(value, Value::Null)
+    })
+}
+
 /// Strategy for generating Value variants including exceptions (for BER tests).
 fn arb_value_with_exceptions() -> impl Strategy<Value = Value> {
     prop_oneof![
@@ -173,11 +181,14 @@ fn arb_outbound_varbinds() -> impl Strategy<Value = Vec<VarBind>> {
 }
 
 fn arb_v1_varbinds() -> impl Strategy<Value = Vec<VarBind>> {
-    arb_outbound_varbinds().prop_filter("SNMPv1 does not carry Counter64", |varbinds| {
-        !varbinds
-            .iter()
-            .any(|varbind| matches!(varbind.value, Value::Counter64(_)))
-    })
+    prop::collection::vec(
+        (arb_oid(), arb_value())
+            .prop_filter("SNMPv1 does not carry Counter64", |(_, value)| {
+                !matches!(value, Value::Counter64(_))
+            })
+            .prop_map(|(oid, value)| VarBind::new(oid, value)),
+        0..=10,
+    )
 }
 
 /// Strategy for generating PDU types (excluding `TrapV1` which has different structure).
@@ -210,12 +221,30 @@ fn arb_pdu() -> impl Strategy<Value = Pdu> {
             arb_outbound_varbinds(),
         )
             .prop_map(|(pdu_type, request_id, varbinds)| {
-                Pdu::standard(pdu_type, request_id, 0, 0, varbinds)
+                Pdu::from_raw_parts(
+                    request_id,
+                    PduBody::Standard {
+                        pdu_type,
+                        error_status: 0,
+                        error_index: 0,
+                    },
+                    varbinds,
+                )
             }),
-        (any::<i32>(), arb_varbinds())
-            .prop_map(|(request_id, varbinds)| Pdu::response(request_id, 0, 0, varbinds)),
+        (any::<i32>(), arb_varbinds()).prop_map(|(request_id, varbinds)| Pdu::from_raw_parts(
+            request_id,
+            PduBody::Standard {
+                pdu_type: StandardPduType::Response,
+                error_status: 0,
+                error_index: 0,
+            },
+            varbinds,
+        )),
         arb_getbulk_pdu(),
     ]
+    .prop_filter("valid outbound PDU", |pdu| {
+        OutboundPdu::try_from_raw(async_snmp::Version::V3, pdu.clone()).is_ok()
+    })
 }
 
 /// Strategy for generating typed GETBULK PDUs.
@@ -227,7 +256,14 @@ fn arb_getbulk_pdu() -> impl Strategy<Value = Pdu> {
         arb_outbound_varbinds(),
     )
         .prop_map(|(request_id, non_repeaters, max_repetitions, varbinds)| {
-            Pdu::get_bulk(request_id, non_repeaters, max_repetitions, varbinds).unwrap()
+            Pdu::from_raw_parts(
+                request_id,
+                PduBody::GetBulk {
+                    non_repeaters,
+                    max_repetitions,
+                },
+                varbinds,
+            )
         })
 }
 
@@ -243,14 +279,14 @@ fn arb_trap_v1_pdu() -> impl Strategy<Value = TrapV1Pdu> {
     )
         .prop_map(
             |(enterprise, agent_addr, generic_trap_raw, specific_trap, time_stamp, varbinds)| {
-                TrapV1Pdu {
+                TrapV1Pdu::from_raw_parts(
                     enterprise,
                     agent_addr,
-                    generic_trap: GenericTrap::from_i32(generic_trap_raw),
+                    GenericTrap::from_i32(generic_trap_raw),
                     specific_trap,
                     time_stamp,
                     varbinds,
-                }
+                )
             },
         )
 }
@@ -379,7 +415,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     #[test]
-    fn set_then_get_round_trip(value in arb_value()) {
+    fn set_then_get_round_trip(value in arb_set_value()) {
         let env = env();
         let case_id = env.next_case_id();
         let test_oid = Oid::from_slice(&[1, 3, 6, 1, 99, 3, case_id]);
@@ -466,8 +502,9 @@ proptest! {
 
     #[test]
     fn pdu_ber_roundtrip(pdu in arb_pdu()) {
+        let outbound = OutboundPdu::try_from_raw(async_snmp::Version::V3, pdu.clone()).unwrap();
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf).unwrap();
+        outbound.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -478,8 +515,9 @@ proptest! {
 
     #[test]
     fn getbulk_pdu_ber_roundtrip(pdu in arb_getbulk_pdu()) {
+        let outbound = OutboundPdu::try_from_raw(async_snmp::Version::V3, pdu.clone()).unwrap();
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf).unwrap();
+        outbound.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -490,19 +528,20 @@ proptest! {
 
     #[test]
     fn trap_v1_pdu_ber_roundtrip(pdu in arb_trap_v1_pdu()) {
+        let outbound = TrapV1Notification::try_from_raw(pdu.clone()).unwrap();
         let mut buf = EncodeBuf::new();
-        pdu.encode(&mut buf).unwrap();
+        outbound.encode(&mut buf).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
         let decoded = TrapV1Pdu::decode(&mut decoder).expect("decode should succeed");
 
-        prop_assert_eq!(pdu.enterprise, decoded.enterprise);
-        prop_assert_eq!(pdu.agent_addr, decoded.agent_addr);
-        prop_assert_eq!(pdu.generic_trap, decoded.generic_trap);
-        prop_assert_eq!(pdu.specific_trap, decoded.specific_trap);
-        prop_assert_eq!(pdu.time_stamp, decoded.time_stamp);
-        prop_assert_eq!(pdu.varbinds, decoded.varbinds);
+        prop_assert_eq!(pdu.enterprise(), decoded.enterprise());
+        prop_assert_eq!(pdu.agent_addr(), decoded.agent_addr());
+        prop_assert_eq!(pdu.generic_trap(), decoded.generic_trap());
+        prop_assert_eq!(pdu.specific_trap(), decoded.specific_trap());
+        prop_assert_eq!(pdu.time_stamp(), decoded.time_stamp());
+        prop_assert_eq!(pdu.varbinds(), decoded.varbinds());
     }
 
     // -------------------------------------------------------------------------
@@ -1095,10 +1134,10 @@ mod v3_msg_flags {
 
 mod request_id_mismatch {
     use super::*;
-    use async_snmp::pdu::Pdu;
+    use async_snmp::pdu::{Pdu, ResponsePdu};
 
-    fn make_response(request_id: i32, varbinds: Vec<VarBind>) -> Pdu {
-        Pdu::response(request_id, 0, 0, varbinds)
+    fn make_response(request_id: i32, varbinds: Vec<VarBind>) -> ResponsePdu {
+        ResponsePdu::success(async_snmp::Version::V3, request_id, varbinds).unwrap()
     }
 
     #[test]
@@ -1119,7 +1158,7 @@ mod request_id_mismatch {
         let mut decoder = Decoder::new(encoded);
         let decoded = Pdu::decode(&mut decoder).unwrap();
 
-        assert_eq!(decoded.request_id, 12345);
+        assert_eq!(decoded.request_id(), 12345);
     }
 
     #[test]
@@ -1134,7 +1173,7 @@ mod request_id_mismatch {
         let mut decoder = Decoder::new(encoded);
         let decoded = Pdu::decode(&mut decoder).unwrap();
 
-        assert_eq!(decoded.request_id, -999);
+        assert_eq!(decoded.request_id(), -999);
     }
 
     #[test]
@@ -1150,7 +1189,8 @@ mod request_id_mismatch {
             let decoded = Pdu::decode(&mut decoder).unwrap();
 
             assert_eq!(
-                decoded.request_id, request_id,
+                decoded.request_id(),
+                request_id,
                 "request_id {request_id} failed"
             );
         }
@@ -1242,14 +1282,14 @@ fn arb_trap_v1_pdu_full_range() -> impl Strategy<Value = TrapV1Pdu> {
     )
         .prop_map(
             |(enterprise, agent_addr, generic_trap_raw, specific_trap, time_stamp, varbinds)| {
-                TrapV1Pdu {
+                TrapV1Pdu::from_raw_parts(
                     enterprise,
                     agent_addr,
-                    generic_trap: GenericTrap::from_i32(generic_trap_raw),
+                    GenericTrap::from_i32(generic_trap_raw),
                     specific_trap,
                     time_stamp,
                     varbinds,
-                }
+                )
             },
         )
 }
@@ -1265,20 +1305,22 @@ fn arb_pdu_full_range() -> impl Strategy<Value = Pdu> {
         .prop_map(
             |(pdu_type, request_id, first_field, second_field, varbinds)| {
                 if pdu_type == PduType::GetBulkRequest {
-                    Pdu {
+                    Pdu::from_raw_parts(
                         request_id,
-                        body: async_snmp::pdu::PduBody::GetBulk {
+                        async_snmp::pdu::PduBody::GetBulk {
                             non_repeaters: first_field as u32,
                             max_repetitions: second_field as u32,
                         },
                         varbinds,
-                    }
+                    )
                 } else {
-                    Pdu::standard(
-                        StandardPduType::try_from(pdu_type).unwrap(),
+                    Pdu::from_raw_parts(
                         request_id,
-                        first_field,
-                        second_field,
+                        PduBody::Standard {
+                            pdu_type: StandardPduType::try_from(pdu_type).unwrap(),
+                            error_status: first_field,
+                            error_index: second_field,
+                        },
                         varbinds,
                     )
                 }
@@ -1303,14 +1345,14 @@ proptest! {
         enterprise in arb_oid(),
         specific_trap in any::<i32>(),
     ) {
-        let pdu = TrapV1Pdu {
-            enterprise: enterprise.clone(),
-            agent_addr: [0, 0, 0, 0],
-            generic_trap: GenericTrap::EnterpriseSpecific,
+        let pdu = TrapV1Pdu::from_raw_parts(
+            enterprise.clone(),
+            [0, 0, 0, 0],
+            GenericTrap::EnterpriseSpecific,
             specific_trap,
-            time_stamp: 0,
-            varbinds: vec![],
-        };
+            0,
+            vec![],
+        );
 
         let result = pdu.v2_trap_oid();
 
@@ -1331,27 +1373,34 @@ proptest! {
 
     #[test]
     fn trap_v1_is_enterprise_specific_consistent(generic_trap in any::<i32>()) {
-        let pdu = TrapV1Pdu {
-            enterprise: Oid::empty(),
-            agent_addr: [0, 0, 0, 0],
-            generic_trap: GenericTrap::from_i32(generic_trap),
-            specific_trap: 0,
-            time_stamp: 0,
-            varbinds: vec![],
-        };
+        let pdu = TrapV1Pdu::from_raw_parts(
+            Oid::empty(),
+            [0, 0, 0, 0],
+            GenericTrap::from_i32(generic_trap),
+            0,
+            0,
+            vec![],
+        );
 
         prop_assert_eq!(pdu.is_enterprise_specific(), generic_trap == 6);
     }
 
     #[test]
     fn pdu_to_response_preserves_fields(pdu in arb_pdu_full_range()) {
-        let response = pdu.to_response();
+        let Ok(response) = async_snmp::ResponsePdu::success(
+            async_snmp::Version::V3,
+            pdu.request_id(),
+            pdu.varbinds().to_vec(),
+        ) else {
+            return Ok(());
+        };
+        let response = response.as_raw();
 
         prop_assert_eq!(response.pdu_type(), PduType::Response);
-        prop_assert_eq!(response.request_id, pdu.request_id);
+        prop_assert_eq!(response.request_id(), pdu.request_id());
         prop_assert_eq!(response.error_status(), 0);
         prop_assert_eq!(response.error_index(), 0);
-        prop_assert_eq!(response.varbinds, pdu.varbinds);
+        prop_assert_eq!(response.varbinds(), pdu.varbinds());
     }
 
     #[test]
@@ -1364,7 +1413,15 @@ proptest! {
 
     #[test]
     fn pdu_error_status_enum_no_panic(error_status in any::<i32>()) {
-        let pdu = Pdu::response(0, error_status, 0, vec![]);
+        let pdu = Pdu::from_raw_parts(
+            0,
+            PduBody::Standard {
+                pdu_type: StandardPduType::Response,
+                error_status,
+                error_index: 0,
+            },
+            vec![],
+        );
 
         let _status = pdu.error_status_enum();
     }
@@ -1431,14 +1488,14 @@ mod trap_v1_boundary {
     use super::*;
 
     fn make_trap(generic_trap: GenericTrap, specific_trap: i32) -> TrapV1Pdu {
-        TrapV1Pdu {
-            enterprise: Oid::from_slice(&[1, 3, 6, 1, 4, 1, 9999]),
-            agent_addr: [192, 168, 1, 1],
+        TrapV1Pdu::from_raw_parts(
+            Oid::from_slice(&[1, 3, 6, 1, 4, 1, 9999]),
+            [192, 168, 1, 1],
             generic_trap,
             specific_trap,
-            time_stamp: 0,
-            varbinds: vec![],
-        }
+            0,
+            vec![],
+        )
     }
 
     #[test]

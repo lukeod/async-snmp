@@ -14,7 +14,8 @@ use async_snmp::notification::{
 use async_snmp::v3::{AuthProtocol, PrivProtocol};
 use async_snmp::varbind::VarBind;
 use async_snmp::{
-    Auth, AuthoritativeEngine, Client, Pdu, PduType, Retry, SecurityLevel, Value, Version, oid,
+    Auth, AuthoritativeEngine, Client, NotificationPdu, PduType, Retry, SecurityLevel,
+    TrapV1Notification, Value, Version, oid,
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -59,43 +60,45 @@ fn pdu_trap_v2_has_correct_varbind_prefix() {
         Value::from("test"),
     )];
 
-    let pdu = Pdu::trap_v2(1, 12345, &trap_oid, extra);
+    let pdu = NotificationPdu::trap_v2(Version::V2c, 1, 12345, &trap_oid, extra).unwrap();
+    let pdu = pdu.as_raw();
 
     assert_eq!(pdu.pdu_type(), async_snmp::PduType::TrapV2);
-    assert_eq!(pdu.request_id, 1);
+    assert_eq!(pdu.request_id(), 1);
     assert_eq!(pdu.error_status(), 0);
     assert_eq!(pdu.error_index(), 0);
-    assert_eq!(pdu.varbinds.len(), 3);
+    assert_eq!(pdu.varbinds().len(), 3);
 
     // First varbind: sysUpTime.0
-    assert_eq!(pdu.varbinds[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 3, 0));
-    assert_eq!(pdu.varbinds[0].value, Value::TimeTicks(12345));
+    assert_eq!(pdu.varbinds()[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 3, 0));
+    assert_eq!(pdu.varbinds()[0].value, Value::TimeTicks(12345));
 
     // Second varbind: snmpTrapOID.0
-    assert_eq!(pdu.varbinds[1].oid, oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0));
+    assert_eq!(pdu.varbinds()[1].oid, oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0));
     assert_eq!(
-        pdu.varbinds[1].value,
+        pdu.varbinds()[1].value,
         Value::ObjectIdentifier(trap_oid.clone())
     );
 
     // Third varbind: caller-provided
-    assert_eq!(pdu.varbinds[2].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
+    assert_eq!(pdu.varbinds()[2].oid, oid!(1, 3, 6, 1, 2, 1, 1, 1, 0));
 }
 
 #[test]
 fn pdu_inform_request_has_correct_varbind_prefix() {
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3); // linkDown
-    let pdu = Pdu::inform_request(42, 99999, &trap_oid, vec![]);
+    let pdu = NotificationPdu::inform(Version::V2c, 42, 99999, &trap_oid, vec![]).unwrap();
+    let pdu = pdu.as_raw();
 
     assert_eq!(pdu.pdu_type(), async_snmp::PduType::InformRequest);
-    assert_eq!(pdu.request_id, 42);
-    assert_eq!(pdu.varbinds.len(), 2);
+    assert_eq!(pdu.request_id(), 42);
+    assert_eq!(pdu.varbinds().len(), 2);
 
     // sysUpTime.0
-    assert_eq!(pdu.varbinds[0].value, Value::TimeTicks(99999));
+    assert_eq!(pdu.varbinds()[0].value, Value::TimeTicks(99999));
     // snmpTrapOID.0
     assert_eq!(
-        pdu.varbinds[1].value,
+        pdu.varbinds()[1].value,
         Value::ObjectIdentifier(trap_oid.clone())
     );
 }
@@ -103,8 +106,8 @@ fn pdu_inform_request_has_correct_varbind_prefix() {
 #[test]
 fn pdu_trap_v2_empty_varbinds() {
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2); // warmStart
-    let pdu = Pdu::trap_v2(1, 0, &trap_oid, vec![]);
-    assert_eq!(pdu.varbinds.len(), 2);
+    let pdu = NotificationPdu::trap_v2(Version::V2c, 1, 0, &trap_oid, vec![]).unwrap();
+    assert_eq!(pdu.as_raw().varbinds().len(), 2);
 }
 
 fn encode_raw_v2c_notification(
@@ -112,19 +115,28 @@ fn encode_raw_v2c_notification(
     request_id: i32,
     varbinds: Vec<VarBind>,
 ) -> Bytes {
-    CommunityMessage::v2c(
-        "public",
-        Pdu::standard(
-            async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap(),
-            request_id,
-            0,
-            0,
-            varbinds,
-        ),
-    )
-    .unwrap()
-    .encode()
-    .unwrap()
+    use async_snmp::ber::EncodeBuf;
+
+    let mut buf = EncodeBuf::new();
+    buf.try_push_sequence(|buf| {
+        buf.try_push_constructed(pdu_type.tag(), |buf| {
+            buf.try_push_sequence(|buf| {
+                for varbind in varbinds.iter().rev() {
+                    varbind.encode(buf)?;
+                }
+                Ok(())
+            })?;
+            buf.push_integer(0);
+            buf.push_integer(0);
+            buf.push_integer(request_id);
+            Ok(())
+        })?;
+        buf.try_push_octet_string(b"public")?;
+        buf.push_integer(Version::V2c.as_i32());
+        Ok(())
+    })
+    .unwrap();
+    buf.finish()
 }
 
 fn nonstandard_name_varbinds(uptime: u32) -> Vec<VarBind> {
@@ -140,7 +152,14 @@ fn nonstandard_name_varbinds(uptime: u32) -> Vec<VarBind> {
 fn valid_sentinel_trap(request_id: i32) -> Bytes {
     CommunityMessage::v2c(
         "public",
-        Pdu::trap_v2(request_id, 777, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), vec![]),
+        NotificationPdu::trap_v2(
+            Version::V2c,
+            request_id,
+            777,
+            &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1),
+            vec![],
+        )
+        .unwrap(),
     )
     .unwrap()
     .encode()
@@ -243,7 +262,7 @@ async fn notification_varbind_validation_controls_inform_acknowledgement() {
     let response_msg = CommunityMessage::decode(Bytes::copy_from_slice(&response[..len])).unwrap();
     let response_pdu = response_msg.into_pdu().unwrap();
     assert_eq!(response_pdu.pdu_type(), PduType::Response);
-    assert_eq!(response_pdu.request_id, 42);
+    assert_eq!(response_pdu.request_id(), 42);
     let (notification, _) = recv_handle.await.unwrap();
     assert!(matches!(
         notification,
@@ -591,8 +610,8 @@ async fn v1_trap_send_receive() {
             community, trap, ..
         } => {
             assert_eq!(community.as_bytes(), b"public");
-            assert_eq!(trap.generic_trap, GenericTrap::LinkDown);
-            assert_eq!(trap.time_stamp, 5000);
+            assert_eq!(trap.generic_trap(), GenericTrap::LinkDown);
+            assert_eq!(trap.time_stamp(), 5000);
         }
         other => panic!("expected TrapV1, got {other:?}"),
     }
@@ -600,7 +619,7 @@ async fn v1_trap_send_receive() {
 
 #[tokio::test]
 async fn v1_trap_send_v1_trap_explicit() {
-    use async_snmp::pdu::{GenericTrap, TrapV1Pdu};
+    use async_snmp::pdu::GenericTrap;
 
     let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
     let recv_addr = receiver.local_addr();
@@ -610,7 +629,7 @@ async fn v1_trap_send_v1_trap_explicit() {
         .await
         .unwrap();
 
-    let trap = TrapV1Pdu::new(
+    let trap = TrapV1Notification::new(
         oid!(1, 3, 6, 1, 4, 1, 9999),
         [10, 0, 0, 1],
         GenericTrap::EnterpriseSpecific,
@@ -620,7 +639,8 @@ async fn v1_trap_send_v1_trap_explicit() {
             oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
             Value::from("hello"),
         )],
-    );
+    )
+    .unwrap();
     client.send_v1_trap(trap).await.unwrap();
 
     let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
@@ -633,12 +653,12 @@ async fn v1_trap_send_v1_trap_explicit() {
             community, trap, ..
         } => {
             assert_eq!(community.as_bytes(), b"public");
-            assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
-            assert_eq!(trap.agent_addr, [10, 0, 0, 1]);
-            assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
-            assert_eq!(trap.specific_trap, 42);
-            assert_eq!(trap.time_stamp, 99999);
-            assert_eq!(trap.varbinds.len(), 1);
+            assert_eq!(trap.enterprise(), &oid!(1, 3, 6, 1, 4, 1, 9999));
+            assert_eq!(trap.agent_addr(), [10, 0, 0, 1]);
+            assert_eq!(trap.generic_trap(), GenericTrap::EnterpriseSpecific);
+            assert_eq!(trap.specific_trap(), 42);
+            assert_eq!(trap.time_stamp(), 99999);
+            assert_eq!(trap.varbinds().len(), 1);
         }
         other => panic!("expected TrapV1, got {other:?}"),
     }
@@ -1028,8 +1048,8 @@ async fn agent_v1_trap_to_sink() {
             community, trap, ..
         } => {
             assert_eq!(community.as_bytes(), b"public");
-            assert_eq!(trap.generic_trap, GenericTrap::WarmStart);
-            assert_eq!(trap.time_stamp, 1000);
+            assert_eq!(trap.generic_trap(), GenericTrap::WarmStart);
+            assert_eq!(trap.time_stamp(), 1000);
         }
         other => panic!("expected TrapV1, got {other:?}"),
     }
@@ -1074,8 +1094,8 @@ async fn agent_mixed_v1_v2c_sinks() {
             community, trap, ..
         } => {
             assert_eq!(community.as_bytes(), b"v1comm");
-            assert_eq!(trap.generic_trap, GenericTrap::LinkUp);
-            assert_eq!(trap.time_stamp, 777);
+            assert_eq!(trap.generic_trap(), GenericTrap::LinkUp);
+            assert_eq!(trap.time_stamp(), 777);
         }
         other => panic!("expected TrapV1, got {other:?}"),
     }

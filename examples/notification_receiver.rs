@@ -223,10 +223,10 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
                 "  Community: {}",
                 String::from_utf8_lossy(community.as_bytes())
             );
-            println!("  Enterprise: {}", trap.enterprise);
-            println!("  Generic Trap: {:?}", trap.generic_trap);
-            println!("  Specific Trap: {}", trap.specific_trap);
-            println!("  Agent Address: {:?}", trap.agent_addr);
+            println!("  Enterprise: {}", trap.enterprise());
+            println!("  Generic Trap: {:?}", trap.generic_trap());
+            println!("  Specific Trap: {}", trap.specific_trap());
+            println!("  Agent Address: {:?}", trap.agent_addr());
         }
 
         Notification::TrapV2c {

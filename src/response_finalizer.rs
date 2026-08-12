@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
+use crate::Version;
 use crate::error::Result;
-use crate::pdu::Pdu;
-use crate::{ErrorStatus, Version};
+use crate::pdu::{Pdu, ResponsePdu};
 
 /// The result of exact response finalization.
 #[derive(Debug)]
@@ -73,12 +73,7 @@ pub(crate) fn finalize_response(
     } else {
         Vec::new()
     };
-    let alternate = Pdu::response(
-        request.request_id,
-        ErrorStatus::TooBig.as_i32(),
-        0,
-        varbinds,
-    );
+    let alternate = ResponsePdu::too_big(version, request.request_id(), varbinds)?.into_raw();
     let alternate = encode(alternate)?;
     if alternate.len() <= limit {
         Ok(FinalizedResponse::Alternate(alternate))
@@ -104,7 +99,7 @@ pub(crate) fn finalize_report(
 mod tests {
     use super::*;
     use crate::oid;
-    use crate::{Value, VarBind};
+    use crate::{ErrorStatus, Value, VarBind};
 
     fn request() -> Pdu {
         Pdu::standard(

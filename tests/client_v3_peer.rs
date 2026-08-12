@@ -85,7 +85,7 @@ fn discovery_step(engine: TestV3Engine) -> ScriptStep {
 
 fn response_step(engine: TestV3Engine, value: &'static str) -> ScriptStep {
     ScriptStep::reply(move |request| {
-        let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+        let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
             .oid
             .clone();
         V3ReplyBuilder::response_to(request, &engine)
@@ -209,7 +209,7 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, policy: DecodePolicy) {
         vec![
             discovery_step(engine),
             ScriptStep::replies(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 let response = V3ReplyBuilder::response_to(request, &response_engine)
@@ -291,7 +291,7 @@ async fn v3_plaintext_and_authpriv_inner_anomaly_precedes_top_level_suffix() {
             vec![
                 discovery_step(engine),
                 ScriptStep::reply(move |request| {
-                    let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                    let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                         .oid
                         .clone();
                     let response = V3ReplyBuilder::response_to(request, &response_engine)
@@ -340,7 +340,7 @@ async fn v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
         vec![
             discovery_step(engine),
             ScriptStep::replies(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 let malformed = V3ReplyBuilder::response_to(request, &response_engine)
@@ -472,7 +472,7 @@ async fn v3_custom_transport_rejects_unauthenticated_candidate_then_accepts_resp
         vec![
             discovery_step(engine),
             ScriptStep::replies(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 let rejected = V3ReplyBuilder::response_to(request, &response_engine)
@@ -553,7 +553,7 @@ async fn rejected_authenticated_candidate_does_not_commit_timeliness() {
         vec![
             discovery_step(engine),
             ScriptStep::replies(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 let rejected = V3ReplyBuilder::response_to(request, &response_engine)
@@ -758,16 +758,14 @@ async fn v3_discovery_rejects_trailing_usm_security_parameter_data() {
         let scoped = ScopedPdu::new(
             reply_engine.engine_id.clone(),
             Bytes::new(),
-            async_snmp::pdu::Pdu::standard(
-                async_snmp::pdu::StandardPduType::Report,
-                0,
-                0,
+            async_snmp::ResponsePdu::report(
                 0,
                 vec![VarBind::new(
                     report_oids::unknown_engine_ids(),
                     Value::Counter32(1),
                 )],
-            ),
+            )
+            .unwrap(),
         )
         .encode_to_bytes()
         .unwrap();
@@ -1122,7 +1120,7 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
                 .build()
             }),
             ScriptStep::reply(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 V3ReplyBuilder::response_to(request, &response_engine)
@@ -1173,8 +1171,8 @@ async fn v3_scripted_auth_priv_time_window_report_correction() {
     assert_eq!(corrected.authentication_valid, Some(true));
     assert_ne!(first.global_data.msg_id(), corrected.global_data.msg_id());
     assert_ne!(
-        first.scoped_pdu.as_ref().unwrap().pdu.request_id,
-        corrected.scoped_pdu.as_ref().unwrap().pdu.request_id
+        first.scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        corrected.scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
     assert_eq!(
         (corrected.usm.engine_boots(), corrected.usm.engine_time()),
@@ -1220,7 +1218,7 @@ async fn v3_exchange_metadata_aggregates_discovery_correction_and_final_response
                 Ok(Bytes::from(response))
             }),
             ScriptStep::reply(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 let response = V3ReplyBuilder::response_to(request, &response_engine)
@@ -1534,8 +1532,8 @@ async fn v3_udp_unauthenticated_time_report_gets_packet_local_correction() {
         requests[2].global_data.msg_id()
     );
     assert_ne!(
-        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
     assert_eq!(requests[3].usm.engine_boots(), 7);
     assert!(requests[3].usm.engine_time() >= 100);
@@ -2001,8 +1999,8 @@ async fn v3_tcp_time_window_report_gets_one_protocol_correction() {
         requests[2].global_data.msg_id()
     );
     assert_ne!(
-        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
 }
 
@@ -2051,8 +2049,8 @@ async fn v3_reliable_custom_transport_allows_protocol_correction() {
         );
     }
     assert_ne!(
-        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
 }
 
@@ -2102,13 +2100,13 @@ async fn v3_report_on_final_timeout_attempt_still_gets_correction() {
     assert_eq!(requests.len(), 4);
     let attempts = &requests[1..];
     assert_eq!(
-        attempts[0].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        attempts[0].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
         "timeout retransmission reuses the PDU request ID"
     );
     assert_ne!(
-        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        attempts[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        attempts[2].scoped_pdu.as_ref().unwrap().pdu.request_id(),
         "protocol correction receives a fresh PDU request ID"
     );
 }
@@ -2698,7 +2696,7 @@ async fn v3_auth_client_rejects_unauthenticated_response() {
         vec![
             discovery_step(engine.clone()),
             ScriptStep::reply(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 V3ReplyBuilder::response_to(request, &response_engine)
@@ -2829,7 +2827,7 @@ async fn v3_reserved_flag_bits_in_reply_ignored_for_level() {
         vec![
             discovery_step(engine.clone()),
             ScriptStep::reply(move |request| {
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 V3ReplyBuilder::response_to(request, &response_engine)
@@ -2894,12 +2892,12 @@ async fn v3_scripted_udp_timeout_retry_count() {
         attempts[2].global_data.msg_id()
     );
     assert_eq!(
-        attempts[0].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id
+        attempts[0].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
     assert_eq!(
-        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        attempts[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+        attempts[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        attempts[2].scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
 }
 
@@ -3382,8 +3380,8 @@ async fn v3_udp_accepts_late_response_to_prior_attempt() {
         requests[2].global_data.msg_id()
     );
     assert_eq!(
-        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
 }
 
@@ -3431,8 +3429,8 @@ async fn v3_custom_transport_accepts_late_response_to_prior_attempt() {
         requests[2].global_data.msg_id()
     );
     assert_eq!(
-        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id()
     );
 }
 
@@ -3542,13 +3540,13 @@ async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
     assert_eq!(requests[3].usm.engine_boots(), 8);
     assert!(requests[3].usm.engine_time() >= 10);
     assert_eq!(
-        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id(),
         "timeout retransmission reuses the PDU request ID"
     );
     assert_ne!(
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[3].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[3].scoped_pdu.as_ref().unwrap().pdu.request_id(),
         "protocol correction receives a fresh PDU request ID"
     );
 }
@@ -3612,13 +3610,13 @@ async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correcti
         "timeout retransmission receives a fresh msgID"
     );
     assert_eq!(
-        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id(),
         "timeout retransmission reuses the PDU request ID"
     );
     assert_ne!(
-        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id,
-        requests[3].scoped_pdu.as_ref().unwrap().pdu.request_id,
+        requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id(),
+        requests[3].scoped_pdu.as_ref().unwrap().pdu.request_id(),
         "protocol correction receives a fresh PDU request ID"
     );
     assert_eq!(
@@ -3715,7 +3713,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
             discovery_step(engine),
             ScriptStep::reply(move |request| {
                 *capture.lock().unwrap() = Some(request.global_data.msg_id());
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 V3ReplyBuilder::response_to(request, &first_response_engine)
@@ -3727,7 +3725,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
             }),
             ScriptStep::reply(move |request| {
                 let stale = first_op_msg_id.lock().unwrap().take().unwrap();
-                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds[0]
+                let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
                     .clone();
                 V3ReplyBuilder::response_to(request, &second_response_engine)

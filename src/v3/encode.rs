@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use crate::message_size::MessageSize;
 use crate::oid::Oid;
-use crate::pdu::Pdu;
+use crate::pdu::{Pdu, ResponsePdu};
 use crate::v3::auth::authenticate_message;
 use crate::v3::{LocalizedKey, SaltCounter, UsmSecurityParams};
 use crate::value::Value;
@@ -118,7 +118,7 @@ pub fn encode_v3_message(
             V3Message::new(global_data, usm_encoded, scoped_pdu)?
         }
         V3MessageData::Encrypted(ciphertext) => {
-            V3Message::new_encrypted(global_data, usm_encoded, ciphertext)?
+            V3Message::new_with_opaque_encrypted_scoped_pdu(global_data, usm_encoded, ciphertext)?
         }
     };
 
@@ -186,13 +186,11 @@ pub(crate) fn encode_v3_report(
     // path reaches here before the scopedPDU is decoded, so it cannot be
     // extracted. (msgID, which correlates the Report, is carried separately in
     // the header.)
-    let report_pdu = Pdu::standard(
-        crate::pdu::StandardPduType::Report,
-        0,
-        0,
+    let report_pdu = ResponsePdu::report(
         0,
         vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
-    );
+    )?
+    .into_raw();
 
     let security_level = if auth_key.is_some() {
         SecurityLevel::AuthNoPriv
@@ -287,9 +285,10 @@ pub(crate) fn encode_v3_response(
             let usm = usm
                 .with_auth_placeholder(auth_key.mac_len())?
                 .with_priv_params(priv_params)?;
-            let mut bytes = V3Message::new_encrypted(global, usm.encode()?, encrypted)?
-                .encode()?
-                .to_vec();
+            let mut bytes =
+                V3Message::new_with_opaque_encrypted_scoped_pdu(global, usm.encode()?, encrypted)?
+                    .encode()?
+                    .to_vec();
             sign_v3_message(auth_key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))
         }

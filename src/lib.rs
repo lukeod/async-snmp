@@ -620,7 +620,11 @@ pub use notification::{
     NotificationVarbindValidation, validate_notification_varbinds,
 };
 pub use oid::Oid;
-pub use pdu::{GenericTrap, Pdu, PduBody, PduType, StandardPduType, TrapV1Pdu};
+pub use pdu::{
+    ErrorIndex, GenericTrap, GetBulkPdu, NotificationPdu, OutboundErrorStatus, OutboundPdu, Pdu,
+    PduBody, PduType, RawPdu, RawTrapV1Pdu, RequestPdu, ResponsePdu, StandardPduType,
+    TrapV1Notification, TrapV1Pdu,
+};
 pub use transport::{
     BuiltinTransport, Candidate, CommunityResponsePolicy, RequestRegistration, ResponseIdentity,
     TcpTransport, Transport, UdpControl, UdpHandle, UdpStats, UdpTransport,

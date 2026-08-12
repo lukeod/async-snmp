@@ -4,7 +4,7 @@ use async_snmp::ber::{Decoder, EncodeBuf};
 use async_snmp::message::{
     MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
-use async_snmp::pdu::{Pdu, PduBody, PduType};
+use async_snmp::pdu::{Pdu, PduBody, PduType, ResponsePdu};
 use async_snmp::transport::Transport;
 use async_snmp::v3::auth::{authenticate_message, verify_message};
 use async_snmp::v3::{SaltCounter, UsmSecurityParams};
@@ -169,20 +169,20 @@ fn encode_raw_scoped_pdu_with_first_integer(
     scoped: &ScopedPdu,
     first_integer_value_content: Option<&[u8]>,
 ) -> Result<Bytes, String> {
-    let (tag, first_field, second_field) = match scoped.pdu.body {
+    let (tag, first_field, second_field) = match scoped.pdu.raw_body() {
         PduBody::Standard {
             pdu_type,
             error_status,
             error_index,
-        } => (pdu_type.pdu_type().tag(), error_status, error_index),
+        } => (pdu_type.pdu_type().tag(), *error_status, *error_index),
         PduBody::GetBulk {
             non_repeaters,
             max_repetitions,
         } => (
             PduType::GetBulkRequest.tag(),
-            i32::try_from(non_repeaters)
+            i32::try_from(*non_repeaters)
                 .map_err(|_| "GETBULK non_repeaters exceeds i32::MAX".to_owned())?,
-            i32::try_from(max_repetitions)
+            i32::try_from(*max_repetitions)
                 .map_err(|_| "GETBULK max_repetitions exceeds i32::MAX".to_owned())?,
         ),
     };
@@ -191,7 +191,7 @@ fn encode_raw_scoped_pdu_with_first_integer(
     buf.try_push_sequence(|buf| {
         buf.try_push_constructed(tag, |buf| {
             buf.try_push_sequence(|buf| {
-                for (index, varbind) in scoped.pdu.varbinds.iter().enumerate().rev() {
+                for (index, varbind) in scoped.pdu.varbinds().iter().enumerate().rev() {
                     if index == 0
                         && let Some(content) = first_integer_value_content
                     {
@@ -207,7 +207,7 @@ fn encode_raw_scoped_pdu_with_first_integer(
             })?;
             buf.push_integer(second_field);
             buf.push_integer(first_field);
-            buf.push_integer(scoped.pdu.request_id);
+            buf.push_integer(scoped.pdu.request_id());
             Ok(())
         })?;
         buf.push_octet_string(&scoped.context_name);
@@ -330,7 +330,13 @@ impl V3ReplyBuilder {
             first_integer_value_content_override: None,
             context_engine_id: scoped.context_engine_id.clone(),
             context_name: scoped.context_name.clone(),
-            pdu: scoped.pdu.to_response(),
+            pdu: ResponsePdu::success(
+                async_snmp::Version::V3,
+                scoped.pdu.request_id(),
+                scoped.pdu.varbinds().to_vec(),
+            )
+            .unwrap()
+            .into_raw(),
             salt: engine.salt.clone(),
         }
     }
@@ -346,13 +352,9 @@ impl V3ReplyBuilder {
         // Reports default to the reporting entity's context, not the request context.
         builder.context_engine_id = engine.engine_id.clone();
         builder.context_name = Bytes::new();
-        builder.pdu = Pdu::standard(
-            async_snmp::pdu::StandardPduType::Report,
-            0,
-            0,
-            0,
-            vec![VarBind::new(oid, Value::Counter32(counter))],
-        );
+        builder.pdu = ResponsePdu::report(0, vec![VarBind::new(oid, Value::Counter32(counter))])
+            .unwrap()
+            .into_raw();
         builder
     }
 
@@ -450,31 +452,80 @@ impl V3ReplyBuilder {
     }
 
     pub fn pdu_type(mut self, pdu_type: PduType) -> Self {
-        assert!(
-            self.pdu.set_standard_pdu_type(
-                async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap()
-            )
+        let (request_id, body, varbinds) = self.pdu.into_raw_parts();
+        let PduBody::Standard {
+            error_status,
+            error_index,
+            ..
+        } = body
+        else {
+            panic!("raw reply type mutation requires a standard-layout PDU");
+        };
+        self.pdu = Pdu::from_raw_parts(
+            request_id,
+            PduBody::Standard {
+                pdu_type: async_snmp::pdu::StandardPduType::try_from(pdu_type).unwrap(),
+                error_status,
+                error_index,
+            },
+            varbinds,
         );
         self
     }
 
     pub fn request_id(mut self, request_id: i32) -> Self {
-        self.pdu.request_id = request_id;
+        let (_, body, varbinds) = self.pdu.into_raw_parts();
+        self.pdu = Pdu::from_raw_parts(request_id, body, varbinds);
         self
     }
 
     pub fn error_status(mut self, error_status: i32) -> Self {
-        assert!(self.pdu.set_error_status(error_status));
+        let (request_id, body, varbinds) = self.pdu.into_raw_parts();
+        let PduBody::Standard {
+            pdu_type,
+            error_index,
+            ..
+        } = body
+        else {
+            panic!("raw error-status mutation requires a standard-layout PDU");
+        };
+        self.pdu = Pdu::from_raw_parts(
+            request_id,
+            PduBody::Standard {
+                pdu_type,
+                error_status,
+                error_index,
+            },
+            varbinds,
+        );
         self
     }
 
     pub fn error_index(mut self, error_index: i32) -> Self {
-        assert!(self.pdu.set_error_index(error_index));
+        let (request_id, body, varbinds) = self.pdu.into_raw_parts();
+        let PduBody::Standard {
+            pdu_type,
+            error_status,
+            ..
+        } = body
+        else {
+            panic!("raw error-index mutation requires a standard-layout PDU");
+        };
+        self.pdu = Pdu::from_raw_parts(
+            request_id,
+            PduBody::Standard {
+                pdu_type,
+                error_status,
+                error_index,
+            },
+            varbinds,
+        );
         self
     }
 
     pub fn varbinds(mut self, varbinds: Vec<VarBind>) -> Self {
-        self.pdu.varbinds = varbinds;
+        let (request_id, body, _) = self.pdu.into_raw_parts();
+        self.pdu = Pdu::from_raw_parts(request_id, body, varbinds);
         self
     }
 

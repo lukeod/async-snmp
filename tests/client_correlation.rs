@@ -1,5 +1,5 @@
 use async_snmp::message::{CommunityMessage, DecodePolicy, Message};
-use async_snmp::{Auth, Client, Oid, Pdu, Retry, Value, VarBind};
+use async_snmp::{Auth, Client, Oid, RequestPdu, ResponsePdu, Retry, Value, VarBind, Version};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,21 +18,21 @@ async fn wrong_community_does_not_consume_pending_udp_request() {
         let (len, source) = socket.recv_from(&mut buf).await.unwrap();
         server_requests.fetch_add(1, Ordering::Relaxed);
         let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
-        let request_id = request.into_pdu().unwrap().request_id;
+        let request_id = request.into_pdu().unwrap().request_id();
         let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
 
         let response = |community: &'static [u8], value: &'static [u8]| {
             CommunityMessage::v2c(
                 Bytes::from_static(community),
-                Pdu::response(
+                ResponsePdu::success(
+                    Version::V2c,
                     request_id,
-                    0,
-                    0,
                     vec![VarBind::new(
                         oid.clone(),
                         Value::OctetString(Bytes::from_static(value)),
                     )],
-                ),
+                )
+                .unwrap(),
             )
             .unwrap()
             .encode()
@@ -78,12 +78,12 @@ async fn malformed_and_wrong_pdu_candidates_do_not_consume_udp_exchange() {
         let mut buf = [0u8; 4096];
         let (len, source) = socket.recv_from(&mut buf).await.unwrap();
         let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
-        let request_id = request.into_pdu().unwrap().request_id;
+        let request_id = request.into_pdu().unwrap().request_id();
         let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
 
         let wrong_pdu = CommunityMessage::v2c(
             "public",
-            Pdu::get_request(request_id, std::slice::from_ref(&oid)),
+            RequestPdu::get(Version::V2c, request_id, std::slice::from_ref(&oid)).unwrap(),
         )
         .unwrap()
         .encode()
@@ -92,15 +92,15 @@ async fn malformed_and_wrong_pdu_candidates_do_not_consume_udp_exchange() {
 
         let mut malformed = CommunityMessage::v2c(
             "public",
-            Pdu::response(
+            ResponsePdu::success(
+                Version::V2c,
                 request_id,
-                0,
-                0,
                 vec![VarBind::new(
                     oid.clone(),
                     Value::ObjectIdentifier(Oid::from_slice(&[1, 3, 6, 1])),
                 )],
-            ),
+            )
+            .unwrap(),
         )
         .unwrap()
         .encode()
@@ -111,15 +111,15 @@ async fn malformed_and_wrong_pdu_candidates_do_not_consume_udp_exchange() {
 
         let genuine = CommunityMessage::v2c(
             "public",
-            Pdu::response(
+            ResponsePdu::success(
+                Version::V2c,
                 request_id,
-                0,
-                0,
                 vec![VarBind::new(
                     oid,
                     Value::OctetString(Bytes::from_static(b"genuine")),
                 )],
-            ),
+            )
+            .unwrap(),
         )
         .unwrap()
         .encode()
@@ -161,18 +161,18 @@ async fn non_utf8_community_correlates_udp_response() {
         };
         assert_eq!(request.community().as_bytes(), community);
 
-        let request_id = request.into_pdu().unwrap().request_id;
+        let request_id = request.into_pdu().unwrap().request_id();
         let response = CommunityMessage::v2c(
             community,
-            Pdu::response(
+            ResponsePdu::success(
+                Version::V2c,
                 request_id,
-                0,
-                0,
                 vec![VarBind::new(
                     Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]),
                     Value::OctetString(Bytes::from_static(b"matched")),
                 )],
-            ),
+            )
+            .unwrap(),
         )
         .unwrap()
         .encode()
@@ -206,20 +206,20 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: Decode
         let mut buf = [0u8; 4096];
         let (len, source) = socket.recv_from(&mut buf).await.unwrap();
         let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
-        let request_id = request.into_pdu().unwrap().request_id;
+        let request_id = request.into_pdu().unwrap().request_id();
         let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
         let response = CommunityMessage::new(
             version.into(),
             "public",
-            Pdu::response(
+            ResponsePdu::success(
+                version.into(),
                 request_id,
-                0,
-                0,
                 vec![VarBind::new(
                     oid,
                     Value::OctetString(Bytes::from_static(b"suffix policy")),
                 )],
-            ),
+            )
+            .unwrap(),
         )
         .unwrap()
         .encode()
@@ -231,7 +231,8 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: Decode
             CommunityMessage::new(
                 version.into(),
                 "public",
-                Pdu::response(request_id.wrapping_add(1), 0, 0, Vec::new()),
+                ResponsePdu::success(version.into(), request_id.wrapping_add(1), Vec::new())
+                    .unwrap(),
             )
             .unwrap()
             .encode()

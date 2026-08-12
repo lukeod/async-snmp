@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::handler::SecurityModel;
 use crate::message::{CommunityMessage, SecurityLevel};
 use crate::oid::Oid;
-use crate::pdu::Pdu;
+use crate::pdu::{NotificationPdu, Pdu};
 use crate::transport::{UdpHandle, UdpTransport};
 use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
@@ -442,28 +442,28 @@ impl super::Agent {
         varbinds: Vec<VarBind>,
     ) -> NotificationSendStream<'_> {
         let pending = FuturesUnordered::new();
-        let pdu = Arc::new(OnceLock::new());
         let trap_oid = Arc::new(trap_oid.clone());
         let varbinds: Arc<[VarBind]> = Arc::from(varbinds);
 
         for sink in &self.inner.trap_sinks {
-            let pdu = Arc::clone(&pdu);
             let trap_oid = Arc::clone(&trap_oid);
             let varbinds = Arc::clone(&varbinds);
             pending.push(Box::pin(async move {
-                let pdu = pdu.get_or_init(|| {
-                    Pdu::trap_v2(
+                let status = if !self.notification_allowed(sink, &trap_oid, &varbinds) {
+                    SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+                } else {
+                    let pdu = NotificationPdu::trap_v2(
+                        Version::V3,
                         self.next_notification_id(),
                         uptime,
                         &trap_oid,
                         varbinds.to_vec(),
-                    )
-                });
-                let status = if !self.notification_allowed(sink, &trap_oid, &varbinds) {
-                    SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
-                } else {
-                    match self.send_trap_to_sink(sink, pdu).await {
-                        Ok(()) => SinkStatus::Succeeded,
+                    );
+                    match pdu {
+                        Ok(pdu) => match self.send_trap_to_sink(sink, pdu.as_raw()).await {
+                            Ok(()) => SinkStatus::Succeeded,
+                            Err(error) => SinkStatus::Failed(error),
+                        },
                         Err(error) => SinkStatus::Failed(error),
                     }
                 };

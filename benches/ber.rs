@@ -348,7 +348,7 @@ fn bench_integer_encode(c: &mut Criterion) {
 /// Benchmark full message decode throughput
 fn bench_message_decode_throughput(c: &mut Criterion) {
     use async_snmp::message::CommunityMessage;
-    use async_snmp::pdu::Pdu;
+    use async_snmp::pdu::ResponsePdu;
     use async_snmp::version::Version;
 
     let mut group = c.benchmark_group("message_decode");
@@ -371,10 +371,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
         ),
     ];
 
-    // Create a GET request and convert to response
-    let request = Pdu::get_request(12345, &[Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0])]);
-    let mut pdu = request.to_response();
-    pdu.varbinds = varbinds;
+    let pdu = ResponsePdu::success(Version::V2c, 12345, varbinds).unwrap();
 
     let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
     let encoded = msg.encode().unwrap();
@@ -397,9 +394,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
         })
         .collect();
 
-    let request = Pdu::get_request(12346, &[Oid::from_slice(&[1, 3, 6, 1, 2, 1, 2, 2, 1, 2])]);
-    let mut pdu = request.to_response();
-    pdu.varbinds = many_varbinds;
+    let pdu = ResponsePdu::success(Version::V2c, 12346, many_varbinds).unwrap();
 
     let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
     let encoded_large = msg.encode().unwrap();

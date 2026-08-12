@@ -128,11 +128,15 @@ impl CommunityMessage {
     ///
     /// Returns [`Error::InvalidMessage`] when the version cannot carry the PDU
     /// or an SNMPv1 PDU contains a `Counter64` value.
-    pub fn new(version: Version, community: impl Into<Community>, pdu: Pdu) -> Result<Self> {
+    pub fn new(
+        version: Version,
+        community: impl Into<Community>,
+        pdu: impl Into<Pdu>,
+    ) -> Result<Self> {
         let message = Self {
             version,
             community: community.into(),
-            pdu: CommunityPdu::Standard(pdu),
+            pdu: CommunityPdu::Standard(pdu.into()),
         };
         message.validate()?;
         Ok(message)
@@ -143,7 +147,7 @@ impl CommunityMessage {
     /// # Errors
     ///
     /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv2c.
-    pub fn v2c(community: impl Into<Community>, pdu: Pdu) -> Result<Self> {
+    pub fn v2c(community: impl Into<Community>, pdu: impl Into<Pdu>) -> Result<Self> {
         Self::new(Version::V2c, community, pdu)
     }
 
@@ -152,7 +156,7 @@ impl CommunityMessage {
     /// # Errors
     ///
     /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv1.
-    pub fn v1(community: impl Into<Community>, pdu: Pdu) -> Result<Self> {
+    pub fn v1(community: impl Into<Community>, pdu: impl Into<Pdu>) -> Result<Self> {
         Self::new(Version::V1, community, pdu)
     }
 
@@ -161,11 +165,11 @@ impl CommunityMessage {
     /// # Errors
     ///
     /// Returns [`Error::InvalidMessage`] when the trap contains `Counter64`.
-    pub fn v1_trap(community: impl Into<Community>, trap: TrapV1Pdu) -> Result<Self> {
+    pub fn v1_trap(community: impl Into<Community>, trap: impl Into<TrapV1Pdu>) -> Result<Self> {
         let message = Self {
             version: Version::V1,
             community: community.into(),
-            pdu: CommunityPdu::TrapV1(trap),
+            pdu: CommunityPdu::TrapV1(trap.into()),
         };
         message.validate()?;
         Ok(message)
@@ -381,7 +385,28 @@ mod tests {
     fn raw_standard_message(version: Version, pdu: &Pdu) -> Bytes {
         let mut buf = EncodeBuf::new();
         buf.try_push_sequence(|buf| {
-            pdu.encode(buf)?;
+            let (pdu_type, first, second) = match pdu.body {
+                crate::pdu::PduBody::Standard {
+                    pdu_type,
+                    error_status,
+                    error_index,
+                } => (pdu_type.pdu_type(), error_status, error_index),
+                crate::pdu::PduBody::GetBulk {
+                    non_repeaters,
+                    max_repetitions,
+                } => (
+                    PduType::GetBulkRequest,
+                    i32::try_from(non_repeaters).unwrap(),
+                    i32::try_from(max_repetitions).unwrap(),
+                ),
+            };
+            buf.try_push_constructed(pdu_type.tag(), |buf| {
+                crate::varbind::encode_varbind_list(buf, &pdu.varbinds)?;
+                buf.push_integer(second);
+                buf.push_integer(first);
+                buf.push_integer(pdu.request_id);
+                Ok(())
+            })?;
             buf.push_octet_string(b"public");
             buf.push_integer(version.as_i32());
             Ok(())
@@ -415,14 +440,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_rejects_invalid_oid() {
-        let message =
+    fn construction_rejects_invalid_oid() {
+        let error =
             CommunityMessage::v2c("public", Pdu::get_request(1, &[crate::oid::Oid::empty()]))
-                .unwrap();
-        assert!(matches!(
-            &*message.encode().unwrap_err(),
-            Error::InvalidOid(_)
-        ));
+                .unwrap_err();
+        assert!(matches!(&*error, Error::InvalidOid(_)));
     }
 
     #[test]

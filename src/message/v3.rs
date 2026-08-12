@@ -304,22 +304,22 @@ impl ScopedPdu {
     pub fn new(
         context_engine_id: impl Into<Bytes>,
         context_name: impl Into<Bytes>,
-        pdu: Pdu,
+        pdu: impl Into<Pdu>,
     ) -> Self {
         Self {
             context_engine_id: context_engine_id.into(),
             context_name: context_name.into(),
-            pdu,
+            pdu: pdu.into(),
         }
     }
 
     /// Create with empty context (most common case).
     #[must_use]
-    pub fn with_empty_context(pdu: Pdu) -> Self {
+    pub fn with_empty_context(pdu: impl Into<Pdu>) -> Self {
         Self {
             context_engine_id: Bytes::new(),
             context_name: Bytes::new(),
-            pdu,
+            pdu: pdu.into(),
         }
     }
 
@@ -497,8 +497,15 @@ impl V3Message {
         Ok(value)
     }
 
-    /// Create a validated V3 message with encrypted scoped data.
-    pub fn new_encrypted(
+    /// Create an SNMPv3 message from opaque encrypted scoped-PDU bytes.
+    ///
+    /// This is a trusted/raw escape hatch for callers that already encrypted a
+    /// complete encoded `ScopedPdu`. The constructor validates the global
+    /// header, USM security parameters, privacy flag, and their relationships,
+    /// but cannot inspect the ciphertext to validate the enclosed PDU's
+    /// outbound invariants. Prefer [`Self::new`] whenever the scoped PDU is
+    /// available as structured plaintext.
+    pub fn new_with_opaque_encrypted_scoped_pdu(
         global_data: MsgGlobalData,
         security_params: Bytes,
         encrypted: Bytes,
@@ -1104,7 +1111,12 @@ mod tests {
             MsgGlobalData::new(1, size, MsgFlags::new(SecurityLevel::AuthPriv, false)).unwrap();
         assert!(V3Message::new(private.clone(), no_auth.clone(), scoped.clone()).is_err());
         assert!(
-            V3Message::new_encrypted(private, no_auth, Bytes::from_static(b"ciphertext")).is_err()
+            V3Message::new_with_opaque_encrypted_scoped_pdu(
+                private,
+                no_auth,
+                Bytes::from_static(b"ciphertext"),
+            )
+            .is_err()
         );
 
         let mut message = V3Message::discovery_request(1, size).unwrap();
@@ -1402,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_rejects_invalid_oid() {
+    fn construction_rejects_invalid_oid() {
         let pdu = Pdu::get_request(1, &[crate::oid::Oid::empty()]);
         let scoped = ScopedPdu::with_empty_context(pdu);
         let global = MsgGlobalData::new(
@@ -1411,11 +1423,8 @@ mod tests {
             MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
         )
         .unwrap();
-        let message = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
-        assert!(matches!(
-            &*message.encode().unwrap_err(),
-            Error::InvalidOid(_)
-        ));
+        let error = V3Message::new(global, no_auth_security_params(), scoped).unwrap_err();
+        assert!(matches!(&*error, Error::InvalidOid(_)));
     }
 
     fn push_integer_content(buf: &mut EncodeBuf, content: &[u8]) {
@@ -1648,7 +1657,7 @@ mod tests {
             MsgFlags::new(SecurityLevel::AuthPriv, false),
         )
         .unwrap();
-        let msg = V3Message::new_encrypted(
+        let msg = V3Message::new_with_opaque_encrypted_scoped_pdu(
             global,
             auth_security_params(true),
             Bytes::from_static(b"encrypted-data"),
@@ -1909,7 +1918,7 @@ mod tests {
             MsgFlags::new(SecurityLevel::AuthPriv, false),
         )
         .unwrap();
-        let msg = V3Message::new_encrypted(
+        let msg = V3Message::new_with_opaque_encrypted_scoped_pdu(
             global,
             auth_security_params(true),
             Bytes::from_static(b"encrypted-data"),

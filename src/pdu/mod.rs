@@ -48,7 +48,11 @@ fn validate_outbound_values(
     varbinds: &[VarBind],
 ) -> Result<()> {
     for varbind in varbinds {
+        varbind.oid.validate_for_wire()?;
         let value = &varbind.value;
+        if let Value::ObjectIdentifier(oid) = value {
+            oid.validate_for_wire()?;
+        }
         if matches!(value, Value::Unknown { .. }) {
             return Err(invalid_outbound(
                 "Value::Unknown cannot be encoded by structured encoders",
@@ -214,7 +218,7 @@ pub enum PduBody {
     /// GETBULK-specific body fields.
     ///
     /// Encoding rejects either field above the RFC 3416 `Integer32` maximum.
-    /// Use [`Pdu::get_bulk`] for checked construction.
+    /// Use [`GetBulkPdu::new`] for checked outbound construction.
     GetBulk {
         /// Number of non-repeating OIDs.
         non_repeaters: u32,
@@ -230,17 +234,221 @@ pub(crate) const MAX_GET_BULK_VALUE: u32 = i32::MAX as u32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdu {
     /// Request ID for correlating requests and responses.
-    pub request_id: i32,
+    pub(crate) request_id: i32,
     /// Typed fields that determine the PDU tag and integer meanings.
-    pub body: PduBody,
+    pub(crate) body: PduBody,
     /// Variable bindings.
-    pub varbinds: Vec<VarBind>,
+    pub(crate) varbinds: Vec<VarBind>,
+}
+
+/// Permissive PDU representation returned by decoders.
+///
+/// Its invariant-bearing fields are read-only. Convert it with a role-specific
+/// `try_from_raw` constructor before deliberately reusing received data for an
+/// outbound message.
+pub type RawPdu = Pdu;
+
+/// A known error-status value suitable for an outbound Response PDU.
+///
+/// Unlike [`ErrorStatus`], this type has no `Unknown` variant. The relationship
+/// between the status, error index, SNMP version, and variable-binding count is
+/// checked by [`ResponsePdu::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutboundErrorStatus {
+    /// No error occurred.
+    NoError,
+    /// The response would exceed a message-size limit.
+    TooBig,
+    /// An object name was unavailable (SNMPv1 only).
+    NoSuchName,
+    /// A SET value was invalid (SNMPv1 only).
+    BadValue,
+    /// A SET targeted a read-only object (SNMPv1 only).
+    ReadOnly,
+    /// An unspecified processing error occurred.
+    GenErr,
+    /// Access to the object was denied.
+    NoAccess,
+    /// A SET value had the wrong ASN.1 type.
+    WrongType,
+    /// A SET value had the wrong length.
+    WrongLength,
+    /// A SET value had the wrong encoding.
+    WrongEncoding,
+    /// A SET value was otherwise invalid.
+    WrongValue,
+    /// Creation of the object was not permitted.
+    NoCreation,
+    /// The requested value was inconsistent.
+    InconsistentValue,
+    /// Required resources were unavailable.
+    ResourceUnavailable,
+    /// The SET commit phase failed.
+    CommitFailed,
+    /// The SET undo phase failed.
+    UndoFailed,
+    /// Authorization failed.
+    AuthorizationError,
+    /// The object is not writable.
+    NotWritable,
+    /// Object creation was inconsistent.
+    InconsistentName,
+}
+
+impl OutboundErrorStatus {
+    /// Return the wire `error-status` value.
+    #[must_use]
+    pub const fn as_i32(self) -> i32 {
+        match self {
+            Self::NoError => 0,
+            Self::TooBig => 1,
+            Self::NoSuchName => 2,
+            Self::BadValue => 3,
+            Self::ReadOnly => 4,
+            Self::GenErr => 5,
+            Self::NoAccess => 6,
+            Self::WrongType => 7,
+            Self::WrongLength => 8,
+            Self::WrongEncoding => 9,
+            Self::WrongValue => 10,
+            Self::NoCreation => 11,
+            Self::InconsistentValue => 12,
+            Self::ResourceUnavailable => 13,
+            Self::CommitFailed => 14,
+            Self::UndoFailed => 15,
+            Self::AuthorizationError => 16,
+            Self::NotWritable => 17,
+            Self::InconsistentName => 18,
+        }
+    }
+}
+
+impl TryFrom<ErrorStatus> for OutboundErrorStatus {
+    type Error = ErrorStatus;
+
+    fn try_from(value: ErrorStatus) -> std::result::Result<Self, Self::Error> {
+        match value {
+            ErrorStatus::NoError => Ok(Self::NoError),
+            ErrorStatus::TooBig => Ok(Self::TooBig),
+            ErrorStatus::NoSuchName => Ok(Self::NoSuchName),
+            ErrorStatus::BadValue => Ok(Self::BadValue),
+            ErrorStatus::ReadOnly => Ok(Self::ReadOnly),
+            ErrorStatus::GenErr => Ok(Self::GenErr),
+            ErrorStatus::NoAccess => Ok(Self::NoAccess),
+            ErrorStatus::WrongType => Ok(Self::WrongType),
+            ErrorStatus::WrongLength => Ok(Self::WrongLength),
+            ErrorStatus::WrongEncoding => Ok(Self::WrongEncoding),
+            ErrorStatus::WrongValue => Ok(Self::WrongValue),
+            ErrorStatus::NoCreation => Ok(Self::NoCreation),
+            ErrorStatus::InconsistentValue => Ok(Self::InconsistentValue),
+            ErrorStatus::ResourceUnavailable => Ok(Self::ResourceUnavailable),
+            ErrorStatus::CommitFailed => Ok(Self::CommitFailed),
+            ErrorStatus::UndoFailed => Ok(Self::UndoFailed),
+            ErrorStatus::AuthorizationError => Ok(Self::AuthorizationError),
+            ErrorStatus::NotWritable => Ok(Self::NotWritable),
+            ErrorStatus::InconsistentName => Ok(Self::InconsistentName),
+            ErrorStatus::Unknown(_) => Err(value),
+        }
+    }
+}
+
+/// A one-based variable-binding index for an outbound error response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ErrorIndex(std::num::NonZeroU32);
+
+impl ErrorIndex {
+    /// Construct a one-based index and check it against a variable-binding list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMessage`] for zero, a value above the wire
+    /// `Integer32` maximum, or an index beyond `varbind_count`.
+    pub fn new(index: u32, varbind_count: usize) -> Result<Self> {
+        let index = std::num::NonZeroU32::new(index)
+            .ok_or_else(|| invalid_outbound("error_index must be nonzero"))?;
+        if index.get() > i32::MAX as u32 {
+            return Err(invalid_outbound("error_index exceeds i32::MAX"));
+        }
+        if usize::try_from(index.get()).map_or(true, |index| index > varbind_count) {
+            return Err(invalid_outbound(
+                "error_index does not identify a variable binding",
+            ));
+        }
+        Ok(Self(index))
+    }
+
+    /// Return the one-based wire value.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// A validated outbound request using the standard PDU layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestPdu {
+    version: Version,
+    pdu: Pdu,
+}
+
+/// A validated outbound GETBULK request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetBulkPdu {
+    version: Version,
+    pdu: Pdu,
+}
+
+/// A validated outbound Response or SNMPv3 Report PDU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsePdu {
+    version: Version,
+    pdu: Pdu,
+}
+
+/// A validated outbound InformRequest or SNMPv2-Trap PDU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationPdu {
+    version: Version,
+    pdu: Pdu,
+}
+
+/// A validated outbound SNMPv1 Trap PDU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrapV1Notification {
+    pdu: TrapV1Pdu,
+}
+
+/// Any validated outbound standard-layout PDU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundPdu {
+    /// GET, GETNEXT, or SET request.
+    Request(RequestPdu),
+    /// GETBULK request.
+    GetBulk(GetBulkPdu),
+    /// Response or Report PDU.
+    Response(ResponsePdu),
+    /// InformRequest or SNMPv2-Trap PDU.
+    Notification(NotificationPdu),
 }
 
 impl Pdu {
+    /// Construct a permissive raw PDU without applying outbound invariants.
+    ///
+    /// This is intended for protocol tooling and tests that need to model
+    /// received peer data. Convert it to a role-specific outbound type, or use
+    /// a fallible message constructor, before sending it.
+    #[must_use]
+    pub fn from_raw_parts(request_id: i32, body: PduBody, varbinds: Vec<VarBind>) -> Self {
+        Self {
+            request_id,
+            body,
+            varbinds,
+        }
+    }
+
     /// Construct a standard-layout PDU.
     #[must_use]
-    pub fn standard(
+    pub(crate) fn standard(
         pdu_type: StandardPduType,
         request_id: i32,
         error_status: i32,
@@ -260,7 +468,7 @@ impl Pdu {
 
     /// Construct a response PDU.
     #[must_use]
-    pub fn response(
+    pub(crate) fn response(
         request_id: i32,
         error_status: i32,
         error_index: i32,
@@ -277,7 +485,7 @@ impl Pdu {
 
     /// Create a new GET request PDU.
     #[must_use]
-    pub fn get_request(request_id: i32, oids: &[Oid]) -> Self {
+    pub(crate) fn get_request(request_id: i32, oids: &[Oid]) -> Self {
         Self::standard(
             StandardPduType::GetRequest,
             request_id,
@@ -288,8 +496,9 @@ impl Pdu {
     }
 
     /// Create a new GETNEXT request PDU.
+    #[cfg(test)]
     #[must_use]
-    pub fn get_next_request(request_id: i32, oids: &[Oid]) -> Self {
+    pub(crate) fn get_next_request(request_id: i32, oids: &[Oid]) -> Self {
         Self::standard(
             StandardPduType::GetNextRequest,
             request_id,
@@ -300,8 +509,9 @@ impl Pdu {
     }
 
     /// Create a new SET request PDU.
+    #[cfg(test)]
     #[must_use]
-    pub fn set_request(request_id: i32, varbinds: Vec<VarBind>) -> Self {
+    pub(crate) fn set_request(request_id: i32, varbinds: Vec<VarBind>) -> Self {
         Self::standard(StandardPduType::SetRequest, request_id, 0, 0, varbinds)
     }
 
@@ -313,7 +523,12 @@ impl Pdu {
     ///
     /// Caller-provided varbinds are appended after the prefix.
     #[must_use]
-    pub fn trap_v2(request_id: i32, uptime: u32, trap_oid: &Oid, varbinds: Vec<VarBind>) -> Self {
+    pub(crate) fn trap_v2(
+        request_id: i32,
+        uptime: u32,
+        trap_oid: &Oid,
+        varbinds: Vec<VarBind>,
+    ) -> Self {
         let mut all_varbinds = Vec::with_capacity(2 + varbinds.len());
         all_varbinds.push(VarBind::new(
             crate::notification::oids::sys_uptime(),
@@ -332,7 +547,7 @@ impl Pdu {
     /// Same varbind structure as `trap_v2` (sysUpTime.0 + snmpTrapOID.0 prefix),
     /// but uses `InformRequest` PDU type which expects a Response from the receiver.
     #[must_use]
-    pub fn inform_request(
+    pub(crate) fn inform_request(
         request_id: i32,
         uptime: u32,
         trap_oid: &Oid,
@@ -363,7 +578,7 @@ impl Pdu {
     ///
     /// Returns [`Error::InvalidMessage`] when
     /// either GETBULK parameter exceeds the RFC 3416 `Integer32` maximum.
-    pub fn get_bulk(
+    pub(crate) fn get_bulk(
         request_id: i32,
         non_repeaters: u32,
         max_repetitions: u32,
@@ -405,6 +620,7 @@ impl Pdu {
         }
     }
 
+    #[cfg(test)]
     fn inferred_encode_version(&self) -> Version {
         match self.pdu_type() {
             PduType::Report => Version::V3,
@@ -428,6 +644,7 @@ impl Pdu {
                 "{pdu_type} PDU is not valid in the {direction:?} direction"
             )));
         }
+        validate_outbound_values(version, direction, &self.varbinds)?;
 
         match self.body {
             PduBody::GetBulk {
@@ -489,7 +706,55 @@ impl Pdu {
             }
         }
 
-        validate_outbound_values(version, direction, &self.varbinds)
+        match pdu_type {
+            PduType::GetRequest | PduType::GetNextRequest | PduType::GetBulkRequest => {}
+            PduType::SetRequest => {
+                if self
+                    .varbinds
+                    .iter()
+                    .any(|varbind| varbind.value == Value::Null || varbind.value.is_exception())
+                {
+                    return Err(invalid_outbound(
+                        "SET request variable bindings require concrete values",
+                    ));
+                }
+            }
+            PduType::InformRequest | PduType::TrapV2 => {
+                let [uptime, trap_oid, rest @ ..] = self.varbinds.as_slice() else {
+                    return Err(invalid_outbound(
+                        "notification PDU requires sysUpTime.0 and snmpTrapOID.0",
+                    ));
+                };
+                if uptime.oid != crate::notification::oids::sys_uptime()
+                    || !matches!(uptime.value, Value::TimeTicks(_))
+                    || trap_oid.oid != crate::notification::oids::snmp_trap_oid()
+                    || !matches!(trap_oid.value, Value::ObjectIdentifier(_))
+                    || rest
+                        .iter()
+                        .any(|varbind| varbind.value == Value::Null || varbind.value.is_exception())
+                {
+                    return Err(invalid_outbound(
+                        "notification PDU has an invalid mandatory prefix or value",
+                    ));
+                }
+            }
+            PduType::Report => {
+                if !matches!(
+                    self.varbinds.as_slice(),
+                    [VarBind {
+                        value: Value::Counter32(_),
+                        ..
+                    }]
+                ) {
+                    return Err(invalid_outbound(
+                        "Report PDU requires exactly one Counter32 variable binding",
+                    ));
+                }
+            }
+            PduType::Response | PduType::TrapV1 => {}
+        }
+
+        Ok(())
     }
 
     pub(crate) fn encode_for(
@@ -532,7 +797,8 @@ impl Pdu {
     ///
     /// Version-specific validation is repeated when the PDU is placed in a
     /// community or SNMPv3 message envelope.
-    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.encode_for(
             buf,
             self.inferred_encode_version(),
@@ -634,6 +900,40 @@ impl Pdu {
         }
     }
 
+    /// Return the request identifier.
+    #[must_use]
+    pub const fn request_id(&self) -> i32 {
+        self.request_id
+    }
+
+    /// Return the permissive decoded body fields.
+    #[must_use]
+    pub const fn raw_body(&self) -> &PduBody {
+        &self.body
+    }
+
+    /// Return the variable bindings in wire order.
+    #[must_use]
+    pub fn varbinds(&self) -> &[VarBind] {
+        &self.varbinds
+    }
+
+    /// Consume the decoded/raw PDU and return its variable bindings.
+    #[must_use]
+    pub fn into_varbinds(self) -> Vec<VarBind> {
+        self.varbinds
+    }
+
+    /// Consume this decoded/raw PDU into its invariant-bearing parts.
+    #[must_use]
+    pub fn into_raw_parts(self) -> (i32, PduBody, Vec<VarBind>) {
+        (self.request_id, self.body, self.varbinds)
+    }
+
+    pub(crate) fn set_request_id(&mut self, request_id: i32) {
+        self.request_id = request_id;
+    }
+
     /// Return standard response fields, if this is a standard-layout PDU.
     #[must_use]
     pub fn error_fields(&self) -> Option<(i32, i32)> {
@@ -674,7 +974,8 @@ impl Pdu {
     /// Set the tag of a standard-layout PDU.
     ///
     /// Returns false for a GETBULK PDU.
-    pub fn set_standard_pdu_type(&mut self, value: StandardPduType) -> bool {
+    #[cfg(test)]
+    pub(crate) fn set_standard_pdu_type(&mut self, value: StandardPduType) -> bool {
         match &mut self.body {
             PduBody::Standard { pdu_type, .. } => {
                 *pdu_type = value;
@@ -687,7 +988,8 @@ impl Pdu {
     /// Set the standard error status.
     ///
     /// Returns false for a GETBULK PDU.
-    pub fn set_error_status(&mut self, value: i32) -> bool {
+    #[cfg(test)]
+    pub(crate) fn set_error_status(&mut self, value: i32) -> bool {
         match &mut self.body {
             PduBody::Standard { error_status, .. } => {
                 *error_status = value;
@@ -700,7 +1002,8 @@ impl Pdu {
     /// Set the standard error index.
     ///
     /// Returns false for a GETBULK PDU.
-    pub fn set_error_index(&mut self, value: i32) -> bool {
+    #[cfg(test)]
+    pub(crate) fn set_error_index(&mut self, value: i32) -> bool {
         match &mut self.body {
             PduBody::Standard { error_index, .. } => {
                 *error_index = value;
@@ -722,24 +1025,43 @@ impl Pdu {
         ErrorStatus::from_i32(self.error_status())
     }
 
-    /// Create a Response PDU from this PDU (for Inform handling).
+    /// Create a validated successful Response PDU from this decoded/raw PDU.
     ///
     /// The response copies the `request_id` and variable bindings,
     /// sets `error_status` and `error_index` to 0, and changes the PDU type to Response.
-    #[must_use]
-    pub fn to_response(&self) -> Self {
-        Self::response(self.request_id, 0, 0, self.varbinds.clone())
+    pub(crate) fn to_response(&self, version: Version) -> Result<Self> {
+        Ok(ResponsePdu::success(version, self.request_id, self.varbinds.clone())?.into_raw())
     }
 
-    /// Create a Response PDU with specific error status.
-    #[must_use]
-    pub fn to_error_response(&self, error_status: ErrorStatus, error_index: i32) -> Self {
-        Self::response(
+    /// Create a validated Response PDU with a specific known error status.
+    #[cfg(any(test, feature = "agent"))]
+    pub(crate) fn to_error_response(
+        &self,
+        version: Version,
+        error_status: ErrorStatus,
+        error_index: usize,
+    ) -> Result<Self> {
+        let error_status = OutboundErrorStatus::try_from(error_status).map_err(|status| {
+            invalid_outbound(format!(
+                "unknown error-status {} is receive-only",
+                status.as_i32()
+            ))
+        })?;
+        let error_index = if error_index == 0 {
+            None
+        } else {
+            let error_index = u32::try_from(error_index)
+                .map_err(|_| invalid_outbound("error_index exceeds u32::MAX"))?;
+            Some(ErrorIndex::new(error_index, self.varbinds.len())?)
+        };
+        Ok(ResponsePdu::new(
+            version,
             self.request_id,
-            error_status.as_i32(),
+            error_status,
             error_index,
             self.varbinds.clone(),
-        )
+        )?
+        .into_raw())
     }
 
     /// Convert a v2 notification PDU to a v1 `TrapV1Pdu` (RFC 3584 Section 3.2).
@@ -883,6 +1205,618 @@ impl Pdu {
     }
 }
 
+fn validate_no_receive_only_values(version: Version, varbinds: &[VarBind]) -> Result<()> {
+    validate_outbound_values(version, PduDirection::Response, varbinds)
+}
+
+fn validate_request_values(kind: StandardPduType, varbinds: &[VarBind]) -> Result<()> {
+    if kind == StandardPduType::SetRequest
+        && varbinds
+            .iter()
+            .any(|varbind| varbind.value == Value::Null || varbind.value.is_exception())
+    {
+        return Err(invalid_outbound(
+            "SET request variable bindings require concrete values",
+        ));
+    }
+    Ok(())
+}
+
+impl RequestPdu {
+    fn new(
+        version: Version,
+        kind: StandardPduType,
+        request_id: i32,
+        varbinds: Vec<VarBind>,
+    ) -> Result<Self> {
+        if !matches!(
+            kind,
+            StandardPduType::GetRequest
+                | StandardPduType::GetNextRequest
+                | StandardPduType::SetRequest
+        ) {
+            return Err(invalid_outbound("PDU type is not an ordinary request"));
+        }
+        validate_outbound_values(version, PduDirection::Request, &varbinds)?;
+        validate_request_values(kind, &varbinds)?;
+        let pdu = Pdu::standard(kind, request_id, 0, 0, varbinds);
+        pdu.validate_outbound(version, PduDirection::Request)?;
+        Ok(Self { version, pdu })
+    }
+
+    /// Construct a GET request whose variable bindings contain Null values.
+    pub fn get(version: Version, request_id: i32, oids: &[Oid]) -> Result<Self> {
+        Self::new(
+            version,
+            StandardPduType::GetRequest,
+            request_id,
+            oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
+        )
+    }
+
+    /// Construct a GETNEXT request whose variable bindings contain Null values.
+    pub fn get_next(version: Version, request_id: i32, oids: &[Oid]) -> Result<Self> {
+        Self::new(
+            version,
+            StandardPduType::GetNextRequest,
+            request_id,
+            oids.iter().map(|oid| VarBind::null(oid.clone())).collect(),
+        )
+    }
+
+    /// Construct a SET request with concrete values.
+    pub fn set(version: Version, request_id: i32, varbinds: Vec<VarBind>) -> Result<Self> {
+        Self::new(version, StandardPduType::SetRequest, request_id, varbinds)
+    }
+
+    /// Validate a decoded/raw PDU as an ordinary outbound request.
+    pub fn try_from_raw(version: Version, pdu: Pdu) -> Result<Self> {
+        let kind = match &pdu.body {
+            PduBody::Standard { pdu_type, .. } => *pdu_type,
+            PduBody::GetBulk { .. } => {
+                return Err(invalid_outbound("GETBULK requires GetBulkPdu"));
+            }
+        };
+        validate_request_values(kind, &pdu.varbinds)?;
+        pdu.validate_outbound(version, PduDirection::Request)?;
+        if !matches!(
+            kind,
+            StandardPduType::GetRequest
+                | StandardPduType::GetNextRequest
+                | StandardPduType::SetRequest
+        ) {
+            return Err(invalid_outbound("PDU type is not an ordinary request"));
+        }
+        Ok(Self { version, pdu })
+    }
+
+    /// Encode the bare request PDU.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.pdu
+            .encode_for(buf, self.version, PduDirection::Request)
+    }
+
+    /// Return the SNMP version against which this request was validated.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Return the request identifier.
+    #[must_use]
+    pub const fn request_id(&self) -> i32 {
+        self.pdu.request_id
+    }
+
+    /// Return whether this is GET, GETNEXT, or SET.
+    #[must_use]
+    pub fn pdu_type(&self) -> PduType {
+        self.pdu.pdu_type()
+    }
+
+    /// Return the request variable bindings.
+    #[must_use]
+    pub fn varbinds(&self) -> &[VarBind] {
+        &self.pdu.varbinds
+    }
+
+    /// Return the decoded/raw representation used on the wire.
+    #[must_use]
+    pub const fn as_raw(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    /// Consume this request into its decoded/raw representation.
+    #[must_use]
+    pub fn into_raw(self) -> Pdu {
+        self.pdu
+    }
+
+    /// Change the request identifier without affecting any other invariant.
+    pub fn set_request_id(&mut self, request_id: i32) {
+        self.pdu.request_id = request_id;
+    }
+}
+
+impl GetBulkPdu {
+    /// Construct a GETBULK request.
+    pub fn new(
+        version: Version,
+        request_id: i32,
+        non_repeaters: u32,
+        max_repetitions: u32,
+        varbinds: Vec<VarBind>,
+    ) -> Result<Self> {
+        if version == Version::V1 {
+            return Err(invalid_outbound("GETBULK is not valid in SNMPv1"));
+        }
+        validate_outbound_values(version, PduDirection::Request, &varbinds)?;
+        let pdu = Pdu::get_bulk(request_id, non_repeaters, max_repetitions, varbinds)?;
+        pdu.validate_outbound(version, PduDirection::Request)?;
+        Ok(Self { version, pdu })
+    }
+
+    /// Validate a decoded/raw PDU as an outbound GETBULK request.
+    pub fn try_from_raw(version: Version, pdu: Pdu) -> Result<Self> {
+        if pdu.pdu_type() != PduType::GetBulkRequest {
+            return Err(invalid_outbound("PDU is not GETBULK"));
+        }
+        pdu.validate_outbound(version, PduDirection::Request)?;
+        Ok(Self { version, pdu })
+    }
+
+    /// Encode the bare GETBULK PDU.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.pdu
+            .encode_for(buf, self.version, PduDirection::Request)
+    }
+
+    /// Return the SNMP version against which this request was validated.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Return the request identifier.
+    #[must_use]
+    pub const fn request_id(&self) -> i32 {
+        self.pdu.request_id
+    }
+
+    /// Return `(non_repeaters, max_repetitions)`.
+    #[must_use]
+    pub fn parameters(&self) -> (u32, u32) {
+        self.pdu
+            .get_bulk_fields()
+            .expect("GetBulkPdu always has GETBULK fields")
+    }
+
+    /// Return the request variable bindings.
+    #[must_use]
+    pub fn varbinds(&self) -> &[VarBind] {
+        &self.pdu.varbinds
+    }
+
+    /// Return the decoded/raw representation used on the wire.
+    #[must_use]
+    pub const fn as_raw(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    /// Consume this request into its decoded/raw representation.
+    #[must_use]
+    pub fn into_raw(self) -> Pdu {
+        self.pdu
+    }
+
+    /// Change the request identifier without affecting any other invariant.
+    pub fn set_request_id(&mut self, request_id: i32) {
+        self.pdu.request_id = request_id;
+    }
+}
+
+impl ResponsePdu {
+    /// Construct a validated Response PDU.
+    ///
+    /// `error_index` must be `None` for noError, tooBig, undoFailed, and
+    /// authorizationError. All other errors require a checked one-based index.
+    pub fn new(
+        version: Version,
+        request_id: i32,
+        status: OutboundErrorStatus,
+        error_index: Option<ErrorIndex>,
+        varbinds: Vec<VarBind>,
+    ) -> Result<Self> {
+        let status_value = status.as_i32();
+        if version == Version::V1 && status_value > ErrorStatus::GenErr.as_i32() {
+            return Err(invalid_outbound(
+                "error status is not valid in an SNMPv1 response",
+            ));
+        }
+        let requires_no_index = matches!(
+            status,
+            OutboundErrorStatus::NoError
+                | OutboundErrorStatus::TooBig
+                | OutboundErrorStatus::UndoFailed
+                | OutboundErrorStatus::AuthorizationError
+        );
+        if requires_no_index != error_index.is_none() {
+            return Err(invalid_outbound(
+                "error status and error_index combination is invalid",
+            ));
+        }
+        if let Some(index) = error_index
+            && usize::try_from(index.get()).map_or(true, |index| index > varbinds.len())
+        {
+            return Err(invalid_outbound(
+                "error_index does not identify a variable binding",
+            ));
+        }
+        if version != Version::V1 && status == OutboundErrorStatus::TooBig && !varbinds.is_empty() {
+            return Err(invalid_outbound(
+                "SNMPv2c and SNMPv3 tooBig responses require an empty variable-binding list",
+            ));
+        }
+        validate_no_receive_only_values(version, &varbinds)?;
+        let wire_error_index = match error_index {
+            Some(index) => i32::try_from(index.get())
+                .map_err(|_| invalid_outbound("error_index exceeds i32::MAX"))?,
+            None => 0,
+        };
+        let pdu = Pdu::response(request_id, status_value, wire_error_index, varbinds);
+        pdu.validate_outbound(version, PduDirection::Response)?;
+        Ok(Self { version, pdu })
+    }
+
+    /// Construct a successful Response PDU.
+    pub fn success(version: Version, request_id: i32, varbinds: Vec<VarBind>) -> Result<Self> {
+        Self::new(
+            version,
+            request_id,
+            OutboundErrorStatus::NoError,
+            None,
+            varbinds,
+        )
+    }
+
+    /// Construct a version-correct tooBig Response PDU.
+    pub fn too_big(version: Version, request_id: i32, varbinds: Vec<VarBind>) -> Result<Self> {
+        Self::new(
+            version,
+            request_id,
+            OutboundErrorStatus::TooBig,
+            None,
+            varbinds,
+        )
+    }
+
+    /// Construct an SNMPv3 Report PDU with zero error fields.
+    pub fn report(request_id: i32, varbinds: Vec<VarBind>) -> Result<Self> {
+        validate_outbound_values(Version::V3, PduDirection::Response, &varbinds)?;
+        if varbinds
+            .iter()
+            .any(|varbind| varbind.value == Value::Null || varbind.value.is_exception())
+        {
+            return Err(invalid_outbound(
+                "Report variable bindings require concrete values",
+            ));
+        }
+        let pdu = Pdu::standard(StandardPduType::Report, request_id, 0, 0, varbinds);
+        pdu.validate_outbound(Version::V3, PduDirection::Response)?;
+        Ok(Self {
+            version: Version::V3,
+            pdu,
+        })
+    }
+
+    /// Validate a decoded/raw PDU as an outbound response-class PDU.
+    pub fn try_from_raw(version: Version, pdu: Pdu) -> Result<Self> {
+        if !matches!(pdu.pdu_type(), PduType::Response | PduType::Report) {
+            return Err(invalid_outbound("PDU is not response-class"));
+        }
+        if pdu.pdu_type() == PduType::Response {
+            OutboundErrorStatus::try_from(pdu.error_status_enum()).map_err(|status| {
+                invalid_outbound(format!(
+                    "unknown error-status {} is receive-only",
+                    status.as_i32()
+                ))
+            })?;
+        }
+        pdu.validate_outbound(version, PduDirection::Response)?;
+        Ok(Self { version, pdu })
+    }
+
+    /// Encode the bare response-class PDU.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.pdu
+            .encode_for(buf, self.version, PduDirection::Response)
+    }
+
+    /// Return the SNMP version against which this response was validated.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Return the request identifier being answered.
+    #[must_use]
+    pub const fn request_id(&self) -> i32 {
+        self.pdu.request_id
+    }
+
+    /// Return the validated error status.
+    #[must_use]
+    pub fn status(&self) -> OutboundErrorStatus {
+        OutboundErrorStatus::try_from(self.pdu.error_status_enum())
+            .expect("ResponsePdu never contains an unknown error status")
+    }
+
+    /// Return the checked one-based error index, if the status uses one.
+    #[must_use]
+    pub fn error_index(&self) -> Option<ErrorIndex> {
+        let index = u32::try_from(self.pdu.error_index()).ok()?;
+        let index = std::num::NonZeroU32::new(index)?;
+        Some(ErrorIndex(index))
+    }
+
+    /// Return the response variable bindings.
+    #[must_use]
+    pub fn varbinds(&self) -> &[VarBind] {
+        &self.pdu.varbinds
+    }
+
+    /// Return the decoded/raw representation used on the wire.
+    #[must_use]
+    pub const fn as_raw(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    /// Consume this response into its decoded/raw representation.
+    #[must_use]
+    pub fn into_raw(self) -> Pdu {
+        self.pdu
+    }
+
+    /// Change the request identifier without affecting any other invariant.
+    pub fn set_request_id(&mut self, request_id: i32) {
+        self.pdu.request_id = request_id;
+    }
+}
+
+impl NotificationPdu {
+    fn new(
+        version: Version,
+        kind: StandardPduType,
+        request_id: i32,
+        uptime: u32,
+        trap_oid: &Oid,
+        varbinds: Vec<VarBind>,
+    ) -> Result<Self> {
+        if version == Version::V1 {
+            return Err(invalid_outbound(
+                "SNMPv2 notification PDUs are not valid in SNMPv1",
+            ));
+        }
+        if !matches!(
+            kind,
+            StandardPduType::TrapV2 | StandardPduType::InformRequest
+        ) {
+            return Err(invalid_outbound("PDU type is not a notification"));
+        }
+        validate_outbound_values(version, PduDirection::Notification, &varbinds)?;
+        if varbinds
+            .iter()
+            .any(|varbind| varbind.value == Value::Null || varbind.value.is_exception())
+        {
+            return Err(invalid_outbound(
+                "notification variable bindings require concrete values",
+            ));
+        }
+        let pdu = match kind {
+            StandardPduType::TrapV2 => Pdu::trap_v2(request_id, uptime, trap_oid, varbinds),
+            StandardPduType::InformRequest => {
+                Pdu::inform_request(request_id, uptime, trap_oid, varbinds)
+            }
+            _ => unreachable!("notification kind checked above"),
+        };
+        let direction = pdu.outbound_direction();
+        pdu.validate_outbound(version, direction)?;
+        Ok(Self { version, pdu })
+    }
+
+    /// Construct an unconfirmed SNMPv2-Trap PDU.
+    pub fn trap_v2(
+        version: Version,
+        request_id: i32,
+        uptime: u32,
+        trap_oid: &Oid,
+        varbinds: Vec<VarBind>,
+    ) -> Result<Self> {
+        Self::new(
+            version,
+            StandardPduType::TrapV2,
+            request_id,
+            uptime,
+            trap_oid,
+            varbinds,
+        )
+    }
+
+    /// Construct a confirmed InformRequest PDU.
+    pub fn inform(
+        version: Version,
+        request_id: i32,
+        uptime: u32,
+        trap_oid: &Oid,
+        varbinds: Vec<VarBind>,
+    ) -> Result<Self> {
+        Self::new(
+            version,
+            StandardPduType::InformRequest,
+            request_id,
+            uptime,
+            trap_oid,
+            varbinds,
+        )
+    }
+
+    /// Validate a decoded/raw PDU as an outbound v2 notification PDU.
+    pub fn try_from_raw(version: Version, pdu: Pdu) -> Result<Self> {
+        if !matches!(pdu.pdu_type(), PduType::TrapV2 | PduType::InformRequest) {
+            return Err(invalid_outbound("PDU is not an SNMPv2 notification"));
+        }
+        let direction = pdu.outbound_direction();
+        pdu.validate_outbound(version, direction)?;
+        Ok(Self { version, pdu })
+    }
+
+    /// Encode the bare notification PDU.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.pdu
+            .encode_for(buf, self.version, self.pdu.outbound_direction())
+    }
+
+    /// Return the SNMP version against which this notification was validated.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Return the request identifier.
+    #[must_use]
+    pub const fn request_id(&self) -> i32 {
+        self.pdu.request_id
+    }
+
+    /// Return whether this is an InformRequest or unconfirmed TrapV2.
+    #[must_use]
+    pub fn pdu_type(&self) -> PduType {
+        self.pdu.pdu_type()
+    }
+
+    /// Return the complete variable-binding list, including the mandatory prefix.
+    #[must_use]
+    pub fn varbinds(&self) -> &[VarBind] {
+        &self.pdu.varbinds
+    }
+
+    /// Return the notification uptime from the mandatory prefix.
+    #[must_use]
+    pub fn uptime(&self) -> u32 {
+        match self.pdu.varbinds.first().map(|varbind| &varbind.value) {
+            Some(Value::TimeTicks(value)) => *value,
+            _ => unreachable!("NotificationPdu always has a TimeTicks prefix"),
+        }
+    }
+
+    /// Return the trap OID from the mandatory prefix.
+    #[must_use]
+    pub fn trap_oid(&self) -> &Oid {
+        match self.pdu.varbinds.get(1).map(|varbind| &varbind.value) {
+            Some(Value::ObjectIdentifier(oid)) => oid,
+            _ => unreachable!("NotificationPdu always has an OBJECT IDENTIFIER prefix"),
+        }
+    }
+
+    /// Return the decoded/raw representation used on the wire.
+    #[must_use]
+    pub const fn as_raw(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    /// Consume this notification into its decoded/raw representation.
+    #[must_use]
+    pub fn into_raw(self) -> Pdu {
+        self.pdu
+    }
+
+    /// Change the request identifier without affecting any other invariant.
+    pub fn set_request_id(&mut self, request_id: i32) {
+        self.pdu.request_id = request_id;
+    }
+}
+
+impl From<RequestPdu> for Pdu {
+    fn from(value: RequestPdu) -> Self {
+        value.into_raw()
+    }
+}
+
+impl From<GetBulkPdu> for Pdu {
+    fn from(value: GetBulkPdu) -> Self {
+        value.into_raw()
+    }
+}
+
+impl From<ResponsePdu> for Pdu {
+    fn from(value: ResponsePdu) -> Self {
+        value.into_raw()
+    }
+}
+
+impl From<NotificationPdu> for Pdu {
+    fn from(value: NotificationPdu) -> Self {
+        value.into_raw()
+    }
+}
+
+impl OutboundPdu {
+    /// Validate and classify a decoded/raw PDU for outbound use.
+    pub fn try_from_raw(version: Version, pdu: Pdu) -> Result<Self> {
+        match pdu.pdu_type() {
+            PduType::GetRequest | PduType::GetNextRequest | PduType::SetRequest => {
+                Ok(Self::Request(RequestPdu::try_from_raw(version, pdu)?))
+            }
+            PduType::GetBulkRequest => Ok(Self::GetBulk(GetBulkPdu::try_from_raw(version, pdu)?)),
+            PduType::Response | PduType::Report => {
+                Ok(Self::Response(ResponsePdu::try_from_raw(version, pdu)?))
+            }
+            PduType::InformRequest | PduType::TrapV2 => Ok(Self::Notification(
+                NotificationPdu::try_from_raw(version, pdu)?,
+            )),
+            PduType::TrapV1 => Err(invalid_outbound("SNMPv1 Trap uses TrapV1Notification")),
+        }
+    }
+
+    /// Return the decoded/raw representation used on the wire.
+    #[must_use]
+    pub fn as_raw(&self) -> &Pdu {
+        match self {
+            Self::Request(pdu) => pdu.as_raw(),
+            Self::GetBulk(pdu) => pdu.as_raw(),
+            Self::Response(pdu) => pdu.as_raw(),
+            Self::Notification(pdu) => pdu.as_raw(),
+        }
+    }
+
+    /// Consume the validated PDU into its decoded/raw representation.
+    #[must_use]
+    pub fn into_raw(self) -> Pdu {
+        match self {
+            Self::Request(pdu) => pdu.into_raw(),
+            Self::GetBulk(pdu) => pdu.into_raw(),
+            Self::Response(pdu) => pdu.into_raw(),
+            Self::Notification(pdu) => pdu.into_raw(),
+        }
+    }
+
+    /// Encode the bare validated PDU.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        match self {
+            Self::Request(pdu) => pdu.encode(buf),
+            Self::GetBulk(pdu) => pdu.encode(buf),
+            Self::Response(pdu) => pdu.encode(buf),
+            Self::Notification(pdu) => pdu.encode(buf),
+        }
+    }
+}
+
+impl From<OutboundPdu> for Pdu {
+    fn from(value: OutboundPdu) -> Self {
+        value.into_raw()
+    }
+}
+
 /// `SNMPv1` generic trap types (RFC 1157 Section 4.1.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenericTrap {
@@ -958,23 +1892,46 @@ impl GenericTrap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrapV1Pdu {
     /// Enterprise OID (sysObjectID of the entity generating the trap)
-    pub enterprise: Oid,
+    pub(crate) enterprise: Oid,
     /// Agent address (IP address of the agent generating the trap)
-    pub agent_addr: [u8; 4],
+    pub(crate) agent_addr: [u8; 4],
     /// Generic trap type
-    pub generic_trap: GenericTrap,
+    pub(crate) generic_trap: GenericTrap,
     /// Specific trap code (meaningful when `generic_trap` is enterpriseSpecific)
-    pub specific_trap: i32,
+    pub(crate) specific_trap: i32,
     /// Time since the network entity was last (re)initialized (in hundredths of seconds)
-    pub time_stamp: u32,
+    pub(crate) time_stamp: u32,
     /// Variable bindings containing "interesting" information
-    pub varbinds: Vec<VarBind>,
+    pub(crate) varbinds: Vec<VarBind>,
 }
 
+/// Permissive SNMPv1 Trap representation returned by decoders.
+pub type RawTrapV1Pdu = TrapV1Pdu;
+
 impl TrapV1Pdu {
+    /// Construct a permissive raw SNMPv1 Trap without outbound validation.
+    #[must_use]
+    pub fn from_raw_parts(
+        enterprise: Oid,
+        agent_addr: [u8; 4],
+        generic_trap: GenericTrap,
+        specific_trap: i32,
+        time_stamp: u32,
+        varbinds: Vec<VarBind>,
+    ) -> Self {
+        Self::new(
+            enterprise,
+            agent_addr,
+            generic_trap,
+            specific_trap,
+            time_stamp,
+            varbinds,
+        )
+    }
+
     /// Create a new `SNMPv1` Trap PDU.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         enterprise: Oid,
         agent_addr: [u8; 4],
         generic_trap: GenericTrap,
@@ -990,6 +1947,42 @@ impl TrapV1Pdu {
             time_stamp,
             varbinds,
         }
+    }
+
+    /// Return the enterprise OID.
+    #[must_use]
+    pub fn enterprise(&self) -> &Oid {
+        &self.enterprise
+    }
+
+    /// Return the originating agent IPv4 address.
+    #[must_use]
+    pub const fn agent_addr(&self) -> [u8; 4] {
+        self.agent_addr
+    }
+
+    /// Return the decoded generic-trap value.
+    #[must_use]
+    pub const fn generic_trap(&self) -> GenericTrap {
+        self.generic_trap
+    }
+
+    /// Return the decoded specific-trap value.
+    #[must_use]
+    pub const fn specific_trap(&self) -> i32 {
+        self.specific_trap
+    }
+
+    /// Return the trap timestamp.
+    #[must_use]
+    pub const fn time_stamp(&self) -> u32 {
+        self.time_stamp
+    }
+
+    /// Return the trap variable bindings.
+    #[must_use]
+    pub fn varbinds(&self) -> &[VarBind] {
+        &self.varbinds
     }
 
     /// Check if this is an enterprise-specific trap.
@@ -1023,7 +2016,7 @@ impl TrapV1Pdu {
     /// use async_snmp::oid;
     ///
     /// // Generic trap (linkDown = 2) -> snmpTraps.3
-    /// let trap = TrapV1Pdu::new(
+    /// let trap = TrapV1Pdu::from_raw_parts(
     ///     oid!(1, 3, 6, 1, 4, 1, 9999),
     ///     [192, 168, 1, 1],
     ///     GenericTrap::LinkDown,
@@ -1034,7 +2027,7 @@ impl TrapV1Pdu {
     /// assert_eq!(trap.v2_trap_oid().unwrap(), oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3));
     ///
     /// // Enterprise-specific trap -> enterprise.0.specific_trap
-    /// let trap = TrapV1Pdu::new(
+    /// let trap = TrapV1Pdu::from_raw_parts(
     ///     oid!(1, 3, 6, 1, 4, 1, 9999),
     ///     [192, 168, 1, 1],
     ///     GenericTrap::EnterpriseSpecific,
@@ -1100,11 +2093,17 @@ impl TrapV1Pdu {
     }
 
     pub(crate) fn validate_outbound(&self) -> Result<()> {
+        self.enterprise.validate_for_wire()?;
+        if matches!(self.generic_trap, GenericTrap::Unknown(_)) {
+            return Err(invalid_outbound(
+                "unknown generic-trap values are receive-only",
+            ));
+        }
         validate_outbound_values(Version::V1, PduDirection::Notification, &self.varbinds)
     }
 
-    /// Encode to BER.
-    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+    /// Encode to BER after applying outbound validation.
+    pub(crate) fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.validate_outbound()?;
         buf.try_push_constructed(tag::pdu::TRAP_V1, |buf| {
             encode_varbind_list(buf, &self.varbinds)?;
@@ -1199,6 +2198,106 @@ impl TrapV1Pdu {
     }
 }
 
+impl TrapV1Notification {
+    /// Construct a validated outbound SNMPv1 Trap PDU.
+    ///
+    /// # Errors
+    ///
+    /// Unknown generic-trap values, receive-only values, values unavailable in
+    /// SNMPv1, and invalid OIDs are rejected. `specific_trap` is encoded as the
+    /// full protocol `Integer32` field without imposing semantic constraints
+    /// that receivers such as net-snmp do not enforce.
+    pub fn new(
+        enterprise: Oid,
+        agent_addr: [u8; 4],
+        generic_trap: GenericTrap,
+        specific_trap: i32,
+        time_stamp: u32,
+        varbinds: Vec<VarBind>,
+    ) -> Result<Self> {
+        if matches!(generic_trap, GenericTrap::Unknown(_)) {
+            return Err(invalid_outbound(
+                "unknown generic-trap values are receive-only",
+            ));
+        }
+        let pdu = TrapV1Pdu::new(
+            enterprise,
+            agent_addr,
+            generic_trap,
+            specific_trap,
+            time_stamp,
+            varbinds,
+        );
+        pdu.validate_outbound()?;
+        Ok(Self { pdu })
+    }
+
+    /// Validate a decoded/raw SNMPv1 trap for outbound use.
+    pub fn try_from_raw(pdu: TrapV1Pdu) -> Result<Self> {
+        pdu.validate_outbound()?;
+        Ok(Self { pdu })
+    }
+
+    /// Encode the bare SNMPv1 Trap PDU.
+    pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
+        self.pdu.encode(buf)
+    }
+
+    /// Return the enterprise OID.
+    #[must_use]
+    pub fn enterprise(&self) -> &Oid {
+        &self.pdu.enterprise
+    }
+
+    /// Return the originating agent IPv4 address.
+    #[must_use]
+    pub const fn agent_addr(&self) -> [u8; 4] {
+        self.pdu.agent_addr
+    }
+
+    /// Return the generic trap classification.
+    #[must_use]
+    pub const fn generic_trap(&self) -> GenericTrap {
+        self.pdu.generic_trap
+    }
+
+    /// Return the specific trap `Integer32` value.
+    #[must_use]
+    pub const fn specific_trap(&self) -> i32 {
+        self.pdu.specific_trap
+    }
+
+    /// Return the timestamp in hundredths of a second.
+    #[must_use]
+    pub const fn time_stamp(&self) -> u32 {
+        self.pdu.time_stamp
+    }
+
+    /// Return the trap variable bindings.
+    #[must_use]
+    pub fn varbinds(&self) -> &[VarBind] {
+        &self.pdu.varbinds
+    }
+
+    /// Return the decoded/raw representation used on the wire.
+    #[must_use]
+    pub const fn as_raw(&self) -> &TrapV1Pdu {
+        &self.pdu
+    }
+
+    /// Consume this notification into its decoded/raw representation.
+    #[must_use]
+    pub fn into_raw(self) -> TrapV1Pdu {
+        self.pdu
+    }
+}
+
+impl From<TrapV1Notification> for TrapV1Pdu {
+    fn from(value: TrapV1Notification) -> Self {
+        value.into_raw()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,6 +2384,330 @@ mod tests {
             });
             buf.finish()
         }
+    }
+
+    #[test]
+    fn validated_requests_cover_versions_types_accessors_and_raw_conversion() {
+        let name = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+        for version in [Version::V1, Version::V2c, Version::V3] {
+            for mut request in [
+                RequestPdu::get(version, 7, std::slice::from_ref(&name)).unwrap(),
+                RequestPdu::get_next(version, 7, std::slice::from_ref(&name)).unwrap(),
+                RequestPdu::set(
+                    version,
+                    7,
+                    vec![VarBind::new(name.clone(), Value::Integer(4))],
+                )
+                .unwrap(),
+            ] {
+                assert_eq!(request.version(), version);
+                assert_eq!(request.request_id(), 7);
+                assert_eq!(request.varbinds().len(), 1);
+                request.set_request_id(9);
+                assert_eq!(request.request_id(), 9);
+
+                let raw = request.into_raw();
+                let validated = RequestPdu::try_from_raw(version, raw.clone()).unwrap();
+                assert_eq!(validated.as_raw(), &raw);
+
+                let mut buf = EncodeBuf::new();
+                validated.encode(&mut buf).unwrap();
+                let mut decoder = Decoder::new(buf.finish());
+                assert_eq!(Pdu::decode(&mut decoder).unwrap(), raw);
+            }
+
+            // RFC 3416 says retrieval-request values are ignored by the
+            // receiver. Preserve any otherwise outbound-encodable value when
+            // decoded data is deliberately validated for retransmission.
+            for kind in [StandardPduType::GetRequest, StandardPduType::GetNextRequest] {
+                let raw = Pdu::standard(
+                    kind,
+                    11,
+                    0,
+                    0,
+                    vec![VarBind::new(name.clone(), Value::Integer(37))],
+                );
+                let request = RequestPdu::try_from_raw(version, raw.clone()).unwrap();
+                let mut buf = EncodeBuf::new();
+                request.encode(&mut buf).unwrap();
+                let mut decoder = Decoder::new(buf.finish());
+                assert_eq!(Pdu::decode(&mut decoder).unwrap(), raw);
+            }
+        }
+
+        assert!(RequestPdu::set(Version::V2c, 1, vec![VarBind::null(name.clone())]).is_err());
+        assert!(
+            RequestPdu::set(
+                Version::V2c,
+                1,
+                vec![VarBind::new(name.clone(), Value::NoSuchObject)]
+            )
+            .is_err()
+        );
+        assert!(
+            RequestPdu::set(
+                Version::V1,
+                1,
+                vec![VarBind::new(name, Value::Counter64(1))]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validated_get_bulk_checks_version_ranges_values_and_mutation() {
+        let name = oid!(1, 3, 6, 1);
+        assert!(GetBulkPdu::new(Version::V1, 1, 0, 1, vec![VarBind::null(name.clone())]).is_err());
+        assert!(
+            GetBulkPdu::new(
+                Version::V2c,
+                1,
+                MAX_GET_BULK_VALUE + 1,
+                1,
+                vec![VarBind::null(name.clone())]
+            )
+            .is_err()
+        );
+        for version in [Version::V2c, Version::V3] {
+            let bulk = GetBulkPdu::new(
+                version,
+                1,
+                0,
+                1,
+                vec![VarBind::new(name.clone(), Value::Integer(1))],
+            )
+            .unwrap();
+            let expected = bulk.as_raw().clone();
+            let mut buf = EncodeBuf::new();
+            bulk.encode(&mut buf).unwrap();
+            let mut decoder = Decoder::new(buf.finish());
+            assert_eq!(Pdu::decode(&mut decoder).unwrap(), expected);
+        }
+
+        let mut bulk = GetBulkPdu::new(Version::V3, 3, 1, 12, vec![VarBind::null(name)]).unwrap();
+        assert_eq!(bulk.parameters(), (1, 12));
+        assert_eq!(bulk.request_id(), 3);
+        assert_eq!(bulk.varbinds().len(), 1);
+        bulk.set_request_id(4);
+        let raw = bulk.into_raw();
+        assert_eq!(
+            GetBulkPdu::try_from_raw(Version::V3, raw)
+                .unwrap()
+                .request_id(),
+            4
+        );
+    }
+
+    #[test]
+    fn validated_responses_tie_status_index_version_and_varbind_count() {
+        let name = oid!(1, 3, 6, 1);
+        let binding = VarBind::null(name.clone());
+        assert!(ErrorIndex::new(0, 1).is_err());
+        assert!(ErrorIndex::new(2, 1).is_err());
+        assert!(ErrorIndex::new(i32::MAX as u32, usize::MAX).is_ok());
+        assert!(ErrorIndex::new(i32::MAX as u32 + 1, usize::MAX).is_err());
+        let index = ErrorIndex::new(1, 1).unwrap();
+
+        assert!(
+            ResponsePdu::new(
+                Version::V2c,
+                1,
+                OutboundErrorStatus::NoError,
+                Some(index),
+                vec![binding.clone()]
+            )
+            .is_err()
+        );
+        assert!(
+            ResponsePdu::new(
+                Version::V2c,
+                1,
+                OutboundErrorStatus::GenErr,
+                None,
+                vec![binding.clone()]
+            )
+            .is_err()
+        );
+        assert!(
+            ResponsePdu::new(
+                Version::V1,
+                1,
+                OutboundErrorStatus::NoAccess,
+                Some(index),
+                vec![binding.clone()]
+            )
+            .is_err()
+        );
+        assert!(ResponsePdu::too_big(Version::V2c, 1, vec![binding.clone()]).is_err());
+        assert!(ResponsePdu::too_big(Version::V1, 1, vec![binding.clone()]).is_ok());
+
+        let mut response = ResponsePdu::new(
+            Version::V3,
+            8,
+            OutboundErrorStatus::GenErr,
+            Some(index),
+            vec![binding],
+        )
+        .unwrap();
+        assert_eq!(response.status(), OutboundErrorStatus::GenErr);
+        assert_eq!(response.error_index(), Some(index));
+        assert_eq!(response.varbinds().len(), 1);
+        response.set_request_id(10);
+        assert_eq!(response.request_id(), 10);
+
+        let unknown = Pdu::from_raw_parts(
+            1,
+            PduBody::Standard {
+                pdu_type: StandardPduType::Response,
+                error_status: 99,
+                error_index: 0,
+            },
+            vec![],
+        );
+        assert_eq!(unknown.error_status_enum(), ErrorStatus::Unknown(99));
+        assert!(ResponsePdu::try_from_raw(Version::V2c, unknown).is_err());
+    }
+
+    #[test]
+    fn response_value_rules_distinguish_versions_and_directions() {
+        let name = oid!(1, 3, 6, 1);
+        let exception = vec![VarBind::new(name.clone(), Value::NoSuchObject)];
+        assert!(ResponsePdu::success(Version::V2c, 1, exception.clone()).is_ok());
+        assert!(ResponsePdu::success(Version::V1, 1, exception).is_err());
+        assert!(
+            RequestPdu::set(
+                Version::V2c,
+                1,
+                vec![VarBind::new(
+                    name,
+                    Value::Unknown {
+                        tag: 0x48,
+                        data: bytes::Bytes::from_static(b"raw"),
+                    },
+                )]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validated_notifications_generate_and_check_the_mandatory_prefix() {
+        let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+        let extra = VarBind::new(oid!(1, 3, 6, 1, 2, 1, 1, 5, 0), Value::Integer(1));
+        assert!(
+            NotificationPdu::trap_v2(Version::V1, 1, 10, &trap_oid, vec![extra.clone()]).is_err()
+        );
+        assert!(
+            NotificationPdu::trap_v2(
+                Version::V2c,
+                1,
+                10,
+                &trap_oid,
+                vec![VarBind::null(oid!(1, 3, 6, 1))]
+            )
+            .is_err()
+        );
+
+        for (kind, expected) in [
+            (StandardPduType::TrapV2, PduType::TrapV2),
+            (StandardPduType::InformRequest, PduType::InformRequest),
+        ] {
+            let mut notification =
+                NotificationPdu::new(Version::V3, kind, 4, 10, &trap_oid, vec![extra.clone()])
+                    .unwrap();
+            assert_eq!(notification.pdu_type(), expected);
+            assert_eq!(notification.uptime(), 10);
+            assert_eq!(notification.trap_oid(), &trap_oid);
+            assert_eq!(notification.varbinds().len(), 3);
+            notification.set_request_id(5);
+            assert_eq!(notification.request_id(), 5);
+
+            let raw = notification.into_raw();
+            let validated = NotificationPdu::try_from_raw(Version::V3, raw.clone()).unwrap();
+            let mut buf = EncodeBuf::new();
+            validated.encode(&mut buf).unwrap();
+            let mut decoder = Decoder::new(buf.finish());
+            assert_eq!(Pdu::decode(&mut decoder).unwrap(), raw);
+        }
+
+        let malformed = Pdu::from_raw_parts(
+            1,
+            PduBody::Standard {
+                pdu_type: StandardPduType::TrapV2,
+                error_status: 0,
+                error_index: 0,
+            },
+            vec![extra],
+        );
+        assert!(NotificationPdu::try_from_raw(Version::V2c, malformed).is_err());
+    }
+
+    #[test]
+    fn reports_are_v3_only_and_have_one_counter_binding() {
+        let report_oid = oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0);
+        assert!(ResponsePdu::report(1, vec![]).is_err());
+        assert!(ResponsePdu::report(1, vec![VarBind::null(report_oid.clone())]).is_err());
+        let report =
+            ResponsePdu::report(1, vec![VarBind::new(report_oid, Value::Counter32(3))]).unwrap();
+        assert_eq!(report.as_raw().pdu_type(), PduType::Report);
+        assert!(ResponsePdu::try_from_raw(Version::V2c, report.as_raw().clone()).is_err());
+        assert!(matches!(
+            OutboundPdu::try_from_raw(Version::V3, report.into_raw()).unwrap(),
+            OutboundPdu::Response(_)
+        ));
+    }
+
+    #[test]
+    fn validated_v1_traps_check_fields_values_accessors_and_roundtrip() {
+        let enterprise = oid!(1, 3, 6, 1, 4, 1, 9999);
+        assert!(
+            TrapV1Notification::new(
+                enterprise.clone(),
+                [127, 0, 0, 1],
+                GenericTrap::Unknown(7),
+                0,
+                1,
+                vec![]
+            )
+            .is_err()
+        );
+        let trap = TrapV1Notification::new(
+            enterprise.clone(),
+            [127, 0, 0, 1],
+            GenericTrap::LinkDown,
+            i32::MIN,
+            100,
+            vec![VarBind::null(oid!(1, 3, 6, 1))],
+        )
+        .unwrap();
+        assert_eq!(trap.enterprise(), &enterprise);
+        assert_eq!(trap.agent_addr(), [127, 0, 0, 1]);
+        assert_eq!(trap.generic_trap(), GenericTrap::LinkDown);
+        assert_eq!(trap.specific_trap(), i32::MIN);
+        assert_eq!(trap.time_stamp(), 100);
+        assert_eq!(trap.varbinds().len(), 1);
+
+        let mut buf = EncodeBuf::new();
+        trap.encode(&mut buf).unwrap();
+        let mut decoder = Decoder::new(buf.finish());
+        assert_eq!(TrapV1Pdu::decode(&mut decoder).unwrap(), trap.into_raw());
+
+        // net-snmp accepts the complete Integer32 specific-trap field without
+        // constraining it based on generic-trap, including this negative
+        // enterprise-specific value.
+        let trap = TrapV1Notification::new(
+            enterprise,
+            [127, 0, 0, 1],
+            GenericTrap::EnterpriseSpecific,
+            -1,
+            100,
+            vec![VarBind::null(oid!(1, 3, 6, 1))],
+        )
+        .unwrap();
+        let mut buf = EncodeBuf::new();
+        trap.encode(&mut buf).unwrap();
+        let mut decoder = Decoder::new(buf.finish());
+        assert_eq!(TrapV1Pdu::decode(&mut decoder).unwrap(), trap.into_raw());
     }
 
     #[test]
@@ -1550,7 +2973,7 @@ mod tests {
             ],
         );
 
-        let response = inform.to_response();
+        let response = inform.to_response(Version::V2c).unwrap();
 
         assert_eq!(response.pdu_type(), PduType::Response);
         assert_eq!(response.request_id, 99999);
@@ -1644,19 +3067,11 @@ mod tests {
     #[test]
     fn authorization_error_response_requires_zero_index() {
         let request = Pdu::get_request(1, &[oid!(1, 3, 6, 1)]);
-        let valid = request.to_error_response(ErrorStatus::AuthorizationError, 0);
-        assert!(
-            valid
-                .validate_outbound(Version::V2c, PduDirection::Response)
-                .is_ok()
-        );
+        let valid = request.to_error_response(Version::V2c, ErrorStatus::AuthorizationError, 0);
+        assert!(valid.is_ok());
 
-        let invalid = request.to_error_response(ErrorStatus::AuthorizationError, 1);
-        assert!(
-            invalid
-                .validate_outbound(Version::V2c, PduDirection::Response)
-                .is_err()
-        );
+        let invalid = request.to_error_response(Version::V2c, ErrorStatus::AuthorizationError, 1);
+        assert!(invalid.is_err());
     }
 
     #[test]

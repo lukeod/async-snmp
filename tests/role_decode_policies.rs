@@ -35,7 +35,7 @@ impl CommunityPolicyTransport {
 impl Transport for CommunityPolicyTransport {
     async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
         let request = async_snmp::message::CommunityMessage::decode(Bytes::copy_from_slice(data))?;
-        let request_id = request.pdu().standard().unwrap().request_id;
+        let request_id = request.pdu().standard().unwrap().request_id();
         let version = request.version();
         let community = request.community();
         let mut replies = self.replies.lock().unwrap();

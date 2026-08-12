@@ -5,9 +5,10 @@ use async_snmp::transport::TcpOptions;
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, DecodeError,
-    DecodeErrorKind, DecodeErrorOrigin, Error, ErrorKind, ErrorStatus, Oid, Pdu,
-    RequestRegistration, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind,
-    VarBind, Version, WalkAbortReason,
+    DecodeErrorKind, DecodeErrorOrigin, Error, ErrorIndex, ErrorKind, ErrorStatus, GetBulkPdu, Oid,
+    Pdu, PduBody, RequestPdu, RequestRegistration, ResponsePdu, StandardPduType, Target,
+    UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind, VarBind, Version,
+    WalkAbortReason,
 };
 #[cfg(feature = "agent")]
 use async_snmp::{
@@ -247,6 +248,88 @@ fn intentional_compatibility_surface_remains_available() {
 }
 
 #[test]
+fn retrieval_requests_reencode_ignored_non_null_values_for_each_version() {
+    use async_snmp::ber::EncodeBuf;
+    use async_snmp::message::{
+        CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message,
+    };
+    use async_snmp::v3::UsmSecurityParams;
+
+    let name = Oid::from_slice(&[1, 3, 6, 1]);
+    let binding = || VarBind::new(name.clone(), Value::Integer(37));
+
+    for version in [Version::V1, Version::V2c, Version::V3] {
+        for kind in [StandardPduType::GetRequest, StandardPduType::GetNextRequest] {
+            let raw = Pdu::from_raw_parts(
+                7,
+                PduBody::Standard {
+                    pdu_type: kind,
+                    error_status: 0,
+                    error_index: 0,
+                },
+                vec![binding()],
+            );
+            let request = RequestPdu::try_from_raw(version, raw).unwrap();
+
+            match version {
+                Version::V1 | Version::V2c => {
+                    let encoded = CommunityMessage::new(version, "public", request)
+                        .unwrap()
+                        .encode()
+                        .unwrap();
+                    let decoded = CommunityMessage::decode(encoded.clone()).unwrap();
+                    assert_eq!(decoded.encode().unwrap(), encoded);
+                }
+                Version::V3 => {
+                    let global = MsgGlobalData::new(
+                        9,
+                        async_snmp::MessageSize::new(65_507).unwrap(),
+                        MsgFlags::new(SecurityLevel::NoAuthNoPriv, false),
+                    )
+                    .unwrap();
+                    let security = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, Bytes::new())
+                        .unwrap()
+                        .encode()
+                        .unwrap();
+                    let encoded =
+                        V3Message::new(global, security, ScopedPdu::with_empty_context(request))
+                            .unwrap()
+                            .encode()
+                            .unwrap();
+                    let decoded = V3Message::decode(encoded.clone()).unwrap();
+                    assert_eq!(decoded.encode().unwrap(), encoded);
+                }
+                _ => unreachable!("test enumerates all supported versions"),
+            }
+        }
+    }
+
+    for version in [Version::V2c, Version::V3] {
+        let bulk = GetBulkPdu::new(version, 7, 0, 10, vec![binding()]).unwrap();
+        let mut encoded = EncodeBuf::new();
+        bulk.encode(&mut encoded).unwrap();
+        let bytes = encoded.finish();
+        let mut decoder = async_snmp::ber::Decoder::new(bytes.clone());
+        let raw = Pdu::decode(&mut decoder).unwrap();
+        let mut reencoded = EncodeBuf::new();
+        GetBulkPdu::try_from_raw(version, raw)
+            .unwrap()
+            .encode(&mut reencoded)
+            .unwrap();
+        assert_eq!(reencoded.finish(), bytes);
+    }
+}
+
+#[test]
+fn error_index_public_integer32_boundaries_do_not_require_varbind_allocation() {
+    assert_eq!(
+        ErrorIndex::new(i32::MAX as u32, usize::MAX).unwrap().get(),
+        i32::MAX as u32
+    );
+    assert!(ErrorIndex::new(i32::MAX as u32 + 1, usize::MAX).is_err());
+}
+
+#[test]
 fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
     use async_snmp::ber::{EncodeBuf, tag};
     use async_snmp::message::{
@@ -302,17 +385,23 @@ fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
     }
 
     let varbinds = vec![VarBind::null(Oid::from_slice(&[1, 3, 6, 1]))];
-    let too_big = Pdu::response(7, ErrorStatus::TooBig.as_i32(), 0, varbinds.clone());
+    let too_big = Pdu::from_raw_parts(
+        7,
+        PduBody::Standard {
+            pdu_type: StandardPduType::Response,
+            error_status: ErrorStatus::TooBig.as_i32(),
+            error_index: 0,
+        },
+        varbinds.clone(),
+    );
 
-    let mut pdu_buf = EncodeBuf::new();
-    pdu_buf.push_byte(0x5a);
-    assert_invalid_message(too_big.encode(&mut pdu_buf));
-    assert_eq!(pdu_buf.finish().as_ref(), &[0x5a]);
-
-    CommunityMessage::v1("public", too_big.clone())
-        .unwrap()
-        .encode()
-        .unwrap();
+    CommunityMessage::v1(
+        "public",
+        ResponsePdu::too_big(Version::V1, 7, varbinds.clone()).unwrap(),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
     assert_invalid_message(CommunityMessage::v2c("public", too_big.clone()));
     let decoded_v2c = CommunityMessage::decode(raw_v2c_message(&varbinds[0])).unwrap();
     assert_invalid_message(decoded_v2c.encode());
@@ -344,7 +433,7 @@ fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
     assert_invalid_message(decoded_v3.encode());
 
     for version in [Version::V2c, Version::V3] {
-        let empty = Pdu::response(7, ErrorStatus::TooBig.as_i32(), 0, vec![]);
+        let empty = ResponsePdu::too_big(version, 7, vec![]).unwrap();
         match version {
             Version::V2c => {
                 CommunityMessage::v2c("public", empty)

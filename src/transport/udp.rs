@@ -1246,7 +1246,8 @@ mod tests {
     /// Build a valid v2c response packet carrying `request_id`, for injection
     /// into `UdpCore::deliver` in the source-mismatch tests below.
     fn response_packet(request_id: i32) -> Bytes {
-        let pdu = crate::pdu::Pdu::get_request(request_id, &[]).to_response();
+        let pdu =
+            crate::pdu::ResponsePdu::success(crate::Version::V2c, request_id, vec![]).unwrap();
         let msg = crate::message::CommunityMessage::v2c(b"public".as_slice(), pdu).unwrap();
         msg.encode().unwrap()
     }
