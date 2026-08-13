@@ -998,6 +998,34 @@ pub(crate) fn checked_deadline(timeout: Duration, description: &str) -> Result<I
     })
 }
 
+/// Normalize a UDP target to the address family selected by a local bind.
+///
+/// IPv6 binds retain IPv6 targets and map IPv4 targets into the dual-stack
+/// address space. IPv4 binds retain IPv4 targets, convert mapped IPv6 targets
+/// back to IPv4, and reject native IPv6 targets.
+pub(crate) fn normalize_udp_target(
+    local_addr: SocketAddr,
+    target: SocketAddr,
+) -> Result<SocketAddr> {
+    match (local_addr, target) {
+        (SocketAddr::V6(_), SocketAddr::V4(target)) => Ok(SocketAddr::new(
+            target.ip().to_ipv6_mapped().into(),
+            target.port(),
+        )),
+        (SocketAddr::V4(_), SocketAddr::V6(target)) => {
+            let Some(ip) = target.ip().to_ipv4_mapped() else {
+                return Err(Error::Config(
+                    format!("UDP target {target} is incompatible with IPv4 socket {local_addr}")
+                        .into(),
+                )
+                .boxed());
+            };
+            Ok(SocketAddr::new(ip.into(), target.port()))
+        }
+        (_, target) => Ok(target),
+    }
+}
+
 // ============================================================================
 // Correlation envelope extraction (shared between transports)
 // ============================================================================

@@ -109,10 +109,11 @@ use crate::oid::Oid;
 #[cfg(test)]
 use crate::pdu::NotificationPdu;
 use crate::pdu::{Pdu, PduBody, PduType, ResponsePdu};
+use crate::transport::normalize_udp_target;
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{
-    EmptyCommunityPolicy, PreparedAuthoritativeUsm, bind_udp_socket, community_matches,
-    prepare_authoritative_usm,
+    EmptyCommunityPolicy, PreparedAuthoritativeUsm, ValidatedAuthoritativeUsm, bind_udp_socket,
+    community_matches, validate_authoritative_usm_deferred,
 };
 use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, UsmUser};
@@ -323,6 +324,42 @@ pub struct AgentBuilder {
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
     disabled_builtins: HashSet<BuiltinMib>,
+}
+
+enum TrapSinkTarget {
+    Address(SocketAddr),
+    HostPort {
+        original: String,
+        host: String,
+        port: u16,
+    },
+}
+
+struct ValidatedTrapSink {
+    id: NotificationSinkId,
+    target: TrapSinkTarget,
+    auth: crate::client::Auth,
+}
+
+struct ValidatedAgentBuilder {
+    bind_addr: SocketAddr,
+    communities: Vec<crate::Community>,
+    usm: ValidatedAuthoritativeUsm,
+    handlers: Vec<RegisteredHandler>,
+    max_message_size: usize,
+    local_receive_capacity: MessageSize,
+    decode_policy: crate::message::DecodePolicy,
+    compatibility_policy: crate::CompatibilityPolicy,
+    concurrency_limit: Option<Arc<Semaphore>>,
+    recv_buffer_size: Option<usize>,
+    authorization: AgentAuthorization,
+    cancel: CancellationToken,
+    trap_sinks: Vec<ValidatedTrapSink>,
+    trap_send_timeout: Duration,
+    inform_timeout: Duration,
+    inform_retry: crate::client::Retry,
+    disabled_builtins: HashSet<BuiltinMib>,
+    requires_privacy: bool,
 }
 
 impl AgentBuilder {
@@ -799,7 +836,13 @@ impl AgentBuilder {
     ///
     /// `id` must be unique within the agent and contain 1 to 32 UTF-8 octets.
     /// It is included in delivery outcomes and should remain stable across
-    /// restarts when the application retains sink status.
+    /// restarts when the application retains sink status. `dest` must include
+    /// a port and may be an IPv4 address, bracketed IPv6 address, or hostname.
+    /// IPv4 binds accept IPv4 and mapped-IPv6 destinations, normalizing the
+    /// latter to IPv4, and reject native IPv6 destinations. IPv6 binds retain
+    /// IPv6 destinations and map IPv4 destinations into the dual-stack address
+    /// space. Hostname candidates are considered in resolver order under the
+    /// same rules.
     ///
     /// # Example
     ///
@@ -905,13 +948,199 @@ impl AgentBuilder {
     /// Returns a configuration error when inbound identities do not have an
     /// explicit access policy, VACM and unrestricted access are both selected,
     /// notification sink IDs are empty, longer than 32 UTF-8 octets, or
-    /// duplicated; USM credentials are invalid; USM users or V3 trap sinks are
-    /// configured without a persisted [`AuthoritativeEngine`]; or the
-    /// response-size limit exceeds the fixed UDP receive capacity. Returns
-    /// [`Error::RandomSource`] when a generated engine ID or required privacy
-    /// salt cannot be initialized.
-    pub async fn build(mut self) -> Result<Agent> {
+    /// duplicated; trap sink destinations are invalid or cannot be resolved;
+    /// USM credentials are invalid; USM users or V3 trap sinks are configured
+    /// without a persisted [`AuthoritativeEngine`]; a timeout cannot be
+    /// represented; or the response-size limit exceeds the fixed UDP receive
+    /// capacity. Returns [`Error::RandomSource`] when a generated engine ID or
+    /// required privacy salt cannot be initialized.
+    ///
+    /// Pure deterministic validation and normalization precedes socket I/O,
+    /// DNS, entropy, and authoritative engine clock or persistence access.
+    /// Checking whether configured durations can form deadlines observes the
+    /// process monotonic clock during that validation phase.
+    pub async fn build(self) -> Result<Agent> {
+        self.build_with_dependencies(
+            |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+            |host, port| async move {
+                tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .map(|addresses| addresses.collect())
+                    .map_err(|error| {
+                        Error::Config(
+                            format!("could not resolve trap sink address '{host}': {error}").into(),
+                        )
+                        .boxed()
+                    })
+            },
+            crate::v3::generate_engine_id,
+            SaltCounter::new,
+        )
+        .await
+    }
+
+    async fn build_with_dependencies<B, BFut, R, RFut, G, S>(
+        self,
+        bind_socket: B,
+        mut resolve_host: R,
+        generate_engine_id: G,
+        create_salt_counter: S,
+    ) -> Result<Agent>
+    where
+        B: FnOnce(SocketAddr, Option<usize>) -> BFut,
+        BFut: Future<Output = std::io::Result<UdpSocket>>,
+        R: FnMut(String, u16) -> RFut,
+        RFut: Future<Output = Result<Vec<SocketAddr>>>,
+        G: FnOnce() -> Result<Bytes>,
+        S: FnOnce() -> Result<SaltCounter>,
+    {
+        // Pure deterministic validation and normalization completes before
+        // socket I/O, DNS, entropy, or authoritative clock/persistence access.
+        // Deadline representability checks also observe the monotonic clock but
+        // have no external effect. Environmental errors then have stable
+        // precedence: bind, trap-sink resolution, authoritative engine
+        // preparation, privacy salt.
+        let mut config = self.validate_and_normalize()?;
+
+        let socket = bind_socket(config.bind_addr, config.recv_buffer_size)
+            .await
+            .map_err(|source| Error::Network {
+                target: config.bind_addr,
+                source,
+            })?;
+        let local_addr = socket.local_addr().map_err(|source| Error::Network {
+            target: config.bind_addr,
+            source,
+        })?;
+
+        let mut trap_sinks = Vec::with_capacity(config.trap_sinks.len());
+        for (index, sink) in config.trap_sinks.into_iter().enumerate() {
+            let dest = match sink.target {
+                TrapSinkTarget::Address(address) => address,
+                TrapSinkTarget::HostPort {
+                    original,
+                    host,
+                    port,
+                } => {
+                    let addresses = resolve_host(host, port).await?;
+                    addresses
+                        .into_iter()
+                        .find_map(|address| {
+                            normalize_udp_target(config.bind_addr, address).ok()
+                        })
+                        .ok_or_else(|| {
+                        Error::Config(
+                            format!(
+                                "no address resolved for trap sink '{original}' is compatible with Agent bind {}",
+                                config.bind_addr
+                            )
+                            .into(),
+                        )
+                        .boxed()
+                    })?
+                }
+            };
+            trap_sinks.push(notification::TrapSink::new(
+                index,
+                sink.id,
+                dest,
+                sink.auth,
+                config.trap_send_timeout,
+                config.inform_timeout,
+                config.inform_retry.clone(),
+            ));
+        }
+
+        let PreparedAuthoritativeUsm {
+            users: usm_users,
+            authoritative_engine,
+            engine_id,
+            engine_boots,
+        } = config.usm.prepare(generate_engine_id)?;
+        let salt_counter = config
+            .requires_privacy
+            .then(create_salt_counter)
+            .transpose()?;
+        let udp_responder = UdpResponder::new(&socket);
+
+        let state = Arc::new(AgentState {
+            authoritative_engine,
+            engine_id,
+            engine_boots: AtomicU32::new(engine_boots),
+            engine_time: AtomicU32::new(0),
+            engine_start: Instant::now(),
+            engine_boots_base: engine_boots,
+            #[cfg(test)]
+            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
+            max_message_size: config.max_message_size,
+            local_receive_capacity: config.local_receive_capacity,
+            decode_policy: config.decode_policy,
+            compatibility_policy: config.compatibility_policy,
+            snmp_in_asn_parse_errs: AtomicU32::new(0),
+            snmp_invalid_msgs: AtomicU32::new(0),
+            snmp_unknown_security_models: AtomicU32::new(0),
+            snmp_silent_drops: AtomicU32::new(0),
+            snmp_unknown_contexts: AtomicU32::new(0),
+            usm_stats: UsmStats::default(),
+        });
+
+        // Register built-in handlers for any not disabled
+        if !config.disabled_builtins.contains(&BuiltinMib::SnmpEngine) {
+            config.handlers.push(RegisteredHandler {
+                prefix: oid!(1, 3, 6, 1, 6, 3, 10, 2, 1),
+                handler: Arc::new(builtins::SnmpEngineHandler {
+                    state: Arc::clone(&state),
+                }),
+            });
+        }
+        if !config.disabled_builtins.contains(&BuiltinMib::UsmStats) {
+            config.handlers.push(RegisteredHandler {
+                prefix: oid!(1, 3, 6, 1, 6, 3, 15, 1, 1),
+                handler: Arc::new(builtins::UsmStatsHandler {
+                    state: Arc::clone(&state),
+                }),
+            });
+        }
+        if !config.disabled_builtins.contains(&BuiltinMib::MpdStats) {
+            config.handlers.push(RegisteredHandler {
+                prefix: oid!(1, 3, 6, 1, 6, 3, 11, 2, 1),
+                handler: Arc::new(builtins::MpdStatsHandler {
+                    state: Arc::clone(&state),
+                }),
+            });
+        }
+
+        // Sort handlers by prefix length (longest first) for matching
+        config
+            .handlers
+            .sort_by_key(|h| std::cmp::Reverse(h.prefix.len()));
+
+        Ok(Agent {
+            inner: Arc::new(AgentInner {
+                socket: Arc::new(socket),
+                udp_responder,
+                local_addr,
+                communities: config.communities,
+                usm_users,
+                handlers: config.handlers,
+                state,
+                salt_counter,
+                concurrency_limit: config.concurrency_limit,
+                authorization: config.authorization,
+                cancel: config.cancel,
+                trap_sinks,
+                notification_id: std::sync::atomic::AtomicI32::new(1),
+                run_active: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    fn validate_and_normalize(mut self) -> Result<ValidatedAgentBuilder> {
+        // Stable validation precedence: deadline representability (which reads
+        // the monotonic clock), authorization, sink IDs, sizes/concurrency,
+        // security configuration, then address syntax and family.
         crate::transport::checked_deadline(self.trap_send_timeout, "trap send timeout")?;
+        crate::transport::checked_deadline(self.inform_timeout, "inform timeout")?;
 
         if matches!(self.authorization, AgentAuthorization::Conflict) {
             return Err(Error::Config(
@@ -941,27 +1170,20 @@ impl AgentBuilder {
             }
         }
 
-        let max_udp_message_size = UDP_RECEIVE_LIMITS.advertised().as_usize();
-        if self.max_message_size > max_udp_message_size {
+        let local_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
+        if self.max_message_size > local_receive_capacity.as_usize() {
             return Err(Error::Config(
-                format!("max_message_size must not exceed UDP capacity {max_udp_message_size}")
+                format!("max_message_size must not exceed UDP capacity {local_receive_capacity}")
                     .into(),
             )
             .boxed());
         }
-        let local_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
-
-        // Keep trap-sink credential validation local because outbound sinks
-        // are agent-specific, but prepare inbound USM and engine state through
-        // the same path used by notification receivers.
-        for (_, _, auth) in &mut self.trap_sinks {
-            if let crate::client::Auth::Usm(config) = auth {
-                config.validate_and_precompute().map_err(|error| {
-                    Error::Config(format!("invalid trap sink USM configuration: {error}").into())
-                        .boxed()
-                })?;
-            }
+        if self.max_concurrent_requests == Some(0) {
+            return Err(
+                Error::Config("max_concurrent_requests must be greater than 0".into()).boxed(),
+            );
         }
+
         let requires_privacy = self
             .usm_users
             .values()
@@ -974,138 +1196,107 @@ impl AgentBuilder {
                 .trap_sinks
                 .iter()
                 .any(|(_, _, auth)| matches!(auth, crate::client::Auth::Usm(_)));
-        let PreparedAuthoritativeUsm {
-            users: usm_users,
-            authoritative_engine,
-            engine_id,
-            engine_boots,
-        } = prepare_authoritative_usm(
+
+        for (_, _, auth) in &mut self.trap_sinks {
+            if let crate::client::Auth::Usm(config) = auth {
+                config.validate_and_precompute().map_err(|error| {
+                    Error::Config(format!("invalid trap sink USM configuration: {error}").into())
+                        .boxed()
+                })?;
+            }
+        }
+        let usm = validate_authoritative_usm_deferred(
             self.usm_users,
             self.authoritative_engine,
             requires_authoritative_engine,
             "invalid USM user configuration",
             "authoritative engine state is required for SNMPv3 agent roles",
         )?;
-        let salt_counter = requires_privacy.then(SaltCounter::new).transpose()?;
 
-        let bind_addr: std::net::SocketAddr = self.bind_addr.parse().map_err(|_| {
-            Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
+        let bind_addr = self.bind_addr.parse().map_err(|_| {
+            Error::Config(format!("invalid bind address: {}", self.bind_addr).into()).boxed()
         })?;
+        let trap_sinks = self
+            .trap_sinks
+            .into_iter()
+            .map(|(id, destination, auth)| {
+                let target = match parse_trap_sink_target(destination)? {
+                    TrapSinkTarget::Address(address) => {
+                        TrapSinkTarget::Address(normalize_udp_target(bind_addr, address)?)
+                    }
+                    target @ TrapSinkTarget::HostPort { .. } => target,
+                };
+                Ok(ValidatedTrapSink { id, target, auth })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let socket = bind_udp_socket(bind_addr, self.recv_buffer_size, None, false)
-            .await
-            .map_err(|e| Error::Network {
-                target: bind_addr,
-                source: e,
-            })?;
-
-        let local_addr = socket.local_addr().map_err(|e| Error::Network {
-            target: bind_addr,
-            source: e,
-        })?;
-
-        let udp_responder = UdpResponder::new(&socket);
-
-        let cancel = self.cancel.unwrap_or_default();
-
-        // Create concurrency limiter if configured. A zero-permit semaphore
-        // would never grant a permit and wedge the agent, so reject it.
-        if self.max_concurrent_requests == Some(0) {
-            return Err(
-                Error::Config("max_concurrent_requests must be greater than 0".into()).into(),
-            );
-        }
         let concurrency_limit = self
             .max_concurrent_requests
-            .map(|n| Arc::new(Semaphore::new(n)));
+            .map(|limit| Arc::new(Semaphore::new(limit)));
 
-        // Resolve trap sink addresses
-        let mut trap_sinks = Vec::with_capacity(self.trap_sinks.len());
-        for (index, (id, dest_str, auth)) in self.trap_sinks.into_iter().enumerate() {
-            let dest: SocketAddr = dest_str.parse().map_err(|_| {
-                Error::Config(format!("invalid trap sink address: {dest_str}").into())
-            })?;
-            trap_sinks.push(notification::TrapSink::new(
-                index,
-                id,
-                dest,
-                auth,
-                self.trap_send_timeout,
-                self.inform_timeout,
-                self.inform_retry.clone(),
-            ));
-        }
-
-        let state = Arc::new(AgentState {
-            authoritative_engine,
-            engine_id,
-            engine_boots: AtomicU32::new(engine_boots),
-            engine_time: AtomicU32::new(0),
-            engine_start: Instant::now(),
-            engine_boots_base: engine_boots,
-            #[cfg(test)]
-            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
+        Ok(ValidatedAgentBuilder {
+            bind_addr,
+            communities: self.communities,
+            usm,
+            handlers: self.handlers,
             max_message_size: self.max_message_size,
             local_receive_capacity,
             decode_policy: self.decode_policy,
             compatibility_policy: self.compatibility_policy,
-            snmp_in_asn_parse_errs: AtomicU32::new(0),
-            snmp_invalid_msgs: AtomicU32::new(0),
-            snmp_unknown_security_models: AtomicU32::new(0),
-            snmp_silent_drops: AtomicU32::new(0),
-            snmp_unknown_contexts: AtomicU32::new(0),
-            usm_stats: UsmStats::default(),
-        });
-
-        // Register built-in handlers for any not disabled
-        if !self.disabled_builtins.contains(&BuiltinMib::SnmpEngine) {
-            self.handlers.push(RegisteredHandler {
-                prefix: oid!(1, 3, 6, 1, 6, 3, 10, 2, 1),
-                handler: Arc::new(builtins::SnmpEngineHandler {
-                    state: Arc::clone(&state),
-                }),
-            });
-        }
-        if !self.disabled_builtins.contains(&BuiltinMib::UsmStats) {
-            self.handlers.push(RegisteredHandler {
-                prefix: oid!(1, 3, 6, 1, 6, 3, 15, 1, 1),
-                handler: Arc::new(builtins::UsmStatsHandler {
-                    state: Arc::clone(&state),
-                }),
-            });
-        }
-        if !self.disabled_builtins.contains(&BuiltinMib::MpdStats) {
-            self.handlers.push(RegisteredHandler {
-                prefix: oid!(1, 3, 6, 1, 6, 3, 11, 2, 1),
-                handler: Arc::new(builtins::MpdStatsHandler {
-                    state: Arc::clone(&state),
-                }),
-            });
-        }
-
-        // Sort handlers by prefix length (longest first) for matching
-        self.handlers
-            .sort_by_key(|h| std::cmp::Reverse(h.prefix.len()));
-
-        Ok(Agent {
-            inner: Arc::new(AgentInner {
-                socket: Arc::new(socket),
-                udp_responder,
-                local_addr,
-                communities: self.communities,
-                usm_users,
-                handlers: self.handlers,
-                state,
-                salt_counter,
-                concurrency_limit,
-                authorization: self.authorization,
-                cancel,
-                trap_sinks,
-                notification_id: std::sync::atomic::AtomicI32::new(1),
-                run_active: AtomicBool::new(false),
-            }),
+            concurrency_limit,
+            recv_buffer_size: self.recv_buffer_size,
+            authorization: self.authorization,
+            cancel: self.cancel.unwrap_or_default(),
+            trap_sinks,
+            trap_send_timeout: self.trap_send_timeout,
+            inform_timeout: self.inform_timeout,
+            inform_retry: self.inform_retry,
+            disabled_builtins: self.disabled_builtins,
+            requires_privacy,
         })
     }
+}
+
+fn parse_trap_sink_target(destination: String) -> Result<TrapSinkTarget> {
+    if let Ok(address) = destination.parse() {
+        return Ok(TrapSinkTarget::Address(address));
+    }
+
+    let (host, port) = if let Some(bracketed) = destination.strip_prefix('[') {
+        let (host, remainder) = bracketed.split_once(']').ok_or_else(|| {
+            Error::Config(format!("invalid trap sink address: {destination}").into()).boxed()
+        })?;
+        let port = remainder.strip_prefix(':').ok_or_else(|| {
+            Error::Config(format!("invalid trap sink address: {destination}").into()).boxed()
+        })?;
+        (host, port)
+    } else {
+        let (host, port) = destination.rsplit_once(':').ok_or_else(|| {
+            Error::Config(format!("invalid trap sink address: {destination}").into()).boxed()
+        })?;
+        if host.contains(':') {
+            return Err(
+                Error::Config(format!("invalid trap sink address: {destination}").into()).boxed(),
+            );
+        }
+        (host, port)
+    };
+
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err(
+            Error::Config(format!("invalid trap sink address: {destination}").into()).boxed(),
+        );
+    }
+    let port = port.parse::<u16>().map_err(|_| {
+        Error::Config(format!("invalid trap sink address: {destination}").into()).boxed()
+    })?;
+    let host = host.to_owned();
+
+    Ok(TrapSinkTarget::HostPort {
+        original: destination,
+        host,
+        port,
+    })
 }
 
 impl Default for AgentBuilder {
@@ -2123,6 +2314,8 @@ impl Clone for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler,
         RequestContext, SecurityModel, SetTestError,
@@ -4266,7 +4459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authoritative_engine_persistence_failure_precedes_bind() {
+    async fn test_invalid_bind_precedes_authoritative_engine_persistence() {
         let engine = AuthoritativeEngine::with_rollover_persistence_failure_for_test(
             b"test-agent-engine".to_vec(),
         );
@@ -4279,7 +4472,33 @@ mod tests {
             .await;
 
         let err = result.err().expect("expected build to fail");
-        assert!(err.to_string().contains("storage unavailable"));
+        assert!(matches!(
+            *err,
+            Error::Config(ref message) if message.contains("invalid bind address")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_engine_persistence_failure_releases_socket() {
+        let reservation = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let engine = AuthoritativeEngine::with_rollover_persistence_failure_for_test(
+            b"test-agent-engine".to_vec(),
+        );
+
+        let error = Agent::builder()
+            .bind(bind_addr.to_string())
+            .community(b"public")
+            .authoritative_engine(engine)
+            .allow_all_access()
+            .build()
+            .await
+            .err()
+            .expect("authoritative persistence must fail");
+
+        assert!(error.to_string().contains("storage unavailable"));
+        let _rebound = UdpSocket::bind(bind_addr).await.unwrap();
     }
 
     #[tokio::test]
@@ -4366,6 +4585,492 @@ mod tests {
 
         let err = result.err().expect("expected build to fail");
         assert!(matches!(*err, Error::Config(_)));
+    }
+
+    fn unavailable_engine_id() -> Result<Bytes> {
+        Err(Error::RandomSource {
+            source: getrandom::Error::UNEXPECTED,
+        }
+        .boxed())
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    fn unavailable_salt_counter() -> Result<SaltCounter> {
+        Err(Error::RandomSource {
+            source: getrandom::Error::UNEXPECTED,
+        }
+        .boxed())
+    }
+
+    #[tokio::test]
+    async fn deterministic_validation_precedes_invalid_bind_and_dependencies() {
+        let error = Agent::builder()
+            .bind("not a socket address")
+            .max_concurrent_requests(Some(0))
+            .trap_sink(
+                "resolver-must-not-run",
+                "unresolvable.invalid:162",
+                crate::Auth::v2c("public"),
+            )
+            .build_with_dependencies(
+                |_, _| async { panic!("socket binder must not run") },
+                |_, _| async { panic!("resolver must not run") },
+                || panic!("engine ID generator must not run"),
+                || panic!("salt generator must not run"),
+            )
+            .await
+            .err()
+            .expect("deterministic configuration must fail");
+
+        assert!(matches!(
+            *error,
+            Error::Config(ref message)
+                if message.as_ref() == "max_concurrent_requests must be greater than 0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_inform_timeout_precedes_occupied_bind() {
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+
+        let error = Agent::builder()
+            .bind(occupied_addr.to_string())
+            .inform_timeout(Duration::MAX)
+            .build()
+            .await
+            .err()
+            .expect("unrepresentable inform timeout must fail");
+
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("inform timeout")
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_sink_id_precedes_occupied_bind_without_socket_attempt() {
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let bind_calls = Arc::new(AtomicUsize::new(0));
+        let bind_calls_for_builder = Arc::clone(&bind_calls);
+
+        let error = Agent::builder()
+            .bind(occupied_addr.to_string())
+            .trap_sink("", "127.0.0.1:162", crate::Auth::v2c("public"))
+            .build_with_dependencies(
+                move |addr, recv_buffer_size| {
+                    bind_calls_for_builder.fetch_add(1, Ordering::Relaxed);
+                    bind_udp_socket(addr, recv_buffer_size, None, false)
+                },
+                |_, _| async { panic!("resolver must not run") },
+                || panic!("engine ID generator must not run"),
+                || panic!("salt generator must not run"),
+            )
+            .await
+            .err()
+            .expect("empty sink ID must fail");
+
+        assert!(matches!(
+            *error,
+            Error::Config(ref message)
+                if message.as_ref() == "notification sink ID must not be empty"
+        ));
+        assert_eq!(bind_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_sink_address_precedes_occupied_bind_without_socket_attempt() {
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let bind_calls = Arc::new(AtomicUsize::new(0));
+        let bind_calls_for_builder = Arc::clone(&bind_calls);
+
+        let error = Agent::builder()
+            .bind(occupied_addr.to_string())
+            .trap_sink("invalid", "missing-port", crate::Auth::v2c("public"))
+            .build_with_dependencies(
+                move |addr, recv_buffer_size| {
+                    bind_calls_for_builder.fetch_add(1, Ordering::Relaxed);
+                    bind_udp_socket(addr, recv_buffer_size, None, false)
+                },
+                |_, _| async { panic!("resolver must not run") },
+                || panic!("engine ID generator must not run"),
+                || panic!("salt generator must not run"),
+            )
+            .await
+            .err()
+            .expect("invalid sink address must fail");
+
+        assert!(matches!(
+            *error,
+            Error::Config(ref message)
+                if message.as_ref() == "invalid trap sink address: missing-port"
+        ));
+        assert_eq!(bind_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+    #[tokio::test]
+    async fn unavailable_usm_backend_precedes_socket_attempt() {
+        let error = Agent::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(AuthoritativeEngine::for_test(
+                b"test-agent-engine".to_vec(),
+                1,
+            ))
+            .usm_user("authenticated", |user| {
+                user.auth(crate::AuthProtocol::Sha256, b"authentication-password")
+            })
+            .allow_all_access()
+            .build_with_dependencies(
+                |_, _| async { panic!("socket binder must not run") },
+                |_, _| async { panic!("resolver must not run") },
+                || panic!("engine ID generator must not run"),
+                || panic!("salt generator must not run"),
+            )
+            .await
+            .err()
+            .expect("unavailable backend must fail");
+
+        assert!(matches!(
+            *error,
+            Error::Config(ref message)
+                if message.contains("no crypto backend is enabled")
+        ));
+    }
+
+    #[tokio::test]
+    async fn occupied_bind_precedes_dns_and_entropy() {
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+
+        let error = Agent::builder()
+            .bind(occupied_addr.to_string())
+            .trap_sink(
+                "unresolved",
+                "unresolvable.invalid:162",
+                crate::Auth::v2c("public"),
+            )
+            .build_with_dependencies(
+                |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+                |_, _| async { panic!("resolver must not run after bind failure") },
+                || panic!("engine ID generator must not run after bind failure"),
+                || panic!("salt generator must not run after bind failure"),
+            )
+            .await
+            .err()
+            .expect("occupied bind must fail");
+
+        assert!(matches!(
+            *error,
+            Error::Network { target, ref source }
+                if target == occupied_addr && source.kind() == std::io::ErrorKind::AddrInUse
+        ));
+    }
+
+    #[tokio::test]
+    async fn dns_failure_precedes_entropy_and_releases_socket() {
+        let reservation = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let error = Agent::builder()
+            .bind(bind_addr.to_string())
+            .trap_sink(
+                "unresolved",
+                "unresolvable.invalid:162",
+                crate::Auth::v2c("public"),
+            )
+            .build_with_dependencies(
+                |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+                |host, _| async move {
+                    Err(Error::Config(format!("injected DNS failure for {host}").into()).boxed())
+                },
+                || panic!("engine ID generator must not run after DNS failure"),
+                || panic!("salt generator must not run after DNS failure"),
+            )
+            .await
+            .err()
+            .expect("injected DNS resolution must fail");
+
+        assert!(error.to_string().contains("injected DNS failure"));
+        let _rebound = UdpSocket::bind(bind_addr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_id_entropy_failure_releases_socket() {
+        let reservation = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let error = Agent::builder()
+            .bind(bind_addr.to_string())
+            .build_with_dependencies(
+                |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+                |_, _| async { panic!("resolver must not run") },
+                unavailable_engine_id,
+                || panic!("salt generator must not run after engine entropy failure"),
+            )
+            .await
+            .err()
+            .expect("injected engine entropy must fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::RandomSource);
+        let _rebound = UdpSocket::bind(bind_addr).await.unwrap();
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn privacy_salt_entropy_failure_releases_socket() {
+        let reservation = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let error = Agent::builder()
+            .bind(bind_addr.to_string())
+            .authoritative_engine(AuthoritativeEngine::for_test(
+                b"test-agent-engine".to_vec(),
+                1,
+            ))
+            .usm_user("private", |user| {
+                user.auth_priv(
+                    crate::AuthProtocol::Sha256,
+                    b"authentication-password",
+                    crate::PrivProtocol::Aes128,
+                    b"privacy-password",
+                )
+            })
+            .allow_all_access()
+            .build_with_dependencies(
+                |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+                |_, _| async { panic!("resolver must not run") },
+                || panic!("configured engine must avoid engine ID generation"),
+                unavailable_salt_counter,
+            )
+            .await
+            .err()
+            .expect("injected salt entropy must fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::RandomSource);
+        let _rebound = UdpSocket::bind(bind_addr).await.unwrap();
+    }
+
+    fn validated_numeric_trap_sink(bind: &str, destination: SocketAddr) -> Result<SocketAddr> {
+        let config = Agent::builder()
+            .bind(bind)
+            .trap_sink(
+                "numeric",
+                destination.to_string(),
+                crate::Auth::v2c("public"),
+            )
+            .validate_and_normalize()?;
+        let target = &config.trap_sinks[0].target;
+        let TrapSinkTarget::Address(address) = target else {
+            panic!("numeric destination must remain an address");
+        };
+        Ok(*address)
+    }
+
+    #[test]
+    fn numeric_trap_sinks_follow_udp_bind_family_normalization() {
+        let ipv4: SocketAddr = "192.0.2.1:1161".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:192.0.2.2]:1162".parse().unwrap();
+        let native_v6 = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            1163,
+            0,
+            7,
+        ));
+
+        assert_eq!(
+            validated_numeric_trap_sink("127.0.0.1:0", ipv4).unwrap(),
+            ipv4
+        );
+        assert_eq!(
+            validated_numeric_trap_sink("127.0.0.1:0", mapped).unwrap(),
+            "192.0.2.2:1162".parse().unwrap()
+        );
+        let error = validated_numeric_trap_sink("127.0.0.1:0", native_v6)
+            .expect_err("native IPv6 sink must be rejected for an IPv4 bind");
+        assert!(error.to_string().contains("incompatible with IPv4 socket"));
+
+        assert_eq!(
+            validated_numeric_trap_sink("[::]:0", ipv4).unwrap(),
+            "[::ffff:192.0.2.1]:1161".parse().unwrap()
+        );
+        assert_eq!(
+            validated_numeric_trap_sink("[::]:0", mapped).unwrap(),
+            mapped
+        );
+        assert_eq!(
+            validated_numeric_trap_sink("[::]:0", native_v6).unwrap(),
+            native_v6,
+            "native IPv6 scope must be preserved"
+        );
+    }
+
+    async fn agent_with_resolved_trap_sink(
+        bind: &str,
+        candidates: Vec<SocketAddr>,
+    ) -> Result<Agent> {
+        Agent::builder()
+            .bind(bind)
+            .trap_sink("hostname", "sink.example:162", crate::Auth::v2c("public"))
+            .build_with_dependencies(
+                |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+                move |host, port| {
+                    let candidates = candidates.clone();
+                    async move {
+                        assert_eq!(host, "sink.example");
+                        assert_eq!(port, 162);
+                        Ok(candidates)
+                    }
+                },
+                || Ok(Bytes::from_static(b"generated-engine")),
+                || panic!("privacy salt must not be created"),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn resolved_trap_sinks_follow_udp_bind_family_normalization() {
+        let ipv4: SocketAddr = "192.0.2.1:1161".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:192.0.2.2]:1162".parse().unwrap();
+        let native_v6 = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            1163,
+            9,
+            7,
+        ));
+
+        let agent = agent_with_resolved_trap_sink("127.0.0.1:0", vec![ipv4])
+            .await
+            .unwrap();
+        assert_eq!(agent.inner.trap_sinks[0].summary.dest(), ipv4);
+
+        let agent = agent_with_resolved_trap_sink("127.0.0.1:0", vec![mapped])
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.inner.trap_sinks[0].summary.dest(),
+            "192.0.2.2:1162".parse().unwrap()
+        );
+
+        let error = agent_with_resolved_trap_sink("127.0.0.1:0", vec![native_v6])
+            .await
+            .err()
+            .expect("native IPv6 sink must be rejected for an IPv4 bind");
+        assert!(error.to_string().contains("no address resolved"));
+
+        let agent = agent_with_resolved_trap_sink("[::]:0", vec![ipv4])
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.inner.trap_sinks[0].summary.dest(),
+            "[::ffff:192.0.2.1]:1161".parse().unwrap()
+        );
+
+        let agent = agent_with_resolved_trap_sink("[::]:0", vec![mapped])
+            .await
+            .unwrap();
+        assert_eq!(agent.inner.trap_sinks[0].summary.dest(), mapped);
+
+        let agent = agent_with_resolved_trap_sink("[::]:0", vec![native_v6])
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.inner.trap_sinks[0].summary.dest(),
+            native_v6,
+            "native IPv6 flow information and scope must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_trap_sink_uses_first_normalizable_candidate_in_order() {
+        let incompatible: SocketAddr = "[2001:db8::1]:1161".parse().unwrap();
+        let first_compatible: SocketAddr = "[::ffff:192.0.2.2]:1162".parse().unwrap();
+        let later_compatible: SocketAddr = "192.0.2.3:1163".parse().unwrap();
+
+        let agent = agent_with_resolved_trap_sink(
+            "127.0.0.1:0",
+            vec![incompatible, first_compatible, later_compatible],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            agent.inner.trap_sinks[0].summary.dest(),
+            "192.0.2.2:1162".parse().unwrap()
+        );
+
+        let agent = agent_with_resolved_trap_sink("[::]:0", vec![later_compatible, incompatible])
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.inner.trap_sinks[0].summary.dest(),
+            "[::ffff:192.0.2.3]:1163".parse().unwrap(),
+            "IPv6 binds must retain resolver order even when a later native IPv6 candidate exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn trap_sink_resolution_preserves_sink_vector_and_index_order() {
+        let resolver_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver_calls_for_builder = Arc::clone(&resolver_calls);
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .trap_sink(
+                "numeric-mapped",
+                "[::ffff:192.0.2.10]:1162",
+                crate::Auth::v2c("public"),
+            )
+            .trap_sink("resolved", "first.example:162", crate::Auth::v2c("public"))
+            .trap_sink("numeric-v4", "192.0.2.30:1162", crate::Auth::v2c("public"))
+            .trap_sink("mapped", "second.example:162", crate::Auth::v2c("public"))
+            .build_with_dependencies(
+                |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+                move |host, port| {
+                    resolver_calls_for_builder
+                        .lock()
+                        .unwrap()
+                        .push(host.clone());
+                    async move {
+                        assert_eq!(port, 162);
+                        match host.as_str() {
+                            "first.example" => Ok(vec![
+                                "[2001:db8::1]:1162".parse().unwrap(),
+                                "192.0.2.20:1162".parse().unwrap(),
+                            ]),
+                            "second.example" => {
+                                Ok(vec!["[::ffff:192.0.2.40]:1162".parse().unwrap()])
+                            }
+                            _ => panic!("unexpected resolver host: {host}"),
+                        }
+                    }
+                },
+                || Ok(Bytes::from_static(b"generated-engine")),
+                || panic!("privacy salt must not be created"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *resolver_calls.lock().unwrap(),
+            ["first.example", "second.example"]
+        );
+        let summaries: Vec<_> = agent.notification_sinks().collect();
+        assert_eq!(summaries.len(), 4);
+        for (expected_index, summary) in summaries.iter().enumerate() {
+            assert_eq!(summary.index(), expected_index);
+        }
+        assert_eq!(summaries[0].id().as_str(), "numeric-mapped");
+        assert_eq!(summaries[0].dest(), "192.0.2.10:1162".parse().unwrap());
+        assert_eq!(summaries[1].id().as_str(), "resolved");
+        assert_eq!(summaries[1].dest(), "192.0.2.20:1162".parse().unwrap());
+        assert_eq!(summaries[2].id().as_str(), "numeric-v4");
+        assert_eq!(summaries[2].dest(), "192.0.2.30:1162".parse().unwrap());
+        assert_eq!(summaries[3].id().as_str(), "mapped");
+        assert_eq!(summaries[3].dest(), "192.0.2.40:1162".parse().unwrap());
     }
 
     #[tokio::test]

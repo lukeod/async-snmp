@@ -62,7 +62,13 @@ impl ValidatedAuthoritativeUsm {
     ) -> Result<PreparedAuthoritativeUsm> {
         let (engine_id, engine_boots) = match self.configured_engine {
             Some(configured) => configured,
-            None => (generate_engine_id()?, 1),
+            None => match &self.authoritative_engine {
+                Some(engine) => {
+                    let (engine_boots, _) = engine.current_boots_time()?;
+                    (Bytes::copy_from_slice(engine.engine_id()), engine_boots)
+                }
+                None => (generate_engine_id()?, 1),
+            },
         };
 
         Ok(PreparedAuthoritativeUsm {
@@ -74,21 +80,68 @@ impl ValidatedAuthoritativeUsm {
     }
 }
 
-/// Validate inbound USM users and configured authoritative engine state.
+/// Validate inbound USM users in byte-lexicographic username order and validate
+/// configured authoritative engine state.
 pub(crate) fn validate_authoritative_usm(
-    mut users: HashMap<Bytes, UsmUser>,
+    users: HashMap<Bytes, UsmUser>,
     authoritative_engine: Option<AuthoritativeEngine>,
     requires_engine: bool,
     invalid_user_context: &str,
     missing_engine_context: &str,
 ) -> Result<ValidatedAuthoritativeUsm> {
-    for config in users.values_mut() {
+    validate_authoritative_usm_with(
+        users,
+        authoritative_engine,
+        requires_engine,
+        invalid_user_context,
+        missing_engine_context,
+        false,
+    )
+}
+
+/// Validate without reading or persisting authoritative engine time.
+#[cfg(feature = "agent")]
+pub(crate) fn validate_authoritative_usm_deferred(
+    users: HashMap<Bytes, UsmUser>,
+    authoritative_engine: Option<AuthoritativeEngine>,
+    requires_engine: bool,
+    invalid_user_context: &str,
+    missing_engine_context: &str,
+) -> Result<ValidatedAuthoritativeUsm> {
+    validate_authoritative_usm_with(
+        users,
+        authoritative_engine,
+        requires_engine,
+        invalid_user_context,
+        missing_engine_context,
+        true,
+    )
+}
+
+fn validate_authoritative_usm_with(
+    mut users: HashMap<Bytes, UsmUser>,
+    authoritative_engine: Option<AuthoritativeEngine>,
+    requires_engine: bool,
+    invalid_user_context: &str,
+    missing_engine_context: &str,
+    defer_engine_time: bool,
+) -> Result<ValidatedAuthoritativeUsm> {
+    let mut validation_order: Vec<_> = users
+        .iter()
+        .map(|(key, config)| (config.username().clone(), key.clone()))
+        .collect();
+    validation_order.sort_unstable();
+    for (_, key) in validation_order {
+        let config = users
+            .get_mut(&key)
+            .expect("key was collected from the same map");
         config.validate_and_precompute().map_err(|error| {
             Error::Config(format!("{invalid_user_context}: {error}").into()).boxed()
         })?;
     }
 
     let (authoritative_engine, configured_engine) = match authoritative_engine {
+        Some(engine) if defer_engine_time => (Some(engine), None),
         Some(engine) => {
             let (engine_boots, _) = engine.current_boots_time()?;
             let engine_id = Bytes::copy_from_slice(engine.engine_id());
@@ -105,25 +158,6 @@ pub(crate) fn validate_authoritative_usm(
         authoritative_engine,
         configured_engine,
     })
-}
-
-/// Validate inbound USM users and prepare the local authoritative engine seed.
-#[cfg(feature = "agent")]
-pub(crate) fn prepare_authoritative_usm(
-    users: HashMap<Bytes, UsmUser>,
-    authoritative_engine: Option<AuthoritativeEngine>,
-    requires_engine: bool,
-    invalid_user_context: &str,
-    missing_engine_context: &str,
-) -> Result<PreparedAuthoritativeUsm> {
-    validate_authoritative_usm(
-        users,
-        authoritative_engine,
-        requires_engine,
-        invalid_user_context,
-        missing_engine_context,
-    )?
-    .prepare(crate::v3::generate_engine_id)
 }
 
 /// Create and bind a UDP socket with optional buffer sizes.
@@ -184,6 +218,86 @@ pub(crate) async fn bind_udp_socket(
     socket.bind(&addr.into())?;
 
     UdpSocket::from_std(socket.into())
+}
+
+#[cfg(test)]
+mod usm_validation_tests {
+    use super::*;
+
+    fn invalid_user_error_with_keys(users: impl IntoIterator<Item = (Bytes, UsmUser)>) -> String {
+        validate_authoritative_usm(
+            users.into_iter().collect(),
+            None,
+            false,
+            "invalid user",
+            "missing engine",
+        )
+        .err()
+        .expect("at least one user must be invalid")
+        .to_string()
+    }
+
+    fn invalid_user_error(users: impl IntoIterator<Item = Bytes>) -> String {
+        invalid_user_error_with_keys(
+            users
+                .into_iter()
+                .map(|username| (username.clone(), UsmUser::new(username))),
+        )
+    }
+
+    #[test]
+    fn authoritative_usm_validation_reports_first_invalid_username_by_octets() {
+        let lexically_first = Bytes::from(vec![0x01; 34]);
+        let lexically_second = Bytes::from(vec![0x02; 33]);
+
+        for users in [
+            vec![lexically_first.clone(), lexically_second.clone()],
+            vec![lexically_second.clone(), lexically_first.clone()],
+        ] {
+            let error = invalid_user_error(users);
+            assert!(error.contains("got 34"), "unexpected error: {error}");
+        }
+
+        for users in [
+            vec![
+                (
+                    Bytes::from_static(b"a-map-key"),
+                    UsmUser::new(lexically_second.clone()),
+                ),
+                (
+                    Bytes::from_static(b"z-map-key"),
+                    UsmUser::new(lexically_first.clone()),
+                ),
+            ],
+            vec![
+                (
+                    Bytes::from_static(b"z-map-key"),
+                    UsmUser::new(lexically_first.clone()),
+                ),
+                (
+                    Bytes::from_static(b"a-map-key"),
+                    UsmUser::new(lexically_second.clone()),
+                ),
+            ],
+        ] {
+            let error = invalid_user_error_with_keys(users);
+            assert!(error.contains("got 34"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn authoritative_usm_validation_order_is_stable_with_empty_and_overlong_users() {
+        let empty = Bytes::new();
+        let overlong = Bytes::from(vec![b'z'; 33]);
+
+        for users in [
+            vec![empty.clone(), overlong.clone()],
+            vec![overlong.clone(), empty.clone()],
+        ] {
+            let error = invalid_user_error(users);
+            assert!(error.contains("got 0"), "unexpected error: {error}");
+        }
+    }
 }
 
 #[cfg(test)]

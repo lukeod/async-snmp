@@ -78,12 +78,12 @@
 
 use super::udp_core::UdpCore;
 pub use super::udp_core::UdpStats;
-use super::{Candidate, RequestRegistration, Transport, extract_request_id};
+use super::{Candidate, RequestRegistration, Transport, extract_request_id, normalize_udp_target};
 use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
 use crate::util::bind_udp_socket;
 use bytes::Bytes;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -181,42 +181,12 @@ impl UdpTransport {
     /// Returns [`Error::Config`] when an IPv4 socket is paired with a native
     /// IPv6 target, because that target cannot be represented by the socket.
     pub fn handle(&self, target: SocketAddr) -> Result<UdpHandle> {
-        let target = self.map_to_socket_family(target)?;
+        let target = normalize_udp_target(self.inner.local_addr, target)?;
         Ok(UdpHandle {
             inner: self.inner.clone(),
             target,
             strict_source: false,
         })
-    }
-
-    /// Map a target address to match this transport's socket family.
-    ///
-    /// Converts IPv4 targets to IPv4-mapped IPv6 addresses when the socket
-    /// is IPv6, enabling dual-stack usage on platforms where the kernel does
-    /// not perform this mapping implicitly (macOS, BSD). For an IPv4 socket,
-    /// mapped IPv6 targets are normalized to IPv4 and native IPv6 targets are
-    /// rejected before any I/O.
-    fn map_to_socket_family(&self, target: SocketAddr) -> Result<SocketAddr> {
-        match (self.inner.local_addr, target) {
-            (SocketAddr::V6(_), SocketAddr::V4(target)) => Ok(SocketAddr::new(
-                IpAddr::V6(target.ip().to_ipv6_mapped()),
-                target.port(),
-            )),
-            (SocketAddr::V4(_), SocketAddr::V6(target)) => {
-                let Some(ip) = target.ip().to_ipv4_mapped() else {
-                    return Err(Error::Config(
-                        format!(
-                            "UDP target {target} is incompatible with IPv4 socket {}",
-                            self.inner.local_addr
-                        )
-                        .into(),
-                    )
-                    .boxed());
-                };
-                Ok(SocketAddr::new(IpAddr::V4(ip), target.port()))
-            }
-            (_, target) => Ok(target),
-        }
     }
 
     /// Get the local bind address.
