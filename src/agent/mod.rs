@@ -323,6 +323,7 @@ pub struct AgentBuilder {
     trap_send_timeout: Duration,
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
+    response_send_timeout: Duration,
     disabled_builtins: HashSet<BuiltinMib>,
 }
 
@@ -358,6 +359,7 @@ struct ValidatedAgentBuilder {
     trap_send_timeout: Duration,
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
+    response_send_timeout: Duration,
     disabled_builtins: HashSet<BuiltinMib>,
     requires_privacy: bool,
 }
@@ -391,6 +393,7 @@ impl AgentBuilder {
             trap_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
             inform_timeout: Duration::from_secs(5),
             inform_retry: crate::client::Retry::default(),
+            response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
             disabled_builtins: HashSet::new(),
         }
     }
@@ -925,6 +928,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the deadline for each agent response send.
+    ///
+    /// The default is five seconds. Expiry releases the request concurrency
+    /// permit so stalled socket writes cannot prevent graceful shutdown.
+    #[must_use]
+    pub fn response_send_timeout(mut self, timeout: Duration) -> Self {
+        self.response_send_timeout = timeout;
+        self
+    }
+
     /// Disable a specific built-in MIB handler group.
     ///
     /// By default, the agent registers handlers for snmpEngine, USM stats,
@@ -1137,6 +1150,11 @@ impl AgentBuilder {
                 trap_sinks,
                 notification_id: std::sync::atomic::AtomicI32::new(1),
                 run_active: AtomicBool::new(false),
+                response_send_timeout: config.response_send_timeout,
+                #[cfg(test)]
+                response_send_gate: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                response_sends_started: AtomicU32::new(0),
             }),
         })
     }
@@ -1147,6 +1165,7 @@ impl AgentBuilder {
         // security configuration, then address syntax and family.
         crate::transport::checked_deadline(self.trap_send_timeout, "trap send timeout")?;
         crate::transport::checked_deadline(self.inform_timeout, "inform timeout")?;
+        crate::transport::checked_deadline(self.response_send_timeout, "response send timeout")?;
 
         if matches!(self.authorization, AgentAuthorization::Conflict) {
             return Err(Error::Config(
@@ -1256,6 +1275,7 @@ impl AgentBuilder {
             trap_send_timeout: self.trap_send_timeout,
             inform_timeout: self.inform_timeout,
             inform_retry: self.inform_retry,
+            response_send_timeout: self.response_send_timeout,
             disabled_builtins: self.disabled_builtins,
             requires_privacy,
         })
@@ -1408,6 +1428,11 @@ pub(crate) struct AgentInner {
     pub(crate) notification_id: std::sync::atomic::AtomicI32,
     /// Shared across clones to enforce one active service loop.
     pub(crate) run_active: AtomicBool,
+    pub(crate) response_send_timeout: Duration,
+    #[cfg(test)]
+    pub(crate) response_send_gate: std::sync::Mutex<Option<Arc<Semaphore>>>,
+    #[cfg(test)]
+    pub(crate) response_sends_started: AtomicU32,
 }
 
 /// SNMP Agent.
@@ -1824,10 +1849,29 @@ impl Agent {
         data: &[u8],
         recv_meta: &ReceivedDatagram,
     ) -> std::io::Result<()> {
-        self.inner
-            .udp_responder
-            .reply(&self.inner.socket, data, recv_meta)
-            .await
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.response_send_timeout)
+            .expect("response send timeout validated by builder");
+        let timeout_error =
+            || std::io::Error::new(std::io::ErrorKind::TimedOut, "response send timed out");
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timeout_error());
+        }
+        #[cfg(test)]
+        let response_send_gate = self.inner.response_send_gate.lock().unwrap().clone();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
+            result = async {
+                #[cfg(test)]
+                self.inner.response_sends_started.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                if let Some(gate) = &response_send_gate {
+                    gate.acquire().await.expect("test send gate remains open").forget();
+                }
+                self.inner.udp_responder.reply(&self.inner.socket, data, recv_meta).await
+            } => result,
+        }
     }
 
     /// Process a single request and return the response bytes.
@@ -2475,6 +2519,84 @@ mod tests {
             agent.run().await.is_ok(),
             "a later call must acquire the guard"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_response_send_does_not_block_graceful_shutdown() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .without_builtin_handlers()
+            .max_concurrent_requests(Some(1))
+            .response_send_timeout(Duration::from_millis(20))
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        *agent.inner.response_send_gate.lock().unwrap() = Some(Arc::new(Semaphore::new(0)));
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = crate::message::CommunityMessage::new(
+            Version::V2c,
+            Bytes::from_static(b"public"),
+            Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        client.send_to(&request, agent.local_addr()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while agent.inner.response_sends_started.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        agent.cancel().cancel();
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("graceful shutdown remained blocked on response send")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_response_timeout_emits_no_agent_response() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .without_builtin_handlers()
+            .response_send_timeout(Duration::ZERO)
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = crate::message::CommunityMessage::new(
+            Version::V2c,
+            Bytes::from_static(b"public"),
+            Pdu::get_request(8, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        client.send_to(&request, agent.local_addr()).await.unwrap();
+        let mut response = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), client.recv_from(&mut response))
+                .await
+                .is_err()
+        );
+        agent.cancel().cancel();
+        run.await.unwrap().unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -4656,6 +4778,21 @@ mod tests {
 
         let err = result.err().expect("expected build to fail");
         assert!(matches!(*err, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_response_send_timeout_precedes_bind() {
+        let error = Agent::builder()
+            .bind("not a socket address")
+            .response_send_timeout(Duration::MAX)
+            .build()
+            .await
+            .err()
+            .expect("invalid timeout must fail");
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("response send timeout")
+        ));
     }
 
     fn unavailable_engine_id() -> Result<Bytes> {

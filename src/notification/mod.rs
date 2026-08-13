@@ -188,7 +188,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::Community;
 use bytes::Bytes;
@@ -587,6 +587,7 @@ pub struct NotificationReceiverBuilder {
     decode_policy: crate::message::DecodePolicy,
     compatibility_policy: crate::CompatibilityPolicy,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
+    response_send_timeout: Duration,
 }
 
 impl NotificationReceiverBuilder {
@@ -610,6 +611,7 @@ impl NotificationReceiverBuilder {
             decode_policy: crate::message::DecodePolicy::Compatible,
             compatibility_policy: crate::CompatibilityPolicy::default(),
             acceptance_policy: None,
+            response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
         }
     }
 
@@ -651,6 +653,16 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
+        self
+    }
+
+    /// Set the deadline for each Inform acknowledgement or SNMPv3 Report send.
+    ///
+    /// The default is five seconds. Expiry releases the receiver's FIFO turn,
+    /// allowing the next cloned receiver to continue.
+    #[must_use]
+    pub fn response_send_timeout(mut self, timeout: Duration) -> Self {
+        self.response_send_timeout = timeout;
         self
     }
 
@@ -923,6 +935,10 @@ impl NotificationReceiverBuilder {
             )
             .boxed());
         }
+        crate::transport::checked_deadline(
+            self.response_send_timeout,
+            "notification response send timeout",
+        )?;
 
         let requires_privacy = self
             .usm_users
@@ -983,6 +999,11 @@ impl NotificationReceiverBuilder {
                 compatibility_policy: self.compatibility_policy,
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: self.acceptance_policy,
+                response_send_timeout: self.response_send_timeout,
+                #[cfg(test)]
+                response_send_gate: Mutex::new(None),
+                #[cfg(test)]
+                response_sends_started: AtomicU32::new(0),
                 recv_gate: AsyncMutex::new(vec![0; crate::UDP_RECEIVE_BUFFER_SIZE]),
             }),
         })
@@ -1289,6 +1310,11 @@ struct ReceiverInner {
     /// Confirmed notifications dropped because even the alternate Response did not fit.
     snmp_silent_drops: AtomicU32,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
+    response_send_timeout: Duration,
+    #[cfg(test)]
+    response_send_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    #[cfg(test)]
+    response_sends_started: AtomicU32,
     /// Fairly serializes cloned `recv` calls and retains their shared UDP buffer.
     recv_gate: AsyncMutex<Vec<u8>>,
 }
@@ -1526,6 +1552,9 @@ impl NotificationReceiver {
     /// [`Self::snmp_silent_drops`] increments, and this method still returns
     /// the accepted notification. Return therefore does not prove that the
     /// originator received an acknowledgement.
+    /// A response write that exceeds the configured
+    /// [`NotificationReceiverBuilder::response_send_timeout`] returns a
+    /// network timeout error and releases this call's FIFO turn.
     ///
     /// V1/v2c community and content are cleartext and unverified unless a
     /// community allowlist was configured. Even an allowlist match provides no
@@ -1571,6 +1600,12 @@ impl NotificationReceiver {
             {
                 Ok(Some(notification)) => return Ok((notification, source)),
                 Ok(None) => {} // Not a notification PDU, ignore
+                Err(e) if matches!(&*e, Error::Network { source, .. } if source.kind() == std::io::ErrorKind::TimedOut) =>
+                {
+                    // A bounded response-write failure terminates this call so
+                    // its FIFO turn is released to the next cloned receiver.
+                    return Err(e);
+                }
                 Err(e) => {
                     // Log parsing error but continue receiving
                     tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to parse notification");
@@ -1601,10 +1636,33 @@ impl NotificationReceiver {
         destination: SocketAddr,
         source: Option<crate::udp_responder::DestinationMetadata>,
     ) -> std::io::Result<()> {
-        self.inner
-            .udp_responder
-            .send_to(&self.inner.socket, data, destination, source)
-            .await
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.response_send_timeout)
+            .expect("response send timeout validated by builder");
+        let timeout_error = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "notification response send timed out",
+            )
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timeout_error());
+        }
+        #[cfg(test)]
+        let response_send_gate = self.inner.response_send_gate.lock().unwrap().clone();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
+            result = async {
+                #[cfg(test)]
+                self.inner.response_sends_started.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                if let Some(gate) = &response_send_gate {
+                    gate.acquire().await.expect("test send gate remains open").forget();
+                }
+                self.inner.udp_responder.send_to(&self.inner.socket, data, destination, source).await
+            } => result,
+        }
     }
 }
 
@@ -1621,6 +1679,21 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_response_send_timeout_precedes_bind() {
+        let error = NotificationReceiver::builder()
+            .bind("not a socket address")
+            .response_send_timeout(Duration::MAX)
+            .build()
+            .await
+            .err()
+            .expect("invalid timeout must fail");
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("notification response send timeout")
+        ));
+    }
 
     #[tokio::test]
     async fn decoding_policy_defaults_strict_preset_and_targeted_override() {
@@ -4651,6 +4724,86 @@ mod tests {
             .await
             .is_err(),
             "one accepted Inform must produce exactly one acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_timeout_releases_fifo_turn_for_cloned_receiver() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .response_send_timeout(Duration::from_millis(20))
+            .build()
+            .await
+            .unwrap();
+        *receiver.inner.response_send_gate.lock().unwrap() =
+            Some(Arc::new(tokio::sync::Semaphore::new(0)));
+        let first_receiver = receiver.clone();
+        let second_receiver = receiver.clone();
+        let first = tokio::spawn(async move { first_receiver.recv().await });
+        let second = tokio::spawn(async move { second_receiver.recv().await });
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        sender
+            .send_to(&build_v2c_inform(b"public"), receiver.local_addr())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while receiver
+                .inner
+                .response_sends_started
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        sender
+            .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
+            .await
+            .unwrap();
+
+        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first receiver did not release its FIFO turn")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            &*first_error,
+            Error::Network { source, .. } if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        let (notification, _) = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second receiver remained blocked after response timeout")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(notification, Notification::TrapV2c { .. }));
+    }
+
+    #[tokio::test]
+    async fn zero_response_timeout_emits_no_inform_acknowledgement() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .response_send_timeout(Duration::ZERO)
+            .build()
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let error = receiver
+            .handle_v2c(build_v2c_inform(b"public"), sender.local_addr().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &*error,
+            Error::Network { source, .. } if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), sender.recv_from(&mut buf))
+                .await
+                .is_err()
         );
     }
 

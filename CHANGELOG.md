@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded total discovery deadline; uncommon errors may use the transparent
   `Error::SharedOperation` wrapper and remain classifiable through
   `Error::kind`, `Error::exchange_source`, and `Error::response_metadata`.
+- Agent replies and notification Inform/Report responses now have configurable
+  send deadlines through `AgentBuilder::response_send_timeout` and
+  `NotificationReceiverBuilder::response_send_timeout`, defaulting to five
+  seconds. A notification response timeout terminates that `recv` call and
+  releases its FIFO turn; agent shutdown drains response attempts only through
+  their bounded deadline.
 
 - **Breaking:** `RequestContext` fields are private and exposed through
   read-only accessors, preventing callers from constructing or mutating
