@@ -287,6 +287,15 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async { Ok(()) })
+        }
+
         fn free<'a>(
             &'a mut self,
             _ctx: &'a RequestContext,
@@ -350,6 +359,15 @@ mod tests {
             _oid: &'a Oid,
             _value: &'a Value,
         ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -515,6 +533,15 @@ mod tests {
             _value: &'a Value,
         ) -> BoxFuture<'a, SetCommitResult> {
             self.commit_count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -688,6 +715,7 @@ mod tests {
         fail_commit_oid: Oid,
         fail_undo_oids: Vec<Oid>,
         calls: Arc<Mutex<SetLifecycleCalls>>,
+        values: Arc<Mutex<Vec<i32>>>,
     }
 
     struct FalliblePreparedSet {
@@ -695,6 +723,8 @@ mod tests {
         fail_commit_oid: Oid,
         fail_undo_oids: Vec<Oid>,
         calls: Arc<Mutex<SetLifecycleCalls>>,
+        values: Arc<Mutex<Vec<i32>>>,
+        previous: Option<i32>,
     }
 
     impl Drop for FalliblePreparedSet {
@@ -712,10 +742,18 @@ mod tests {
             &'a mut self,
             _ctx: &'a RequestContext,
             oid: &'a Oid,
-            _value: &'a Value,
+            value: &'a Value,
         ) -> BoxFuture<'a, SetCommitResult> {
             assert_eq!(oid, &self.prepared_oid);
             self.calls.lock().unwrap().commit.push(oid.clone());
+            let index = usize::try_from(oid.as_ref()[7] - 1).unwrap();
+            let Value::Integer(value) = value else {
+                unreachable!("test supplies integer values")
+            };
+            self.previous = Some(std::mem::replace(
+                &mut self.values.lock().unwrap()[index],
+                *value,
+            ));
             let result = if oid == &self.fail_commit_oid {
                 Err(SetCommitError::Failed)
             } else {
@@ -736,6 +774,10 @@ mod tests {
                 if self.fail_undo_oids.contains(oid) {
                     Err(SetUndoError::Failed)
                 } else {
+                    if let Some(previous) = self.previous.take() {
+                        let index = usize::try_from(oid.as_ref()[7] - 1).unwrap();
+                        self.values.lock().unwrap()[index] = previous;
+                    }
                     Ok(())
                 }
             })
@@ -808,6 +850,8 @@ mod tests {
                     fail_commit_oid: self.fail_commit_oid.clone(),
                     fail_undo_oids: self.fail_undo_oids.clone(),
                     calls: self.calls.clone(),
+                    values: self.values.clone(),
+                    previous: None,
                 }) as Box<dyn PreparedSet>)
             })
         }
@@ -831,13 +875,15 @@ mod tests {
         version: Version,
         fail_commit: u32,
         fail_undos: &[u32],
-    ) -> (Pdu, SetLifecycleCalls) {
+    ) -> (Pdu, SetLifecycleCalls, Vec<i32>) {
         let calls = Arc::new(Mutex::new(SetLifecycleCalls::default()));
+        let values = Arc::new(Mutex::new(vec![10, 20, 30]));
         let handler = Arc::new(CommitFailHandler {
             fail_test_oid: None,
             fail_commit_oid: set_oid(fail_commit),
             fail_undo_oids: set_oids(fail_undos),
             calls: calls.clone(),
+            values: values.clone(),
         });
 
         let agent = Agent::builder()
@@ -859,7 +905,8 @@ mod tests {
         let ctx = crate::test_support::request_context_for_version(version, PduType::SetRequest);
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         let calls = calls.lock().unwrap().clone();
-        (response, calls)
+        let values = values.lock().unwrap().clone();
+        (response, calls, values)
     }
 
     fn assert_commit_failure_lifecycle(
@@ -900,26 +947,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_failure_at_first_undoes_failed_and_frees_trailing() {
-        let (response, calls) = run_commit_scenario(Version::V2c, 1, &[]).await;
+        let (response, calls, values) = run_commit_scenario(Version::V2c, 1, &[]).await;
         assert_commit_failure_lifecycle(&response, &calls, 1, &[1], &[1], &[3, 2]);
+        assert_eq!(values, [10, 20, 30]);
     }
 
     #[tokio::test]
     async fn test_commit_failure_in_middle_undoes_attempted_and_frees_trailing() {
-        let (response, calls) = run_commit_scenario(Version::V2c, 2, &[]).await;
+        let (response, calls, values) = run_commit_scenario(Version::V2c, 2, &[]).await;
         assert_commit_failure_lifecycle(&response, &calls, 2, &[1, 2], &[2, 1], &[3]);
+        assert_eq!(values, [10, 20, 30]);
     }
 
     #[tokio::test]
     async fn test_commit_failure_at_end_undoes_all_attempted() {
-        let (response, calls) = run_commit_scenario(Version::V2c, 3, &[]).await;
+        let (response, calls, values) = run_commit_scenario(Version::V2c, 3, &[]).await;
         assert_commit_failure_lifecycle(&response, &calls, 3, &[1, 2, 3], &[3, 2, 1], &[]);
+        assert_eq!(values, [10, 20, 30]);
     }
 
     #[tokio::test]
     async fn commit_failure_mapping_uses_commit_binding_for_all_versions() {
         for version in [Version::V1, Version::V2c, Version::V3] {
-            let (response, calls) = run_commit_scenario(version, 2, &[]).await;
+            let (response, calls, values) = run_commit_scenario(version, 2, &[]).await;
             let expected_status = if version == Version::V1 {
                 ErrorStatus::GenErr
             } else {
@@ -935,6 +985,7 @@ mod tests {
             assert_eq!(calls.commit, set_oids(&[1, 2]));
             assert_eq!(calls.undo, set_oids(&[2, 1]));
             assert_eq!(calls.free, set_oids(&[3]));
+            assert_eq!(values, [10, 20, 30]);
         }
     }
 
@@ -942,7 +993,8 @@ mod tests {
     async fn undo_failure_mapping_tracks_failed_undo_binding_for_all_versions() {
         for failed_undo in [2, 1] {
             for version in [Version::V1, Version::V2c, Version::V3] {
-                let (response, calls) = run_commit_scenario(version, 2, &[failed_undo]).await;
+                let (response, calls, _values) =
+                    run_commit_scenario(version, 2, &[failed_undo]).await;
                 let (expected_status, expected_index) = if version == Version::V1 {
                     (ErrorStatus::GenErr, failed_undo as i32)
                 } else {
@@ -974,7 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_undo_failures_report_first_failure_in_reverse_order() {
         for version in [Version::V1, Version::V2c, Version::V3] {
-            let (response, calls) = run_commit_scenario(version, 2, &[1, 2]).await;
+            let (response, calls, _values) = run_commit_scenario(version, 2, &[1, 2]).await;
             let (expected_status, expected_index) = if version == Version::V1 {
                 (ErrorStatus::GenErr, 2)
             } else {
@@ -997,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_commits_succeed_finalize_in_reverse_order() {
-        let (response, calls) = run_commit_scenario(Version::V2c, 99, &[]).await;
+        let (response, calls, values) = run_commit_scenario(Version::V2c, 99, &[]).await;
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(calls.test, set_oids(&[1, 2, 3]));
@@ -1006,6 +1058,7 @@ mod tests {
         assert!(calls.free.is_empty());
         assert_eq!(calls.finalize, set_oids(&[3, 2, 1]));
         assert_eq!(calls.drop, set_oids(&[3, 2, 1]));
+        assert_eq!(values, [1, 2, 3]);
     }
 
     #[tokio::test]
@@ -1016,6 +1069,7 @@ mod tests {
             fail_commit_oid: set_oid(99),
             fail_undo_oids: Vec::new(),
             calls: calls.clone(),
+            values: Arc::new(Mutex::new(vec![10, 20, 30])),
         });
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
@@ -1071,6 +1125,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((TAG, "commit", ctx.request_id(), oid.clone()));
+            Box::pin(async { Ok(()) })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
             Box::pin(async { Ok(()) })
         }
     }

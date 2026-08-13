@@ -7,10 +7,8 @@
 //! 2. **PreparedSet::commit** - Apply the change
 //! 3. **PreparedSet::finalize** - Release successful transaction state
 //!
-//! After validation, both commits in this example are infallible and reserve no
-//! resources, so the default terminal methods are sufficient. A handler whose
-//! commit can fail must retain the previous value in its prepared object and
-//! restore it from `undo`.
+//! Each prepared change retains the previous value so `undo` can restore it if
+//! a later binding's commit fails.
 //!
 //! The example exposes a small configuration subtree under a private
 //! enterprise OID with two writable scalars (a string and an integer)
@@ -21,7 +19,7 @@
 use async_snmp::agent::Agent;
 use async_snmp::handler::{
     BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet, RequestContext,
-    SetCommitResult, SetTestError, SetTestResult,
+    SetCommitResult, SetTestError, SetTestResult, SetUndoResult,
 };
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
@@ -49,10 +47,12 @@ enum ConfigChange {
     Name {
         target: Arc<RwLock<Bytes>>,
         value: Bytes,
+        previous: Option<Bytes>,
     },
     Interval {
         target: Arc<RwLock<i32>>,
         value: i32,
+        previous: Option<i32>,
     },
 }
 
@@ -69,15 +69,59 @@ impl PreparedSet for PreparedConfigSet {
         _value: &'a Value,
     ) -> BoxFuture<'a, SetCommitResult> {
         Box::pin(async move {
-            match &self.change {
-                ConfigChange::Name { target, value } => {
-                    *target.write().unwrap() = value.clone();
+            match &mut self.change {
+                ConfigChange::Name {
+                    target,
+                    value,
+                    previous,
+                } => {
+                    *previous = Some(std::mem::replace(
+                        &mut *target.write().unwrap(),
+                        value.clone(),
+                    ));
                 }
-                ConfigChange::Interval { target, value } => {
-                    *target.write().unwrap() = *value;
+                ConfigChange::Interval {
+                    target,
+                    value,
+                    previous,
+                } => {
+                    *previous = Some(std::mem::replace(&mut *target.write().unwrap(), *value));
                 }
             }
             self.change_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    fn undo<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, SetUndoResult> {
+        Box::pin(async move {
+            let mut restored = false;
+            match &mut self.change {
+                ConfigChange::Name {
+                    target, previous, ..
+                } => {
+                    if let Some(previous) = previous.take() {
+                        *target.write().unwrap() = previous;
+                        restored = true;
+                    }
+                }
+                ConfigChange::Interval {
+                    target, previous, ..
+                } => {
+                    if let Some(previous) = previous.take() {
+                        *target.write().unwrap() = previous;
+                        restored = true;
+                    }
+                }
+            }
+            if restored {
+                self.change_count.fetch_sub(1, Ordering::Relaxed);
+            }
             Ok(())
         })
     }
@@ -173,6 +217,7 @@ impl MibHandler for ConfigHandler {
                             change: ConfigChange::Name {
                                 target: self.name.clone(),
                                 value: bytes.clone(),
+                                previous: None,
                             },
                             change_count: self.change_count.clone(),
                         }) as Box<dyn PreparedSet>)
@@ -186,6 +231,7 @@ impl MibHandler for ConfigHandler {
                         change: ConfigChange::Interval {
                             target: self.interval.clone(),
                             value: *v,
+                            previous: None,
                         },
                         change_count: self.change_count.clone(),
                     })

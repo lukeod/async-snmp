@@ -71,12 +71,10 @@ pub trait PreparedSet: Send + 'static {
     /// dropped; `Drop` must tolerate the already-disarmed state.
     fn undo<'a>(
         &'a mut self,
-        _ctx: &'a RequestContext,
-        _oid: &'a Oid,
-        _value: &'a Value,
-    ) -> BoxFuture<'a, SetUndoResult> {
-        Box::pin(async { Ok(()) })
-    }
+        ctx: &'a RequestContext,
+        oid: &'a Oid,
+        value: &'a Value,
+    ) -> BoxFuture<'a, SetUndoResult>;
 
     /// Release a reservation whose commit was never attempted.
     ///

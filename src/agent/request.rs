@@ -379,7 +379,7 @@ mod tests {
     use super::*;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet,
-        RequestContext, SecurityModel, SetCommitResult, SetTestResult,
+        RequestContext, SecurityModel, SetCommitResult, SetTestResult, SetUndoResult,
     };
     use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
     use crate::oid;
@@ -409,6 +409,15 @@ mod tests {
             _value: &'a Value,
         ) -> BoxFuture<'a, SetCommitResult> {
             self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -1249,6 +1258,15 @@ mod tests {
                 self.state.set_authoritative_elapsed_for_test(128);
                 Ok(())
             })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async { Ok(()) })
         }
     }
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_snmp::handler::{
     BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet, RequestContext,
-    SetCommitResult, SetTestResult,
+    SetCommitResult, SetTestResult, SetUndoResult,
 };
 use async_snmp::{Agent, Auth, Client, Oid, Retry, Value, oid};
 use tokio::sync::Semaphore;
@@ -173,6 +173,15 @@ impl PreparedSet for BlockingPreparedSet {
             self.committed.store(true, Ordering::SeqCst);
             Ok(())
         })
+    }
+
+    fn undo<'a>(
+        &'a mut self,
+        _ctx: &'a RequestContext,
+        _oid: &'a Oid,
+        _value: &'a Value,
+    ) -> BoxFuture<'a, SetUndoResult> {
+        Box::pin(async { Ok(()) })
     }
 }
 
