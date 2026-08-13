@@ -148,6 +148,125 @@ const V3_PRIV_OVERHEAD: usize = 20;
 /// it is an internal processing failure rather than evidence of end-of-MIB.
 const MAX_GETNEXT_SKIP_ITERATIONS: usize = 1000;
 
+const AGENT_RECV_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(1);
+const AGENT_RECV_ERROR_BACKOFF_MAX: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiveErrorClass {
+    DatagramLocal,
+    Transient,
+    Fatal,
+}
+
+fn next_agent_recv_error_backoff(current: Duration) -> Duration {
+    match current {
+        Duration::ZERO => AGENT_RECV_ERROR_BACKOFF_MIN,
+        duration => (duration * 2).min(AGENT_RECV_ERROR_BACKOFF_MAX),
+    }
+}
+
+fn classify_receive_error(error: &std::io::Error) -> ReceiveErrorClass {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        return ReceiveErrorClass::DatagramLocal;
+    }
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::OutOfMemory
+    ) || error.raw_os_error().is_some_and(transient_recv_errno)
+    {
+        return ReceiveErrorClass::Transient;
+    }
+    ReceiveErrorClass::Fatal
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+))]
+fn transient_recv_errno(code: i32) -> bool {
+    use nix::libc;
+
+    matches!(
+        code,
+        libc::EAGAIN
+            | libc::EINTR
+            | libc::ENOBUFS
+            | libc::ENOMEM
+            | libc::ECONNREFUSED
+            | libc::ECONNRESET
+            | libc::ENETDOWN
+            | libc::ENETUNREACH
+            | libc::EHOSTUNREACH
+    )
+}
+
+#[cfg(any(target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
+fn transient_recv_errno(code: i32) -> bool {
+    matches!(
+        code,
+        libc::EAGAIN
+            | libc::EINTR
+            | libc::ENOBUFS
+            | libc::ENOMEM
+            | libc::ECONNREFUSED
+            | libc::ECONNRESET
+            | libc::ENETDOWN
+            | libc::ENETUNREACH
+            | libc::EHOSTUNREACH
+    )
+}
+
+#[cfg(windows)]
+fn transient_recv_errno(code: i32) -> bool {
+    use windows_sys::Win32::Networking::WinSock;
+
+    matches!(
+        code,
+        WinSock::WSAEINTR
+            | WinSock::WSAEWOULDBLOCK
+            | WinSock::WSAENOBUFS
+            | WinSock::WSAECONNREFUSED
+            | WinSock::WSAECONNRESET
+            | WinSock::WSAENETDOWN
+            | WinSock::WSAENETUNREACH
+            | WinSock::WSAEHOSTUNREACH
+    )
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    windows,
+)))]
+fn transient_recv_errno(_code: i32) -> bool {
+    false
+}
+
 /// Clears the shared active-run flag whenever an [`Agent::run`] future exits or
 /// is dropped.
 struct RunGuard<'a> {
@@ -1155,6 +1274,10 @@ impl AgentBuilder {
                 response_send_gate: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 response_sends_started: AtomicU32::new(0),
+                #[cfg(test)]
+                receive_errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                #[cfg(test)]
+                receive_attempts: AtomicU32::new(0),
             }),
         })
     }
@@ -1433,6 +1556,10 @@ pub(crate) struct AgentInner {
     pub(crate) response_send_gate: std::sync::Mutex<Option<Arc<Semaphore>>>,
     #[cfg(test)]
     pub(crate) response_sends_started: AtomicU32,
+    #[cfg(test)]
+    receive_errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
+    #[cfg(test)]
+    receive_attempts: AtomicU32,
 }
 
 /// SNMP Agent.
@@ -1726,6 +1853,9 @@ impl Agent {
     ///
     /// Only one active call to `run` is supported for an agent. Cloned handles
     /// may still be used for other agent operations while that call is active.
+    /// Datagram-local receive metadata errors are discarded. Known transient
+    /// socket errors are retried with bounded backoff; invalid or unknown
+    /// socket-state errors terminate the service and are returned.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn run(&self) -> Result<()> {
         self.inner
@@ -1738,6 +1868,7 @@ impl Agent {
 
         let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
         let mut request_tasks = RequestTasks::new(self.inner.cancel.child_token());
+        let mut recv_error_backoff = Duration::ZERO;
 
         let log_task_result = |result: std::result::Result<(), JoinError>| {
             if let Err(error) = result {
@@ -1760,8 +1891,36 @@ impl Agent {
                     }
                     result = self.recv_packet(&mut buf) => {
                         match result {
-                            Ok(recv_meta) => break recv_meta,
-                            Err(error) => break 'service Err(error),
+                            Ok(recv_meta) => {
+                                recv_error_backoff = Duration::ZERO;
+                                break recv_meta;
+                            }
+                            Err(error) => match classify_receive_error(&error) {
+                                ReceiveErrorClass::DatagramLocal => {
+                                    recv_error_backoff = Duration::ZERO;
+                                    tracing::warn!(target: "async_snmp::agent", %error, "discarding datagram with invalid receive metadata");
+                                }
+                                ReceiveErrorClass::Transient => {
+                                    recv_error_backoff =
+                                        next_agent_recv_error_backoff(recv_error_backoff);
+                                    tracing::warn!(target: "async_snmp::agent", %error, backoff = ?recv_error_backoff, "transient UDP receive error");
+                                    tokio::select! {
+                                        biased;
+                                        () = self.inner.cancel.cancelled() => {
+                                            tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
+                                            break 'service Ok(());
+                                        }
+                                        () = tokio::time::sleep(recv_error_backoff) => {}
+                                    }
+                                }
+                                ReceiveErrorClass::Fatal => {
+                                    break 'service Err(Error::Network {
+                                        target: self.inner.local_addr,
+                                        source: error,
+                                    }
+                                    .boxed());
+                                }
+                            },
                         }
                     }
                 }
@@ -1832,18 +1991,15 @@ impl Agent {
         run_result
     }
 
-    async fn recv_packet(&self, buf: &mut [u8]) -> Result<ReceivedDatagram> {
-        self.inner
-            .udp_responder
-            .recv(&self.inner.socket, buf)
-            .await
-            .map_err(|source| {
-                Error::Network {
-                    target: self.inner.local_addr,
-                    source,
-                }
-                .boxed()
-            })
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<ReceivedDatagram> {
+        #[cfg(test)]
+        {
+            self.inner.receive_attempts.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = self.inner.receive_errors.lock().unwrap().pop_front() {
+                return Err(error);
+            }
+        }
+        self.inner.udp_responder.recv(&self.inner.socket, buf).await
     }
 
     async fn send_response(
@@ -2535,6 +2691,150 @@ mod tests {
             agent.run().await.is_ok(),
             "a later call must acquire the guard"
         );
+    }
+
+    #[test]
+    fn receive_error_classification_and_backoff_are_bounded() {
+        assert_eq!(
+            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::InvalidData)),
+            ReceiveErrorClass::DatagramLocal
+        );
+        assert_eq!(
+            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            ReceiveErrorClass::Transient
+        );
+        assert_eq!(
+            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::NetworkDown)),
+            ReceiveErrorClass::Transient
+        );
+        assert_eq!(
+            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            ReceiveErrorClass::Fatal
+        );
+        assert_eq!(
+            classify_receive_error(&std::io::Error::other("unclassified socket failure")),
+            ReceiveErrorClass::Fatal
+        );
+
+        let mut backoff = Duration::ZERO;
+        for _ in 0..16 {
+            backoff = next_agent_recv_error_backoff(backoff);
+        }
+        assert_eq!(backoff, AGENT_RECV_ERROR_BACKOFF_MAX);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+    ))]
+    #[test]
+    fn receive_error_classification_treats_enobufs_as_transient() {
+        assert_eq!(
+            classify_receive_error(&std::io::Error::from_raw_os_error(nix::libc::ENOBUFS)),
+            ReceiveErrorClass::Transient
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_receive_errors_do_not_stop_agent() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        {
+            let mut errors = agent.inner.receive_errors.lock().unwrap();
+            errors.push_back(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "injected datagram metadata failure",
+            ));
+            errors.push_back(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        }
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+
+        let request = crate::message::CommunityMessage::new(
+            Version::V2c,
+            Bytes::from_static(b"public"),
+            Pdu::get_request(17, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&request, agent.local_addr()).await.unwrap();
+        let mut response = [0_u8; 2048];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response))
+                .await
+                .expect("agent stopped after a recoverable receive error")
+                .unwrap();
+        let response =
+            crate::message::CommunityMessage::decode(Bytes::copy_from_slice(&response[..len]))
+                .unwrap();
+        assert_eq!(response.pdu().standard().unwrap().request_id, 17);
+
+        agent.cancel().cancel();
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_receive_error_stops_agent() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        agent
+            .inner
+            .receive_errors
+            .lock()
+            .unwrap()
+            .push_back(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+
+        let error = agent.run().await.unwrap_err();
+        let Error::Network { source, .. } = &*error else {
+            panic!("fatal receive error lost its network classification");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_interrupts_receive_error_backoff() {
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        agent
+            .inner
+            .receive_errors
+            .lock()
+            .unwrap()
+            .push_back(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        let before = tokio::time::Instant::now();
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        while agent.inner.receive_attempts.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        agent.cancel().cancel();
+        run.await.unwrap().unwrap();
+        assert_eq!(tokio::time::Instant::now(), before);
     }
 
     #[tokio::test]

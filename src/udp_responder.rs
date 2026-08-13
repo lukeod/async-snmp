@@ -732,12 +732,17 @@ mod platform {
             .address
             .as_ref()
             .and_then(decode_socket_addr)
-            .ok_or_else(|| io::Error::other("received a non-IP UDP address"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "received a non-IP UDP address")
+            })?;
         let mut destination_ip = None;
         let mut interface_index = 0;
         #[cfg(not(target_os = "freebsd"))]
         let mut ordinary_ipv4_local = None;
-        for control in message.cmsgs().map_err(io::Error::from)? {
+        for control in message
+            .cmsgs()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        {
             match control {
                 #[cfg(any(
                     target_os = "linux",
@@ -1063,7 +1068,9 @@ mod platform {
             })?;
             address.as_socket()
         }
-        .ok_or_else(|| io::Error::other("received a non-IP UDP address"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "received a non-IP UDP address")
+        })?;
 
         Ok(ReceivedDatagram {
             len: len as usize,
@@ -1508,7 +1515,9 @@ mod platform {
             })?;
             address.as_socket()
         }
-        .ok_or_else(|| io::Error::other("received a non-IP UDP address"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "received a non-IP UDP address")
+        })?;
 
         Ok(ReceivedDatagram {
             len: len as usize,

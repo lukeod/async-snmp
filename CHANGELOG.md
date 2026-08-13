@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Agent UDP receive failures are now classified by scope. Invalid per-datagram
+  metadata is discarded, known transient socket failures are retried with
+  cancellation-aware bounded backoff, and fatal or unknown socket-state errors
+  still terminate `Agent::run`.
 - **Breaking:** GETNEXT/GETBULK handler results are now validated against the
   `MibHandler` contract. Returned OIDs must be strictly increasing and owned by
   the producing handler according to `MibHandler::handles`; violations produce
