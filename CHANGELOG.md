@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds. A notification response timeout terminates that `recv` call and
   releases its FIFO turn; agent shutdown drains response attempts only through
   their bounded deadline.
+- Agent `snmpInASNParseErrs` accounting now covers actual ASN.1/BER decode
+  failures at the message-processing boundary. Unknown versions and decoded
+  SNMPv1 `Counter64` values remain version-semantic failures rather than parse
+  errors.
 
 - **Breaking:** `RequestContext` fields are private and exposed through
   read-only accessors, preventing callers from constructing or mutating

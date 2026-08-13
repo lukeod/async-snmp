@@ -3,12 +3,13 @@
 use bytes::Bytes;
 use std::net::SocketAddr;
 
+#[cfg(test)]
+use crate::Value;
 use crate::error::Result;
 use crate::handler::RequestContext;
 use crate::message::CommunityMessage;
 use crate::pdu::{PduType, ResponsePdu};
 use crate::v3::process::{MpdCounters, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
-use crate::value::Value;
 use crate::version::{CommunityVersion, Version};
 
 use std::sync::atomic::Ordering;
@@ -69,12 +70,8 @@ impl Agent {
             && pdu
                 .varbinds
                 .iter()
-                .any(|vb| matches!(vb.value, Value::Counter64(_)))
+                .any(|vb| matches!(vb.value, crate::Value::Counter64(_)))
         {
-            self.inner
-                .state
-                .snmp_in_asn_parse_errs
-                .fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 target: "async_snmp::agent",
                 source = %source,
@@ -723,18 +720,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v1_counter64_requests_are_dropped_before_dispatch() {
+    async fn v1_counter64_is_a_version_semantic_drop_not_an_asn_parse_error() {
         let callbacks = Arc::new(CallbackCounts::default());
         let agent = community_test_agent(Arc::clone(&callbacks)).await;
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        for (index, pdu_type) in [
+        for pdu_type in [
             PduType::GetRequest,
             PduType::GetNextRequest,
             PduType::SetRequest,
         ]
         .into_iter()
-        .enumerate()
         {
             let request = community_request(
                 Version::V1,
@@ -743,7 +739,7 @@ mod tests {
                 Value::Counter64(1_u64 << 40),
             );
             assert!(agent.handle_v1(request, source).await.unwrap().is_none());
-            assert_eq!(agent.snmp_in_asn_parse_errs(), index as u32 + 1);
+            assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
             assert_no_callbacks(&callbacks);
         }
 
@@ -768,8 +764,77 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(agent.snmp_in_asn_parse_errs(), 4);
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
         assert_no_callbacks(&callbacks);
+    }
+
+    #[tokio::test]
+    async fn agent_counts_wire_decode_failures_but_not_unknown_versions() {
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = community_test_agent(callbacks).await;
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        for malformed in [
+            Bytes::from_static(&[0x30, 0x01, 0x02]),
+            Bytes::from_static(&[0x30, 0x03, 0x02, 0x01, 0x01]),
+            Bytes::from_static(&[0x30, 0x03, 0x02, 0x01, 0x03]),
+        ] {
+            assert!(agent.handle_request(malformed, source).await.is_err());
+        }
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 3);
+
+        let unknown_version = Bytes::from_static(&[0x30, 0x03, 0x02, 0x01, 0x09]);
+        assert!(agent.handle_request(unknown_version, source).await.is_err());
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 3);
+    }
+
+    fn patch_first(data: &Bytes, pattern: &[u8], offset: usize, value: u8) -> Bytes {
+        let mut bytes = data.to_vec();
+        let position = bytes
+            .windows(pattern.len())
+            .position(|window| window == pattern)
+            .expect("encoded pattern must be present");
+        bytes[position + offset] = value;
+        Bytes::from(bytes)
+    }
+
+    #[tokio::test]
+    async fn agent_keeps_mpd_failures_out_of_asn_parse_errors() {
+        let engine_id = b"\x80\x00\x00\x00\x01mpdstats".to_vec();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("noauthuser", Ok)
+            .unwrap()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let source = "127.0.0.1:9999".parse().unwrap();
+        let request = build_noauth_msg(&engine_id, b"noauthuser", &engine_id);
+
+        let invalid_flags = patch_first(&request, &[0x04, 0x01, 0x04], 2, 0x02);
+        assert!(agent.handle_request(invalid_flags, source).await.is_err());
+        assert_eq!(agent.snmp_invalid_msgs(), 1);
+        assert_eq!(agent.snmp_unknown_security_models(), 0);
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
+
+        let unknown_model = patch_first(&request, &[0x04, 0x01, 0x04, 0x02, 0x01, 0x03], 5, 99);
+        assert!(agent.handle_request(unknown_model, source).await.is_err());
+        assert_eq!(agent.snmp_invalid_msgs(), 1);
+        assert_eq!(agent.snmp_unknown_security_models(), 1);
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
+
+        let invalid_flags_length = patch_first(&request, &[0x04, 0x01, 0x04], 1, 0);
+        assert!(
+            agent
+                .handle_request(invalid_flags_length, source)
+                .await
+                .is_err()
+        );
+        assert_eq!(agent.snmp_invalid_msgs(), 1);
+        assert_eq!(agent.snmp_unknown_security_models(), 1);
+        assert_eq!(agent.snmp_in_asn_parse_errs(), 1);
     }
 
     #[tokio::test]

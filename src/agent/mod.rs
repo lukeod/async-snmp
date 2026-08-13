@@ -1531,8 +1531,10 @@ impl Agent {
 
     /// Get the snmpInASNParseErrs counter value.
     ///
-    /// This counter tracks authenticated SNMPv1 requests rejected because a
-    /// varbind carries the SNMPv2-only Counter64 type.
+    /// This counter tracks ASN.1 or BER syntax errors encountered while
+    /// decoding received SNMP messages. Authentication, authorization,
+    /// message-processing, and version-specific semantic failures are not
+    /// included.
     ///
     /// OID: 1.3.6.1.2.1.11.6.0
     #[must_use]
@@ -1878,6 +1880,29 @@ impl Agent {
     ///
     /// Returns `None` if no response should be sent.
     async fn handle_request(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
+        let result = self.handle_request_inner(data, source).await;
+        if matches!(
+            &result,
+            Err(error) if matches!(
+                &**error,
+                Error::Decode(error)
+                    if !matches!(
+                        error.kind,
+                        crate::DecodeErrorKind::UnknownVersion(_)
+                            | crate::DecodeErrorKind::InvalidMsgFlags
+                            | crate::DecodeErrorKind::UnknownSecurityModel(_)
+                    )
+            )
+        ) {
+            self.inner
+                .state
+                .snmp_in_asn_parse_errs
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn handle_request_inner(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
         match crate::message::peek_version(data.clone(), source)? {
             Version::V1 => self.handle_v1(data, source).await,
             Version::V2c => self.handle_v2c(data, source).await,
