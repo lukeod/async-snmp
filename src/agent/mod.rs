@@ -1877,9 +1877,9 @@ impl Agent {
             PduType::GetNextRequest => self.handle_get_next(ctx, pdu).await,
             PduType::GetBulkRequest => {
                 // SNMPv1 does not support GETBULK
-                if ctx.version == Version::V1 {
+                if ctx.version() == Version::V1 {
                     return pdu.to_error_response(
-                        ctx.version,
+                        ctx.version(),
                         ErrorStatus::GenErr,
                         usize::from(!pdu.varbinds.is_empty()),
                     );
@@ -1890,7 +1890,7 @@ impl Agent {
             PduType::InformRequest => self.handle_inform(ctx, pdu),
             _ => {
                 // Should not happen - filtered earlier
-                pdu.to_error_response(ctx.version, ErrorStatus::GenErr, 0)
+                pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, 0)
             }
         }
     }
@@ -1908,7 +1908,7 @@ impl Agent {
     fn handle_inform(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
         // Exact sizing and the empty-varbind tooBig fallback are applied at the
         // shared message-envelope finalizer after the response is encoded.
-        pdu.to_response(ctx.version)
+        pdu.to_response(ctx.version())
     }
 
     /// Effective maximum response message size for a request: the smaller of
@@ -1916,7 +1916,7 @@ impl Agent {
     /// (v3). v1/v2c requests carry no `msg_max_size`, so the agent limit applies.
     fn effective_max_size(&self, ctx: &RequestContext) -> usize {
         let agent_max = self.inner.state.max_message_size;
-        match ctx.msg_max_size {
+        match ctx.msg_max_size() {
             Some(client_max) => agent_max.min(client_max),
             None => agent_max,
         }
@@ -1935,21 +1935,21 @@ impl Agent {
     /// candidate and the final response are authoritatively decided by exact
     /// message-envelope encoding.
     fn response_overhead(&self, ctx: &RequestContext) -> usize {
-        if ctx.version != Version::V3 {
+        if ctx.version() != Version::V3 {
             // v1/v2c echo the request's community string in the response
             // wrapper. A long, operator-configured community can otherwise
             // push the encoded Response past the size limit after
             // response_fits has already accepted it.
-            return RESPONSE_OVERHEAD + ctx.security_name.len();
+            return RESPONSE_OVERHEAD + ctx.security_name().len();
         }
         let mut overhead = RESPONSE_OVERHEAD
             + 2 * self.inner.state.engine_id.len()
-            + ctx.security_name.len()
-            + ctx.context_name.len();
-        if ctx.security_level.requires_auth() {
+            + ctx.security_name().len()
+            + ctx.context_name().len();
+        if ctx.security_level().requires_auth() {
             overhead += V3_AUTH_OVERHEAD;
         }
-        if ctx.security_level.requires_priv() {
+        if ctx.security_level().requires_priv() {
             overhead += V3_PRIV_OVERHEAD;
         }
         overhead
@@ -1962,11 +1962,15 @@ impl Agent {
         for (index, vb) in pdu.varbinds.iter().enumerate() {
             // VACM read access check
             if let Some(vacm) = self.inner.authorization.vacm()
-                && !vacm.check_access(ctx.read_view.as_ref(), &vb.oid)
+                && !vacm.check_access(ctx.read_view(), &vb.oid)
             {
                 // v1: noSuchName, v2c/v3: noAccess or NoSuchObject
-                if ctx.version == Version::V1 {
-                    return pdu.to_error_response(ctx.version, ErrorStatus::NoSuchName, index + 1);
+                if ctx.version() == Version::V1 {
+                    return pdu.to_error_response(
+                        ctx.version(),
+                        ErrorStatus::NoSuchName,
+                        index + 1,
+                    );
                 }
                 // For GET, return NoSuchObject for inaccessible OIDs per RFC 3415
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::NoSuchObject));
@@ -1985,7 +1989,11 @@ impl Agent {
                             error = %err,
                             "handler GET failed; responding genErr"
                         );
-                        return pdu.to_error_response(ctx.version, ErrorStatus::GenErr, index + 1);
+                        return pdu.to_error_response(
+                            ctx.version(),
+                            ErrorStatus::GenErr,
+                            index + 1,
+                        );
                     }
                 }
             } else {
@@ -1994,9 +2002,9 @@ impl Agent {
 
             let response_value = match result {
                 GetResult::Value(v) => {
-                    if v1_rejects_counter64(ctx.version, &v) {
+                    if v1_rejects_counter64(ctx.version(), &v) {
                         return pdu.to_error_response(
-                            ctx.version,
+                            ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
                         );
@@ -2005,9 +2013,9 @@ impl Agent {
                 }
                 GetResult::NoSuchObject => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchObject exception
-                    if ctx.version == Version::V1 {
+                    if ctx.version() == Version::V1 {
                         return pdu.to_error_response(
-                            ctx.version,
+                            ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
                         );
@@ -2016,9 +2024,9 @@ impl Agent {
                 }
                 GetResult::NoSuchInstance => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchInstance exception
-                    if ctx.version == Version::V1 {
+                    if ctx.version() == Version::V1 {
                         return pdu.to_error_response(
-                            ctx.version,
+                            ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
                         );
@@ -2030,7 +2038,7 @@ impl Agent {
             response_varbinds.push(VarBind::new(vb.oid.clone(), response_value));
         }
 
-        Ok(ResponsePdu::success(ctx.version, pdu.request_id, response_varbinds)?.into_raw())
+        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
     }
 
     /// Handle GETNEXT request.
@@ -2050,7 +2058,7 @@ impl Agent {
                         error = %err,
                         "handler GETNEXT failed; responding genErr"
                     );
-                    return pdu.to_error_response(ctx.version, ErrorStatus::GenErr, index + 1);
+                    return pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, index + 1);
                 }
             };
 
@@ -2058,14 +2066,18 @@ impl Agent {
                 response_varbinds.push(next_vb);
             } else {
                 // v1 returns noSuchName, v2c/v3 returns endOfMibView
-                if ctx.version == Version::V1 {
-                    return pdu.to_error_response(ctx.version, ErrorStatus::NoSuchName, index + 1);
+                if ctx.version() == Version::V1 {
+                    return pdu.to_error_response(
+                        ctx.version(),
+                        ErrorStatus::NoSuchName,
+                        index + 1,
+                    );
                 }
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
             }
         }
 
-        Ok(ResponsePdu::success(ctx.version, pdu.request_id, response_varbinds)?.into_raw())
+        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
     }
 
     /// Handle GETBULK request.
@@ -2105,7 +2117,7 @@ impl Agent {
                         error = %err,
                         "handler GETBULK failed; responding genErr"
                     );
-                    return pdu.to_error_response(ctx.version, ErrorStatus::GenErr, index + 1);
+                    return pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, index + 1);
                 }
             };
 
@@ -2130,7 +2142,7 @@ impl Agent {
                 // repeater loop (falling through would emit repeater varbinds
                 // into the dropped non-repeater's slot).
                 return Ok(
-                    ResponsePdu::success(ctx.version, pdu.request_id, response_varbinds)?
+                    ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?
                         .into_raw(),
                 );
             }
@@ -2165,7 +2177,7 @@ impl Agent {
                                     "handler GETBULK failed; responding genErr"
                                 );
                                 return pdu.to_error_response(
-                                    ctx.version,
+                                    ctx.version(),
                                     ErrorStatus::GenErr,
                                     non_repeaters + i + 1,
                                 );
@@ -2203,7 +2215,7 @@ impl Agent {
             }
         }
 
-        Ok(ResponsePdu::success(ctx.version, pdu.request_id, response_varbinds)?.into_raw())
+        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
     }
 
     /// Find the handler for a given OID.
@@ -2240,12 +2252,12 @@ impl Agent {
                         );
                         return Ok(None);
                     }
-                    if v1_rejects_counter64(ctx.version, &next_vb.value) {
+                    if v1_rejects_counter64(ctx.version(), &next_vb.value) {
                         search_from = next_vb.oid.clone();
                         continue;
                     }
                     if let Some(vacm) = self.inner.authorization.vacm() {
-                        if vacm.check_access(ctx.read_view.as_ref(), &next_vb.oid) {
+                        if vacm.check_access(ctx.read_view(), &next_vb.oid) {
                             return Ok(candidate);
                         }
                         search_from = next_vb.oid.clone();
@@ -2396,20 +2408,7 @@ mod tests {
     }
 
     fn test_ctx() -> RequestContext {
-        RequestContext {
-            source: "127.0.0.1:12345".parse().unwrap(),
-            version: Version::V2c,
-            security_model: SecurityModel::V2c,
-            security_name: crate::SecurityName::Community(crate::Community::from("public")),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_name: Bytes::new(),
-            request_id: 1,
-            pdu_type: PduType::GetRequest,
-            group_name: None,
-            read_view: None,
-            write_view: None,
-            msg_max_size: None,
-        }
+        crate::test_support::request_context(PduType::GetRequest)
     }
 
     async fn wait_for_run_state(agent: &Agent, expected: bool) {
@@ -2584,8 +2583,7 @@ mod tests {
     #[tokio::test]
     async fn test_mib_handler_default_set() {
         let handler = TestHandler;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::SetRequest;
+        let ctx = crate::test_support::request_context(PduType::SetRequest);
 
         let result = handler
             .test_set(&ctx, &oid!(1, 3, 6, 1), &Value::Integer(1))
@@ -2635,8 +2633,7 @@ mod tests {
     #[tokio::test]
     async fn test_test_handler_get_next() {
         let handler = TestHandler;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetNextRequest;
+        let ctx = crate::test_support::request_context(PduType::GetNextRequest);
 
         // Before first OID
         let next = handler
@@ -2909,8 +2906,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
+        let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
         let pdu = Pdu::get_bulk(9, 0, 2, vec![VarBind::new(prefix, Value::Null)]).unwrap();
 
         assert!(
@@ -2957,8 +2953,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
+        let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
         let pdu = Pdu::get_bulk(10, 0, 3, vec![VarBind::new(prefix.clone(), Value::Null)]).unwrap();
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
@@ -3052,8 +3047,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_v1_handler_error_maps_to_generr() {
         let agent = failing_backend_agent().await;
-        let mut ctx = test_ctx();
-        ctx.version = Version::V1;
+        let ctx = crate::test_support::community_request_context(
+            crate::CommunityVersion::V1,
+            PduType::GetRequest,
+        );
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetRequest,
@@ -3074,8 +3071,7 @@ mod tests {
     #[tokio::test]
     async fn test_getnext_handler_error_maps_to_generr() {
         let agent = failing_backend_agent().await;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetNextRequest;
+        let ctx = crate::test_support::request_context(PduType::GetNextRequest);
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetNextRequest,
@@ -3096,8 +3092,7 @@ mod tests {
     #[tokio::test]
     async fn test_getbulk_handler_error_maps_to_generr() {
         let agent = failing_backend_agent().await;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
+        let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
 
         // Non-repeater resolves to .1.0; the repeater's first GETNEXT fails.
         // error-index refers to the varbind position in the received request
@@ -3187,9 +3182,11 @@ mod tests {
     async fn test_getbulk_vacm_filters_inaccessible_oids() {
         let agent = test_agent_with_restricted_vacm().await;
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
-        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+        let ctx = crate::test_support::with_vacm_views(
+            crate::test_support::request_context(PduType::GetBulkRequest),
+            Bytes::from_static(b"restricted"),
+            Bytes::new(),
+        );
 
         // GETBULK starting before the handler prefix, requesting up to 10 repeats.
         // The handler has OIDs {1,2,3,4,5}.0 but only {2,4} are in the view.
@@ -3239,9 +3236,11 @@ mod tests {
     async fn test_getbulk_non_repeaters_vacm_filtered() {
         let agent = test_agent_with_restricted_vacm().await;
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
-        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+        let ctx = crate::test_support::with_vacm_views(
+            crate::test_support::request_context(PduType::GetBulkRequest),
+            Bytes::from_static(b"restricted"),
+            Bytes::new(),
+        );
 
         // GETBULK with non_repeaters=2, max_repetitions=0.
         // First varbind starts before the subtree: walks past denied .99999.1.0
@@ -3333,9 +3332,11 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetNextRequest;
-        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+        let ctx = crate::test_support::with_vacm_views(
+            crate::test_support::request_context(PduType::GetNextRequest),
+            Bytes::from_static(b"restricted"),
+            Bytes::new(),
+        );
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetNextRequest,
@@ -3412,10 +3413,10 @@ mod tests {
     #[tokio::test]
     async fn test_v1_counter64_skip_cap_is_gen_err() {
         let (agent, calls) = counter64_range_agent(true).await;
-        let mut ctx = test_ctx();
-        ctx.version = Version::V1;
-        ctx.security_model = SecurityModel::V1;
-        ctx.pdu_type = PduType::GetNextRequest;
+        let ctx = crate::test_support::community_request_context(
+            crate::CommunityVersion::V1,
+            PduType::GetNextRequest,
+        );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
@@ -3427,10 +3428,10 @@ mod tests {
     #[tokio::test]
     async fn test_v1_counter64_skip_reaching_actual_eom_is_not_cap_failure() {
         let (agent, calls) = counter64_range_agent(false).await;
-        let mut ctx = test_ctx();
-        ctx.version = Version::V1;
-        ctx.security_model = SecurityModel::V1;
-        ctx.pdu_type = PduType::GetNextRequest;
+        let ctx = crate::test_support::community_request_context(
+            crate::CommunityVersion::V1,
+            PduType::GetNextRequest,
+        );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
@@ -3518,9 +3519,11 @@ mod tests {
         // GETNEXT from .99999.1.0 should skip .99999.2.0 and return .99999.3.0.
         let agent = test_agent_with_gap_vacm().await;
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetNextRequest;
-        ctx.read_view = Some(Bytes::from_static(b"gap"));
+        let ctx = crate::test_support::with_vacm_views(
+            crate::test_support::request_context(PduType::GetNextRequest),
+            Bytes::from_static(b"gap"),
+            Bytes::new(),
+        );
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetNextRequest,
@@ -3550,9 +3553,11 @@ mod tests {
         // is .99999.5.0 which is denied, so the walk reaches end-of-MIB.
         let agent = test_agent_with_restricted_vacm().await;
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetNextRequest;
-        ctx.read_view = Some(Bytes::from_static(b"restricted"));
+        let ctx = crate::test_support::with_vacm_views(
+            crate::test_support::request_context(PduType::GetNextRequest),
+            Bytes::from_static(b"restricted"),
+            Bytes::new(),
+        );
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetNextRequest,
@@ -3586,8 +3591,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
+        let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
 
         let pdu = Pdu::get_bulk(
             1,
@@ -3626,10 +3630,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ctx = test_ctx();
-        ctx.version = Version::V1;
-        ctx.security_model = SecurityModel::V1;
-        ctx.pdu_type = PduType::GetBulkRequest;
+        let ctx = crate::test_support::community_request_context(
+            crate::CommunityVersion::V1,
+            PduType::GetBulkRequest,
+        );
 
         let pdu = Pdu::get_bulk(
             1,
@@ -3707,10 +3711,10 @@ mod tests {
         // Should return noSuchName for the Counter64 varbind.
         let agent = test_agent_with_counter64().await;
 
-        let mut ctx = test_ctx();
-        ctx.version = Version::V1;
-        ctx.security_model = SecurityModel::V1;
-        ctx.pdu_type = PduType::GetRequest;
+        let ctx = crate::test_support::community_request_context(
+            crate::CommunityVersion::V1,
+            PduType::GetRequest,
+        );
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetRequest,
@@ -3770,10 +3774,16 @@ mod tests {
             .await
             .unwrap();
 
-        // First, get the full response without msg_max_size limit
-        let mut ctx_unlimited = test_ctx();
-        ctx_unlimited.pdu_type = PduType::GetBulkRequest;
-        ctx_unlimited.msg_max_size = None;
+        // First, get the full response with the largest UDP msgMaxSize.
+        let ctx_unlimited = crate::test_support::usm_request_context_with(
+            Bytes::from_static(b"user"),
+            SecurityLevel::NoAuthNoPriv,
+            Bytes::new(),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::GetBulkRequest,
+            65_507,
+        );
 
         let pdu = Pdu::get_bulk(
             1,
@@ -3798,9 +3808,15 @@ mod tests {
         // RESPONSE_OVERHEAD is 100, and each varbind for OIDs like
         // .1.3.6.1.4.1.99999.N.0 with Integer value is ~22 bytes.
         // Set msg_max_size to fit overhead + ~2 varbinds but not all 5.
-        let mut ctx_limited = test_ctx();
-        ctx_limited.pdu_type = PduType::GetBulkRequest;
-        ctx_limited.msg_max_size = Some(150); // overhead(100) + room for ~2 varbinds
+        let ctx_limited = crate::test_support::usm_request_context_with(
+            Bytes::from_static(b"user"),
+            SecurityLevel::NoAuthNoPriv,
+            Bytes::new(),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::GetBulkRequest,
+            150,
+        );
 
         let limited_response = agent.dispatch_request(&ctx_limited, &pdu).await.unwrap();
         let limited_count = limited_response
@@ -3837,30 +3853,32 @@ mod tests {
         let v2c = test_ctx();
         assert_eq!(
             agent.response_overhead(&v2c),
-            RESPONSE_OVERHEAD + v2c.security_name.len()
+            RESPONSE_OVERHEAD + v2c.security_name().len()
         );
 
         let username = Bytes::from_static(b"user");
         let variable = 2 * engine_id.len() + username.len(); // context name empty
 
-        let mut noauth = test_ctx();
-        noauth.version = Version::V3;
-        noauth.security_level = SecurityLevel::NoAuthNoPriv;
-        noauth.security_name = crate::SecurityName::Usm(username.clone());
+        let noauth = crate::test_support::usm_request_context(
+            SecurityLevel::NoAuthNoPriv,
+            PduType::GetRequest,
+        );
         assert_eq!(
             agent.response_overhead(&noauth),
             RESPONSE_OVERHEAD + variable
         );
 
-        let mut authnopriv = noauth.clone();
-        authnopriv.security_level = SecurityLevel::AuthNoPriv;
+        let authnopriv = crate::test_support::usm_request_context(
+            SecurityLevel::AuthNoPriv,
+            PduType::GetRequest,
+        );
         assert_eq!(
             agent.response_overhead(&authnopriv),
             RESPONSE_OVERHEAD + variable + V3_AUTH_OVERHEAD
         );
 
-        let mut authpriv = noauth.clone();
-        authpriv.security_level = SecurityLevel::AuthPriv;
+        let authpriv =
+            crate::test_support::usm_request_context(SecurityLevel::AuthPriv, PduType::GetRequest);
         assert_eq!(
             agent.response_overhead(&authpriv),
             RESPONSE_OVERHEAD + variable + V3_AUTH_OVERHEAD + V3_PRIV_OVERHEAD
@@ -3885,25 +3903,31 @@ mod tests {
         // A long, operator-configured community is echoed in the v1/v2c
         // response wrapper and must be reflected in GETBULK's early budget.
         let short = test_ctx();
-        let mut long = test_ctx();
-        long.security_name = crate::SecurityName::Usm(Bytes::from(vec![b'x'; 200]));
+        let long = crate::test_support::community_request_context_with(
+            crate::CommunityVersion::V2c,
+            crate::Community::from(vec![b'x'; 200]),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::GetRequest,
+        );
 
         assert_eq!(
             agent.response_overhead(&long) - agent.response_overhead(&short),
-            long.security_name.len() - short.security_name.len()
+            long.security_name().len() - short.security_name().len()
         );
     }
 
     #[tokio::test]
     async fn test_getbulk_authpriv_budgets_for_wrapper() {
-        // For the same advertised msgMaxSize, an authPriv v3 request must
+        // For the same effective response limit, an authPriv v3 request must
         // reserve more space for the USM/scopedPDU wrapper than a v2c request,
         // so it fits strictly fewer varbinds. Under the old fixed overhead both
         // budgeted identically and the authPriv Response could exceed the limit.
+        let limit = 200;
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .max_message_size(65507)
+            .max_message_size(limit)
             .engine_id(vec![0x11u8; 17])
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(FiveOidHandler))
             .allow_all_access()
@@ -3921,11 +3945,7 @@ mod tests {
 
         // A limit large enough to expose the difference: v2c fits more varbinds
         // than authPriv because authPriv's overhead is larger.
-        let limit = 200;
-
-        let mut v2c = test_ctx();
-        v2c.pdu_type = PduType::GetBulkRequest;
-        v2c.msg_max_size = Some(limit);
+        let v2c = crate::test_support::request_context(PduType::GetBulkRequest);
         let v2c_count = agent
             .dispatch_request(&v2c, &pdu)
             .await
@@ -3935,12 +3955,15 @@ mod tests {
             .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
             .count();
 
-        let mut authpriv = test_ctx();
-        authpriv.version = Version::V3;
-        authpriv.security_level = SecurityLevel::AuthPriv;
-        authpriv.security_name = crate::SecurityName::Usm(Bytes::from_static(b"user"));
-        authpriv.pdu_type = PduType::GetBulkRequest;
-        authpriv.msg_max_size = Some(limit);
+        let authpriv = crate::test_support::usm_request_context_with(
+            Bytes::from_static(b"user"),
+            SecurityLevel::AuthPriv,
+            Bytes::new(),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::GetBulkRequest,
+            limit,
+        );
         let authpriv_count = agent
             .dispatch_request(&authpriv, &pdu)
             .await
@@ -4039,9 +4062,15 @@ mod tests {
         let small_vb = VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 9, 0), Value::Integer(7));
         let max = RESPONSE_OVERHEAD + big_vb.encoded_size() + small_vb.encoded_size();
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
-        ctx.msg_max_size = Some(max);
+        let ctx = crate::test_support::usm_request_context_with(
+            Bytes::from_static(b"user"),
+            SecurityLevel::NoAuthNoPriv,
+            Bytes::new(),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::GetBulkRequest,
+            max,
+        );
 
         let pdu = Pdu::get_bulk(
             1,
@@ -4097,10 +4126,16 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
         // Below RESPONSE_OVERHEAD, so even the first varbind cannot fit.
-        ctx.msg_max_size = Some(RESPONSE_OVERHEAD - 1);
+        let ctx = crate::test_support::usm_request_context_with(
+            Bytes::from_static(b"user"),
+            SecurityLevel::NoAuthNoPriv,
+            Bytes::new(),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::GetBulkRequest,
+            RESPONSE_OVERHEAD - 1,
+        );
 
         let pdu = Pdu::get_bulk(
             1,
@@ -4145,9 +4180,15 @@ mod tests {
         );
         let max = RESPONSE_OVERHEAD + big_vb.encoded_size() - 1;
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
-        ctx.msg_max_size = Some(max);
+        let ctx = crate::test_support::usm_request_context_with(
+            Bytes::from_static(b"user"),
+            SecurityLevel::NoAuthNoPriv,
+            Bytes::new(),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::GetBulkRequest,
+            max,
+        );
 
         let pdu = Pdu::get_bulk(
             1,
@@ -4178,9 +4219,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetBulkRequest;
-        ctx.msg_max_size = None; // v2c, no client limit
+        let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
 
         let pdu = Pdu::get_bulk(
             1,
@@ -4209,10 +4248,10 @@ mod tests {
         // and return the Integer at .99999.2.0.
         let agent = test_agent_with_counter64().await;
 
-        let mut ctx = test_ctx();
-        ctx.version = Version::V1;
-        ctx.security_model = SecurityModel::V1;
-        ctx.pdu_type = PduType::GetNextRequest;
+        let ctx = crate::test_support::community_request_context(
+            crate::CommunityVersion::V1,
+            PduType::GetNextRequest,
+        );
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetNextRequest,
@@ -5412,8 +5451,7 @@ mod tests {
     #[tokio::test]
     async fn test_inform_within_limit_echoes_varbinds() {
         let agent = small_limit_agent().await;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::InformRequest;
+        let ctx = crate::test_support::request_context(PduType::InformRequest);
 
         // A small Inform fits within the limit and is acknowledged by echoing
         // the same varbinds in a Response.
@@ -5441,8 +5479,7 @@ mod tests {
     #[tokio::test]
     async fn test_getnext_within_limit_returns_response() {
         let agent = small_limit_agent().await;
-        let mut ctx = test_ctx();
-        ctx.pdu_type = PduType::GetNextRequest;
+        let ctx = crate::test_support::request_context(PduType::GetNextRequest);
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::GetNextRequest,

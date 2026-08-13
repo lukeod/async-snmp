@@ -76,7 +76,7 @@ impl Agent {
         for (index, vb) in pdu.varbinds.iter().enumerate() {
             // VACM write access check
             if let Some(vacm) = self.inner.authorization.vacm()
-                && !vacm.check_access(ctx.write_view.as_ref(), &vb.oid)
+                && !vacm.check_access(ctx.write_view(), &vb.oid)
             {
                 // Free resources for all previously successful varbinds
                 while let Some(index) = transaction.pending.len().checked_sub(1) {
@@ -90,12 +90,12 @@ impl Agent {
                 }
                 // v2c/v3 report noAccess; v1 downgrades it to noSuchName.
                 let status = ErrorStatus::NoAccess;
-                let status = if ctx.version == Version::V1 {
+                let status = if ctx.version() == Version::V1 {
                     status.to_v1()
                 } else {
                     status
                 };
-                return pdu.to_error_response(ctx.version, status, index + 1);
+                return pdu.to_error_response(ctx.version(), status, index + 1);
             }
 
             let handler = self.find_handler(&vb.oid);
@@ -114,12 +114,12 @@ impl Agent {
                 // No handler for this OID: v2c/v3 report notWritable; v1
                 // downgrades it to noSuchName.
                 let status = ErrorStatus::NotWritable;
-                let status = if ctx.version == Version::V1 {
+                let status = if ctx.version() == Version::V1 {
                     status.to_v1()
                 } else {
                     status
                 };
-                return pdu.to_error_response(ctx.version, status, index + 1);
+                return pdu.to_error_response(ctx.version(), status, index + 1);
             }
 
             let handler = handler.unwrap();
@@ -138,12 +138,12 @@ impl Agent {
                     }
 
                     let status = result.to_error_status();
-                    let status = if ctx.version == Version::V1 {
+                    let status = if ctx.version() == Version::V1 {
                         status.to_v1()
                     } else {
                         status
                     };
-                    return pdu.to_error_response(ctx.version, status, index + 1);
+                    return pdu.to_error_response(ctx.version(), status, index + 1);
                 }
             };
 
@@ -200,7 +200,7 @@ impl Agent {
                 let (status, error_index) = match undo_failure {
                     Some((error, failed_undo_index)) => {
                         let status = error.to_error_status();
-                        if ctx.version == Version::V1 {
+                        if ctx.version() == Version::V1 {
                             // RFC 2576 maps undoFailed to v1 genErr; retain the
                             // binding identity required by the v1 error.
                             (status.to_v1(), (failed_undo_index + 1) as i32)
@@ -212,7 +212,7 @@ impl Agent {
                     }
                     None => {
                         let status = commit_error.to_error_status();
-                        let status = if ctx.version == Version::V1 {
+                        let status = if ctx.version() == Version::V1 {
                             status.to_v1()
                         } else {
                             status
@@ -223,7 +223,7 @@ impl Agent {
                     }
                 };
                 return pdu.to_error_response(
-                    ctx.version,
+                    ctx.version(),
                     status,
                     usize::try_from(error_index).unwrap_or(0),
                 );
@@ -242,7 +242,7 @@ impl Agent {
             transaction.pending.pop();
         }
 
-        pdu.to_response(ctx.version)
+        pdu.to_response(ctx.version())
     }
 }
 
@@ -252,17 +252,14 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use bytes::Bytes;
-
     use crate::Oid;
     use crate::agent::Agent;
     use crate::error::ErrorStatus;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet,
-        RequestContext, SecurityModel, SetCommitError, SetCommitResult, SetTestError,
-        SetTestResult, SetUndoError, SetUndoResult,
+        RequestContext, SetCommitError, SetCommitResult, SetTestError, SetTestResult, SetUndoError,
+        SetUndoResult,
     };
-    use crate::message::SecurityLevel;
     use crate::oid;
     use crate::pdu::{Pdu, PduType};
     use crate::value::Value;
@@ -339,20 +336,7 @@ mod tests {
     }
 
     fn test_ctx() -> RequestContext {
-        RequestContext {
-            source: "127.0.0.1:12345".parse().unwrap(),
-            version: Version::V2c,
-            security_model: SecurityModel::V2c,
-            security_name: crate::SecurityName::Community(crate::Community::from("public")),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_name: Bytes::new(),
-            request_id: 1,
-            pdu_type: PduType::SetRequest,
-            group_name: None,
-            read_view: None,
-            write_view: None,
-            msg_max_size: None,
-        }
+        crate::test_support::request_context(PduType::SetRequest)
     }
 
     struct GeneralFailureHandler;
@@ -426,8 +410,8 @@ mod tests {
         );
 
         for version in [Version::V1, Version::V2c, Version::V3] {
-            let mut ctx = test_ctx();
-            ctx.version = version;
+            let ctx =
+                crate::test_support::request_context_for_version(version, PduType::SetRequest);
             let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
             assert_eq!(
                 response.error_status(),
@@ -872,8 +856,7 @@ mod tests {
             0,
             three_set_varbinds(),
         );
-        let mut ctx = test_ctx();
-        ctx.version = version;
+        let ctx = crate::test_support::request_context_for_version(version, PduType::SetRequest);
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         let calls = calls.lock().unwrap().clone();
         (response, calls)
@@ -1082,12 +1065,12 @@ mod tests {
             oid: &'a Oid,
             _value: &'a Value,
         ) -> BoxFuture<'a, SetCommitResult> {
-            assert_eq!(ctx.request_id, self.request_id);
+            assert_eq!(ctx.request_id(), self.request_id);
             assert_eq!(oid, &self.oid);
             self.events
                 .lock()
                 .unwrap()
-                .push((TAG, "commit", ctx.request_id, oid.clone()));
+                .push((TAG, "commit", ctx.request_id(), oid.clone()));
             Box::pin(async { Ok(()) })
         }
     }
@@ -1118,10 +1101,10 @@ mod tests {
             self.events
                 .lock()
                 .unwrap()
-                .push((TAG, "test", ctx.request_id, oid.clone()));
+                .push((TAG, "test", ctx.request_id(), oid.clone()));
             let prepared = TypedPrepared::<TAG> {
                 events: self.events.clone(),
-                request_id: ctx.request_id,
+                request_id: ctx.request_id(),
                 oid: oid.clone(),
             };
             Box::pin(async move { Ok(Box::new(prepared) as Box<dyn PreparedSet>) })
@@ -1161,8 +1144,13 @@ mod tests {
                 VarBind::new(set_oid(2), Value::Integer(2)),
             ],
         );
-        let mut ctx = test_ctx();
-        ctx.request_id = 17;
+        let ctx = crate::test_support::community_request_context_with(
+            crate::CommunityVersion::V2c,
+            crate::Community::from("public"),
+            "127.0.0.1:12345".parse().unwrap(),
+            17,
+            PduType::SetRequest,
+        );
 
         let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
         assert_eq!(response.error_status(), ErrorStatus::NoError.as_i32());

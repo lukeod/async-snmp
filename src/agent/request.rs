@@ -4,12 +4,12 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::error::Result;
-use crate::handler::{RequestContext, SecurityModel, SecurityName};
-use crate::message::{CommunityMessage, SecurityLevel};
+use crate::handler::RequestContext;
+use crate::message::CommunityMessage;
 use crate::pdu::{PduType, ResponsePdu};
 use crate::v3::process::{MpdCounters, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
 use crate::value::Value;
-use crate::version::Version;
+use crate::version::{CommunityVersion, Version};
 
 use std::sync::atomic::Ordering;
 
@@ -20,7 +20,8 @@ use super::RESPONSE_OVERHEAD;
 impl Agent {
     /// Handle `SNMPv1` request.
     pub(super) async fn handle_v1(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
-        self.handle_community(data, source, Version::V1).await
+        self.handle_community(data, source, CommunityVersion::V1)
+            .await
     }
 
     /// Handle `SNMPv2c` request.
@@ -29,7 +30,8 @@ impl Agent {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Bytes>> {
-        self.handle_community(data, source, Version::V2c).await
+        self.handle_community(data, source, CommunityVersion::V2c)
+            .await
     }
 
     /// Handle an `SNMPv1` or `SNMPv2c` community-based request.
@@ -37,8 +39,9 @@ impl Agent {
         &self,
         data: Bytes,
         source: SocketAddr,
-        version: Version,
+        community_version: CommunityVersion,
     ) -> Result<Option<Bytes>> {
+        let version = Version::from(community_version);
         let msg = CommunityMessage::decode_with_target_and_policies(
             data,
             Some(source),
@@ -81,27 +84,14 @@ impl Agent {
             return Ok(None);
         }
 
-        let security_model = match version {
-            Version::V1 => SecurityModel::V1,
-            Version::V2c => SecurityModel::V2c,
-            Version::V3 => unreachable!("handle_community called with V3"),
-        };
-
         // Build request context
-        let mut ctx = RequestContext {
+        let mut ctx = RequestContext::community(
             source,
-            version,
-            security_model,
-            security_name: SecurityName::Community(msg.community().clone()),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_name: Bytes::new(),
-            request_id: pdu.request_id,
-            pdu_type: pdu.pdu_type(),
-            group_name: None,
-            read_view: None,
-            write_view: None,
-            msg_max_size: None,
-        };
+            community_version,
+            msg.community().clone(),
+            pdu.request_id,
+            pdu.pdu_type(),
+        );
 
         let encode = |response_pdu| {
             let response_msg = match version {
@@ -245,20 +235,15 @@ impl Agent {
         }
 
         // Build request context
-        let mut ctx = RequestContext {
+        let mut ctx = RequestContext::usm(
             source,
-            version: Version::V3,
-            security_model: SecurityModel::from(global_data.msg_security_model),
-            security_name: SecurityName::Usm(usm_params.username.clone()),
+            usm_params.username.clone(),
             security_level,
-            context_name: scoped_pdu.context_name.clone(),
-            request_id: pdu.request_id,
-            pdu_type: pdu.pdu_type(),
-            group_name: None,
-            read_view: None,
-            write_view: None,
-            msg_max_size: Some(global_data.msg_max_size.as_usize()),
-        };
+            scoped_pdu.context_name.clone(),
+            pdu.request_id,
+            pdu.pdu_type(),
+            global_data.msg_max_size.as_usize(),
+        );
 
         // A successful SET echoes the request varbinds. Preserve the exact
         // preflight bytes so the authoritative boots/time tuple (and authPriv
@@ -317,31 +302,34 @@ impl Agent {
         let Some(vacm) = self.inner.authorization.vacm() else {
             return true;
         };
-        let Some(group) = vacm.get_group(ctx.security_model, ctx.security_name.as_bytes()) else {
-            tracing::warn!(target: "async_snmp::agent", security_model = ?ctx.security_model, "VACM has no group for accepted security name");
+        let Some(group) = vacm.get_group(ctx.security_model(), ctx.security_name().as_bytes())
+        else {
+            tracing::warn!(target: "async_snmp::agent", security_model = ?ctx.security_model(), "VACM has no group for accepted security name");
             return false;
         };
-        ctx.group_name = Some(group.clone());
         let Some(access) = vacm.get_access(
             group,
-            &ctx.context_name,
-            ctx.security_model,
-            ctx.security_level,
+            ctx.context_name(),
+            ctx.security_model(),
+            ctx.security_level(),
         ) else {
             tracing::warn!(
                 target: "async_snmp::agent",
                 group = %String::from_utf8_lossy(group),
-                context = %String::from_utf8_lossy(&ctx.context_name),
-                security_model = ?ctx.security_model,
-                security_level = ?ctx.security_level,
+                context = %String::from_utf8_lossy(ctx.context_name()),
+                security_model = ?ctx.security_model(),
+                security_level = ?ctx.security_level(),
                 "VACM group has no matching access entry"
             );
             return false;
         };
 
-        ctx.read_view = Some(access.read_view.clone());
-        ctx.write_view = Some(access.write_view.clone());
-        let required_view = match ctx.pdu_type {
+        ctx.set_vacm_access(
+            group.clone(),
+            access.read_view.clone(),
+            access.write_view.clone(),
+        );
+        let required_view = match ctx.pdu_type() {
             PduType::GetRequest | PduType::GetNextRequest | PduType::GetBulkRequest => {
                 &access.read_view
             }
@@ -353,7 +341,7 @@ impl Agent {
             tracing::warn!(
                 target: "async_snmp::agent",
                 group = %String::from_utf8_lossy(group),
-                pdu_type = ?ctx.pdu_type,
+                pdu_type = ?ctx.pdu_type(),
                 "VACM access entry has no defined view for request class"
             );
             return false;
@@ -391,9 +379,9 @@ mod tests {
     use super::*;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet,
-        RequestContext, SetCommitResult, SetTestResult,
+        RequestContext, SecurityModel, SetCommitResult, SetTestResult,
     };
-    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+    use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
     use crate::oid;
     use crate::oid::Oid;
     use crate::pdu::Pdu;

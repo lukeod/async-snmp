@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `RequestContext` fields are private and exposed through
+  read-only accessors, preventing callers from constructing or mutating
+  version/security combinations that cannot result from a validated request.
+  The production-public `RequestContext::test_context` constructor is removed.
+  Handler unit tests should keep policy in helpers over explicit inputs; tests
+  that require a complete context should capture one from an in-process
+  `Agent` request.
 - **Breaking:** Secret-bearing `Community`, `Auth`, `UsmConfig`, `UsmUser`,
   `SecurityName`, `RequestRegistration`, `MasterKey`, and `MasterKeys` no longer
   implement their previously derived comparison and/or hashing traits

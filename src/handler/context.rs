@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use crate::Community;
 use crate::message::SecurityLevel;
 use crate::pdu::PduType;
-use crate::version::Version;
+use crate::version::{CommunityVersion, Version};
 
 use super::SecurityModel;
 
@@ -83,13 +83,6 @@ impl SecurityName {
 /// Contains information about the incoming request for authorization decisions,
 /// including VACM-resolved access control information when VACM is enabled.
 ///
-/// # Fields
-///
-/// The context provides:
-/// - **Request origin**: Source address and request ID
-/// - **Security info**: Version, model, level, and security name (community/username)
-/// - **VACM info**: Group name and view names (when VACM is configured)
-///
 /// # Example
 ///
 /// ```rust
@@ -104,7 +97,7 @@ impl SecurityName {
 ///             // Log request details
 ///             println!(
 ///                 "GET {} from {} (user: {:?}, version: {:?})",
-///                 oid, ctx.source, ctx.security_name, ctx.version
+///                 oid, ctx.source(), ctx.security_name(), ctx.version()
 ///             );
 ///
 ///             if oid == &oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0) {
@@ -133,68 +126,103 @@ impl SecurityName {
 ///
 /// fn may_read_v2c(ctx: &RequestContext) -> bool {
 ///     let reader = SecurityName::Community(Community::from(b"reader\xff"));
-///     ctx.security_model == SecurityModel::V2c && ctx.security_name.matches(&reader)
+///     ctx.security_model() == SecurityModel::V2c && ctx.security_name().matches(&reader)
 /// }
 ///
 /// fn may_write(ctx: &RequestContext) -> bool {
 ///     let operator = SecurityName::Usm(bytes::Bytes::from_static(b"operator\xff"));
-///     ctx.security_model == SecurityModel::Usm
-///         && matches!(ctx.security_level, SecurityLevel::AuthNoPriv | SecurityLevel::AuthPriv)
-///         && ctx.security_name.matches(&operator)
+///     ctx.security_model() == SecurityModel::Usm
+///         && matches!(ctx.security_level(), SecurityLevel::AuthNoPriv | SecurityLevel::AuthPriv)
+///         && ctx.security_name().matches(&operator)
 /// }
 /// ```
+///
+/// A context is created by the agent from a validated incoming request. Its
+/// fields cannot be replaced or combined into states that are impossible on
+/// the wire:
+///
+/// ```compile_fail,E0616
+/// use async_snmp::{RequestContext, Version};
+///
+/// fn change_version(ctx: &mut RequestContext) {
+///     ctx.version = Version::V1;
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use async_snmp::RequestContext;
+///
+/// let _ctx = RequestContext::test_context();
+/// ```
+///
+/// ```compile_fail,E0451
+/// use async_snmp::RequestContext;
+///
+/// let _ctx = RequestContext {
+///     source: "127.0.0.1:161".parse().unwrap(),
+///     ..unimplemented!()
+/// };
+/// ```
+///
+/// # Testing handlers
+///
+/// `RequestContext` has no public constructor because the agent derives it
+/// from a validated request and successful authorization. Keep pure handler
+/// policy in helpers that take only the values they need. When a test needs a
+/// complete context, run an in-process [`crate::Agent`] and capture the context
+/// passed to a test handler.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     /// Source address of the request.
     ///
     /// Use this for logging or additional access control beyond VACM.
-    pub source: SocketAddr,
+    source: SocketAddr,
 
     /// SNMP version (V1, V2c, or V3).
-    pub version: Version,
+    version: Version,
 
     /// Security model used for this request.
     ///
     /// - `V1` for `SNMPv1` community-based
     /// - `V2c` for `SNMPv2c` community-based
     /// - `Usm` for `SNMPv3` User-based Security Model
-    pub security_model: SecurityModel,
+    security_model: SecurityModel,
 
     /// Model-specific community identifier or USM username.
-    pub security_name: SecurityName,
+    security_name: SecurityName,
 
     /// Security level (v3 only, `NoAuthNoPriv` for v1/v2c).
     ///
     /// Indicates whether authentication and/or privacy were used.
-    pub security_level: SecurityLevel,
+    security_level: SecurityLevel,
 
     /// Context name (v3 only, empty for v1/v2c).
     ///
     /// `SNMPv3` contexts allow partitioning MIB views.
-    pub context_name: Bytes,
+    context_name: Bytes,
 
     /// Request ID from the PDU.
     ///
     /// Useful for correlating requests with responses in logs.
-    pub request_id: i32,
+    request_id: i32,
 
     /// PDU type (`GetRequest`, `GetNextRequest`, `SetRequest`, etc.).
-    pub pdu_type: PduType,
+    pdu_type: PduType,
 
     /// Resolved group name (if VACM enabled).
     ///
     /// Set when VACM successfully maps the security name to a group.
-    pub group_name: Option<Bytes>,
+    group_name: Option<Bytes>,
 
     /// Read view name (if VACM enabled).
     ///
     /// The view that controls which OIDs can be read.
-    pub read_view: Option<Bytes>,
+    read_view: Option<Bytes>,
 
     /// Write view name (if VACM enabled).
     ///
     /// The view that controls which OIDs can be written.
-    pub write_view: Option<Bytes>,
+    write_view: Option<Bytes>,
 
     /// Client-advertised maximum message size (V3 only).
     ///
@@ -203,28 +231,262 @@ pub struct RequestContext {
     /// limit response sizes to `min(agent_max, msg_max_size)`.
     ///
     /// None for v1/v2c requests (no msgMaxSize field in those versions).
-    pub msg_max_size: Option<usize>,
+    msg_max_size: Option<usize>,
 }
 
 impl RequestContext {
-    /// Create a minimal context for unit testing.
-    #[must_use]
-    pub fn test_context() -> Self {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    pub(crate) fn community(
+        source: SocketAddr,
+        version: CommunityVersion,
+        community: Community,
+        request_id: i32,
+        pdu_type: PduType,
+    ) -> Self {
+        let (version, security_model) = match version {
+            CommunityVersion::V1 => (Version::V1, SecurityModel::V1),
+            CommunityVersion::V2c => (Version::V2c, SecurityModel::V2c),
+        };
 
         Self {
-            source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            version: Version::V2c,
-            security_model: SecurityModel::V2c,
-            security_name: SecurityName::Community(Community::from("public")),
+            source,
+            version,
+            security_model,
+            security_name: SecurityName::Community(community),
             security_level: SecurityLevel::NoAuthNoPriv,
             context_name: Bytes::new(),
-            request_id: 1,
-            pdu_type: PduType::GetRequest,
+            request_id,
+            pdu_type,
             group_name: None,
             read_view: None,
             write_view: None,
             msg_max_size: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn usm(
+        source: SocketAddr,
+        username: Bytes,
+        security_level: SecurityLevel,
+        context_name: Bytes,
+        request_id: i32,
+        pdu_type: PduType,
+        msg_max_size: usize,
+    ) -> Self {
+        Self {
+            source,
+            version: Version::V3,
+            security_model: SecurityModel::Usm,
+            security_name: SecurityName::Usm(username),
+            security_level,
+            context_name,
+            request_id,
+            pdu_type,
+            group_name: None,
+            read_view: None,
+            write_view: None,
+            msg_max_size: Some(msg_max_size),
+        }
+    }
+
+    pub(crate) fn set_vacm_access(
+        &mut self,
+        group_name: Bytes,
+        read_view: Bytes,
+        write_view: Bytes,
+    ) {
+        self.group_name = Some(group_name);
+        self.read_view = Some(read_view);
+        self.write_view = Some(write_view);
+    }
+
+    /// Return the source address of the request.
+    #[must_use]
+    pub const fn source(&self) -> SocketAddr {
+        self.source
+    }
+
+    /// Return the SNMP version.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Return the concrete security model used for the request.
+    #[must_use]
+    pub const fn security_model(&self) -> SecurityModel {
+        self.security_model
+    }
+
+    /// Return the model-specific community identifier or USM username.
+    #[must_use]
+    pub const fn security_name(&self) -> &SecurityName {
+        &self.security_name
+    }
+
+    /// Return the security level used for the request.
+    #[must_use]
+    pub const fn security_level(&self) -> SecurityLevel {
+        self.security_level
+    }
+
+    /// Return the SNMPv3 context name as protocol octets.
+    ///
+    /// This is empty for community-based requests and need not be UTF-8.
+    #[must_use]
+    pub const fn context_name(&self) -> &Bytes {
+        &self.context_name
+    }
+
+    /// Return the request ID from the PDU.
+    #[must_use]
+    pub const fn request_id(&self) -> i32 {
+        self.request_id
+    }
+
+    /// Return the incoming PDU type.
+    #[must_use]
+    pub const fn pdu_type(&self) -> PduType {
+        self.pdu_type
+    }
+
+    /// Return the VACM-resolved group name, if VACM was applied.
+    #[must_use]
+    pub const fn group_name(&self) -> Option<&Bytes> {
+        self.group_name.as_ref()
+    }
+
+    /// Return the VACM-resolved read view name, if VACM was applied.
+    #[must_use]
+    pub const fn read_view(&self) -> Option<&Bytes> {
+        self.read_view.as_ref()
+    }
+
+    /// Return the VACM-resolved write view name, if VACM was applied.
+    #[must_use]
+    pub const fn write_view(&self) -> Option<&Bytes> {
+        self.write_view.as_ref()
+    }
+
+    /// Return the client-advertised maximum message size for SNMPv3.
+    ///
+    /// Community-based requests do not carry this field and return `None`.
+    #[must_use]
+    pub const fn msg_max_size(&self) -> Option<usize> {
+        self.msg_max_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use static_assertions::assert_impl_all;
+
+    assert_impl_all!(RequestContext: Send, Sync, Clone, std::fmt::Debug);
+
+    #[test]
+    fn community_accessors_cover_v1_v2c_and_non_utf8_names() {
+        let source = "192.0.2.55:6161".parse().unwrap();
+        let community = Community::from(b"reader\xff".as_slice());
+
+        for (community_version, version, model) in [
+            (CommunityVersion::V1, Version::V1, SecurityModel::V1),
+            (CommunityVersion::V2c, Version::V2c, SecurityModel::V2c),
+        ] {
+            let context = RequestContext::community(
+                source,
+                community_version,
+                community.clone(),
+                416,
+                PduType::GetNextRequest,
+            );
+
+            assert_eq!(context.source(), source);
+            assert_eq!(context.version(), version);
+            assert_eq!(context.security_model(), model);
+            assert!(
+                context
+                    .security_name()
+                    .matches(&SecurityName::Community(community.clone()))
+            );
+            assert_eq!(context.security_level(), SecurityLevel::NoAuthNoPriv);
+            assert!(context.context_name().is_empty());
+            assert_eq!(context.request_id(), 416);
+            assert_eq!(context.pdu_type(), PduType::GetNextRequest);
+            assert_eq!(context.group_name(), None);
+            assert_eq!(context.read_view(), None);
+            assert_eq!(context.write_view(), None);
+            assert_eq!(context.msg_max_size(), None);
+        }
+    }
+
+    #[test]
+    fn usm_accessors_cover_every_security_level_and_octet_fields() {
+        let source = "[2001:db8::1]:6161".parse().unwrap();
+        let username = Bytes::from_static(b"operator\xff");
+        let context_name = Bytes::from_static(b"tenant\x80");
+
+        for level in [
+            SecurityLevel::NoAuthNoPriv,
+            SecurityLevel::AuthNoPriv,
+            SecurityLevel::AuthPriv,
+        ] {
+            let mut context = RequestContext::usm(
+                source,
+                username.clone(),
+                level,
+                context_name.clone(),
+                -17,
+                PduType::SetRequest,
+                4096,
+            );
+            context.set_vacm_access(
+                Bytes::from_static(b"operators\xfe"),
+                Bytes::from_static(b"read\xfd"),
+                Bytes::from_static(b"write\xfc"),
+            );
+
+            assert_eq!(context.source(), source);
+            assert_eq!(context.version(), Version::V3);
+            assert_eq!(context.security_model(), SecurityModel::Usm);
+            assert_eq!(context.security_name().as_bytes(), username);
+            assert_eq!(context.security_level(), level);
+            assert_eq!(context.context_name(), &context_name);
+            assert_eq!(context.request_id(), -17);
+            assert_eq!(context.pdu_type(), PduType::SetRequest);
+            assert_eq!(context.group_name().unwrap(), b"operators\xfe".as_slice());
+            assert_eq!(context.read_view().unwrap(), b"read\xfd".as_slice());
+            assert_eq!(context.write_view().unwrap(), b"write\xfc".as_slice());
+            assert_eq!(context.msg_max_size(), Some(4096));
+        }
+    }
+
+    #[test]
+    fn debug_redacts_community_and_keeps_usm_username() {
+        let community = RequestContext::community(
+            "192.0.2.55:6161".parse().unwrap(),
+            CommunityVersion::V2c,
+            Community::from("community-redaction-sentinel-4d91"),
+            416,
+            PduType::GetRequest,
+        );
+        let rendered = format!("{community:?}");
+        assert!(rendered.contains("REDACTED"));
+        assert!(!rendered.contains("community-redaction-sentinel-4d91"));
+        assert!(rendered.contains("192.0.2.55:6161"));
+        assert!(rendered.contains("416"));
+
+        let usm = RequestContext::usm(
+            "192.0.2.55:6161".parse().unwrap(),
+            Bytes::from_static(b"visible-usm-user"),
+            SecurityLevel::AuthNoPriv,
+            Bytes::new(),
+            417,
+            PduType::GetRequest,
+            4096,
+        );
+        let rendered = format!("{usm:#?}");
+        assert!(rendered.contains("visible-usm-user"));
+        assert!(rendered.contains("192.0.2.55:6161"));
     }
 }

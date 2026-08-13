@@ -291,10 +291,8 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::handler::{RequestContext, SecurityModel};
-    use crate::message::SecurityLevel;
+    use crate::handler::RequestContext;
     use crate::pdu::PduType;
-    use crate::version::Version;
 
     fn test_state() -> Arc<AgentState> {
         Arc::new(AgentState {
@@ -328,20 +326,7 @@ mod tests {
     }
 
     fn test_ctx() -> RequestContext {
-        RequestContext {
-            source: "127.0.0.1:12345".parse().unwrap(),
-            version: Version::V2c,
-            security_model: SecurityModel::V2c,
-            security_name: crate::SecurityName::Community(crate::Community::from("public")),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_name: Bytes::new(),
-            request_id: 1,
-            pdu_type: PduType::GetRequest,
-            group_name: None,
-            read_view: None,
-            write_view: None,
-            msg_max_size: None,
-        }
+        crate::test_support::request_context(PduType::GetRequest)
     }
 
     // -----------------------------------------------------------------------

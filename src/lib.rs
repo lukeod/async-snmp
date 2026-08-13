@@ -582,6 +582,9 @@ pub mod version;
 
 pub(crate) mod util;
 
+#[cfg(all(test, feature = "agent"))]
+pub(crate) mod test_support;
+
 #[cfg(feature = "cli")]
 pub mod cli;
 

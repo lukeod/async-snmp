@@ -147,29 +147,6 @@ fn request_registration_debug_redacts_identity_but_keeps_correlation_details() {
 
 #[cfg(feature = "agent")]
 #[test]
-fn request_context_redacts_communities_and_keeps_usm_usernames() {
-    use async_snmp::{RequestContext, SecurityModel, SecurityName, Version};
-
-    let mut context = RequestContext::test_context();
-    context.source = "192.0.2.55:6161".parse().unwrap();
-    context.request_id = 416;
-    context.security_name = SecurityName::Community(Community::from(SENTINEL));
-    assert_redacted(&context);
-    let community_debug = format!("{context:?}");
-    assert!(community_debug.contains("192.0.2.55:6161"));
-    assert!(community_debug.contains("416"));
-    assert!(community_debug.contains("V2c"));
-
-    context.version = Version::V3;
-    context.security_model = SecurityModel::Usm;
-    context.security_name = SecurityName::Usm(Bytes::from_static(b"visible-usm-user"));
-    let usm_debug = format!("{context:#?}");
-    assert!(usm_debug.contains("visible-usm-user"));
-    assert!(usm_debug.contains("192.0.2.55:6161"));
-}
-
-#[cfg(feature = "agent")]
-#[test]
 fn vacm_debug_redacts_all_security_name_selectors() {
     use async_snmp::{SecurityModel, VacmConfig, VacmSecurityModel};
 
