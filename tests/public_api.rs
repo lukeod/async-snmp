@@ -447,6 +447,12 @@ fn intentional_compatibility_surface_remains_available() {
     let _: std::result::Result<(), Box<async_snmp::Error>> = result;
 }
 
+#[cfg(feature = "agent")]
+#[test]
+fn agent_clock_surface_is_coherent_and_fallible() {
+    let _: fn(&Agent) -> async_snmp::Result<(u32, u32)> = Agent::engine_boots_time;
+}
+
 #[test]
 fn retrieval_requests_reencode_ignored_non_null_values_for_each_version() {
     use async_snmp::ber::EncodeBuf;

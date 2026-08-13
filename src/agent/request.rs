@@ -148,10 +148,11 @@ impl Agent {
     /// [`process_v3_inbound`] core in the authoritative role.
     pub(super) async fn handle_v3(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
         let state = &self.inner.state;
+        let (engine_boots, engine_time) = state.authoritative_boots_time()?;
         let usm_ctx = V3LocalContext {
             engine_id: &state.engine_id,
-            engine_boots: state.engine_boots.load(Ordering::Relaxed),
-            engine_time: state.engine_time.load(Ordering::Relaxed),
+            engine_boots,
+            engine_time,
             local_receive_capacity: state.local_receive_capacity,
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             decode_policy: state.decode_policy,
@@ -1496,11 +1497,11 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let cycle = u64::from(MAX_ENGINE_TIME) + 1;
         agent
             .inner
             .state
-            .engine_boots
-            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+            .set_authoritative_elapsed_for_test(cycle * u64::from(MAX_ENGINE_TIME));
 
         let msg = build_authnopriv_msg(&engine_id, b"noauthuser");
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -1585,11 +1586,11 @@ mod tests {
             .unwrap();
         // Latch engine boots so the Section 2.3 notInTimeWindows rejection
         // would fire first if Step 5 did not precede it.
+        let cycle = u64::from(MAX_ENGINE_TIME) + 1;
         agent
             .inner
             .state
-            .engine_boots
-            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+            .set_authoritative_elapsed_for_test(cycle * u64::from(MAX_ENGINE_TIME));
 
         let msg = build_authpriv_bad_hmac(&engine_id, b"trapuser", b"wrong-password-1234");
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();

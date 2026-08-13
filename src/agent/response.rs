@@ -24,10 +24,9 @@ impl Agent {
         derived_keys: Option<&DerivedKeys>,
     ) -> Result<crate::response_finalizer::FinalizedResponse> {
         let security_level = incoming.msg_flags.security_level;
-        // Handlers are asynchronous and may run long after the receive task's
-        // cached time refresh. Derive both fields from one elapsed-time sample
-        // at response generation so the authoritative tuple is current and
-        // cannot straddle a boots/time rollover.
+        // Handlers are asynchronous and may run for an arbitrary duration.
+        // Derive both fields from one sample at response generation so the
+        // authoritative tuple is current and cannot straddle a rollover.
         let (engine_boots, engine_time) = self.inner.state.authoritative_boots_time()?;
 
         // RFC 3414 Section 2.3: refuse authenticated messages when boots latched
@@ -294,16 +293,7 @@ mod tests {
     #[tokio::test]
     async fn test_response_uses_current_coherent_authoritative_time() {
         let agent = test_agent().await;
-
-        // Model a response generated after handler dispatch without refreshing
-        // the legacy cached fields. A response must not use this stale,
-        // internally inconsistent tuple.
-        agent.inner.state.engine_boots.store(17, Ordering::Relaxed);
-        agent
-            .inner
-            .state
-            .engine_time
-            .store(MAX_ENGINE_TIME, Ordering::Relaxed);
+        agent.inner.state.set_authoritative_elapsed_for_test(123);
 
         let earliest = agent.inner.state.authoritative_boots_time().unwrap();
         let encoded = agent
@@ -323,12 +313,9 @@ mod tests {
         let response_usm = UsmSecurityParams::decode(message.security_params).unwrap();
         let response_pair = (response_usm.engine_boots, response_usm.engine_time);
 
-        assert_ne!(response_pair, (17, MAX_ENGINE_TIME));
-        assert_eq!(response_pair.0, 1);
-        assert!(
-            response_pair.1 >= earliest.1 && response_pair.1 <= latest.1,
-            "response pair {response_pair:?} should come from one current elapsed-time sample between {earliest:?} and {latest:?}"
-        );
+        assert_eq!(earliest, (1, 123));
+        assert_eq!(latest, (1, 123));
+        assert_eq!(response_pair, (1, 123));
     }
 
     // RFC 3412 Section 6.3: the advertised msgMaxSize is this agent's own

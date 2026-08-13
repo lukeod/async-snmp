@@ -44,18 +44,18 @@ impl SnmpEngineHandler {
         oid!(1, 3, 6, 1, 6, 3, 10, 2, 1)
     }
 
-    fn get_column_value(&self, col: u32) -> Option<Value> {
-        match col {
+    fn get_column_value(&self, col: u32) -> HandlerResult<Option<Value>> {
+        Ok(match col {
             1 => Some(Value::OctetString(self.state.engine_id.clone())),
             2 => Some(Value::Integer(
-                self.state.engine_boots.load(Ordering::Relaxed) as i32,
+                self.state.authoritative_boots_time()?.0 as i32,
             )),
             3 => Some(Value::Integer(
-                self.state.engine_time.load(Ordering::Relaxed) as i32,
+                self.state.authoritative_boots_time()?.1 as i32,
             )),
             4 => Some(Value::Integer(self.state.local_receive_capacity.as_i32())),
             _ => None,
-        }
+        })
     }
 }
 
@@ -75,7 +75,7 @@ impl MibHandler for SnmpEngineHandler {
             if instance != 0 {
                 return Ok(GetResult::NoSuchInstance);
             }
-            match self.get_column_value(col) {
+            match self.get_column_value(col)? {
                 Some(v) => Ok(GetResult::Value(v)),
                 None => Ok(GetResult::NoSuchObject),
             }
@@ -92,7 +92,7 @@ impl MibHandler for SnmpEngineHandler {
             for col in 1..=4u32 {
                 let scalar_oid = prefix.child(col).child(0);
                 if oid < &scalar_oid {
-                    let value = self.get_column_value(col).unwrap();
+                    let value = self.get_column_value(col)?.unwrap();
                     return Ok(GetNextResult::Value(VarBind::new(scalar_oid, value)));
                 }
             }
@@ -298,11 +298,9 @@ mod tests {
         Arc::new(AgentState {
             authoritative_engine: None,
             engine_id: Bytes::from_static(&[0x80, 0x00, 0x01, 0x02, 0x03]),
-            engine_boots: AtomicU32::new(5),
-            engine_time: AtomicU32::new(12345),
             engine_start: Instant::now(),
             engine_boots_base: 5,
-            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
+            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(12345),
             max_message_size: 1472,
             local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             decode_policy: crate::message::DecodePolicy::Compatible,
@@ -375,6 +373,29 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, GetResult::Value(Value::Integer(12345))));
+    }
+
+    #[tokio::test]
+    async fn snmp_engine_clock_failure_is_a_handler_error() {
+        let mut state = test_state();
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.authoritative_engine = Some(
+            crate::v3::AuthoritativeEngine::with_rollover_persistence_failure_for_test(
+                b"test-agent-engine".to_vec(),
+            ),
+        );
+        state_mut
+            .authoritative_elapsed_override
+            .store(u64::MAX, Ordering::Relaxed);
+        let handler = SnmpEngineHandler { state };
+
+        let error = handler
+            .get(&test_ctx(), &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 2, 0))
+            .await
+            .unwrap_err();
+
+        assert!(error.message().contains("storage unavailable"));
+        assert!(error.source().is_some());
     }
 
     #[tokio::test]

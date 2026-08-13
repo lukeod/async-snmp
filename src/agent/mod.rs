@@ -1208,8 +1208,6 @@ impl AgentBuilder {
         let state = Arc::new(AgentState {
             authoritative_engine,
             engine_id,
-            engine_boots: AtomicU32::new(engine_boots),
-            engine_time: AtomicU32::new(0),
             engine_start: Instant::now(),
             engine_boots_base: engine_boots,
             #[cfg(test)]
@@ -1462,8 +1460,6 @@ impl Default for AgentBuilder {
 pub(crate) struct AgentState {
     pub(crate) authoritative_engine: Option<AuthoritativeEngine>,
     pub(crate) engine_id: Bytes,
-    pub(crate) engine_boots: AtomicU32,
-    pub(crate) engine_time: AtomicU32,
     pub(crate) engine_start: Instant,
     /// Initial `engine_boots` value at startup, used to compute overflow-adjusted boots.
     pub(crate) engine_boots_base: u32,
@@ -1503,17 +1499,16 @@ impl AgentState {
         #[cfg(test)]
         let override_elapsed = self.authoritative_elapsed_override.load(Ordering::Relaxed);
         #[cfg(test)]
-        let pair = if override_elapsed != u64::MAX {
-            compute_engine_boots_time(self.engine_boots_base, override_elapsed)
+        return if override_elapsed != u64::MAX {
+            Ok(compute_engine_boots_time(
+                self.engine_boots_base,
+                override_elapsed,
+            ))
         } else {
-            self.sample_authoritative_boots_time()?
+            self.sample_authoritative_boots_time()
         };
         #[cfg(not(test))]
-        let pair = self.sample_authoritative_boots_time()?;
-
-        self.engine_boots.store(pair.0, Ordering::Relaxed);
-        self.engine_time.store(pair.1, Ordering::Relaxed);
-        Ok(pair)
+        self.sample_authoritative_boots_time()
     }
 
     fn sample_authoritative_boots_time(&self) -> Result<(u32, u32)> {
@@ -1636,23 +1631,17 @@ impl Agent {
         &self.inner.state.engine_id
     }
 
-    /// Get the most recently sampled engine boots value.
+    /// Return one coherent current engine boots/time pair.
     ///
-    /// V3 processing samples the shared authoritative clock. Any rollover
-    /// increment has already been stored through the retained persistence
-    /// callback before this snapshot is published.
-    #[must_use]
-    pub fn engine_boots(&self) -> u32 {
-        self.inner.state.engine_boots.load(Ordering::Relaxed)
-    }
-
-    /// Get the most recently sampled engine time value.
+    /// If engine time has wrapped, an [`AuthoritativeEngine`] persists the
+    /// incremented boots value before this method returns it.
     ///
-    /// This snapshot is refreshed during protocol processing rather than by a
-    /// background timer, so it can remain unchanged while the Agent is idle.
-    #[must_use]
-    pub fn engine_time(&self) -> u32 {
-        self.inner.state.engine_time.load(Ordering::Relaxed)
+    /// # Errors
+    ///
+    /// Returns [`Error::AuthoritativeEnginePersistence`] if a rollover cannot
+    /// be persisted. The previously durable pair remains authoritative.
+    pub fn engine_boots_time(&self) -> Result<(u32, u32)> {
+        self.inner.state.authoritative_boots_time()
     }
 
     /// Get the cancellation token for this agent.
@@ -1972,10 +1961,6 @@ impl Agent {
                     return;
                 }
 
-                if let Err(error) = agent.update_engine_time() {
-                    tracing::warn!(target: "async_snmp::agent", %error, "could not persist authoritative engine time transition");
-                }
-
                 match agent.handle_request(data, recv_meta.source).await {
                     Ok(Some(response_bytes)) => {
                         if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
@@ -2071,28 +2056,6 @@ impl Agent {
             Version::V2c => self.handle_v2c(data, source).await,
             Version::V3 => self.handle_v3(data, source).await,
         }
-    }
-
-    /// Update engine boots and time based on elapsed time since start.
-    ///
-    /// Per RFC 3414 Section 2.3, when snmpEngineTime reaches `MAX_ENGINE_TIME`
-    /// (2^31-1), snmpEngineBoots is incremented and snmpEngineTime resets to
-    /// zero. The boots/time pair is derived from total elapsed seconds and
-    /// the base boots value at startup, so no mutable state beyond the
-    /// atomics is needed.
-    fn update_engine_time(&self) -> Result<()> {
-        let previous_boots = self.inner.state.engine_boots.load(Ordering::Relaxed);
-        let (boots, _) = self.inner.state.authoritative_boots_time()?;
-
-        if boots != previous_boots && boots > self.inner.state.engine_boots_base {
-            tracing::warn!(
-                target: "async_snmp::agent",
-                engine_boots = boots,
-                "engine time wrapped past MAX_ENGINE_TIME, incrementing engine boots"
-            );
-        }
-
-        Ok(())
     }
 
     /// Validate community string using constant-time comparison.
@@ -5118,7 +5081,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(agent.engine_boots(), 1);
+        assert_eq!(agent.engine_boots_time().unwrap().0, 1);
         assert_eq!(agent.engine_id(), b"test-agent-engine");
     }
 
@@ -5889,7 +5852,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(agent.engine_boots(), 1);
+        assert_eq!(agent.engine_boots_time().unwrap().0, 1);
     }
 
     #[tokio::test]

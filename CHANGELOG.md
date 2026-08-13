@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Removed the unused `ViewCheckResult` type and
   `View::check_subtree` method. VACM enforcement continues to use exact
   per-OID checks, which remain necessary for custom handler ownership.
+- **Breaking:** Replaced `Agent::engine_boots` and `Agent::engine_time` stale
+  snapshots with fallible `Agent::engine_boots_time`, which returns one current
+  coherent pair and surfaces authoritative rollover persistence failures.
+  SNMP-ENGINE-MIB clock reads now use the same source and report `genErr` when
+  the durable clock cannot advance.
 
 - Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
   single-flight operation. Callers share success or structured failure under a
