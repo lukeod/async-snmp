@@ -14,8 +14,8 @@ use async_snmp::notification::{
 use async_snmp::v3::{AuthProtocol, PrivProtocol};
 use async_snmp::varbind::VarBind;
 use async_snmp::{
-    Auth, AuthoritativeEngine, Client, NotificationPdu, PduType, Retry, SecurityLevel,
-    TrapV1Notification, Value, Version, oid,
+    Auth, AuthoritativeEngine, Client, NotificationPdu, NotificationSinkId, PduType, Retry,
+    SecurityLevel, TrapV1Notification, Value, Version, oid,
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -752,7 +752,11 @@ async fn agent_v2c_trap_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v2c", recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("v2c").unwrap(),
+            recv_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -790,7 +794,11 @@ async fn agent_trap_send_timeout_is_bounded_and_reported() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("timed", recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("timed").unwrap(),
+            recv_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .trap_send_timeout(Duration::ZERO)
         .allow_all_access()
         .build()
@@ -841,7 +849,11 @@ async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("lazy", recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("lazy").unwrap(),
+            recv_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -858,7 +870,7 @@ async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
     );
 
     let sink = stream.next().await.expect("configured sink outcome");
-    assert_eq!(sink.sink.id().as_str(), "lazy");
+    assert_eq!(sink.sink.id().as_bytes(), b"lazy");
     assert_eq!(sink.sink.index(), 0);
     assert_eq!(sink.sink.dest(), recv_addr);
     assert!(matches!(sink.status, SinkStatus::Succeeded));
@@ -879,7 +891,11 @@ async fn agent_v2c_inform_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v2c", recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("v2c").unwrap(),
+            recv_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -939,7 +955,7 @@ async fn agent_v3_trap_to_sink() {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
         .trap_sink(
-            "v3",
+            NotificationSinkId::new("v3").unwrap(),
             recv_addr.to_string(),
             Auth::usm_builder("trapuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
@@ -985,8 +1001,16 @@ async fn agent_multiple_sinks() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("first", addr1.to_string(), Auth::v2c("public"))
-        .trap_sink("second", addr2.to_string(), Auth::v2c("trap-community"))
+        .trap_sink(
+            NotificationSinkId::new("first").unwrap(),
+            addr1.to_string(),
+            Auth::v2c("public"),
+        )
+        .trap_sink(
+            NotificationSinkId::new("second").unwrap(),
+            addr2.to_string(),
+            Auth::v2c("trap-community"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -1035,7 +1059,11 @@ async fn agent_v1_trap_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v1", recv_addr.to_string(), Auth::v1("public"))
+        .trap_sink(
+            NotificationSinkId::new("v1").unwrap(),
+            recv_addr.to_string(),
+            Auth::v1("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -1075,8 +1103,16 @@ async fn agent_mixed_v1_v2c_sinks() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v1", addr_v1.to_string(), Auth::v1("v1comm"))
-        .trap_sink("v2c", addr_v2.to_string(), Auth::v2c("v2comm"))
+        .trap_sink(
+            NotificationSinkId::new("v1").unwrap(),
+            addr_v1.to_string(),
+            Auth::v1("v1comm"),
+        )
+        .trap_sink(
+            NotificationSinkId::new("v2c").unwrap(),
+            addr_v2.to_string(),
+            Auth::v2c("v2comm"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -1157,64 +1193,19 @@ async fn agent_no_sinks_is_noop() {
 }
 
 #[tokio::test]
-async fn agent_rejects_invalid_sink_id_lengths_before_bind_configuration() {
-    let empty = expect_agent_build_error(
-        Agent::builder()
-            .bind("not-a-socket-address")
-            .trap_sink("", "127.0.0.1:9", Auth::v1("public"))
-            .build()
-            .await,
-        "empty sink ID unexpectedly accepted",
-    );
-    assert_eq!(
-        empty.to_string(),
-        "configuration error: notification sink ID must not be empty"
-    );
-
-    let too_long = expect_agent_build_error(
-        Agent::builder()
-            .bind("not-a-socket-address")
-            .trap_sink("x".repeat(33), "127.0.0.1:9", Auth::v1("public"))
-            .build()
-            .await,
-        "overlong sink ID unexpectedly accepted",
-    );
-    assert_eq!(
-        too_long.to_string(),
-        "configuration error: notification sink ID length 33 exceeds maximum 32 UTF-8 octets"
-    );
-
-    let multibyte = expect_agent_build_error(
-        Agent::builder()
-            .bind("not-a-socket-address")
-            .trap_sink("é".repeat(17), "127.0.0.1:9", Auth::v1("public"))
-            .build()
-            .await,
-        "overlong multibyte sink ID unexpectedly accepted",
-    );
-    assert_eq!(
-        multibyte.to_string(),
-        "configuration error: notification sink ID length 34 exceeds maximum 32 UTF-8 octets"
-    );
-
-    let agent = Agent::builder()
-        .bind("127.0.0.1:0")
-        .trap_sink("é".repeat(16), "127.0.0.1:9", Auth::v1("public"))
-        .build()
-        .await
-        .expect("32-octet sink ID should be accepted");
-    assert_eq!(
-        agent.notification_sinks().next().unwrap().id().as_str(),
-        "é".repeat(16)
-    );
-}
-
-#[tokio::test]
 async fn agent_rejects_duplicate_sink_ids_before_bind_configuration() {
     let result = Agent::builder()
         .bind("not-a-socket-address")
-        .trap_sink("duplicate", "127.0.0.1:9", Auth::v1("first"))
-        .trap_sink("duplicate", "127.0.0.1:10", Auth::v2c("second"))
+        .trap_sink(
+            NotificationSinkId::new("duplicate").unwrap(),
+            "127.0.0.1:9",
+            Auth::v1("first"),
+        )
+        .trap_sink(
+            NotificationSinkId::new("duplicate").unwrap(),
+            "127.0.0.1:10",
+            Auth::v2c("second"),
+        )
         .build()
         .await;
 
@@ -1230,6 +1221,19 @@ async fn agent_rejects_duplicate_sink_ids_before_bind_configuration() {
 }
 
 #[tokio::test]
+async fn agent_preserves_non_utf8_sink_id_octets() {
+    let id = NotificationSinkId::try_from(&b"binary\x00\xff"[..]).unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .trap_sink(id.clone(), "127.0.0.1:9", Auth::v1("public"))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(agent.notification_sinks().next().unwrap().id(), &id);
+}
+
+#[tokio::test]
 async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
     const COMMUNITY_SECRET: &str = "community-summary-secret";
     const USER_SECRET: &str = "username-summary-secret";
@@ -1239,9 +1243,13 @@ async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .authoritative_engine(no_op_authoritative_engine(b"sink-summary-engine"))
-        .trap_sink("community", dest.to_string(), Auth::v2c(COMMUNITY_SECRET))
         .trap_sink(
-            "usm",
+            NotificationSinkId::new("community").unwrap(),
+            dest.to_string(),
+            Auth::v2c(COMMUNITY_SECRET),
+        )
+        .trap_sink(
+            NotificationSinkId::new("usm").unwrap(),
             dest.to_string(),
             Auth::usm_builder(USER_SECRET)
                 .context_name(CONTEXT_SECRET)
@@ -1254,12 +1262,12 @@ async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
     let summaries: Vec<_> = agent.notification_sinks().cloned().collect();
     assert_eq!(summaries.len(), 2);
     assert_eq!(summaries[0].index(), 0);
-    assert_eq!(summaries[0].id().as_str(), "community");
+    assert_eq!(summaries[0].id().as_bytes(), b"community");
     assert_eq!(summaries[0].dest(), dest);
     assert_eq!(summaries[0].version(), Version::V2c);
     assert_eq!(summaries[0].security_level(), None);
     assert_eq!(summaries[1].index(), 1);
-    assert_eq!(summaries[1].id().as_str(), "usm");
+    assert_eq!(summaries[1].id().as_bytes(), b"usm");
     assert_eq!(summaries[1].dest(), dest);
     assert_eq!(summaries[1].version(), Version::V3);
     assert_eq!(
@@ -1292,7 +1300,11 @@ async fn agent_inform_reports_failing_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("dead", dead_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("dead").unwrap(),
+            dead_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())
         .allow_all_access()
@@ -1362,7 +1374,7 @@ async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
         .community(b"public")
         .authoritative_engine(no_op_authoritative_engine(b"agent-inform-metadata"))
         .trap_sink(
-            "metadata",
+            NotificationSinkId::new("metadata").unwrap(),
             peer.addr().to_string(),
             Auth::usm_builder("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
@@ -1444,7 +1456,7 @@ async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
         .community(b"public")
         .authoritative_engine(no_op_authoritative_engine(b"agent-malformed-inform"))
         .trap_sink(
-            "malformed",
+            NotificationSinkId::new("malformed").unwrap(),
             peer.addr().to_string(),
             Auth::usm_builder("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
@@ -1493,8 +1505,16 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("dead", dead_addr.to_string(), Auth::v2c("public"))
-        .trap_sink("live", live_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("dead").unwrap(),
+            dead_addr.to_string(),
+            Auth::v2c("public"),
+        )
+        .trap_sink(
+            NotificationSinkId::new("live").unwrap(),
+            live_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .inform_timeout(Duration::from_secs(2))
         .inform_retry(Retry::none())
         .allow_all_access()
@@ -1510,7 +1530,7 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
         .await
         .expect("live sink completion was delayed by the unreachable sink")
         .expect("live sink outcome");
-    assert_eq!(live.sink.id().as_str(), "live");
+    assert_eq!(live.sink.id().as_bytes(), b"live");
     assert_eq!(live.sink.index(), 1);
     assert_eq!(live.sink.dest(), live_addr);
     assert!(matches!(live.status, SinkStatus::Succeeded));
@@ -1519,7 +1539,7 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
     assert!(matches!(notification, Notification::InformV2c { .. }));
 
     let dead = stream.next().await.expect("dead sink outcome");
-    assert_eq!(dead.sink.id().as_str(), "dead");
+    assert_eq!(dead.sink.id().as_bytes(), b"dead");
     assert_eq!(dead.sink.index(), 0);
     assert_eq!(dead.sink.dest(), dead_addr);
     assert!(matches!(dead.status, SinkStatus::Failed(_)));
@@ -1533,7 +1553,11 @@ async fn dropping_inform_stream_cancels_retries() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("cancelled", target_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("cancelled").unwrap(),
+            target_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::fixed(2, Duration::ZERO))
         .allow_all_access()
@@ -1574,8 +1598,16 @@ async fn agent_inform_aggregate_restores_configuration_order() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("dead", dead_addr.to_string(), Auth::v2c("public"))
-        .trap_sink("live", live_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("dead").unwrap(),
+            dead_addr.to_string(),
+            Auth::v2c("public"),
+        )
+        .trap_sink(
+            NotificationSinkId::new("live").unwrap(),
+            live_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .inform_timeout(Duration::from_millis(100))
         .inform_retry(Retry::none())
         .allow_all_access()
@@ -1588,10 +1620,10 @@ async fn agent_inform_aggregate_restores_configuration_order() {
     let outcome = agent.send_inform(&trap_oid, 0, vec![]).await;
     receive.await.unwrap().unwrap();
 
-    assert_eq!(outcome.sinks()[0].sink.id().as_str(), "dead");
+    assert_eq!(outcome.sinks()[0].sink.id().as_bytes(), b"dead");
     assert_eq!(outcome.sinks()[0].sink.index(), 0);
     assert!(matches!(outcome.sinks()[0].status, SinkStatus::Failed(_)));
-    assert_eq!(outcome.sinks()[1].sink.id().as_str(), "live");
+    assert_eq!(outcome.sinks()[1].sink.id().as_bytes(), b"live");
     assert_eq!(outcome.sinks()[1].sink.index(), 1);
     assert!(matches!(outcome.sinks()[1].status, SinkStatus::Succeeded));
 }
@@ -1603,7 +1635,11 @@ async fn agent_trap_reports_total_conversion_failure() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v1", sink_addr.to_string(), Auth::v1("public"))
+        .trap_sink(
+            NotificationSinkId::new("v1").unwrap(),
+            sink_addr.to_string(),
+            Auth::v1("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -1640,8 +1676,16 @@ async fn agent_trap_reports_ordered_partial_success() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v1", v1_addr.to_string(), Auth::v1("public"))
-        .trap_sink("v2c", v2_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("v1").unwrap(),
+            v1_addr.to_string(),
+            Auth::v1("public"),
+        )
+        .trap_sink(
+            NotificationSinkId::new("v2c").unwrap(),
+            v2_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -1681,7 +1725,11 @@ async fn agent_v1_inform_is_explicitly_skipped() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v1", sink_addr.to_string(), Auth::v1("public"))
+        .trap_sink(
+            NotificationSinkId::new("v1").unwrap(),
+            sink_addr.to_string(),
+            Auth::v1("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -1707,7 +1755,11 @@ async fn agent_inform_stream_yields_skipped_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v1-skip", "127.0.0.1:9", Auth::v1("public"))
+        .trap_sink(
+            NotificationSinkId::new("v1-skip").unwrap(),
+            "127.0.0.1:9",
+            Auth::v1("public"),
+        )
         .allow_all_access()
         .build()
         .await
@@ -1716,7 +1768,7 @@ async fn agent_inform_stream_yields_skipped_sink() {
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
     let mut stream = agent.send_inform_stream(&trap_oid, 0, vec![]);
     let skipped = stream.next().await.expect("skipped sink outcome");
-    assert_eq!(skipped.sink.id().as_str(), "v1-skip");
+    assert_eq!(skipped.sink.id().as_bytes(), b"v1-skip");
     assert_eq!(skipped.sink.index(), 0);
     assert!(matches!(
         skipped.status,
@@ -1731,7 +1783,11 @@ async fn agent_best_effort_helpers_complete_after_failure_and_skip() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink("v1", receiver.local_addr().to_string(), Auth::v1("public"))
+        .trap_sink(
+            NotificationSinkId::new("v1").unwrap(),
+            receiver.local_addr().to_string(),
+            Auth::v1("public"),
+        )
         .allow_all_access()
         .build()
         .await

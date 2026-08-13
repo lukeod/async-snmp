@@ -91,7 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request-ID and retry-jitter seeds use warned deterministic fallbacks when OS
   entropy is unavailable.
 - **Breaking:** `AgentBuilder::trap_sink` now requires a stable caller-supplied
-  `NotificationSinkId`; duplicate IDs are rejected during agent construction.
+  `NotificationSinkId`; construct one with fallible `new` or `TryFrom` before
+  adding the sink. IDs retain 1-32 opaque octets, including non-UTF-8 values,
+  and invalid lengths return `NotificationSinkIdError`. Duplicate IDs are
+  rejected during agent construction.
   `Agent::notification_sinks` exposes cloneable, credential-free
   `NotificationSinkSummary` values in configuration order, and each
   `SinkOutcome` carries the same summary instead of a destination-only identity.

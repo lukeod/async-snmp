@@ -3,6 +3,13 @@ use std::time::Duration;
 
 use async_snmp::message::Message;
 use async_snmp::transport::TcpOptions;
+#[cfg(feature = "agent")]
+use async_snmp::{
+    Agent, AgentBuilder, BoxFuture, GetNextResult, GetResult, NotificationSendStream,
+    NotificationSinkId, NotificationSinkIdError, NotificationSinkSummary, PreparedSet,
+    RequestContext, SetCommitError, SetCommitResult, SetTestError, SetTestResult, SetUndoError,
+    SetUndoResult, oid,
+};
 use async_snmp::{
     Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, DecodeError,
@@ -10,12 +17,6 @@ use async_snmp::{
     Pdu, PduBody, RequestPdu, RequestRegistration, ResponsePdu, StandardPduType, Target,
     UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind, VarBind, Version,
     WalkAbortReason,
-};
-#[cfg(feature = "agent")]
-use async_snmp::{
-    BoxFuture, GetNextResult, GetResult, NotificationSendStream, NotificationSinkId,
-    NotificationSinkSummary, PreparedSet, RequestContext, SetCommitError, SetCommitResult,
-    SetTestError, SetTestResult, SetUndoError, SetUndoResult, oid,
 };
 use bytes::Bytes;
 
@@ -580,8 +581,45 @@ fn vacm_duplicate_and_replacement_apis_are_public() {
 #[cfg(feature = "agent")]
 #[test]
 fn notification_sink_identity_types_are_public() {
-    let id = NotificationSinkId::from("primary");
-    assert_eq!(id.as_str(), "primary");
+    use std::collections::{BTreeMap, HashMap};
+
+    let one = NotificationSinkId::new("p").unwrap();
+    let thirty_two = NotificationSinkId::try_from([b'x'; 32]).unwrap();
+    let non_utf8 = NotificationSinkId::try_from(&b"edge\xff"[..]).unwrap();
+
+    assert_eq!(one.as_bytes(), b"p");
+    assert_eq!(thirty_two.as_bytes(), &[b'x'; 32]);
+    assert_eq!(non_utf8.as_bytes(), b"edge\xff");
+    assert_eq!(non_utf8.to_string(), "edge\\xff");
+    assert_eq!(
+        format!("{non_utf8:?}"),
+        "NotificationSinkId(b\"edge\\xff\")"
+    );
+
+    let empty: NotificationSinkIdError = NotificationSinkId::new([]).unwrap_err();
+    assert_eq!(empty.length(), 0);
+    assert_eq!(
+        empty.to_string(),
+        "notification sink ID length 0 is outside 1..=32 octets"
+    );
+    let too_long = NotificationSinkId::try_from(vec![b'x'; 33]).unwrap_err();
+    assert_eq!(too_long.length(), 33);
+    let multibyte = NotificationSinkId::new("é".repeat(17)).unwrap_err();
+    assert_eq!(multibyte.length(), 34);
+
+    let from_str = NotificationSinkId::try_from(String::from("primary")).unwrap();
+    let from_bytes = NotificationSinkId::try_from(Vec::from(&b"primary"[..])).unwrap();
+    assert_eq!(from_str, from_bytes);
+
+    let mut hash = HashMap::new();
+    hash.insert(from_str.clone(), "hash");
+    assert_eq!(hash.get(&from_bytes), Some(&"hash"));
+    let ordered = BTreeMap::from([(non_utf8.clone(), 2), (one.clone(), 1)]);
+    assert_eq!(ordered.keys().next(), Some(&non_utf8));
+
+    let builder: AgentBuilder =
+        Agent::builder().trap_sink(from_str, "127.0.0.1:162", async_snmp::Auth::v2c("public"));
+    drop(builder);
     let _: Option<NotificationSinkSummary> = None;
     let _: Option<NotificationSendStream<'static>> = None;
 }

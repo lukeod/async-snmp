@@ -3,6 +3,8 @@
 //! Provides trap sink configuration and methods for sending notifications
 //! from an agent to configured destinations.
 
+use std::fmt;
+use std::fmt::Write;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -34,66 +36,124 @@ const MAX_NOTIFICATION_SINK_ID_LEN: usize = 32;
 /// The identifier is operational metadata and is never derived from sink
 /// credentials. Callers should keep it stable across agent restarts when sink
 /// delivery outcomes are retained outside the library. Configured identifiers
-/// must contain 1 to 32 UTF-8 octets, matching the `snmpTargetAddrName` size
-/// defined by RFC 3413.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NotificationSinkId(Arc<str>);
+/// contain 1 to 32 octets, matching the `snmpTargetAddrName` size defined by
+/// RFC 3413. Identifiers are opaque octets and need not contain UTF-8.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NotificationSinkId(Arc<[u8]>);
+
+/// Error returned when a notification sink identifier has an invalid length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("notification sink ID length {length} is outside 1..=32 octets")]
+pub struct NotificationSinkIdError {
+    length: usize,
+}
+
+impl NotificationSinkIdError {
+    /// Return the rejected identifier length in octets.
+    #[must_use]
+    pub const fn length(&self) -> usize {
+        self.length
+    }
+}
 
 impl NotificationSinkId {
-    /// Create a notification sink identifier.
+    /// Create a notification sink identifier from bytes or text.
     ///
-    /// Validation is deferred until [`AgentBuilder::build`](super::AgentBuilder::build)
-    /// so identifiers can be supplied directly to the fluent builder API.
-    #[must_use]
-    pub fn new(id: impl Into<Arc<str>>) -> Self {
-        Self(id.into())
+    /// Returns [`NotificationSinkIdError`] unless `id` contains 1 to 32
+    /// octets. Text inputs are measured by their UTF-8 encoding.
+    pub fn new(id: impl AsRef<[u8]>) -> std::result::Result<Self, NotificationSinkIdError> {
+        Self::try_from(id.as_ref())
     }
 
-    /// Return the identifier as text.
+    /// Return the identifier octets.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
-        let len = self.0.len();
-        if len == 0 {
-            return Err(Error::Config("notification sink ID must not be empty".into()).boxed());
+    fn from_arc(id: Arc<[u8]>) -> std::result::Result<Self, NotificationSinkIdError> {
+        let length = id.len();
+        if !(1..=MAX_NOTIFICATION_SINK_ID_LEN).contains(&length) {
+            return Err(NotificationSinkIdError { length });
         }
-        if len > MAX_NOTIFICATION_SINK_ID_LEN {
-            return Err(Error::Config(
-                format!(
-                    "notification sink ID length {len} exceeds maximum {MAX_NOTIFICATION_SINK_ID_LEN} UTF-8 octets"
-                )
-                .into(),
-            )
-            .boxed());
+        Ok(Self(id))
+    }
+}
+
+fn write_escaped_id(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    for &byte in bytes {
+        for escaped in std::ascii::escape_default(byte) {
+            f.write_char(char::from(escaped))?;
         }
-        Ok(())
+    }
+    Ok(())
+}
+
+impl fmt::Debug for NotificationSinkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NotificationSinkId(b\"")?;
+        write_escaped_id(self.as_bytes(), f)?;
+        f.write_str("\")")
     }
 }
 
-impl std::fmt::Display for NotificationSinkId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+impl fmt::Display for NotificationSinkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_escaped_id(self.as_bytes(), f)
     }
 }
 
-impl AsRef<str> for NotificationSinkId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
+impl AsRef<[u8]> for NotificationSinkId {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
-impl From<&str> for NotificationSinkId {
-    fn from(id: &str) -> Self {
-        Self::new(Arc::<str>::from(id))
+impl TryFrom<&[u8]> for NotificationSinkId {
+    type Error = NotificationSinkIdError;
+
+    fn try_from(id: &[u8]) -> std::result::Result<Self, Self::Error> {
+        Self::from_arc(Arc::from(id))
     }
 }
 
-impl From<String> for NotificationSinkId {
-    fn from(id: String) -> Self {
-        Self::new(Arc::<str>::from(id))
+impl TryFrom<Vec<u8>> for NotificationSinkId {
+    type Error = NotificationSinkIdError;
+
+    fn try_from(id: Vec<u8>) -> std::result::Result<Self, Self::Error> {
+        Self::from_arc(Arc::from(id))
+    }
+}
+
+impl<const N: usize> TryFrom<&[u8; N]> for NotificationSinkId {
+    type Error = NotificationSinkIdError;
+
+    fn try_from(id: &[u8; N]) -> std::result::Result<Self, Self::Error> {
+        Self::try_from(id.as_slice())
+    }
+}
+
+impl<const N: usize> TryFrom<[u8; N]> for NotificationSinkId {
+    type Error = NotificationSinkIdError;
+
+    fn try_from(id: [u8; N]) -> std::result::Result<Self, Self::Error> {
+        Self::try_from(Vec::from(id))
+    }
+}
+
+impl TryFrom<&str> for NotificationSinkId {
+    type Error = NotificationSinkIdError;
+
+    fn try_from(id: &str) -> std::result::Result<Self, Self::Error> {
+        Self::try_from(id.as_bytes())
+    }
+}
+
+impl TryFrom<String> for NotificationSinkId {
+    type Error = NotificationSinkIdError;
+
+    fn try_from(id: String) -> std::result::Result<Self, Self::Error> {
+        Self::try_from(id.into_bytes())
     }
 }
 
@@ -493,12 +553,12 @@ impl super::Agent {
     ///
     /// ```rust,no_run
     /// # use async_snmp::agent::Agent;
-    /// # use async_snmp::{Auth, oid};
+    /// # use async_snmp::{Auth, NotificationSinkId, oid};
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
-    ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
+    ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
     ///     .allow_all_access()
     ///     .build()
     ///     .await?;
@@ -614,12 +674,12 @@ impl super::Agent {
     ///
     /// ```rust,no_run
     /// # use async_snmp::agent::Agent;
-    /// # use async_snmp::{Auth, oid};
+    /// # use async_snmp::{Auth, NotificationSinkId, oid};
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
-    ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
+    ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
     ///     .allow_all_access()
     ///     .build()
     ///     .await?;
@@ -854,7 +914,7 @@ mod tests {
     fn test_sink(auth: impl Into<Auth>) -> TrapSink {
         TrapSink::new(
             0,
-            NotificationSinkId::from("test-sink"),
+            NotificationSinkId::new("test-sink").unwrap(),
             "127.0.0.1:9".parse().unwrap(),
             auth.into(),
             crate::client::DEFAULT_SEND_TIMEOUT,
@@ -1082,8 +1142,16 @@ mod tests {
 
         let mixed = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink("allowed", "127.0.0.1:9", Auth::v2c("allowed"))
-            .trap_sink("denied", "127.0.0.1:9", Auth::v2c("denied"))
+            .trap_sink(
+                NotificationSinkId::new("allowed").unwrap(),
+                "127.0.0.1:9",
+                Auth::v2c("allowed"),
+            )
+            .trap_sink(
+                NotificationSinkId::new("denied").unwrap(),
+                "127.0.0.1:9",
+                Auth::v2c("denied"),
+            )
             .vacm(|v| {
                 v.group("allowed", SecurityModel::V2c, "allowed")
                     .group("denied", SecurityModel::V2c, "denied")
@@ -1114,7 +1182,11 @@ mod tests {
 
         let denied_inform = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink("denied", "127.0.0.1:9", Auth::v2c("denied"))
+            .trap_sink(
+                NotificationSinkId::new("denied").unwrap(),
+                "127.0.0.1:9",
+                Auth::v2c("denied"),
+            )
             .vacm(|v| {
                 v.group("denied", SecurityModel::V2c, "denied")
                     .access(
@@ -1137,7 +1209,11 @@ mod tests {
 
         let denied_v1_inform = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink("denied-v1", "127.0.0.1:9", Auth::v1("denied"))
+            .trap_sink(
+                NotificationSinkId::new("denied-v1").unwrap(),
+                "127.0.0.1:9",
+                Auth::v1("denied"),
+            )
             .vacm(|v| v)
             .build()
             .await
@@ -1155,7 +1231,11 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .trap_sink("public", "127.0.0.1:9", Auth::v2c("public"))
+            .trap_sink(
+                NotificationSinkId::new("public").unwrap(),
+                "127.0.0.1:9",
+                Auth::v2c("public"),
+            )
             .allow_all_access()
             .build()
             .await
@@ -1184,7 +1264,11 @@ mod tests {
     async fn unpolled_trap_stream_does_not_allocate_request_id() {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink("lazy", "127.0.0.1:9", Auth::v1("public"))
+            .trap_sink(
+                NotificationSinkId::new("lazy").unwrap(),
+                "127.0.0.1:9",
+                Auth::v1("public"),
+            )
             .build()
             .await
             .unwrap();

@@ -79,8 +79,8 @@ pub mod vacm;
 
 pub use crate::handler::SecurityModel;
 pub use notification::{
-    NotificationOutcome, NotificationSendStream, NotificationSinkId, NotificationSinkSummary,
-    SinkOutcome, SinkSkipReason, SinkStatus,
+    NotificationOutcome, NotificationSendStream, NotificationSinkId, NotificationSinkIdError,
+    NotificationSinkSummary, SinkOutcome, SinkSkipReason, SinkStatus,
 };
 pub use vacm::{
     DuplicateVacmAccessEntry, VacmAccessIndex, VacmBuilder, VacmConfig, VacmSecurityModel, View,
@@ -834,7 +834,8 @@ impl AgentBuilder {
     /// any V3 sink still requires local authoritative state because it may be
     /// used by [`Agent::send_trap()`].
     ///
-    /// `id` must be unique within the agent and contain 1 to 32 UTF-8 octets.
+    /// `id` must be unique within the agent. Its 1-to-32-octet length was
+    /// validated when the [`NotificationSinkId`] was constructed.
     /// It is included in delivery outcomes and should remain stable across
     /// restarts when the application retains sink status. `dest` must include
     /// a port and may be an IPv4 address, bracketed IPv6 address, or hostname.
@@ -848,7 +849,9 @@ impl AgentBuilder {
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
-    /// use async_snmp::{Auth, AuthProtocol, AuthoritativeEngine, PrivProtocol};
+    /// use async_snmp::{
+    ///     Auth, AuthProtocol, AuthoritativeEngine, NotificationSinkId, PrivProtocol,
+    /// };
     /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
@@ -860,8 +863,8 @@ impl AgentBuilder {
     ///     .bind("0.0.0.0:1161")
     ///     .authoritative_engine(engine)
     ///     .community(b"public")
-    ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
-    ///     .trap_sink("secure", "10.0.0.1:162", Auth::usm_builder("trapuser")
+    ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
+    ///     .trap_sink(NotificationSinkId::new("secure").unwrap(), "10.0.0.1:162", Auth::usm_builder("trapuser")
     ///         .auth_priv(
     ///             AuthProtocol::Sha256,
     ///             "authpass",
@@ -878,11 +881,11 @@ impl AgentBuilder {
     #[must_use]
     pub fn trap_sink(
         mut self,
-        id: impl Into<NotificationSinkId>,
+        id: NotificationSinkId,
         dest: impl Into<String>,
         auth: impl Into<crate::client::Auth>,
     ) -> Self {
-        self.trap_sinks.push((id.into(), dest.into(), auth.into()));
+        self.trap_sinks.push((id, dest.into(), auth.into()));
         self
     }
 
@@ -947,8 +950,8 @@ impl AgentBuilder {
     ///
     /// Returns a configuration error when inbound identities do not have an
     /// explicit access policy, VACM and unrestricted access are both selected,
-    /// notification sink IDs are empty, longer than 32 UTF-8 octets, or
-    /// duplicated; trap sink destinations are invalid or cannot be resolved;
+    /// notification sink IDs are duplicated; trap sink destinations are
+    /// invalid or cannot be resolved;
     /// USM credentials are invalid; USM users or V3 trap sinks are configured
     /// without a persisted [`AuthoritativeEngine`]; a timeout cannot be
     /// represented; or the response-size limit exceeds the fixed UDP receive
@@ -1162,7 +1165,6 @@ impl AgentBuilder {
 
         let mut sink_ids = HashSet::with_capacity(self.trap_sinks.len());
         for (id, _, _) in &self.trap_sinks {
-            id.validate()?;
             if !sink_ids.insert(id.clone()) {
                 return Err(
                     Error::Config(format!("duplicate notification sink ID: {id}").into()).boxed(),
@@ -4485,7 +4487,11 @@ mod tests {
     async fn test_v3_trap_sink_requires_authoritative_engine_before_bind() {
         let result = Agent::builder()
             .bind("not a socket address")
-            .trap_sink("v3-sink", "127.0.0.1:162", crate::Auth::usm("trapuser"))
+            .trap_sink(
+                NotificationSinkId::new("v3-sink").unwrap(),
+                "127.0.0.1:162",
+                crate::Auth::usm("trapuser"),
+            )
             .build()
             .await;
 
@@ -4647,7 +4653,7 @@ mod tests {
             .bind("not a socket address")
             .max_concurrent_requests(Some(0))
             .trap_sink(
-                "resolver-must-not-run",
+                NotificationSinkId::new("resolver-must-not-run").unwrap(),
                 "unresolvable.invalid:162",
                 crate::Auth::v2c("public"),
             )
@@ -4688,37 +4694,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_sink_id_precedes_occupied_bind_without_socket_attempt() {
-        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let occupied_addr = occupied.local_addr().unwrap();
-        let bind_calls = Arc::new(AtomicUsize::new(0));
-        let bind_calls_for_builder = Arc::clone(&bind_calls);
-
-        let error = Agent::builder()
-            .bind(occupied_addr.to_string())
-            .trap_sink("", "127.0.0.1:162", crate::Auth::v2c("public"))
-            .build_with_dependencies(
-                move |addr, recv_buffer_size| {
-                    bind_calls_for_builder.fetch_add(1, Ordering::Relaxed);
-                    bind_udp_socket(addr, recv_buffer_size, None, false)
-                },
-                |_, _| async { panic!("resolver must not run") },
-                || panic!("engine ID generator must not run"),
-                || panic!("salt generator must not run"),
-            )
-            .await
-            .err()
-            .expect("empty sink ID must fail");
-
-        assert!(matches!(
-            *error,
-            Error::Config(ref message)
-                if message.as_ref() == "notification sink ID must not be empty"
-        ));
-        assert_eq!(bind_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
     async fn invalid_sink_address_precedes_occupied_bind_without_socket_attempt() {
         let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let occupied_addr = occupied.local_addr().unwrap();
@@ -4727,7 +4702,11 @@ mod tests {
 
         let error = Agent::builder()
             .bind(occupied_addr.to_string())
-            .trap_sink("invalid", "missing-port", crate::Auth::v2c("public"))
+            .trap_sink(
+                NotificationSinkId::new("invalid").unwrap(),
+                "missing-port",
+                crate::Auth::v2c("public"),
+            )
             .build_with_dependencies(
                 move |addr, recv_buffer_size| {
                     bind_calls_for_builder.fetch_add(1, Ordering::Relaxed);
@@ -4787,7 +4766,7 @@ mod tests {
         let error = Agent::builder()
             .bind(occupied_addr.to_string())
             .trap_sink(
-                "unresolved",
+                NotificationSinkId::new("unresolved").unwrap(),
                 "unresolvable.invalid:162",
                 crate::Auth::v2c("public"),
             )
@@ -4817,7 +4796,7 @@ mod tests {
         let error = Agent::builder()
             .bind(bind_addr.to_string())
             .trap_sink(
-                "unresolved",
+                NotificationSinkId::new("unresolved").unwrap(),
                 "unresolvable.invalid:162",
                 crate::Auth::v2c("public"),
             )
@@ -4899,7 +4878,7 @@ mod tests {
         let config = Agent::builder()
             .bind(bind)
             .trap_sink(
-                "numeric",
+                NotificationSinkId::new("numeric").unwrap(),
                 destination.to_string(),
                 crate::Auth::v2c("public"),
             )
@@ -4955,7 +4934,11 @@ mod tests {
     ) -> Result<Agent> {
         Agent::builder()
             .bind(bind)
-            .trap_sink("hostname", "sink.example:162", crate::Auth::v2c("public"))
+            .trap_sink(
+                NotificationSinkId::new("hostname").unwrap(),
+                "sink.example:162",
+                crate::Auth::v2c("public"),
+            )
             .build_with_dependencies(
                 |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
                 move |host, port| {
@@ -5059,13 +5042,25 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .trap_sink(
-                "numeric-mapped",
+                NotificationSinkId::new("numeric-mapped").unwrap(),
                 "[::ffff:192.0.2.10]:1162",
                 crate::Auth::v2c("public"),
             )
-            .trap_sink("resolved", "first.example:162", crate::Auth::v2c("public"))
-            .trap_sink("numeric-v4", "192.0.2.30:1162", crate::Auth::v2c("public"))
-            .trap_sink("mapped", "second.example:162", crate::Auth::v2c("public"))
+            .trap_sink(
+                NotificationSinkId::new("resolved").unwrap(),
+                "first.example:162",
+                crate::Auth::v2c("public"),
+            )
+            .trap_sink(
+                NotificationSinkId::new("numeric-v4").unwrap(),
+                "192.0.2.30:1162",
+                crate::Auth::v2c("public"),
+            )
+            .trap_sink(
+                NotificationSinkId::new("mapped").unwrap(),
+                "second.example:162",
+                crate::Auth::v2c("public"),
+            )
             .build_with_dependencies(
                 |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
                 move |host, port| {
@@ -5102,13 +5097,13 @@ mod tests {
         for (expected_index, summary) in summaries.iter().enumerate() {
             assert_eq!(summary.index(), expected_index);
         }
-        assert_eq!(summaries[0].id().as_str(), "numeric-mapped");
+        assert_eq!(summaries[0].id().as_bytes(), b"numeric-mapped");
         assert_eq!(summaries[0].dest(), "192.0.2.10:1162".parse().unwrap());
-        assert_eq!(summaries[1].id().as_str(), "resolved");
+        assert_eq!(summaries[1].id().as_bytes(), b"resolved");
         assert_eq!(summaries[1].dest(), "192.0.2.20:1162".parse().unwrap());
-        assert_eq!(summaries[2].id().as_str(), "numeric-v4");
+        assert_eq!(summaries[2].id().as_bytes(), b"numeric-v4");
         assert_eq!(summaries[2].dest(), "192.0.2.30:1162".parse().unwrap());
-        assert_eq!(summaries[3].id().as_str(), "mapped");
+        assert_eq!(summaries[3].id().as_bytes(), b"mapped");
         assert_eq!(summaries[3].dest(), "192.0.2.40:1162".parse().unwrap());
     }
 

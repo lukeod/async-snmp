@@ -15,7 +15,9 @@ use async_snmp::agent::{Agent, NotificationOutcome, SinkStatus};
 use async_snmp::notification::{Notification, NotificationAcceptance, NotificationReceiver};
 use async_snmp::v3::AuthoritativeEngine;
 use async_snmp::varbind::VarBind;
-use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, SecurityLevel, Value, oid};
+use async_snmp::{
+    Auth, AuthProtocol, Client, NotificationSinkId, PrivProtocol, SecurityLevel, Value, oid,
+};
 use std::time::Duration;
 
 #[tokio::main]
@@ -91,7 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         // Configure trap sinks - agent sends to all of them
-        .trap_sink("local-receiver", recv_addr.to_string(), Auth::v2c("public"))
+        .trap_sink(
+            NotificationSinkId::new("local-receiver").unwrap(),
+            recv_addr.to_string(),
+            Auth::v2c("public"),
+        )
         .allow_all_access()
         .build()
         .await?;
