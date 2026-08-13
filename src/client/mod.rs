@@ -84,6 +84,7 @@ use crate::version::Version;
 use response_shape::{RequestShape, classify};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -180,6 +181,126 @@ struct ClientEngine {
     generation: Arc<()>,
 }
 
+struct DiscoveryFlight {
+    outcome: Mutex<Option<DiscoveryOutcome>>,
+    complete: tokio::sync::Notify,
+}
+
+#[derive(Clone)]
+enum DiscoveryOutcome {
+    Success(ResponseMetadata),
+    Timeout {
+        target: SocketAddr,
+        elapsed: Duration,
+        retries: u32,
+    },
+    Closed(SocketAddr),
+    Network {
+        target: SocketAddr,
+        kind: std::io::ErrorKind,
+        message: Arc<str>,
+    },
+    RequestIdInUse(i32),
+    OutboundMessageTooLarge {
+        size: usize,
+        limit: usize,
+    },
+    Auth(SocketAddr),
+    Decode(crate::DecodeError),
+    MalformedResponse(SocketAddr),
+    Config(Arc<str>),
+    InvalidMessage(Arc<str>),
+    InvalidOid(Arc<str>),
+    Failure(Arc<Error>),
+}
+
+impl DiscoveryOutcome {
+    fn share_result(result: Result<ResponseMetadata>) -> (Self, Result<ResponseMetadata>) {
+        match result {
+            Ok(metadata) => (Self::Success(metadata.clone()), Ok(metadata)),
+            Err(error) => {
+                let outcome = match &*error {
+                    Error::Timeout {
+                        target,
+                        elapsed,
+                        retries,
+                    } => Self::Timeout {
+                        target: *target,
+                        elapsed: *elapsed,
+                        retries: *retries,
+                    },
+                    Error::Closed { target } => Self::Closed(*target),
+                    Error::Network { target, source } => Self::Network {
+                        target: *target,
+                        kind: source.kind(),
+                        message: source.to_string().into(),
+                    },
+                    Error::RequestIdInUse { request_id } => Self::RequestIdInUse(*request_id),
+                    Error::OutboundMessageTooLarge { size, limit } => {
+                        Self::OutboundMessageTooLarge {
+                            size: *size,
+                            limit: *limit,
+                        }
+                    }
+                    Error::Auth { target } => Self::Auth(*target),
+                    Error::Decode(error) => Self::Decode(error.clone()),
+                    Error::MalformedResponse { target } => Self::MalformedResponse(*target),
+                    Error::Config(message) => Self::Config(message.as_ref().into()),
+                    Error::InvalidMessage(message) => Self::InvalidMessage(message.as_ref().into()),
+                    Error::InvalidOid(message) => Self::InvalidOid(message.as_ref().into()),
+                    _ => {
+                        let source: Arc<Error> = error.into();
+                        return (
+                            Self::Failure(Arc::clone(&source)),
+                            Err(Error::SharedOperation { source }.boxed()),
+                        );
+                    }
+                };
+                (outcome, Err(error))
+            }
+        }
+    }
+
+    fn into_result(self) -> Result<ResponseMetadata> {
+        match self {
+            Self::Success(metadata) => Ok(metadata),
+            Self::Timeout {
+                target,
+                elapsed,
+                retries,
+            } => Err(Error::Timeout {
+                target,
+                elapsed,
+                retries,
+            }
+            .boxed()),
+            Self::Closed(target) => Err(Error::Closed { target }.boxed()),
+            Self::Network {
+                target,
+                kind,
+                message,
+            } => Err(Error::Network {
+                target,
+                source: std::io::Error::new(kind, message.to_string()),
+            }
+            .boxed()),
+            Self::RequestIdInUse(request_id) => Err(Error::RequestIdInUse { request_id }.boxed()),
+            Self::OutboundMessageTooLarge { size, limit } => {
+                Err(Error::OutboundMessageTooLarge { size, limit }.boxed())
+            }
+            Self::Auth(target) => Err(Error::Auth { target }.boxed()),
+            Self::Decode(error) => Err(Error::Decode(error).boxed()),
+            Self::MalformedResponse(target) => Err(Error::MalformedResponse { target }.boxed()),
+            Self::Config(message) => Err(Error::Config(message.as_ref().into()).boxed()),
+            Self::InvalidMessage(message) => {
+                Err(Error::InvalidMessage(message.as_ref().into()).boxed())
+            }
+            Self::InvalidOid(message) => Err(Error::InvalidOid(message.as_ref().into()).boxed()),
+            Self::Failure(source) => Err(Error::SharedOperation { source }.boxed()),
+        }
+    }
+}
+
 impl ClientEngine {
     fn new(state: EngineState, derived_keys: DerivedKeys) -> Self {
         Self {
@@ -199,8 +320,10 @@ struct ClientInner<T: Transport> {
     salt_counter: Option<SaltCounter>,
     /// Shared engine cache (V3, optional)
     engine_cache: Option<Arc<EngineCache>>,
-    /// Serializes concurrent discovery attempts so only one runs at a time.
+    /// Serializes explicit rediscovery against ordinary discovery.
     discovery_lock: AsyncMutex<()>,
+    /// Cancellation-safe ordinary-discovery single flight.
+    discovery_flight: Mutex<Option<Arc<DiscoveryFlight>>>,
     /// Keys derived against the local authoritative engine ID for V3 traps.
     local_derived_keys: RwLock<Option<DerivedKeys>>,
     #[cfg(test)]
@@ -410,6 +533,7 @@ impl<T: Transport> Client<T> {
                 salt_counter,
                 engine_cache,
                 discovery_lock: AsyncMutex::new(()),
+                discovery_flight: Mutex::new(None),
                 local_derived_keys: RwLock::new(None),
                 #[cfg(test)]
                 authenticated_response_validated_hook: RwLock::new(None),

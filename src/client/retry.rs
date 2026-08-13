@@ -183,6 +183,40 @@ impl Retry {
             }
         }
     }
+
+    pub(crate) fn maximum_delay(&self, attempt: u32) -> Duration {
+        match &self.backoff {
+            Backoff::None => Duration::ZERO,
+            Backoff::Fixed { delay } => *delay,
+            Backoff::Exponential {
+                initial,
+                max,
+                jitter,
+            } => {
+                let multiplier = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
+                let capped = initial.saturating_mul(multiplier).min(*max);
+                Duration::try_from_secs_f64(capped.as_secs_f64() * (1.0 + jitter))
+                    .unwrap_or(Duration::MAX)
+                    .min(*max)
+            }
+        }
+    }
+
+    pub(crate) fn maximum_total_delay(&self, retries: u32) -> Option<Duration> {
+        match &self.backoff {
+            Backoff::None => Some(Duration::ZERO),
+            Backoff::Fixed { delay } => delay.checked_mul(retries),
+            Backoff::Exponential { .. } => {
+                let prefix = retries.min(32);
+                let mut total = Duration::ZERO;
+                for attempt in 0..prefix {
+                    total = total.checked_add(self.maximum_delay(attempt))?;
+                }
+                let remaining = retries - prefix;
+                total.checked_add(self.maximum_delay(31).checked_mul(remaining)?)
+            }
+        }
+    }
 }
 
 /// Builder for exponential backoff retry configuration.
@@ -311,6 +345,39 @@ mod tests {
         let retry = Retry::none();
         assert_eq!(retry.max_attempts(), 0);
         assert_eq!(retry.compute_delay(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn maximum_delay_bounds_jittered_delays() {
+        let retry = Retry::exponential(4)
+            .initial_delay(Duration::from_millis(100))
+            .max_delay(Duration::from_secs(2))
+            .jitter(1.0)
+            .build()
+            .unwrap();
+        for attempt in 0..4 {
+            let maximum = retry.maximum_delay(attempt);
+            for _ in 0..100 {
+                assert!(retry.compute_delay(attempt) <= maximum);
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_total_delay_handles_maximum_retry_count_in_bounded_work() {
+        let fixed = Retry::fixed(u32::MAX, Duration::from_nanos(1));
+        assert_eq!(
+            fixed.maximum_total_delay(u32::MAX),
+            Some(Duration::from_nanos(u64::from(u32::MAX)))
+        );
+
+        let exponential = Retry::exponential(u32::MAX)
+            .initial_delay(Duration::from_nanos(1))
+            .max_delay(Duration::from_nanos(32))
+            .jitter(1.0)
+            .build()
+            .unwrap();
+        assert!(exponential.maximum_total_delay(u32::MAX).is_some());
     }
 
     #[test]

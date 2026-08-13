@@ -377,8 +377,8 @@ pub enum ConstructionStage {
 
 /// Payload-free classification of a top-level [`Error`].
 ///
-/// This does not define retryability or severity. Exchange metadata wrappers
-/// report the underlying failure's kind.
+/// This does not define retryability or severity. Exchange metadata and shared
+/// operation wrappers report the underlying failure's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -489,6 +489,14 @@ impl std::fmt::Display for ErrorKind {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A failure shared by concurrent participants in one internal operation.
+    #[error("{source}")]
+    SharedOperation {
+        /// Original structured failure shared without lossy reconstruction.
+        #[source]
+        source: std::sync::Arc<Error>,
+    },
+
     /// An exchange consumed one or more accepted responses before ending in an
     /// error that has no response metadata of its own.
     ///
@@ -647,6 +655,7 @@ impl Error {
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
         match self {
+            Self::SharedOperation { source } => source.kind(),
             Self::Exchange { source, .. } => source.kind(),
             Self::Network { .. } => ErrorKind::Network,
             Self::Timeout { .. } => ErrorKind::Timeout,
@@ -679,6 +688,7 @@ impl Error {
     #[must_use]
     pub fn response_metadata(&self) -> Option<&crate::client::ResponseMetadata> {
         match self {
+            Self::SharedOperation { source } => source.response_metadata(),
             Self::Exchange { metadata, .. }
             | Self::Snmp { metadata, .. }
             | Self::Report { metadata, .. } => Some(metadata.as_ref()),
@@ -687,12 +697,16 @@ impl Error {
         }
     }
 
-    /// Return the underlying failure carried by an exchange metadata wrapper.
+    /// Return the underlying failure carried by an exchange metadata or shared
+    /// operation wrapper.
     ///
-    /// For errors that do not need the wrapper, this returns `self`.
+    /// For unwrapped errors, this returns `self`. Prefer this accessor or
+    /// [`Self::kind`] when matching failures that may be shared by concurrent
+    /// participants.
     #[must_use]
     pub fn exchange_source(&self) -> &Error {
         match self {
+            Self::SharedOperation { source } => source.exchange_source(),
             Self::Exchange { source, .. } => source.exchange_source(),
             _ => self,
         }
@@ -700,7 +714,7 @@ impl Error {
 
     /// Return the authoritative-engine persistence failure, if this is one.
     ///
-    /// Exchange metadata wrappers are traversed in the same way as
+    /// Exchange metadata and shared operation wrappers are traversed in the same way as
     /// [`Error::exchange_source`].
     #[must_use]
     pub fn authoritative_engine_persistence(

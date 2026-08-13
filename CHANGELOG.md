@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
+  single-flight operation. Callers share success or structured failure under a
+  bounded total discovery deadline; uncommon errors may use the transparent
+  `Error::SharedOperation` wrapper and remain classifiable through
+  `Error::kind`, `Error::exchange_source`, and `Error::response_metadata`.
+
 - **Breaking:** `RequestContext` fields are private and exposed through
   read-only accessors, preventing callers from constructing or mutating
   version/security combinations that cannot result from a validated request.

@@ -25,6 +25,30 @@ use std::time::Instant;
 use tracing::{Span, instrument};
 
 use super::{Client, ClientEngine, DecodedResponse, ResponseMetadata};
+use super::{DiscoveryFlight, DiscoveryOutcome};
+
+struct DiscoveryLeaderGuard<'a> {
+    slot: &'a std::sync::Mutex<Option<Arc<DiscoveryFlight>>>,
+    flight: Arc<DiscoveryFlight>,
+    completed: bool,
+}
+
+impl Drop for DiscoveryLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        {
+            *slot = None;
+        }
+        drop(slot);
+        self.flight.complete.notify_waiters();
+    }
+}
 
 struct EncodedV3Request {
     data: Vec<u8>,
@@ -103,22 +127,165 @@ impl<T: Transport> Client<T> {
     /// Ensure engine ID is discovered for V3 operations.
     #[instrument(level = "debug", skip(self), fields(snmp.target = %self.peer_addr()))]
     pub(super) async fn ensure_engine_discovered(&self) -> Result<ResponseMetadata> {
-        // Fast path: already discovered.
-        {
-            let engine = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-            if engine.is_some() {
-                return Ok(ResponseMetadata::default());
-            }
-        }
+        let timeout = self.discovery_timeout_budget()?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Config("engine discovery timeout overflow".into()).boxed())?;
 
-        // Serialize concurrent discovery attempts. Only one task runs discovery
-        // at a time; the rest wait here and then take the fast path above.
-        let _guard = self.inner.discovery_lock.lock().await;
-        self.discover_engine_locked(false).await
+        loop {
+            // Fast path, repeated after a cancelled leader wakes its waiters.
+            {
+                let engine = self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
+                if engine.is_some() {
+                    return Ok(ResponseMetadata::default());
+                }
+            }
+
+            let (flight, leader) = {
+                let mut slot =
+                    self.inner.discovery_flight.lock().map_err(|_| {
+                        Error::Config("discovery flight lock poisoned".into()).boxed()
+                    })?;
+                match slot.as_ref() {
+                    Some(flight) => (Arc::clone(flight), false),
+                    None => {
+                        let flight = Arc::new(DiscoveryFlight {
+                            outcome: std::sync::Mutex::new(None),
+                            complete: tokio::sync::Notify::new(),
+                        });
+                        *slot = Some(Arc::clone(&flight));
+                        (flight, true)
+                    }
+                }
+            };
+
+            if leader {
+                let mut guard = DiscoveryLeaderGuard {
+                    slot: &self.inner.discovery_flight,
+                    flight: Arc::clone(&flight),
+                    completed: false,
+                };
+                let timeout_result = || {
+                    Err(Error::Timeout {
+                        target: self.peer_addr(),
+                        elapsed: timeout,
+                        retries: self.discovery_max_attempts(),
+                    }
+                    .boxed())
+                };
+                let result = if tokio::time::Instant::now() >= deadline {
+                    timeout_result()
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = tokio::time::sleep_until(deadline) => timeout_result(),
+                        result = async {
+                            let _rediscovery_guard = self.inner.discovery_lock.lock().await;
+                            self.discover_engine_locked(false).await
+                        } => result,
+                    }
+                };
+                let (outcome, result) = DiscoveryOutcome::share_result(result);
+                *flight
+                    .outcome
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(outcome);
+                {
+                    let mut slot = self
+                        .inner
+                        .discovery_flight
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if slot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                    {
+                        *slot = None;
+                    }
+                }
+                guard.completed = true;
+                flight.complete.notify_waiters();
+                return result;
+            }
+
+            let notified = flight.complete.notified();
+            if let Some(outcome) = flight
+                .outcome
+                .lock()
+                .map_err(|_| Error::Config("discovery outcome lock poisoned".into()).boxed())?
+                .clone()
+            {
+                return outcome.into_result();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Timeout {
+                    target: self.peer_addr(),
+                    elapsed: timeout,
+                    retries: self.discovery_max_attempts(),
+                }
+                .boxed());
+            }
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => return Err(Error::Timeout {
+                    target: self.peer_addr(),
+                    elapsed: timeout,
+                    retries: self.discovery_max_attempts(),
+                }.boxed()),
+                () = notified => {},
+            }
+
+            if let Some(outcome) = flight
+                .outcome
+                .lock()
+                .map_err(|_| Error::Config("discovery outcome lock poisoned".into()).boxed())?
+                .clone()
+            {
+                return outcome.into_result();
+            }
+            // A cancelled leader clears the shared slot without publishing an
+            // outcome. Re-enter so one surviving waiter takes over under the
+            // original caller deadline.
+        }
+    }
+
+    fn discovery_timeout_budget(&self) -> Result<std::time::Duration> {
+        let retries = self.discovery_max_attempts();
+        let mut timeout = self
+            .inner
+            .config
+            .request_timeout
+            .checked_mul(retries)
+            .and_then(|retry_timeouts| {
+                retry_timeouts.checked_add(self.inner.config.request_timeout)
+            })
+            .ok_or_else(|| Error::Config("engine discovery timeout overflow".into()).boxed())?;
+        if !self.inner.transport.is_reliable() {
+            timeout = timeout
+                .checked_add(
+                    self.inner
+                        .config
+                        .retry
+                        .maximum_total_delay(retries)
+                        .ok_or_else(|| {
+                            Error::Config("engine discovery timeout overflow".into()).boxed()
+                        })?,
+                )
+                .ok_or_else(|| Error::Config("engine discovery timeout overflow".into()).boxed())?;
+        }
+        Ok(timeout)
+    }
+
+    fn discovery_max_attempts(&self) -> u32 {
+        if self.inner.transport.is_reliable() {
+            0
+        } else {
+            self.inner.config.retry.max_attempts()
+        }
     }
 
     /// Discover and replace the established authoritative engine.
@@ -257,6 +424,11 @@ impl<T: Transport> Client<T> {
                         if !delay.is_zero() {
                             tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
                             tokio::time::sleep(delay).await;
+                        } else {
+                            // Custom transports may report an immediately ready
+                            // timeout. Yield so large zero-backoff schedules
+                            // remain cancellable and cannot monopolize a worker.
+                            tokio::task::yield_now().await;
                         }
                     }
                     // fall thru to next loop iteration
@@ -1902,6 +2074,326 @@ mod tests {
             }
             ref other => panic!("should return Timeout after all retries exhausted, got {other}"),
         }
+    }
+
+    #[derive(Clone)]
+    struct SingleFlightFailureTransport {
+        peer: SocketAddr,
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Transport for SingleFlightFailureTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv_with<T, F>(
+            &self,
+            _registration: RequestRegistration,
+            _validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.entered.notify_waiters();
+            self.release
+                .acquire()
+                .await
+                .expect("test release remains open")
+                .forget();
+            Err(Error::Timeout {
+                target: self.peer,
+                elapsed: Duration::from_millis(50),
+                retries: 0,
+            }
+            .boxed())
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_is_shared_by_concurrent_callers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let transport = SingleFlightFailureTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+
+        let first_entered = entered.notified();
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.ensure_engine_discovered().await }
+        });
+        first_entered.await;
+        let mut waiters = Vec::new();
+        for _ in 0..15 {
+            let client = client.clone();
+            waiters.push(tokio::spawn(async move {
+                client.ensure_engine_discovered().await
+            }));
+        }
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+
+        let first_error = first.await.unwrap().unwrap_err();
+        assert!(matches!(*first_error, Error::Timeout { .. }));
+        for waiter in waiters {
+            let error = waiter.await.unwrap().unwrap_err();
+            assert!(matches!(*error, Error::Timeout { .. }));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_discovery_leader_is_taken_over_by_waiter() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let transport = SingleFlightFailureTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+
+        let leader_entered = entered.notified();
+        let leader = tokio::spawn({
+            let client = client.clone();
+            async move { client.ensure_engine_discovered().await }
+        });
+        leader_entered.await;
+        let waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.ensure_engine_discovered().await }
+        });
+        tokio::task::yield_now().await;
+        leader.abort();
+
+        while calls.load(Ordering::Relaxed) < 2 {
+            tokio::task::yield_now().await;
+        }
+        release.add_permits(1);
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn expired_discovery_deadline_does_not_start_transport_io() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = SingleFlightFailureTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: calls.clone(),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::ZERO,
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+
+        let error = client.ensure_engine_discovered().await.unwrap_err();
+        assert!(matches!(*error, Error::Timeout { retries: 0, .. }));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[derive(Clone)]
+    struct ImmediateTimeoutTransport {
+        peer: SocketAddr,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Transport for ImmediateTimeoutTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv_with<T, F>(
+            &self,
+            _registration: RequestRegistration,
+            _validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(Error::Timeout {
+                target: self.peer,
+                elapsed: Duration::ZERO,
+                retries: 0,
+            }
+            .boxed())
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_backoff_discovery_retries_remain_cancellable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = ImmediateTimeoutTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: calls.clone(),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::fixed(u32::MAX, Duration::ZERO),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+
+        let discovery = tokio::spawn(async move { client.ensure_engine_discovered().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        discovery.abort();
+        assert!(
+            calls.load(Ordering::Relaxed) < 10_000,
+            "retry loop did not yield to cancellation"
+        );
+    }
+
+    #[derive(Clone)]
+    struct StructuredFailureTransport {
+        peer: SocketAddr,
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Transport for StructuredFailureTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv_with<T, F>(
+            &self,
+            _registration: RequestRegistration,
+            _validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.entered.notify_waiters();
+            self.release
+                .acquire()
+                .await
+                .expect("test release remains open")
+                .forget();
+            Err(Error::Snmp {
+                target: self.peer,
+                status: crate::ErrorStatus::GenErr,
+                index: 0,
+                oid: None,
+                metadata: Box::default(),
+            }
+            .boxed())
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_discovery_failure_is_preserved_for_waiters() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let transport = StructuredFailureTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+
+        let leader_entered = entered.notified();
+        let leader = tokio::spawn({
+            let client = client.clone();
+            async move { client.ensure_engine_discovered().await }
+        });
+        leader_entered.await;
+        let waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.ensure_engine_discovered().await }
+        });
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+
+        for error in [
+            leader.await.unwrap().unwrap_err(),
+            waiter.await.unwrap().unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), crate::ErrorKind::Snmp);
+            assert!(matches!(error.exchange_source(), Error::Snmp { .. }));
+            assert!(error.response_metadata().is_some());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
 
