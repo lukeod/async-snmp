@@ -6,7 +6,7 @@ mod common;
 
 use async_snmp::message::{DecodePolicy, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
-use async_snmp::v3::{AuthProtocol, EngineState, PrivProtocol, ReportStatus, report_oids};
+use async_snmp::v3::{AuthProtocol, DiscoveredEngine, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
     Auth, Client, ClientConfig, CompatibilityPolicy, EngineCache, ErrorStatus, MasterKeys,
     ReceiveLimits, Retry, UsmConfig, Value, VarBind, oid,
@@ -937,10 +937,11 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
     let engine_b = TestV3Engine::new(replacement_id.clone()).user(user_for(level));
     let cache = Arc::new(EngineCache::new());
     let stale_cache = cache.clone();
-    let stale_identity = EngineState::discovered(
+    let stale_identity = DiscoveredEngine::new(
         engine_a.engine_id.clone(),
         async_snmp::MessageSize::new(65_507).unwrap(),
-    );
+    )
+    .unwrap();
     let target = "127.0.0.1:161".parse().unwrap();
     let report_engine = engine_b.clone();
     let transport = ScriptedTransport::new(
@@ -951,7 +952,9 @@ async fn v3_explicit_rediscovery_replaces_identity_and_cache_mapping() {
             ScriptStep::reply(move |request| {
                 // Model an independent stale client refreshing engine A's
                 // mapping while rediscovery is in flight.
-                stale_cache.insert(target, stale_identity);
+                stale_cache
+                    .insert_discovered(target, stale_identity)
+                    .unwrap();
                 V3ReplyBuilder::report_to(
                     request,
                     &report_engine,
@@ -1008,10 +1011,11 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     let engine_b = TestV3Engine::new(replacement_id).user(user_for(level));
     let cache = Arc::new(EngineCache::new());
     let stale_cache = cache.clone();
-    let stale_identity = EngineState::discovered(
+    let stale_identity = DiscoveredEngine::new(
         engine_a.engine_id.clone(),
         async_snmp::MessageSize::new(65_507).unwrap(),
-    );
+    )
+    .unwrap();
     let target = "127.0.0.1:161".parse().unwrap();
     let report_engine = engine_b.clone();
     let transport = ScriptedTransport::new(
@@ -1020,7 +1024,9 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
             discovery_step(engine_a.clone()),
             response_step(engine_a.clone(), "before"),
             ScriptStep::reply(move |request| {
-                stale_cache.insert(target, stale_identity);
+                stale_cache
+                    .insert_discovered(target, stale_identity)
+                    .unwrap();
                 V3ReplyBuilder::report_to(
                     request,
                     &report_engine,
@@ -1686,7 +1692,7 @@ async fn v3_reliable_custom_transport_allows_packet_local_compatibility() {
 }
 
 #[tokio::test]
-async fn v3_failed_packet_local_correction_preserves_trusted_time() {
+async fn v3_failed_packet_local_correction_preserves_authenticated_time() {
     let level = SecurityLevel::AuthNoPriv;
     let engine = engine_for(level);
     let report_engine = engine.clone();

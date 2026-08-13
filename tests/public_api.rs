@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_snmp::message::Message;
@@ -49,6 +50,60 @@ fn notification_acceptance_policy_surface_is_public() {
             Ok(NotificationAcceptance::Reject)
         },
     );
+}
+
+#[test]
+fn engine_cache_public_seeding_encodes_and_validates_trust() {
+    use async_snmp::v3::MAX_ENGINE_TIME;
+    use async_snmp::{DiscoveredEngine, EngineCache, MessageSize};
+
+    let target: SocketAddr = "192.0.2.1:161".parse().unwrap();
+    let capacity = MessageSize::new(1400).unwrap();
+    let discovered = || DiscoveredEngine::new(Bytes::from_static(b"remote-engine"), capacity);
+    let cache = EngineCache::new();
+
+    cache
+        .insert_discovered(target, discovered().unwrap())
+        .unwrap();
+    let state = cache.get(&target).unwrap();
+    assert_eq!(state.engine_id(), b"remote-engine".as_slice());
+    assert_eq!(state.msg_max_size(), capacity);
+    assert!(state.authenticated_time().is_none());
+
+    cache
+        .seed_authenticated(target, discovered().unwrap(), 0, 10)
+        .unwrap();
+    assert_eq!(
+        cache
+            .get(&target)
+            .unwrap()
+            .authenticated_time()
+            .unwrap()
+            .boots(),
+        0
+    );
+    assert!(
+        cache
+            .seed_authenticated(target, discovered().unwrap(), 1, MAX_ENGINE_TIME + 1)
+            .is_err()
+    );
+    assert_eq!(
+        cache
+            .get(&target)
+            .unwrap()
+            .authenticated_time()
+            .unwrap()
+            .latest_received_time(),
+        10
+    );
+
+    cache
+        .seed_authenticated(target, discovered().unwrap(), 7, 500)
+        .unwrap();
+    let state = cache.get(&target).unwrap();
+    let authenticated = state.authenticated_time().unwrap();
+    assert_eq!(authenticated.boots(), 7);
+    assert_eq!(authenticated.latest_received_time(), 500);
 }
 
 #[test]

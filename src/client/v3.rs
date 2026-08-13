@@ -14,8 +14,9 @@ use crate::message::{
 use crate::pdu::{Pdu, PduType};
 use crate::transport::{Candidate, RequestRegistration, Transport};
 use crate::v3::{
-    EngineCache, EngineState, ReportStatus, UsmSecurityParams, auth::verify_message,
-    classify_report, validate_engine_id,
+    EngineCache, EngineCacheAccessError, EngineState, ReportStatus, TimelinessCandidateOutcome,
+    TimelinessPublicationOutcome, UsmSecurityParams, auth::verify_message, classify_report,
+    validate_engine_id,
 };
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -50,6 +51,13 @@ struct DiscoveryResponse {
     metadata: ResponseMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineTimelinessOutcome {
+    Timely,
+    Stale,
+    IdentityConflict,
+}
+
 fn check_and_update_engine_timeliness(
     state: &mut EngineState,
     cache: Option<&EngineCache>,
@@ -57,20 +65,37 @@ fn check_and_update_engine_timeliness(
     engine_id: &[u8],
     msg_boots: u32,
     msg_time: u32,
-) -> Option<bool> {
-    if state.engine_id.as_ref() != engine_id {
-        return None;
+) -> Result<EngineTimelinessOutcome> {
+    if state.engine_id().as_ref() != engine_id {
+        return Ok(EngineTimelinessOutcome::IdentityConflict);
     }
 
     if let Some(cache) = cache {
-        let (timely, cached_state) =
-            cache.check_and_update_timeliness(&target, state, engine_id, msg_boots, msg_time)?;
-        state.merge_from(&cached_state);
-        return Some(timely);
+        return match cache
+            .check_and_update_timeliness(&target, state, engine_id, msg_boots, msg_time)
+            .map_err(EngineCacheAccessError::into_public)?
+        {
+            TimelinessPublicationOutcome::Published(cached)
+            | TimelinessPublicationOutcome::RestoredMapping(cached) => {
+                state.merge_from(&cached);
+                Ok(EngineTimelinessOutcome::Timely)
+            }
+            TimelinessPublicationOutcome::Stale(cached) => {
+                state.merge_from(&cached);
+                Ok(EngineTimelinessOutcome::Stale)
+            }
+            TimelinessPublicationOutcome::IdentityConflict => {
+                Ok(EngineTimelinessOutcome::IdentityConflict)
+            }
+        };
     }
 
     let timely = state.check_and_update_timeliness(msg_boots, msg_time);
-    Some(timely)
+    Ok(if timely {
+        EngineTimelinessOutcome::Timely
+    } else {
+        EngineTimelinessOutcome::Stale
+    })
 }
 
 // V3-specific Client implementation
@@ -151,26 +176,27 @@ impl<T: Transport> Client<T> {
 
         // Explicit rediscovery must reach the peer even if another client
         // refreshes the previous target mapping while discovery is in progress.
-        if !replace_cached_identity
-            && let Some(cache) = &self.inner.engine_cache
-            && let Some(cached_state) = cache.get(&self.peer_addr())
-        {
-            tracing::debug!(target: "async_snmp::client", "using cached engine state");
-            let security = self
-                .inner
-                .config
-                .usm_config()
-                .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
-            let derived_keys = security
-                .derive_keys(&cached_state.engine_id)
-                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-            let mut engine = self
-                .inner
-                .engine
-                .write()
-                .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-            *engine = Some(ClientEngine::new(cached_state, derived_keys));
-            return Ok(ResponseMetadata::default());
+        if !replace_cached_identity && let Some(cache) = &self.inner.engine_cache {
+            let cached_state = cache
+                .get_result(&self.peer_addr())
+                .map_err(EngineCacheAccessError::into_public)?;
+            if let Some(cached_state) = cached_state {
+                tracing::debug!(target: "async_snmp::client", "using cached engine state");
+                let security =
+                    self.inner.config.usm_config().ok_or_else(|| {
+                        Error::Config("V3 security not configured".into()).boxed()
+                    })?;
+                let derived_keys = security
+                    .derive_keys(cached_state.engine_id())
+                    .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+                let mut engine = self
+                    .inner
+                    .engine
+                    .write()
+                    .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
+                *engine = Some(ClientEngine::new(cached_state, derived_keys));
+                return Ok(ResponseMetadata::default());
+            }
         }
 
         // Perform discovery with retry (same policy as normal requests)
@@ -249,7 +275,7 @@ impl<T: Transport> Client<T> {
         })?;
         let engine_state = discovery.engine_state;
         let metadata = discovery.metadata;
-        tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(&engine_state.engine_id), snmp.msg_max_size = engine_state.msg_max_size.as_usize() }, "discovered engine identity");
+        tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(engine_state.engine_id()), snmp.msg_max_size = engine_state.msg_max_size().as_usize() }, "discovered engine identity");
 
         let install_result: Result<()> = (|| {
             let security = self
@@ -265,7 +291,7 @@ impl<T: Transport> Client<T> {
             let replacement_keys = if replace_cached_identity {
                 Some(
                     security
-                        .derive_keys(&engine_state.engine_id)
+                        .derive_keys(engine_state.engine_id())
                         .map_err(|e| Error::Config(e.to_string().into()).boxed())?,
                 )
             } else {
@@ -277,7 +303,7 @@ impl<T: Transport> Client<T> {
                 // This matches the live-then-cache lock order used by authenticated
                 // timeliness updates and prevents clones from observing a new
                 // mapping alongside the old identity-localized keys. Reloading the
-                // cache state also adopts trusted time already shared by another
+                // cache state also adopts authenticated time already shared by another
                 // target for the newly discovered engine ID.
                 let mut engine = self
                     .inner
@@ -298,13 +324,12 @@ impl<T: Transport> Client<T> {
             // replacing an active target mapping, then derive keys for the
             // canonical identity.
             let engine_state = if let Some(cache) = &self.inner.engine_cache {
-                cache.insert(self.peer_addr(), engine_state.clone());
-                cache.get(&self.peer_addr()).unwrap_or(engine_state)
+                cache.insert_state(self.peer_addr(), engine_state)?
             } else {
                 engine_state
             };
             let derived_keys = security
-                .derive_keys(&engine_state.engine_id)
+                .derive_keys(engine_state.engine_id())
                 .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
             let mut engine = self
                 .inner
@@ -379,7 +404,7 @@ impl<T: Transport> Client<T> {
             return Err(malformed());
         }
 
-        if scoped_pdu.context_engine_id != engine_state.engine_id
+        if scoped_pdu.context_engine_id != *engine_state.engine_id()
             || !scoped_pdu.context_name.is_empty()
         {
             return Err(malformed());
@@ -402,7 +427,10 @@ impl<T: Transport> Client<T> {
         let Some(cache) = &self.inner.engine_cache else {
             return Ok(());
         };
-        let Some(cached_state) = cache.get(&self.peer_addr()) else {
+        let Some(cached_state) = cache
+            .get_result(&self.peer_addr())
+            .map_err(EngineCacheAccessError::into_public)?
+        else {
             return Ok(());
         };
         let mut engine = self
@@ -442,13 +470,13 @@ impl<T: Transport> Client<T> {
             .as_ref()
             .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?;
 
-        let context_engine_id = engine.state.engine_id.clone();
+        let context_engine_id = engine.state.engine_id().clone();
         let context_name = security.configured_context_name().clone();
         let (engine_boots, engine_time) = if let Some(engine_time) = engine_time_override {
             // Keep the untrusted tuple bound to the engine generation that
             // supplied it. Concurrent explicit rediscovery must not combine
             // one engine's tuple with another engine's identity/localized keys.
-            if engine_time.engine_id != engine.state.engine_id {
+            if engine_time.engine_id != *engine.state.engine_id() {
                 return Err(Error::MalformedResponse {
                     target: self.peer_addr(),
                 }
@@ -469,12 +497,12 @@ impl<T: Transport> Client<T> {
             self.inner.salt_counter.as_ref(),
             true, // reportable=true for requests
             // RFC 3412 Section 6.3: msgMaxSize advertises THIS sender's own
-            // receive capacity, not the remote's. `engine_state.msg_max_size`
+            // receive capacity, not the remote's. `engine_state.msg_max_size()`
             // holds the remote's advertised limit (used to constrain our
             // outbound size), so advertise the local transport capacity here.
             self.inner.transport.receive_limits().advertised(),
         )?;
-        self.enforce_outbound_size(data.len(), Some(engine.state.msg_max_size))?;
+        self.enforce_outbound_size(data.len(), Some(engine.state.msg_max_size()))?;
 
         Ok(EncodedV3Request {
             data,
@@ -532,7 +560,7 @@ impl<T: Transport> Client<T> {
         let engine = engine
             .as_ref()
             .ok_or_else(|| Error::Config("engine not discovered".into()).boxed())?;
-        if engine.state.engine_id != response_usm.engine_id {
+        if *engine.state.engine_id() != response_usm.engine_id {
             tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr() }, "USM authoritative engine does not select the cached localized keys");
             return Err(Error::Auth {
                 target: self.peer_addr(),
@@ -713,27 +741,24 @@ impl<T: Transport> Client<T> {
                 })?
                 .state
                 .clone();
-            let timely = self
-                .inner
-                .engine_cache
-                .as_deref()
-                .and_then(|cache| {
-                    cache.timeliness_candidate(
-                        &self.peer_addr(),
-                        &local_state,
-                        &usm.engine_id,
-                        usm.engine_boots,
-                        usm.engine_time,
-                    )
-                })
-                .map_or_else(
-                    || {
-                        local_state
-                            .clone()
-                            .check_and_update_timeliness(usm.engine_boots, usm.engine_time)
-                    },
-                    |(timely, _)| timely,
-                );
+            let timely = if let Some(cache) = self.inner.engine_cache.as_deref() {
+                matches!(
+                    cache
+                        .timeliness_candidate(
+                            &self.peer_addr(),
+                            &local_state,
+                            &usm.engine_id,
+                            usm.engine_boots,
+                            usm.engine_time,
+                        )
+                        .map_err(EngineCacheAccessError::into_public)?,
+                    TimelinessCandidateOutcome::Timely | TimelinessCandidateOutcome::MissingMapping
+                )
+            } else {
+                local_state
+                    .clone()
+                    .check_and_update_timeliness(usm.engine_boots, usm.engine_time)
+            };
             if !timely {
                 return Ok(Candidate::Reject);
             }
@@ -921,7 +946,7 @@ impl<T: Transport> Client<T> {
                                     error.with_prior_response_metadata(&exchange_metadata)
                                 })?;
                             if !Arc::ptr_eq(&engine.generation, &validated_generation) {
-                                None
+                                EngineTimelinessOutcome::IdentityConflict
                             } else {
                                 check_and_update_engine_timeliness(
                                     &mut engine.state,
@@ -931,21 +956,27 @@ impl<T: Transport> Client<T> {
                                     response_usm.engine_boots,
                                     response_usm.engine_time,
                                 )
+                                .map_err(|error| {
+                                    error.with_prior_response_metadata(&exchange_metadata)
+                                })?
                             }
                         };
-                        let Some(timely) = publication else {
-                            return Err(Error::MalformedResponse {
-                                target: self.peer_addr(),
+                        match publication {
+                            EngineTimelinessOutcome::Timely => {}
+                            EngineTimelinessOutcome::Stale => {
+                                return Err(Error::Auth {
+                                    target: self.peer_addr(),
+                                }
+                                .boxed()
+                                .with_prior_response_metadata(&exchange_metadata));
                             }
-                            .boxed()
-                            .with_prior_response_metadata(&exchange_metadata));
-                        };
-                        if !timely {
-                            return Err(Error::Auth {
-                                target: self.peer_addr(),
+                            EngineTimelinessOutcome::IdentityConflict => {
+                                return Err(Error::MalformedResponse {
+                                    target: self.peer_addr(),
+                                }
+                                .boxed()
+                                .with_prior_response_metadata(&exchange_metadata));
                             }
-                            .boxed()
-                            .with_prior_response_metadata(&exchange_metadata));
                         }
                     }
 
@@ -1043,7 +1074,7 @@ impl<T: Transport> Client<T> {
                                 error.with_prior_response_metadata(&exchange_metadata)
                             })?;
                         if let Some(ref engine) = *engine
-                            && response_usm.engine_id != engine.state.engine_id
+                            && response_usm.engine_id != *engine.state.engine_id()
                         {
                             tracing::warn!(target: "async_snmp::client", {
                                 peer = %self.peer_addr()
@@ -1392,7 +1423,7 @@ mod tests {
             5000,
         );
 
-        assert_eq!(timely, None);
+        assert!(matches!(timely, Ok(EngineTimelinessOutcome::Stale)));
         assert!(cache.get(&target).is_none());
         assert!(cache.is_empty());
     }
@@ -1403,14 +1434,14 @@ mod tests {
         let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
         let engine_id = Bytes::from_static(b"engine");
         let mut state = EngineState::new(engine_id.clone(), 1, 1000);
-        cache.insert(target, state.clone());
+        cache.insert_state(target, state.clone()).unwrap();
 
-        let (initially_timely, _) = cache
+        let initially_timely = cache
             .timeliness_candidate(&target, &state, &engine_id, 1, 1100)
             .expect("cached identity");
-        assert!(initially_timely);
+        assert_eq!(initially_timely, TimelinessCandidateOutcome::Timely);
 
-        assert_eq!(
+        assert!(matches!(
             check_and_update_engine_timeliness(
                 &mut state,
                 Some(&cache),
@@ -1419,9 +1450,9 @@ mod tests {
                 1,
                 1400,
             ),
-            Some(true)
-        );
-        assert_eq!(
+            Ok(EngineTimelinessOutcome::Timely)
+        ));
+        assert!(matches!(
             check_and_update_engine_timeliness(
                 &mut state,
                 Some(&cache),
@@ -1430,8 +1461,30 @@ mod tests {
                 1,
                 1100,
             ),
-            Some(false)
-        );
+            Ok(EngineTimelinessOutcome::Stale)
+        ));
+    }
+
+    #[test]
+    fn engine_cache_poison_is_attributed_to_local_configuration() {
+        let cache = EngineCache::new();
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
+        let engine_id = Bytes::from_static(b"engine");
+        let mut state = EngineState::new(engine_id.clone(), 1, 1000);
+        cache.poison_for_test();
+
+        let error = check_and_update_engine_timeliness(
+            &mut state,
+            Some(&cache),
+            target,
+            &engine_id,
+            1,
+            1100,
+        )
+        .unwrap_err();
+
+        assert!(matches!(*error, Error::Config(_)));
+        assert!(!matches!(*error, Error::MalformedResponse { .. }));
     }
 
     #[test]
@@ -1446,7 +1499,7 @@ mod tests {
         {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
-            let derived_keys = security.derive_keys(&state.engine_id).unwrap();
+            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") =
                 Some(ClientEngine::new(state, derived_keys));
         }
@@ -1478,7 +1531,7 @@ mod tests {
         {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine-a"), 1, 42);
-            let derived_keys = security.derive_keys(&state.engine_id).unwrap();
+            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") =
                 Some(ClientEngine::new(state, derived_keys));
         }
@@ -1670,8 +1723,8 @@ mod tests {
         let engine = client.inner.engine.read().expect("engine lock poisoned");
         assert!(engine.is_some());
         let state = &engine.as_ref().unwrap().state;
-        assert_eq!(state.engine_id.as_ref(), engine_id);
-        assert!(state.trusted_time().is_none());
+        assert_eq!(state.engine_id().as_ref(), engine_id);
+        assert!(state.authenticated_time().is_none());
     }
 
     #[tokio::test]
@@ -1710,7 +1763,7 @@ mod tests {
             "only discovery may reach transport send"
         );
         let engine = client.inner.engine.read().unwrap();
-        assert_eq!(engine.as_ref().unwrap().state.msg_max_size, remote_limit);
+        assert_eq!(engine.as_ref().unwrap().state.msg_max_size(), remote_limit);
     }
 
     #[tokio::test]
@@ -2229,7 +2282,9 @@ mod response_validation_tests {
             .expect("valid client config");
         let state = EngineState::new(Bytes::from_static(ENGINE_ID), 1, 1000);
         let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
-        cache.insert(client.peer_addr(), state.clone());
+        cache
+            .insert_state(client.peer_addr(), state.clone())
+            .unwrap();
         *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
 
         let (candidate_checked_tx, candidate_checked_rx) = std::sync::mpsc::channel();
@@ -2278,16 +2333,56 @@ mod response_validation_tests {
         let err = stale_request.await.unwrap().unwrap_err();
         assert!(matches!(*err, Error::Auth { .. }));
         let engine = client.inner.engine.read().unwrap();
-        let trusted = engine.as_ref().unwrap().state.trusted_time().unwrap();
+        let trusted = engine.as_ref().unwrap().state.authenticated_time().unwrap();
         assert_eq!(trusted.latest_received_time(), 1400);
         assert_eq!(
             cache
                 .get(&client.peer_addr())
                 .unwrap()
-                .trusted_time()
+                .authenticated_time()
                 .unwrap()
                 .latest_received_time(),
             1400
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v3_authenticated_publication_restores_mapping_cleared_after_validation() {
+        let transport = DeferredUpdateTransport::new();
+        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let cache = Arc::new(EngineCache::new());
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(security.clone()),
+            retry: crate::client::Retry::none(),
+            allow_unauthenticated_v3_time_correction: true,
+            ..ClientConfig::default()
+        };
+        let client = Client::with_engine_cache(transport, config, cache.clone())
+            .expect("valid client config");
+        let state = EngineState::new(Bytes::from_static(ENGINE_ID), 1, 1000);
+        let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
+        cache
+            .insert_state(client.peer_addr(), state.clone())
+            .unwrap();
+        *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
+
+        let hook_cache = Arc::clone(&cache);
+        *client
+            .inner
+            .authenticated_response_validated_hook
+            .write()
+            .unwrap() = Some(Arc::new(move || hook_cache.clear()));
+
+        client
+            .send_v3_and_recv(Pdu::get_request(1, &[oid!(1, 3, 6, 1, 1)]))
+            .await
+            .expect("authenticated response should restore the cleared mapping");
+
+        let cached = cache.get(&client.peer_addr()).expect("restored mapping");
+        assert_eq!(cached.engine_id(), ENGINE_ID);
+        assert_eq!(
+            cached.authenticated_time().unwrap().latest_received_time(),
+            1100
         );
     }
 
@@ -2305,7 +2400,9 @@ mod response_validation_tests {
             .expect("valid client config");
         let state = EngineState::new(Bytes::from_static(ENGINE_ID), 1, 1000);
         let derived_keys = security.derive_keys(ENGINE_ID).unwrap();
-        cache.insert(client.peer_addr(), state.clone());
+        cache
+            .insert_state(client.peer_addr(), state.clone())
+            .unwrap();
         *client.inner.engine.write().unwrap() = Some(ClientEngine::new(state, derived_keys));
 
         let response_validated = Arc::new(Barrier::new(2));
@@ -2342,10 +2439,10 @@ mod response_validation_tests {
         let engine = client.inner.engine.read().unwrap();
         let state = &engine.as_ref().unwrap().state;
         assert_eq!(state.engine_id(), REPLACEMENT_ENGINE_ID);
-        assert!(state.trusted_time().is_none());
+        assert!(state.authenticated_time().is_none());
         let cached = cache.get(&client.peer_addr()).unwrap();
         assert_eq!(cached.engine_id(), REPLACEMENT_ENGINE_ID);
-        assert!(cached.trusted_time().is_none());
+        assert!(cached.authenticated_time().is_none());
     }
 
     /// RFC 3412 Section 6.3: an outgoing request advertises the manager's own

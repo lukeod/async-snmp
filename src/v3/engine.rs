@@ -4,8 +4,9 @@
 //! traffic, then establishes boots/time only from an HMAC-verified message.
 //! This module keeps those trust domains separate and provides:
 //!
-//! - `EngineCache`: Thread-safe target identities and per-engine trusted time
-//! - `EngineState`: Discovered identity with optional trusted time
+//! - `EngineCache`: Thread-safe target identities and per-engine authenticated time
+//! - `DiscoveredEngine`: Validated identity and advertised receive capacity
+//! - `EngineState`: Cached identity with optional authenticated time
 //! - Discovery response parsing
 //!
 //! # Discovery Flow
@@ -175,19 +176,55 @@ pub mod report_oids {
     }
 }
 
+/// A validated identity and advertised receive capacity learned through
+/// unauthenticated engine discovery.
+///
+/// This type deliberately contains no boots/time fields: discovery cannot
+/// establish authenticated timeliness state. Constructing it validates the
+/// authoritative engine ID before it can enter an [`EngineCache`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredEngine {
+    engine_id: Bytes,
+    msg_max_size: MessageSize,
+}
+
+impl DiscoveredEngine {
+    /// Validate a discovered authoritative engine identity.
+    pub fn new(engine_id: impl Into<Bytes>, msg_max_size: MessageSize) -> Result<Self> {
+        let engine_id = engine_id.into();
+        validate_engine_id(&engine_id)?;
+        Ok(Self {
+            engine_id,
+            msg_max_size,
+        })
+    }
+
+    /// Return the authoritative engine ID.
+    #[must_use]
+    pub fn engine_id(&self) -> &Bytes {
+        &self.engine_id
+    }
+
+    /// Return the remote engine's advertised receive capacity.
+    #[must_use]
+    pub fn msg_max_size(&self) -> MessageSize {
+        self.msg_max_size
+    }
+}
+
 /// HMAC-established notion of an authoritative engine's boots/time tuple.
 ///
 /// Discovery never constructs this value. It is created and advanced only by
 /// RFC 3414 Section 3.2 Step 7(b) after a message's HMAC has been verified.
 #[derive(Debug, Clone)]
-pub struct TrustedEngineTime {
+pub struct AuthenticatedEngineTime {
     boots: u32,
     received_time_base: u32,
     received_at: Instant,
     latest_received_time: u32,
 }
 
-impl TrustedEngineTime {
+impl AuthenticatedEngineTime {
     fn new_at(boots: u32, time: u32, now: Instant) -> Self {
         Self {
             boots,
@@ -262,20 +299,18 @@ impl TrustedEngineTime {
     }
 }
 
-/// Identity discovered for a remote authoritative engine, with optional
-/// HMAC-established trusted time.
+/// Read-only cached state, structurally separating discovered identity from
+/// optional HMAC-established time.
 #[derive(Debug, Clone)]
 pub struct EngineState {
-    /// Authoritative engine ID.
-    pub(crate) engine_id: Bytes,
-    /// Maximum message size the remote engine can accept.
-    pub msg_max_size: MessageSize,
-    trusted_time: Option<TrustedEngineTime>,
+    discovered: DiscoveredEngine,
+    authenticated_time: Option<AuthenticatedEngineTime>,
 }
 
 impl EngineState {
-    /// Create engine state whose boots/time are already authenticated.
-    pub fn new(engine_id: Bytes, engine_boots: u32, engine_time: u32) -> Self {
+    /// Create engine state whose boots/time have already been authenticated by
+    /// the caller's internal protocol path.
+    pub(crate) fn new(engine_id: Bytes, engine_boots: u32, engine_time: u32) -> Self {
         Self::with_msg_max_size(
             engine_id,
             engine_boots,
@@ -286,25 +321,29 @@ impl EngineState {
 
     /// Create an identity learned through unauthenticated discovery.
     #[must_use]
-    pub fn discovered(engine_id: Bytes, msg_max_size: MessageSize) -> Self {
+    pub(crate) fn from_discovery(engine_id: Bytes, msg_max_size: MessageSize) -> Self {
         Self {
-            engine_id,
-            msg_max_size,
-            trusted_time: None,
+            discovered: DiscoveredEngine {
+                engine_id,
+                msg_max_size,
+            },
+            authenticated_time: None,
         }
     }
 
     /// Create authenticated state with explicit msgMaxSize.
-    pub fn with_msg_max_size(
+    pub(crate) fn with_msg_max_size(
         engine_id: Bytes,
         engine_boots: u32,
         engine_time: u32,
         msg_max_size: MessageSize,
     ) -> Self {
         Self {
-            engine_id,
-            msg_max_size,
-            trusted_time: Some(TrustedEngineTime::new_at(
+            discovered: DiscoveredEngine {
+                engine_id,
+                msg_max_size,
+            },
+            authenticated_time: Some(AuthenticatedEngineTime::new_at(
                 engine_boots,
                 engine_time,
                 Instant::now(),
@@ -313,7 +352,8 @@ impl EngineState {
     }
 
     /// Create authenticated state with msgMaxSize capped to a session limit.
-    pub fn with_msg_max_size_capped(
+    #[cfg(test)]
+    fn with_msg_max_size_capped(
         engine_id: Bytes,
         engine_boots: u32,
         engine_time: u32,
@@ -331,50 +371,58 @@ impl EngineState {
     /// Return the authoritative engine ID.
     #[must_use]
     pub fn engine_id(&self) -> &Bytes {
-        &self.engine_id
+        self.discovered.engine_id()
     }
 
-    /// Return the HMAC-established trusted time, if synchronization occurred.
+    /// Return the validated discovery identity and advertised capacity.
     #[must_use]
-    pub fn trusted_time(&self) -> Option<&TrustedEngineTime> {
-        self.trusted_time.as_ref()
+    pub fn discovered(&self) -> &DiscoveredEngine {
+        &self.discovered
+    }
+
+    /// Return the remote engine's advertised receive capacity.
+    #[must_use]
+    pub fn msg_max_size(&self) -> MessageSize {
+        self.discovered.msg_max_size()
+    }
+
+    /// Return the HMAC-established time, if synchronization occurred.
+    #[must_use]
+    pub fn authenticated_time(&self) -> Option<&AuthenticatedEngineTime> {
+        self.authenticated_time.as_ref()
     }
 
     /// Return the progressing trusted boots/time pair, or `(0, 0)` before the
     /// first authenticated message establishes a notion.
     #[must_use]
-    pub fn estimated_boots_time(&self) -> (u32, u32) {
+    pub(crate) fn estimated_boots_time(&self) -> (u32, u32) {
         self.estimated_boots_time_at(Instant::now())
     }
 
     pub(crate) fn estimated_boots_time_at(&self, now: Instant) -> (u32, u32) {
-        self.trusted_time
+        self.authenticated_time
             .as_ref()
             .map_or((0, 0), |time| time.estimated_at(now))
     }
 
-    pub(crate) fn last_trusted_update_at(&self) -> Option<Instant> {
-        self.trusted_time.as_ref().map(|time| time.received_at)
+    pub(crate) fn last_authenticated_update_at(&self) -> Option<Instant> {
+        self.authenticated_time
+            .as_ref()
+            .map(|time| time.received_at)
     }
 
-    /// Retained convenience accessor for the estimated time component.
-    #[must_use]
-    pub fn estimated_time(&self) -> u32 {
-        self.estimated_boots_time().1
-    }
-
-    /// Apply a forward-only authenticated high-water update.
-    ///
-    /// The caller must have verified the message HMAC and engine identity.
-    pub fn update_time(&mut self, response_boots: u32, response_time: u32) -> bool {
+    /// Apply a forward-only authenticated high-water update after the internal
+    /// caller has verified the message HMAC and engine identity.
+    #[cfg(test)]
+    fn update_time(&mut self, response_boots: u32, response_time: u32) -> bool {
         self.update_time_at(response_boots, response_time, Instant::now())
     }
 
     fn update_time_at(&mut self, response_boots: u32, response_time: u32, now: Instant) -> bool {
-        match self.trusted_time.as_mut() {
+        match self.authenticated_time.as_mut() {
             Some(time) => time.update_at(response_boots, response_time, now),
             None => {
-                self.trusted_time = Some(TrustedEngineTime::new_at(
+                self.authenticated_time = Some(AuthenticatedEngineTime::new_at(
                     response_boots,
                     response_time,
                     now,
@@ -384,31 +432,34 @@ impl EngineState {
         }
     }
 
-    /// Merge only a newer trusted notion from another clone of this identity.
+    /// Merge only a newer authenticated notion from another clone of this identity.
     pub(crate) fn merge_from(&mut self, other: &Self) -> bool {
-        if self.engine_id != other.engine_id {
+        if self.discovered.engine_id != other.discovered.engine_id {
             return false;
         }
-        self.msg_max_size = self.msg_max_size.min(other.msg_max_size);
-        let Some(other_time) = &other.trusted_time else {
+        self.discovered.msg_max_size = self
+            .discovered
+            .msg_max_size
+            .min(other.discovered.msg_max_size);
+        let Some(other_time) = &other.authenticated_time else {
             return false;
         };
-        match self.trusted_time.as_mut() {
+        match self.authenticated_time.as_mut() {
             Some(time) => time.update_at(
                 other_time.boots,
                 other_time.latest_received_time,
                 other_time.received_at,
             ),
             None => {
-                self.trusted_time = Some(other_time.clone());
+                self.authenticated_time = Some(other_time.clone());
                 true
             }
         }
     }
 
-    /// Apply RFC 3414 Step 7(b) and evaluate the asymmetric time window.
-    /// The caller must first verify the message HMAC and engine identity.
-    pub fn check_and_update_timeliness(&mut self, msg_boots: u32, msg_time: u32) -> bool {
+    /// Apply RFC 3414 Step 7(b) after the internal caller has verified the
+    /// message HMAC and engine identity, then evaluate the asymmetric window.
+    pub(crate) fn check_and_update_timeliness(&mut self, msg_boots: u32, msg_time: u32) -> bool {
         self.check_and_update_timeliness_at(msg_boots, msg_time, Instant::now())
     }
 
@@ -425,9 +476,10 @@ impl EngineState {
             && (msg_boots != local_boots || msg_time >= local_time.saturating_sub(TIME_WINDOW))
     }
 
-    /// Check the authoritative-role symmetric window against trusted time.
+    /// Check the authoritative-role symmetric window against authenticated time.
     #[must_use]
-    pub fn is_in_time_window(&self, msg_boots: u32, msg_time: u32) -> bool {
+    #[cfg(test)]
+    fn is_in_time_window(&self, msg_boots: u32, msg_time: u32) -> bool {
         let (local_boots, local_time) = self.estimated_boots_time();
         in_authoritative_time_window(local_boots, local_time, msg_boots, msg_time)
     }
@@ -442,6 +494,28 @@ fn cap_msg_max_size(reported: MessageSize, session_max: MessageSize) -> MessageS
     }
 }
 
+fn validate_authenticated_time(engine_boots: u32, engine_time: u32) -> Result<()> {
+    if engine_boots > MAX_ENGINE_TIME {
+        return Err(Error::Config(
+            format!(
+                "authenticated engine boots {engine_boots} out of range (must be 0..={MAX_ENGINE_TIME})"
+            )
+            .into(),
+        )
+        .boxed());
+    }
+    if engine_time > MAX_ENGINE_TIME {
+        return Err(Error::Config(
+            format!(
+                "authenticated engine time {engine_time} out of range (must be 0..={MAX_ENGINE_TIME})"
+            )
+            .into(),
+        )
+        .boxed());
+    }
+    Ok(())
+}
+
 /// Time window check when the local engine's boots/time are the reference
 /// (RFC 3414 Section 2.2.3, applied by Section 3.2 Step 7a in the
 /// authoritative role).
@@ -451,8 +525,8 @@ fn cap_msg_max_size(reported: MessageSize, session_max: MessageSize) -> MessageS
 /// time is within [`TIME_WINDOW`] seconds of local time (symmetric).
 ///
 /// For messages from a remote authoritative engine (Step 7b), use
-/// [`EngineState::check_and_update_timeliness`] instead: that check is
-/// asymmetric and self-updating.
+/// Internal non-authoritative processing applies the asymmetric, self-updating
+/// Step 7(b) check after HMAC verification.
 pub fn in_authoritative_time_window(
     local_boots: u32,
     local_time: u32,
@@ -483,13 +557,50 @@ struct CachedTarget {
 #[derive(Debug, Default)]
 struct EngineCacheInner {
     targets: HashMap<SocketAddr, CachedTarget>,
-    trusted_times: HashMap<Bytes, TrustedEngineTime>,
+    authenticated_times: HashMap<Bytes, AuthenticatedEngineTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EngineCacheAccessError {
+    Poisoned,
+}
+
+impl EngineCacheAccessError {
+    pub(crate) fn into_public(self) -> Box<Error> {
+        match self {
+            Self::Poisoned => Error::Config("engine cache lock poisoned".into()).boxed(),
+        }
+    }
+}
+
+type CacheResult<T> = std::result::Result<T, EngineCacheAccessError>;
+
+#[derive(Debug)]
+enum StoreOutcome {
+    Stored(EngineState),
+    IdentityConflict(EngineState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimelinessCandidateOutcome {
+    Timely,
+    MissingMapping,
+    Stale,
+    IdentityConflict,
+}
+
+#[derive(Debug)]
+pub(crate) enum TimelinessPublicationOutcome {
+    Published(EngineState),
+    RestoredMapping(EngineState),
+    Stale(EngineState),
+    IdentityConflict,
 }
 
 /// Thread-safe cache of discovered `SNMPv3` engine state.
 ///
 /// Target addresses map to discovered identities and remote message-size
-/// limits. Trusted time is keyed separately by authoritative engine ID, so
+/// limits. Authenticated time is keyed separately by authoritative engine ID, so
 /// clients reaching the same engine through multiple targets converge on one
 /// high-water value. Whole-state inserts merge monotonically and cannot replace
 /// a newer trusted tuple with a stale clone.
@@ -498,7 +609,7 @@ struct EngineCacheInner {
 ///
 /// Each target identity has a refresh timestamp. Every accepted HMAC-verified
 /// message refreshes it, including an older in-window message that does not
-/// advance trusted time. Entries older than the configured TTL
+/// advance authenticated time. Entries older than the configured TTL
 /// (default 5 minutes) are removed by [`get`](Self::get).
 ///
 /// Expiry prevents a shared entry from being handed indefinitely to newly
@@ -516,6 +627,47 @@ struct EngineCacheInner {
 /// The cache is unbounded by default. Applications that need a fixed bound can
 /// use [`with_max_capacity`](Self::with_max_capacity), which evicts the oldest
 /// entry when inserting at capacity.
+///
+/// # Trust boundary
+///
+/// Discovery identities and authenticated boots/time cannot be interchanged.
+/// The mutable timeliness operations used after HMAC verification are not
+/// public API:
+///
+/// ```compile_fail,E0624
+/// use async_snmp::v3::EngineState;
+/// use bytes::Bytes;
+///
+/// let mut state = EngineState::new(Bytes::from_static(b"remote-engine"), 1, 10);
+/// state.update_time(1, 20);
+/// ```
+///
+/// Whole cached states likewise cannot be inserted or used to publish a
+/// packet tuple:
+///
+/// ```compile_fail,E0599
+/// use async_snmp::EngineCache;
+/// use std::net::SocketAddr;
+///
+/// let cache = EngineCache::new();
+/// let target: SocketAddr = "192.0.2.1:161".parse().unwrap();
+/// let state = cache.get(&target).unwrap();
+/// cache.insert(target, state);
+/// ```
+///
+/// ```compile_fail,E0599
+/// use async_snmp::EngineCache;
+/// use std::net::SocketAddr;
+///
+/// let cache = EngineCache::new();
+/// let target: SocketAddr = "192.0.2.1:161".parse().unwrap();
+/// cache.update_time(&target, 1, 20);
+/// ```
+///
+/// Public preloading is available only through
+/// [`seed_authenticated`](Self::seed_authenticated), whose name requires the
+/// caller to attest that the tuple came from an authenticated source and whose
+/// inputs are validated before publication.
 ///
 /// # Example
 ///
@@ -584,35 +736,103 @@ impl EngineCache {
     /// Returns `None` if the entry does not exist or has expired.
     /// Expired entries are removed from the cache.
     pub fn get(&self, target: &SocketAddr) -> Option<EngineState> {
-        self.get_at(target, Instant::now())
+        self.get_result_at(target, Instant::now()).ok().flatten()
     }
 
+    #[cfg(test)]
     fn get_at(&self, target: &SocketAddr, now: Instant) -> Option<EngineState> {
-        let mut inner = self.inner.write().ok()?;
-        let cached = inner.targets.get(target)?;
-        if now
-            .checked_duration_since(cached.refreshed_at)
-            .unwrap_or_default()
-            > self.ttl
-        {
-            let engine_id = cached.engine_id.clone();
-            inner.targets.remove(target);
-            remove_orphaned_time(&mut inner, &engine_id);
-            return None;
-        }
-        compose_cached_state(&inner, target)
+        self.get_result_at(target, now).ok().flatten()
     }
 
-    /// Store engine state for a target.
+    pub(crate) fn get_result(&self, target: &SocketAddr) -> CacheResult<Option<EngineState>> {
+        self.get_result_at(target, Instant::now())
+    }
+
+    fn get_result_at(&self, target: &SocketAddr, now: Instant) -> CacheResult<Option<EngineState>> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| EngineCacheAccessError::Poisoned)?;
+        expire_target_if_needed(&mut inner, target, now, self.ttl);
+        Ok(compose_cached_state(&inner, target))
+    }
+
+    /// Store a validated, unauthenticated discovery identity for a target.
     ///
     /// If a max capacity is set and the cache is full, the least recently
     /// refreshed target identity is evicted.
-    pub fn insert(&self, target: SocketAddr, state: EngineState) {
-        self.insert_at(target, state, Instant::now());
+    pub fn insert_discovered(&self, target: SocketAddr, engine: DiscoveredEngine) -> Result<()> {
+        let expected_engine_id = engine.engine_id.clone();
+        let state = EngineState::from_discovery(engine.engine_id, engine.msg_max_size);
+        let outcome = self
+            .store_at(target, state, Instant::now(), false)
+            .map_err(EngineCacheAccessError::into_public)?;
+        match outcome {
+            StoreOutcome::Stored(stored) if stored.engine_id() == &expected_engine_id => Ok(()),
+            StoreOutcome::IdentityConflict(_) | StoreOutcome::Stored(_) => Err(Error::Config(
+                "target is already mapped to a different unexpired engine identity".into(),
+            )
+            .boxed()),
+        }
     }
 
-    fn insert_at(&self, target: SocketAddr, state: EngineState, now: Instant) {
-        let _ = self.store_at(target, state, now, false);
+    pub(crate) fn insert_state(
+        &self,
+        target: SocketAddr,
+        state: EngineState,
+    ) -> Result<EngineState> {
+        self.insert_state_at(target, state, Instant::now())
+            .map_err(EngineCacheAccessError::into_public)
+    }
+
+    fn insert_state_at(
+        &self,
+        target: SocketAddr,
+        state: EngineState,
+        now: Instant,
+    ) -> CacheResult<EngineState> {
+        match self.store_at(target, state, now, false)? {
+            StoreOutcome::Stored(state) | StoreOutcome::IdentityConflict(state) => Ok(state),
+        }
+    }
+
+    /// Seed state from a source the caller has independently authenticated.
+    ///
+    /// This is intended for restoring authenticated cache data maintained by
+    /// an application. It must not be used with boots/time copied from an
+    /// unauthenticated discovery response. The identity, boots, and time are
+    /// validated before the cache is changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid engine ID, boots or time above
+    /// `MAX_ENGINE_TIME`, or a poisoned cache
+    /// lock.
+    pub fn seed_authenticated(
+        &self,
+        target: SocketAddr,
+        engine: DiscoveredEngine,
+        engine_boots: u32,
+        engine_time: u32,
+    ) -> Result<()> {
+        validate_authenticated_time(engine_boots, engine_time)?;
+        let expected_engine_id = engine.engine_id.clone();
+        let state = EngineState::with_msg_max_size(
+            engine.engine_id,
+            engine_boots,
+            engine_time,
+            engine.msg_max_size,
+        );
+        let outcome = self
+            .store_at(target, state, Instant::now(), false)
+            .map_err(EngineCacheAccessError::into_public)?;
+        match outcome {
+            StoreOutcome::Stored(stored) if stored.engine_id() == &expected_engine_id => Ok(()),
+            StoreOutcome::IdentityConflict(_) | StoreOutcome::Stored(_) => Err(Error::Config(
+                "target is already mapped to a different unexpired engine identity".into(),
+            )
+            .boxed()),
+        }
     }
 
     /// Replace one target identity after an explicit, validated rediscovery.
@@ -621,15 +841,22 @@ impl EngineCache {
     /// conflicting mapping. Holding the cache write lock makes the replacement
     /// win over stale clients that reinsert the old identity while discovery is
     /// in flight; subsequent ordinary inserts cannot replace the new mapping.
-    /// The returned state includes trusted time already shared under the new
+    /// The returned state includes authenticated time already shared under the new
     /// authoritative engine ID.
     pub(crate) fn replace_target(
         &self,
         target: SocketAddr,
         state: EngineState,
     ) -> Result<EngineState> {
-        self.store_at(target, state, Instant::now(), true)
-            .ok_or_else(|| Error::Config("engine cache lock poisoned".into()).boxed())
+        match self
+            .store_at(target, state, Instant::now(), true)
+            .map_err(EngineCacheAccessError::into_public)?
+        {
+            StoreOutcome::Stored(state) => Ok(state),
+            StoreOutcome::IdentityConflict(_) => {
+                unreachable!("explicit replacement cannot report an identity conflict")
+            }
+        }
     }
 
     fn store_at(
@@ -638,68 +865,80 @@ impl EngineCache {
         state: EngineState,
         now: Instant,
         replace_identity: bool,
-    ) -> Option<EngineState> {
-        let mut inner = self.inner.write().ok()?;
+    ) -> CacheResult<StoreOutcome> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| EngineCacheAccessError::Poisoned)?;
+
+        expire_target_if_needed(&mut inner, &target, now, self.ttl);
 
         if !replace_identity
             && let Some(existing) = inner.targets.get(&target)
-            && existing.engine_id != state.engine_id
-            && now
-                .checked_duration_since(existing.refreshed_at)
-                .unwrap_or_default()
-                <= self.ttl
+            && existing.engine_id != *state.engine_id()
         {
-            return compose_cached_state(&inner, &target);
+            return Ok(StoreOutcome::IdentityConflict(
+                compose_cached_state(&inner, &target)
+                    .expect("existing target must compose into cached state"),
+            ));
         }
 
-        if let Some(cap) = self.max_capacity
+        let evicted = if let Some(cap) = self.max_capacity
             && !inner.targets.contains_key(&target)
             && inner.targets.len() >= cap
-            && let Some((oldest_target, oldest_engine)) = inner
+        {
+            inner
                 .targets
                 .iter()
                 .min_by_key(|(_, cached)| cached.refreshed_at)
                 .map(|(target, cached)| (*target, cached.engine_id.clone()))
-        {
-            inner.targets.remove(&oldest_target);
-            remove_orphaned_time(&mut inner, &oldest_engine);
-        }
+        } else {
+            None
+        };
 
         let replaced_engine = inner
             .targets
             .get(&target)
-            .filter(|cached| cached.engine_id != state.engine_id)
+            .filter(|cached| cached.engine_id != *state.engine_id())
             .map(|cached| cached.engine_id.clone());
-        if let Some(trusted) = &state.trusted_time {
-            merge_trusted_time(&mut inner.trusted_times, &state.engine_id, trusted);
+        if let Some(authenticated) = &state.authenticated_time {
+            merge_authenticated_time(
+                &mut inner.authenticated_times,
+                state.engine_id(),
+                authenticated,
+            );
         }
+        let engine_id = state.discovered.engine_id;
+        let msg_max_size = state.discovered.msg_max_size;
         inner.targets.insert(
             target,
             CachedTarget {
-                engine_id: state.engine_id,
-                msg_max_size: state.msg_max_size,
+                engine_id,
+                msg_max_size,
                 refreshed_at: now,
             },
         );
+        if let Some((oldest_target, oldest_engine)) = evicted {
+            inner.targets.remove(&oldest_target);
+            remove_orphaned_time(&mut inner, &oldest_engine);
+        }
         if let Some(replaced_engine) = replaced_engine {
             remove_orphaned_time(&mut inner, &replaced_engine);
         }
-        compose_cached_state(&inner, &target)
+        Ok(StoreOutcome::Stored(
+            compose_cached_state(&inner, &target)
+                .expect("stored target must compose into cached state"),
+        ))
     }
 
-    /// Update time for an existing entry after authenticating a message.
-    ///
-    /// The caller must have verified the message HMAC and engine identity.
-    /// Returns true if the entry was updated, false if not found or not updated.
-    pub fn update_time(
-        &self,
-        target: &SocketAddr,
-        response_boots: u32,
-        response_time: u32,
-    ) -> bool {
+    /// Update time after internal processing authenticated the message and
+    /// validated its authoritative engine identity.
+    #[cfg(test)]
+    fn update_time(&self, target: &SocketAddr, response_boots: u32, response_time: u32) -> bool {
         self.update_time_at(target, response_boots, response_time, Instant::now())
     }
 
+    #[cfg(test)]
     fn update_time_at(
         &self,
         target: &SocketAddr,
@@ -717,12 +956,12 @@ impl EngineCache {
         else {
             return false;
         };
-        let changed = match inner.trusted_times.get_mut(&engine_id) {
+        let changed = match inner.authenticated_times.get_mut(&engine_id) {
             Some(time) => time.update_at(response_boots, response_time, now),
             None => {
-                inner.trusted_times.insert(
+                inner.authenticated_times.insert(
                     engine_id,
-                    TrustedEngineTime::new_at(response_boots, response_time, now),
+                    AuthenticatedEngineTime::new_at(response_boots, response_time, now),
                 );
                 true
             }
@@ -735,7 +974,7 @@ impl EngineCache {
 
     /// Atomically apply authenticated timeliness processing to shared state.
     ///
-    /// The live client's trusted notion is merged before evaluating the
+    /// The live client's authenticated notion is merged before evaluating the
     /// message, so a rebuilt cache cannot weaken that client's time window.
     /// Timely authenticated messages refresh the target TTL, including older
     /// in-window messages that do not advance the high-water mark. Rejected
@@ -748,7 +987,7 @@ impl EngineCache {
         engine_id: &[u8],
         msg_boots: u32,
         msg_time: u32,
-    ) -> Option<(bool, EngineState)> {
+    ) -> CacheResult<TimelinessPublicationOutcome> {
         self.check_and_update_timeliness_at(
             target,
             local_state,
@@ -772,16 +1011,66 @@ impl EngineCache {
         engine_id: &[u8],
         msg_boots: u32,
         msg_time: u32,
-    ) -> Option<(bool, EngineState)> {
-        let inner = self.inner.read().ok()?;
-        let cached_engine_id = &inner.targets.get(target)?.engine_id;
-        if cached_engine_id.as_ref() != engine_id || local_state.engine_id.as_ref() != engine_id {
-            return None;
+    ) -> CacheResult<TimelinessCandidateOutcome> {
+        self.timeliness_candidate_at(
+            target,
+            local_state,
+            engine_id,
+            msg_boots,
+            msg_time,
+            Instant::now(),
+        )
+    }
+
+    fn timeliness_candidate_at(
+        &self,
+        target: &SocketAddr,
+        local_state: &EngineState,
+        engine_id: &[u8],
+        msg_boots: u32,
+        msg_time: u32,
+        now: Instant,
+    ) -> CacheResult<TimelinessCandidateOutcome> {
+        if local_state.engine_id().as_ref() != engine_id {
+            return Ok(TimelinessCandidateOutcome::IdentityConflict);
         }
+
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| EngineCacheAccessError::Poisoned)?;
+        expire_target_if_needed(&mut inner, target, now, self.ttl);
+
+        let Some(cached_engine_id) = inner
+            .targets
+            .get(target)
+            .map(|cached| cached.engine_id.clone())
+        else {
+            let mut candidate = local_state.clone();
+            return Ok(
+                if candidate.check_and_update_timeliness_at(msg_boots, msg_time, now) {
+                    TimelinessCandidateOutcome::MissingMapping
+                } else {
+                    TimelinessCandidateOutcome::Stale
+                },
+            );
+        };
+        if cached_engine_id.as_ref() != engine_id {
+            return Ok(TimelinessCandidateOutcome::IdentityConflict);
+        }
+
         let mut candidate = local_state.clone();
-        candidate.merge_from(&compose_cached_state(&inner, target)?);
-        let timely = candidate.check_and_update_timeliness(msg_boots, msg_time);
-        Some((timely, candidate))
+        candidate.merge_from(
+            &compose_cached_state(&inner, target)
+                .expect("existing target must compose into cached state"),
+        );
+        Ok(
+            if candidate.check_and_update_timeliness_at(msg_boots, msg_time, now) {
+                TimelinessCandidateOutcome::Timely
+            } else {
+                TimelinessCandidateOutcome::Stale
+            },
+        )
     }
 
     fn check_and_update_timeliness_at(
@@ -792,32 +1081,91 @@ impl EngineCache {
         msg_boots: u32,
         msg_time: u32,
         now: Instant,
-    ) -> Option<(bool, EngineState)> {
-        let mut inner = self.inner.write().ok()?;
-        let cached_engine_id = inner.targets.get(target)?.engine_id.clone();
-        if cached_engine_id.as_ref() != engine_id || local_state.engine_id.as_ref() != engine_id {
-            return None;
+    ) -> CacheResult<TimelinessPublicationOutcome> {
+        if local_state.engine_id().as_ref() != engine_id {
+            return Ok(TimelinessPublicationOutcome::IdentityConflict);
         }
-        if let Some(local_time) = &local_state.trusted_time {
-            merge_trusted_time(&mut inner.trusted_times, &cached_engine_id, local_time);
+
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| EngineCacheAccessError::Poisoned)?;
+        expire_target_if_needed(&mut inner, target, now, self.ttl);
+
+        let mapping_missing = match inner.targets.get(target) {
+            Some(cached) if cached.engine_id.as_ref() != engine_id => {
+                return Ok(TimelinessPublicationOutcome::IdentityConflict);
+            }
+            Some(_) => false,
+            None => true,
+        };
+
+        let engine_id = local_state.engine_id().clone();
+        let mut state = local_state.clone();
+        if let Some(shared_time) = inner.authenticated_times.get(&engine_id) {
+            state.merge_from(&EngineState {
+                discovered: state.discovered.clone(),
+                authenticated_time: Some(shared_time.clone()),
+            });
         }
-        let time = inner
-            .trusted_times
-            .entry(cached_engine_id.clone())
-            .or_insert_with(|| TrustedEngineTime::new_at(msg_boots, msg_time, now));
-        time.update_at(msg_boots, msg_time, now);
-        let (local_boots, local_time) = time.estimated_at(now);
-        let timely = local_boots != MAX_ENGINE_TIME
-            && msg_boots >= local_boots
-            && (msg_boots != local_boots || msg_time >= local_time.saturating_sub(TIME_WINDOW));
+
+        let timely = state.check_and_update_timeliness_at(msg_boots, msg_time, now);
+        if let Some(authenticated) = &state.authenticated_time {
+            merge_authenticated_time(&mut inner.authenticated_times, &engine_id, authenticated);
+        }
+
         if timely {
-            inner.targets.get_mut(target)?.refreshed_at = now;
+            if mapping_missing {
+                let evicted = if let Some(cap) = self.max_capacity
+                    && inner.targets.len() >= cap
+                {
+                    inner
+                        .targets
+                        .iter()
+                        .min_by_key(|(_, cached)| cached.refreshed_at)
+                        .map(|(target, cached)| (*target, cached.engine_id.clone()))
+                } else {
+                    None
+                };
+                inner.targets.insert(
+                    *target,
+                    CachedTarget {
+                        engine_id: engine_id.clone(),
+                        msg_max_size: local_state.msg_max_size(),
+                        refreshed_at: now,
+                    },
+                );
+                if let Some((oldest_target, oldest_engine)) = evicted {
+                    inner.targets.remove(&oldest_target);
+                    remove_orphaned_time(&mut inner, &oldest_engine);
+                }
+            } else {
+                inner
+                    .targets
+                    .get_mut(target)
+                    .expect("current target mapping must remain present")
+                    .refreshed_at = now;
+            }
+
+            let state = compose_cached_state(&inner, target)
+                .expect("published target must compose into cached state");
+            return Ok(if mapping_missing {
+                TimelinessPublicationOutcome::RestoredMapping(state)
+            } else {
+                TimelinessPublicationOutcome::Published(state)
+            });
         }
-        let state = compose_cached_state(&inner, target)?;
-        Some((timely, state))
+
+        if mapping_missing {
+            remove_orphaned_time(&mut inner, &engine_id);
+        } else {
+            state = compose_cached_state(&inner, target)
+                .expect("existing target must compose into cached state");
+        }
+        Ok(TimelinessPublicationOutcome::Stale(state))
     }
 
-    /// Remove cached identity for a target. Shared trusted time remains while
+    /// Remove cached identity for a target. Shared authenticated time remains while
     /// another target still maps to the same authoritative engine.
     pub fn remove(&self, target: &SocketAddr) -> Option<EngineState> {
         let mut inner = self.inner.write().ok()?;
@@ -827,11 +1175,11 @@ impl EngineCache {
         Some(state)
     }
 
-    /// Clear all cached identities and trusted time.
+    /// Clear all cached identities and authenticated time.
     pub fn clear(&self) {
         if let Ok(mut inner) = self.inner.write() {
             inner.targets.clear();
-            inner.trusted_times.clear();
+            inner.authenticated_times.clear();
         }
     }
 
@@ -844,23 +1192,34 @@ impl EngineCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.inner.write().expect("engine cache test lock");
+            panic!("poison engine cache for test");
+        }));
+        assert!(self.inner.is_poisoned());
+    }
 }
 
 fn compose_cached_state(inner: &EngineCacheInner, target: &SocketAddr) -> Option<EngineState> {
     let cached = inner.targets.get(target)?;
     Some(EngineState {
-        engine_id: cached.engine_id.clone(),
-        msg_max_size: cached.msg_max_size,
-        trusted_time: inner.trusted_times.get(&cached.engine_id).cloned(),
+        discovered: DiscoveredEngine {
+            engine_id: cached.engine_id.clone(),
+            msg_max_size: cached.msg_max_size,
+        },
+        authenticated_time: inner.authenticated_times.get(&cached.engine_id).cloned(),
     })
 }
 
-fn merge_trusted_time(
-    trusted_times: &mut HashMap<Bytes, TrustedEngineTime>,
+fn merge_authenticated_time(
+    authenticated_times: &mut HashMap<Bytes, AuthenticatedEngineTime>,
     engine_id: &Bytes,
-    incoming: &TrustedEngineTime,
+    incoming: &AuthenticatedEngineTime,
 ) {
-    match trusted_times.get_mut(engine_id) {
+    match authenticated_times.get_mut(engine_id) {
         Some(current) => {
             current.update_at(
                 incoming.boots,
@@ -869,7 +1228,7 @@ fn merge_trusted_time(
             );
         }
         None => {
-            trusted_times.insert(engine_id.clone(), incoming.clone());
+            authenticated_times.insert(engine_id.clone(), incoming.clone());
         }
     }
 }
@@ -880,7 +1239,25 @@ fn remove_orphaned_time(inner: &mut EngineCacheInner, engine_id: &Bytes) {
         .values()
         .any(|cached| cached.engine_id == engine_id)
     {
-        inner.trusted_times.remove(engine_id);
+        inner.authenticated_times.remove(engine_id);
+    }
+}
+
+fn expire_target_if_needed(
+    inner: &mut EngineCacheInner,
+    target: &SocketAddr,
+    now: Instant,
+    ttl: Duration,
+) {
+    let expired_engine = inner.targets.get(target).and_then(|cached| {
+        (now.checked_duration_since(cached.refreshed_at)
+            .unwrap_or_default()
+            > ttl)
+            .then(|| cached.engine_id.clone())
+    });
+    if let Some(engine_id) = expired_engine {
+        inner.targets.remove(target);
+        remove_orphaned_time(inner, &engine_id);
     }
 }
 
@@ -888,7 +1265,7 @@ fn remove_orphaned_time(inner: &mut EngineCacheInner, engine_id: &Bytes) {
 ///
 /// The discovery response carries boots/time too, but this parser deliberately
 /// discards them because the discovery message is unauthenticated.
-pub fn parse_discovery_response(security_params: &Bytes) -> Result<EngineState> {
+pub fn parse_discovery_response(security_params: &Bytes) -> Result<DiscoveredEngine> {
     parse_discovery_response_with_msg_max_size(security_params, UDP_RECEIVE_LIMITS.advertised())
 }
 
@@ -900,9 +1277,9 @@ pub fn parse_discovery_response(security_params: &Bytes) -> Result<EngineState> 
 pub(crate) fn parse_discovery_response_with_msg_max_size(
     security_params: &Bytes,
     reported_msg_max_size: MessageSize,
-) -> Result<EngineState> {
+) -> Result<DiscoveredEngine> {
     let usm = UsmSecurityParams::decode(security_params.clone())?;
-    discovered_engine_state(usm.engine_id, reported_msg_max_size)
+    discovered_engine(usm.engine_id, reported_msg_max_size)
 }
 
 /// Construct discovery state from security parameters already decoded under
@@ -911,8 +1288,22 @@ pub(crate) fn discovered_engine_state(
     engine_id: Bytes,
     reported_msg_max_size: MessageSize,
 ) -> Result<EngineState> {
+    let engine = discovered_engine(engine_id, reported_msg_max_size)?;
+    Ok(EngineState::from_discovery(
+        engine.engine_id,
+        engine.msg_max_size,
+    ))
+}
+
+fn discovered_engine(
+    engine_id: Bytes,
+    reported_msg_max_size: MessageSize,
+) -> Result<DiscoveredEngine> {
     validate_discovered_engine_id(&engine_id)?;
-    Ok(EngineState::discovered(engine_id, reported_msg_max_size))
+    Ok(DiscoveredEngine {
+        engine_id,
+        msg_max_size: reported_msg_max_size,
+    })
 }
 
 /// Extract engine identity with explicit msgMaxSize and session limit.
@@ -924,14 +1315,12 @@ pub fn parse_discovery_response_with_limits(
     security_params: &Bytes,
     reported_msg_max_size: MessageSize,
     session_max: MessageSize,
-) -> Result<EngineState> {
+) -> Result<DiscoveredEngine> {
     let usm = UsmSecurityParams::decode(security_params.clone())?;
-    validate_discovered_engine_id(&usm.engine_id)?;
-
-    Ok(EngineState::discovered(
+    discovered_engine(
         usm.engine_id,
         cap_msg_max_size(reported_msg_max_size, session_max),
-    ))
+    )
 }
 
 fn validate_discovered_engine_id(engine_id: &[u8]) -> Result<()> {
@@ -1026,7 +1415,7 @@ mod tests {
         let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
 
         // Estimated time should be at least engine_time
-        let estimated = state.estimated_time();
+        let estimated = state.estimated_boots_time().1;
         assert!(estimated >= 1000);
     }
 
@@ -1036,16 +1425,25 @@ mod tests {
 
         // Same boots, newer time -> should update
         assert!(state.update_time(1, 1100));
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1100);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1100
+        );
 
         // Same boots, older time -> should NOT update
         assert!(!state.update_time(1, 1050));
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1100);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1100
+        );
 
         // New boot cycle -> should update
         assert!(state.update_time(2, 500));
-        assert_eq!(state.trusted_time().unwrap().boots(), 2);
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 500);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 2);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            500
+        );
     }
 
     /// Test anti-replay protection via latestReceivedEngineTime (RFC 3414 Section 3.2 Step 7b).
@@ -1065,7 +1463,7 @@ mod tests {
             "Should reject replay: time 1400 < latest 1500"
         );
         assert_eq!(
-            state.trusted_time().unwrap().latest_received_time(),
+            state.authenticated_time().unwrap().latest_received_time(),
             1500,
             "Latest should not change"
         );
@@ -1075,14 +1473,20 @@ mod tests {
             !state.update_time(1, 1500),
             "Should reject replay: time 1500 == latest 1500"
         );
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1500);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1500
+        );
 
         // Time 1501 (newer) should be accepted
         assert!(
             state.update_time(1, 1501),
             "Should accept: time 1501 > latest 1500"
         );
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1501);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1501
+        );
     }
 
     /// Test anti-replay across boot cycles.
@@ -1100,10 +1504,13 @@ mod tests {
             state.update_time(2, 100),
             "New boot cycle should accept even with lower time"
         );
-        assert_eq!(state.trusted_time().unwrap().boots(), 2);
-        assert_eq!(state.trusted_time().unwrap().received_time_base(), 100);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 2);
         assert_eq!(
-            state.trusted_time().unwrap().latest_received_time(),
+            state.authenticated_time().unwrap().received_time_base(),
+            100
+        );
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
             100,
             "Latest should reset to new time"
         );
@@ -1114,7 +1521,10 @@ mod tests {
             "Should reject older time in same boot cycle"
         );
         assert!(state.update_time(2, 150), "Should accept newer time");
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 150);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            150
+        );
     }
 
     /// Test anti-replay rejects old boot cycles.
@@ -1130,12 +1540,12 @@ mod tests {
             "Should reject old boot cycle even with high time"
         );
         assert_eq!(
-            state.trusted_time().unwrap().boots(),
+            state.authenticated_time().unwrap().boots(),
             5,
             "Boots should not change"
         );
         assert_eq!(
-            state.trusted_time().unwrap().latest_received_time(),
+            state.authenticated_time().unwrap().latest_received_time(),
             1000,
             "Latest should not change"
         );
@@ -1150,11 +1560,17 @@ mod tests {
         let mut state = EngineState::new(Bytes::from_static(b"engine"), 1, 0);
 
         // Start with time=0
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 0);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            0
+        );
 
         // Time=1 should be accepted (> 0)
         assert!(state.update_time(1, 1));
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1
+        );
 
         // Time=0 should be rejected (< 1)
         assert!(!state.update_time(1, 0));
@@ -1162,7 +1578,7 @@ mod tests {
         // The largest pre-rollover time can be accepted.
         assert!(state.update_time(1, MAX_ENGINE_TIME - 1));
         assert_eq!(
-            state.trusted_time().unwrap().latest_received_time(),
+            state.authenticated_time().unwrap().latest_received_time(),
             MAX_ENGINE_TIME - 1
         );
 
@@ -1271,7 +1687,10 @@ mod tests {
 
         // Older time but within 150s of our notion: accepted, latest unchanged
         assert!(state.check_and_update_timeliness(3, 900));
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1000);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1000
+        );
 
         // Exactly at the boundary (1000 - 150 = 850): accepted
         assert!(state.check_and_update_timeliness(3, 850));
@@ -1281,18 +1700,24 @@ mod tests {
     fn test_check_and_update_timeliness_controllable_boundary_without_rollback() {
         let now = Instant::now();
         let mut at_boundary = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
-        at_boundary.trusted_time.as_mut().unwrap().received_at = now;
+        at_boundary.authenticated_time.as_mut().unwrap().received_at = now;
         assert!(at_boundary.check_and_update_timeliness_at(3, 950, now + Duration::from_secs(100)));
         assert_eq!(
-            at_boundary.trusted_time().unwrap().latest_received_time(),
+            at_boundary
+                .authenticated_time()
+                .unwrap()
+                .latest_received_time(),
             1000,
             "an older in-window message must not lower the high-water mark"
         );
 
         let mut outside = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
-        outside.trusted_time.as_mut().unwrap().received_at = now;
+        outside.authenticated_time.as_mut().unwrap().received_at = now;
         assert!(!outside.check_and_update_timeliness_at(3, 949, now + Duration::from_secs(100)));
-        assert_eq!(outside.trusted_time().unwrap().latest_received_time(), 1000);
+        assert_eq!(
+            outside.authenticated_time().unwrap().latest_received_time(),
+            1000
+        );
     }
 
     #[test]
@@ -1300,8 +1725,14 @@ mod tests {
         let mut state = EngineState::new(Bytes::from_static(b"engine"), 3, 1000);
 
         assert!(state.check_and_update_timeliness(3, 1200));
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1200);
-        assert_eq!(state.trusted_time().unwrap().received_time_base(), 1200);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1200
+        );
+        assert_eq!(
+            state.authenticated_time().unwrap().received_time_base(),
+            1200
+        );
     }
 
     #[test]
@@ -1320,7 +1751,7 @@ mod tests {
 
         assert!(!state.check_and_update_timeliness(2, 5000));
         assert_eq!(
-            state.trusted_time().unwrap().boots(),
+            state.authenticated_time().unwrap().boots(),
             3,
             "old boot cycle must not update LCD"
         );
@@ -1332,8 +1763,11 @@ mod tests {
 
         // Sender rebooted: higher boots with low time is accepted and updates LCD
         assert!(state.check_and_update_timeliness(4, 10));
-        assert_eq!(state.trusted_time().unwrap().boots(), 4);
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 10);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 4);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            10
+        );
 
         // Messages from the previous boot cycle are now rejected
         assert!(!state.check_and_update_timeliness(3, 99999));
@@ -1357,23 +1791,126 @@ mod tests {
 
         // Insert
         let state = EngineState::new(Bytes::from_static(b"engine1"), 1, 1000);
-        cache.insert(addr, state);
+        cache.insert_state(addr, state).unwrap();
 
         assert_eq!(cache.len(), 1);
         assert!(!cache.is_empty());
 
         // Get
         let retrieved = cache.get(&addr).unwrap();
-        assert_eq!(retrieved.engine_id.as_ref(), b"engine1");
-        assert_eq!(retrieved.trusted_time().unwrap().boots(), 1);
+        assert_eq!(retrieved.engine_id().as_ref(), b"engine1");
+        assert_eq!(retrieved.authenticated_time().unwrap().boots(), 1);
 
         // Update time
         assert!(cache.update_time(&addr, 1, 1100));
 
         // Remove
         let removed = cache.remove(&addr).unwrap();
-        assert_eq!(removed.trusted_time().unwrap().latest_received_time(), 1100);
+        assert_eq!(
+            removed.authenticated_time().unwrap().latest_received_time(),
+            1100
+        );
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_public_discovery_insert_cannot_establish_authenticated_time() {
+        let cache = EngineCache::new();
+        let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        let discovered = DiscoveredEngine::new(
+            Bytes::from_static(b"remote-engine"),
+            crate::MessageSize::new(1400).unwrap(),
+        )
+        .unwrap();
+
+        cache.insert_discovered(addr, discovered).unwrap();
+
+        let cached = cache.get(&addr).unwrap();
+        assert_eq!(cached.engine_id(), b"remote-engine".as_slice());
+        assert!(cached.authenticated_time().is_none());
+        assert_eq!(cached.estimated_boots_time(), (0, 0));
+    }
+
+    #[test]
+    fn test_authenticated_seed_validates_invariants_before_publication() {
+        let cache = EngineCache::new();
+        let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        let discovered = || {
+            DiscoveredEngine::new(
+                Bytes::from_static(b"remote-engine"),
+                crate::MessageSize::new(1400).unwrap(),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            cache
+                .seed_authenticated(addr, discovered(), MAX_ENGINE_TIME + 1, 10)
+                .is_err()
+        );
+        assert!(
+            cache
+                .seed_authenticated(addr, discovered(), 1, MAX_ENGINE_TIME + 1)
+                .is_err()
+        );
+        assert!(cache.is_empty());
+
+        cache.seed_authenticated(addr, discovered(), 0, 10).unwrap();
+        let zero_boots = cache.get(&addr).unwrap();
+        assert_eq!(zero_boots.authenticated_time().unwrap().boots(), 0);
+
+        cache
+            .seed_authenticated(addr, discovered(), 7, 500)
+            .unwrap();
+        let cached = cache.get(&addr).unwrap();
+        assert_eq!(cached.engine_id(), b"remote-engine".as_slice());
+        let time = cached.authenticated_time().unwrap();
+        assert_eq!((time.boots(), time.latest_received_time()), (7, 500));
+    }
+
+    #[test]
+    fn test_public_cache_inserts_reject_active_identity_conflicts() {
+        let cache = EngineCache::new();
+        let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        let capacity = crate::MessageSize::new(1400).unwrap();
+        cache
+            .insert_discovered(
+                addr,
+                DiscoveredEngine::new(Bytes::from_static(b"engine-one"), capacity).unwrap(),
+            )
+            .unwrap();
+
+        let error = cache
+            .insert_discovered(
+                addr,
+                DiscoveredEngine::new(Bytes::from_static(b"engine-two"), capacity).unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(*error, Error::Config(_)));
+        assert_eq!(
+            cache.get(&addr).unwrap().engine_id(),
+            b"engine-one".as_slice()
+        );
+    }
+
+    #[test]
+    fn discovery_insert_reports_poison_as_local_configuration_error() {
+        let cache = EngineCache::new();
+        let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        cache.poison_for_test();
+
+        let error = cache
+            .insert_discovered(
+                addr,
+                DiscoveredEngine::new(
+                    Bytes::from_static(b"remote-engine"),
+                    crate::MessageSize::new(1400).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(*error, Error::Config(_)));
     }
 
     #[test]
@@ -1381,51 +1918,58 @@ mod tests {
         let cache = EngineCache::new();
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
         let shared_addr: SocketAddr = "192.168.1.2:161".parse().unwrap();
-        let old = EngineState::discovered(
+        let old = EngineState::from_discovery(
             Bytes::from_static(b"old-engine"),
             crate::MessageSize::new(1400).unwrap(),
         );
-        let new = EngineState::discovered(
+        let new = EngineState::from_discovery(
             Bytes::from_static(b"new-engine"),
             crate::MessageSize::new(1500).unwrap(),
         );
         let shared = EngineState::new(Bytes::from_static(b"new-engine"), 7, 500);
 
-        cache.insert(addr, old.clone());
-        cache.insert(shared_addr, shared);
+        cache.insert_state(addr, old.clone()).unwrap();
+        cache.insert_state(shared_addr, shared).unwrap();
         let replaced = cache.replace_target(addr, new).unwrap();
-        cache.insert(addr, old);
+        cache.insert_state(addr, old).unwrap();
 
         assert_eq!(replaced.engine_id().as_ref(), b"new-engine");
-        let trusted = replaced.trusted_time().unwrap();
+        let trusted = replaced.authenticated_time().unwrap();
         assert_eq!((trusted.boots(), trusted.latest_received_time()), (7, 500));
 
         let cached = cache.get(&addr).unwrap();
         assert_eq!(cached.engine_id().as_ref(), b"new-engine");
-        assert_eq!(cached.msg_max_size, 1500);
+        assert_eq!(cached.msg_max_size(), 1500);
     }
 
     #[test]
-    fn test_engine_cache_shares_trusted_time_by_engine_id() {
+    fn test_engine_cache_shares_authenticated_time_by_engine_id() {
         let cache = EngineCache::new();
         let addr1: SocketAddr = "192.168.1.1:161".parse().unwrap();
         let addr2: SocketAddr = "192.168.1.2:161".parse().unwrap();
         let engine_id = Bytes::from_static(b"shared-engine");
 
-        cache.insert(
-            addr1,
-            EngineState::discovered(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
-        );
-        cache.insert(
-            addr2,
-            EngineState::discovered(engine_id, crate::MessageSize::new(1500).unwrap()),
-        );
+        cache
+            .insert_state(
+                addr1,
+                EngineState::from_discovery(
+                    engine_id.clone(),
+                    crate::MessageSize::new(1400).unwrap(),
+                ),
+            )
+            .unwrap();
+        cache
+            .insert_state(
+                addr2,
+                EngineState::from_discovery(engine_id, crate::MessageSize::new(1500).unwrap()),
+            )
+            .unwrap();
         assert!(cache.update_time(&addr1, 4, 500));
 
         let state2 = cache.get(&addr2).unwrap();
-        let trusted = state2.trusted_time().unwrap();
+        let trusted = state2.authenticated_time().unwrap();
         assert_eq!((trusted.boots(), trusted.latest_received_time()), (4, 500));
-        assert_eq!(state2.msg_max_size, 1500);
+        assert_eq!(state2.msg_max_size(), 1500);
     }
 
     #[test]
@@ -1434,15 +1978,21 @@ mod tests {
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
         let engine_id = Bytes::from_static(b"engine1");
 
-        cache.insert(addr, EngineState::new(engine_id.clone(), 7, 500));
-        cache.insert(addr, EngineState::new(engine_id.clone(), 6, 9000));
-        cache.insert(
-            addr,
-            EngineState::discovered(engine_id, crate::MessageSize::new(1400).unwrap()),
-        );
+        cache
+            .insert_state(addr, EngineState::new(engine_id.clone(), 7, 500))
+            .unwrap();
+        cache
+            .insert_state(addr, EngineState::new(engine_id.clone(), 6, 9000))
+            .unwrap();
+        cache
+            .insert_state(
+                addr,
+                EngineState::from_discovery(engine_id, crate::MessageSize::new(1400).unwrap()),
+            )
+            .unwrap();
 
         let state = cache.get(&addr).unwrap();
-        let trusted = state.trusted_time().unwrap();
+        let trusted = state.authenticated_time().unwrap();
         assert_eq!((trusted.boots(), trusted.latest_received_time()), (7, 500));
     }
 
@@ -1452,31 +2002,36 @@ mod tests {
 
         let cache = Arc::new(EngineCache::new());
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
-        cache.insert(
-            addr,
-            EngineState::discovered(
-                Bytes::from_static(b"engine1"),
-                crate::MessageSize::new(1400).unwrap(),
-            ),
-        );
+        let discovered = DiscoveredEngine::new(
+            Bytes::from_static(b"engine1"),
+            crate::MessageSize::new(1400).unwrap(),
+        )
+        .unwrap();
+        cache.insert_discovered(addr, discovered.clone()).unwrap();
 
         let older = Arc::clone(&cache);
         let newer = Arc::clone(&cache);
+        let older_engine = discovered.clone();
+        let newer_engine = discovered;
         let older_task = std::thread::spawn(move || {
             for _ in 0..100 {
-                older.update_time(&addr, 4, 9000);
+                older
+                    .seed_authenticated(addr, older_engine.clone(), 4, 9000)
+                    .unwrap();
             }
         });
         let newer_task = std::thread::spawn(move || {
             for _ in 0..100 {
-                newer.update_time(&addr, 5, 10);
+                newer
+                    .seed_authenticated(addr, newer_engine.clone(), 5, 10)
+                    .unwrap();
             }
         });
         older_task.join().unwrap();
         newer_task.join().unwrap();
 
         let state = cache.get(&addr).unwrap();
-        let trusted = state.trusted_time().unwrap();
+        let trusted = state.authenticated_time().unwrap();
         assert_eq!((trusted.boots(), trusted.latest_received_time()), (5, 10));
     }
 
@@ -1487,13 +2042,209 @@ mod tests {
         let now = Instant::now();
 
         let state = EngineState::new(Bytes::from_static(b"engine1"), 1, 1000);
-        cache.insert_at(addr, state, now);
+        cache.insert_state_at(addr, state, now).unwrap();
         assert!(cache.get_at(&addr, now + Duration::from_secs(5)).is_some());
         assert!(
             cache.get_at(&addr, now + Duration::from_secs(6)).is_none(),
             "expired entry should return None"
         );
         assert!(cache.is_empty(), "expired entry should be removed");
+    }
+
+    #[test]
+    fn authenticated_publication_restores_ttl_expired_mapping() {
+        let cache = EngineCache::new().with_ttl(Duration::from_secs(5));
+        let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        let now = Instant::now();
+        let engine_id = Bytes::from_static(b"engine1");
+        let local_state = EngineState::new(engine_id.clone(), 1, 1000);
+        cache
+            .insert_state_at(addr, local_state.clone(), now)
+            .unwrap();
+
+        let outcome = cache
+            .check_and_update_timeliness_at(
+                &addr,
+                &local_state,
+                &engine_id,
+                1,
+                1100,
+                now + Duration::from_secs(6),
+            )
+            .unwrap();
+
+        let TimelinessPublicationOutcome::RestoredMapping(state) = outcome else {
+            panic!("authenticated publication must restore the expired mapping");
+        };
+        assert_eq!(state.engine_id(), &engine_id);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1100
+        );
+        assert!(cache.get_at(&addr, now + Duration::from_secs(6)).is_some());
+    }
+
+    #[test]
+    fn authenticated_publication_restores_capacity_evicted_mapping() {
+        let cache = EngineCache::new().with_max_capacity(1);
+        let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        let other: SocketAddr = "192.0.2.2:161".parse().unwrap();
+        let now = Instant::now();
+        let engine_id = Bytes::from_static(b"engine1");
+        let local_state = EngineState::new(engine_id.clone(), 1, 1000);
+        cache
+            .insert_state_at(addr, local_state.clone(), now)
+            .unwrap();
+        cache
+            .insert_state_at(
+                other,
+                EngineState::new(Bytes::from_static(b"engine2"), 1, 50),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(cache.get_at(&addr, now + Duration::from_secs(1)).is_none());
+
+        let outcome = cache
+            .check_and_update_timeliness_at(
+                &addr,
+                &local_state,
+                &engine_id,
+                1,
+                1100,
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            TimelinessPublicationOutcome::RestoredMapping(_)
+        ));
+        assert!(cache.get_at(&other, now + Duration::from_secs(2)).is_none());
+        assert_eq!(
+            cache
+                .get_at(&addr, now + Duration::from_secs(2))
+                .unwrap()
+                .authenticated_time()
+                .unwrap()
+                .latest_received_time(),
+            1100
+        );
+    }
+
+    #[test]
+    fn authenticated_publication_restores_removed_and_cleared_mappings() {
+        for clear in [false, true] {
+            let cache = EngineCache::new();
+            let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+            let engine_id = Bytes::from_static(b"engine1");
+            let local_state = EngineState::new(engine_id.clone(), 1, 1000);
+            cache.insert_state(addr, local_state.clone()).unwrap();
+            if clear {
+                cache.clear();
+            } else {
+                cache.remove(&addr).expect("seeded mapping");
+            }
+
+            let outcome = cache
+                .check_and_update_timeliness(&addr, &local_state, &engine_id, 1, 1100)
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                TimelinessPublicationOutcome::RestoredMapping(_)
+            ));
+            assert_eq!(
+                cache
+                    .get(&addr)
+                    .unwrap()
+                    .authenticated_time()
+                    .unwrap()
+                    .latest_received_time(),
+                1100
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_replacement_preserves_same_engine_high_water_time() {
+        let cache = EngineCache::new().with_max_capacity(1);
+        let first: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        let replacement: SocketAddr = "192.0.2.2:161".parse().unwrap();
+        let now = Instant::now();
+        let engine_id = Bytes::from_static(b"shared-engine");
+        cache
+            .insert_state_at(first, EngineState::new(engine_id.clone(), 5, 500), now)
+            .unwrap();
+        cache
+            .insert_state_at(
+                replacement,
+                EngineState::new(engine_id, 4, 9000),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert!(cache.get_at(&first, now + Duration::from_secs(1)).is_none());
+        let state = cache
+            .get_at(&replacement, now + Duration::from_secs(1))
+            .unwrap();
+        let time = state.authenticated_time().unwrap();
+        assert_eq!((time.boots(), time.latest_received_time()), (5, 500));
+    }
+
+    #[test]
+    fn concurrent_rebind_and_authenticated_recovery_never_mix_identities() {
+        use std::sync::{Arc, Barrier};
+
+        for _ in 0..64 {
+            let cache = Arc::new(EngineCache::new());
+            let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+            let local_id = Bytes::from_static(b"engine-local");
+            let foreign_id = Bytes::from_static(b"engine-foreign");
+            let local_state = EngineState::new(local_id.clone(), 1, 1000);
+            let barrier = Arc::new(Barrier::new(3));
+
+            let publishing_cache = Arc::clone(&cache);
+            let publishing_barrier = Arc::clone(&barrier);
+            let publishing_state = local_state.clone();
+            let publishing_id = local_id.clone();
+            let publisher = std::thread::spawn(move || {
+                publishing_barrier.wait();
+                publishing_cache
+                    .check_and_update_timeliness(&addr, &publishing_state, &publishing_id, 1, 1100)
+                    .unwrap()
+            });
+
+            let rebinding_cache = Arc::clone(&cache);
+            let rebinding_barrier = Arc::clone(&barrier);
+            let rebinder = std::thread::spawn(move || {
+                rebinding_barrier.wait();
+                rebinding_cache.insert_discovered(
+                    addr,
+                    DiscoveredEngine::new(foreign_id, crate::MessageSize::new(1400).unwrap())
+                        .unwrap(),
+                )
+            });
+
+            barrier.wait();
+            let publication = publisher.join().unwrap();
+            let rebind = rebinder.join().unwrap();
+            let cached = cache.get(&addr).unwrap();
+            match publication {
+                TimelinessPublicationOutcome::RestoredMapping(_) => {
+                    assert!(rebind.is_err());
+                    assert_eq!(cached.engine_id(), &local_id);
+                    assert_eq!(
+                        cached.authenticated_time().unwrap().latest_received_time(),
+                        1100
+                    );
+                }
+                TimelinessPublicationOutcome::IdentityConflict => {
+                    rebind.unwrap();
+                    assert_eq!(cached.engine_id(), b"engine-foreign".as_slice());
+                    assert!(cached.authenticated_time().is_none());
+                }
+                other => panic!("unexpected concurrent publication outcome: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1504,8 +2255,10 @@ mod tests {
         let engine_id = Bytes::from_static(b"engine1");
         let local_state = EngineState::new(engine_id.clone(), 1, 1000);
 
-        cache.insert_at(addr, local_state.clone(), now);
-        let (timely, _) = cache
+        cache
+            .insert_state_at(addr, local_state.clone(), now)
+            .unwrap();
+        let outcome = cache
             .check_and_update_timeliness_at(
                 &addr,
                 &local_state,
@@ -1515,7 +2268,10 @@ mod tests {
                 now + Duration::from_secs(4),
             )
             .unwrap();
-        assert!(timely, "older in-window input remains acceptable");
+        assert!(matches!(
+            outcome,
+            TimelinessPublicationOutcome::Published(_)
+        ));
         assert!(
             cache.get_at(&addr, now + Duration::from_secs(8)).is_some(),
             "accepted authenticated input must refresh TTL without advancing high-water"
@@ -1529,14 +2285,19 @@ mod tests {
         let now = Instant::now();
         let engine_id = Bytes::from_static(b"engine1");
         let mut local_state = EngineState::new(engine_id.clone(), 5, 1000);
-        local_state.trusted_time.as_mut().unwrap().received_at = now;
+        local_state.authenticated_time.as_mut().unwrap().received_at = now;
 
-        cache.insert_at(
-            addr,
-            EngineState::discovered(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
-            now,
-        );
-        let (timely, canonical) = cache
+        cache
+            .insert_state_at(
+                addr,
+                EngineState::from_discovery(
+                    engine_id.clone(),
+                    crate::MessageSize::new(1400).unwrap(),
+                ),
+                now,
+            )
+            .unwrap();
+        let outcome = cache
             .check_and_update_timeliness_at(
                 &addr,
                 &local_state,
@@ -1547,8 +2308,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!timely, "rebuilt cache must not weaken live client state");
-        let trusted = canonical.trusted_time().unwrap();
+        let TimelinessPublicationOutcome::Stale(canonical) = outcome else {
+            panic!("rebuilt cache must reject stale input");
+        };
+        let trusted = canonical.authenticated_time().unwrap();
         assert_eq!((trusted.boots(), trusted.latest_received_time()), (5, 1000));
     }
 
@@ -1559,10 +2322,12 @@ mod tests {
         let now = Instant::now();
         let engine_id = Bytes::from_static(b"engine1");
         let mut local_state = EngineState::new(engine_id.clone(), 5, 1000);
-        local_state.trusted_time.as_mut().unwrap().received_at = now;
+        local_state.authenticated_time.as_mut().unwrap().received_at = now;
 
-        cache.insert_at(addr, local_state.clone(), now);
-        let (timely, _) = cache
+        cache
+            .insert_state_at(addr, local_state.clone(), now)
+            .unwrap();
+        let outcome = cache
             .check_and_update_timeliness_at(
                 &addr,
                 &local_state,
@@ -1572,7 +2337,7 @@ mod tests {
                 now + Duration::from_secs(4),
             )
             .unwrap();
-        assert!(!timely);
+        assert!(matches!(outcome, TimelinessPublicationOutcome::Stale(_)));
         assert!(cache.get_at(&addr, now + Duration::from_secs(6)).is_none());
     }
 
@@ -1583,10 +2348,12 @@ mod tests {
         let now = Instant::now();
         let engine_id = Bytes::from_static(b"engine1");
         let mut local_state = EngineState::new(engine_id.clone(), 5, 1000);
-        local_state.trusted_time.as_mut().unwrap().received_at = now;
+        local_state.authenticated_time.as_mut().unwrap().received_at = now;
 
-        cache.insert_at(addr, local_state.clone(), now);
-        let (timely, _) = cache
+        cache
+            .insert_state_at(addr, local_state.clone(), now)
+            .unwrap();
+        let outcome = cache
             .check_and_update_timeliness_at(
                 &addr,
                 &local_state,
@@ -1596,7 +2363,7 @@ mod tests {
                 now + Duration::from_secs(6),
             )
             .unwrap();
-        assert!(!timely);
+        assert!(matches!(outcome, TimelinessPublicationOutcome::Stale(_)));
         assert!(cache.get_at(&addr, now + Duration::from_secs(6)).is_none());
         assert!(cache.is_empty());
     }
@@ -1609,25 +2376,31 @@ mod tests {
         let addr3: SocketAddr = "192.168.1.3:161".parse().unwrap();
 
         let now = Instant::now();
-        cache.insert_at(
-            addr1,
-            EngineState::new(Bytes::from_static(b"e1"), 1, 100),
-            now,
-        );
-        cache.insert_at(
-            addr2,
-            EngineState::new(Bytes::from_static(b"e2"), 1, 200),
-            now + Duration::from_secs(1),
-        );
+        cache
+            .insert_state_at(
+                addr1,
+                EngineState::new(Bytes::from_static(b"e1"), 1, 100),
+                now,
+            )
+            .unwrap();
+        cache
+            .insert_state_at(
+                addr2,
+                EngineState::new(Bytes::from_static(b"e2"), 1, 200),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
 
         assert_eq!(cache.len(), 2);
 
         // Third insert should evict the least recently refreshed target.
-        cache.insert_at(
-            addr3,
-            EngineState::new(Bytes::from_static(b"e3"), 1, 300),
-            now + Duration::from_secs(2),
-        );
+        cache
+            .insert_state_at(
+                addr3,
+                EngineState::new(Bytes::from_static(b"e3"), 1, 300),
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
         assert_eq!(cache.len(), 2);
         assert!(
             cache.get(&addr1).is_none(),
@@ -1658,8 +2431,17 @@ mod tests {
 
         let state = parse_discovery_response(&encoded).unwrap();
         assert_eq!(state.engine_id.as_ref(), b"test-engine-id");
-        assert!(state.trusted_time().is_none());
-        assert_eq!(state.estimated_boots_time(), (0, 0));
+        assert_eq!(state.msg_max_size, UDP_RECEIVE_LIMITS.advertised());
+    }
+
+    #[test]
+    fn test_discovered_engine_rejects_invalid_identity() {
+        let capacity = crate::MessageSize::new(1400).unwrap();
+        assert!(DiscoveredEngine::new(Bytes::new(), capacity).is_err());
+        assert!(DiscoveredEngine::new(Bytes::from_static(b"valid"), capacity).is_ok());
+        assert!(DiscoveredEngine::new(Bytes::from_static(&[0; 5]), capacity).is_err());
+        assert!(DiscoveredEngine::new(Bytes::from_static(&[0xff; 5]), capacity).is_err());
+        assert!(DiscoveredEngine::new(Bytes::from(vec![1; 33]), capacity).is_err());
     }
 
     #[test]
@@ -1703,8 +2485,11 @@ mod tests {
             state.update_time(2_147_483_647, 100),
             "Transition to boots=2_147_483_647 should be accepted"
         );
-        assert_eq!(state.trusted_time().unwrap().boots(), 2_147_483_647);
-        assert_eq!(state.trusted_time().unwrap().received_time_base(), 100);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 2_147_483_647);
+        assert_eq!(
+            state.authenticated_time().unwrap().received_time_base(),
+            100
+        );
     }
 
     /// Test `update_time` behavior when boots is latched.
@@ -1722,11 +2507,17 @@ mod tests {
             state.update_time(2_147_483_647, 2000),
             "Time tracking updates should still work"
         );
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 2000);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            2000
+        );
 
         // Old time rejected per normal anti-replay
         assert!(!state.update_time(2_147_483_647, 1500));
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 2000);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            2000
+        );
 
         // The key security check is in is_in_time_window
         assert!(
@@ -1763,9 +2554,15 @@ mod tests {
     fn test_engine_state_created_latched() {
         let state = EngineState::new(Bytes::from_static(b"engine"), 2_147_483_647, 5000);
 
-        assert_eq!(state.trusted_time().unwrap().boots(), 2_147_483_647);
-        assert_eq!(state.trusted_time().unwrap().received_time_base(), 5000);
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 5000);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 2_147_483_647);
+        assert_eq!(
+            state.authenticated_time().unwrap().received_time_base(),
+            5000
+        );
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            5000
+        );
 
         // Should immediately be in latched state
         assert!(
@@ -1788,12 +2585,12 @@ mod tests {
 
         // Should accept boot to 2_147_483_646
         assert!(state.update_time(2_147_483_646, 500));
-        assert_eq!(state.trusted_time().unwrap().boots(), 2_147_483_646);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 2_147_483_646);
         assert!(state.is_in_time_window(2_147_483_646, 500));
 
         // Should accept boot to 2_147_483_647 (becomes latched)
         assert!(state.update_time(2_147_483_647, 100));
-        assert_eq!(state.trusted_time().unwrap().boots(), 2_147_483_647);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 2_147_483_647);
 
         // Now latched - all messages rejected
         assert!(!state.is_in_time_window(2_147_483_647, 100));
@@ -1814,11 +2611,14 @@ mod tests {
 
         // Same boot, newer time should be accepted
         assert!(state.update_time(2_147_483_640, 1500));
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 1500);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            1500
+        );
 
         // New boot should be accepted
         assert!(state.update_time(2_147_483_641, 100));
-        assert_eq!(state.trusted_time().unwrap().boots(), 2_147_483_641);
+        assert_eq!(state.authenticated_time().unwrap().boots(), 2_147_483_641);
     }
 
     /// Test `EngineCache` behavior with latched engines.
@@ -1831,10 +2631,12 @@ mod tests {
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
 
         // Insert latched engine
-        cache.insert(
-            addr,
-            EngineState::new(Bytes::from_static(b"latched"), 2_147_483_647, 1000),
-        );
+        cache
+            .insert_state(
+                addr,
+                EngineState::new(Bytes::from_static(b"latched"), 2_147_483_647, 1000),
+            )
+            .unwrap();
 
         // Time tracking still works
         assert!(
@@ -1844,7 +2646,10 @@ mod tests {
 
         // Verify state was updated
         let state = cache.get(&addr).unwrap();
-        assert_eq!(state.trusted_time().unwrap().latest_received_time(), 2000);
+        assert_eq!(
+            state.authenticated_time().unwrap().latest_received_time(),
+            2000
+        );
 
         // But the key security property: is_in_time_window rejects
         assert!(
@@ -1872,7 +2677,7 @@ mod tests {
             1000,
             crate::MessageSize::new(65507).unwrap(),
         );
-        assert_eq!(state.msg_max_size, 65507);
+        assert_eq!(state.msg_max_size(), 65507);
     }
 
     /// Test that the default constructor uses the maximum UDP message size.
@@ -1883,7 +2688,7 @@ mod tests {
     fn test_engine_state_default_msg_max_size() {
         let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
         assert_eq!(
-            state.msg_max_size,
+            state.msg_max_size(),
             UDP_RECEIVE_LIMITS.advertised(),
             "Default msg_max_size should be the maximum UDP datagram size"
         );
@@ -1905,7 +2710,8 @@ mod tests {
             UDP_RECEIVE_LIMITS.advertised(),          // Our session maximum
         );
         assert_eq!(
-            state.msg_max_size, 65507,
+            state.msg_max_size(),
+            65507,
             "msg_max_size should be capped to session maximum"
         );
     }
@@ -1924,7 +2730,8 @@ mod tests {
             UDP_RECEIVE_LIMITS.advertised(), // Our session maximum
         );
         assert_eq!(
-            state.msg_max_size, 1472,
+            state.msg_max_size(),
+            1472,
             "msg_max_size within limit should not be capped"
         );
     }
@@ -1941,7 +2748,7 @@ mod tests {
             UDP_RECEIVE_LIMITS.advertised(), // Exactly at session max
             UDP_RECEIVE_LIMITS.advertised(), // Our session maximum
         );
-        assert_eq!(state.msg_max_size, 65507);
+        assert_eq!(state.msg_max_size(), 65507);
     }
 
     #[test]
@@ -1980,7 +2787,7 @@ mod tests {
             MessageSize::try_from(TCP_MAX).unwrap(),
             MessageSize::try_from(TCP_MAX).unwrap(),
         );
-        assert_eq!(state.msg_max_size, TCP_MAX);
+        assert_eq!(state.msg_max_size(), TCP_MAX);
 
         // Values above i32::MAX cannot enter EngineState; wire decoding and
         // transport configuration reject them before session capping.
@@ -1993,7 +2800,7 @@ mod tests {
         let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
 
         // UDP_RECEIVE_LIMITS.advertised() is the maximum UDP payload (65507)
-        assert_eq!(state.msg_max_size, UDP_RECEIVE_LIMITS.advertised());
+        assert_eq!(state.msg_max_size(), UDP_RECEIVE_LIMITS.advertised());
     }
 
     // ========================================================================
@@ -2014,7 +2821,7 @@ mod tests {
         let state = EngineState::new(Bytes::from_static(b"engine"), 1, MAX_ENGINE_TIME - 10);
 
         // Even though we're adding elapsed time, result should never exceed MAX_ENGINE_TIME
-        let estimated = state.estimated_time();
+        let estimated = state.estimated_boots_time().1;
         assert!(
             estimated <= MAX_ENGINE_TIME,
             "estimated_time() should never exceed MAX_ENGINE_TIME ({MAX_ENGINE_TIME}), got {estimated}"
@@ -2026,7 +2833,7 @@ mod tests {
     fn test_estimated_pair_rolls_after_max_engine_time() {
         let now = Instant::now();
         let mut state = EngineState::new(Bytes::from_static(b"engine"), 1, 0);
-        state.trusted_time.as_mut().unwrap().received_at = now;
+        state.authenticated_time.as_mut().unwrap().received_at = now;
 
         assert_eq!(
             state.estimated_boots_time_at(now + Duration::from_secs(u64::from(MAX_ENGINE_TIME))),
@@ -2043,7 +2850,7 @@ mod tests {
     fn test_max_engine_time_tuple_remains_timely() {
         let now = Instant::now();
         let mut state = EngineState::new(Bytes::from_static(b"engine"), 1, MAX_ENGINE_TIME);
-        state.trusted_time.as_mut().unwrap().received_at = now;
+        state.authenticated_time.as_mut().unwrap().received_at = now;
 
         assert!(state.check_and_update_timeliness_at(1, MAX_ENGINE_TIME, now));
         assert_eq!(state.estimated_boots_time_at(now), (1, MAX_ENGINE_TIME));
@@ -2068,7 +2875,7 @@ mod tests {
         let state = EngineState::new(Bytes::from_static(b"engine"), 1, 1000);
 
         // For a fresh state, elapsed should be ~0, so estimated should be ~engine_time
-        let estimated = state.estimated_time();
+        let estimated = state.estimated_boots_time().1;
         assert!(
             estimated >= 1000,
             "estimated_time() should be at least engine_time"

@@ -393,7 +393,7 @@ pub(crate) fn process_v3_inbound(
                     && engines.len() >= max_remote_engines
                     && let Some(oldest) = engines
                         .iter()
-                        .min_by_key(|(_, state)| state.last_trusted_update_at())
+                        .min_by_key(|(_, state)| state.last_authenticated_update_at())
                         .map(|(k, _)| k.clone())
                 {
                     engines.remove(&oldest);

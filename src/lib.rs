@@ -641,7 +641,7 @@ pub use transport::{
     TcpTransport, Transport, UdpControl, UdpHandle, UdpStats, UdpTransport,
 };
 pub use v3::{
-    AuthProtocol, AuthoritativeEngine, EngineCache, ParseProtocolError,
+    AuthProtocol, AuthoritativeEngine, DiscoveredEngine, EngineCache, ParseProtocolError,
     PersistedAuthoritativeEngine, PrivProtocol, UsmConfig, UsmUser, generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]

@@ -114,7 +114,7 @@ async fn v3_auth_sha512() {
 /// canonical tuple without causing another notInTimeWindows Report.
 #[tokio::test]
 async fn v3_shared_cache_rejects_stale_boots_overwrite() {
-    use async_snmp::v3::{EngineCache, EngineState};
+    use async_snmp::v3::{DiscoveredEngine, EngineCache};
     use std::sync::Arc;
 
     let agent = TestAgentBuilder::new()
@@ -148,16 +148,21 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
     // high-water value. A second client sharing the cache adopts the canonical
     // monotonic state and sends no additional stale request.
     let good = cache.get(&agent.addr()).expect("cache seeded");
-    let good_boots = good.trusted_time().unwrap().boots();
+    let good_boots = good.authenticated_time().unwrap().boots();
     assert!(good_boots > 0, "agent boots must be nonzero");
-    cache.insert(
-        agent.addr(),
-        EngineState::new(
-            good.engine_id().clone(),
-            good_boots - 1,
-            good.estimated_time(),
-        ),
-    );
+    let stale_time = good
+        .authenticated_time()
+        .unwrap()
+        .latest_received_time()
+        .saturating_sub(1);
+    cache
+        .seed_authenticated(
+            agent.addr(),
+            DiscoveredEngine::new(good.engine_id().clone(), good.msg_max_size()).unwrap(),
+            good_boots,
+            stale_time,
+        )
+        .unwrap();
 
     let client2 = Client::builder(
         agent.addr().to_string(),
@@ -187,7 +192,7 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
 /// The same stale-cache overwrite protection applies to authPriv clients.
 #[tokio::test]
 async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
-    use async_snmp::v3::{EngineCache, EngineState};
+    use async_snmp::v3::{DiscoveredEngine, EngineCache};
     use std::sync::Arc;
 
     let agent = TestAgentBuilder::new()
@@ -223,16 +228,21 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
     assert_eq!(baseline_reports, 1);
 
     let good = cache.get(&agent.addr()).expect("cache seeded");
-    let good_boots = good.trusted_time().unwrap().boots();
+    let good_boots = good.authenticated_time().unwrap().boots();
     assert!(good_boots > 0, "agent boots must be nonzero");
-    cache.insert(
-        agent.addr(),
-        EngineState::new(
-            good.engine_id().clone(),
-            good_boots - 1,
-            good.estimated_time(),
-        ),
-    );
+    let stale_time = good
+        .authenticated_time()
+        .unwrap()
+        .latest_received_time()
+        .saturating_sub(1);
+    cache
+        .seed_authenticated(
+            agent.addr(),
+            DiscoveredEngine::new(good.engine_id().clone(), good.msg_max_size()).unwrap(),
+            good_boots,
+            stale_time,
+        )
+        .unwrap();
 
     let client2 = Client::builder(
         agent.addr().to_string(),

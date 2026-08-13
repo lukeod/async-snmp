@@ -72,12 +72,16 @@ pub use config::{UsmConfig, UsmUser};
 pub use crypto::{CryptoBackend, CryptoError, CryptoResult};
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 pub(crate) use crypto::{CryptoBackend, CryptoError, CryptoResult};
-pub(crate) use engine::discovered_engine_state;
 pub use engine::report_oids;
 pub use engine::{
-    EngineCache, EngineState, MAX_ENGINE_ID_LEN, MAX_ENGINE_TIME, MIN_ENGINE_ID_LEN, TIME_WINDOW,
-    TrustedEngineTime, compute_engine_boots_time, generate_engine_id, in_authoritative_time_window,
-    parse_discovery_response, parse_discovery_response_with_limits, validate_engine_id,
+    AuthenticatedEngineTime, DiscoveredEngine, EngineCache, EngineState, MAX_ENGINE_ID_LEN,
+    MAX_ENGINE_TIME, MIN_ENGINE_ID_LEN, TIME_WINDOW, compute_engine_boots_time, generate_engine_id,
+    in_authoritative_time_window, parse_discovery_response, parse_discovery_response_with_limits,
+    validate_engine_id,
+};
+pub(crate) use engine::{
+    EngineCacheAccessError, TimelinessCandidateOutcome, TimelinessPublicationOutcome,
+    discovered_engine_state,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use privacy::{PrivKey, PrivacyError, PrivacyResult, SaltCounter};

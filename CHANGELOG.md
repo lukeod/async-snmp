@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** SNMPv3 engine-cache APIs now separate unauthenticated
+  `DiscoveredEngine` identity/capacity from `AuthenticatedEngineTime`.
+  Trust-establishing `EngineState` constructors and timeliness mutations are
+  internal; public cache population uses `insert_discovered` or the explicitly
+  attested, fallible `seed_authenticated`. Authenticated publication restores
+  mappings removed by expiry, capacity eviction, `remove`, or `clear` without
+  weakening generation/identity race checks, and shared per-engine high-water
+  time remains monotonic across same-identity capacity replacement.
 - **Breaking:** `Auth::usm` now accepts username octets and returns `Auth`
   directly, consistently with `Auth::v1` and `Auth::v2c`. Credentialed,
   private, context-specific, and precomputed-key configurations use
@@ -205,6 +213,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration
 
+- Replace direct `EngineState` construction, field access, `EngineCache::insert`,
+  and `EngineState::update_time` with
+  `DiscoveredEngine::new(engine_id, msg_max_size)` and
+  `EngineCache::insert_discovered`. Applications restoring independently
+  authenticated persistence should call `EngineCache::seed_authenticated` and
+  handle its `Result`; engine boots zero is accepted, while boots/time above
+  `MAX_ENGINE_TIME` remain invalid. Read cached identity/capacity through
+  `EngineState::engine_id` and `msg_max_size`, and authenticated state through
+  `authenticated_time`.
 - **Client fixed-cardinality responses:** `get`, `get_many`, `get_next`,
   `get_next_many`, `set`, and `set_many` now return
   `FixedCardinalityResponse` rather than a bare `Vec<VarBind>`/single binding.
