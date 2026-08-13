@@ -82,7 +82,10 @@ pub use notification::{
     NotificationOutcome, NotificationSendStream, NotificationSinkId, NotificationSinkSummary,
     SinkOutcome, SinkSkipReason, SinkStatus,
 };
-pub use vacm::{VacmBuilder, VacmConfig, VacmSecurityModel, View, ViewCheckResult, ViewSubtree};
+pub use vacm::{
+    DuplicateVacmAccessEntry, VacmAccessIndex, VacmBuilder, VacmConfig, VacmSecurityModel, View,
+    ViewCheckResult, ViewSubtree,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -245,6 +248,7 @@ pub(crate) struct RegisteredHandler {
 pub(crate) enum AgentAuthorization {
     Unset,
     Vacm(VacmConfig),
+    InvalidVacm(DuplicateVacmAccessEntry),
     AllowAll,
     Conflict,
 }
@@ -253,7 +257,7 @@ impl AgentAuthorization {
     pub(crate) fn vacm(&self) -> Option<&VacmConfig> {
         match self {
             Self::Vacm(vacm) => Some(vacm),
-            Self::Unset | Self::AllowAll | Self::Conflict => None,
+            Self::Unset | Self::InvalidVacm(_) | Self::AllowAll | Self::Conflict => None,
         }
     }
 }
@@ -742,9 +746,12 @@ impl AgentBuilder {
     {
         let builder = VacmBuilder::new();
         self.authorization = match self.authorization {
-            AgentAuthorization::Unset | AgentAuthorization::Vacm(_) => {
-                AgentAuthorization::Vacm(configure(builder).build())
-            }
+            AgentAuthorization::Unset
+            | AgentAuthorization::Vacm(_)
+            | AgentAuthorization::InvalidVacm(_) => match configure(builder).build() {
+                Ok(config) => AgentAuthorization::Vacm(config),
+                Err(error) => AgentAuthorization::InvalidVacm(error),
+            },
             AgentAuthorization::AllowAll | AgentAuthorization::Conflict => {
                 AgentAuthorization::Conflict
             }
@@ -764,9 +771,9 @@ impl AgentBuilder {
             AgentAuthorization::Unset | AgentAuthorization::AllowAll => {
                 AgentAuthorization::AllowAll
             }
-            AgentAuthorization::Vacm(_) | AgentAuthorization::Conflict => {
-                AgentAuthorization::Conflict
-            }
+            AgentAuthorization::Vacm(_)
+            | AgentAuthorization::InvalidVacm(_)
+            | AgentAuthorization::Conflict => AgentAuthorization::Conflict,
         };
         self
     }
@@ -909,6 +916,9 @@ impl AgentBuilder {
                 "VACM and unrestricted Agent access are mutually exclusive".into(),
             )
             .boxed());
+        }
+        if let AgentAuthorization::InvalidVacm(error) = &self.authorization {
+            return Err(Error::Config(error.to_string().into()).boxed());
         }
         if (!self.communities.is_empty() || !self.usm_users.is_empty())
             && matches!(self.authorization, AgentAuthorization::Unset)
@@ -4179,6 +4189,34 @@ mod tests {
                 Error::Config(ref message) if message.contains("mutually exclusive")
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_vacm_access_rows_are_rejected_before_bind() {
+        let result = Agent::builder()
+            .bind("not a socket address")
+            .community(b"public")
+            .vacm(|vacm| {
+                vacm.access(
+                    "group",
+                    SecurityModel::V2c,
+                    SecurityLevel::NoAuthNoPriv,
+                    |entry| entry.read_view("first"),
+                )
+                .access(
+                    "group",
+                    SecurityModel::V2c,
+                    SecurityLevel::NoAuthNoPriv,
+                    |entry| entry.context_match_prefix().read_view("duplicate"),
+                )
+            })
+            .build()
+            .await;
+        let error = result.err().expect("duplicate access row must fail");
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("duplicate VACM access entry")
+        ));
     }
 
     #[tokio::test]

@@ -472,6 +472,58 @@ fn security_model_canonical_paths_remain_available() {
 
 #[cfg(feature = "agent")]
 #[test]
+fn vacm_duplicate_and_replacement_apis_are_public() {
+    use async_snmp::agent::vacm::AccessEntryBuilder;
+    use async_snmp::{SecurityLevel, SecurityModel, VacmBuilder, VacmConfig};
+
+    let direct_first =
+        AccessEntryBuilder::new("group", SecurityModel::Usm, SecurityLevel::AuthNoPriv)
+            .read_view("first")
+            .build();
+    let direct_replacement =
+        AccessEntryBuilder::new("group", SecurityModel::Usm, SecurityLevel::AuthNoPriv)
+            .read_view("replacement")
+            .build();
+    let mut direct = VacmConfig::new();
+    direct.add_access(direct_first).unwrap();
+    assert!(direct.replace_access(direct_replacement).is_some());
+
+    let duplicate: async_snmp::DuplicateVacmAccessEntry = VacmBuilder::new()
+        .access(
+            "group",
+            SecurityModel::Usm,
+            SecurityLevel::AuthNoPriv,
+            |entry| entry.read_view("first"),
+        )
+        .access(
+            "group",
+            SecurityModel::Usm,
+            SecurityLevel::AuthNoPriv,
+            |entry| entry.read_view("duplicate"),
+        )
+        .build()
+        .unwrap_err();
+    let _: &async_snmp::VacmAccessIndex = duplicate.index();
+
+    VacmBuilder::new()
+        .access(
+            "group",
+            SecurityModel::Usm,
+            SecurityLevel::AuthNoPriv,
+            |entry| entry.read_view("first"),
+        )
+        .replace_access(
+            "group",
+            SecurityModel::Usm,
+            SecurityLevel::AuthNoPriv,
+            |entry| entry.read_view("replacement"),
+        )
+        .build()
+        .unwrap();
+}
+
+#[cfg(feature = "agent")]
+#[test]
 fn notification_sink_identity_types_are_public() {
     let id = NotificationSinkId::from("primary");
     assert_eq!(id.as_str(), "primary");

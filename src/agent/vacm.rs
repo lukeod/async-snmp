@@ -40,7 +40,7 @@
 //!         |a| a.read_view("full_view"))
 //!     // Define what OIDs are in full_view
 //!     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
-//!     .build();
+//!     .build().unwrap();
 //! # }
 //! ```
 //!
@@ -83,7 +83,7 @@
 //!         .include(oid!(1, 3, 6, 1)))           // everything
 //!     .view("if_admin_view", |v| v
 //!         .include(oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 7)))  // ifAdminStatus
-//!     .build();
+//!     .build().unwrap();
 //! # }
 //! ```
 //!
@@ -164,6 +164,7 @@
 //! - **SNMPv2c/v3 SET**: Returns `noAccess` error
 
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::fmt;
 
 use bytes::Bytes;
@@ -277,8 +278,8 @@ impl View {
 
     /// Add an included subtree to the view.
     ///
-    /// All OIDs starting with `oid` will be included unless a longer matching
-    /// subtree excludes them, or an equally long matching subtree is excluded.
+    /// All OIDs starting with `oid` will be included unless the RFC 3415
+    /// precedence rules select another matching family.
     ///
     /// # Example
     ///
@@ -336,8 +337,9 @@ impl View {
 
     /// Add an excluded subtree to the view.
     ///
-    /// OIDs starting with `oid` will be excluded, even if they match
-    /// an included subtree. Exclusions take precedence.
+    /// This family excludes matching OIDs when RFC 3415 precedence selects it:
+    /// the matching family with the most sub-identifiers wins, followed by the
+    /// lexicographically greatest subtree OID when lengths are equal.
     ///
     /// # Example
     ///
@@ -377,10 +379,10 @@ impl View {
 
     /// Check if an OID is in this view.
     ///
-    /// Per RFC 3415 Section 5, matching applies each subtree's mask and the
+    /// Per RFC 3415 Section 4, matching applies each subtree's mask and the
     /// match with the most sub-identifiers determines inclusion/exclusion. If
-    /// equally long masked entries match and disagree, exclusion wins. The
-    /// result does not depend on the order subtrees were added.
+    /// equally long masked entries match, the lexicographically greatest
+    /// subtree OID decides. The result does not depend on insertion order.
     ///
     /// # Example
     ///
@@ -424,7 +426,8 @@ impl View {
     /// - [`ViewCheckResult::Ambiguous`]: Mixed permissions, check each OID individually
     #[must_use]
     pub fn check_subtree(&self, oid: &Oid) -> ViewCheckResult {
-        // Find the longest masked covering match; exclusion wins a tie.
+        // Find the longest masked covering match; the lexicographically
+        // greatest subtree OID wins a length tie.
         let mut best_covering: Option<(&[u32], bool)> = None;
         let mut has_child_include = false;
         let mut has_child_exclude = false;
@@ -479,14 +482,19 @@ impl View {
 
 /// RFC 3415 precedence for overlapping masked MIB-view subtree matches.
 ///
-/// More sub-identifiers wins. At equal lengths, an exclusion replaces an
-/// inclusion; another inclusion or exclusion cannot change the result.
+/// More sub-identifiers wins. At equal lengths, the lexicographically greatest
+/// subtree OID wins. Identical invalid duplicate indices resolve to exclusion.
 fn view_match_wins(best: Option<(&[u32], bool)>, arcs: &[u32], included: bool) -> bool {
     match best {
         None => true,
         Some((best_arcs, best_included)) => {
             arcs.len() > best_arcs.len()
-                || (arcs.len() == best_arcs.len() && best_included && !included)
+                || (arcs.len() == best_arcs.len()
+                    && (arcs > best_arcs
+                        // Duplicate subtree indices are not valid VACM rows,
+                        // but resolve them conservatively and independently
+                        // of insertion order if a View is manually assembled.
+                        || (arcs == best_arcs && best_included && !included)))
         }
     }
 }
@@ -569,6 +577,57 @@ pub struct VacmAccessEntry {
     pub notify_view: Bytes,
 }
 
+impl VacmAccessEntry {
+    /// Return the RFC 3415 `vacmAccessEntry` row index for this entry.
+    #[must_use]
+    pub fn index(&self) -> VacmAccessIndex {
+        VacmAccessIndex {
+            group_name: self.group_name.clone(),
+            context_prefix: self.context_prefix.clone(),
+            security_model: self.security_model,
+            security_level: self.security_level,
+        }
+    }
+}
+
+/// RFC 3415 `vacmAccessEntry` row index.
+///
+/// `context_match` and the view names are mutable columns of the conceptual
+/// row and are therefore deliberately absent from this key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VacmAccessIndex {
+    /// Group name component of the row index.
+    pub group_name: Bytes,
+    /// Context prefix component of the row index.
+    pub context_prefix: Bytes,
+    /// Security model component of the row index.
+    pub security_model: VacmSecurityModel,
+    /// Security level component of the row index.
+    pub security_level: SecurityLevel,
+}
+
+/// Error returned when an access row is added at an occupied row index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateVacmAccessEntry {
+    index: VacmAccessIndex,
+}
+
+impl DuplicateVacmAccessEntry {
+    /// Return the duplicate row index.
+    #[must_use]
+    pub fn index(&self) -> &VacmAccessIndex {
+        &self.index
+    }
+}
+
+impl fmt::Display for DuplicateVacmAccessEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "duplicate VACM access entry at index {:?}", self.index)
+    }
+}
+
+impl StdError for DuplicateVacmAccessEntry {}
+
 /// Builder for access entries.
 ///
 /// Configure what views a group can access for different operations.
@@ -590,7 +649,7 @@ pub struct VacmAccessEntry {
 ///     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
 ///     .view("config_view", |v| v.include(oid!(1, 3, 6, 1, 4, 1)))
 ///     .view("trap_view", |v| v.include(oid!(1, 3, 6, 1)))
-///     .build();
+///     .build().unwrap();
 /// ```
 pub struct AccessEntryBuilder {
     group_name: Bytes,
@@ -629,41 +688,6 @@ impl AccessEntryBuilder {
     #[must_use]
     pub fn context_prefix(mut self, prefix: impl Into<Bytes>) -> Self {
         self.context_prefix = prefix.into();
-        self
-    }
-
-    /// Set the security model this entry applies to.
-    ///
-    /// The builder constructor requires an explicit initial model.
-    #[must_use]
-    pub fn security_model(mut self, model: impl Into<VacmSecurityModel>) -> Self {
-        self.security_model = model.into();
-        self
-    }
-
-    /// Set the minimum security level required.
-    ///
-    /// Requests with lower security levels will be denied access.
-    /// The builder constructor requires an explicit initial level.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::agent::{SecurityModel, VacmBuilder};
-    /// use async_snmp::message::SecurityLevel;
-    /// use async_snmp::oid;
-    ///
-    /// let vacm = VacmBuilder::new()
-    ///     .group("admin", SecurityModel::Usm, "secure_group")
-    ///     .access("secure_group", SecurityModel::Usm, SecurityLevel::AuthPriv, |a| a
-    ///         // Require authentication and encryption
-    ///         .read_view("full_view"))
-    ///     .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
-    ///     .build();
-    /// ```
-    #[must_use]
-    pub fn security_level(mut self, level: SecurityLevel) -> Self {
-        self.security_level = level;
         self
     }
 
@@ -728,8 +752,8 @@ impl AccessEntryBuilder {
 pub struct VacmConfig {
     /// (securityModel selector, securityName) → groupName
     security_to_group: HashMap<(VacmSecurityModel, Bytes), Bytes>,
-    /// Access table entries.
-    access_entries: Vec<VacmAccessEntry>,
+    /// RFC 3415 row index → access table entry.
+    access_entries: HashMap<VacmAccessIndex, VacmAccessEntry>,
     /// viewName → View
     views: HashMap<Bytes, View>,
 }
@@ -802,9 +826,24 @@ impl VacmConfig {
         );
     }
 
-    /// Add an access entry.
-    pub fn add_access(&mut self, entry: VacmAccessEntry) {
-        self.access_entries.push(entry);
+    /// Add an access entry, preserving the existing row on an index collision.
+    ///
+    /// Use [`replace_access`](Self::replace_access) when replacement is
+    /// intentional.
+    pub fn add_access(&mut self, entry: VacmAccessEntry) -> Result<(), DuplicateVacmAccessEntry> {
+        let index = entry.index();
+        if self.access_entries.contains_key(&index) {
+            return Err(DuplicateVacmAccessEntry { index });
+        }
+        self.access_entries.insert(index, entry);
+        Ok(())
+    }
+
+    /// Insert an access entry or explicitly replace the row at the same index.
+    ///
+    /// Returns the replaced row, if the index was already occupied.
+    pub fn replace_access(&mut self, entry: VacmAccessEntry) -> Option<VacmAccessEntry> {
+        self.access_entries.insert(entry.index(), entry)
     }
 
     /// Add a view.
@@ -841,7 +880,7 @@ impl VacmConfig {
     /// Returns the best matching entry per RFC 3415 Section 4 (vacmAccessTable DESCRIPTION).
     /// Selection uses a 4-tier preference order:
     /// 1. Prefer specific securityModel over Any
-    /// 2. Prefer exact contextMatch over prefix
+    /// 2. Prefer a contextPrefix identical to the request contextName
     /// 3. Prefer longer contextPrefix
     /// 4. Prefer higher securityLevel
     #[must_use]
@@ -853,7 +892,7 @@ impl VacmConfig {
         level: SecurityLevel,
     ) -> Option<&VacmAccessEntry> {
         self.access_entries
-            .iter()
+            .values()
             .filter(|e| {
                 e.group_name.as_ref() == group
                     && self.context_matches(&e.context_prefix, context, e.context_match)
@@ -863,7 +902,7 @@ impl VacmConfig {
             .max_by_key(|e| {
                 // RFC 3415 Section 4 preference order (tuple comparison is lexicographic)
                 let model_score: u8 = u8::from(e.security_model.is_exact(model));
-                let match_score: u8 = u8::from(e.context_match == ContextMatch::Exact);
+                let match_score: u8 = u8::from(e.context_prefix.as_ref() == context);
                 let prefix_len = e.context_prefix.len();
                 let level_score = e.security_level as u8;
                 (model_score, match_score, prefix_len, level_score)
@@ -933,10 +972,11 @@ impl VacmConfig {
 ///         .include(oid!(1, 3, 6, 1)))
 ///
 ///     // Step 4: Build
-///     .build();
+///     .build().unwrap();
 /// ```
 pub struct VacmBuilder {
     config: VacmConfig,
+    duplicate_access_entries: Vec<VacmAccessIndex>,
 }
 
 impl VacmBuilder {
@@ -945,6 +985,7 @@ impl VacmBuilder {
     pub fn new() -> Self {
         Self {
             config: VacmConfig::new(),
+            duplicate_access_entries: Vec::new(),
         }
     }
 
@@ -969,7 +1010,7 @@ impl VacmBuilder {
     ///     .group("monitor", SecurityModel::V2c, "readonly")
     ///     // Different users in different groups
     ///     .group("admin", SecurityModel::Usm, "admin_group")
-    ///     .build();
+    ///     .build().unwrap();
     /// ```
     #[must_use]
     pub fn group(
@@ -1002,7 +1043,7 @@ impl VacmBuilder {
     ///         // No write_view = read-only
     ///     )
     ///     .view("system_view", |v| v.include(oid!(1, 3, 6, 1, 2, 1, 1)))
-    ///     .build();
+    ///     .build().unwrap();
     /// ```
     #[must_use]
     pub fn access<F>(
@@ -1017,7 +1058,38 @@ impl VacmBuilder {
     {
         let builder = AccessEntryBuilder::new(group_name, security_model, security_level);
         let entry = configure(builder).build();
-        self.config.add_access(entry);
+        if let Err(error) = self.config.add_access(entry) {
+            self.duplicate_access_entries.push(error.index);
+        }
+        self
+    }
+
+    /// Insert an access entry or explicitly replace the row at the same index.
+    ///
+    /// This has the same row-building API as [`access`](Self::access), but its
+    /// name makes replacement intentional. A replacement also resolves a
+    /// previous duplicate for that row in this builder.
+    #[must_use]
+    pub fn replace_access<F>(
+        mut self,
+        group_name: impl Into<Bytes>,
+        security_model: impl Into<VacmSecurityModel>,
+        security_level: SecurityLevel,
+        configure: F,
+    ) -> Self
+    where
+        F: FnOnce(AccessEntryBuilder) -> AccessEntryBuilder,
+    {
+        let entry = configure(AccessEntryBuilder::new(
+            group_name,
+            security_model,
+            security_level,
+        ))
+        .build();
+        let index = entry.index();
+        self.duplicate_access_entries
+            .retain(|duplicate| duplicate != &index);
+        self.config.replace_access(entry);
         self
     }
 
@@ -1038,7 +1110,7 @@ impl VacmBuilder {
     ///     .view("all_except_private", |v| v
     ///         .include(oid!(1, 3, 6, 1))
     ///         .exclude(oid!(1, 3, 6, 1, 4, 1, 99999)))  // exclude our enterprise
-    ///     .build();
+    ///     .build().unwrap();
     /// ```
     #[must_use]
     pub fn view<F>(mut self, name: impl Into<Bytes>, configure: F) -> Self
@@ -1051,9 +1123,11 @@ impl VacmBuilder {
     }
 
     /// Build the VACM configuration.
-    #[must_use]
-    pub fn build(self) -> VacmConfig {
-        self.config
+    pub fn build(self) -> Result<VacmConfig, DuplicateVacmAccessEntry> {
+        if let Some(index) = self.duplicate_access_entries.into_iter().next() {
+            return Err(DuplicateVacmAccessEntry { index });
+        }
+        Ok(self.config)
     }
 }
 
@@ -1067,6 +1141,26 @@ impl Default for VacmBuilder {
 mod tests {
     use super::*;
     use crate::oid;
+    use proptest::prelude::*;
+
+    fn access_entry(
+        context_prefix: &'static [u8],
+        security_model: VacmSecurityModel,
+        security_level: SecurityLevel,
+        context_match: ContextMatch,
+        read_view: &'static [u8],
+    ) -> VacmAccessEntry {
+        VacmAccessEntry {
+            group_name: Bytes::from_static(b"test_group"),
+            context_prefix: Bytes::from_static(context_prefix),
+            security_model,
+            security_level,
+            context_match,
+            read_view: Bytes::from_static(read_view),
+            write_view: Bytes::new(),
+            notify_view: Bytes::new(),
+        }
+    }
 
     #[test]
     fn test_view_contains_simple() {
@@ -1101,7 +1195,7 @@ mod tests {
 
     #[test]
     fn test_view_longest_match_wins() {
-        // RFC 3415 Section 5: when multiple subtrees match, longest match wins.
+        // RFC 3415 Section 4: when multiple subtrees match, longest match wins.
         // include(1.3.6.1) + exclude(1.3.6.1.2) + include(1.3.6.1.2.1)
         // For OID 1.3.6.1.2.1.1.0, all three match. Longest is include(1.3.6.1.2.1),
         // so the OID should be accessible.
@@ -1132,9 +1226,9 @@ mod tests {
     }
 
     #[test]
-    fn test_view_equal_length_exclude_wins() {
-        // When include and exclude have equal match length, exclude should win
-        // (conservative interpretation: deny beats allow at same specificity)
+    fn test_view_identical_oid_collision_resolves_to_exclusion() {
+        // Identical subtree OIDs cannot coexist in a valid VACM table. A View
+        // assembled with that collision resolves conservatively to exclusion.
         let view = View::new()
             .include(oid!(1, 3, 6, 1, 2, 1))
             .exclude(oid!(1, 3, 6, 1, 2, 1));
@@ -1144,9 +1238,9 @@ mod tests {
 
     #[test]
     fn test_view_equal_length_identical_oid_order_independent() {
-        // T4 gap: an include and an exclude on the *same* subtree OID form an
-        // index collision that cannot occur in a real vacmViewTreeFamilyTable.
-        // Both insertion orders must resolve identically (exclude wins).
+        // An include and an exclude on the same subtree OID form an index
+        // collision that cannot occur in a valid vacmViewTreeFamilyTable.
+        // The conservative exclusion fallback is independent of insertion order.
         let include_first = View::new()
             .include(oid!(1, 3, 6, 1, 2, 1))
             .exclude(oid!(1, 3, 6, 1, 2, 1));
@@ -1167,20 +1261,24 @@ mod tests {
     }
 
     #[test]
-    fn test_view_equal_length_masked_exclusion_wins() {
-        // Two different equal-length masked subtrees match the same query.
-        // Exclusion wins regardless of subtree lexicographic order or insertion
-        // order.
+    fn test_view_equal_length_masked_lexicographically_greatest_subtree_wins() {
+        // RFC 3415 Section 4: the lexicographically greatest subtree OID
+        // decides when equal-length masked rows both match.
         let query = oid!(1, 3, 6, 1, 2, 1, 5, 5);
         let mask = vec![0xFE]; // arcs 0-6 exact, arc 7 wildcard
 
-        for view in [
+        for excluded_high in [
             View::new()
                 .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone())
                 .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone()),
             View::new()
                 .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone())
                 .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone()),
+        ] {
+            assert!(!excluded_high.contains(&query));
+        }
+
+        for included_high in [
             View::new()
                 .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone())
                 .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone()),
@@ -1188,14 +1286,14 @@ mod tests {
                 .include_masked(oid!(1, 3, 6, 1, 2, 1, 5, 9), mask.clone())
                 .exclude_masked(oid!(1, 3, 6, 1, 2, 1, 5, 1), mask.clone()),
         ] {
-            assert!(!view.contains(&query));
+            assert!(included_high.contains(&query));
         }
     }
 
     #[test]
     fn test_check_subtree_equal_length_tie_break_order_independent() {
-        // Same equal-length masked scenario as the contains tie test. Exclusion
-        // covers the query regardless of insertion order.
+        // Same equal-length masked scenario as the contains tie test. The
+        // lexicographically greatest subtree excludes regardless of insertion.
         let query = oid!(1, 3, 6, 1, 2, 1, 5, 5);
         let mask = vec![0xFE];
 
@@ -1271,16 +1369,18 @@ mod tests {
     #[test]
     fn test_vacm_access_lookup() {
         let mut config = VacmConfig::new();
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"readonly_group"),
-            context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"full_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"readonly_group"),
+                context_prefix: Bytes::new(),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"full_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         let access = config.get_access(
             b"readonly_group",
@@ -1295,16 +1395,18 @@ mod tests {
     #[test]
     fn test_vacm_access_security_level() {
         let mut config = VacmConfig::new();
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"admin_group"),
-            context_prefix: Bytes::new(),
-            security_model: SecurityModel::Usm.into(),
-            security_level: SecurityLevel::AuthPriv, // Require encryption
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"full_view"),
-            write_view: Bytes::from_static(b"full_view"),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"admin_group"),
+                context_prefix: Bytes::new(),
+                security_model: SecurityModel::Usm.into(),
+                security_level: SecurityLevel::AuthPriv, // Require encryption
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"full_view"),
+                write_view: Bytes::from_static(b"full_view"),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Should not match with lower security level
         let access = config.get_access(
@@ -1366,10 +1468,164 @@ mod tests {
                 |a| a.read_view("full_view").write_view("full_view"),
             )
             .view("full_view", |v| v.include(oid!(1, 3, 6, 1)))
-            .build();
+            .build()
+            .unwrap();
 
         assert!(config.get_group(SecurityModel::V2c, b"public").is_some());
         assert!(config.get_group(SecurityModel::Usm, b"admin").is_some());
+    }
+
+    #[test]
+    fn duplicate_access_row_is_rejected_and_preserves_existing_entry() {
+        let mut config = VacmConfig::new();
+        let first = access_entry(
+            b"ctx",
+            SecurityModel::Usm.into(),
+            SecurityLevel::AuthNoPriv,
+            ContextMatch::Exact,
+            b"first",
+        );
+        let duplicate = access_entry(
+            b"ctx",
+            SecurityModel::Usm.into(),
+            SecurityLevel::AuthNoPriv,
+            ContextMatch::Prefix,
+            b"duplicate",
+        );
+
+        config.add_access(first).unwrap();
+        let error = config.add_access(duplicate).unwrap_err();
+        assert_eq!(error.index().group_name.as_ref(), b"test_group");
+        assert_eq!(error.index().context_prefix.as_ref(), b"ctx");
+        assert_eq!(error.index().security_model, SecurityModel::Usm.into());
+        assert_eq!(error.index().security_level, SecurityLevel::AuthNoPriv);
+        assert_eq!(
+            config
+                .get_access(
+                    b"test_group",
+                    b"ctx",
+                    SecurityModel::Usm,
+                    SecurityLevel::AuthNoPriv,
+                )
+                .unwrap()
+                .read_view
+                .as_ref(),
+            b"first"
+        );
+    }
+
+    #[test]
+    fn explicit_access_replacement_is_deterministic() {
+        let mut config = VacmConfig::new();
+        let first = access_entry(
+            b"ctx",
+            SecurityModel::Usm.into(),
+            SecurityLevel::AuthNoPriv,
+            ContextMatch::Exact,
+            b"first",
+        );
+        let replacement = access_entry(
+            b"ctx",
+            SecurityModel::Usm.into(),
+            SecurityLevel::AuthNoPriv,
+            ContextMatch::Prefix,
+            b"replacement",
+        );
+
+        assert!(config.replace_access(first).is_none());
+        let replaced = config.replace_access(replacement).unwrap();
+        assert_eq!(replaced.read_view.as_ref(), b"first");
+        let selected = config
+            .get_access(
+                b"test_group",
+                b"ctx/child",
+                SecurityModel::Usm,
+                SecurityLevel::AuthNoPriv,
+            )
+            .unwrap();
+        assert_eq!(selected.read_view.as_ref(), b"replacement");
+        assert_eq!(selected.context_match, ContextMatch::Prefix);
+    }
+
+    #[test]
+    fn builder_rejects_duplicates_unless_replacement_is_explicit() {
+        let duplicate = VacmBuilder::new()
+            .access(
+                "test_group",
+                SecurityModel::Usm,
+                SecurityLevel::AuthNoPriv,
+                |entry| entry.context_prefix("ctx").read_view("first"),
+            )
+            .access(
+                "test_group",
+                SecurityModel::Usm,
+                SecurityLevel::AuthNoPriv,
+                |entry| {
+                    entry
+                        .context_prefix("ctx")
+                        .context_match_prefix()
+                        .read_view("duplicate")
+                },
+            )
+            .build()
+            .unwrap_err();
+        assert_eq!(duplicate.index().context_prefix.as_ref(), b"ctx");
+
+        let config = VacmBuilder::new()
+            .access(
+                "test_group",
+                SecurityModel::Usm,
+                SecurityLevel::AuthNoPriv,
+                |entry| entry.context_prefix("ctx").read_view("first"),
+            )
+            .replace_access(
+                "test_group",
+                SecurityModel::Usm,
+                SecurityLevel::AuthNoPriv,
+                |entry| {
+                    entry
+                        .context_prefix("ctx")
+                        .context_match_prefix()
+                        .read_view("replacement")
+                },
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            config
+                .get_access(
+                    b"test_group",
+                    b"ctx/child",
+                    SecurityModel::Usm,
+                    SecurityLevel::AuthNoPriv,
+                )
+                .unwrap()
+                .read_view
+                .as_ref(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn absent_group_and_view_references_remain_valid_configuration() {
+        let config = VacmBuilder::new()
+            .access(
+                "unmapped_group",
+                SecurityModel::Usm,
+                SecurityLevel::NoAuthNoPriv,
+                |entry| entry.read_view("undefined_view"),
+            )
+            .build()
+            .unwrap();
+        let access = config
+            .get_access(
+                b"unmapped_group",
+                b"",
+                SecurityModel::Usm,
+                SecurityLevel::NoAuthNoPriv,
+            )
+            .unwrap();
+        assert!(!config.check_access(Some(&access.read_view), &oid!(1, 3, 6, 1)));
     }
 
     #[test]
@@ -1390,7 +1646,8 @@ mod tests {
             )
             .view("read", |view| view.include(oid!(1, 3, 6)))
             .view("write", |view| view.include(oid!(1, 3, 6, 1, 4, 1)))
-            .build();
+            .build()
+            .unwrap();
         let group = config.get_group(SecurityModel::Usm, b"operator").unwrap();
 
         assert!(
@@ -1413,7 +1670,7 @@ mod tests {
     // RFC 3415 Section 4 preference order tests
     // The vacmAccessTable DESCRIPTION specifies a 4-tier preference order:
     // 1. Prefer specific securityModel over Any
-    // 2. Prefer exact contextMatch over prefix
+    // 2. Prefer a contextPrefix identical to the request contextName
     // 3. Prefer longer contextPrefix
     // 4. Prefer higher securityLevel
 
@@ -1423,28 +1680,32 @@ mod tests {
         let mut config = VacmConfig::new();
 
         // Add entry with Any security model
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"any_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::new(),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"any_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Add entry with specific V2c security model
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::new(),
-            security_model: SecurityModel::V2c.into(),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"v2c_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::new(),
+                security_model: SecurityModel::V2c.into(),
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"v2c_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Query with V2c - should get the specific V2c entry
         let access = config
@@ -1474,47 +1735,51 @@ mod tests {
     }
 
     #[test]
-    fn test_vacm_access_prefers_exact_context_match_over_prefix() {
-        // Tier 2: Exact contextMatch should be preferred over prefix match
+    fn test_vacm_access_prefers_identical_context_prefix() {
+        // Tier 2: a contextPrefix identical to contextName is preferred even
+        // when the row's contextMatch column is Prefix.
         let mut config = VacmConfig::new();
 
-        // Add entry with prefix context match
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"prefix_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        // A shorter prefix requires a higher security level.
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"c"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::AuthPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"short_high_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
-        // Add entry with exact context match (same prefix)
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"exact_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        // Prefix mode still has an identical contextPrefix for context "ctx".
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"ctx"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"identical_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
-        // Query with exact context "ctx" - should get the exact match entry
         let access = config
             .get_access(
                 b"test_group",
                 b"ctx",
                 SecurityModel::V2c,
-                SecurityLevel::NoAuthNoPriv,
+                SecurityLevel::AuthPriv,
             )
             .expect("should find access entry");
         assert_eq!(
             access.read_view,
-            Bytes::from_static(b"exact_view"),
-            "should prefer exact context match over prefix"
+            Bytes::from_static(b"identical_view"),
+            "an identical contextPrefix has RFC preference"
         );
     }
 
@@ -1524,28 +1789,32 @@ mod tests {
         let mut config = VacmConfig::new();
 
         // Add entry with shorter context prefix
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"short_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"ctx"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"short_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Add entry with longer context prefix
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx_longer"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"long_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"ctx_longer"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"long_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Query with context that matches both - should get the longer prefix
         let access = config
@@ -1569,40 +1838,46 @@ mod tests {
         let mut config = VacmConfig::new();
 
         // Add entry with NoAuthNoPriv
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"noauth_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::new(),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"noauth_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Add entry with AuthNoPriv
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::AuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"auth_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::new(),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::AuthNoPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"auth_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Add entry with AuthPriv
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::AuthPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"authpriv_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::new(),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::AuthPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"authpriv_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         for (level, expected_view) in [
             (SecurityLevel::NoAuthNoPriv, b"noauth_view".as_slice()),
@@ -1623,29 +1898,33 @@ mod tests {
         let mut config = VacmConfig::new();
 
         // Entry: Any model, prefix match, short prefix, high security
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::AuthPriv, // highest security
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"any_prefix_short_high"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"ctx"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::AuthPriv, // highest security
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"any_prefix_short_high"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Entry: Specific model, prefix match, short prefix, low security
         // Tier 1 (specific model) should beat tier 4 (high security)
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
-            security_model: SecurityModel::V2c.into(),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"v2c_prefix_short_low"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"ctx"),
+                security_model: SecurityModel::V2c.into(),
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"v2c_prefix_short_low"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Query - specific model (V2c) should win over Any even though Any has higher security
         let access = config
@@ -1664,78 +1943,37 @@ mod tests {
     }
 
     #[test]
-    fn test_vacm_access_preference_context_match_over_prefix_length() {
-        // Tier 2 (exact match) should beat tier 3 (longer prefix)
-        let mut config = VacmConfig::new();
-
-        // Entry: prefix match with longer prefix
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"context"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"long_prefix_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
-
-        // Entry: exact match with shorter prefix
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"short_exact_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
-
-        // Query with "ctx" - exact match should win even though it's shorter
-        let access = config
-            .get_access(
-                b"test_group",
-                b"ctx",
-                SecurityModel::V2c,
-                SecurityLevel::NoAuthNoPriv,
-            )
-            .expect("should find access entry");
-        assert_eq!(
-            access.read_view,
-            Bytes::from_static(b"short_exact_view"),
-            "tier 2 (exact match) should take precedence over tier 3 (longer prefix)"
-        );
-    }
-
-    #[test]
     fn test_vacm_access_preference_prefix_length_over_security() {
         // Tier 3 (longer prefix) should beat tier 4 (higher security)
         let mut config = VacmConfig::new();
 
         // Entry: short prefix with high security
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::AuthPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"short_high_sec"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"ctx"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::AuthPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"short_high_sec"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Entry: longer prefix with low security
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx_test"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"long_low_sec"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"ctx_test"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"long_low_sec"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Query - longer prefix should win even though short prefix has higher security
         let access = config
@@ -1759,28 +1997,32 @@ mod tests {
         let mut config = VacmConfig::new();
 
         // Entry 1: Any, prefix, short, NoAuth
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"a"),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Prefix,
-            read_view: Bytes::from_static(b"entry1"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"a"),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Prefix,
+                read_view: Bytes::from_static(b"entry1"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         // Entry 2: V2c (specific), exact, short, NoAuth - should win for "a" context
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"a"),
-            security_model: SecurityModel::V2c.into(),
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"entry2"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::from_static(b"a"),
+                security_model: SecurityModel::V2c.into(),
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"entry2"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         let access = config
             .get_access(
@@ -1799,11 +2041,8 @@ mod tests {
 
     // Tests that verify preference ordering is independent of insertion order
     #[test]
-    fn test_vacm_access_exact_wins_regardless_of_insertion_order() {
-        // Add exact first, prefix second - exact should still win
-        let mut config = VacmConfig::new();
-
-        config.add_access(VacmAccessEntry {
+    fn test_vacm_access_context_modes_and_selection_are_insertion_independent() {
+        let exact = VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
             context_prefix: Bytes::from_static(b"ctx"),
             security_model: VacmSecurityModel::Any,
@@ -1812,32 +2051,54 @@ mod tests {
             read_view: Bytes::from_static(b"exact_view"),
             write_view: Bytes::new(),
             notify_view: Bytes::new(),
-        });
-
-        config.add_access(VacmAccessEntry {
+        };
+        let prefix = VacmAccessEntry {
             group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::from_static(b"ctx"),
+            context_prefix: Bytes::from_static(b"ctx/"),
             security_model: VacmSecurityModel::Any,
             security_level: SecurityLevel::NoAuthNoPriv,
             context_match: ContextMatch::Prefix,
             read_view: Bytes::from_static(b"prefix_view"),
             write_view: Bytes::new(),
             notify_view: Bytes::new(),
-        });
+        };
 
-        let access = config
-            .get_access(
-                b"test_group",
-                b"ctx",
-                SecurityModel::V2c,
-                SecurityLevel::NoAuthNoPriv,
-            )
-            .expect("should find access entry");
-        assert_eq!(
-            access.read_view,
-            Bytes::from_static(b"exact_view"),
-            "exact match should win regardless of insertion order"
-        );
+        for rows in [
+            [exact.clone(), prefix.clone()],
+            [prefix.clone(), exact.clone()],
+        ] {
+            let mut config = VacmConfig::new();
+            for row in rows {
+                config.add_access(row).unwrap();
+            }
+
+            assert_eq!(
+                config
+                    .get_access(
+                        b"test_group",
+                        b"ctx",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                    )
+                    .unwrap()
+                    .read_view
+                    .as_ref(),
+                b"exact_view"
+            );
+            assert_eq!(
+                config
+                    .get_access(
+                        b"test_group",
+                        b"ctx/child",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                    )
+                    .unwrap()
+                    .read_view
+                    .as_ref(),
+                b"prefix_view"
+            );
+        }
     }
 
     #[test]
@@ -1845,27 +2106,31 @@ mod tests {
         // Add higher security first, lower second - higher should still win
         let mut config = VacmConfig::new();
 
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::AuthPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"authpriv_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::new(),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::AuthPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"authpriv_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
-        config.add_access(VacmAccessEntry {
-            group_name: Bytes::from_static(b"test_group"),
-            context_prefix: Bytes::new(),
-            security_model: VacmSecurityModel::Any,
-            security_level: SecurityLevel::NoAuthNoPriv,
-            context_match: ContextMatch::Exact,
-            read_view: Bytes::from_static(b"noauth_view"),
-            write_view: Bytes::new(),
-            notify_view: Bytes::new(),
-        });
+        config
+            .add_access(VacmAccessEntry {
+                group_name: Bytes::from_static(b"test_group"),
+                context_prefix: Bytes::new(),
+                security_model: VacmSecurityModel::Any,
+                security_level: SecurityLevel::NoAuthNoPriv,
+                context_match: ContextMatch::Exact,
+                read_view: Bytes::from_static(b"noauth_view"),
+                write_view: Bytes::new(),
+                notify_view: Bytes::new(),
+            })
+            .unwrap();
 
         let access = config
             .get_access(
@@ -1920,7 +2185,7 @@ mod tests {
 
     #[test]
     fn test_check_subtree_oid_within_excluded_subtree() {
-        // OID within an excluded subtree (after include) is excluded
+        // The longer excluded family determines access within its subtree.
         let view = View::new()
             .include(oid!(1, 3, 6, 1, 2, 1))
             .exclude(oid!(1, 3, 6, 1, 2, 1, 1, 7));
@@ -2046,10 +2311,7 @@ mod tests {
 
     #[test]
     fn test_check_subtree_exclude_only_is_excluded() {
-        // An exclude without a covering include excludes nothing
-        // (exclude only has effect when there's a matching include)
-        // Actually, per RFC 3415, an exclude without include means the OID
-        // is simply not in the view at all (excluded)
+        // Without a selected included family, no OID is in the view.
         let view = View::new().exclude(oid!(1, 3, 6, 1, 2, 1, 1, 7));
 
         // Everything is excluded because there's no include
@@ -2152,6 +2414,113 @@ mod tests {
                     // Ambiguous can be either, depending on specific OID
                 }
             }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn access_selection_is_independent_of_insertion_order(order_keys in any::<[u32; 4]>()) {
+            let rows = [
+                access_entry(
+                    b"c",
+                    VacmSecurityModel::Any,
+                    SecurityLevel::NoAuthNoPriv,
+                    ContextMatch::Prefix,
+                    b"any_short",
+                ),
+                access_entry(
+                    b"ctx",
+                    VacmSecurityModel::Any,
+                    SecurityLevel::NoAuthNoPriv,
+                    ContextMatch::Prefix,
+                    b"any_identical",
+                ),
+                access_entry(
+                    b"c",
+                    SecurityModel::V2c.into(),
+                    SecurityLevel::AuthPriv,
+                    ContextMatch::Prefix,
+                    b"exact_model_short_high",
+                ),
+                access_entry(
+                    b"ctx",
+                    SecurityModel::V2c.into(),
+                    SecurityLevel::AuthNoPriv,
+                    ContextMatch::Prefix,
+                    b"winner",
+                ),
+            ];
+            let mut order = [0, 1, 2, 3];
+            order.sort_by_key(|&index| (order_keys[index], index));
+
+            let mut config = VacmConfig::new();
+            for index in order {
+                config.add_access(rows[index].clone()).unwrap();
+            }
+
+            prop_assert_eq!(
+                config
+                    .get_access(
+                        b"test_group",
+                        b"ctx",
+                        SecurityModel::V2c,
+                        SecurityLevel::AuthPriv,
+                    )
+                    .unwrap()
+                    .read_view
+                    .as_ref(),
+                b"winner"
+            );
+        }
+
+        #[test]
+        fn equal_length_masked_view_uses_lexicographically_greatest_subtree(
+            first_arc in 0u32..=255,
+            second_arc in 0u32..=255,
+            query_arc in any::<u32>(),
+            first_included in any::<bool>(),
+            second_included in any::<bool>(),
+            reverse in any::<bool>(),
+        ) {
+            prop_assume!(first_arc != second_arc);
+            let first = Oid::new([1, 3, 6, 1, 2, 1, 5, first_arc]);
+            let second = Oid::new([1, 3, 6, 1, 2, 1, 5, second_arc]);
+            let query = Oid::new([1, 3, 6, 1, 2, 1, 5, query_arc]);
+            let add = |view: View, oid: Oid, included: bool| {
+                if included {
+                    view.include_masked(oid, vec![0xfe])
+                } else {
+                    view.exclude_masked(oid, vec![0xfe])
+                }
+            };
+            let view = if reverse {
+                add(
+                    add(View::new(), second, second_included),
+                    first,
+                    first_included,
+                )
+            } else {
+                add(
+                    add(View::new(), first, first_included),
+                    second,
+                    second_included,
+                )
+            };
+            let expected = if first_arc > second_arc {
+                first_included
+            } else {
+                second_included
+            };
+
+            prop_assert_eq!(view.contains(&query), expected);
+            prop_assert_eq!(
+                view.check_subtree(&query),
+                if expected {
+                    ViewCheckResult::Included
+                } else {
+                    ViewCheckResult::Excluded
+                }
+            );
         }
     }
 }

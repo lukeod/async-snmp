@@ -59,7 +59,7 @@ impl V3SecurityModel {
 ///
 /// The variants are ordered from least secure to most secure,
 /// supporting VACM-style level comparisons (e.g., `actual >= required`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SecurityLevel {
     /// No authentication, no privacy
     NoAuthNoPriv,

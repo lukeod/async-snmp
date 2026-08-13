@@ -587,9 +587,9 @@ pub mod mib_support;
 // Re-exports for convenience
 #[cfg(feature = "agent")]
 pub use agent::{
-    Agent, AgentBuilder, BuiltinMib, NotificationOutcome, NotificationSendStream,
-    NotificationSinkId, NotificationSinkSummary, SinkOutcome, SinkSkipReason, SinkStatus,
-    VacmBuilder, VacmConfig, VacmSecurityModel, View,
+    Agent, AgentBuilder, BuiltinMib, DuplicateVacmAccessEntry, NotificationOutcome,
+    NotificationSendStream, NotificationSinkId, NotificationSinkSummary, SinkOutcome,
+    SinkSkipReason, SinkStatus, VacmAccessIndex, VacmBuilder, VacmConfig, VacmSecurityModel, View,
 };
 pub use client::{
     Auth, BulkResponse, BulkWalk, BulkWalkWithMetadata, Client, ClientBuilder, ClientConfig,

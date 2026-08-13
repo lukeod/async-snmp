@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** VACM access rows are keyed by the RFC 3415
+  `(groupName, contextPrefix, securityModel, securityLevel)` index.
+  `VacmConfig::add_access` and `VacmBuilder::build` now reject duplicate rows;
+  `replace_access` provides explicit insert-or-replace semantics. Security
+  model and level are fixed when `AccessEntryBuilder` is constructed;
+  `VacmBuilder::access`/`replace_access` supply those values and the nested
+  setters are removed. Access selection now gives RFC preference to a context
+  prefix identical to the requested context name, independently of the row's
+  exact/prefix matching column.
 - **Breaking:** `ClientBuilder::new` now takes authentication only and contains
   protocol/client policy. `ClientBuilder::target` produces a
   `TargetClientBuilder` for built-in UDP/TCP construction, including target,
