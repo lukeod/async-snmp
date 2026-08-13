@@ -1064,124 +1064,6 @@ impl Pdu {
         .into_raw())
     }
 
-    /// Convert a v2 notification PDU to a v1 `TrapV1Pdu` (RFC 3584 Section 3.2).
-    ///
-    /// Extracts the v1 fields from the standard v2 notification varbind layout:
-    /// - sysUpTime.0 (first varbind) -> `time_stamp`
-    /// - snmpTrapOID.0 (second varbind) -> `generic_trap`, `specific_trap`, enterprise
-    /// - snmpTrapAddress.0 varbind (if present) -> `agent_addr`
-    /// - snmpTrapEnterprise.0 varbind (if present) -> enterprise (for standard traps)
-    ///
-    /// Per RFC 3584 Section 3.2: if any varbind is Counter64, the trap cannot be
-    /// represented in v1 and `None` is returned.
-    ///
-    /// The `default_addr` parameter provides the `agent_addr` when no
-    /// snmpTrapAddress.0 varbind is present (typically the local IP address,
-    /// or `[0,0,0,0]` if unknown).
-    ///
-    /// Returns `None` if:
-    /// - The PDU has fewer than 2 varbinds
-    /// - The first varbind is not `TimeTicks`
-    /// - The second varbind is not an OID
-    /// - Any varbind contains a Counter64 value
-    #[must_use]
-    pub fn to_v1_trap(&self, default_addr: [u8; 4]) -> Option<TrapV1Pdu> {
-        use crate::notification::oids;
-        use crate::value::Value;
-
-        if self.varbinds.len() < 2 {
-            return None;
-        }
-
-        // Verify OID names per RFC 3416 Section 4.2.6: the first two varbinds
-        // must be sysUpTime.0 and snmpTrapOID.0.
-        if self.varbinds[0].oid != oids::sys_uptime() {
-            return None;
-        }
-        if self.varbinds[1].oid != oids::snmp_trap_oid() {
-            return None;
-        }
-
-        let time_stamp = match &self.varbinds[0].value {
-            Value::TimeTicks(t) => *t,
-            _ => return None,
-        };
-
-        let Value::ObjectIdentifier(trap_oid) = &self.varbinds[1].value else {
-            return None;
-        };
-
-        // Check for Counter64 in any varbind (RFC 3584 Section 3.2, rule 6)
-        for vb in &self.varbinds {
-            if matches!(vb.value, Value::Counter64(_)) {
-                return None;
-            }
-        }
-
-        // Derive generic_trap, specific_trap, and enterprise from snmpTrapOID
-        let snmp_traps_prefix = oids::snmp_traps();
-        let (generic_trap, specific_trap, enterprise) = if trap_oid.starts_with(&snmp_traps_prefix)
-            && trap_oid.len() == snmp_traps_prefix.len() + 1
-            && (1..=6).contains(&trap_oid.arcs()[trap_oid.len() - 1])
-        {
-            // Standard trap: snmpTraps.{generic+1}
-            let last_arc = trap_oid.arcs()[trap_oid.len() - 1];
-            let generic = GenericTrap::from_i32((last_arc - 1) as i32);
-            // For standard traps, enterprise comes from snmpTrapEnterprise.0
-            // varbind if present, otherwise use snmpTraps
-            let enterprise_oid = oids::snmp_trap_enterprise();
-            let ent = self.varbinds[2..]
-                .iter()
-                .find(|vb| vb.oid == enterprise_oid)
-                .and_then(|vb| match &vb.value {
-                    Value::ObjectIdentifier(oid) => Some(oid.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| snmp_traps_prefix.clone());
-            (generic, 0, ent)
-        } else if trap_oid.len() >= 2 {
-            // Enterprise-specific trap. RFC 3584 Section 3.2:
-            // - If next-to-last sub-id is zero: enterprise = OID minus last 2 arcs
-            // - If next-to-last sub-id is non-zero: enterprise = OID minus last arc
-            let arcs = trap_oid.arcs();
-            let specific = i32::try_from(arcs[arcs.len() - 1]).ok()?;
-            let next_to_last = arcs[arcs.len() - 2];
-            let enterprise = if next_to_last == 0 {
-                Oid::from_slice(&arcs[..arcs.len() - 2])
-            } else {
-                Oid::from_slice(&arcs[..arcs.len() - 1])
-            };
-            (GenericTrap::EnterpriseSpecific, specific, enterprise)
-        } else {
-            return None;
-        };
-
-        // Extract agent_addr from snmpTrapAddress.0 varbind if present
-        let trap_address_oid = oids::snmp_trap_address();
-        let agent_addr = self.varbinds[2..]
-            .iter()
-            .find(|vb| vb.oid == trap_address_oid)
-            .and_then(|vb| match &vb.value {
-                Value::IpAddress(addr) => Some(*addr),
-                _ => None,
-            })
-            .unwrap_or(default_addr);
-
-        // RFC 3584 Section 3.2 rule (6): the SNMPv1 varbinds are the SNMPv2
-        // varbinds minus only the sysUpTime.0/snmpTrapOID.0 prefix;
-        // snmpTrapAddress.0 and snmpTrapEnterprise.0 are retained.
-        let varbinds: Vec<VarBind> = self.varbinds[2..].to_vec();
-
-        Some(TrapV1Pdu {
-            enterprise,
-            agent_addr,
-            generic_trap,
-            specific_trap,
-            time_stamp,
-            varbinds,
-        })
-    }
-
     /// Check if this is a notification PDU (Trap or Inform).
     #[must_use]
     pub fn is_notification(&self) -> bool {
@@ -1716,6 +1598,81 @@ impl NotificationPdu {
             Some(Value::ObjectIdentifier(oid)) => oid,
             _ => unreachable!("NotificationPdu always has an OBJECT IDENTIFIER prefix"),
         }
+    }
+
+    /// Convert this v2/v3 notification to a validated SNMPv1 Trap.
+    ///
+    /// Implements RFC 3584 Section 3.2. `default_addr` is used when the
+    /// notification has no `snmpTrapAddress.0` varbind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the notification contains a `Counter64`, its trap
+    /// OID cannot be represented by the v1 fields, or the derived enterprise
+    /// and copied varbinds do not form an encodable SNMPv1 Trap.
+    pub fn to_v1_trap(&self, default_addr: [u8; 4]) -> Result<TrapV1Notification> {
+        use crate::notification::oids;
+
+        if self
+            .pdu
+            .varbinds
+            .iter()
+            .any(|varbind| matches!(varbind.value, Value::Counter64(_)))
+        {
+            return Err(invalid_outbound(
+                "Counter64 notification values cannot be represented in SNMPv1",
+            ));
+        }
+
+        let trap_oid = self.trap_oid();
+        let snmp_traps_prefix = oids::snmp_traps();
+        let (generic_trap, specific_trap, enterprise) = if trap_oid.starts_with(&snmp_traps_prefix)
+            && trap_oid.len() == snmp_traps_prefix.len() + 1
+            && (1..=6).contains(&trap_oid.arcs()[trap_oid.len() - 1])
+        {
+            let last_arc = trap_oid.arcs()[trap_oid.len() - 1];
+            let enterprise = self.pdu.varbinds[2..]
+                .iter()
+                .find(|varbind| varbind.oid == oids::snmp_trap_enterprise())
+                .and_then(|varbind| match &varbind.value {
+                    Value::ObjectIdentifier(oid) => Some(oid.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| snmp_traps_prefix.clone());
+            (GenericTrap::from_i32((last_arc - 1) as i32), 0, enterprise)
+        } else if trap_oid.len() >= 2 {
+            let arcs = trap_oid.arcs();
+            let specific_trap = i32::try_from(arcs[arcs.len() - 1])
+                .map_err(|_| invalid_outbound("trap OID specific value exceeds Integer32"))?;
+            let enterprise = if arcs[arcs.len() - 2] == 0 {
+                Oid::from_slice(&arcs[..arcs.len() - 2])
+            } else {
+                Oid::from_slice(&arcs[..arcs.len() - 1])
+            };
+            (GenericTrap::EnterpriseSpecific, specific_trap, enterprise)
+        } else {
+            return Err(invalid_outbound(
+                "trap OID is too short for SNMPv1 conversion",
+            ));
+        };
+
+        let agent_addr = self.pdu.varbinds[2..]
+            .iter()
+            .find(|varbind| varbind.oid == oids::snmp_trap_address())
+            .and_then(|varbind| match varbind.value {
+                Value::IpAddress(address) => Some(address),
+                _ => None,
+            })
+            .unwrap_or(default_addr);
+
+        TrapV1Notification::new(
+            enterprise,
+            agent_addr,
+            generic_trap,
+            specific_trap,
+            self.uptime(),
+            self.pdu.varbinds[2..].to_vec(),
+        )
     }
 
     /// Return the decoded/raw representation used on the wire.
@@ -2309,6 +2266,12 @@ mod tests {
             normalize_negative_get_bulk_fields: false,
             ..CompatibilityPolicy::DEFAULT
         }
+    }
+
+    fn to_v1_trap(pdu: &Pdu, address: [u8; 4]) -> Result<TrapV1Pdu> {
+        Ok(NotificationPdu::try_from_raw(Version::V2c, pdu.clone())?
+            .to_v1_trap(address)?
+            .into_raw())
     }
 
     /// Test helper for encoding PDUs with arbitrary field values.
@@ -3496,7 +3459,7 @@ mod tests {
             )],
         );
 
-        let trap = pdu.to_v1_trap([10, 0, 0, 1]).unwrap();
+        let trap = to_v1_trap(&pdu, [10, 0, 0, 1]).unwrap();
 
         assert_eq!(trap.generic_trap, GenericTrap::LinkDown);
         assert_eq!(trap.specific_trap, 0);
@@ -3511,7 +3474,7 @@ mod tests {
     fn test_v2_to_v1_enterprise_specific_trap() {
         let pdu = Pdu::trap_v2(1, 100, &oid!(1, 3, 6, 1, 4, 1, 9999, 1, 2, 0, 42), vec![]);
 
-        let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
+        let trap = to_v1_trap(&pdu, [0, 0, 0, 0]).unwrap();
 
         assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
         assert_eq!(trap.specific_trap, 42);
@@ -3525,13 +3488,34 @@ mod tests {
         // enterprise is snmpTrapOID with only the last sub-id removed.
         let pdu = Pdu::trap_v2(1, 200, &oid!(1, 3, 6, 1, 4, 1, 9999, 1, 42), vec![]);
 
-        let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
+        let trap = to_v1_trap(&pdu, [0, 0, 0, 0]).unwrap();
 
         assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
         assert_eq!(trap.specific_trap, 42);
         // Next-to-last arc is 1 (non-zero), so only last arc stripped
         assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999, 1));
         assert_eq!(trap.time_stamp, 200);
+    }
+
+    #[test]
+    fn v2_to_v1_rejects_short_derived_enterprise_oids() {
+        for trap_oid in [oid!(0, 1), oid!(0, 0, 1)] {
+            let notification =
+                NotificationPdu::trap_v2(Version::V2c, 1, 100, &trap_oid, vec![]).unwrap();
+            assert!(notification.to_v1_trap([0, 0, 0, 0]).is_err());
+        }
+
+        let boundary = NotificationPdu::trap_v2(Version::V2c, 1, 100, &oid!(0, 0, 0, 1), vec![])
+            .unwrap()
+            .to_v1_trap([0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(boundary.enterprise(), &oid!(0, 0));
+    }
+
+    #[test]
+    fn arbitrary_standard_pdu_cannot_enter_notification_conversion() {
+        let get = Pdu::get_request(1, &[oid!(1, 3, 6, 1)]);
+        assert!(NotificationPdu::try_from_raw(Version::V2c, get).is_err());
     }
 
     #[test]
@@ -3542,7 +3526,7 @@ mod tests {
         for arc in [0u32, 7, 9] {
             let pdu = Pdu::trap_v2(1, 100, &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, arc), vec![]);
 
-            let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
+            let trap = to_v1_trap(&pdu, [0, 0, 0, 0]).unwrap();
 
             assert_eq!(trap.generic_trap, GenericTrap::EnterpriseSpecific);
             assert_eq!(trap.specific_trap, i32::try_from(arc).unwrap());
@@ -3566,7 +3550,7 @@ mod tests {
             )],
         );
 
-        let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
+        let trap = to_v1_trap(&pdu, [0, 0, 0, 0]).unwrap();
         assert_eq!(trap.agent_addr, [192, 168, 1, 1]);
         // RFC 3584 Section 3.2 rule (6): only sysUpTime.0 and snmpTrapOID.0
         // are excluded; snmpTrapAddress.0 is retained in the varbinds
@@ -3590,7 +3574,7 @@ mod tests {
             )],
         );
 
-        let trap = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
+        let trap = to_v1_trap(&pdu, [0, 0, 0, 0]).unwrap();
         // Standard trap should use the enterprise from snmpTrapEnterprise.0
         assert_eq!(trap.enterprise, oid!(1, 3, 6, 1, 4, 1, 9999));
         // RFC 3584 Section 3.2 rule (6): only sysUpTime.0 and snmpTrapOID.0
@@ -3615,14 +3599,14 @@ mod tests {
         );
 
         // Counter64 in any varbind means the trap cannot be represented in V1
-        assert!(pdu.to_v1_trap([0, 0, 0, 0]).is_none());
+        assert!(to_v1_trap(&pdu, [0, 0, 0, 0]).is_err());
     }
 
     #[test]
     fn test_v2_to_v1_too_few_varbinds() {
         let pdu = Pdu::standard(crate::pdu::StandardPduType::TrapV2, 1, 0, 0, vec![]);
 
-        assert!(pdu.to_v1_trap([0, 0, 0, 0]).is_none());
+        assert!(to_v1_trap(&pdu, [0, 0, 0, 0]).is_err());
     }
 
     #[test]
@@ -3647,7 +3631,7 @@ mod tests {
         );
 
         let v2 = original.to_v2_pdu().unwrap();
-        let restored = v2.to_v1_trap([0, 0, 0, 0]).unwrap();
+        let restored = to_v1_trap(&v2, [0, 0, 0, 0]).unwrap();
 
         assert_eq!(restored.enterprise, original.enterprise);
         assert_eq!(restored.generic_trap, original.generic_trap);
@@ -3674,7 +3658,7 @@ mod tests {
         );
 
         let v2 = original.to_v2_pdu().unwrap();
-        let restored = v2.to_v1_trap([10, 0, 0, 1]).unwrap();
+        let restored = to_v1_trap(&v2, [10, 0, 0, 1]).unwrap();
 
         assert_eq!(restored.generic_trap, GenericTrap::WarmStart);
         assert_eq!(restored.specific_trap, 0);
@@ -3704,7 +3688,7 @@ mod tests {
 
         for (trap_oid, expected_generic) in traps {
             let pdu = Pdu::trap_v2(1, 100, &trap_oid, vec![]);
-            let v1 = pdu.to_v1_trap([0, 0, 0, 0]).unwrap();
+            let v1 = to_v1_trap(&pdu, [0, 0, 0, 0]).unwrap();
             assert_eq!(v1.generic_trap, expected_generic, "Failed for {trap_oid:?}");
             assert_eq!(v1.specific_trap, 0);
         }

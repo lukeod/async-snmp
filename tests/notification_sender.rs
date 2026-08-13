@@ -694,7 +694,10 @@ async fn v1_trap_counter64_rejected() {
             )],
         )
         .await;
-    assert!(result.is_err());
+    assert!(matches!(
+        *result.expect_err("Counter64 cannot be converted to SNMPv1"),
+        async_snmp::Error::InvalidMessage(_)
+    ));
 }
 
 #[tokio::test]
@@ -1683,7 +1686,7 @@ async fn agent_trap_reports_total_conversion_failure() {
     assert!(matches!(
         &outcome.sinks()[0].status,
         SinkStatus::Failed(error)
-            if matches!(&**error, async_snmp::Error::Config(_))
+            if matches!(&**error, async_snmp::Error::InvalidMessage(_))
     ));
 }
 

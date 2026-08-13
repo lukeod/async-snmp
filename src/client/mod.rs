@@ -1043,12 +1043,7 @@ impl<T: Transport> Client<T> {
             // request_id is unused in the v1 wire format, use 0 to avoid
             // wasting a slot in the request_id sequence.
             let pdu = NotificationPdu::trap_v2(Version::V2c, 0, uptime, trap_oid, varbinds)?;
-            let trap = pdu.as_raw().to_v1_trap(local_ip).ok_or_else(|| {
-                Error::Config("cannot convert trap to v1 (Counter64 varbind?)".into()).boxed()
-            })?;
-            return self
-                .send_v1_trap(TrapV1Notification::try_from_raw(trap)?)
-                .await;
+            return self.send_v1_trap(pdu.to_v1_trap(local_ip)?).await;
         }
 
         let request_id = self.next_request_id();

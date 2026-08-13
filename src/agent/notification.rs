@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::handler::SecurityModel;
 use crate::message::{CommunityMessage, SecurityLevel};
 use crate::oid::Oid;
-use crate::pdu::{NotificationPdu, Pdu};
+use crate::pdu::NotificationPdu;
 use crate::transport::{UdpHandle, UdpTransport};
 use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
@@ -520,7 +520,7 @@ impl super::Agent {
                         varbinds.to_vec(),
                     );
                     match pdu {
-                        Ok(pdu) => match self.send_trap_to_sink(sink, pdu.as_raw()).await {
+                        Ok(pdu) => match self.send_trap_to_sink(sink, &pdu).await {
                             Ok(()) => SinkStatus::Succeeded,
                             Err(error) => SinkStatus::Failed(error),
                         },
@@ -779,7 +779,7 @@ impl super::Agent {
     }
 
     /// Send a trap PDU to a single sink.
-    async fn send_trap_to_sink(&self, sink: &TrapSink, pdu: &Pdu) -> Result<()> {
+    async fn send_trap_to_sink(&self, sink: &TrapSink, pdu: &NotificationPdu) -> Result<()> {
         let data = match sink.summary.version {
             Version::V1 => {
                 // Convert the v2 PDU to a v1 TrapV1Pdu (RFC 3584 Section 3.2).
@@ -791,15 +791,16 @@ impl super::Agent {
                     },
                     Err(_) => [0, 0, 0, 0],
                 };
-                let trap = pdu.to_v1_trap(local_ip).ok_or_else(|| {
-                    Error::Config("cannot convert trap to v1 for sink (Counter64 varbind?)".into())
-                        .boxed()
-                })?;
-                let msg = CommunityMessage::v1_trap(sink.community.clone(), trap)?;
+                let trap = pdu.to_v1_trap(local_ip)?;
+                let msg = CommunityMessage::v1_trap(sink.community.clone(), trap.into_raw())?;
                 msg.encode()
             }
             Version::V2c => {
-                let msg = CommunityMessage::new(Version::V2c, sink.community.clone(), pdu.clone())?;
+                let msg = CommunityMessage::new(
+                    Version::V2c,
+                    sink.community.clone(),
+                    pdu.as_raw().clone(),
+                )?;
                 msg.encode()
             }
             Version::V3 => {
@@ -816,7 +817,7 @@ impl super::Agent {
 
                 let msg_id = self.next_notification_id();
                 let encoded = crate::v3::encode::encode_v3_message(
-                    pdu,
+                    pdu.as_raw(),
                     msg_id,
                     &self.inner.state.engine_id,
                     engine_boots,

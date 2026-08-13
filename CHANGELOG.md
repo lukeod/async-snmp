@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** v2/v3-to-v1 trap conversion moved from permissive
+  `Pdu::to_v1_trap` to `NotificationPdu::to_v1_trap`. It now returns a
+  validated `TrapV1Notification` result and rejects conversions whose derived
+  enterprise OID or copied values cannot be encoded as SNMPv1.
+
 - Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
   single-flight operation. Callers share success or structured failure under a
   bounded total discovery deadline; uncommon errors may use the transparent
