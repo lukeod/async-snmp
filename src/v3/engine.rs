@@ -679,13 +679,13 @@ pub(crate) enum TimelinessPublicationOutcome {
 /// let cache = Arc::new(EngineCache::new());
 ///
 /// let client1 = Client::builder("192.168.1.1:161",
-///     Auth::usm_builder("admin").auth(AuthProtocol::Sha1, "authpass").build())
+///     Auth::usm_builder("admin").auth(AuthProtocol::Sha1, "authpass").build().unwrap())
 ///     .engine_cache(cache.clone())
 ///     .connect()
 ///     .await?;
 ///
 /// let client2 = Client::builder("192.168.1.2:161",
-///     Auth::usm_builder("admin").auth(AuthProtocol::Sha1, "authpass").build())
+///     Auth::usm_builder("admin").auth(AuthProtocol::Sha1, "authpass").build().unwrap())
 ///     .engine_cache(cache.clone())
 ///     .connect()
 ///     .await?;

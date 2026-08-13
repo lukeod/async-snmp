@@ -42,15 +42,19 @@ fn user_for(level: SecurityLevel) -> UsmConfig {
     let user = UsmConfig::new(USERNAME);
     match level {
         SecurityLevel::NoAuthNoPriv => user,
-        SecurityLevel::AuthNoPriv => user.with_master_keys(
-            MasterKeys::new(AuthProtocol::Sha256, AUTH_PASSWORD.as_bytes()).unwrap(),
-        ),
-        SecurityLevel::AuthPriv => user.with_master_keys(
-            MasterKeys::new(AuthProtocol::Sha256, AUTH_PASSWORD.as_bytes())
-                .unwrap()
-                .with_privacy(PrivProtocol::Aes128, PRIV_PASSWORD.as_bytes())
-                .unwrap(),
-        ),
+        SecurityLevel::AuthNoPriv => user
+            .with_master_keys(
+                MasterKeys::new(AuthProtocol::Sha256, AUTH_PASSWORD.as_bytes()).unwrap(),
+            )
+            .unwrap(),
+        SecurityLevel::AuthPriv => user
+            .with_master_keys(
+                MasterKeys::new(AuthProtocol::Sha256, AUTH_PASSWORD.as_bytes())
+                    .unwrap()
+                    .with_privacy(PrivProtocol::Aes128, PRIV_PASSWORD.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap(),
     }
 }
 
@@ -59,7 +63,8 @@ fn auth_for(level: SecurityLevel) -> Auth {
         SecurityLevel::NoAuthNoPriv => Auth::usm(USERNAME),
         SecurityLevel::AuthNoPriv => Auth::usm_builder(USERNAME)
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .build(),
+            .build()
+            .unwrap(),
         SecurityLevel::AuthPriv => Auth::usm_builder(USERNAME)
             .auth_priv(
                 AuthProtocol::Sha256,
@@ -67,7 +72,8 @@ fn auth_for(level: SecurityLevel) -> Auth {
                 PrivProtocol::Aes128,
                 PRIV_PASSWORD,
             )
-            .build(),
+            .build()
+            .unwrap(),
     }
 }
 

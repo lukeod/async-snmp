@@ -2380,7 +2380,9 @@ mod response_validation_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn v3_deferred_update_revalidates_after_concurrent_advancement() {
         let transport = DeferredUpdateTransport::new();
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let security = UsmConfig::new("user")
+            .auth(AuthProtocol::Sha1, "authpass12345678")
+            .unwrap();
         let cache = Arc::new(EngineCache::new());
         let config = ClientConfig {
             auth: crate::Auth::Usm(security.clone()),
@@ -2459,7 +2461,9 @@ mod response_validation_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn v3_authenticated_publication_restores_mapping_cleared_after_validation() {
         let transport = DeferredUpdateTransport::new();
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let security = UsmConfig::new("user")
+            .auth(AuthProtocol::Sha1, "authpass12345678")
+            .unwrap();
         let cache = Arc::new(EngineCache::new());
         let config = ClientConfig {
             auth: crate::Auth::Usm(security.clone()),
@@ -2499,7 +2503,9 @@ mod response_validation_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn v3_rediscovery_between_validation_and_publication_preserves_new_generation() {
         let transport = RediscoveryRaceTransport::new();
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let security = UsmConfig::new("user")
+            .auth(AuthProtocol::Sha1, "authpass12345678")
+            .unwrap();
         let cache = Arc::new(EngineCache::new());
         let config = ClientConfig {
             auth: crate::Auth::Usm(security.clone()),
@@ -2560,7 +2566,9 @@ mod response_validation_tests {
     /// engine's cached advertised limit.
     #[tokio::test]
     async fn v3_advertises_local_receive_capacity_not_remote() {
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let security = UsmConfig::new("user")
+            .auth(AuthProtocol::Sha1, "authpass12345678")
+            .unwrap();
         let transport = CannedTransport {
             peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
             response: Bytes::new(),
@@ -2691,7 +2699,9 @@ mod response_validation_tests {
     /// fresh engine time passes.
     #[tokio::test]
     async fn v3_accepts_timely_authenticated_response() {
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let security = UsmConfig::new("user")
+            .auth(AuthProtocol::Sha1, "authpass12345678")
+            .unwrap();
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         let response = build_response(PduType::Response, 123, 1, 1200, Some(b"authpass12345678"));
         let client = canned_client(response, 1, 1000, security);
@@ -2705,7 +2715,9 @@ mod response_validation_tests {
     /// must be rejected.
     #[tokio::test(start_paused = true)]
     async fn v3_rejects_stale_authenticated_response() {
-        let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
+        let security = UsmConfig::new("user")
+            .auth(AuthProtocol::Sha1, "authpass12345678")
+            .unwrap();
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         // Local notion is time 1000; 500 is beyond the 150-second window.
         let response = build_response(PduType::Response, 123, 1, 500, Some(b"authpass12345678"));

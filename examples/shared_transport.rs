@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with these credentials can cheaply clone the master keys and engine cache.
     let auth = Auth::usm_builder("privaes192_user")
         .with_master_keys(master_keys.clone())
-        .build();
+        .build()?;
     let client = Client::builder(container_target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(5))

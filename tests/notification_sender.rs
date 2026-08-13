@@ -471,6 +471,7 @@ async fn v3_trap_send_receive() {
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
+        .unwrap()
         .accept_all_notifications()
         .build()
         .await
@@ -481,7 +482,8 @@ async fn v3_trap_send_receive() {
         recv_addr.to_string(),
         Auth::usm_builder("trapuser")
             .auth(AuthProtocol::Sha256, "authpass12345678")
-            .build(),
+            .build()
+            .unwrap(),
     )
     .local_authoritative_engine(shared_engine)
     .connect()
@@ -531,6 +533,7 @@ async fn v3_inform_send_receive() {
                 b"privpass12345678",
             )
         })
+        .unwrap()
         .accept_all_notifications()
         .build()
         .await
@@ -553,7 +556,8 @@ async fn v3_inform_send_receive() {
                 PrivProtocol::Aes128,
                 "privpass12345678",
             )
-            .build(),
+            .build()
+            .unwrap(),
     )
     .connect()
     .await
@@ -718,6 +722,7 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
         .usm_user("user", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
+        .unwrap()
         .accept_all_notifications()
         .build()
         .await
@@ -728,7 +733,8 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
         recv_addr.to_string(),
         Auth::usm_builder("user")
             .auth(AuthProtocol::Sha256, "authpass12345678")
-            .build(),
+            .build()
+            .unwrap(),
     )
     // No local authoritative engine state set.
     .connect()
@@ -941,6 +947,7 @@ async fn agent_v3_trap_to_sink() {
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
+        .unwrap()
         .accept_all_notifications()
         .build()
         .await
@@ -954,12 +961,14 @@ async fn agent_v3_trap_to_sink() {
         .usm_user("trapuser", |u| {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
+        .unwrap()
         .trap_sink(
             NotificationSinkId::new("v3").unwrap(),
             recv_addr.to_string(),
             Auth::usm_builder("trapuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
-                .build(),
+                .build()
+                .unwrap(),
         )
         .allow_all_access()
         .build()
@@ -1253,7 +1262,8 @@ async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
             dest.to_string(),
             Auth::usm_builder(USER_SECRET)
                 .context_name(CONTEXT_SECRET)
-                .build(),
+                .build()
+                .unwrap(),
         )
         .build()
         .await
@@ -1329,9 +1339,13 @@ async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
     let level = SecurityLevel::AuthNoPriv;
     let peer_engine = TestV3Engine::new(Bytes::from_static(b"\x80\x00\x7e\xd9\x05inform-metadata"))
         .boots_time(7, 100)
-        .user(async_snmp::UsmConfig::new("informuser").with_master_keys(
-            async_snmp::MasterKeys::new(AuthProtocol::Sha256, b"authpass12345678").unwrap(),
-        ));
+        .user(
+            async_snmp::UsmConfig::new("informuser")
+                .with_master_keys(
+                    async_snmp::MasterKeys::new(AuthProtocol::Sha256, b"authpass12345678").unwrap(),
+                )
+                .unwrap(),
+        );
     let discovery_engine = peer_engine.clone();
     let correction_engine = peer_engine.clone();
     let peer = ScriptedV3Peer::udp(
@@ -1378,7 +1392,8 @@ async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
             peer.addr().to_string(),
             Auth::usm_builder("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
-                .build(),
+                .build()
+                .unwrap(),
         )
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())
@@ -1419,9 +1434,13 @@ async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
         b"\x80\x00\x7e\xd9\x05inform-malformed-ack",
     ))
     .boots_time(7, 100)
-    .user(async_snmp::UsmConfig::new("informuser").with_master_keys(
-        async_snmp::MasterKeys::new(AuthProtocol::Sha256, b"authpass12345678").unwrap(),
-    ));
+    .user(
+        async_snmp::UsmConfig::new("informuser")
+            .with_master_keys(
+                async_snmp::MasterKeys::new(AuthProtocol::Sha256, b"authpass12345678").unwrap(),
+            )
+            .unwrap(),
+    );
     let discovery_engine = peer_engine.clone();
     let response_engine = peer_engine.clone();
     let peer = ScriptedV3Peer::udp(
@@ -1460,7 +1479,8 @@ async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
             peer.addr().to_string(),
             Auth::usm_builder("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
-                .build(),
+                .build()
+                .unwrap(),
         )
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())

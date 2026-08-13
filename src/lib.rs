@@ -84,7 +84,7 @@
 //!             PrivProtocol::Aes128,
 //!             "privpass123",
 //!         )
-//!         .build();
+//!         .build().unwrap();
 //!
 //!     let client = Client::builder(("192.168.1.1", 161), auth)
 //!         .connect()
@@ -254,7 +254,7 @@
 //! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
 //!     let auth = Auth::usm_builder("snmpuser")
 //!         .with_master_keys(master_keys.clone())
-//!         .build();
+//!         .build().unwrap();
 //!     let client = Client::builder(target, auth)
 //!         .engine_cache(engine_cache.clone())
 //!         .build_with(&transport)
@@ -646,11 +646,12 @@ pub use transport::{
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, AuthoritativeEnginePersistenceError,
-    AuthoritativeEnginePersistenceOperation, DiscoveredEngine, EngineCache, ParseProtocolError,
-    PersistedAuthoritativeEngine, PrivProtocol, UsmConfig, UsmUser, generate_engine_id,
+    AuthoritativeEnginePersistenceOperation, CryptoBackend, CryptoError, CryptoResult,
+    DiscoveredEngine, EngineCache, ParseProtocolError, PersistedAuthoritativeEngine, PrivProtocol,
+    UsmConfig, UsmUser, generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-pub use v3::{CryptoBackend, CryptoError, CryptoResult, LocalizedKey, MasterKey, MasterKeys};
+pub use v3::{LocalizedKey, MasterKey, MasterKeys};
 pub use value::{RowStatus, StorageType, Value, ValueKind};
 pub use varbind::VarBind;
 pub use version::Version;

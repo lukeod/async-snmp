@@ -146,7 +146,9 @@ impl MasterKey {
     /// # Errors
     ///
     /// Returns [`CryptoError::InvalidKeyLength`](super::CryptoError::InvalidKeyLength)
-    /// unless `key` is exactly [`AuthProtocol::digest_len`] octets.
+    /// unless `key` is exactly [`AuthProtocol::digest_len`] octets. After
+    /// length validation, returns a capability error if the selected backend
+    /// cannot use `protocol`.
     pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> CryptoResult<Self> {
         Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
     }
@@ -161,6 +163,7 @@ impl MasterKey {
         if key.len() != protocol.digest_len() {
             return Err(super::CryptoError::InvalidKeyLength);
         }
+        backend.validate_auth_protocol(protocol)?;
         Ok(Self {
             key,
             protocol,
@@ -178,6 +181,7 @@ impl MasterKey {
     /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
     /// backend does not support the key's authentication protocol.
     pub fn localize(&self, engine_id: &[u8]) -> CryptoResult<LocalizedKey> {
+        self.backend.validate_auth_protocol(self.protocol)?;
         let localized =
             localize_key_with_backend(self.backend, self.protocol, &self.key, engine_id)?;
         Ok(LocalizedKey {
@@ -306,7 +310,9 @@ impl LocalizedKey {
     /// # Errors
     ///
     /// Returns [`CryptoError::InvalidKeyLength`](super::CryptoError::InvalidKeyLength)
-    /// unless `key` is exactly [`AuthProtocol::digest_len`] octets.
+    /// unless `key` is exactly [`AuthProtocol::digest_len`] octets. After
+    /// length validation, returns a capability error if the selected backend
+    /// cannot use `protocol`.
     pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> CryptoResult<Self> {
         Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
     }
@@ -321,6 +327,7 @@ impl LocalizedKey {
         if key.len() != protocol.digest_len() {
             return Err(super::CryptoError::InvalidKeyLength);
         }
+        backend.validate_auth_protocol(protocol)?;
         Ok(Self {
             key,
             protocol,
@@ -399,6 +406,78 @@ impl std::fmt::Debug for LocalizedKey {
 impl AsRef<[u8]> for LocalizedKey {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
+    }
+}
+
+#[cfg(all(test, not(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))))]
+mod no_backend_tests {
+    use super::*;
+    use crate::v3::PrivProtocol;
+
+    fn unavailable_master_keys() -> MasterKeys {
+        MasterKeys {
+            auth_master: MasterKey {
+                key: vec![0_u8; AuthProtocol::Sha256.digest_len()],
+                protocol: AuthProtocol::Sha256,
+                backend: CryptoBackend::Unavailable,
+            },
+            priv_protocol: None,
+            priv_master: None,
+        }
+    }
+
+    #[test]
+    fn active_auth_key_constructors_reject_unavailable_backend() {
+        for protocol in [
+            AuthProtocol::Md5,
+            AuthProtocol::Sha1,
+            AuthProtocol::Sha224,
+            AuthProtocol::Sha256,
+            AuthProtocol::Sha384,
+            AuthProtocol::Sha512,
+        ] {
+            let len = protocol.digest_len();
+            assert_eq!(
+                MasterKey::from_bytes(protocol, vec![0_u8; len - 1]).unwrap_err(),
+                super::super::CryptoError::InvalidKeyLength
+            );
+            assert_eq!(
+                MasterKey::from_bytes(protocol, vec![0_u8; len]).unwrap_err(),
+                super::super::CryptoError::BackendUnavailable
+            );
+            assert_eq!(
+                LocalizedKey::from_bytes(protocol, vec![0_u8; len - 1]).unwrap_err(),
+                super::super::CryptoError::InvalidKeyLength
+            );
+            assert_eq!(
+                LocalizedKey::from_bytes(protocol, vec![0_u8; len]).unwrap_err(),
+                super::super::CryptoError::BackendUnavailable
+            );
+        }
+        assert_eq!(
+            MasterKey::from_password(AuthProtocol::Sha256, b"short").unwrap_err(),
+            super::super::CryptoError::PasswordTooShort
+        );
+        assert_eq!(
+            LocalizedKey::from_password(AuthProtocol::Sha256, b"short", b"engine-id").unwrap_err(),
+            super::super::CryptoError::PasswordTooShort
+        );
+    }
+
+    #[test]
+    fn master_keys_privacy_password_validation_precedes_backend_capability() {
+        assert_eq!(
+            unavailable_master_keys()
+                .with_privacy(PrivProtocol::Aes128, b"1234567")
+                .unwrap_err(),
+            super::super::CryptoError::PasswordTooShort
+        );
+        assert_eq!(
+            unavailable_master_keys()
+                .with_privacy(PrivProtocol::Aes128, b"12345678")
+                .unwrap_err(),
+            super::super::CryptoError::BackendUnavailable
+        );
     }
 }
 
@@ -617,11 +696,16 @@ impl MasterKeys {
     ///
     /// This is the common case where auth and priv passwords are identical.
     /// The same master key is reused, avoiding duplicate derivation.
-    #[must_use]
-    pub fn with_privacy_same_password(mut self, priv_protocol: super::PrivProtocol) -> Self {
+    pub fn with_privacy_same_password(
+        mut self,
+        priv_protocol: super::PrivProtocol,
+    ) -> CryptoResult<Self> {
+        self.auth_master
+            .crypto_backend()
+            .validate_priv_protocol(priv_protocol)?;
         self.priv_protocol = Some(priv_protocol);
         // priv_master stays None - we'll use auth_master for priv key derivation
-        self
+        Ok(self)
     }
 
     /// Add privacy with a different password than authentication.
@@ -631,14 +715,23 @@ impl MasterKeys {
     ///
     /// # Errors
     ///
-    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
-    /// backend does not support the authentication protocol used for key
-    /// derivation.
+    /// Returns [`CryptoError::PasswordTooShort`](super::CryptoError::PasswordTooShort)
+    /// if `priv_password` is shorter than eight octets.
+    ///
+    /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm)
+    /// if the active crypto backend does not support the requested privacy
+    /// protocol or the authentication protocol used for key derivation.
     pub fn with_privacy(
         mut self,
         priv_protocol: super::PrivProtocol,
         priv_password: &[u8],
     ) -> CryptoResult<Self> {
+        if priv_password.len() < MIN_PASSWORD_LENGTH {
+            return Err(super::CryptoError::PasswordTooShort);
+        }
+        self.auth_master
+            .crypto_backend()
+            .validate_priv_protocol(priv_protocol)?;
         self.priv_protocol = Some(priv_protocol);
         // Use the auth protocol for priv key derivation (per RFC 3826 Section 1.2)
         self.priv_master = Some(MasterKey::from_password_with_backend(
@@ -712,7 +805,7 @@ impl MasterKeys {
     /// use async_snmp::{AuthProtocol, MasterKeys, PrivProtocol};
     ///
     /// let keys = MasterKeys::new(AuthProtocol::Sha1, b"authpassword").unwrap()
-    ///     .with_privacy_same_password(PrivProtocol::Aes256);
+    ///     .with_privacy_same_password(PrivProtocol::Aes256).unwrap();
     ///
     /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
     ///
@@ -1099,13 +1192,29 @@ mod tests {
                     ));
                 }
 
-                let master =
-                    MasterKey::from_bytes_with_backend(protocol, vec![0xAA; len], backend).unwrap();
-                assert_eq!(master.as_bytes().len(), len);
+                let master = MasterKey::from_bytes_with_backend(protocol, vec![0xAA; len], backend);
                 let localized =
-                    LocalizedKey::from_bytes_with_backend(protocol, vec![0xAA; len], backend)
-                        .unwrap();
-                assert_eq!(localized.as_bytes().len(), len);
+                    LocalizedKey::from_bytes_with_backend(protocol, vec![0xAA; len], backend);
+
+                let is_supported = match backend {
+                    #[cfg(feature = "crypto-rustcrypto")]
+                    CryptoBackend::RustCrypto => true,
+                    #[cfg(feature = "crypto-fips")]
+                    CryptoBackend::AwsLcFips => protocol != AuthProtocol::Md5,
+                };
+                if !is_supported {
+                    assert!(matches!(
+                        master,
+                        Err(super::super::CryptoError::UnsupportedAlgorithm("MD5"))
+                    ));
+                    assert!(matches!(
+                        localized,
+                        Err(super::super::CryptoError::UnsupportedAlgorithm("MD5"))
+                    ));
+                } else {
+                    assert_eq!(master.unwrap().as_bytes().len(), len);
+                    assert_eq!(localized.unwrap().as_bytes().len(), len);
+                }
             }
         }
     }
@@ -1285,7 +1394,8 @@ mod tests {
         let engine_id = decode_hex("000000000000000000000002").unwrap();
         let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"sharedpassword")
             .unwrap()
-            .with_privacy_same_password(PrivProtocol::Aes128);
+            .with_privacy_same_password(PrivProtocol::Aes128)
+            .unwrap();
 
         assert_eq!(master_keys.auth_protocol(), AuthProtocol::Sha256);
         assert_eq!(master_keys.priv_protocol(), Some(PrivProtocol::Aes128));
@@ -1311,7 +1421,8 @@ mod tests {
         // Verify that different passwords produce different keys
         let same_password_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
             .unwrap()
-            .with_privacy_same_password(PrivProtocol::Aes128);
+            .with_privacy_same_password(PrivProtocol::Aes128)
+            .unwrap();
         let (_, priv_key_same) = same_password_keys.localize(&engine_id).unwrap();
 
         // The priv keys should differ when using different passwords
@@ -1319,6 +1430,47 @@ mod tests {
         assert_ne!(
             priv_key.as_ref().unwrap().encryption_key(),
             priv_key_same.as_ref().unwrap().encryption_key()
+        );
+    }
+
+    #[test]
+    fn test_master_keys_privacy_password_validation_precedes_derivation() {
+        use crate::v3::PrivProtocol;
+
+        assert_eq!(
+            MasterKeys::new(AuthProtocol::Sha256, b"authpassword")
+                .unwrap()
+                .with_privacy(PrivProtocol::Aes128, b"1234567")
+                .unwrap_err(),
+            super::super::CryptoError::PasswordTooShort
+        );
+    }
+
+    #[cfg(feature = "crypto-fips")]
+    #[test]
+    fn test_master_keys_privacy_password_validation_precedes_protocol_capability() {
+        use crate::v3::PrivProtocol;
+
+        let master_keys = || {
+            MasterKeys::new_with_backend(
+                AuthProtocol::Sha256,
+                b"authpassword",
+                CryptoBackend::AwsLcFips,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            master_keys()
+                .with_privacy(PrivProtocol::Des, b"1234567")
+                .unwrap_err(),
+            super::super::CryptoError::PasswordTooShort
+        );
+        assert_eq!(
+            master_keys()
+                .with_privacy(PrivProtocol::Des, b"12345678")
+                .unwrap_err(),
+            super::super::CryptoError::UnsupportedAlgorithm("DES")
         );
     }
 

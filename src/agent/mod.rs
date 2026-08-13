@@ -527,7 +527,7 @@ impl AgentBuilder {
     ///     // User capable of authentication
     ///     .usm_user("monitor", |u| {
     ///         u.auth(AuthProtocol::Sha256, b"monitorpass123")
-    ///     })
+    ///     }).unwrap()
     ///     // User capable of authentication and privacy
     ///     .usm_user("admin", |u| {
     ///         u.auth_priv(
@@ -536,22 +536,25 @@ impl AgentBuilder {
     ///             PrivProtocol::Aes128,
     ///             b"adminpriv123",
     ///         )
-    ///     })
+    ///     }).unwrap()
     ///     .allow_all_access()
     ///     .build()
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    #[must_use]
-    pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
+    pub fn usm_user<F>(
+        mut self,
+        username: impl Into<Bytes>,
+        configure: F,
+    ) -> crate::CryptoResult<Self>
     where
-        F: FnOnce(UsmUser) -> UsmUser,
+        F: FnOnce(UsmUser) -> crate::CryptoResult<UsmUser>,
     {
         let username_bytes: Bytes = username.into();
-        let config = configure(UsmUser::new(username_bytes.clone()));
+        let config = configure(UsmUser::new(username_bytes.clone()))?;
         self.usm_users.insert(username_bytes, config);
-        self
+        Ok(self)
     }
 
     /// Set the persisted local authoritative engine state for `SNMPv3`.
@@ -871,7 +874,7 @@ impl AgentBuilder {
     ///             PrivProtocol::Aes128,
     ///             "privpass",
     ///         )
-    ///         .build())
+    ///         .build().unwrap())
     ///     .allow_all_access()
     ///     .build()
     ///     .await?;
@@ -4393,7 +4396,8 @@ mod tests {
 
         let result = Agent::builder()
             .bind("not a socket address")
-            .usm_user("user", |user| user)
+            .usm_user("user", Ok)
+            .unwrap()
             .build()
             .await;
         let error = result.err().expect("missing Agent policy must fail");
@@ -4470,7 +4474,8 @@ mod tests {
     async fn test_v3_agent_requires_authoritative_engine_before_bind() {
         let result = Agent::builder()
             .bind("not a socket address")
-            .usm_user("user", |user| user)
+            .usm_user("user", Ok)
+            .unwrap()
             .allow_all_access()
             .build()
             .await;
@@ -4592,7 +4597,8 @@ mod tests {
     async fn test_invalid_usm_user_is_rejected_before_bind() {
         let result = Agent::builder()
             .bind("not a socket address")
-            .usm_user("", |user| user)
+            .usm_user("", Ok)
+            .unwrap()
             .allow_all_access()
             .build()
             .await;
@@ -4749,8 +4755,8 @@ mod tests {
     }
 
     #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-    #[tokio::test]
-    async fn unavailable_usm_backend_precedes_socket_attempt() {
+    #[test]
+    fn unavailable_usm_backend_is_reported_by_user_configuration() {
         let error = Agent::builder()
             .bind("127.0.0.1:0")
             .authoritative_engine(AuthoritativeEngine::for_test(
@@ -4760,22 +4766,10 @@ mod tests {
             .usm_user("authenticated", |user| {
                 user.auth(crate::AuthProtocol::Sha256, b"authentication-password")
             })
-            .allow_all_access()
-            .build_with_dependencies(
-                |_, _| async { panic!("socket binder must not run") },
-                |_, _| async { panic!("resolver must not run") },
-                || panic!("engine ID generator must not run"),
-                || panic!("salt generator must not run"),
-            )
-            .await
             .err()
-            .expect("unavailable backend must fail");
+            .expect("user configuration must reject the unavailable backend");
 
-        assert!(matches!(
-            *error,
-            Error::Config(ref message)
-                if message.contains("no crypto backend is enabled")
-        ));
+        assert_eq!(error, crate::CryptoError::BackendUnavailable);
     }
 
     #[tokio::test]
@@ -4879,6 +4873,7 @@ mod tests {
                     b"privacy-password",
                 )
             })
+            .unwrap()
             .allow_all_access()
             .build_with_dependencies(
                 |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),

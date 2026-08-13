@@ -13,7 +13,7 @@
 use async_snmp::format::hex::{decode, encode};
 use async_snmp::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol, SaltCounter};
 #[cfg(feature = "crypto-fips")]
-use async_snmp::v3::{CryptoBackend, CryptoError, PrivacyError};
+use async_snmp::v3::{CryptoBackend, CryptoError, MasterKey};
 
 /// RFC 3414 Appendix A.3.1: Password to Key using MD5
 ///
@@ -545,22 +545,51 @@ fn test_fips_rejects_empty_password_before_md5_selection() {
     );
 }
 
-/// FIPS provider rejects MD5 for HMAC computation.
+/// FIPS provider rejects an active MD5 key at construction.
 #[cfg(feature = "crypto-fips")]
 #[test]
-fn test_fips_rejects_md5_hmac() {
-    let key = LocalizedKey::from_bytes_with_backend(
+fn test_fips_rejects_raw_md5_key() {
+    let master = MasterKey::from_bytes_with_backend(
         AuthProtocol::Md5,
         vec![0; 16],
         CryptoBackend::AwsLcFips,
+    );
+    let localized = LocalizedKey::from_bytes_with_backend(
+        AuthProtocol::Md5,
+        vec![0; 16],
+        CryptoBackend::AwsLcFips,
+    );
+    assert!(
+        matches!(master, Err(CryptoError::UnsupportedAlgorithm("MD5"))),
+        "FIPS provider should reject an MD5 master key: got {:?}",
+        master
+    );
+    assert!(
+        matches!(localized, Err(CryptoError::UnsupportedAlgorithm("MD5"))),
+        "FIPS provider should reject an MD5 localized key: got {:?}",
+        localized
+    );
+}
+
+/// Privacy capability validation precedes localization and extension.
+#[cfg(feature = "crypto-fips")]
+#[test]
+fn test_fips_rejects_privacy_protocol_before_derivation() {
+    let master = MasterKey::from_bytes_with_backend(
+        AuthProtocol::Sha256,
+        vec![0; 32],
+        CryptoBackend::AwsLcFips,
     )
     .unwrap();
-    let result = key.compute_hmac(b"test data");
-    assert!(
-        matches!(result, Err(CryptoError::UnsupportedAlgorithm("MD5"))),
-        "FIPS provider should reject MD5 HMAC: got {:?}",
-        result
-    );
+
+    assert!(matches!(
+        PrivKey::from_master_key(&master, PrivProtocol::Des, b"engine-id"),
+        Err(CryptoError::UnsupportedAlgorithm("DES"))
+    ));
+    assert!(matches!(
+        PrivKey::from_master_key(&master, PrivProtocol::Des3, b"engine-id"),
+        Err(CryptoError::UnsupportedAlgorithm("3DES"))
+    ));
 }
 
 /// Extended keys from same password but different engine IDs differ.
@@ -591,42 +620,28 @@ fn test_extended_keys_differ_by_engine_id() {
     assert_ne!(priv_key_1.encryption_key(), priv_key_2.encryption_key());
 }
 
-/// FIPS provider rejects DES encryption.
+/// FIPS provider rejects an active DES key at construction.
 #[cfg(feature = "crypto-fips")]
 #[test]
-fn test_fips_rejects_des_encrypt() {
-    let priv_key =
-        PrivKey::from_bytes_with_backend(PrivProtocol::Des, vec![0; 16], CryptoBackend::AwsLcFips)
-            .unwrap();
-    let result = priv_key.encrypt(b"test data", 1, 1, &SaltCounter::new().unwrap());
+fn test_fips_rejects_raw_des_key() {
+    let result =
+        PrivKey::from_bytes_with_backend(PrivProtocol::Des, vec![0; 16], CryptoBackend::AwsLcFips);
     assert!(
-        matches!(
-            result,
-            Err(PrivacyError::Crypto(CryptoError::UnsupportedAlgorithm(
-                "DES"
-            )))
-        ),
-        "FIPS provider should reject DES: got {:?}",
+        matches!(result, Err(CryptoError::UnsupportedAlgorithm("DES"))),
+        "FIPS provider should reject a DES key: got {:?}",
         result
     );
 }
 
-/// FIPS provider rejects 3DES encryption.
+/// FIPS provider rejects an active 3DES key at construction.
 #[cfg(feature = "crypto-fips")]
 #[test]
-fn test_fips_rejects_3des_encrypt() {
-    let priv_key =
-        PrivKey::from_bytes_with_backend(PrivProtocol::Des3, vec![0; 32], CryptoBackend::AwsLcFips)
-            .unwrap();
-    let result = priv_key.encrypt(b"test data", 1, 1, &SaltCounter::new().unwrap());
+fn test_fips_rejects_raw_3des_key() {
+    let result =
+        PrivKey::from_bytes_with_backend(PrivProtocol::Des3, vec![0; 32], CryptoBackend::AwsLcFips);
     assert!(
-        matches!(
-            result,
-            Err(PrivacyError::Crypto(CryptoError::UnsupportedAlgorithm(
-                "3DES"
-            )))
-        ),
-        "FIPS provider should reject 3DES: got {:?}",
+        matches!(result, Err(CryptoError::UnsupportedAlgorithm("3DES"))),
+        "FIPS provider should reject a 3DES key: got {:?}",
         result
     );
 }
@@ -648,20 +663,24 @@ fn both_backends_are_explicit_and_match_shared_sha_aes_vectors() {
 
     let rust = async_snmp::UsmConfig::new("user")
         .with_crypto_backend(CryptoBackend::RustCrypto)
+        .unwrap()
         .auth_priv(
             AuthProtocol::Sha256,
             b"maplesyrup",
             PrivProtocol::Aes128,
             b"maplesyrup",
-        );
+        )
+        .unwrap();
     let fips = async_snmp::UsmConfig::new("user")
         .with_crypto_backend(CryptoBackend::AwsLcFips)
+        .unwrap()
         .auth_priv(
             AuthProtocol::Sha256,
             b"maplesyrup",
             PrivProtocol::Aes128,
             b"maplesyrup",
-        );
+        )
+        .unwrap();
 
     assert_eq!(rust.crypto_backend(), CryptoBackend::RustCrypto);
     assert_eq!(fips.crypto_backend(), CryptoBackend::AwsLcFips);

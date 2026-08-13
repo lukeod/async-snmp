@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PrivProtocol::Aes128,
             "privpass123",
         )
-        .build();
+        .build()?;
 
     match Client::builder(target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)

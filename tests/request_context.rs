@@ -224,6 +224,7 @@ async fn agent_captures_complete_v3_contexts_at_every_security_level() {
                 PRIV_PASSWORD,
             )
         })
+        .unwrap()
         .handler(oid!(1, 3, 6, 1, 4, 1, 99999), capture.clone())
         .without_builtin_handlers()
         .vacm(|vacm| {
@@ -286,7 +287,7 @@ async fn agent_captures_complete_v3_contexts_at_every_security_level() {
         SecurityLevel::AuthNoPriv,
         SecurityLevel::AuthPriv,
     ] {
-        let context = capture_get(&agent, &transport, auth(level)).await;
+        let context = capture_get(&agent, &transport, auth(level).unwrap()).await;
         assert_context(
             &context,
             ExpectedContext {

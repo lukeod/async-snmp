@@ -905,7 +905,9 @@ mod tests {
         let mut users = HashMap::new();
         users.insert(
             Bytes::from_static(b"user"),
-            UsmUser::new("user").auth(AuthProtocol::Sha256, b"auth-password"),
+            UsmUser::new("user")
+                .auth(AuthProtocol::Sha256, b"auth-password")
+                .unwrap(),
         );
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
@@ -937,7 +939,9 @@ mod tests {
         use crate::v3::AuthProtocol;
 
         let engine_id = local_engine_id();
-        let user = UsmUser::new("user").auth(AuthProtocol::Sha256, b"auth-password");
+        let user = UsmUser::new("user")
+            .auth(AuthProtocol::Sha256, b"auth-password")
+            .unwrap();
         let keys = user.derive_keys(&engine_id).unwrap();
         let auth_key = keys.auth_key.as_ref().unwrap();
         let mut users = HashMap::new();
@@ -978,12 +982,14 @@ mod tests {
         use crate::v3::{AuthProtocol, PrivProtocol};
 
         let engine_id = local_engine_id();
-        let user = UsmUser::new("user").auth_priv(
-            AuthProtocol::Sha256,
-            b"auth-password",
-            PrivProtocol::Aes128,
-            b"priv-password",
-        );
+        let user = UsmUser::new("user")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            )
+            .unwrap();
         let keys = user.derive_keys(&engine_id).unwrap();
         let auth_key = keys.auth_key.as_ref().unwrap();
         let mut users = HashMap::new();
@@ -1023,18 +1029,22 @@ mod tests {
         use crate::v3::{AuthProtocol, PrivProtocol, SaltCounter, UsmConfig};
 
         let engine_id = local_engine_id();
-        let user = UsmUser::new("user").auth_priv(
-            AuthProtocol::Sha256,
-            b"auth-password",
-            PrivProtocol::Aes128,
-            b"priv-password",
-        );
-        let security = UsmConfig::new("user").auth_priv(
-            AuthProtocol::Sha256,
-            b"auth-password",
-            PrivProtocol::Aes128,
-            b"priv-password",
-        );
+        let user = UsmUser::new("user")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            )
+            .unwrap();
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            )
+            .unwrap();
         let keys = security.derive_keys(&engine_id).unwrap();
         let auth_key = keys.auth_key.as_ref().unwrap();
         let mut users = HashMap::new();
@@ -1179,7 +1189,9 @@ mod tests {
         let mut users = HashMap::new();
         users.insert(
             Bytes::from_static(b"user"),
-            UsmUser::new("user").auth(AuthProtocol::Sha1, "authpass12345678"),
+            UsmUser::new("user")
+                .auth(AuthProtocol::Sha1, "authpass12345678")
+                .unwrap(),
         );
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
@@ -1319,13 +1331,17 @@ mod tests {
 
         let engine_id = local_engine_id();
         for user in [
-            UsmUser::new("user").auth(AuthProtocol::Sha256, b"auth-password"),
-            UsmUser::new("user").auth_priv(
-                AuthProtocol::Sha256,
-                b"auth-password",
-                PrivProtocol::Aes128,
-                b"priv-password",
-            ),
+            UsmUser::new("user")
+                .auth(AuthProtocol::Sha256, b"auth-password")
+                .unwrap(),
+            UsmUser::new("user")
+                .auth_priv(
+                    AuthProtocol::Sha256,
+                    b"auth-password",
+                    PrivProtocol::Aes128,
+                    b"priv-password",
+                )
+                .unwrap(),
         ] {
             let mut users = HashMap::new();
             users.insert(Bytes::from_static(b"user"), user);
@@ -1344,15 +1360,19 @@ mod tests {
             assert_eq!(stats.unsupported_sec_levels.load(Ordering::Relaxed), 0);
         }
 
-        let inbound_user = UsmUser::new("user").auth_priv(
-            AuthProtocol::Sha256,
-            b"auth-password",
-            PrivProtocol::Aes128,
-            b"priv-password",
-        );
+        let inbound_user = UsmUser::new("user")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            )
+            .unwrap();
         let mut users = HashMap::new();
         users.insert(Bytes::from_static(b"user"), inbound_user);
-        let outbound = UsmConfig::new("user").auth(AuthProtocol::Sha256, b"auth-password");
+        let outbound = UsmConfig::new("user")
+            .auth(AuthProtocol::Sha256, b"auth-password")
+            .unwrap();
         let keys = outbound.derive_keys(&engine_id).unwrap();
         let data = crate::v3::encode::encode_v3_message(
             &Pdu::get_request(42, &[]),

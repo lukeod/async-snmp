@@ -324,13 +324,16 @@ mod tests {
             let config = match level {
                 SecurityLevel::NoAuthNoPriv => UsmConfig::new(username.clone()),
                 SecurityLevel::AuthNoPriv => UsmConfig::new(username.clone())
-                    .auth(AuthProtocol::Sha256, b"long-auth-password"),
-                SecurityLevel::AuthPriv => UsmConfig::new(username.clone()).auth_priv(
-                    AuthProtocol::Sha256,
-                    b"long-auth-password",
-                    PrivProtocol::Aes128,
-                    b"long-privacy-password",
-                ),
+                    .auth(AuthProtocol::Sha256, b"long-auth-password")
+                    .unwrap(),
+                SecurityLevel::AuthPriv => UsmConfig::new(username.clone())
+                    .auth_priv(
+                        AuthProtocol::Sha256,
+                        b"long-auth-password",
+                        PrivProtocol::Aes128,
+                        b"long-privacy-password",
+                    )
+                    .unwrap(),
             };
             let keys = config.derive_keys(&engine_id).unwrap();
             let salt = SaltCounter::new().unwrap();

@@ -13,10 +13,15 @@ use super::{AuthProtocol, PrivProtocol};
 ///
 /// This covers failures that originate from the crypto backend itself:
 /// unsupported algorithms, invalid key material, and cipher-level errors.
-/// Protocol-level framing errors (e.g., wrong privParameters length) live
-/// in [`PrivacyError`](super::privacy::PrivacyError).
+/// Protocol-level framing errors (e.g., wrong privParameters length) use the
+/// separate privacy error type in builds that enable a crypto backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CryptoError {
+    /// No cryptographic backend was compiled into the crate.
+    ///
+    /// `noAuthNoPriv` remains available without a backend, but configuring
+    /// authentication or privacy credentials returns this error immediately.
+    BackendUnavailable,
     /// The crypto backend does not support the requested algorithm.
     ///
     /// For example, the FIPS provider does not support MD5 or DES.
@@ -47,6 +52,7 @@ pub enum CryptoError {
 impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BackendUnavailable => write!(f, "no crypto backend is enabled"),
             Self::UnsupportedAlgorithm(name) => {
                 write!(f, "unsupported algorithm: {name}")
             }
@@ -176,7 +182,7 @@ pub(crate) trait CryptoProvider: Send + Sync + 'static {
 /// Cargo features only determine which variants are available. Enabling the
 /// FIPS backend does not by itself make an operation FIPS-compliant; callers
 /// must select the `AwsLcFips` variant of [`CryptoBackend`] and can inspect that
-/// choice through [`UsmConfig::crypto_backend`](super::UsmConfig::crypto_backend).
+/// choice through `UsmConfig::crypto_backend`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum CryptoBackend {
@@ -186,8 +192,8 @@ pub enum CryptoBackend {
     /// The AWS-LC FIPS implementation.
     #[cfg(feature = "crypto-fips")]
     AwsLcFips,
+    /// No backend is compiled into this build.
     #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-    #[doc(hidden)]
     Unavailable,
 }
 
@@ -205,7 +211,7 @@ impl Default for CryptoBackend {
 impl CryptoBackend {
     #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
     fn unavailable() -> CryptoError {
-        CryptoError::UnsupportedAlgorithm("no crypto backend is enabled")
+        CryptoError::BackendUnavailable
     }
 
     pub(crate) fn validate_auth_protocol(self, _protocol: AuthProtocol) -> CryptoResult<()> {

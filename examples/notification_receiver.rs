@@ -80,11 +80,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PrivProtocol::Aes128,
                 b"privpass123",
             )
-        })
+        })?
         // Can add multiple users
         .usm_user("readonly", |u| {
             u.auth(AuthProtocol::Sha256, b"readonlypass")
-        })
+        })?
         // This synchronous policy runs after applicable USM processing and
         // notification-prefix validation, but before any Inform response. It
         // can inspect all normalized content; keep it bounded and non-blocking.

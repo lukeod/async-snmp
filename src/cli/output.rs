@@ -694,6 +694,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn security_info_is_derived_from_constructed_auth() {
         let community = Auth::v1("private");
@@ -705,7 +706,8 @@ mod tests {
 
         let usm = crate::Auth::usm_builder("operator")
             .auth(crate::AuthProtocol::Sha256, "authpassword")
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(usm.version(), Version::V3);
         assert!(matches!(
             build_security_info(&usm),

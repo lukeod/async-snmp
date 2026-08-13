@@ -366,7 +366,8 @@ async fn v3_auth_no_priv() {
         &target,
         Auth::usm_builder(users::AUTHSHA256_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -395,7 +396,8 @@ async fn v3_auth_priv() {
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -424,7 +426,8 @@ async fn v3_auth_md5() {
         &target,
         Auth::usm_builder(users::AUTHMD5_USER)
             .auth(AuthProtocol::Md5, AUTH_PASS)
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -448,7 +451,8 @@ async fn v3_auth_sha1() {
         &target,
         Auth::usm_builder(users::AUTHSHA1_USER)
             .auth(AuthProtocol::Sha1, AUTH_PASS)
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -472,7 +476,8 @@ async fn v3_auth_sha256() {
         &target,
         Auth::usm_builder(users::AUTHSHA256_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -491,7 +496,10 @@ async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(user).auth(protocol, AUTH_PASS).build(),
+        Auth::usm_builder(user)
+            .auth(protocol, AUTH_PASS)
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -541,7 +549,8 @@ async fn v3_priv_des() {
         &target,
         Auth::usm_builder(users::PRIVDES_USER)
             .auth_priv(AuthProtocol::Sha1, AUTH_PASS, PrivProtocol::Des, PRIV_PASS)
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -570,7 +579,8 @@ async fn v3_priv_aes128() {
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -764,7 +774,8 @@ async fn v3_engine_discovery_and_request() {
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build(),
+            .build()
+            .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()

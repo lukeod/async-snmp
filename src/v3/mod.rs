@@ -74,10 +74,7 @@ pub use config::DerivedKeys;
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 pub(crate) use config::DerivedKeys;
 pub use config::{UsmConfig, UsmUser};
-#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use crypto::{CryptoBackend, CryptoError, CryptoResult};
-#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-pub(crate) use crypto::{CryptoBackend, CryptoError, CryptoResult};
 pub use engine::report_oids;
 pub use engine::{
     AuthenticatedEngineTime, DiscoveredEngine, EngineCache, EngineState, MAX_ENGINE_ID_LEN,

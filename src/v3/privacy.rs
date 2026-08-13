@@ -179,6 +179,9 @@ impl PrivKey {
     /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
     /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
     ///
+    /// The password length and both backend capabilities are validated before
+    /// password expansion or key localization begins.
+    ///
     /// This method performs password expansion and localization. When multiple
     /// engines share credentials, retain a [`MasterKey`](super::MasterKey) and
     /// call [`PrivKey::from_master_key`] for each engine.
@@ -227,6 +230,11 @@ impl PrivKey {
     ) -> super::crypto::CryptoResult<Self> {
         use super::MasterKey;
 
+        if password.len() < super::auth::MIN_PASSWORD_LENGTH {
+            return Err(CryptoError::PasswordTooShort);
+        }
+        backend.validate_auth_protocol(auth_protocol)?;
+        backend.validate_priv_protocol(priv_protocol)?;
         let master = MasterKey::from_password_with_backend(auth_protocol, password, backend)?;
         Self::from_master_key(&master, priv_protocol, engine_id)
     }
@@ -240,6 +248,9 @@ impl PrivKey {
     ///
     /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
     /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
+    ///
+    /// Both the master key's authentication protocol and `priv_protocol` must
+    /// be supported by its selected backend.
     ///
     /// # Example
     ///
@@ -267,6 +278,12 @@ impl PrivKey {
         };
 
         let auth_protocol = master.protocol();
+        master
+            .crypto_backend()
+            .validate_auth_protocol(auth_protocol)?;
+        master
+            .crypto_backend()
+            .validate_priv_protocol(priv_protocol)?;
         let key_extension = priv_protocol.key_extension_for(auth_protocol);
 
         // Localize the master key (per RFC 3826 Section 1.2)
@@ -304,7 +321,8 @@ impl PrivKey {
     /// this returns `Err(CryptoError::InvalidKeyLength)` instead. A key longer
     /// than `protocol.key_len()` is accepted (per RFC 3826 Section 3.1.2, the
     /// localized key length is "at least" the required size); the extra
-    /// trailing bytes are simply unused.
+    /// trailing bytes are simply unused. Length validation precedes the
+    /// selected backend's privacy-protocol capability check.
     pub fn from_bytes(
         protocol: PrivProtocol,
         key: impl Into<Vec<u8>>,
@@ -322,6 +340,7 @@ impl PrivKey {
         if key.len() < protocol.key_len() {
             return Err(CryptoError::InvalidKeyLength);
         }
+        backend.validate_priv_protocol(protocol)?;
         Ok(Self {
             key,
             protocol,
@@ -621,6 +640,52 @@ impl std::fmt::Debug for PrivKey {
     }
 }
 
+#[cfg(all(test, not(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))))]
+mod no_backend_key_tests {
+    use super::*;
+
+    #[test]
+    fn active_privacy_key_constructors_reject_unavailable_backend() {
+        for protocol in [
+            PrivProtocol::Des,
+            PrivProtocol::Des3,
+            PrivProtocol::Aes128,
+            PrivProtocol::Aes192,
+            PrivProtocol::Aes256,
+        ] {
+            let len = protocol.key_len();
+            assert_eq!(
+                PrivKey::from_bytes(protocol, vec![0_u8; len - 1]).unwrap_err(),
+                CryptoError::InvalidKeyLength
+            );
+            assert_eq!(
+                PrivKey::from_bytes(protocol, vec![0_u8; len]).unwrap_err(),
+                CryptoError::BackendUnavailable
+            );
+        }
+        assert_eq!(
+            PrivKey::from_password(
+                AuthProtocol::Sha256,
+                PrivProtocol::Aes128,
+                b"short",
+                b"engine-id",
+            )
+            .unwrap_err(),
+            CryptoError::PasswordTooShort
+        );
+        assert_eq!(
+            PrivKey::from_password(
+                AuthProtocol::Sha256,
+                PrivProtocol::Aes128,
+                b"long-enough",
+                b"engine-id",
+            )
+            .unwrap_err(),
+            CryptoError::BackendUnavailable
+        );
+    }
+}
+
 #[cfg(test)]
 mod entropy_tests {
     use super::*;
@@ -805,10 +870,19 @@ mod tests {
     #[test]
     fn test_from_bytes_accepts_exact_length_key() {
         let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 16]);
-        assert!(priv_key.is_ok());
+        if CryptoBackend::default()
+            .validate_priv_protocol(PrivProtocol::Des)
+            .is_ok()
+        {
+            assert!(priv_key.is_ok());
+        } else {
+            assert_eq!(
+                priv_key.unwrap_err(),
+                CryptoError::UnsupportedAlgorithm("DES")
+            );
+        }
 
-        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; 16]);
-        assert!(priv_key.is_ok());
+        assert!(PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; 16]).is_ok());
     }
 
     #[test]
@@ -816,20 +890,73 @@ mod tests {
         // RFC 3826 Section 3.1.2 specifies the localized key is ">= " the required
         // length; downstream slices only ever take a `[..N]` prefix, so extra
         // trailing bytes are unused but harmless.
-        let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 20]).unwrap();
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; 20]).unwrap();
         // Encrypting should not panic now that the key is validated as long enough.
         let _ = priv_key.encrypt(b"data", 0, 0, &SaltCounter::new().unwrap());
     }
 
     #[test]
     fn test_from_bytes_key_len_boundary() {
-        let des_len = PrivProtocol::Des.key_len();
-        assert!(PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; des_len - 1]).is_err());
-        assert!(PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; des_len]).is_ok());
+        let aes128_len = PrivProtocol::Aes128.key_len();
+        assert!(PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; aes128_len - 1]).is_err());
+        assert!(PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; aes128_len]).is_ok());
 
         let aes256_len = PrivProtocol::Aes256.key_len();
         assert!(PrivKey::from_bytes(PrivProtocol::Aes256, vec![0u8; aes256_len - 1]).is_err());
         assert!(PrivKey::from_bytes(PrivProtocol::Aes256, vec![0u8; aes256_len]).is_ok());
+    }
+
+    #[test]
+    fn raw_privacy_key_capabilities_for_each_protocol_and_backend() {
+        let protocols = [
+            PrivProtocol::Des,
+            PrivProtocol::Des3,
+            PrivProtocol::Aes128,
+            PrivProtocol::Aes192,
+            PrivProtocol::Aes256,
+        ];
+        let backends = [
+            #[cfg(feature = "crypto-rustcrypto")]
+            CryptoBackend::RustCrypto,
+            #[cfg(feature = "crypto-fips")]
+            CryptoBackend::AwsLcFips,
+        ];
+
+        for backend in backends {
+            for protocol in protocols {
+                let len = protocol.key_len();
+                assert_eq!(
+                    PrivKey::from_bytes_with_backend(protocol, vec![0_u8; len - 1], backend)
+                        .unwrap_err(),
+                    CryptoError::InvalidKeyLength
+                );
+
+                let result = PrivKey::from_bytes_with_backend(protocol, vec![0_u8; len], backend);
+                let is_supported = match backend {
+                    #[cfg(feature = "crypto-rustcrypto")]
+                    CryptoBackend::RustCrypto => true,
+                    #[cfg(feature = "crypto-fips")]
+                    CryptoBackend::AwsLcFips => {
+                        !matches!(protocol, PrivProtocol::Des | PrivProtocol::Des3)
+                    }
+                };
+                if is_supported {
+                    assert_eq!(result.unwrap().key.len(), protocol.key_len());
+                } else {
+                    let algorithm = match protocol {
+                        PrivProtocol::Des => "DES",
+                        PrivProtocol::Des3 => "3DES",
+                        PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
+                            unreachable!()
+                        }
+                    };
+                    assert_eq!(
+                        result.unwrap_err(),
+                        CryptoError::UnsupportedAlgorithm(algorithm)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

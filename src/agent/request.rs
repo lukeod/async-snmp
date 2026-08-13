@@ -1022,7 +1022,8 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
-            .usm_user("noauthuser", |user| user)
+            .usm_user("noauthuser", Ok)
+            .unwrap()
             .allow_all_access()
             .strict_decoding()
             .build()
@@ -1047,7 +1048,8 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
-            .usm_user("noauthuser", |u| u)
+            .usm_user("noauthuser", Ok)
+            .unwrap()
             .allow_all_access()
             .build()
             .await
@@ -1081,7 +1083,8 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
-            .usm_user("noauthuser", |u| u)
+            .usm_user("noauthuser", Ok)
+            .unwrap()
             .allow_all_access()
             .build()
             .await
@@ -1114,6 +1117,7 @@ mod tests {
             .usm_user("keyed-user", |user| {
                 user.auth(AuthProtocol::Sha256, b"auth-password")
             })
+            .unwrap()
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
             .allow_all_access()
             .build()
@@ -1149,6 +1153,7 @@ mod tests {
             .usm_user("keyed-user", |user| {
                 user.auth(AuthProtocol::Sha256, b"auth-password")
             })
+            .unwrap()
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
             .vacm(|vacm| {
                 vacm.group("keyed-user", SecurityModel::Usm, "operators")
@@ -1197,7 +1202,8 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"\x80\x00\x00\x00\x01agenteng".to_vec())
-            .usm_user("user", |user| user)
+            .usm_user("user", Ok)
+            .unwrap()
             .vacm(|vacm| vacm)
             .build()
             .await
@@ -1324,7 +1330,8 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.to_vec())
-            .usm_user(username.clone(), |u| u)
+            .usm_user(username.clone(), Ok)
+            .unwrap()
             .max_message_size(exact_limit)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler.clone())
             .without_builtin_handlers()
@@ -1368,7 +1375,8 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
-            .usm_user("noauthuser", |u| u)
+            .usm_user("noauthuser", Ok)
+            .unwrap()
             .allow_all_access()
             .build()
             .await
@@ -1399,7 +1407,8 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
-            .usm_user("noauthuser", |u| u)
+            .usm_user("noauthuser", Ok)
+            .unwrap()
             .allow_all_access()
             .build()
             .await
@@ -1442,6 +1451,7 @@ mod tests {
             .usm_user("trapuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .allow_all_access()
             .build()
             .await
@@ -1485,6 +1495,7 @@ mod tests {
             .usm_user("trapuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .allow_all_access()
             .build()
             .await

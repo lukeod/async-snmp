@@ -908,7 +908,9 @@ async fn send_datagram_with_timeout(
 mod tests {
     use super::{NotificationSinkId, SinkSkipReason, SinkStatus, TrapSink};
     use crate::agent::{Agent, SecurityModel, VacmSecurityModel};
-    use crate::{Auth, AuthProtocol, Error, PrivProtocol, SecurityLevel, Value, VarBind, oid};
+    use crate::{Auth, Error, SecurityLevel, Value, VarBind, oid};
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    use crate::{AuthProtocol, PrivProtocol};
     use bytes::Bytes;
 
     fn test_sink(auth: impl Into<Auth>) -> TrapSink {
@@ -923,6 +925,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn notify_view_uses_each_sink_identity_context_and_security_level() {
         let agent = Agent::builder()
@@ -981,7 +984,8 @@ mod tests {
                 &test_sink(
                     Auth::usm_builder("context-user")
                         .context_name("tenant/blue")
-                        .build(),
+                        .build()
+                        .unwrap(),
                 ),
                 &trap_oid,
                 &[]
@@ -992,7 +996,8 @@ mod tests {
                 &test_sink(
                     Auth::usm_builder("context-user")
                         .context_name("tenant/red")
-                        .build(),
+                        .build()
+                        .unwrap(),
                 ),
                 &trap_oid,
                 &[]
@@ -1005,6 +1010,7 @@ mod tests {
                         .auth(AuthProtocol::Sha256, "auth-password")
                         .context_name("secure")
                         .build()
+                        .unwrap()
                 ),
                 &trap_oid,
                 &[]
@@ -1022,6 +1028,7 @@ mod tests {
                         )
                         .context_name("secure")
                         .build()
+                        .unwrap()
                 ),
                 &trap_oid,
                 &[]

@@ -66,7 +66,7 @@
 //!             PrivProtocol::Aes128,
 //!             b"privpass123",
 //!         )
-//!     })
+//!     }).unwrap()
 //!     .acceptance_policy(|notification| {
 //!         if notification.security_level >= Some(SecurityLevel::AuthNoPriv) {
 //!             NotificationAcceptance::Accept
@@ -109,6 +109,7 @@
 //!             b"privpass123",
 //!         )
 //!     })
+//!     .unwrap()
 //!     .acceptance_policy(|notification| match notification.security_level {
 //!         None => NotificationAcceptance::Accept, // community allowlist matched
 //!         Some(level) if level >= SecurityLevel::AuthNoPriv => {
@@ -758,7 +759,7 @@ impl NotificationReceiverBuilder {
     ///             PrivProtocol::Aes128,
     ///             b"privpassword",
     ///         )
-    ///     })
+    ///     }).unwrap()
     ///     .acceptance_policy(|notification| {
     ///         if notification.security_level >= Some(SecurityLevel::AuthNoPriv) {
     ///             NotificationAcceptance::Accept
@@ -771,15 +772,18 @@ impl NotificationReceiverBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    #[must_use]
-    pub fn usm_user<F>(mut self, username: impl Into<Bytes>, configure: F) -> Self
+    pub fn usm_user<F>(
+        mut self,
+        username: impl Into<Bytes>,
+        configure: F,
+    ) -> crate::CryptoResult<Self>
     where
-        F: FnOnce(UsmUser) -> UsmUser,
+        F: FnOnce(UsmUser) -> crate::CryptoResult<UsmUser>,
     {
         let username_bytes: Bytes = username.into();
-        let config = configure(UsmUser::new(username_bytes.clone()));
+        let config = configure(UsmUser::new(username_bytes.clone()))?;
         self.usm_users.insert(username_bytes, config);
-        self
+        Ok(self)
     }
 
     /// Restrict accepted v1/v2c notifications to the given community string.
@@ -1227,7 +1231,7 @@ impl Notification {
 ///     .authoritative_engine(engine)
 ///     .usm_user("trapuser", |u| {
 ///         u.auth(AuthProtocol::Sha1, b"authpassword")
-///     })
+///     }).unwrap()
 ///     .acceptance_policy(|notification| {
 ///         if notification.security_level >= Some(SecurityLevel::AuthNoPriv) {
 ///             NotificationAcceptance::Accept
@@ -1651,6 +1655,7 @@ mod tests {
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::pdu::Pdu;
     use crate::util::{EmptyCommunityPolicy, community_matches};
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::v3::AuthProtocol;
 
     #[test]
@@ -1889,11 +1894,13 @@ mod tests {
         assert_eq!(receiver.engine_id(), configured_engine_id);
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_notification_receiver_builder_with_user() {
         let builder = NotificationReceiverBuilder::new()
             .bind("0.0.0.0:1162")
-            .usm_user("trapuser", |u| u.auth(AuthProtocol::Sha1, b"authpass"));
+            .usm_user("trapuser", |u| u.auth(AuthProtocol::Sha1, b"authpass"))
+            .unwrap();
 
         assert_eq!(builder.bind_addr, "0.0.0.0:1162");
         assert_eq!(builder.usm_users.len(), 1);
@@ -1909,7 +1916,8 @@ mod tests {
     async fn test_v3_receiver_requires_authoritative_engine_before_bind() {
         let result = NotificationReceiver::builder()
             .bind("not a socket address")
-            .usm_user("user", |user| user)
+            .usm_user("user", Ok)
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await;
@@ -1926,7 +1934,8 @@ mod tests {
     async fn v3_receiver_requires_explicit_acceptance_policy_before_bind() {
         let result = NotificationReceiver::builder()
             .bind("not a socket address")
-            .usm_user("user", |user| user)
+            .usm_user("user", Ok)
+            .unwrap()
             .build()
             .await;
         let error = result.err().expect("missing receiver policy must fail");
@@ -1940,7 +1949,8 @@ mod tests {
     async fn test_invalid_usm_user_is_rejected_before_bind() {
         let result = NotificationReceiver::builder()
             .bind("not a socket address")
-            .usm_user("", |user| user)
+            .usm_user("", Ok)
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await;
@@ -2310,13 +2320,16 @@ mod tests {
         match level {
             SecurityLevel::NoAuthNoPriv => crate::v3::UsmConfig::new(username),
             SecurityLevel::AuthNoPriv => crate::v3::UsmConfig::new(username)
-                .auth(AuthProtocol::Sha256, b"inform-auth-password"),
-            SecurityLevel::AuthPriv => crate::v3::UsmConfig::new(username).auth_priv(
-                AuthProtocol::Sha256,
-                b"inform-auth-password",
-                PrivProtocol::Aes128,
-                b"inform-priv-password",
-            ),
+                .auth(AuthProtocol::Sha256, b"inform-auth-password")
+                .unwrap(),
+            SecurityLevel::AuthPriv => crate::v3::UsmConfig::new(username)
+                .auth_priv(
+                    AuthProtocol::Sha256,
+                    b"inform-auth-password",
+                    PrivProtocol::Aes128,
+                    b"inform-priv-password",
+                )
+                .unwrap(),
         }
     }
 
@@ -2328,13 +2341,16 @@ mod tests {
         match level {
             SecurityLevel::NoAuthNoPriv => crate::v3::UsmUser::new(username),
             SecurityLevel::AuthNoPriv => crate::v3::UsmUser::new(username)
-                .auth(AuthProtocol::Sha256, b"inform-auth-password"),
-            SecurityLevel::AuthPriv => crate::v3::UsmUser::new(username).auth_priv(
-                AuthProtocol::Sha256,
-                b"inform-auth-password",
-                PrivProtocol::Aes128,
-                b"inform-priv-password",
-            ),
+                .auth(AuthProtocol::Sha256, b"inform-auth-password")
+                .unwrap(),
+            SecurityLevel::AuthPriv => crate::v3::UsmUser::new(username)
+                .auth_priv(
+                    AuthProtocol::Sha256,
+                    b"inform-auth-password",
+                    PrivProtocol::Aes128,
+                    b"inform-priv-password",
+                )
+                .unwrap(),
         }
     }
 
@@ -2428,6 +2444,7 @@ mod tests {
             .usm_user("trapuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -2497,6 +2514,7 @@ mod tests {
             .usm_user("trapuser", |user| {
                 user.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .acceptance_policy(|notification: &NotificationEnvelope<'_>| {
                 if notification.username == Some(b"trapuser")
                     && notification.security_level >= Some(SecurityLevel::AuthNoPriv)
@@ -2529,6 +2547,7 @@ mod tests {
             .usm_user("informuser", |user| {
                 user.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .acceptance_policy(|notification: &NotificationEnvelope<'_>| {
                 if notification.pdu_class == NotificationPduClass::Inform
                     && notification.security_level >= Some(SecurityLevel::AuthNoPriv)
@@ -2738,6 +2757,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -2773,6 +2793,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -2808,6 +2829,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3070,6 +3092,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3107,6 +3130,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3143,6 +3167,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3243,7 +3268,8 @@ mod tests {
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
-                .usm_user(username.clone(), move |_| config)
+                .usm_user(username.clone(), move |_| Ok(config))
+                .unwrap()
                 .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
                     assert_eq!(notification.version, Version::V3);
                     assert!(notification.community.is_none());
@@ -3300,7 +3326,8 @@ mod tests {
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
-                .usm_user(username.clone(), move |_| config)
+                .usm_user(username.clone(), move |_| Ok(config))
+                .unwrap()
                 .accept_all_notifications()
                 .max_message_size(1)
                 .build()
@@ -3343,6 +3370,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3455,6 +3483,7 @@ mod tests {
             .usm_user("trapuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .acceptance_policy(move |_: &NotificationEnvelope<'_>| {
                 policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
                 NotificationAcceptance::Accept
@@ -3508,7 +3537,8 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"my-receiver-engine".to_vec())
-            .usm_user("plainuser", |u| u)
+            .usm_user("plainuser", Ok)
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3541,6 +3571,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3694,6 +3725,7 @@ mod tests {
                     b"privpass12345678",
                 )
             })
+            .unwrap()
             .acceptance_policy(move |_: &NotificationEnvelope<'_>| {
                 policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
                 NotificationAcceptance::Accept
@@ -3750,6 +3782,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3824,6 +3857,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -3888,6 +3922,7 @@ mod tests {
             .usm_user("informuser", |u| {
                 u.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await
@@ -4247,7 +4282,8 @@ mod tests {
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
-                .usm_user(username.clone(), move |_| config)
+                .usm_user(username.clone(), move |_| Ok(config))
+                .unwrap()
                 .accept_all_notifications()
                 .build()
                 .await
@@ -4290,7 +4326,8 @@ mod tests {
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
-                .usm_user(username.clone(), move |_| config)
+                .usm_user(username.clone(), move |_| Ok(config))
+                .unwrap()
                 .accept_all_notifications()
                 .strict_decoding()
                 .build()
@@ -5005,6 +5042,7 @@ mod tests {
             .usm_user("informuser", |user| {
                 user.auth(AuthProtocol::Sha1, b"authpass12345678")
             })
+            .unwrap()
             .accept_all_notifications()
             .build()
             .await

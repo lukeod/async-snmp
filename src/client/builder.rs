@@ -135,7 +135,7 @@ impl From<SocketAddr> for Target {
 /// // v3 client with authentication
 /// let client = ClientBuilder::new(Auth::usm_builder("admin")
 ///     .auth(async_snmp::AuthProtocol::Sha256, "password")
-///     .build())
+///     .build().unwrap())
 ///     .request_timeout(Duration::from_secs(10))
 ///     .retry(Retry::fixed(5, Duration::ZERO))
 ///     .target("192.168.1.1:161")
@@ -222,7 +222,7 @@ impl ClientBuilder {
     /// // Using Auth::usm_builder() for authenticated SNMPv3
     /// let builder = ClientBuilder::new(Auth::usm_builder("admin")
     ///     .auth(async_snmp::AuthProtocol::Sha256, "password")
-    ///     .build());
+    ///     .build().unwrap());
     /// ```
     pub fn new(auth: impl Into<Auth>) -> Self {
         Self {
@@ -524,6 +524,8 @@ impl ClientBuilder {
     /// # Example
     ///
     /// ```rust
+    /// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    /// # {
     /// use async_snmp::{Auth, AuthProtocol, ClientBuilder};
     /// use async_snmp::v3::AuthoritativeEngine;
     /// use std::convert::Infallible;
@@ -532,8 +534,9 @@ impl ClientBuilder {
     ///     Ok::<(), Infallible>(())
     /// }).unwrap();
     /// let builder = async_snmp::Client::builder(("192.168.1.1", 162),
-    ///     Auth::usm_builder("trapuser").auth(AuthProtocol::Sha256, "password").build())
+    ///     Auth::usm_builder("trapuser").auth(AuthProtocol::Sha256, "password").build().unwrap())
     ///     .local_authoritative_engine(engine);
+    /// # }
     /// ```
     #[must_use]
     pub fn local_authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
@@ -554,6 +557,8 @@ impl ClientBuilder {
     /// # Example
     ///
     /// ```rust
+    /// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    /// # {
     /// use async_snmp::{Auth, AuthProtocol, ClientBuilder, EngineCache};
     /// use std::sync::Arc;
     ///
@@ -562,12 +567,13 @@ impl ClientBuilder {
     ///
     /// // Multiple clients can share the same cache
     /// let builder1 = async_snmp::Client::builder("192.168.1.1:161",
-    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build())
+    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build().unwrap())
     ///     .engine_cache(cache.clone());
     ///
     /// let builder2 = async_snmp::Client::builder("192.168.1.2:161",
-    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build())
+    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build().unwrap())
     ///     .engine_cache(cache.clone());
+    /// # }
     /// ```
     #[must_use]
     pub fn engine_cache(mut self, cache: Arc<EngineCache>) -> Self {
@@ -694,11 +700,13 @@ impl ClientBuilder {
 
 impl TargetClientBuilder {
     #[cfg(test)]
+    #[allow(dead_code, reason = "used by feature-specific builder tests")]
     fn validate(&self) -> Result<()> {
         self.client.validate()
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "used by feature-specific builder tests")]
     fn build_config(&self) -> ClientConfig {
         self.client.build_config()
     }
@@ -1264,7 +1272,9 @@ mod tests {
     use super::*;
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::v3::MasterKeys;
-    use crate::v3::{AuthProtocol, PrivProtocol, UsmConfig};
+    use crate::v3::UsmConfig;
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    use crate::v3::{AuthProtocol, PrivProtocol};
 
     #[test]
     fn test_builder_defaults() {
@@ -1717,10 +1727,8 @@ mod tests {
         assert!(matches!(invalid, Err(ref error) if matches!(&**error, Error::Config(_))));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        let invalid_usm = ClientBuilder::new(Auth::Usm(
-            UsmConfig::new("").auth(AuthProtocol::Sha256, b"password"),
-        ))
-        .build_with_transport(transport);
+        let invalid_usm =
+            ClientBuilder::new(Auth::Usm(UsmConfig::new(""))).build_with_transport(transport);
         assert!(matches!(
             invalid_usm,
             Err(ref error)
@@ -1821,17 +1829,20 @@ mod tests {
         assert!(builder.validate().is_ok());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_validate_usm_auth_no_priv_ok() {
         let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm_builder("admin")
                 .auth(AuthProtocol::Sha256, "authpass")
-                .build(),
+                .build()
+                .unwrap(),
         );
         assert!(builder.validate().is_ok());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_validate_usm_auth_priv_ok() {
         let builder = Client::builder(
@@ -1843,18 +1854,21 @@ mod tests {
                     PrivProtocol::Aes128,
                     "privpass",
                 )
-                .build(),
+                .build()
+                .unwrap(),
         );
         assert!(builder.validate().is_ok());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_builder_with_usm_config() {
         let builder = Client::builder(
             "192.168.1.1:161",
             Auth::usm_builder("admin")
-                .auth(AuthProtocol::Sha256, "pass")
-                .build(),
+                .auth(AuthProtocol::Sha256, "password")
+                .build()
+                .unwrap(),
         );
         assert!(builder.validate().is_ok());
     }
@@ -1867,7 +1881,8 @@ mod tests {
             "192.168.1.1:161",
             Auth::usm_builder("user")
                 .with_master_keys(auth_only)
-                .build(),
+                .build()
+                .unwrap(),
         );
         assert!(builder.validate().is_ok());
 
@@ -1879,11 +1894,13 @@ mod tests {
             "192.168.1.1:161",
             Auth::usm_builder("user")
                 .with_master_keys(auth_priv)
-                .build(),
+                .build()
+                .unwrap(),
         );
         assert!(builder.validate().is_ok());
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_build_config_preserves_v3_context_name() {
         let builder = Client::builder(
@@ -1891,7 +1908,8 @@ mod tests {
             Auth::usm_builder("admin")
                 .auth(AuthProtocol::Sha256, "authpass")
                 .context_name("vlan100")
-                .build(),
+                .build()
+                .unwrap(),
         );
 
         let config = builder.build_config();

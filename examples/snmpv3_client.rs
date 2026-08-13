@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PrivProtocol::Aes128,
             "privpass123",
         )
-        .build();
+        .build()?;
 
     let client = Client::builder(target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Uses container user: authsha256_user (SHA-256 auth, no privacy)
     let auth_only = Auth::usm_builder("authsha256_user")
         .auth(AuthProtocol::Sha256, "authpass123")
-        .build();
+        .build()?;
     // auth() selects authNoPriv.
 
     let client_auth = Client::builder(target, auth_only)
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // repeating password-to-key derivation.
         let auth = Auth::usm_builder("privaes192_user")
             .with_master_keys(master_keys.clone())
-            .build();
+            .build()?;
 
         // Each client reuses the master keys; only localization is performed
         match Client::builder(*target_addr, auth)
@@ -186,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PrivProtocol::Aes256,
             "strongprivpass",
         )
-        .build();
+        .build()?;
 
     println!("Created auth config: SHA-512 + AES-256");
     println!("Auth protocol: {:?}", AuthProtocol::Sha512);
@@ -209,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "privpass123",
         )
         .context_name("vlan100")
-        .build();
+        .build()?;
 
     println!("Created auth config with context name 'vlan100'");
 

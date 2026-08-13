@@ -20,7 +20,7 @@
 //! // Each client localizes the keys for its authoritative engine.
 //! let auth = Auth::usm_builder("admin")
 //!     .with_master_keys(master_keys)
-//!     .build();
+//!     .build().unwrap();
 //! # }
 //! ```
 
@@ -51,7 +51,10 @@ pub enum Auth {
 /// [`Auth::usm`] constructs the username-only `noAuthNoPriv` case directly,
 /// consistently with [`Auth::v1`] and [`Auth::v2c`]. Use this builder when
 /// authentication, privacy, a context name, precomputed keys, or an explicit
-/// cryptographic backend is required. [`Self::build`] always returns [`Auth`].
+/// cryptographic backend is required. Credential and backend methods are
+/// fallible so capability errors are returned while the configuration is being
+/// assembled. [`Self::build`] returns the completed [`Auth`] or the first
+/// credential capability error.
 ///
 /// The [`Debug`](std::fmt::Debug) implementation exposes usernames and context
 /// names as byte-exact escaped octets while redacting passwords and master keys.
@@ -59,11 +62,14 @@ pub enum Auth {
 /// ordering, or hashing credentials.
 ///
 /// ```rust
+/// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+/// # {
 /// use async_snmp::{Auth, AuthProtocol};
 ///
 /// let builder = Auth::usm_builder("admin")
 ///     .auth(AuthProtocol::Sha256, "authpassword");
-/// let auth = builder.clone().build();
+/// let auth = builder.clone().build().unwrap();
+/// # }
 /// ```
 ///
 /// ```compile_fail,E0369
@@ -90,19 +96,23 @@ pub enum Auth {
 #[derive(Clone)]
 #[must_use = "call build() to produce an Auth configuration"]
 pub struct UsmAuthBuilder {
-    config: UsmConfig,
+    config: crate::CryptoResult<UsmConfig>,
 }
 
 impl UsmAuthBuilder {
     fn new(username: impl AsRef<[u8]>) -> Self {
         Self {
-            config: UsmConfig::new(bytes::Bytes::copy_from_slice(username.as_ref())),
+            config: Ok(UsmConfig::new(bytes::Bytes::copy_from_slice(
+                username.as_ref(),
+            ))),
         }
     }
 
     /// Configure password-backed authentication (`authNoPriv`).
     pub fn auth(mut self, protocol: crate::AuthProtocol, password: impl AsRef<[u8]>) -> Self {
-        self.config = self.config.auth(protocol, password);
+        self.config = self
+            .config
+            .and_then(|config| config.auth(protocol, password));
         self
     }
 
@@ -114,41 +124,51 @@ impl UsmAuthBuilder {
         priv_protocol: crate::PrivProtocol,
         priv_password: impl AsRef<[u8]>,
     ) -> Self {
-        self.config =
-            self.config
-                .auth_priv(auth_protocol, auth_password, priv_protocol, priv_password);
+        self.config = self.config.and_then(|config| {
+            config.auth_priv(auth_protocol, auth_password, priv_protocol, priv_password)
+        });
         self
     }
 
     /// Set the `SNMPv3` scoped-PDU context name as protocol octets.
     pub fn context_name(mut self, context_name: impl Into<bytes::Bytes>) -> Self {
-        self.config = self.config.context_name(context_name);
+        self.config = self.config.map(|config| config.context_name(context_name));
         self
     }
 
     /// Select the cryptographic backend for this USM configuration.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     pub fn with_crypto_backend(mut self, backend: crate::CryptoBackend) -> Self {
-        self.config = self.config.with_crypto_backend(backend);
+        self.config = self
+            .config
+            .and_then(|config| config.with_crypto_backend(backend));
         self
     }
 
     /// Use precomputed master keys instead of password-backed credentials.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     pub fn with_master_keys(mut self, master_keys: crate::MasterKeys) -> Self {
-        self.config = self.config.with_master_keys(master_keys);
+        self.config = self
+            .config
+            .and_then(|config| config.with_master_keys(master_keys));
         self
     }
 
     /// Build the `SNMPv3` authentication configuration.
-    pub fn build(self) -> Auth {
-        Auth::Usm(self.config)
+    pub fn build(self) -> crate::CryptoResult<Auth> {
+        self.config.map(Auth::Usm)
     }
 }
 
 impl std::fmt::Debug for UsmAuthBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("UsmAuthBuilder").field(&self.config).finish()
+        match &self.config {
+            Ok(config) => f.debug_tuple("UsmAuthBuilder").field(config).finish(),
+            Err(error) => f
+                .debug_tuple("UsmAuthBuilder")
+                .field(&format_args!("invalid configuration: {error}"))
+                .finish(),
+        }
     }
 }
 
@@ -245,11 +265,14 @@ impl Auth {
     /// authentication configuration.
     ///
     /// Usernames are accepted and retained as protocol octets. The terminal
-    /// [`UsmAuthBuilder::build`] method returns [`Auth`] unambiguously.
+    /// [`UsmAuthBuilder::build`] method returns a cryptographic capability
+    /// error before the configuration can be passed to a network role.
     ///
     /// # Example
     ///
     /// ```rust
+    /// # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    /// # {
     /// use async_snmp::{Auth, AuthProtocol, PrivProtocol};
     ///
     /// let auth = Auth::usm_builder("admin")
@@ -260,7 +283,8 @@ impl Auth {
     ///         "privpassword",
     ///     )
     ///     .context_name("tenant/blue")
-    ///     .build();
+    ///     .build().unwrap();
+    /// # }
     /// ```
     pub fn usm_builder(username: impl AsRef<[u8]>) -> UsmAuthBuilder {
         UsmAuthBuilder::new(username)
@@ -323,6 +347,7 @@ impl std::fmt::Debug for Auth {
 mod tests {
     use super::*;
     use crate::message::SecurityLevel;
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::v3::{AuthProtocol, PrivProtocol};
     use bytes::Bytes;
 
@@ -402,11 +427,13 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_auth_no_priv() {
         let auth = Auth::usm_builder("admin")
             .auth(AuthProtocol::Sha256, "authpass123")
-            .build();
+            .build()
+            .unwrap();
         match auth {
             Auth::Usm(usm) => {
                 assert_eq!(usm.username().as_ref(), b"admin");
@@ -416,6 +443,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_auth_priv() {
         let auth = Auth::usm_builder("admin")
@@ -425,7 +453,8 @@ mod tests {
                 PrivProtocol::Aes128,
                 "privpass",
             )
-            .build();
+            .build()
+            .unwrap();
         match auth {
             Auth::Usm(usm) => {
                 assert_eq!(usm.username().as_ref(), b"admin");
@@ -435,12 +464,14 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_with_context_name() {
         let auth = Auth::usm_builder("admin")
             .auth(AuthProtocol::Sha256, "authpass")
             .context_name("vlan100")
-            .build();
+            .build()
+            .unwrap();
         match auth {
             Auth::Usm(usm) => {
                 assert_eq!(usm.username().as_ref(), b"admin");
@@ -450,13 +481,20 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_builder_chaining() {
         // Verify all methods can be chained
         let auth = Auth::usm_builder("user")
-            .auth_priv(AuthProtocol::Sha512, "auth", PrivProtocol::Aes256, "priv")
+            .auth_priv(
+                AuthProtocol::Sha512,
+                "authpass",
+                PrivProtocol::Aes256,
+                "privpass",
+            )
             .context_name("ctx")
-            .build();
+            .build()
+            .unwrap();
 
         match auth {
             Auth::Usm(usm) => {
@@ -468,6 +506,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_debug_redacts_secrets() {
         // Community string must not appear in Debug output.
@@ -485,7 +524,8 @@ mod tests {
                 "privpassword456",
             )
             .context_name("vlan100")
-            .build();
+            .build()
+            .unwrap();
         let config_rendered = format!("{auth:?}");
         assert!(
             !config_rendered.contains("authpassword123"),
@@ -524,6 +564,7 @@ mod tests {
         assert_eq!(config.username(), &username);
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_builder_preserves_non_utf8_octets_at_each_security_level() {
         let username = Bytes::from_static(b"user\x00\xff");
@@ -531,7 +572,8 @@ mod tests {
             Auth::usm(username.clone()),
             Auth::usm_builder(username.clone())
                 .auth(AuthProtocol::Sha256, "authpass")
-                .build(),
+                .build()
+                .unwrap(),
             Auth::usm_builder(username.clone())
                 .auth_priv(
                     AuthProtocol::Sha256,
@@ -539,7 +581,8 @@ mod tests {
                     PrivProtocol::Aes128,
                     "privpass",
                 )
-                .build(),
+                .build()
+                .unwrap(),
         ];
 
         for (auth, level) in configurations.iter().zip([
@@ -576,6 +619,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_usm_builder_debug_is_byte_exact_and_redacted() {
         let builder = Auth::usm_builder(Bytes::from_static(b"user\xff"))

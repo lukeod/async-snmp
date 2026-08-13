@@ -1527,7 +1527,8 @@ mod tests {
             let auth = metadata_client(
                 Auth::usm_builder("auth-user")
                     .auth(crate::AuthProtocol::Sha256, "authpassword")
-                    .build(),
+                    .build()
+                    .unwrap(),
             );
             assert_eq!(auth.version(), Version::V3);
             assert_eq!(auth.security_level(), Some(SecurityLevel::AuthNoPriv));
@@ -1541,7 +1542,8 @@ mod tests {
                         crate::PrivProtocol::Aes128,
                         "privpassword",
                     )
-                    .build(),
+                    .build()
+                    .unwrap(),
             );
             assert_eq!(auth_priv.version(), Version::V3);
             assert_eq!(auth_priv.security_level(), Some(SecurityLevel::AuthPriv));

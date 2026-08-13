@@ -241,27 +241,25 @@ impl V3Args {
                 return Err("privacy protocol required when using priv password".into());
             }
 
+            let config = self.select_crypto_backend(crate::v3::UsmConfig::new(username.clone()))?;
             let config = match (
                 self.auth_protocol,
                 self.auth_password.as_deref(),
                 self.priv_protocol,
                 self.priv_password.as_deref(),
             ) {
-                (None, _, None, _) => crate::v3::UsmConfig::new(username.clone()),
-                (Some(auth_protocol), Some(auth_password), None, _) => {
-                    crate::v3::UsmConfig::new(username.clone()).auth(auth_protocol, auth_password)
-                }
+                (None, _, None, _) => config,
+                (Some(auth_protocol), Some(auth_password), None, _) => config
+                    .auth(auth_protocol, auth_password)
+                    .map_err(|error| format!("invalid USM credentials: {error}"))?,
                 (
                     Some(auth_protocol),
                     Some(auth_password),
                     Some(priv_protocol),
                     Some(priv_password),
-                ) => crate::v3::UsmConfig::new(username.clone()).auth_priv(
-                    auth_protocol,
-                    auth_password,
-                    priv_protocol,
-                    priv_password,
-                ),
+                ) => config
+                    .auth_priv(auth_protocol, auth_password, priv_protocol, priv_password)
+                    .map_err(|error| format!("invalid USM credentials: {error}"))?,
                 (None, _, Some(_), _) => {
                     return Err("authentication protocol required when using privacy".into());
                 }
@@ -270,7 +268,6 @@ impl V3Args {
                     return Err("priv password required".into());
                 }
             };
-            let config = self.select_crypto_backend(config)?;
             Ok(config.into())
         } else {
             if matches!(common.snmp_version, SnmpVersion::V3) {
@@ -294,7 +291,9 @@ impl V3Args {
             Some(CryptoBackendArg::RustCrypto) => {
                 #[cfg(feature = "crypto-rustcrypto")]
                 {
-                    Ok(config.with_crypto_backend(CryptoBackend::RustCrypto))
+                    config
+                        .with_crypto_backend(CryptoBackend::RustCrypto)
+                        .map_err(|error| error.to_string())
                 }
                 #[cfg(not(feature = "crypto-rustcrypto"))]
                 {
@@ -305,7 +304,9 @@ impl V3Args {
             Some(CryptoBackendArg::AwsLcFips) => {
                 #[cfg(feature = "crypto-fips")]
                 {
-                    Ok(config.with_crypto_backend(CryptoBackend::AwsLcFips))
+                    config
+                        .with_crypto_backend(CryptoBackend::AwsLcFips)
+                        .map_err(|error| error.to_string())
                 }
                 #[cfg(not(feature = "crypto-fips"))]
                 {
@@ -736,8 +737,8 @@ mod tests {
     }
 
     #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-    #[tokio::test]
-    async fn cli_password_credentials_reach_backend_validation_without_crypto() {
+    #[test]
+    fn cli_password_credentials_fail_before_client_construction_without_crypto() {
         let parsed = TestCliArgs::try_parse_from([
             "test",
             "-u",
@@ -749,12 +750,8 @@ mod tests {
             "127.0.0.1",
         ])
         .unwrap();
-        let auth = parsed.v3.auth(&parsed.common).unwrap();
-        let error = match crate::Client::builder("127.0.0.1", auth).connect().await {
-            Ok(_) => panic!("password credentials unexpectedly passed validation"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("no crypto backend is enabled"));
+        let error = parsed.v3.auth(&parsed.common).unwrap_err();
+        assert!(error.contains("no crypto backend is enabled"), "{error}");
     }
 
     #[test]
@@ -958,6 +955,7 @@ mod tests {
         assert!(args.validate().unwrap_err().contains("crypto-fips"));
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[test]
     fn test_v3_args_auth_constructs_valid_security_levels() {
         let no_auth = V3Args {
@@ -1007,6 +1005,23 @@ mod tests {
         };
         assert_eq!(auth_priv.auth_protocol(), Some(AuthProtocol::Sha1));
         assert_eq!(auth_priv.priv_protocol(), Some(PrivProtocol::Aes128));
+    }
+
+    #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+    #[test]
+    fn backend_free_cli_rejects_credentials_during_argument_conversion() {
+        let error = V3Args {
+            username: Some("user".to_string()),
+            auth_protocol: Some(AuthProtocol::Sha256),
+            auth_password: Some("authpass".to_string()),
+            priv_protocol: None,
+            priv_password: None,
+            crypto_backend: None,
+        }
+        .auth(&common_args())
+        .unwrap_err();
+
+        assert!(error.contains("no crypto backend is enabled"), "{error}");
     }
 
     #[test]

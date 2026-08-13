@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b"privpass12345678",
             )
         })
+        .unwrap()
         // This local demo also receives cleartext v2c messages. For v3, require
         // authentication because configured keyed users also support spoofable
         // noAuthNoPriv input.
@@ -93,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b"privpass12345678",
             )
         })
+        .unwrap()
         // Configure trap sinks - agent sends to all of them
         .trap_sink(
             NotificationSinkId::new("local-receiver").unwrap(),
@@ -142,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recv_addr.to_string(),
         Auth::usm_builder("v3user")
             .auth(AuthProtocol::Sha256, "authpass12345678")
-            .build(),
+            .build()?,
     )
     .local_authoritative_engine(engine)
     .connect()
@@ -162,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PrivProtocol::Aes128,
                 "privpass12345678",
             )
-            .build(),
+            .build()?,
     )
     .connect()
     .await?;

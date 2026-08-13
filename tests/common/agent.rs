@@ -248,8 +248,8 @@ impl TestAgentBuilder {
         }
 
         for user in &self.usm_users {
-            builder =
-                builder.usm_user(user.username.clone(), |u| match (&user.auth, &user.priv_) {
+            builder = builder
+                .usm_user(user.username.clone(), |u| match (&user.auth, &user.priv_) {
                     (
                         Some((auth_protocol, auth_password)),
                         Some((priv_protocol, priv_password)),
@@ -257,9 +257,10 @@ impl TestAgentBuilder {
                     (Some((auth_protocol, auth_password)), None) => {
                         u.auth(*auth_protocol, auth_password)
                     }
-                    (None, None) => u,
+                    (None, None) => Ok(u),
                     (None, Some(_)) => panic!("test USM privacy requires authentication"),
-                });
+                })
+                .unwrap();
         }
 
         if !self.usm_users.is_empty() {
