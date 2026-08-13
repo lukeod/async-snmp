@@ -967,7 +967,7 @@ impl NotificationReceiverBuilder {
                 compatibility_policy: self.compatibility_policy,
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: self.acceptance_policy,
-                recv_gate: AsyncMutex::new(()),
+                recv_gate: AsyncMutex::new(vec![0; crate::UDP_RECEIVE_BUFFER_SIZE]),
             }),
         })
     }
@@ -1270,8 +1270,8 @@ struct ReceiverInner {
     /// Confirmed notifications dropped because even the alternate Response did not fit.
     snmp_silent_drops: AtomicU32,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
-    /// Fairly serializes cloned `recv` calls so each datagram has one waiter.
-    recv_gate: AsyncMutex<()>,
+    /// Fairly serializes cloned `recv` calls and retains their shared UDP buffer.
+    recv_gate: AsyncMutex<Vec<u8>>,
 }
 
 impl ReceiverInner {
@@ -1411,7 +1411,7 @@ impl NotificationReceiver {
                 compatibility_policy: crate::CompatibilityPolicy::default(),
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: None,
-                recv_gate: AsyncMutex::new(()),
+                recv_gate: AsyncMutex::new(vec![0; crate::UDP_RECEIVE_BUFFER_SIZE]),
             }),
         })
     }
@@ -1529,20 +1529,26 @@ impl NotificationReceiver {
     /// [`SecurityLevel::AuthPriv`] and remain spoofable at
     /// [`SecurityLevel::NoAuthNoPriv`].
     ///
+    /// Clones share the socket and one fixed receive buffer; cloning does not
+    /// allocate another UDP-sized buffer. Concurrent calls are queued in FIFO
+    /// order. The active call retains its queue position while it skips
+    /// malformed, rejected, or non-notification datagrams. Cancelling a queued
+    /// or active call releases its position and leaves the shared buffer ready
+    /// for the next waiter.
+    ///
     /// Returns the notification and the source address.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
     pub async fn recv(&self) -> Result<(Notification, SocketAddr)> {
         // Tokio's mutex queues callers in FIFO order. Keeping the guard while
         // malformed/non-notification datagrams are skipped prevents a later
         // cloned receiver from overtaking the earlier call.
-        let _recv_guard = self.inner.recv_gate.lock().await;
-        let mut buf = vec![0u8; crate::UDP_RECEIVE_BUFFER_SIZE];
+        let mut buf = self.inner.recv_gate.lock().await;
 
         loop {
             let received = self
                 .inner
                 .udp_responder
-                .recv(&self.inner.socket, &mut buf)
+                .recv(&self.inner.socket, buf.as_mut_slice())
                 .await
                 .map_err(|source| Error::Network {
                     target: self.inner.local_addr,
@@ -3639,6 +3645,11 @@ mod tests {
             .unwrap()
     }
 
+    async fn receive_buffer_identity(receiver: &NotificationReceiver) -> (usize, usize, usize) {
+        let buffer = receiver.inner.recv_gate.lock().await;
+        (buffer.as_ptr() as usize, buffer.len(), buffer.capacity())
+    }
+
     fn build_v2c_inform(community: &[u8]) -> Bytes {
         use crate::message::CommunityMessage;
         use crate::pdu::Pdu;
@@ -4330,12 +4341,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_buffer_reuses_capacity_at_udp_boundaries() {
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let destination = receiver.local_addr();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let initial = receive_buffer_identity(&receiver).await;
+        assert_eq!(initial.1, crate::UDP_RECEIVE_BUFFER_SIZE);
+        assert!(initial.2 >= crate::UDP_RECEIVE_BUFFER_SIZE);
+
+        let mut maximum_datagram = build_v2c_trap_with_request_id(b"public", 70).to_vec();
+        let message_len = maximum_datagram.len();
+        maximum_datagram.resize(crate::MAX_UDP_PAYLOAD, 0xa5);
+        assert_eq!(
+            client
+                .send_to(&maximum_datagram, destination)
+                .await
+                .unwrap(),
+            crate::MAX_UDP_PAYLOAD
+        );
+
+        let (notification, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("maximum UDP notification stalled")
+                .unwrap();
+        let Notification::TrapV2c {
+            request_id,
+            decode_anomalies,
+            ..
+        } = notification
+        else {
+            panic!("expected v2c trap")
+        };
+        assert_eq!(request_id, 70);
+        assert_eq!(
+            decode_anomalies,
+            vec![crate::DecodeAnomaly::TrailingBytes {
+                original_length: crate::MAX_UDP_PAYLOAD - message_len,
+                canonical_length: 0,
+            }],
+            "the maximum legal IPv4 UDP payload must not be truncated"
+        );
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
+
+        client
+            .send_to(&build_v2c_trap_with_request_id(b"public", 71), destination)
+            .await
+            .unwrap();
+        let (notification, _) = receiver.recv().await.unwrap();
+        assert!(matches!(
+            notification,
+            Notification::TrapV2c { request_id: 71, .. }
+        ));
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
+    }
+
+    #[tokio::test]
+    async fn receive_buffer_accepts_maximum_native_ipv6_udp_payload() {
+        const IPV6_MAX_UDP_PAYLOAD: usize = 65_527;
+
+        let receiver = NotificationReceiver::bind("[::1]:0").await.unwrap();
+        let destination = receiver.local_addr();
+        let client = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let initial = receive_buffer_identity(&receiver).await;
+        assert_eq!(initial.1, crate::UDP_RECEIVE_BUFFER_SIZE);
+        assert!(initial.2 >= crate::UDP_RECEIVE_BUFFER_SIZE);
+
+        let mut maximum_datagram = build_v2c_trap_with_request_id(b"public", 72).to_vec();
+        let message_len = maximum_datagram.len();
+        maximum_datagram.resize(IPV6_MAX_UDP_PAYLOAD, 0xa5);
+        assert_eq!(
+            client
+                .send_to(&maximum_datagram, destination)
+                .await
+                .unwrap(),
+            IPV6_MAX_UDP_PAYLOAD
+        );
+
+        let (notification, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("maximum native IPv6 UDP notification stalled")
+                .unwrap();
+        let Notification::TrapV2c {
+            request_id,
+            decode_anomalies,
+            ..
+        } = notification
+        else {
+            panic!("expected v2c trap")
+        };
+        assert_eq!(request_id, 72);
+        assert_eq!(
+            decode_anomalies,
+            vec![crate::DecodeAnomaly::TrailingBytes {
+                original_length: IPV6_MAX_UDP_PAYLOAD - message_len,
+                canonical_length: 0,
+            }],
+            "the maximum legal native IPv6 UDP payload must not be truncated"
+        );
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
+    }
+
+    #[tokio::test]
+    async fn receive_buffer_survives_skipped_datagrams_policy_errors_and_panics() {
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .try_acceptance_policy(|notification: &NotificationEnvelope<'_>| {
+                match notification.request_id {
+                    Some(1) => Ok(NotificationAcceptance::Reject),
+                    Some(2) => Err(NotificationAcceptanceError::new("injected policy error")),
+                    Some(3) => panic!("injected policy panic"),
+                    _ => Ok(NotificationAcceptance::Accept),
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+        let destination = receiver.local_addr();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let initial = receive_buffer_identity(&receiver).await;
+
+        for datagram in [
+            Bytes::from_static(&[0x30, 0x01, 0xff]),
+            build_v2c_trap_with_request_id(b"public", 1),
+            build_v2c_trap_with_request_id(b"public", 2),
+            build_v2c_trap_with_request_id(b"public", 3),
+            build_v2c_trap_with_request_id(b"public", 4),
+        ] {
+            client.send_to(&datagram, destination).await.unwrap();
+        }
+
+        let (notification, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("receiver did not advance past skipped datagrams")
+                .unwrap();
+        assert!(matches!(
+            notification,
+            Notification::TrapV2c { request_id: 4, .. }
+        ));
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cloned_recv_returns_shared_buffer_to_next_waiter() {
+        use std::task::Poll;
+
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let cloned = receiver.clone();
+        assert!(Arc::ptr_eq(&receiver.inner, &cloned.inner));
+        let initial = receive_buffer_identity(&receiver).await;
+
+        let mut cancelled = Box::pin(cloned.recv());
+        assert!(matches!(futures::poll!(&mut cancelled), Poll::Pending));
+        drop(cancelled);
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
+
+        let gate = receiver.inner.recv_gate.lock().await;
+        let queued_clone = receiver.clone();
+        let mut queued = Box::pin(queued_clone.recv());
+        assert!(matches!(futures::poll!(&mut queued), Poll::Pending));
+        drop(queued);
+        drop(gate);
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
+            .await
+            .unwrap();
+        let (notification, _) = receiver.recv().await.unwrap();
+        assert!(matches!(notification, Notification::TrapV2c { .. }));
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
+    }
+
+    #[tokio::test]
     async fn concurrent_cloned_recv_waiters_preserve_fifo_without_stalling() {
         use std::task::Poll;
 
         let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
         let destination = receiver.local_addr();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let initial = receive_buffer_identity(&receiver).await;
 
         // Hold the gate while each future is polled once. This deterministically
         // establishes the FIFO waiter order before the datagram burst arrives.
@@ -4371,6 +4559,7 @@ mod tests {
             other => panic!("unexpected notification: {other:?}"),
         });
         assert_eq!(request_ids, [11, 12, 13]);
+        assert_eq!(receive_buffer_identity(&receiver).await, initial);
     }
 
     /// A dual-stack IPv6 wildcard socket receives this IPv4 datagram through
