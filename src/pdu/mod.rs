@@ -1965,6 +1965,7 @@ impl TrapV1Pdu {
     /// - `generic_trap` is `Unknown` with a negative value (undefined per RFC 1157)
     /// - `generic_trap` is `Unknown` with value `i32::MAX` (would overflow when adding 1)
     /// - `specific_trap < 0` for enterprise-specific traps (OID arcs must be non-negative)
+    /// - the complete synthesized OID violates outbound OID constraints
     ///
     /// # Example
     ///
@@ -2002,7 +2003,9 @@ impl TrapV1Pdu {
             let mut arcs: Vec<u32> = self.enterprise.arcs().to_vec();
             arcs.push(0);
             arcs.push(self.specific_trap as u32);
-            Ok(Oid::new(arcs))
+            let oid = Oid::new(arcs);
+            oid.validate_for_wire()?;
+            Ok(oid)
         } else {
             let raw = self.generic_trap.as_i32();
             if raw < 0 {
@@ -2028,25 +2031,18 @@ impl TrapV1Pdu {
     ///
     /// # Errors
     ///
-    /// Returns an error if the trap OID cannot be computed (see [`Self::v2_trap_oid`]).
-    pub fn to_v2_pdu(&self) -> crate::Result<Pdu> {
-        use crate::notification::oids;
-        use crate::value::Value;
-
+    /// Returns an error if the trap OID cannot be computed (see
+    /// [`Self::v2_trap_oid`]) or if any copied variable binding cannot be
+    /// encoded in an outbound SNMPv2 notification.
+    pub fn to_v2_pdu(&self) -> crate::Result<NotificationPdu> {
         let trap_oid = self.v2_trap_oid()?;
-
-        let mut varbinds = Vec::with_capacity(2 + self.varbinds.len());
-        varbinds.push(VarBind::new(
-            oids::sys_uptime(),
-            Value::TimeTicks(self.time_stamp),
-        ));
-        varbinds.push(VarBind::new(
-            oids::snmp_trap_oid(),
-            Value::ObjectIdentifier(trap_oid),
-        ));
-        varbinds.extend_from_slice(&self.varbinds);
-
-        Ok(Pdu::standard(StandardPduType::TrapV2, 0, 0, 0, varbinds))
+        NotificationPdu::trap_v2(
+            Version::V2c,
+            0,
+            self.time_stamp,
+            &trap_oid,
+            self.varbinds.clone(),
+        )
     }
 
     pub(crate) fn validate_outbound(&self) -> Result<()> {
@@ -3386,23 +3382,23 @@ mod tests {
         let pdu = trap.to_v2_pdu().unwrap();
 
         assert_eq!(pdu.pdu_type(), PduType::TrapV2);
-        assert_eq!(pdu.request_id, 0);
+        assert_eq!(pdu.request_id(), 0);
         // sysUpTime.0 + snmpTrapOID.0 + 1 original varbind (no proxy varbinds)
-        assert_eq!(pdu.varbinds.len(), 3);
+        assert_eq!(pdu.varbinds().len(), 3);
 
         // First varbind: sysUpTime.0
-        assert_eq!(pdu.varbinds[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 3, 0));
-        assert_eq!(pdu.varbinds[0].value, Value::TimeTicks(12345));
+        assert_eq!(pdu.varbinds()[0].oid, oid!(1, 3, 6, 1, 2, 1, 1, 3, 0));
+        assert_eq!(pdu.varbinds()[0].value, Value::TimeTicks(12345));
 
         // Second varbind: snmpTrapOID.0 = snmpTraps.3 (linkDown)
-        assert_eq!(pdu.varbinds[1].oid, oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0));
+        assert_eq!(pdu.varbinds()[1].oid, oid!(1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0));
         assert_eq!(
-            pdu.varbinds[1].value,
+            pdu.varbinds()[1].value,
             Value::ObjectIdentifier(oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3))
         );
 
         // Third: original varbind
-        assert_eq!(pdu.varbinds[2].oid, oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1));
+        assert_eq!(pdu.varbinds()[2].oid, oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1));
     }
 
     #[test]
@@ -3419,7 +3415,7 @@ mod tests {
         let pdu = trap.to_v2_pdu().unwrap();
         // Only sysUpTime.0 and snmpTrapOID.0 - no proxy varbinds even with
         // non-zero agent_addr (RFC 3584 Section 3.1(4))
-        assert_eq!(pdu.varbinds.len(), 2);
+        assert_eq!(pdu.varbinds().len(), 2);
     }
 
     #[test]
@@ -3439,9 +3435,59 @@ mod tests {
 
         // snmpTrapOID.0 should be enterprise.0.42
         assert_eq!(
-            pdu.varbinds[1].value,
+            pdu.varbinds()[1].value,
             Value::ObjectIdentifier(oid!(1, 3, 6, 1, 4, 1, 9999, 1, 2, 0, 42))
         );
+    }
+
+    #[test]
+    fn v1_to_v2_rejects_invalid_synthesized_trap_oid() {
+        let mut enterprise_arcs = vec![1, 3];
+        enterprise_arcs.resize(crate::oid::MAX_OID_LEN - 1, 1);
+        let trap = TrapV1Pdu::from_raw_parts(
+            Oid::new(enterprise_arcs),
+            [0, 0, 0, 0],
+            GenericTrap::EnterpriseSpecific,
+            1,
+            0,
+            vec![],
+        );
+
+        assert!(trap.enterprise().validate_for_wire().is_ok());
+        assert!(trap.v2_trap_oid().is_err());
+        assert!(trap.to_v2_pdu().is_err());
+    }
+
+    #[test]
+    fn v1_to_v2_validates_every_copied_varbind() {
+        let valid = VarBind::new(oid!(1, 3, 6, 1, 4, 1, 9999, 1), Value::Integer(1));
+        let invalid_varbinds = [
+            VarBind::new(Oid::empty(), Value::Integer(2)),
+            VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 9999, 2),
+                Value::ObjectIdentifier(Oid::empty()),
+            ),
+            VarBind::new(oid!(1, 3, 6, 1, 4, 1, 9999, 3), Value::Null),
+            VarBind::new(
+                oid!(1, 3, 6, 1, 4, 1, 9999, 4),
+                Value::Unknown {
+                    tag: 0x48,
+                    data: bytes::Bytes::from_static(b"raw"),
+                },
+            ),
+        ];
+
+        for invalid in invalid_varbinds {
+            let trap = TrapV1Pdu::from_raw_parts(
+                oid!(1, 3, 6, 1, 4, 1, 9999),
+                [0, 0, 0, 0],
+                GenericTrap::ColdStart,
+                0,
+                0,
+                vec![valid.clone(), invalid],
+            );
+            assert!(trap.to_v2_pdu().is_err());
+        }
     }
 
     #[test]
@@ -3631,7 +3677,7 @@ mod tests {
         );
 
         let v2 = original.to_v2_pdu().unwrap();
-        let restored = to_v1_trap(&v2, [0, 0, 0, 0]).unwrap();
+        let restored = to_v1_trap(v2.as_raw(), [0, 0, 0, 0]).unwrap();
 
         assert_eq!(restored.enterprise, original.enterprise);
         assert_eq!(restored.generic_trap, original.generic_trap);
@@ -3658,7 +3704,7 @@ mod tests {
         );
 
         let v2 = original.to_v2_pdu().unwrap();
-        let restored = to_v1_trap(&v2, [10, 0, 0, 1]).unwrap();
+        let restored = to_v1_trap(v2.as_raw(), [10, 0, 0, 1]).unwrap();
 
         assert_eq!(restored.generic_trap, GenericTrap::WarmStart);
         assert_eq!(restored.specific_trap, 0);

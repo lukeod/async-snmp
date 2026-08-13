@@ -1358,7 +1358,14 @@ proptest! {
 
         if specific_trap < 0 {
             prop_assert!(result.is_err());
-        } else if !enterprise.is_empty() {
+        } else {
+            let mut expected_arcs = enterprise.arcs().to_vec();
+            expected_arcs.extend([0, specific_trap as u32]);
+            let expected = Oid::new(expected_arcs);
+            if expected.validate_for_wire().is_err() {
+                prop_assert!(result.is_err());
+                return Ok(());
+            }
             let oid = result.unwrap();
             prop_assert!(oid.starts_with(&enterprise));
         }
