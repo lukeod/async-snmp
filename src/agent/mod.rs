@@ -84,7 +84,7 @@ pub use notification::{
 };
 pub use vacm::{
     DuplicateVacmAccessEntry, VacmAccessIndex, VacmBuilder, VacmConfig, VacmSecurityModel, View,
-    ViewCheckResult, ViewSubtree,
+    ViewSubtree,
 };
 
 use std::collections::{HashMap, HashSet};

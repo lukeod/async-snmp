@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ErrorStatus::from_i32` is now a pure constant conversion. Unknown or future
   status values remain available through `ErrorStatus::Unknown` without
   emitting a warning as a conversion side effect.
+- **Breaking:** Removed the unused `ViewCheckResult` type and
+  `View::check_subtree` method. VACM enforcement continues to use exact
+  per-OID checks, which remain necessary for custom handler ownership.
 
 - Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
   single-flight operation. Callers share success or structured failure under a
