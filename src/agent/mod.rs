@@ -818,12 +818,14 @@ impl AgentBuilder {
     ///     .authoritative_engine(engine)
     ///     .community(b"public")
     ///     .trap_sink("primary", "192.168.1.100:162", Auth::v2c("public"))
-    ///     .trap_sink("secure", "10.0.0.1:162", Auth::usm("trapuser").auth_priv(
-    ///         AuthProtocol::Sha256,
-    ///         "authpass",
-    ///         PrivProtocol::Aes128,
-    ///         "privpass",
-    ///     ))
+    ///     .trap_sink("secure", "10.0.0.1:162", Auth::usm_builder("trapuser")
+    ///         .auth_priv(
+    ///             AuthProtocol::Sha256,
+    ///             "authpass",
+    ///             PrivProtocol::Aes128,
+    ///             "privpass",
+    ///         )
+    ///         .build())
     ///     .allow_all_access()
     ///     .build()
     ///     .await?;

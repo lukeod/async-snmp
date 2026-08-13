@@ -133,8 +133,9 @@ impl From<SocketAddr> for Target {
 ///     .connect().await?;
 ///
 /// // v3 client with authentication
-/// let client = ClientBuilder::new(
-///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"))
+/// let client = ClientBuilder::new(Auth::usm_builder("admin")
+///     .auth(async_snmp::AuthProtocol::Sha256, "password")
+///     .build())
 ///     .request_timeout(Duration::from_secs(10))
 ///     .retry(Retry::fixed(5, Duration::ZERO))
 ///     .target("192.168.1.1:161")
@@ -218,9 +219,10 @@ impl ClientBuilder {
     /// // Using Auth::v1() for SNMPv1
     /// let builder = ClientBuilder::new(Auth::v1("private"));
     ///
-    /// // Using Auth::usm() for SNMPv3
-    /// let builder = ClientBuilder::new(
-    ///     Auth::usm("admin").auth(async_snmp::AuthProtocol::Sha256, "password"));
+    /// // Using Auth::usm_builder() for authenticated SNMPv3
+    /// let builder = ClientBuilder::new(Auth::usm_builder("admin")
+    ///     .auth(async_snmp::AuthProtocol::Sha256, "password")
+    ///     .build());
     /// ```
     pub fn new(auth: impl Into<Auth>) -> Self {
         Self {
@@ -530,7 +532,7 @@ impl ClientBuilder {
     ///     Ok::<(), Infallible>(())
     /// }).unwrap();
     /// let builder = async_snmp::Client::builder(("192.168.1.1", 162),
-    ///     Auth::usm("trapuser").auth(AuthProtocol::Sha256, "password"))
+    ///     Auth::usm_builder("trapuser").auth(AuthProtocol::Sha256, "password").build())
     ///     .local_authoritative_engine(engine);
     /// ```
     #[must_use]
@@ -560,11 +562,11 @@ impl ClientBuilder {
     ///
     /// // Multiple clients can share the same cache
     /// let builder1 = async_snmp::Client::builder("192.168.1.1:161",
-    ///     Auth::usm("admin").auth(AuthProtocol::Sha256, "password"))
+    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build())
     ///     .engine_cache(cache.clone());
     ///
     /// let builder2 = async_snmp::Client::builder("192.168.1.2:161",
-    ///     Auth::usm("admin").auth(AuthProtocol::Sha256, "password"))
+    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build())
     ///     .engine_cache(cache.clone());
     /// ```
     #[must_use]
@@ -1733,7 +1735,7 @@ mod tests {
         for (auth, expected) in [
             (Auth::v1("private"), crate::Version::V1),
             (Auth::v2c("public"), crate::Version::V2c),
-            (Auth::usm("operator").into(), crate::Version::V3),
+            (Auth::usm("operator"), crate::Version::V3),
         ] {
             let custom_client = ClientBuilder::new(auth.clone())
                 .build_with_transport(custom.clone())
@@ -1817,7 +1819,9 @@ mod tests {
     fn test_validate_usm_auth_no_priv_ok() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm("admin").auth(AuthProtocol::Sha256, "authpass"),
+            Auth::usm_builder("admin")
+                .auth(AuthProtocol::Sha256, "authpass")
+                .build(),
         );
         assert!(builder.validate().is_ok());
     }
@@ -1826,12 +1830,14 @@ mod tests {
     fn test_validate_usm_auth_priv_ok() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm("admin").auth_priv(
-                AuthProtocol::Sha256,
-                "authpass",
-                PrivProtocol::Aes128,
-                "privpass",
-            ),
+            Auth::usm_builder("admin")
+                .auth_priv(
+                    AuthProtocol::Sha256,
+                    "authpass",
+                    PrivProtocol::Aes128,
+                    "privpass",
+                )
+                .build(),
         );
         assert!(builder.validate().is_ok());
     }
@@ -1840,7 +1846,9 @@ mod tests {
     fn test_builder_with_usm_config() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm("admin").auth(AuthProtocol::Sha256, "pass"),
+            Auth::usm_builder("admin")
+                .auth(AuthProtocol::Sha256, "pass")
+                .build(),
         );
         assert!(builder.validate().is_ok());
     }
@@ -1851,7 +1859,9 @@ mod tests {
         let auth_only = MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm("user").with_master_keys(auth_only),
+            Auth::usm_builder("user")
+                .with_master_keys(auth_only)
+                .build(),
         );
         assert!(builder.validate().is_ok());
 
@@ -1861,7 +1871,9 @@ mod tests {
             .unwrap();
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm("user").with_master_keys(auth_priv),
+            Auth::usm_builder("user")
+                .with_master_keys(auth_priv)
+                .build(),
         );
         assert!(builder.validate().is_ok());
     }
@@ -1870,9 +1882,10 @@ mod tests {
     fn test_build_config_preserves_v3_context_name() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm("admin")
+            Auth::usm_builder("admin")
                 .auth(AuthProtocol::Sha256, "authpass")
-                .context_name("vlan100"),
+                .context_name("vlan100")
+                .build(),
         );
 
         let config = builder.build_config();

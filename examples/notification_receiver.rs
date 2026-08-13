@@ -252,7 +252,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
         } => {
             println!("  Type: SNMPv3 Trap");
             println!("  Security Level: {security_level:?}");
-            println!("  Username: {}", String::from_utf8_lossy(username));
+            println!("  Username: {username:?}");
             println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
             println!("  Context Name: {}", String::from_utf8_lossy(context_name));
             println!("  Request ID: {request_id}");
@@ -281,7 +281,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
         } => {
             println!("  Type: SNMPv3 Inform (response attempted before delivery)");
             println!("  Security Level: {security_level:?}");
-            println!("  Username: {}", String::from_utf8_lossy(username));
+            println!("  Username: {username:?}");
             println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
             println!("  Context Name: {}", String::from_utf8_lossy(context_name));
             println!("  Request ID: {request_id}");

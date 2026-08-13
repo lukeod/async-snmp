@@ -77,12 +77,14 @@
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> async_snmp::Result<()> {
-//!     let auth = Auth::usm("admin").auth_priv(
-//!         AuthProtocol::Sha256,
-//!         "authpass123",
-//!         PrivProtocol::Aes128,
-//!         "privpass123",
-//!     );
+//!     let auth = Auth::usm_builder("admin")
+//!         .auth_priv(
+//!             AuthProtocol::Sha256,
+//!             "authpass123",
+//!             PrivProtocol::Aes128,
+//!             "privpass123",
+//!         )
+//!         .build();
 //!
 //!     let client = Client::builder(("192.168.1.1", 161), auth)
 //!         .connect()
@@ -250,7 +252,9 @@
 //! let transport = UdpTransport::bind("0.0.0.0:0").await?;
 //!
 //! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
-//!     let auth = Auth::usm("snmpuser").with_master_keys(master_keys.clone());
+//!     let auth = Auth::usm_builder("snmpuser")
+//!         .with_master_keys(master_keys.clone())
+//!         .build();
 //!     let client = Client::builder(target, auth)
 //!         .engine_cache(engine_cache.clone())
 //!         .build_with(&transport)
@@ -597,9 +601,9 @@ pub use client::{
     DEFAULT_MAX_REPETITIONS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
     FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
     FixedCardinalityResponse, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
-    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder, Walk,
-    WalkCollection, WalkError, WalkItem, WalkMode, WalkStream, WalkStreamWithMetadata,
-    WalkWithMetadata,
+    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder,
+    UsmAuthBuilder, Walk, WalkCollection, WalkError, WalkItem, WalkMode, WalkStream,
+    WalkStreamWithMetadata, WalkWithMetadata,
 };
 pub use community::Community;
 pub use compatibility::{

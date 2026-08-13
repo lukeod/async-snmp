@@ -20,7 +20,7 @@ use std::time::Duration;
 
 // RFC 5612 documentation PEN 32473 with RFC 3411 format 5 opaque octets.
 const ENGINE_ID: &[u8] = b"\x80\x00\x7e\xd9\x05scripted-engine";
-const USERNAME: &str = "testuser";
+const USERNAME: &[u8] = b"test\xffuser";
 const AUTH_PASSWORD: &str = "authpassword123";
 const PRIV_PASSWORD: &str = "privpassword123";
 const LOOPBACK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -56,18 +56,18 @@ fn user_for(level: SecurityLevel) -> UsmConfig {
 
 fn auth_for(level: SecurityLevel) -> Auth {
     match level {
-        SecurityLevel::NoAuthNoPriv => Auth::usm(USERNAME).into(),
-        SecurityLevel::AuthNoPriv => Auth::usm(USERNAME)
+        SecurityLevel::NoAuthNoPriv => Auth::usm(USERNAME),
+        SecurityLevel::AuthNoPriv => Auth::usm_builder(USERNAME)
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .into(),
-        SecurityLevel::AuthPriv => Auth::usm(USERNAME)
+            .build(),
+        SecurityLevel::AuthPriv => Auth::usm_builder(USERNAME)
             .auth_priv(
                 AuthProtocol::Sha256,
                 AUTH_PASSWORD,
                 PrivProtocol::Aes128,
                 PRIV_PASSWORD,
             )
-            .into(),
+            .build(),
     }
 }
 
@@ -174,6 +174,7 @@ async fn udp_success_at_level(level: SecurityLevel) {
     assert!(requests[0].usm.engine_id().is_empty());
     assert!(requests[0].usm.username().is_empty());
     assert_eq!(requests[1].usm.engine_id().as_ref(), ENGINE_ID);
+    assert_eq!(requests[1].usm.username().as_ref(), USERNAME);
     assert_eq!(
         (
             requests[1].usm.engine_boots(),
@@ -2582,7 +2583,7 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
                     &malformed_engine.engine_id,
                     &[8],
                     &[0x01, 0xf4],
-                    USERNAME.as_bytes(),
+                    USERNAME,
                     &[0xaa; 24],
                     &[],
                 );

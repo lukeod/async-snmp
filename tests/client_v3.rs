@@ -50,7 +50,9 @@ async fn v3_auth_sha256() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+        Auth::usm_builder("authuser")
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .build(),
     )
     .connect()
     .await
@@ -75,7 +77,9 @@ async fn auth_only_roundtrip(protocol: AuthProtocol) {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authuser").auth(protocol, AUTH_PASS),
+        Auth::usm_builder("authuser")
+            .auth(protocol, AUTH_PASS)
+            .build(),
     )
     .connect()
     .await
@@ -125,7 +129,9 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
     let cache = Arc::new(EngineCache::new());
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+        Auth::usm_builder("authuser")
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .build(),
     )
     .engine_cache(cache.clone())
     .connect()
@@ -155,7 +161,9 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
 
     let client2 = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+        Auth::usm_builder("authuser")
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .build(),
     )
     .engine_cache(cache)
     .connect()
@@ -196,12 +204,14 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
     let cache = Arc::new(EngineCache::new());
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authprivuser").auth_priv(
-            AuthProtocol::Sha256,
-            AUTH_PASS,
-            PrivProtocol::Aes128,
-            PRIV_PASS,
-        ),
+        Auth::usm_builder("authprivuser")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                AUTH_PASS,
+                PrivProtocol::Aes128,
+                PRIV_PASS,
+            )
+            .build(),
     )
     .engine_cache(cache.clone())
     .connect()
@@ -226,12 +236,14 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
 
     let client2 = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authprivuser").auth_priv(
-            AuthProtocol::Sha256,
-            AUTH_PASS,
-            PrivProtocol::Aes128,
-            PRIV_PASS,
-        ),
+        Auth::usm_builder("authprivuser")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                AUTH_PASS,
+                PrivProtocol::Aes128,
+                PRIV_PASS,
+            )
+            .build(),
     )
     .engine_cache(cache)
     .connect()
@@ -264,12 +276,14 @@ async fn v3_auth_priv_sha256_aes128() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authprivuser").auth_priv(
-            AuthProtocol::Sha256,
-            AUTH_PASS,
-            PrivProtocol::Aes128,
-            PRIV_PASS,
-        ),
+        Auth::usm_builder("authprivuser")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                AUTH_PASS,
+                PrivProtocol::Aes128,
+                PRIV_PASS,
+            )
+            .build(),
     )
     .connect()
     .await
@@ -296,7 +310,9 @@ async fn v3_auth_md5() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("md5user").auth(AuthProtocol::Md5, AUTH_PASS),
+        Auth::usm_builder("md5user")
+            .auth(AuthProtocol::Md5, AUTH_PASS)
+            .build(),
     )
     .connect()
     .await
@@ -325,7 +341,9 @@ async fn v3_auth_priv_sha1_des() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("desuser").auth_priv(AuthProtocol::Sha1, AUTH_PASS, PrivProtocol::Des, PRIV_PASS),
+        Auth::usm_builder("desuser")
+            .auth_priv(AuthProtocol::Sha1, AUTH_PASS, PrivProtocol::Des, PRIV_PASS)
+            .build(),
     )
     .connect()
     .await
@@ -351,7 +369,9 @@ async fn v3_wrong_password_fails() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authuser").auth(AuthProtocol::Sha256, "wrongpassword"),
+        Auth::usm_builder("authuser")
+            .auth(AuthProtocol::Sha256, "wrongpassword")
+            .build(),
     )
     .request_timeout(Duration::from_millis(500))
     .retry(Retry::none())
@@ -384,7 +404,9 @@ async fn v3_unknown_user_auth_fails() {
     // Try to use unknown user with authentication - should fail
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("unknownuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+        Auth::usm_builder("unknownuser")
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .build(),
     )
     .request_timeout(Duration::from_millis(500))
     .retry(Retry::none())
@@ -450,7 +472,9 @@ async fn v3_engine_discovery() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm("authuser").auth(AuthProtocol::Sha256, AUTH_PASS),
+        Auth::usm_builder("authuser")
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .build(),
     )
     .connect()
     .await

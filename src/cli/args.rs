@@ -247,16 +247,16 @@ impl V3Args {
                 self.priv_protocol,
                 self.priv_password.as_deref(),
             ) {
-                (None, _, None, _) => Auth::usm(username),
+                (None, _, None, _) => crate::v3::UsmConfig::new(username.clone()),
                 (Some(auth_protocol), Some(auth_password), None, _) => {
-                    Auth::usm(username).auth(auth_protocol, auth_password)
+                    crate::v3::UsmConfig::new(username.clone()).auth(auth_protocol, auth_password)
                 }
                 (
                     Some(auth_protocol),
                     Some(auth_password),
                     Some(priv_protocol),
                     Some(priv_password),
-                ) => Auth::usm(username).auth_priv(
+                ) => crate::v3::UsmConfig::new(username.clone()).auth_priv(
                     auth_protocol,
                     auth_password,
                     priv_protocol,

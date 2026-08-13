@@ -45,7 +45,7 @@ impl std::fmt::Display for OperationType {
 pub enum SecurityInfo {
     Community,
     V3 {
-        username: String,
+        username: bytes::Bytes,
         auth_protocol: Option<String>,
         priv_protocol: Option<String>,
     },
@@ -81,7 +81,7 @@ fn write_verbose_request_to(mut output: impl Write, info: &RequestInfo) {
             auth_protocol,
             priv_protocol,
         } => {
-            let _ = writeln!(output, "Username:  {}", username);
+            let _ = writeln!(output, "Username:  {username:?}");
             if let Some(auth) = auth_protocol {
                 let _ = writeln!(output, "Auth:      {}", auth);
             }
@@ -629,7 +629,7 @@ pub fn build_security_info(auth: &Auth) -> SecurityInfo {
     match auth {
         Auth::Community { .. } => SecurityInfo::Community,
         Auth::Usm(config) => SecurityInfo::V3 {
-            username: String::from_utf8_lossy(config.username()).into_owned(),
+            username: config.username().clone(),
             auth_protocol: config.auth_protocol().map(|protocol| protocol.to_string()),
             priv_protocol: config.priv_protocol().map(|protocol| protocol.to_string()),
         },
@@ -703,9 +703,9 @@ mod tests {
             SecurityInfo::Community
         ));
 
-        let usm: Auth = crate::Auth::usm("operator")
+        let usm = crate::Auth::usm_builder("operator")
             .auth(crate::AuthProtocol::Sha256, "authpassword")
-            .into();
+            .build();
         assert_eq!(usm.version(), Version::V3);
         assert!(matches!(
             build_security_info(&usm),
@@ -713,8 +713,26 @@ mod tests {
                 username,
                 auth_protocol: Some(protocol),
                 priv_protocol: None,
-            } if username == "operator" && protocol == "SHA-256"
+            } if username.as_ref() == b"operator" && protocol == "SHA-256"
         ));
+    }
+
+    #[test]
+    fn security_info_formats_non_utf8_username_without_replacement() {
+        let auth = Auth::usm(bytes::Bytes::from_static(b"operator\xff"));
+        let info = RequestInfo {
+            target: "127.0.0.1:161",
+            version: auth.version(),
+            security: build_security_info(&auth),
+            operation: OperationType::Get,
+            oids: vec![Oid::from_slice(&[1, 3, 6, 1])],
+        };
+        let mut output = Vec::new();
+
+        write_verbose_request_to(&mut output, &info);
+        let verbose = String::from_utf8(output).unwrap();
+        assert!(verbose.contains(r#"Username:  b"operator\xff""#));
+        assert!(!verbose.contains('\u{fffd}'));
     }
 
     #[test]

@@ -916,22 +916,35 @@ mod tests {
 
         assert!(agent.notification_allowed(&test_sink(Auth::v1("v1-community")), &trap_oid, &[]));
         assert!(agent.notification_allowed(&test_sink(Auth::v2c("v2-community")), &trap_oid, &[]));
-        assert!(agent.notification_allowed(
-            &test_sink(Auth::usm("context-user").context_name("tenant/blue")),
-            &trap_oid,
-            &[]
-        ));
-        assert!(!agent.notification_allowed(
-            &test_sink(Auth::usm("context-user").context_name("tenant/red")),
-            &trap_oid,
-            &[]
-        ));
+        assert!(
+            agent.notification_allowed(
+                &test_sink(
+                    Auth::usm_builder("context-user")
+                        .context_name("tenant/blue")
+                        .build(),
+                ),
+                &trap_oid,
+                &[]
+            )
+        );
         assert!(
             !agent.notification_allowed(
                 &test_sink(
-                    Auth::usm("security-user")
+                    Auth::usm_builder("context-user")
+                        .context_name("tenant/red")
+                        .build(),
+                ),
+                &trap_oid,
+                &[]
+            )
+        );
+        assert!(
+            !agent.notification_allowed(
+                &test_sink(
+                    Auth::usm_builder("security-user")
                         .auth(AuthProtocol::Sha256, "auth-password")
                         .context_name("secure")
+                        .build()
                 ),
                 &trap_oid,
                 &[]
@@ -940,7 +953,7 @@ mod tests {
         assert!(
             agent.notification_allowed(
                 &test_sink(
-                    Auth::usm("security-user")
+                    Auth::usm_builder("security-user")
                         .auth_priv(
                             AuthProtocol::Sha256,
                             "auth-password",
@@ -948,6 +961,7 @@ mod tests {
                             "privacy-password",
                         )
                         .context_name("secure")
+                        .build()
                 ),
                 &trap_oid,
                 &[]

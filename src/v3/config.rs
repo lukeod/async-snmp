@@ -157,7 +157,7 @@ impl UsmUser {
 impl std::fmt::Debug for UsmUser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UsmUser")
-            .field("username", &String::from_utf8_lossy(self.username()))
+            .field("username", self.username())
             .field("auth_protocol", &self.auth_protocol())
             .field("priv_protocol", &self.priv_protocol())
             .field("maximum_security_level", &self.maximum_security_level())
@@ -438,12 +438,12 @@ impl std::fmt::Debug for UsmConfig {
             ),
         };
         f.debug_struct("UsmConfig")
-            .field("username", &String::from_utf8_lossy(&self.username))
+            .field("username", &self.username)
             .field("auth_protocol", &auth)
             .field("auth_password", &auth_password)
             .field("priv_protocol", &privacy)
             .field("priv_password", &priv_password)
-            .field("context_name", &String::from_utf8_lossy(&self.context_name))
+            .field("context_name", &self.context_name)
             .field("crypto_backend", &self.crypto_backend)
             .field("master_keys", &master_keys)
             .finish()

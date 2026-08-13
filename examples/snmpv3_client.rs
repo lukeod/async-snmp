@@ -35,12 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build authentication using the USM configuration API
     // Uses container user: privaes128_user (SHA + AES-128)
-    let auth = Auth::usm("privaes128_user").auth_priv(
-        AuthProtocol::Sha1,
-        "authpass123",
-        PrivProtocol::Aes128,
-        "privpass123",
-    );
+    let auth = Auth::usm_builder("privaes128_user")
+        .auth_priv(
+            AuthProtocol::Sha1,
+            "authpass123",
+            PrivProtocol::Aes128,
+            "privpass123",
+        )
+        .build();
 
     let client = Client::builder(target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
@@ -64,7 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- SNMPv3 authNoPriv (SHA-256 only) ---\n");
 
     // Uses container user: authsha256_user (SHA-256 auth, no privacy)
-    let auth_only = Auth::usm("authsha256_user").auth(AuthProtocol::Sha256, "authpass123");
+    let auth_only = Auth::usm_builder("authsha256_user")
+        .auth(AuthProtocol::Sha256, "authpass123")
+        .build();
     // auth() selects authNoPriv.
 
     let client_auth = Client::builder(target, auth_only)
@@ -125,7 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for target_addr in &targets {
         // Cloning copies only the small zeroizing key buffers and avoids
         // repeating password-to-key derivation.
-        let auth = Auth::usm("privaes192_user").with_master_keys(master_keys.clone());
+        let auth = Auth::usm_builder("privaes192_user")
+            .with_master_keys(master_keys.clone())
+            .build();
 
         // Each client reuses the master keys; only localization is performed
         match Client::builder(*target_addr, auth)
@@ -173,12 +179,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - PrivProtocol::Aes192   (draft/vendor extension)
     // - PrivProtocol::Aes256   (draft/vendor extension)
 
-    let strong_auth = Auth::usm("admin").auth_priv(
-        AuthProtocol::Sha512,
-        "strongauthpass",
-        PrivProtocol::Aes256,
-        "strongprivpass",
-    );
+    let strong_auth = Auth::usm_builder("admin")
+        .auth_priv(
+            AuthProtocol::Sha512,
+            "strongauthpass",
+            PrivProtocol::Aes256,
+            "strongprivpass",
+        )
+        .build();
 
     println!("Created auth config: SHA-512 + AES-256");
     println!("Auth protocol: {:?}", AuthProtocol::Sha512);
@@ -193,14 +201,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Context Name (VACM) ---\n");
 
     // Some agents use context names for View-based Access Control (VACM)
-    let auth_with_context = Auth::usm("snmpuser")
+    let auth_with_context = Auth::usm_builder("snmpuser")
         .auth_priv(
             AuthProtocol::Sha256,
             "authpass123",
             PrivProtocol::Aes128,
             "privpass123",
         )
-        .context_name("vlan100");
+        .context_name("vlan100")
+        .build();
 
     println!("Created auth config with context name 'vlan100'");
 

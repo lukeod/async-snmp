@@ -527,13 +527,13 @@ struct EngineCacheInner {
 /// let cache = Arc::new(EngineCache::new());
 ///
 /// let client1 = Client::builder("192.168.1.1:161",
-///     Auth::usm("admin").auth(AuthProtocol::Sha1, "authpass"))
+///     Auth::usm_builder("admin").auth(AuthProtocol::Sha1, "authpass").build())
 ///     .engine_cache(cache.clone())
 ///     .connect()
 ///     .await?;
 ///
 /// let client2 = Client::builder("192.168.1.2:161",
-///     Auth::usm("admin").auth(AuthProtocol::Sha1, "authpass"))
+///     Auth::usm_builder("admin").auth(AuthProtocol::Sha1, "authpass").build())
 ///     .engine_cache(cache.clone())
 ///     .connect()
 ///     .await?;

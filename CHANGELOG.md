@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `Auth::usm` now accepts username octets and returns `Auth`
+  directly, consistently with `Auth::v1` and `Auth::v2c`. Credentialed,
+  private, context-specific, and precomputed-key configurations use
+  `Auth::usm_builder(...).build()`. USM username diagnostics preserve exact
+  octets instead of applying lossy UTF-8 conversion.
 - **Breaking:** VACM access rows are keyed by the RFC 3415
   `(groupName, contextPrefix, securityModel, securityLevel)` index.
   `VacmConfig::add_access` and `VacmBuilder::build` now reject duplicate rows;

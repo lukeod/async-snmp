@@ -8,7 +8,7 @@ mod retry;
 mod v3;
 mod walk;
 
-pub use auth::{Auth, CommunityVersion};
+pub use auth::{Auth, CommunityVersion, UsmAuthBuilder};
 pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target, TargetClientBuilder};
 pub use chunks::{FixedCardinalityChunk, FixedCardinalityChunkError, FixedCardinalityChunkStream};
 pub use response_shape::{
@@ -1498,7 +1498,7 @@ mod tests {
         assert_eq!(v2c.security_level(), None);
         assert!(v2c.inner.salt_counter.is_none());
 
-        let no_auth = metadata_client(Auth::usm("no-auth-user").into());
+        let no_auth = metadata_client(Auth::usm("no-auth-user"));
         assert_eq!(no_auth.version(), Version::V3);
         assert_eq!(no_auth.security_level(), Some(SecurityLevel::NoAuthNoPriv));
         assert!(no_auth.inner.salt_counter.is_none());
@@ -1506,23 +1506,23 @@ mod tests {
         #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
         {
             let auth = metadata_client(
-                Auth::usm("auth-user")
+                Auth::usm_builder("auth-user")
                     .auth(crate::AuthProtocol::Sha256, "authpassword")
-                    .into(),
+                    .build(),
             );
             assert_eq!(auth.version(), Version::V3);
             assert_eq!(auth.security_level(), Some(SecurityLevel::AuthNoPriv));
             assert!(auth.inner.salt_counter.is_none());
 
             let auth_priv = metadata_client(
-                Auth::usm("private-user")
+                Auth::usm_builder("private-user")
                     .auth_priv(
                         crate::AuthProtocol::Sha256,
                         "authpassword",
                         crate::PrivProtocol::Aes128,
                         "privpassword",
                     )
-                    .into(),
+                    .build(),
             );
             assert_eq!(auth_priv.version(), Version::V3);
             assert_eq!(auth_priv.security_level(), Some(SecurityLevel::AuthPriv));
@@ -1554,7 +1554,7 @@ mod tests {
         let tcp_client = Client::new(
             tcp_transport,
             ClientConfig {
-                auth: Auth::usm("no-auth-user").into(),
+                auth: Auth::usm("no-auth-user"),
                 ..Default::default()
             },
         )
@@ -1727,7 +1727,7 @@ mod tests {
                 timeouts: Arc::clone(&timeouts),
             },
             ClientConfig {
-                auth: crate::Auth::usm("trapuser").into(),
+                auth: crate::Auth::usm("trapuser"),
                 send_timeout,
                 local_authoritative_engine: Some(authoritative_engine),
                 ..Default::default()

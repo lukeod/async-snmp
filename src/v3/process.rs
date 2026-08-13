@@ -311,7 +311,7 @@ pub(crate) fn process_v3_inbound(
     // RFC 3414 Section 3.2 Step 4: the user must exist in the local user
     // database regardless of security level.
     let Some(user_config) = ctx.usm_users.get(&usm_params.username) else {
-        tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "unknown user");
+        tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.username = ?usm_params.username }, "unknown user");
         return fail(UsmFailure::UnknownUserNames, None);
     };
     // Keys are localized to the message's (authoritative) engine ID: the
@@ -328,7 +328,7 @@ pub(crate) fn process_v3_inbound(
         let supported = derived_keys.auth_key.is_some()
             && (security_level != SecurityLevel::AuthPriv || derived_keys.priv_key.is_some());
         if !supported {
-            tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.username = %String::from_utf8_lossy(&usm_params.username) }, "user does not support requested security level");
+            tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.username = ?usm_params.username }, "user does not support requested security level");
             return fail(UsmFailure::UnsupportedSecLevels, None);
         }
     }

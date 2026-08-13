@@ -18,9 +18,9 @@
 //!     .with_privacy(PrivProtocol::Aes128, b"privpassword").unwrap();
 //!
 //! // Each client localizes the keys for its authoritative engine.
-//! let auth: Auth = Auth::usm("admin")
+//! let auth = Auth::usm_builder("admin")
 //!     .with_master_keys(master_keys)
-//!     .into();
+//!     .build();
 //! # }
 //! ```
 
@@ -44,6 +44,112 @@ pub enum Auth {
     },
     /// User-based Security Model (`SNMPv3`).
     Usm(UsmConfig),
+}
+
+/// Builder for an [`Auth::Usm`] configuration.
+///
+/// [`Auth::usm`] constructs the username-only `noAuthNoPriv` case directly,
+/// consistently with [`Auth::v1`] and [`Auth::v2c`]. Use this builder when
+/// authentication, privacy, a context name, precomputed keys, or an explicit
+/// cryptographic backend is required. [`Self::build`] always returns [`Auth`].
+///
+/// The [`Debug`](std::fmt::Debug) implementation exposes usernames and context
+/// names as byte-exact escaped octets while redacting passwords and master keys.
+/// The builder is cloneable, but deliberately does not support comparing,
+/// ordering, or hashing credentials.
+///
+/// ```rust
+/// use async_snmp::{Auth, AuthProtocol};
+///
+/// let builder = Auth::usm_builder("admin")
+///     .auth(AuthProtocol::Sha256, "authpassword");
+/// let auth = builder.clone().build();
+/// ```
+///
+/// ```compile_fail,E0369
+/// use async_snmp::Auth;
+///
+/// let left = Auth::usm_builder("admin");
+/// let right = Auth::usm_builder("admin");
+/// let _same = left == right;
+/// ```
+///
+/// ```compile_fail,E0277
+/// use async_snmp::Auth;
+///
+/// fn require_ord<T: Ord>(_: &T) {}
+/// require_ord(&Auth::usm_builder("admin"));
+/// ```
+///
+/// ```compile_fail,E0277
+/// use async_snmp::Auth;
+///
+/// fn require_hash<T: std::hash::Hash>(_: &T) {}
+/// require_hash(&Auth::usm_builder("admin"));
+/// ```
+#[derive(Clone)]
+#[must_use = "call build() to produce an Auth configuration"]
+pub struct UsmAuthBuilder {
+    config: UsmConfig,
+}
+
+impl UsmAuthBuilder {
+    fn new(username: impl AsRef<[u8]>) -> Self {
+        Self {
+            config: UsmConfig::new(bytes::Bytes::copy_from_slice(username.as_ref())),
+        }
+    }
+
+    /// Configure password-backed authentication (`authNoPriv`).
+    pub fn auth(mut self, protocol: crate::AuthProtocol, password: impl AsRef<[u8]>) -> Self {
+        self.config = self.config.auth(protocol, password);
+        self
+    }
+
+    /// Configure password-backed authentication and privacy (`authPriv`).
+    pub fn auth_priv(
+        mut self,
+        auth_protocol: crate::AuthProtocol,
+        auth_password: impl AsRef<[u8]>,
+        priv_protocol: crate::PrivProtocol,
+        priv_password: impl AsRef<[u8]>,
+    ) -> Self {
+        self.config =
+            self.config
+                .auth_priv(auth_protocol, auth_password, priv_protocol, priv_password);
+        self
+    }
+
+    /// Set the `SNMPv3` scoped-PDU context name as protocol octets.
+    pub fn context_name(mut self, context_name: impl Into<bytes::Bytes>) -> Self {
+        self.config = self.config.context_name(context_name);
+        self
+    }
+
+    /// Select the cryptographic backend for this USM configuration.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    pub fn with_crypto_backend(mut self, backend: crate::CryptoBackend) -> Self {
+        self.config = self.config.with_crypto_backend(backend);
+        self
+    }
+
+    /// Use precomputed master keys instead of password-backed credentials.
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    pub fn with_master_keys(mut self, master_keys: crate::MasterKeys) -> Self {
+        self.config = self.config.with_master_keys(master_keys);
+        self
+    }
+
+    /// Build the `SNMPv3` authentication configuration.
+    pub fn build(self) -> Auth {
+        Auth::Usm(self.config)
+    }
+}
+
+impl std::fmt::Debug for UsmAuthBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("UsmAuthBuilder").field(&self.config).finish()
+    }
 }
 
 impl Default for Auth {
@@ -110,41 +216,54 @@ impl Auth {
         }
     }
 
-    /// Create an `SNMPv3` USM configuration.
+    /// Create an `SNMPv3` username-only (`noAuthNoPriv`) configuration.
     ///
-    /// Returns the outbound [`UsmConfig`] used by clients and trap sinks.
-    /// Inbound agents and notification receivers use [`crate::UsmUser`]
-    /// because configured mechanisms are capabilities rather than the exact
-    /// level of an incoming packet. `SNMPv3` supports three security levels:
-    /// - noAuthNoPriv: username only (no security)
-    /// - authNoPriv: username with authentication (integrity)
-    /// - authPriv: username with authentication and encryption (confidentiality)
+    /// Usernames are protocol octets and do not need to be valid UTF-8. This
+    /// constructor returns [`Auth`] directly, like [`Self::v1`] and
+    /// [`Self::v2c`]. Use [`Self::usm_builder`] for authentication, privacy,
+    /// context names, or precomputed keys.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_snmp::Auth;
+    /// use bytes::Bytes;
+    ///
+    /// // noAuthNoPriv: username only
+    /// let auth = Auth::usm("readonly");
+    ///
+    /// // Arbitrary octets are preserved.
+    /// let auth = Auth::usm(Bytes::from_static(b"operator\xff"));
+    /// ```
+    pub fn usm(username: impl AsRef<[u8]>) -> Self {
+        Self::Usm(UsmConfig::new(bytes::Bytes::copy_from_slice(
+            username.as_ref(),
+        )))
+    }
+
+    /// Start building a credentialed or context-specific `SNMPv3` USM
+    /// authentication configuration.
+    ///
+    /// Usernames are accepted and retained as protocol octets. The terminal
+    /// [`UsmAuthBuilder::build`] method returns [`Auth`] unambiguously.
     ///
     /// # Example
     ///
     /// ```rust
     /// use async_snmp::{Auth, AuthProtocol, PrivProtocol};
     ///
-    /// // noAuthNoPriv: username only
-    /// let auth: Auth = Auth::usm("readonly").into();
-    ///
-    /// // authNoPriv: with authentication
-    /// let auth: Auth = Auth::usm("admin")
-    ///     .auth(AuthProtocol::Sha256, "authpassword")
-    ///     .into();
-    ///
-    /// // authPriv: with authentication and encryption
-    /// let auth: Auth = Auth::usm("admin")
+    /// let auth = Auth::usm_builder("admin")
     ///     .auth_priv(
     ///         AuthProtocol::Sha256,
     ///         "authpassword",
     ///         PrivProtocol::Aes128,
     ///         "privpassword",
     ///     )
-    ///     .into();
+    ///     .context_name("tenant/blue")
+    ///     .build();
     /// ```
-    pub fn usm(username: impl Into<String>) -> UsmConfig {
-        UsmConfig::new(bytes::Bytes::from(username.into()))
+    pub fn usm_builder(username: impl AsRef<[u8]>) -> UsmAuthBuilder {
+        UsmAuthBuilder::new(username)
     }
 
     /// Return the SNMP version selected by this authentication configuration.
@@ -272,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_usm_no_auth_no_priv() {
-        let auth: Auth = Auth::usm("readonly").into();
+        let auth = Auth::usm("readonly");
         match auth {
             Auth::Usm(usm) => {
                 assert_eq!(usm.username().as_ref(), b"readonly");
@@ -285,9 +404,9 @@ mod tests {
 
     #[test]
     fn test_usm_auth_no_priv() {
-        let auth: Auth = Auth::usm("admin")
+        let auth = Auth::usm_builder("admin")
             .auth(AuthProtocol::Sha256, "authpass123")
-            .into();
+            .build();
         match auth {
             Auth::Usm(usm) => {
                 assert_eq!(usm.username().as_ref(), b"admin");
@@ -299,14 +418,14 @@ mod tests {
 
     #[test]
     fn test_usm_auth_priv() {
-        let auth: Auth = Auth::usm("admin")
+        let auth = Auth::usm_builder("admin")
             .auth_priv(
                 AuthProtocol::Sha256,
                 "authpass",
                 PrivProtocol::Aes128,
                 "privpass",
             )
-            .into();
+            .build();
         match auth {
             Auth::Usm(usm) => {
                 assert_eq!(usm.username().as_ref(), b"admin");
@@ -318,10 +437,10 @@ mod tests {
 
     #[test]
     fn test_usm_with_context_name() {
-        let auth: Auth = Auth::usm("admin")
+        let auth = Auth::usm_builder("admin")
             .auth(AuthProtocol::Sha256, "authpass")
             .context_name("vlan100")
-            .into();
+            .build();
         match auth {
             Auth::Usm(usm) => {
                 assert_eq!(usm.username().as_ref(), b"admin");
@@ -334,10 +453,10 @@ mod tests {
     #[test]
     fn test_usm_builder_chaining() {
         // Verify all methods can be chained
-        let auth: Auth = Auth::usm("user")
+        let auth = Auth::usm_builder("user")
             .auth_priv(AuthProtocol::Sha512, "auth", PrivProtocol::Aes256, "priv")
             .context_name("ctx")
-            .into();
+            .build();
 
         match auth {
             Auth::Usm(usm) => {
@@ -358,15 +477,16 @@ mod tests {
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
 
         // USM auth/priv passwords must not appear in Debug output.
-        let config = Auth::usm("admin")
+        let auth = Auth::usm_builder("admin")
             .auth_priv(
                 AuthProtocol::Sha256,
                 "authpassword123",
                 PrivProtocol::Aes128,
                 "privpassword456",
             )
-            .context_name("vlan100");
-        let config_rendered = format!("{config:?}");
+            .context_name("vlan100")
+            .build();
+        let config_rendered = format!("{auth:?}");
         assert!(
             !config_rendered.contains("authpassword123"),
             "{config_rendered}"
@@ -379,11 +499,92 @@ mod tests {
         assert!(config_rendered.contains("admin"), "{config_rendered}");
         assert!(config_rendered.contains("vlan100"), "{config_rendered}");
 
-        let usm: Auth = config.into();
-        let usm_rendered = format!("{usm:?}");
+        let usm_rendered = format!("{auth:?}");
         assert!(!usm_rendered.contains("authpassword123"), "{usm_rendered}");
         assert!(!usm_rendered.contains("privpassword456"), "{usm_rendered}");
         assert!(usm_rendered.contains("[REDACTED]"), "{usm_rendered}");
         assert!(usm_rendered.contains("admin"), "{usm_rendered}");
+    }
+
+    #[test]
+    fn test_usm_constructor_consistency_and_octets() {
+        let username = Bytes::from_static(b"operator\xff");
+        let constructors: [Auth; 3] = [
+            Auth::v1(username.clone()),
+            Auth::v2c(username.clone()),
+            Auth::usm(username.clone()),
+        ];
+
+        assert_eq!(constructors[0].version(), Version::V1);
+        assert_eq!(constructors[1].version(), Version::V2c);
+        assert_eq!(constructors[2].version(), Version::V3);
+        let Auth::Usm(config) = &constructors[2] else {
+            panic!("expected Usm variant");
+        };
+        assert_eq!(config.username(), &username);
+    }
+
+    #[test]
+    fn test_usm_builder_preserves_non_utf8_octets_at_each_security_level() {
+        let username = Bytes::from_static(b"user\x00\xff");
+        let configurations = [
+            Auth::usm(username.clone()),
+            Auth::usm_builder(username.clone())
+                .auth(AuthProtocol::Sha256, "authpass")
+                .build(),
+            Auth::usm_builder(username.clone())
+                .auth_priv(
+                    AuthProtocol::Sha256,
+                    "authpass",
+                    PrivProtocol::Aes128,
+                    "privpass",
+                )
+                .build(),
+        ];
+
+        for (auth, level) in configurations.iter().zip([
+            SecurityLevel::NoAuthNoPriv,
+            SecurityLevel::AuthNoPriv,
+            SecurityLevel::AuthPriv,
+        ]) {
+            let Auth::Usm(config) = auth else {
+                panic!("expected Usm variant");
+            };
+            assert_eq!(config.username(), &username);
+            assert_eq!(config.security_level(), level);
+        }
+    }
+
+    #[test]
+    fn test_usm_auth_api_validates_username_octet_boundaries() {
+        for username in [vec![0xff], vec![b'u'; 32]] {
+            let Auth::Usm(mut config) = Auth::usm(username) else {
+                panic!("expected Usm variant");
+            };
+            assert!(config.validate_and_precompute().is_ok());
+        }
+
+        for username in [Vec::new(), vec![b'u'; 33]] {
+            let length = username.len();
+            let Auth::Usm(mut config) = Auth::usm(username) else {
+                panic!("expected Usm variant");
+            };
+            assert_eq!(
+                config.validate_and_precompute(),
+                Err(crate::v3::CryptoError::InvalidUsmUsernameLength { length })
+            );
+        }
+    }
+
+    #[test]
+    fn test_usm_builder_debug_is_byte_exact_and_redacted() {
+        let builder = Auth::usm_builder(Bytes::from_static(b"user\xff"))
+            .auth(AuthProtocol::Sha256, "authpassword");
+        let rendered = format!("{builder:?}");
+
+        assert!(rendered.contains(r"user\xff"), "{rendered}");
+        assert!(!rendered.contains('\u{fffd}'), "{rendered}");
+        assert!(!rendered.contains("authpassword"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
 }

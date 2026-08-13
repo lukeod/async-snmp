@@ -364,7 +364,9 @@ async fn v3_auth_no_priv() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::AUTHSHA256_USER).auth(AuthProtocol::Sha256, AUTH_PASS),
+        Auth::usm_builder(users::AUTHSHA256_USER)
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -386,12 +388,14 @@ async fn v3_auth_priv() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVAES128_USER).auth_priv(
-            AuthProtocol::Sha1,
-            AUTH_PASS,
-            PrivProtocol::Aes128,
-            PRIV_PASS,
-        ),
+        Auth::usm_builder(users::PRIVAES128_USER)
+            .auth_priv(
+                AuthProtocol::Sha1,
+                AUTH_PASS,
+                PrivProtocol::Aes128,
+                PRIV_PASS,
+            )
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -418,7 +422,9 @@ async fn v3_auth_md5() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::AUTHMD5_USER).auth(AuthProtocol::Md5, AUTH_PASS),
+        Auth::usm_builder(users::AUTHMD5_USER)
+            .auth(AuthProtocol::Md5, AUTH_PASS)
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -440,7 +446,9 @@ async fn v3_auth_sha1() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::AUTHSHA1_USER).auth(AuthProtocol::Sha1, AUTH_PASS),
+        Auth::usm_builder(users::AUTHSHA1_USER)
+            .auth(AuthProtocol::Sha1, AUTH_PASS)
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -462,7 +470,9 @@ async fn v3_auth_sha256() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::AUTHSHA256_USER).auth(AuthProtocol::Sha256, AUTH_PASS),
+        Auth::usm_builder(users::AUTHSHA256_USER)
+            .auth(AuthProtocol::Sha256, AUTH_PASS)
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -479,11 +489,14 @@ async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
     let snmpd = Snmpd::start().await;
     let target = snmpd.udp_target();
 
-    let client = Client::builder(&target, Auth::usm(user).auth(protocol, AUTH_PASS))
-        .request_timeout(Duration::from_secs(5))
-        .connect()
-        .await
-        .unwrap();
+    let client = Client::builder(
+        &target,
+        Auth::usm_builder(user).auth(protocol, AUTH_PASS).build(),
+    )
+    .request_timeout(Duration::from_secs(5))
+    .connect()
+    .await
+    .unwrap();
 
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert!(result.anomalies.is_empty());
@@ -526,12 +539,9 @@ async fn v3_priv_des() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVDES_USER).auth_priv(
-            AuthProtocol::Sha1,
-            AUTH_PASS,
-            PrivProtocol::Des,
-            PRIV_PASS,
-        ),
+        Auth::usm_builder(users::PRIVDES_USER)
+            .auth_priv(AuthProtocol::Sha1, AUTH_PASS, PrivProtocol::Des, PRIV_PASS)
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -553,12 +563,14 @@ async fn v3_priv_aes128() {
 
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVAES128_USER).auth_priv(
-            AuthProtocol::Sha1,
-            AUTH_PASS,
-            PrivProtocol::Aes128,
-            PRIV_PASS,
-        ),
+        Auth::usm_builder(users::PRIVAES128_USER)
+            .auth_priv(
+                AuthProtocol::Sha1,
+                AUTH_PASS,
+                PrivProtocol::Aes128,
+                PRIV_PASS,
+            )
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
@@ -745,12 +757,14 @@ async fn v3_engine_discovery_and_request() {
     // This test verifies the full V3 flow: discovery + authenticated request
     let client = Client::builder(
         &target,
-        Auth::usm(users::PRIVAES128_USER).auth_priv(
-            AuthProtocol::Sha1,
-            AUTH_PASS,
-            PrivProtocol::Aes128,
-            PRIV_PASS,
-        ),
+        Auth::usm_builder(users::PRIVAES128_USER)
+            .auth_priv(
+                AuthProtocol::Sha1,
+                AUTH_PASS,
+                PrivProtocol::Aes128,
+                PRIV_PASS,
+            )
+            .build(),
     )
     .request_timeout(Duration::from_secs(5))
     .connect()
