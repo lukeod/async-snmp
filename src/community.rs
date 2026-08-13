@@ -3,6 +3,7 @@
 use std::fmt;
 
 use bytes::{Bytes, BytesMut};
+use subtle::ConstantTimeEq;
 
 /// An SNMPv1 or SNMPv2c community identifier.
 ///
@@ -15,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 /// accidental disclosure through library diagnostics; it does not provide
 /// confidentiality on the wire or protect raw buffers, packet captures,
 /// application copies, or downstream formatting of explicitly accessed bytes.
-#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Default)]
 pub struct Community(Bytes);
 
 impl Community {
@@ -35,6 +36,18 @@ impl Community {
     #[must_use]
     pub fn into_bytes(self) -> Bytes {
         self.0
+    }
+
+    /// Return whether `candidate` contains the same community octets.
+    ///
+    /// For equal-length inputs, comparison time does not depend on the octet
+    /// values. Length is not concealed: a length mismatch may return sooner.
+    /// Use this method instead of comparing [`Self::as_bytes`] when matching a
+    /// received community during authentication or authorization.
+    #[must_use]
+    pub fn matches(&self, candidate: impl AsRef<[u8]>) -> bool {
+        let candidate = candidate.as_ref();
+        self.0.len() == candidate.len() && bool::from(self.0.as_ref().ct_eq(candidate))
     }
 }
 
@@ -123,12 +136,22 @@ mod tests {
     #[test]
     fn debug_is_redacted_and_bytes_remain_explicitly_available() {
         let community = Community::from(Bytes::from_static(b"sentinel-community"));
-        assert_eq!(community.as_bytes(), b"sentinel-community");
+        assert!(community.matches(b"sentinel-community"));
         assert!(!format!("{community:?}").contains("sentinel-community"));
         assert!(!format!("{community:#?}").contains("sentinel-community"));
         assert_eq!(
             community.into_bytes(),
             Bytes::from_static(b"sentinel-community")
         );
+    }
+
+    #[test]
+    fn matches_arbitrary_octets_and_rejects_content_and_length_mismatches() {
+        let community = Community::from(&b"private\x00\xff"[..]);
+
+        assert!(community.matches(b"private\x00\xff"));
+        assert!(!community.matches(b"private\x00\xfe"));
+        assert!(!community.matches(b"private\x00"));
+        assert!(!community.matches(b"private\x00\xff\x00"));
     }
 }

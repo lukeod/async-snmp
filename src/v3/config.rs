@@ -11,7 +11,7 @@ use crate::v3::{
     AuthProtocol, CryptoBackend, CryptoError, CryptoResult, LocalizedKey, PrivKey, PrivProtocol,
 };
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct Password(Vec<u8>);
 
 impl AsRef<[u8]> for Password {
@@ -20,7 +20,7 @@ impl AsRef<[u8]> for Password {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone)]
 enum UsmCredentials {
     NoAuthNoPriv,
     Passwords {
@@ -43,7 +43,7 @@ enum UsmCredentials {
 /// buffers when those buffers are dropped. This guarantee does not extend to
 /// caller-provided inputs, live clones, allocator or cryptographic-provider
 /// internals, encoded message buffers, or kernel copies.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone)]
 pub struct UsmConfig {
     username: Bytes,
     credentials: UsmCredentials,
@@ -61,7 +61,7 @@ pub struct UsmConfig {
 ///
 /// Unlike [`UsmConfig`], this type has no scoped-PDU context because inbound
 /// contexts come from the received message.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone)]
 pub struct UsmUser {
     config: UsmConfig,
 }
@@ -349,9 +349,6 @@ impl UsmConfig {
                     self.crypto_backend,
                 )?;
                 let master_keys = match privacy {
-                    Some((priv_protocol, priv_password)) if priv_password == auth_password => {
-                        master_keys.with_privacy_same_password(*priv_protocol)
-                    }
                     Some((priv_protocol, priv_password)) => {
                         master_keys.with_privacy(*priv_protocol, priv_password.as_ref())?
                     }
@@ -464,6 +461,10 @@ pub struct DerivedKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use static_assertions::assert_not_impl_any;
+
+    assert_not_impl_any!(Password: PartialEq, Eq, PartialOrd, Ord, std::hash::Hash);
+    assert_not_impl_any!(UsmCredentials: PartialEq, Eq, PartialOrd, Ord, std::hash::Hash);
 
     #[test]
     fn test_usm_user_config_no_auth() {
@@ -668,7 +669,7 @@ mod tests {
         assert_eq!(a_priv.protocol(), b_priv.protocol());
         assert_eq!(a_priv.encryption_key(), b_priv.encryption_key());
 
-        // authPriv, same auth/priv password (with_privacy_same_password path)
+        // authPriv, same auth/priv password through the general derivation path
         let uncached = UsmConfig::new(Bytes::from_static(b"u")).auth_priv(
             AuthProtocol::Sha1,
             b"sharedpassword",

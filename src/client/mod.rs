@@ -557,7 +557,7 @@ impl<T: Transport> Client<T> {
                         return Ok(Candidate::Reject);
                     }
                     if let Message::Community(ref message) = response
-                        && community.as_bytes() != message.community().as_bytes()
+                        && !community.matches(message.community().as_bytes())
                     {
                         let accepted = match self.inner.config.community_response_policy {
                             crate::transport::CommunityResponsePolicy::Exact => false,

@@ -2878,7 +2878,7 @@ mod tests {
                 .usm_user(username.clone(), move |_| config)
                 .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
                     assert_eq!(notification.version, Version::V3);
-                    assert_eq!(notification.community, None);
+                    assert!(notification.community.is_none());
                     assert_eq!(notification.username, Some(policy_username.as_ref()));
                     assert_eq!(notification.security_level, Some(level));
                     assert_eq!(notification.pdu_class, NotificationPduClass::Inform);

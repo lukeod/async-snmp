@@ -724,7 +724,7 @@ mod tests {
             Auth::Community {
                 version: crate::CommunityVersion::V1,
                 ref community,
-            } if community.as_bytes() == b"private"
+            } if community.matches(b"private")
         ));
 
         let no_auth = TestCliArgs::try_parse_from(["test", "-u", "readonly", "127.0.0.1"]).unwrap();

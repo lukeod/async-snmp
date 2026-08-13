@@ -77,7 +77,7 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 /// let key2 = master.localize(engine2_id).unwrap();
 /// # }
 /// ```
-#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MasterKey {
     key: Vec<u8>,
     #[zeroize(skip)]
@@ -563,7 +563,7 @@ pub fn verify_message(
 /// // Use with multiple clients; each client localizes for its engine.
 /// # }
 /// ```
-#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MasterKeys {
     /// Master key for authentication (and base for privacy key derivation)
     auth_master: MasterKey,
@@ -1039,18 +1039,18 @@ mod tests {
         let engine_id = decode_hex("000000000000000000000002").unwrap();
         let short = b"1234567"; // 7 octets
 
-        assert_eq!(
+        assert!(matches!(
             MasterKey::from_password(AuthProtocol::Sha1, short),
             Err(super::super::CryptoError::PasswordTooShort)
-        );
+        ));
         assert_eq!(
             LocalizedKey::from_password(AuthProtocol::Sha1, short, &engine_id).err(),
             Some(super::super::CryptoError::PasswordTooShort)
         );
-        assert_eq!(
+        assert!(matches!(
             MasterKeys::new(AuthProtocol::Sha1, short),
             Err(super::super::CryptoError::PasswordTooShort)
-        );
+        ));
     }
 
     #[test]
@@ -1085,10 +1085,10 @@ mod tests {
             for protocol in protocols {
                 let len = protocol.digest_len();
                 for actual in [len - 1, len + 1] {
-                    assert_eq!(
+                    assert!(matches!(
                         MasterKey::from_bytes_with_backend(protocol, vec![0xAA; actual], backend),
                         Err(super::super::CryptoError::InvalidKeyLength)
-                    );
+                    ));
                     assert!(matches!(
                         LocalizedKey::from_bytes_with_backend(
                             protocol,

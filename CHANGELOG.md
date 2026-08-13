@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Secret-bearing `Community`, `Auth`, `UsmConfig`, `UsmUser`,
+  `SecurityName`, `RequestRegistration`, `MasterKey`, and `MasterKeys` no longer
+  implement their previously derived comparison and/or hashing traits
+  (`PartialEq`, `Eq`, `PartialOrd`, `Ord`, and `Hash`, as applicable). Selectors
+  such as protocol, security level, cryptographic backend, and policy enums
+  retain their existing, justified trait sets. `Community::matches` and
+  `SecurityName::matches` provide content-constant-time matching for
+  authentication and authorization without
+  restoring secret-dependent derived equality. Credential cloning remains
+  available where configuration reuse requires it, and library `Debug` output
+  remains redacted.
 - **Breaking:** SNMPv3 engine-cache APIs now separate unauthenticated
   `DiscoveredEngine` identity/capacity from `AuthenticatedEngineTime`.
   Trust-establishing `EngineState` constructors and timeliness mutations are

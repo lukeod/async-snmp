@@ -159,7 +159,7 @@ async fn non_utf8_community_correlates_udp_response() {
         else {
             panic!("expected community request");
         };
-        assert_eq!(request.community().as_bytes(), community);
+        assert!(request.community().matches(&community));
 
         let request_id = request.into_pdu().unwrap().request_id();
         let response = CommunityMessage::v2c(

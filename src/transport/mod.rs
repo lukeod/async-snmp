@@ -100,7 +100,7 @@ pub enum CommunityResponsePolicy {
 }
 
 /// Protocol-specific response identity held inside a request registration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum ResponseCorrelation {
     /// SNMPv1/v2c responses must match this version and community policy.
     Community {
@@ -154,7 +154,7 @@ pub(crate) enum ResponseCorrelation {
 ///     CommunityResponsePolicy::Exact,
 /// );
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RequestRegistration {
     /// Request ID (v1/v2c) or msgID (v3).
     request_id: i32,
@@ -344,7 +344,7 @@ impl ResponseCorrelation {
         if actual_version != *version {
             return ResponseIdentity::Reject;
         }
-        if actual_community == community.as_bytes() {
+        if community.matches(actual_community) {
             return ResponseIdentity::Match;
         }
         match policy {
@@ -359,6 +359,15 @@ impl ResponseCorrelation {
         }
     }
 }
+
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(
+    ResponseCorrelation: PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    std::hash::Hash
+);
 
 /// Result of validating a correlated response candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

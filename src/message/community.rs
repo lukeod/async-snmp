@@ -453,7 +453,7 @@ mod tests {
         let message = CommunityMessage::v1_trap("public", trap).unwrap();
         let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
         assert_eq!(decoded.version(), Version::V1);
-        assert_eq!(decoded.community().as_bytes(), b"public");
+        assert!(decoded.community().matches(b"public"));
         assert_eq!(
             decoded.pdu().trap_v1().unwrap().enterprise,
             oid!(1, 3, 6, 1, 4, 1, 9999)
@@ -468,7 +468,7 @@ mod tests {
             .unwrap();
             let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
             assert_eq!(decoded.version(), version);
-            assert_eq!(decoded.community().as_bytes(), b"private");
+            assert!(decoded.community().matches(b"private"));
             assert_eq!(decoded.pdu().standard().unwrap().request_id, 123);
         }
     }

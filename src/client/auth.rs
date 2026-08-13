@@ -33,7 +33,7 @@ use crate::version::Version;
 ///
 /// The [`Debug`] implementation redacts community identifiers so that credentials
 /// are not leaked through logs or diagnostics.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone)]
 pub enum Auth {
     /// Community authentication (`SNMPv1` or v2c).
     Community {
@@ -332,7 +332,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community.as_bytes(), b"public");
+                assert!(community.matches(b"public"));
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -344,7 +344,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V1);
-                assert_eq!(community.as_bytes(), b"private");
+                assert!(community.matches(b"private"));
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -356,7 +356,7 @@ mod tests {
         match auth {
             Auth::Community { version, community } => {
                 assert_eq!(version, CommunityVersion::V2c);
-                assert_eq!(community.as_bytes(), b"secret");
+                assert!(community.matches(b"secret"));
             }
             Auth::Usm(_) => panic!("expected Community variant"),
         }
@@ -376,7 +376,7 @@ mod tests {
                     community: actual,
                 } => {
                     assert_eq!(version, expected_version);
-                    assert_eq!(actual.as_bytes(), community);
+                    assert!(actual.matches(&community));
                 }
                 Auth::Usm(_) => panic!("expected Community variant"),
             }

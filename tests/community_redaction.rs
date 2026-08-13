@@ -30,7 +30,7 @@ fn request_pdu(request_id: i32) -> Pdu {
 fn community_raw_access_is_explicit_and_handles_arbitrary_octets() {
     for bytes in [b"".as_slice(), b"\x00\xffcommunity\x80".as_slice()] {
         let community = Community::from(bytes);
-        assert_eq!(community.as_bytes(), bytes);
+        assert!(community.matches(bytes));
         assert_redacted(&community);
         assert_eq!(community.into_bytes(), Bytes::copy_from_slice(bytes));
     }

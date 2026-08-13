@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
+use subtle::ConstantTimeEq;
 
 use crate::Community;
 use crate::message::SecurityLevel;
@@ -18,7 +19,7 @@ use super::SecurityModel;
 ///
 /// Community variants retain transitive Debug redaction, while USM usernames
 /// remain visible in diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum SecurityName {
     /// SNMPv1/v2c community identifier.
     Community(Community),
@@ -46,6 +47,34 @@ impl SecurityName {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.as_bytes().is_empty()
+    }
+
+    /// Return whether `candidate` is the same kind of security name with the
+    /// same protocol octets.
+    ///
+    /// Community names match only community names, and USM usernames match
+    /// only USM usernames. For same-variant, equal-length inputs, comparison
+    /// time does not depend on the octet values. Variant and length are not
+    /// concealed and a mismatch in either may return sooner.
+    ///
+    /// This comparison alone is not a complete authorization decision. A
+    /// handler must also check [`RequestContext::security_model`] to
+    /// distinguish SNMPv1 communities, SNMPv2c communities, and USM users. USM
+    /// authorization should additionally require the appropriate
+    /// [`RequestContext::security_level`], because `noAuthNoPriv` usernames are
+    /// not authenticated.
+    #[must_use]
+    pub fn matches(&self, candidate: &Self) -> bool {
+        match (self, candidate) {
+            (Self::Community(expected), Self::Community(actual)) => {
+                expected.matches(actual.as_bytes())
+            }
+            (Self::Usm(expected), Self::Usm(actual)) => {
+                expected.len() == actual.len()
+                    && bool::from(expected.as_ref().ct_eq(actual.as_ref()))
+            }
+            (Self::Community(_), Self::Usm(_)) | (Self::Usm(_), Self::Community(_)) => false,
+        }
     }
 }
 
@@ -93,6 +122,25 @@ impl SecurityName {
 ///     ) -> BoxFuture<'a, HandlerResult<async_snmp::handler::GetNextResult>> {
 ///         Box::pin(async { Ok(async_snmp::handler::GetNextResult::EndOfMibView) })
 ///     }
+/// }
+/// ```
+///
+/// Authorization code should match both the security model and name, and for
+/// USM should require a security level that authenticates the username:
+///
+/// ```rust
+/// use async_snmp::{Community, RequestContext, SecurityLevel, SecurityModel, SecurityName};
+///
+/// fn may_read_v2c(ctx: &RequestContext) -> bool {
+///     let reader = SecurityName::Community(Community::from(b"reader\xff"));
+///     ctx.security_model == SecurityModel::V2c && ctx.security_name.matches(&reader)
+/// }
+///
+/// fn may_write(ctx: &RequestContext) -> bool {
+///     let operator = SecurityName::Usm(bytes::Bytes::from_static(b"operator\xff"));
+///     ctx.security_model == SecurityModel::Usm
+///         && matches!(ctx.security_level, SecurityLevel::AuthNoPriv | SecurityLevel::AuthPriv)
+///         && ctx.security_name.matches(&operator)
 /// }
 /// ```
 #[derive(Debug, Clone)]

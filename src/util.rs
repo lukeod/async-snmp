@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 use crate::Community;
 use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
-use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
@@ -33,9 +32,7 @@ pub(crate) fn community_matches(
 
     let mut valid = false;
     for candidate in configured {
-        if candidate.as_bytes().len() == community.len()
-            && bool::from(candidate.as_bytes().ct_eq(community))
-        {
+        if candidate.matches(community) {
             valid = true;
         }
     }
