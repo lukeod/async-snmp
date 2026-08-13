@@ -137,6 +137,7 @@ pub trait PreparedSet: Send + 'static {
 ///
 /// Key considerations:
 /// - The returned OID must be strictly greater than the input OID
+/// - [`handles`](MibHandler::handles) must return `true` for the returned OID
 /// - GETBULK uses GETNEXT repeatedly, so efficient implementation matters
 /// - Use [`OidTable`](super::OidTable) to simplify sorted OID management
 ///
@@ -382,7 +383,10 @@ pub trait MibHandler: Send + Sync + 'static {
     ///
     /// Return `Ok(`[`GetNextResult::Value`]`)` with the lexicographically next
     /// OID and value after `oid`, or `Ok(`[`GetNextResult::EndOfMibView`]`)`
-    /// if there are no more OIDs in this handler's subtree.
+    /// if there are no more OIDs owned by this handler. The returned OID must
+    /// be strictly greater than `oid`, and [`handles`](MibHandler::handles)
+    /// must return `true` for it. The agent rejects either contract violation
+    /// and responds to the request with `genErr`.
     ///
     /// Return `Err(`[`HandlerError`](super::HandlerError)`)` only when the
     /// handler failed to determine an answer; the agent then responds to the
@@ -421,8 +425,11 @@ pub trait MibHandler: Send + Sync + 'static {
     /// the registered prefix (i.e., the OID is within this handler's subtree).
     /// Override for more complex matching.
     ///
-    /// This method is used to route GET and SET requests. GETNEXT and GETBULK
-    /// consult all handlers regardless of this method.
+    /// This method routes GET and SET requests and establishes ownership of
+    /// candidates returned by GETNEXT and GETBULK. GETNEXT and GETBULK consult
+    /// every registered handler because overriding this method can
+    /// intentionally establish non-prefix ownership; the registered prefix is
+    /// passed as context for that ownership decision, not used as a bound.
     fn handles(&self, registered_prefix: &Oid, oid: &Oid) -> bool {
         oid.starts_with(registered_prefix)
     }

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** GETNEXT/GETBULK handler results are now validated against the
+  `MibHandler` contract. Returned OIDs must be strictly increasing and owned by
+  the producing handler according to `MibHandler::handles`; violations produce
+  `genErr` instead of being silently discarded or accepted across ownership
+  boundaries.
 - **Breaking:** v2/v3-to-v1 trap conversion moved from permissive
   `Pdu::to_v1_trap` to `NotificationPdu::to_v1_trap`. It now returns a
   validated `TrapV1Notification` result and rejects conversions whose derived

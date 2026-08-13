@@ -2317,15 +2317,6 @@ impl Agent {
             match candidate {
                 None => return Ok(None),
                 Some(ref next_vb) => {
-                    if next_vb.oid <= search_from {
-                        tracing::error!(
-                            target: "async_snmp::agent",
-                            from = %search_from,
-                            got = %next_vb.oid,
-                            "handler returned non-increasing OID in GETNEXT"
-                        );
-                        return Ok(None);
-                    }
                     if v1_rejects_counter64(ctx.version(), &next_vb.value) {
                         search_from = next_vb.oid.clone();
                         continue;
@@ -2358,29 +2349,29 @@ impl Agent {
         ctx: &RequestContext,
         oid: &Oid,
     ) -> HandlerResult<Option<VarBind>> {
-        // Find the first handler that can provide a next OID.
-        //
-        // A handler can only return an OID > oid if:
-        //   - oid falls within the handler's subtree (oid starts with handler prefix), OR
-        //   - the handler's entire subtree is after oid (handler prefix > oid)
-        //
-        // Handlers whose prefix is <= oid and whose subtree does not contain oid
-        // cannot return anything useful and are skipped.
+        // Custom `handles` implementations may establish non-prefix ownership,
+        // so a registration prefix cannot safely prune this minimum scan.
         let mut best_result: Option<VarBind> = None;
 
         for handler in &self.inner.handlers {
             let prefix = &handler.prefix;
-            if prefix <= oid && !oid.starts_with(prefix) {
-                continue;
-            }
             if let GetNextResult::Value(next) = handler.handler.get_next(ctx, oid).await? {
-                // Must be lexicographically greater than the request OID
-                if next.oid > *oid {
-                    match &best_result {
-                        None => best_result = Some(next),
-                        Some(current) if next.oid < current.oid => best_result = Some(next),
-                        _ => {}
-                    }
+                if next.oid <= *oid {
+                    return Err(crate::handler::HandlerError::new(format!(
+                        "GETNEXT handler registered at {prefix} returned non-increasing OID {} after {oid}",
+                        next.oid
+                    )));
+                }
+                if !handler.handler.handles(prefix, &next.oid) {
+                    return Err(crate::handler::HandlerError::new(format!(
+                        "GETNEXT handler registered at {prefix} returned unowned OID {}",
+                        next.oid
+                    )));
+                }
+                match &best_result {
+                    None => best_result = Some(next),
+                    Some(current) if next.oid < current.oid => best_result = Some(next),
+                    _ => {}
                 }
             }
         }
@@ -2893,8 +2884,35 @@ mod tests {
         }
     }
 
+    struct FixedNextHandler {
+        candidate: Oid,
+    }
+
+    impl MibHandler for FixedNextHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async move {
+                Ok(GetNextResult::Value(VarBind::new(
+                    self.candidate.clone(),
+                    Value::Integer(1),
+                )))
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn get_next_serial_probing_preserves_registration_contracts() {
+    async fn get_next_serial_probing_preserves_custom_ownership_contracts() {
         let cursor = oid!(1, 3, 6, 1, 4, 1, 100);
         for reverse_registration in [false, true] {
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2902,15 +2920,14 @@ mod tests {
             let containing_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let nested = (
                 oid!(1, 3, 6, 1, 4, 1, 100, 2),
-                Arc::new(SerialProbeHandler {
-                    handles: false,
-                    ..serial_probe(
-                        "nested",
-                        vec![oid!(1, 3, 6, 1, 4, 1, 100, 1)],
-                        nested_calls.clone(),
-                        order.clone(),
-                    )
-                }) as Arc<dyn MibHandler>,
+                // The candidate is outside the registered prefix, but this
+                // handler's custom `handles` implementation owns it.
+                Arc::new(serial_probe(
+                    "nested",
+                    vec![oid!(1, 3, 6, 1, 4, 1, 100, 1)],
+                    nested_calls.clone(),
+                    order.clone(),
+                )) as Arc<dyn MibHandler>,
             );
             let containing = (
                 cursor.clone(),
@@ -2973,6 +2990,89 @@ mod tests {
             .unwrap();
         assert_eq!(result.oid, cursor.child(2));
         assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn get_next_rejects_non_increasing_and_unowned_candidates() {
+        let ctx = crate::test_support::request_context(PduType::GetNextRequest);
+        let cases = [
+            (
+                "non-increasing OID",
+                oid!(1, 3, 6, 1, 4, 1, 500),
+                oid!(1, 3, 6, 1, 4, 1, 500, 1),
+                oid!(1, 3, 6, 1, 4, 1, 500, 1),
+            ),
+            (
+                "unowned OID",
+                oid!(1, 3, 6, 1, 4, 1, 500),
+                oid!(1, 3, 6, 1, 4, 1, 500),
+                oid!(1, 3, 6, 1, 4, 1, 600, 1),
+            ),
+        ];
+
+        for (expected_error, prefix, cursor, candidate) in cases {
+            let agent = Agent::builder()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .without_builtin_handlers()
+                .handler(prefix, Arc::new(FixedNextHandler { candidate }))
+                .allow_all_access()
+                .build()
+                .await
+                .unwrap();
+
+            let error = agent.get_next_oid(&ctx, &cursor).await.unwrap_err();
+            assert!(error.message().contains(expected_error));
+
+            let request = Pdu::standard(
+                crate::pdu::StandardPduType::GetNextRequest,
+                9,
+                0,
+                0,
+                vec![VarBind::new(cursor, Value::Null)],
+            );
+            let response = agent.dispatch_request(&ctx, &request).await.unwrap();
+            assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+            assert_eq!(response.error_index(), 1);
+            assert_eq!(response.varbinds, request.varbinds);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_bulk_preserves_non_prefix_ownership_after_crossing_registration_prefix() {
+        let root = oid!(1, 3, 6, 1, 4, 1, 700);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .handler(
+                root.child(2),
+                Arc::new(serial_probe(
+                    "custom",
+                    vec![root.child(1), root.child(3), root.child(4)],
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    order.clone(),
+                )),
+            )
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
+        let request =
+            Pdu::get_bulk(11, 0, 2, vec![VarBind::new(root.child(1), Value::Null)]).unwrap();
+
+        let response = agent.dispatch_request(&ctx, &request).await.unwrap();
+        assert_eq!(
+            response
+                .varbinds
+                .iter()
+                .map(|varbind| varbind.oid.clone())
+                .collect::<Vec<_>>(),
+            [root.child(3), root.child(4)]
+        );
+        assert_eq!(*order.lock().unwrap(), ["custom", "custom"]);
     }
 
     #[tokio::test]
