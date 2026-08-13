@@ -33,7 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_id = b"example-sender-engine".to_vec();
     // This example uses a no-op persistence callback. A deployed application
     // must store both fields durably and use AuthoritativeEngine::restart on
-    // subsequent process starts.
+    // subsequent process starts. Concrete Error + Send + Sync callback failures
+    // are preserved by AuthoritativeEnginePersistenceError.
     let engine =
         AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(()))?;
     let receiver = NotificationReceiver::builder()

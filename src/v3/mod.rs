@@ -15,7 +15,10 @@
 //! candidate and message-size limit. Boots/time becomes trusted only after
 //! HMAC verification and RFC 3414 Step 7(b) processing. Local authoritative
 //! roles use [`AuthoritativeEngine`] so a stable engine ID and every boots
-//! increment are persisted before protocol use.
+//! increment are persisted before protocol use. Persistence callback failures
+//! retain their concrete standard-error source in
+//! [`AuthoritativeEnginePersistenceError`], together with the attempted boots
+//! transition.
 //!
 //! Cargo features determine which crypto backends are available. Each
 //! Each [`UsmConfig`] or [`UsmUser`] selects a backend; RustCrypto remains the
@@ -62,7 +65,10 @@ mod usm;
 pub use auth::{LocalizedKey, MasterKey, MasterKeys};
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 pub(crate) use auth::{LocalizedKey, MasterKey, MasterKeys};
-pub use authoritative::{AuthoritativeEngine, PersistedAuthoritativeEngine};
+pub use authoritative::{
+    AuthoritativeEngine, AuthoritativeEnginePersistenceError,
+    AuthoritativeEnginePersistenceOperation, PersistedAuthoritativeEngine,
+};
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use config::DerivedKeys;
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]

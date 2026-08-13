@@ -62,7 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A receiver with USM users is authoritative for V3 Inform exchanges and
     // needs stable engine ID/boots state. This no-op callback is suitable only
     // for the example; deployed applications must store both fields durably
-    // and call AuthoritativeEngine::restart on later process starts.
+    // and call AuthoritativeEngine::restart on later process starts. Storage
+    // errors must implement Error + Send + Sync and remain downcastable through
+    // AuthoritativeEnginePersistenceError.
     let engine = AuthoritativeEngine::install(b"example-receiver-engine".to_vec(), |_| {
         Ok::<(), std::convert::Infallible>(())
     })?;

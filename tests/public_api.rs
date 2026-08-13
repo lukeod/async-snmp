@@ -1,3 +1,5 @@
+use std::error::Error as _;
+use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -11,12 +13,13 @@ use async_snmp::{
     SetUndoResult, oid,
 };
 use async_snmp::{
-    Auth, Client, ClientConfig, CommunityVersion, CompatibilityPolicy, ConstructionStage,
-    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, DecodeError,
-    DecodeErrorKind, DecodeErrorOrigin, Error, ErrorIndex, ErrorKind, ErrorStatus, GetBulkPdu, Oid,
-    Pdu, PduBody, RequestPdu, RequestRegistration, ResponsePdu, StandardPduType, Target,
-    UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind, VarBind, Version,
-    WalkAbortReason,
+    Auth, AuthoritativeEngine, AuthoritativeEnginePersistenceError,
+    AuthoritativeEnginePersistenceOperation, Client, ClientConfig, CommunityVersion,
+    CompatibilityPolicy, ConstructionStage, DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SEND_TIMEOUT, DecodeError, DecodeErrorKind, DecodeErrorOrigin, Error, ErrorIndex,
+    ErrorKind, ErrorStatus, GetBulkPdu, Oid, Pdu, PduBody, RequestPdu, RequestRegistration,
+    ResponsePdu, StandardPduType, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value,
+    ValueKind, VarBind, Version, WalkAbortReason,
 };
 use bytes::Bytes;
 
@@ -172,10 +175,151 @@ fn stable_value_and_error_kinds_are_public() {
     assert_eq!(ValueKind::Integer.as_str(), "integer");
     assert_eq!(Error::Config("bad input".into()).kind(), ErrorKind::Config);
     assert_eq!(ErrorKind::Config.as_str(), "configuration");
+    assert_eq!(
+        AuthoritativeEnginePersistenceOperation::EngineTimeRollover.to_string(),
+        "engine-time rollover"
+    );
+    assert_eq!(
+        ErrorKind::AuthoritativeEnginePersistence.as_str(),
+        "authoritative_engine_persistence"
+    );
 
     // The kind remains nameable when the feature-gated parent error does not.
     let agent_kind = ErrorKind::AgentAlreadyRunning;
     assert_eq!(agent_kind.to_string(), "agent_already_running");
+}
+
+#[test]
+fn authoritative_persistence_error_surface_preserves_callback_type() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct PublicPersistenceSentinel;
+
+    impl Display for PublicPersistenceSentinel {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("public persistence sentinel")
+        }
+    }
+
+    impl std::error::Error for PublicPersistenceSentinel {}
+
+    fn accepts_public_type(_error: &AuthoritativeEnginePersistenceError) {}
+
+    let error = AuthoritativeEngine::install(b"public-api-engine".to_vec(), |_| {
+        Err(PublicPersistenceSentinel)
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AuthoritativeEnginePersistence);
+
+    let persistence = error
+        .authoritative_engine_persistence()
+        .expect("typed persistence error");
+    accepts_public_type(persistence);
+    assert_eq!(
+        persistence.operation(),
+        AuthoritativeEnginePersistenceOperation::Install
+    );
+    assert_eq!(persistence.previous_engine_boots(), None);
+    assert_eq!(persistence.attempted_engine_boots(), 1);
+    assert_eq!(
+        persistence.downcast_source_ref::<PublicPersistenceSentinel>(),
+        Some(&PublicPersistenceSentinel)
+    );
+    assert!(
+        persistence
+            .persistence_source()
+            .is::<PublicPersistenceSentinel>()
+    );
+}
+
+#[test]
+fn authoritative_persistence_accepts_boxed_dynamic_errors() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct BoxedPersistenceSentinel;
+
+    impl Display for BoxedPersistenceSentinel {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("boxed persistence sentinel")
+        }
+    }
+
+    impl std::error::Error for BoxedPersistenceSentinel {}
+
+    let error = AuthoritativeEngine::install(b"boxed-error-engine".to_vec(), |_| {
+        let error: Box<dyn std::error::Error + Send + Sync + 'static> =
+            Box::new(BoxedPersistenceSentinel);
+        Err(error)
+    })
+    .unwrap_err();
+    let persistence = error
+        .authoritative_engine_persistence()
+        .expect("typed persistence error");
+
+    assert_eq!(
+        persistence.downcast_source_ref::<BoxedPersistenceSentinel>(),
+        Some(&BoxedPersistenceSentinel)
+    );
+}
+
+#[test]
+fn authoritative_persistence_retains_nested_source_chain() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct NestedPersistenceCause;
+
+    impl Display for NestedPersistenceCause {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("nested persistence cause")
+        }
+    }
+
+    impl std::error::Error for NestedPersistenceCause {}
+
+    #[derive(Debug)]
+    struct PublicPersistenceContext {
+        source: NestedPersistenceCause,
+    }
+
+    impl Display for PublicPersistenceContext {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "public persistence context: {}", self.source)
+        }
+    }
+
+    impl std::error::Error for PublicPersistenceContext {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.source)
+        }
+    }
+
+    struct IntoOnlyPersistenceError(PublicPersistenceContext);
+
+    impl From<IntoOnlyPersistenceError> for Box<dyn std::error::Error + Send + Sync + 'static> {
+        fn from(error: IntoOnlyPersistenceError) -> Self {
+            Box::new(error.0)
+        }
+    }
+
+    let error = AuthoritativeEngine::install(b"nested-error-engine".to_vec(), |_| {
+        Err(IntoOnlyPersistenceError(PublicPersistenceContext {
+            source: NestedPersistenceCause,
+        }))
+    })
+    .unwrap_err();
+    let persistence = error
+        .authoritative_engine_persistence()
+        .expect("typed persistence error");
+
+    assert!(
+        persistence
+            .downcast_source_ref::<PublicPersistenceContext>()
+            .is_some()
+    );
+    assert!(
+        persistence
+            .source()
+            .and_then(std::error::Error::source)
+            .is_some_and(|source| source.is::<NestedPersistenceCause>())
+    );
+    assert!(error.to_string().contains("nested persistence cause"));
 }
 
 #[cfg(feature = "agent")]

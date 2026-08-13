@@ -5,6 +5,8 @@
 //! - [`Error`] - The main error type covering all failure modes
 //! - [`DecodeError`] - Structured packet-decoding diagnostics
 //! - [`ConstructionStage`] - The phase active at a construction deadline
+//! - [`AuthoritativeEnginePersistenceError`](crate::AuthoritativeEnginePersistenceError) -
+//!   Authoritative-engine durable storage failures
 //! - [`ErrorStatus`] - SNMP protocol errors returned by agents (RFC 3416)
 //! - [`WalkAbortReason`] - Reasons a walk operation was aborted
 //!
@@ -408,6 +410,8 @@ pub enum ErrorKind {
     WalkAborted,
     /// Invalid configuration.
     Config,
+    /// Authoritative-engine state could not be persisted.
+    AuthoritativeEnginePersistence,
     /// Operating-system random source failure.
     RandomSource,
     /// Available even when the `agent` feature is disabled.
@@ -437,6 +441,7 @@ impl ErrorKind {
             Self::ResponseShape => "response_shape",
             Self::WalkAborted => "walk_aborted",
             Self::Config => "configuration",
+            Self::AuthoritativeEnginePersistence => "authoritative_engine_persistence",
             Self::RandomSource => "random_source",
             Self::AgentAlreadyRunning => "agent_already_running",
             Self::InvalidMessage => "invalid_message",
@@ -612,6 +617,10 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(Box<str>),
 
+    /// An authoritative-engine state transition could not be persisted.
+    #[error(transparent)]
+    AuthoritativeEnginePersistence(#[from] crate::v3::AuthoritativeEnginePersistenceError),
+
     /// The operating system could not provide random bytes.
     #[error("OS random source unavailable: {source}")]
     RandomSource {
@@ -653,6 +662,7 @@ impl Error {
             Self::ResponseShape { .. } => ErrorKind::ResponseShape,
             Self::WalkAborted { .. } => ErrorKind::WalkAborted,
             Self::Config(_) => ErrorKind::Config,
+            Self::AuthoritativeEnginePersistence(_) => ErrorKind::AuthoritativeEnginePersistence,
             Self::RandomSource { .. } => ErrorKind::RandomSource,
             #[cfg(feature = "agent")]
             Self::AgentAlreadyRunning => ErrorKind::AgentAlreadyRunning,
@@ -685,6 +695,20 @@ impl Error {
         match self {
             Self::Exchange { source, .. } => source.exchange_source(),
             _ => self,
+        }
+    }
+
+    /// Return the authoritative-engine persistence failure, if this is one.
+    ///
+    /// Exchange metadata wrappers are traversed in the same way as
+    /// [`Error::exchange_source`].
+    #[must_use]
+    pub fn authoritative_engine_persistence(
+        &self,
+    ) -> Option<&crate::v3::AuthoritativeEnginePersistenceError> {
+        match self.exchange_source() {
+            Self::AuthoritativeEnginePersistence(error) => Some(error),
+            _ => None,
         }
     }
 
@@ -1052,6 +1076,13 @@ mod tests {
             ),
             (Error::Config("config".into()), ErrorKind::Config),
             (
+                *crate::v3::AuthoritativeEngine::install(b"error-kind-engine".to_vec(), |_| {
+                    Err(std::io::Error::other("persistence"))
+                })
+                .unwrap_err(),
+                ErrorKind::AuthoritativeEnginePersistence,
+            ),
+            (
                 Error::RandomSource {
                     source: getrandom::Error::UNEXPECTED,
                 },
@@ -1089,6 +1120,10 @@ mod tests {
             (ErrorKind::ResponseShape, "response_shape"),
             (ErrorKind::WalkAborted, "walk_aborted"),
             (ErrorKind::Config, "configuration"),
+            (
+                ErrorKind::AuthoritativeEnginePersistence,
+                "authoritative_engine_persistence",
+            ),
             (ErrorKind::RandomSource, "random_source"),
             (ErrorKind::AgentAlreadyRunning, "agent_already_running"),
             (ErrorKind::InvalidMessage, "invalid_message"),

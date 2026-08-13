@@ -4542,6 +4542,26 @@ mod tests {
             .err()
             .expect("authoritative persistence must fail");
 
+        assert_eq!(
+            error.kind(),
+            crate::ErrorKind::AuthoritativeEnginePersistence
+        );
+        let persistence = error
+            .authoritative_engine_persistence()
+            .expect("Agent must preserve the persistence failure");
+        assert_eq!(
+            persistence.operation(),
+            crate::AuthoritativeEnginePersistenceOperation::EngineTimeRollover
+        );
+        assert_eq!(persistence.previous_engine_boots(), Some(1));
+        assert_eq!(persistence.attempted_engine_boots(), 2);
+        assert_eq!(
+            persistence
+                .downcast_source_ref::<std::io::Error>()
+                .expect("concrete callback error")
+                .kind(),
+            std::io::ErrorKind::Other
+        );
         assert!(error.to_string().contains("storage unavailable"));
         let _rebound = UdpSocket::bind(bind_addr).await.unwrap();
     }

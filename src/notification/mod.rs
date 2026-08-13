@@ -185,7 +185,7 @@ mod varbind;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -968,6 +968,7 @@ impl NotificationReceiverBuilder {
                 varbind_validation: self.varbind_validation,
                 engine_id,
                 salt_counter,
+                authoritative_snapshot: AtomicU64::new(pack_boots_time((engine_boots, 0))),
                 engine_boots_base: engine_boots,
                 engine_start: Instant::now(),
                 usm_stats: UsmStats::default(),
@@ -1260,6 +1261,8 @@ struct ReceiverInner {
     engine_id: Bytes,
     /// Salt counter for privacy operations
     salt_counter: Option<SaltCounter>,
+    /// Most recently sampled authoritative boots/time tuple.
+    authoritative_snapshot: AtomicU64,
     /// Initial engine boots value at startup, used to compute overflow-adjusted boots.
     engine_boots_base: u32,
     /// Time when the receiver was started, used to compute engine time.
@@ -1307,7 +1310,7 @@ impl ReceiverInner {
 
     /// Return one coherent authoritative boots/time pair for the current instant.
     fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
-        match &self.authoritative_engine {
+        let pair = match &self.authoritative_engine {
             Some(engine) => engine.current_boots_time(),
             None => {
                 let total_secs = self.engine_start.elapsed().as_secs();
@@ -1316,8 +1319,25 @@ impl ReceiverInner {
                     total_secs,
                 ))
             }
-        }
+        }?;
+        Ok(self.publish_authoritative_boots_time(pair))
     }
+
+    fn publish_authoritative_boots_time(&self, pair: (u32, u32)) -> (u32, u32) {
+        let packed = pack_boots_time(pair);
+        let previous = self
+            .authoritative_snapshot
+            .fetch_max(packed, Ordering::Relaxed);
+        unpack_boots_time(previous.max(packed))
+    }
+}
+
+const fn pack_boots_time((boots, time): (u32, u32)) -> u64 {
+    (boots as u64) << 32 | time as u64
+}
+
+const fn unpack_boots_time(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
 }
 
 impl NotificationReceiver {
@@ -1423,16 +1443,16 @@ impl NotificationReceiver {
         &self.inner.engine_id
     }
 
-    /// Get the current local authoritative engine boots value.
+    /// Get the most recently sampled local engine boots value.
+    ///
+    /// V3 processing samples the authoritative clock. Any rollover increment
+    /// has already been stored through the retained persistence callback before
+    /// this snapshot is published. This getter does not sample the clock or run
+    /// the persistence callback, so it can remain unchanged while the receiver
+    /// is idle.
     #[must_use]
     pub fn engine_boots(&self) -> u32 {
-        match self.inner.authoritative_boots_time() {
-            Ok(pair) => pair.0,
-            Err(_) => self.inner.authoritative_engine.as_ref().map_or(
-                self.inner.engine_boots_base,
-                AuthoritativeEngine::engine_boots,
-            ),
-        }
+        unpack_boots_time(self.inner.authoritative_snapshot.load(Ordering::Relaxed)).0
     }
 
     /// Get the usmStatsUnknownEngineIDs counter value.
@@ -1592,6 +1612,8 @@ impl Clone for NotificationReceiver {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     #[tokio::test]
@@ -1942,7 +1964,129 @@ mod tests {
             .await;
 
         let err = result.err().expect("expected build to fail");
+        assert_eq!(err.kind(), crate::ErrorKind::AuthoritativeEnginePersistence);
+        let persistence = err
+            .authoritative_engine_persistence()
+            .expect("receiver must preserve the persistence failure");
+        assert_eq!(
+            persistence.operation(),
+            crate::AuthoritativeEnginePersistenceOperation::EngineTimeRollover
+        );
+        assert_eq!(persistence.previous_engine_boots(), Some(1));
+        assert_eq!(persistence.attempted_engine_boots(), 2);
+        assert_eq!(
+            persistence
+                .downcast_source_ref::<std::io::Error>()
+                .expect("concrete callback error")
+                .kind(),
+            std::io::ErrorKind::Other
+        );
         assert!(err.to_string().contains("storage unavailable"));
+    }
+
+    #[tokio::test]
+    async fn receiver_engine_boots_is_pure_and_v3_processing_reports_rollover_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let engine = AuthoritativeEngine::install(b"test-receiver-engine".to_vec(), move |_| {
+            if callback_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("rollover persistence unavailable"))
+            }
+        })
+        .unwrap();
+        let mut receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine)
+            .build()
+            .await
+            .unwrap();
+        Arc::get_mut(&mut receiver.inner)
+            .unwrap()
+            .authoritative_engine
+            .as_mut()
+            .unwrap()
+            .set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+
+        assert_eq!(receiver.engine_boots(), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let error = receiver
+            .handle_v3(Bytes::new(), "127.0.0.1:1162".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::ErrorKind::AuthoritativeEnginePersistence
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(receiver.engine_boots(), 1);
+    }
+
+    #[tokio::test]
+    async fn receiver_snapshot_rejects_delayed_pre_rollover_clone_sample() {
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let stored_for_callback = Arc::clone(&stored);
+        let engine = AuthoritativeEngine::install(b"test-receiver-engine".to_vec(), move |state| {
+            stored_for_callback
+                .lock()
+                .unwrap()
+                .push(state.engine_boots());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine)
+            .build()
+            .await
+            .unwrap();
+        let cycle = u64::from(crate::v3::MAX_ENGINE_TIME) + 1;
+        let stale_sampled = Arc::new(std::sync::Barrier::new(2));
+        let rollover_published = Arc::new(std::sync::Barrier::new(2));
+
+        let stale_inner = Arc::clone(&receiver.inner);
+        let stale_engine = stale_inner.authoritative_engine.as_ref().unwrap().clone();
+        let stale_sampled_thread = Arc::clone(&stale_sampled);
+        let rollover_published_thread = Arc::clone(&rollover_published);
+        let stale = std::thread::spawn(move || {
+            let pair = stale_engine
+                .current_boots_time_at_for_test(cycle - 1)
+                .unwrap();
+            assert_eq!(pair, (1, crate::v3::MAX_ENGINE_TIME));
+            stale_sampled_thread.wait();
+            rollover_published_thread.wait();
+            stale_inner.publish_authoritative_boots_time(pair)
+        });
+
+        stale_sampled.wait();
+        let current = receiver
+            .inner
+            .authoritative_engine
+            .as_ref()
+            .unwrap()
+            .current_boots_time_at_for_test(cycle)
+            .unwrap();
+        assert_eq!(current, (2, 0));
+        assert_eq!(
+            receiver.inner.publish_authoritative_boots_time(current),
+            (2, 0)
+        );
+        rollover_published.wait();
+
+        assert_eq!(stale.join().unwrap(), (2, 0));
+        assert_eq!(receiver.engine_boots(), 2);
+        assert_eq!(
+            unpack_boots_time(
+                receiver
+                    .inner
+                    .authoritative_snapshot
+                    .load(Ordering::Relaxed)
+            ),
+            (2, 0)
+        );
+        assert_eq!(stored.lock().unwrap().as_slice(), &[1, 2]);
     }
 
     #[test]
