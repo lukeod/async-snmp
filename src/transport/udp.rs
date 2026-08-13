@@ -153,6 +153,18 @@ struct UdpTransportInner {
     recv_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
+struct UdpRecvTaskCleanup {
+    core: Arc<UdpCore>,
+    shutdown_complete: CancellationToken,
+}
+
+impl Drop for UdpRecvTaskCleanup {
+    fn drop(&mut self) {
+        self.core.close();
+        self.shutdown_complete.cancel();
+    }
+}
+
 impl UdpTransport {
     /// Bind to the given address with default configuration.
     ///
@@ -224,10 +236,16 @@ impl UdpTransport {
         let socket = inner.socket.clone();
         let core = inner.core.clone();
         let shutdown = inner.shutdown.clone();
-        let shutdown_complete = inner.shutdown_complete.clone();
+        let cleanup = UdpRecvTaskCleanup {
+            core: inner.core.clone(),
+            shutdown_complete: inner.shutdown_complete.clone(),
+        };
         let local_addr = inner.local_addr;
         let receive_limits = inner.receive_limits;
         let handle = tokio::spawn(async move {
+            // Constructed before spawning so dropping an unpolled task still
+            // closes the core and signals completion synchronously.
+            let _cleanup = cleanup;
             let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
             let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
             // Backoff applied after a recv error to avoid a hot spin when the
@@ -285,11 +303,6 @@ impl UdpTransport {
                     }
                 }
             }
-
-            // Wake pending waiters so they fail now rather than at their
-            // individual deadlines.
-            core.close();
-            shutdown_complete.cancel();
         });
         // Safe: mutex was just created, no contention possible
         *inner
@@ -972,6 +985,31 @@ mod tests {
             matches!(*err, Error::Closed { .. }),
             "expected Error::Closed, got {err:?}"
         );
+    }
+
+    #[test]
+    fn shutdown_completes_after_originating_runtime_is_dropped() {
+        let runtime_a = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime_a.block_on(async {
+            let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+            transport.control()
+        });
+
+        drop(runtime_a);
+
+        let runtime_b = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime_b.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), control.shutdown())
+                .await
+                .expect("shutdown hung after originating runtime teardown");
+        });
+        assert!(control.is_shutdown());
     }
 
     #[tokio::test]
