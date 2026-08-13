@@ -202,8 +202,9 @@ use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 use crate::udp_responder::UdpResponder;
 use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
+use crate::v3::process::RemoteEngineTable;
 use crate::v3::process::UsmStats;
-use crate::v3::{AuthoritativeEngine, EngineState, SaltCounter};
+use crate::v3::{AuthoritativeEngine, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
@@ -976,7 +977,7 @@ impl NotificationReceiverBuilder {
                 engine_boots_base: engine_boots,
                 engine_start: Instant::now(),
                 usm_stats: UsmStats::default(),
-                remote_engines: Mutex::new(HashMap::new()),
+                remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
                 max_message_size: self.max_message_size,
                 decode_policy: self.decode_policy,
                 compatibility_policy: self.compatibility_policy,
@@ -1278,8 +1279,9 @@ struct ReceiverInner {
     /// authenticated message from each engine, so only holders of configured
     /// credentials can add entries. Bounded to `MAX_REMOTE_ENGINES` with
     /// least-recently-updated eviction so a credential holder cannot grow it
-    /// without limit by fabricating engine IDs.
-    remote_engines: Mutex<HashMap<Bytes, EngineState>>,
+    /// without limit by fabricating engine IDs. An exact ordered index keeps
+    /// eviction bounded without retaining stale auxiliary records.
+    remote_engines: Mutex<RemoteEngineTable>,
     /// Local outbound response policy limit.
     max_message_size: usize,
     decode_policy: crate::message::DecodePolicy,
@@ -2639,7 +2641,11 @@ mod tests {
             let mut engines = receiver.inner.remote_engines.lock().unwrap();
             for i in 0..MAX_REMOTE_ENGINES {
                 let id = Bytes::from(format!("dummy-engine-{i}"));
-                engines.insert(id.clone(), EngineState::new(id, 1, 1));
+                let state = crate::v3::EngineState::new(id.clone(), 1, 1);
+                let updated_at = state
+                    .last_authenticated_update_at()
+                    .expect("dummy state has authenticated time");
+                engines.insert(id, state, updated_at);
             }
             assert_eq!(engines.len(), MAX_REMOTE_ENGINES);
         }
@@ -2653,6 +2659,7 @@ mod tests {
         let engines = receiver.inner.remote_engines.lock().unwrap();
         assert_eq!(engines.len(), MAX_REMOTE_ENGINES);
         assert!(engines.contains_key(&Bytes::from_static(b"fresh-remote-engine")));
+        assert!(!engines.contains_key(&Bytes::from_static(b"dummy-engine-0")));
     }
 
     /// A replayed (stale) trap from a known remote engine is rejected:

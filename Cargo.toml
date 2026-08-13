@@ -99,6 +99,10 @@ required-features = ["crypto-rustcrypto"]
 name = "transport_comparison"
 harness = false
 
+[[bench]]
+name = "remote_engine_cache"
+harness = false
+
 [features]
 default = ["crypto-rustcrypto"]
 agent = []                  # SNMP agent

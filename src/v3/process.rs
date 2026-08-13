@@ -24,6 +24,7 @@ use crate::message_size::MessageSize;
 use crate::oid::Oid;
 use crate::v3::auth::verify_message;
 use crate::v3::encode::encode_v3_report;
+use crate::v3::recency_map::RecencyMap;
 use crate::v3::{
     EngineState, LocalizedKey, UsmSecurityParams, in_authoritative_time_window, report_oids,
     validate_engine_id,
@@ -113,10 +114,11 @@ pub(crate) enum V3Role<'a> {
     /// authoritative engine ID (traps) use Step 7b against per-engine state
     /// seeded from the first authenticated message.
     Receiver {
-        remote_engines: &'a Mutex<HashMap<Bytes, EngineState>>,
-        max_remote_engines: usize,
+        remote_engines: &'a Mutex<RemoteEngineTable>,
     },
 }
+
+pub(crate) type RemoteEngineTable = RecencyMap<Bytes, EngineState>;
 
 impl V3Role<'_> {
     #[cfg(any(feature = "agent", test))]
@@ -129,23 +131,17 @@ impl V3Role<'_> {
         false
     }
 
-    fn receiver_config(&self) -> (&Mutex<HashMap<Bytes, EngineState>>, usize) {
+    fn remote_engines(&self) -> &Mutex<RemoteEngineTable> {
         #[cfg(any(feature = "agent", test))]
         match self {
             Self::Authoritative => unreachable!("authoritative role rejected a foreign engine ID"),
-            Self::Receiver {
-                remote_engines,
-                max_remote_engines,
-            } => (remote_engines, *max_remote_engines),
+            Self::Receiver { remote_engines } => remote_engines,
         }
 
         #[cfg(not(any(feature = "agent", test)))]
         {
-            let Self::Receiver {
-                remote_engines,
-                max_remote_engines,
-            } = self;
-            (remote_engines, *max_remote_engines)
+            let Self::Receiver { remote_engines } = self;
+            remote_engines
         }
     }
 }
@@ -373,7 +369,7 @@ pub(crate) fn process_v3_inbound(
                 return fail(UsmFailure::NotInTimeWindows, Some(auth_key));
             }
         } else {
-            let (remote_engines, max_remote_engines) = role.receiver_config();
+            let remote_engines = role.remote_engines();
             // Step 7b: the sender is the authoritative engine (traps sent
             // under the sender's engine ID), checked against per-engine
             // state seeded from the first authenticated message.
@@ -385,26 +381,33 @@ pub(crate) fn process_v3_inbound(
                 let mut engines = remote_engines
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Bound the table: a peer holding one credential can
-                // authenticate under arbitrarily many fabricated engine
-                // IDs, so evict the least-recently-updated engine when
-                // full before seeding a new one.
-                if !engines.contains_key(&engine_key)
-                    && engines.len() >= max_remote_engines
-                    && let Some(oldest) = engines
-                        .iter()
-                        .min_by_key(|(_, state)| state.last_authenticated_update_at())
-                        .map(|(k, _)| k.clone())
-                {
-                    engines.remove(&oldest);
-                }
-                let state = engines.entry(engine_key).or_insert_with_key(|k| {
-                    EngineState::new(k.clone(), usm_params.engine_boots, usm_params.engine_time)
-                });
-                let timely = state
-                    .check_and_update_timeliness(usm_params.engine_boots, usm_params.engine_time);
+                let update = |state: &mut EngineState| {
+                    let timely = state.check_and_update_timeliness(
+                        usm_params.engine_boots,
+                        usm_params.engine_time,
+                    );
+                    let updated_at = state
+                        .last_authenticated_update_at()
+                        .expect("remote engine state retains authenticated time");
+                    let estimated = (!timely).then(|| state.estimated_boots_time());
+                    ((timely, estimated), updated_at)
+                };
+                let result = engines.update(&engine_key, update);
+                let (timely, estimated) = if let Some(result) = result {
+                    result
+                } else {
+                    let mut state = EngineState::new(
+                        engine_key.clone(),
+                        usm_params.engine_boots,
+                        usm_params.engine_time,
+                    );
+                    let (result, updated_at) = update(&mut state);
+                    engines.insert(engine_key, state, updated_at);
+                    result
+                };
                 if !timely {
-                    let (our_boots, our_time) = state.estimated_boots_time();
+                    let (our_boots, our_time) =
+                        estimated.expect("untimely message records estimated time");
                     tracing::warn!(target: "async_snmp::v3", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = our_boots, snmp.our_time = our_time }, "message outside time window");
                 }
                 timely
@@ -820,10 +823,9 @@ mod tests {
             b"",
             b"",
         );
-        let remote_engines = Mutex::new(HashMap::new());
+        let remote_engines = Mutex::new(RemoteEngineTable::new(16));
         let role = V3Role::Receiver {
             remote_engines: &remote_engines,
-            max_remote_engines: 16,
         };
 
         let outcome = process_v3_inbound(data, &ctx, &role).unwrap();
@@ -1267,10 +1269,9 @@ mod tests {
         let users = HashMap::new();
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
-        let remote_engines = Mutex::new(HashMap::new());
+        let remote_engines = Mutex::new(RemoteEngineTable::new(16));
         let receiver = V3Role::Receiver {
             remote_engines: &remote_engines,
-            max_remote_engines: 16,
         };
 
         for invalid in [
@@ -1312,10 +1313,9 @@ mod tests {
         };
         assert_eq!(failure, UsmFailure::UnknownEngineIds);
 
-        let remote_engines = Mutex::new(HashMap::new());
+        let remote_engines = Mutex::new(RemoteEngineTable::new(16));
         let role = V3Role::Receiver {
             remote_engines: &remote_engines,
-            max_remote_engines: 16,
         };
         let outcome = process_v3_inbound(data, &ctx, &role).unwrap();
         assert!(

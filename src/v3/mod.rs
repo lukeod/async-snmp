@@ -58,6 +58,7 @@ mod engine;
 )]
 mod privacy;
 pub(crate) mod process;
+mod recency_map;
 mod report;
 mod usm;
 

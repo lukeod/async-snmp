@@ -204,7 +204,6 @@ impl super::NotificationReceiver {
         };
         let role = V3Role::Receiver {
             remote_engines: &self.inner.remote_engines,
-            max_remote_engines: super::MAX_REMOTE_ENGINES,
         };
 
         let inbound = match process_v3_inbound(data, &usm_ctx, &role)? {
