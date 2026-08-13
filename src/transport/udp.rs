@@ -198,6 +198,8 @@ impl UdpTransport {
             inner: self.inner.clone(),
             target,
             strict_source: false,
+            #[cfg(test)]
+            send_gate: None,
         })
     }
 
@@ -531,6 +533,8 @@ pub struct UdpHandle {
     inner: Arc<UdpTransportInner>,
     target: SocketAddr,
     strict_source: bool,
+    #[cfg(test)]
+    send_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl UdpHandle {
@@ -587,7 +591,18 @@ impl Transport for UdpHandle {
             self.inner
                 .core
                 .register(registration, self.target, self.strict_source)?;
-        self.send_datagram(data).await?;
+        let deadline = registration.deadline();
+        if std::time::Instant::now() >= deadline {
+            return Err(registration.timeout_error(self.target));
+        }
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                tracing::debug!(target: "async_snmp::transport::udp", { request_id = registration.request_id(), target = %self.target }, "transport timeout during UDP send");
+                return Err(registration.timeout_error(self.target));
+            }
+            result = self.send_datagram(data) => result?,
+        }
         self.recv_registered_with(&registration, validate).await
     }
 
@@ -639,6 +654,13 @@ impl UdpHandle {
 
     async fn send_datagram(&self, data: &[u8]) -> Result<()> {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
+        #[cfg(test)]
+        if let Some(gate) = &self.send_gate {
+            gate.acquire()
+                .await
+                .expect("test send gate remains open")
+                .forget();
+        }
         tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.bytes = data.len() }, "UDP send");
         self.inner
             .socket
@@ -924,6 +946,58 @@ mod tests {
 
         assert_eq!(client.stats(), control.stats());
         assert_eq!(client.stats().expired_registrations, 1);
+    }
+
+    #[tokio::test]
+    async fn request_send_uses_exchange_deadline_and_releases_registration() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let mut handle = transport.handle(listener.local_addr().unwrap()).unwrap();
+        handle.send_gate = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+
+        let started = std::time::Instant::now();
+        let error = handle
+            .request_with(
+                b"request",
+                RequestRegistration::test_unchecked(42, Duration::from_millis(20)),
+                |_, _| Ok(Candidate::Accept(())),
+            )
+            .await
+            .expect_err("stalled send must time out");
+
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(handle.stats().expired_registrations, 1);
+
+        // The timed-out future dropped its registration guard, so the same ID
+        // can be registered immediately instead of remaining pinned until the
+        // endpoint's periodic cleanup pass.
+        drop(register_v3(&handle, 42, Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_request_does_not_send_datagram() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle(listener.local_addr().unwrap()).unwrap();
+
+        let error = handle
+            .request_with(
+                b"request",
+                RequestRegistration::test_unchecked(43, Duration::ZERO),
+                |_, _| Ok(Candidate::Accept(())),
+            )
+            .await
+            .expect_err("zero-timeout request must time out");
+
+        assert!(matches!(*error, Error::Timeout { .. }));
+        let mut received = [0u8; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.recv_from(&mut received))
+                .await
+                .is_err(),
+            "expired request emitted a datagram"
+        );
     }
 
     #[tokio::test]

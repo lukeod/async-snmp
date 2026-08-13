@@ -125,6 +125,21 @@ impl UdpRegistration {
     pub(crate) fn request_id(&self) -> i32 {
         self.primary
     }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.owner.deadline
+    }
+
+    pub(crate) fn timeout_error(&self, target: SocketAddr) -> Box<Error> {
+        let now = Instant::now();
+        self.owner.note_expired(&self.core.stats);
+        Error::Timeout {
+            target,
+            elapsed: self.owner.elapsed(now),
+            retries: self.owner.retries,
+        }
+        .boxed()
+    }
 }
 
 impl Drop for UdpRegistration {
