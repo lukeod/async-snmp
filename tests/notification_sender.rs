@@ -937,6 +937,41 @@ async fn agent_v2c_inform_to_sink() {
     }
 }
 
+#[tokio::test]
+async fn agent_inform_sinks_share_source_endpoint() {
+    let first_receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let second_receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = first_receiver.local_addr();
+    let second_addr = second_receiver.local_addr();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .trap_sink(
+            NotificationSinkId::new("first").unwrap(),
+            first_addr.to_string(),
+            Auth::v2c("public"),
+        )
+        .trap_sink(
+            NotificationSinkId::new("second").unwrap(),
+            second_addr.to_string(),
+            Auth::v2c("private"),
+        )
+        .allow_all_access()
+        .build()
+        .await
+        .unwrap();
+    let first = tokio::spawn(async move { first_receiver.recv().await.unwrap() });
+    let second = tokio::spawn(async move { second_receiver.recv().await.unwrap() });
+
+    let outcome = agent
+        .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2), 1000, vec![])
+        .await;
+    assert!(outcome.all_succeeded());
+    let (_, first_source) = first.await.unwrap();
+    let (_, second_source) = second.await.unwrap();
+    assert_eq!(first_source, second_source);
+    assert_ne!(first_source.port(), agent.local_addr().port());
+}
+
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
 async fn agent_v3_trap_to_sink() {

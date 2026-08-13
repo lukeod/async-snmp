@@ -221,8 +221,38 @@ pub(crate) struct TrapSink {
     inform_timeout: Duration,
     inform_retry: Retry,
     /// Cached client for inform sending. Lazily created on first inform.
-    /// Holds both the transport (to keep the socket alive) and the client.
-    inform_client: AsyncMutex<Option<(UdpTransport, Client<UdpHandle>)>>,
+    inform_client: AsyncMutex<Option<Client<UdpHandle>>>,
+}
+
+/// Agent-owned Inform endpoints, shared by every sink in an address family.
+pub(crate) struct InformTransportPool {
+    ipv4: AsyncMutex<Option<UdpTransport>>,
+    ipv6: AsyncMutex<Option<UdpTransport>>,
+}
+
+impl InformTransportPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            ipv4: AsyncMutex::new(None),
+            ipv6: AsyncMutex::new(None),
+        }
+    }
+
+    async fn handle(&self, target: SocketAddr) -> Result<UdpHandle> {
+        let (slot, bind_addr) = if target.is_ipv6() {
+            (&self.ipv6, "[::]:0")
+        } else {
+            (&self.ipv4, "0.0.0.0:0")
+        };
+        let mut transport = slot.lock().await;
+        if transport.is_none() {
+            *transport = Some(UdpTransport::bind(bind_addr).await?);
+        }
+        transport
+            .as_ref()
+            .expect("Inform transport was initialized")
+            .handle(target)
+    }
 }
 
 impl TrapSink {
@@ -302,9 +332,12 @@ impl TrapSink {
     }
 
     /// Get or create the cached inform client for this sink.
-    async fn get_or_create_inform_client(&self) -> Result<Client<UdpHandle>> {
+    async fn get_or_create_inform_client(
+        &self,
+        transports: &InformTransportPool,
+    ) -> Result<Client<UdpHandle>> {
         let mut guard = self.inform_client.lock().await;
-        if let Some((_, ref client)) = *guard {
+        if let Some(ref client) = *guard {
             return Ok(client.clone());
         }
 
@@ -318,15 +351,9 @@ impl TrapSink {
             ..ClientConfig::default()
         };
 
-        let bind_addr = if self.summary.dest.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let transport = UdpTransport::bind(bind_addr).await?;
-        let handle = transport.handle(self.summary.dest)?;
+        let handle = transports.handle(self.summary.dest).await?;
         let client = Client::new(handle, config)?;
-        *guard = Some((transport, client.clone()));
+        *guard = Some(client.clone());
         Ok(client)
     }
 }
@@ -661,7 +688,8 @@ impl super::Agent {
     /// Constructs an `InformRequest` PDU and sends it to each destination,
     /// waiting for acknowledgement from each. Sink exchanges run concurrently,
     /// and outcomes remain in sink configuration order. Reuses a cached client
-    /// per sink for the request/response exchange.
+    /// per sink and one Inform UDP endpoint per destination address family for
+    /// request/response exchanges.
     ///
     /// V1 trap sinks are explicitly reported as skipped because v1 does not
     /// support informs. For a V3 sink, the receiver is authoritative; the
@@ -852,7 +880,9 @@ impl super::Agent {
         uptime: u32,
         varbinds: &[VarBind],
     ) -> Result<crate::client::ResponseMetadata> {
-        let client = sink.get_or_create_inform_client().await?;
+        let client = sink
+            .get_or_create_inform_client(&self.inner.inform_transports)
+            .await?;
         client
             .send_inform_with_metadata(trap_oid, uptime, varbinds.to_vec())
             .await
@@ -924,6 +954,45 @@ mod tests {
             std::time::Duration::from_millis(10),
             crate::client::Retry::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn inform_clients_share_one_lazy_endpoint_per_family() {
+        let first_receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_target = first_receiver.local_addr().unwrap();
+        let second_target = second_receiver.local_addr().unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .trap_sink(
+                NotificationSinkId::new("first").unwrap(),
+                first_target.to_string(),
+                Auth::v2c("public"),
+            )
+            .trap_sink(
+                NotificationSinkId::new("second").unwrap(),
+                second_target.to_string(),
+                Auth::v2c("private"),
+            )
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(agent.inner.inform_transports.ipv4.lock().await.is_none());
+        let (first, second) = tokio::join!(
+            agent.inner.trap_sinks[0].get_or_create_inform_client(&agent.inner.inform_transports),
+            agent.inner.trap_sinks[1].get_or_create_inform_client(&agent.inner.inform_transports),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.peer_addr(), first_target);
+        assert_eq!(second.peer_addr(), second_target);
+
+        let transport = agent.inner.inform_transports.ipv4.lock().await;
+        let endpoint = transport.as_ref().expect("IPv4 endpoint was not cached");
+        assert_ne!(endpoint.local_addr().port(), agent.local_addr().port());
+        assert!(agent.inner.inform_transports.ipv6.lock().await.is_none());
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]

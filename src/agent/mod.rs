@@ -1267,6 +1267,7 @@ impl AgentBuilder {
                 authorization: config.authorization,
                 cancel: config.cancel,
                 trap_sinks,
+                inform_transports: notification::InformTransportPool::new(),
                 notification_id: std::sync::atomic::AtomicI32::new(1),
                 run_active: AtomicBool::new(false),
                 response_send_timeout: config.response_send_timeout,
@@ -1547,6 +1548,8 @@ pub(crate) struct AgentInner {
     pub(crate) cancel: CancellationToken,
     /// Configured trap/inform destinations.
     pub(crate) trap_sinks: Vec<notification::TrapSink>,
+    /// Inform endpoints shared by all sinks of each destination family.
+    pub(crate) inform_transports: notification::InformTransportPool,
     /// Per-agent monotonic counter for trap request-ids and v3 notification msgIDs.
     pub(crate) notification_id: std::sync::atomic::AtomicI32,
     /// Shared across clones to enforce one active service loop.

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Inform sinks now share one lazily created UDP endpoint per destination
+  address family. Per-sink clients and protocol state remain cached, while
+  same-family sinks no longer retain redundant sockets and receive tasks.
 - Agent UDP receive failures are now classified by scope. Invalid per-datagram
   metadata is discarded, known transient socket failures are retried with
   cancellation-aware bounded backoff, and fatal or unknown socket-state errors
