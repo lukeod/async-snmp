@@ -108,6 +108,10 @@ name = "agent_getnext"
 harness = false
 required-features = ["agent"]
 
+[[bench]]
+name = "error_representation"
+harness = false
+
 [features]
 default = ["crypto-rustcrypto"]
 agent = []                  # SNMP agent

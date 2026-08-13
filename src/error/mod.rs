@@ -12,7 +12,11 @@
 //!
 //! # Error Handling
 //!
-//! Errors are boxed for efficiency: `Result<T> = Result<T, Box<Error>>`.
+//! Errors are boxed so `Result<T>` stays compact and async state machines that
+//! retain an error across a suspension point do not embed the full [`Error`]
+//! enum. This trades one heap allocation on error construction for smaller
+//! success values and futures. The `error_representation` benchmark measures
+//! that trade-off.
 //!
 //! ```rust
 //! use async_snmp::{Error, Result};
