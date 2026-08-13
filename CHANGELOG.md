@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `TrapV1Pdu::to_v2_pdu` now returns a validated
   `NotificationPdu` and rejects invalid synthesized trap OIDs or copied
   variable bindings instead of returning state that fails during encoding.
+- Typed net-snmp Opaque accessors now require the declared extension payload to
+  consume the complete Opaque value. Variable-width integer payloads retain
+  their existing non-minimal encoding compatibility, and raw access is unchanged.
 
 - Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
   single-flight operation. Callers share success or structured failure under a

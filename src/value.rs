@@ -766,7 +766,7 @@ impl Value {
     pub fn as_opaque_float(&self) -> Option<f32> {
         match self {
             Value::Opaque(data)
-                if data.len() >= 7
+                if data.len() == 7
                 && data[0] == 0x9f       // ASN_OPAQUE_TAG1 (extension)
                 && data[1] == 0x78       // ASN_OPAQUE_FLOAT
                 && data[2] == 0x04 =>
@@ -803,7 +803,7 @@ impl Value {
     pub fn as_opaque_double(&self) -> Option<f64> {
         match self {
             Value::Opaque(data)
-                if data.len() >= 11
+                if data.len() == 11
                 && data[0] == 0x9f       // ASN_OPAQUE_TAG1 (extension)
                 && data[1] == 0x79       // ASN_OPAQUE_DOUBLE
                 && data[2] == 0x08 =>
@@ -821,6 +821,9 @@ impl Value {
     /// `SNMPv1` doesn't support Counter64 natively. net-snmp encodes 64-bit
     /// counters inside Opaque for `SNMPv1` compatibility using extension tag
     /// (0x9f) + counter64 type (0x76) + length + big-endian bytes.
+    /// Payloads from one through eight bytes are accepted without enforcing a
+    /// minimal integer representation, but the declared payload must consume
+    /// the complete Opaque value.
     ///
     /// # Examples
     ///
@@ -843,6 +846,9 @@ impl Value {
     /// Extract signed 64-bit integer from Opaque value (net-snmp extension).
     ///
     /// Uses extension tag (0x9f) + i64 type (0x7a) + length + big-endian bytes.
+    /// Payloads from one through eight bytes are sign-extended. Redundant
+    /// leading sign bytes remain accepted for interoperability, but the
+    /// declared payload must consume the complete Opaque value.
     ///
     /// # Examples
     ///
@@ -867,7 +873,7 @@ impl Value {
             {
                 // ASN_OPAQUE_I64
                 let len = data[2] as usize;
-                if data.len() < 3 + len || len == 0 || len > 8 {
+                if data.len() != 3 + len || len == 0 || len > 8 {
                     return None;
                 }
                 let bytes = &data[3..3 + len];
@@ -886,6 +892,9 @@ impl Value {
     /// Extract unsigned 64-bit integer from Opaque value (net-snmp extension).
     ///
     /// Uses extension tag (0x9f) + u64 type (0x7b) + length + big-endian bytes.
+    /// Payloads from one through eight bytes are accepted without enforcing a
+    /// minimal integer representation, but the declared payload must consume
+    /// the complete Opaque value.
     ///
     /// # Examples
     ///
@@ -914,7 +923,7 @@ impl Value {
                 && data[1] == expected_type =>
             {
                 let len = data[2] as usize;
-                if data.len() < 3 + len || len == 0 || len > 8 {
+                if data.len() != 3 + len || len == 0 || len > 8 {
                     return None;
                 }
                 let bytes = &data[3..3 + len];
@@ -2312,6 +2321,53 @@ mod tests {
             0x9f, 0x7b, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         ]);
         assert_eq!(Value::Opaque(max).as_opaque_u64(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn opaque_typed_accessors_reject_trailing_bytes_without_altering_raw_access() {
+        let cases = [
+            (
+                Bytes::from_static(&[0x9f, 0x78, 0x04, 0x40, 0x49, 0x0f, 0xdb, 0xff]),
+                "float",
+            ),
+            (
+                Bytes::from_static(&[
+                    0x9f, 0x79, 0x08, 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18, 0xff,
+                ]),
+                "double",
+            ),
+            (
+                Bytes::from_static(&[0x9f, 0x76, 0x01, 0x2a, 0xff]),
+                "counter64",
+            ),
+            (Bytes::from_static(&[0x9f, 0x7a, 0x01, 0xff, 0x00]), "i64"),
+            (Bytes::from_static(&[0x9f, 0x7b, 0x01, 0x2a, 0xff]), "u64"),
+        ];
+
+        for (data, kind) in cases {
+            let value = Value::Opaque(data.clone());
+            match kind {
+                "float" => assert_eq!(value.as_opaque_float(), None),
+                "double" => assert_eq!(value.as_opaque_double(), None),
+                "counter64" => assert_eq!(value.as_opaque_counter64(), None),
+                "i64" => assert_eq!(value.as_opaque_i64(), None),
+                "u64" => assert_eq!(value.as_opaque_u64(), None),
+                _ => unreachable!(),
+            }
+            assert_eq!(value.as_bytes(), Some(data.as_ref()));
+        }
+    }
+
+    #[test]
+    fn opaque_integer_accessors_retain_non_minimal_payload_compatibility() {
+        let signed = Value::Opaque(Bytes::from_static(&[0x9f, 0x7a, 0x02, 0xff, 0xff]));
+        assert_eq!(signed.as_opaque_i64(), Some(-1));
+
+        let unsigned = Value::Opaque(Bytes::from_static(&[0x9f, 0x7b, 0x02, 0x00, 0x2a]));
+        assert_eq!(unsigned.as_opaque_u64(), Some(42));
+
+        let counter = Value::Opaque(Bytes::from_static(&[0x9f, 0x76, 0x02, 0x00, 0x2a]));
+        assert_eq!(counter.as_opaque_counter64(), Some(42));
     }
 
     #[test]
