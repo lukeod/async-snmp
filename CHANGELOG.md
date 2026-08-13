@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MibHandler` contract. Returned OIDs must be strictly increasing and owned by
   the producing handler according to `MibHandler::handles`; violations produce
   `genErr` instead of being silently discarded or accepted across ownership
-  boundaries.
+  boundaries. Independent handler probes now run with a bounded concurrency of
+  16 while result and error selection remains deterministic in handler order.
 - **Breaking:** v2/v3-to-v1 trap conversion moved from permissive
   `Pdu::to_v1_trap` to `NotificationPdu::to_v1_trap`. It now returns a
   validated `TrapV1Notification` result and rejects conversions whose derived

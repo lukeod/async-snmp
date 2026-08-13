@@ -139,6 +139,8 @@ pub trait PreparedSet: Send + 'static {
 /// - The returned OID must be strictly greater than the input OID
 /// - [`handles`](MibHandler::handles) must return `true` for the returned OID
 /// - GETBULK uses GETNEXT repeatedly, so efficient implementation matters
+/// - The agent probes up to 16 registered handlers concurrently for each step;
+///   multiple registrations of the same handler may therefore overlap
 /// - Use [`OidTable`](super::OidTable) to simplify sorted OID management
 ///
 /// # Error Handling

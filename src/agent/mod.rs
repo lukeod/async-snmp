@@ -95,6 +95,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
@@ -147,6 +148,9 @@ const V3_PRIV_OVERHEAD: usize = 20;
 /// `Counter64` candidates that cannot be returned to SNMPv1 requesters. Reaching
 /// it is an internal processing failure rather than evidence of end-of-MIB.
 const MAX_GETNEXT_SKIP_ITERATIONS: usize = 1000;
+
+/// Maximum number of independent handler GETNEXT probes in flight at once.
+const MAX_CONCURRENT_GETNEXT_PROBES: usize = 16;
 
 const AGENT_RECV_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(1);
 const AGENT_RECV_ERROR_BACKOFF_MAX: Duration = Duration::from_millis(100);
@@ -2510,31 +2514,60 @@ impl Agent {
     ) -> HandlerResult<Option<VarBind>> {
         // Custom `handles` implementations may establish non-prefix ownership,
         // so a registration prefix cannot safely prune this minimum scan.
+        let handlers = &self.inner.handlers;
         let mut best_result: Option<VarBind> = None;
+        let mut completed = std::iter::repeat_with(|| None)
+            .take(handlers.len())
+            .collect::<Vec<_>>();
+        let mut next_to_start = 0;
+        let mut next_to_process = 0;
+        let mut probes = FuturesUnordered::new();
+        let probe =
+            |index: usize| async move { (index, handlers[index].handler.get_next(ctx, oid).await) };
 
-        for handler in &self.inner.handlers {
-            let prefix = &handler.prefix;
-            if let GetNextResult::Value(next) = handler.handler.get_next(ctx, oid).await? {
-                if next.oid <= *oid {
-                    return Err(crate::handler::HandlerError::new(format!(
-                        "GETNEXT handler registered at {prefix} returned non-increasing OID {} after {oid}",
-                        next.oid
-                    )));
+        while next_to_start < handlers.len() && probes.len() < MAX_CONCURRENT_GETNEXT_PROBES {
+            probes.push(probe(next_to_start));
+            next_to_start += 1;
+        }
+
+        while let Some((index, result)) = probes.next().await {
+            completed[index] = Some(result);
+
+            while let Some(result) = completed[next_to_process].take() {
+                let handler = &handlers[next_to_process];
+                let prefix = &handler.prefix;
+                if let GetNextResult::Value(next) = result? {
+                    if next.oid <= *oid {
+                        return Err(crate::handler::HandlerError::new(format!(
+                            "GETNEXT handler registered at {prefix} returned non-increasing OID {} after {oid}",
+                            next.oid
+                        )));
+                    }
+                    if !handler.handler.handles(prefix, &next.oid) {
+                        return Err(crate::handler::HandlerError::new(format!(
+                            "GETNEXT handler registered at {prefix} returned unowned OID {}",
+                            next.oid
+                        )));
+                    }
+                    match &best_result {
+                        None => best_result = Some(next),
+                        Some(current) if next.oid < current.oid => best_result = Some(next),
+                        _ => {}
+                    }
                 }
-                if !handler.handler.handles(prefix, &next.oid) {
-                    return Err(crate::handler::HandlerError::new(format!(
-                        "GETNEXT handler registered at {prefix} returned unowned OID {}",
-                        next.oid
-                    )));
+                next_to_process += 1;
+                if next_to_process == handlers.len() {
+                    break;
                 }
-                match &best_result {
-                    None => best_result = Some(next),
-                    Some(current) if next.oid < current.oid => best_result = Some(next),
-                    _ => {}
-                }
+            }
+
+            while next_to_start < handlers.len() && probes.len() < MAX_CONCURRENT_GETNEXT_PROBES {
+                probes.push(probe(next_to_start));
+                next_to_start += 1;
             }
         }
 
+        debug_assert_eq!(next_to_process, handlers.len());
         Ok(best_result)
     }
 }
@@ -3215,7 +3248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_next_serial_probing_preserves_custom_ownership_contracts() {
+    async fn get_next_concurrent_probing_preserves_custom_ownership_contracts() {
         let cursor = oid!(1, 3, 6, 1, 4, 1, 100);
         for reverse_registration in [false, true] {
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3266,7 +3299,7 @@ mod tests {
                 containing_calls.load(std::sync::atomic::Ordering::SeqCst),
                 1
             );
-            assert_eq!(*order.lock().unwrap(), ["nested", "containing"]);
+            assert_eq!(order.lock().unwrap().len(), 2);
         }
 
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3292,7 +3325,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.oid, cursor.child(2));
-        assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+        assert_eq!(order.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -3379,7 +3412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_next_waits_for_each_probe_before_starting_the_next() {
+    async fn get_next_starts_independent_probes_and_selects_errors_in_handler_order() {
         use std::sync::atomic::Ordering;
 
         let prefix = oid!(1, 3, 6, 1, 4, 1, 200);
@@ -3389,6 +3422,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let first = SerialProbeHandler {
             release: Some(release.clone()),
+            error: Some("first failure"),
             ..serial_probe(
                 "first",
                 vec![prefix.child(1)],
@@ -3413,50 +3447,102 @@ mod tests {
         let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while first_calls.load(Ordering::SeqCst) == 0 {
+            while first_calls.load(Ordering::SeqCst) == 0 || later_calls.load(Ordering::SeqCst) == 0
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(later_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(*order.lock().unwrap(), ["first"]);
-
-        release.notify_one();
-        let error = task.await.unwrap().unwrap_err();
-        assert_eq!(error.message(), "later failure");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(later_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*order.lock().unwrap(), ["first", "later"]);
+        assert!(!task.is_finished());
+
+        release.notify_waiters();
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.message(), "first failure");
+        assert_eq!(order.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn cancelled_get_bulk_drops_current_probe_without_starting_later_handlers() {
+    async fn get_next_returns_deterministic_error_without_waiting_for_later_probe() {
         use std::sync::atomic::Ordering;
 
-        let prefix = oid!(1, 3, 6, 1, 4, 1, 300);
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 250);
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let first_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let later_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_release = Arc::new(tokio::sync::Notify::new());
+        let later_release = Arc::new(tokio::sync::Notify::new());
+        let later_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first = SerialProbeHandler {
-            release: Some(Arc::new(tokio::sync::Notify::new())),
-            dropped: Some(dropped.clone()),
+            release: Some(first_release.clone()),
+            error: Some("first failure"),
             ..serial_probe("first", Vec::new(), first_calls.clone(), order.clone())
+        };
+        let later = SerialProbeHandler {
+            release: Some(later_release),
+            dropped: Some(later_dropped.clone()),
+            ..serial_probe("later", Vec::new(), later_calls.clone(), order.clone())
         };
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .without_builtin_handlers()
             .handler(prefix.clone(), Arc::new(first))
-            .handler(
-                prefix.clone(),
-                Arc::new(serial_probe(
-                    "later",
-                    Vec::new(),
-                    later_calls.clone(),
-                    order.clone(),
-                )),
-            )
+            .handler(prefix.clone(), Arc::new(later))
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while first_calls.load(Ordering::SeqCst) == 0 || later_calls.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first_release.notify_waiters();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.message(), "first failure");
+        assert!(later_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_get_bulk_drops_all_in_flight_probes() {
+        use std::sync::atomic::Ordering;
+
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 300);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let later_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let later_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first = SerialProbeHandler {
+            release: Some(release.clone()),
+            dropped: Some(first_dropped.clone()),
+            ..serial_probe("first", Vec::new(), first_calls.clone(), order.clone())
+        };
+        let later = SerialProbeHandler {
+            release: Some(release),
+            dropped: Some(later_dropped.clone()),
+            ..serial_probe("later", Vec::new(), later_calls.clone(), order.clone())
+        };
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .handler(prefix.clone(), Arc::new(first))
+            .handler(prefix.clone(), Arc::new(later))
             .allow_all_access()
             .build()
             .await
@@ -3473,13 +3559,121 @@ mod tests {
             .is_err()
         );
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(later_calls.load(Ordering::SeqCst), 0);
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(*order.lock().unwrap(), ["first"]);
+        assert_eq!(later_calls.load(Ordering::SeqCst), 1);
+        assert!(first_dropped.load(Ordering::SeqCst));
+        assert!(later_dropped.load(Ordering::SeqCst));
+        assert_eq!(order.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn get_bulk_repeats_serial_handler_order_for_each_step() {
+    async fn get_next_probe_concurrency_is_bounded() {
+        use std::sync::atomic::Ordering;
+
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 350);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut builder = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers();
+        for _ in 0..=MAX_CONCURRENT_GETNEXT_PROBES {
+            builder = builder.handler(
+                prefix.clone(),
+                Arc::new(SerialProbeHandler {
+                    release: Some(release.clone()),
+                    ..serial_probe("probe", Vec::new(), calls.clone(), order.clone())
+                }),
+            );
+        }
+        let agent = builder.allow_all_access().build().await.unwrap();
+        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) < MAX_CONCURRENT_GETNEXT_PROBES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_CONCURRENT_GETNEXT_PROBES);
+
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) <= MAX_CONCURRENT_GETNEXT_PROBES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_CONCURRENT_GETNEXT_PROBES + 1
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn get_next_refills_probe_window_without_batch_barriers() {
+        use std::sync::atomic::Ordering;
+
+        let prefix = oid!(1, 3, 6, 1, 4, 1, 375);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_release = Arc::new(tokio::sync::Notify::new());
+        let last_release = Arc::new(tokio::sync::Notify::new());
+        let mut builder = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .handler(
+                prefix.clone(),
+                Arc::new(SerialProbeHandler {
+                    release: Some(first_release),
+                    ..serial_probe("first", Vec::new(), calls.clone(), order.clone())
+                }),
+            );
+        for _ in 1..MAX_CONCURRENT_GETNEXT_PROBES {
+            builder = builder.handler(
+                prefix.clone(),
+                Arc::new(serial_probe(
+                    "fast",
+                    Vec::new(),
+                    calls.clone(),
+                    order.clone(),
+                )),
+            );
+        }
+        builder = builder.handler(
+            prefix.clone(),
+            Arc::new(SerialProbeHandler {
+                release: Some(last_release),
+                ..serial_probe("last", Vec::new(), calls.clone(), order.clone())
+            }),
+        );
+        let agent = builder.allow_all_access().build().await.unwrap();
+        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) <= MAX_CONCURRENT_GETNEXT_PROBES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_CONCURRENT_GETNEXT_PROBES + 1
+        );
+        assert!(!task.is_finished());
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn get_bulk_repeats_bounded_handler_probes_for_each_step() {
         let prefix = oid!(1, 3, 6, 1, 4, 1, 400);
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let agent = Agent::builder()
@@ -3520,10 +3714,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [prefix.child(1), prefix.child(2), prefix.child(3)]
         );
-        assert_eq!(
-            *order.lock().unwrap(),
-            ["first", "second", "first", "second", "first", "second"]
-        );
+        assert_eq!(order.lock().unwrap().len(), 6);
     }
 
     // Serves .99999.1.0 and fails everything past it, simulating a backing

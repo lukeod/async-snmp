@@ -103,6 +103,11 @@ harness = false
 name = "remote_engine_cache"
 harness = false
 
+[[bench]]
+name = "agent_getnext"
+harness = false
+required-features = ["agent"]
+
 [features]
 default = ["crypto-rustcrypto"]
 agent = []                  # SNMP agent
