@@ -1328,6 +1328,25 @@ mod tests {
             .boxed()))
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             self.peer
         }
@@ -1597,6 +1616,25 @@ mod tests {
             }
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             self.peer
         }
@@ -1636,6 +1674,25 @@ mod tests {
                 ),
                 self.peer,
             )))
+        }
+
+        fn recv_with<T, F>(
+            &self,
+            registration: RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
         }
 
         fn peer_addr(&self) -> SocketAddr {
@@ -1792,6 +1849,24 @@ mod tests {
                     .boxed())
                 }
             }
+            fn recv_with<T, F>(
+                &self,
+                registration: RequestRegistration,
+                validate: F,
+            ) -> impl std::future::Future<Output = Result<T>> + Send
+            where
+                T: Send,
+                F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            {
+                crate::transport::recv_with_scripted(
+                    registration,
+                    self.peer_addr(),
+                    move |registration| {
+                        futures_util::stream::once(async move { self.recv(registration).await })
+                    },
+                    validate,
+                )
+            }
             fn peer_addr(&self) -> SocketAddr {
                 self.peer
             }
@@ -1889,6 +1964,25 @@ mod response_validation_tests {
             ready(Ok((self.response.clone(), self.peer)))
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             self.peer
         }
@@ -1929,7 +2023,15 @@ mod response_validation_tests {
             Ok(())
         }
 
-        async fn recv(&self, _registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
+        async fn recv_with<U, F>(
+            &self,
+            _registration: RequestRegistration,
+            _validate: F,
+        ) -> Result<U>
+        where
+            U: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
+        {
             Err(Error::Config("DeferredUpdateTransport uses request()".into()).boxed())
         }
 
@@ -1993,7 +2095,15 @@ mod response_validation_tests {
             Ok(())
         }
 
-        async fn recv(&self, _registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
+        async fn recv_with<U, F>(
+            &self,
+            _registration: RequestRegistration,
+            _validate: F,
+        ) -> Result<U>
+        where
+            U: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
+        {
             Err(Error::Config("RediscoveryRaceTransport uses request()".into()).boxed())
         }
 
@@ -2549,7 +2659,7 @@ mod response_validation_tests {
     /// without authentication must be rejected for the missing capability,
     /// not processed unauthenticated (RFC 3412 Section 7.2 processes at the
     /// received level).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn v3_noauth_client_rejects_received_auth_response() {
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         let response = build_response(PduType::Response, 123, 1, 1001, Some(b"authpass12345678"));
@@ -2557,14 +2667,14 @@ mod response_validation_tests {
 
         let err = client.send_v3_and_recv(pdu).await.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "test transport must surface rejected unverifiable candidate, got: {err}"
+            matches!(*err, Error::Timeout { .. }),
+            "single-response transport must exhaust the rejected unverifiable candidate, got: {err}"
         );
     }
 
     /// RFC 3416 Section 4.2: an echoed request-type PDU with a matching
     /// request-id is not a Response and must be rejected.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn v3_rejects_echoed_request_pdu() {
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         let response = build_response(PduType::GetRequest, 123, 1, 1001, None);
@@ -2572,8 +2682,8 @@ mod response_validation_tests {
 
         let err = client.send_v3_and_recv(pdu).await.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
+            matches!(*err, Error::Timeout { .. }),
+            "expected Timeout after the rejected candidate, got: {err}"
         );
     }
 
@@ -2593,7 +2703,7 @@ mod response_validation_tests {
     /// RFC 3414 Section 3.2 Step 7b: an authenticated response whose engine
     /// time is more than 150 seconds behind the local notion is a replay and
     /// must be rejected.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn v3_rejects_stale_authenticated_response() {
         let security = UsmConfig::new("user").auth(AuthProtocol::Sha1, "authpass12345678");
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
@@ -2603,8 +2713,8 @@ mod response_validation_tests {
 
         let err = client.send_v3_and_recv(pdu).await.unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "test transport must surface rejected stale candidate, got: {err}"
+            matches!(*err, Error::Timeout { .. }),
+            "single-response transport must exhaust the rejected stale candidate, got: {err}"
         );
     }
 }

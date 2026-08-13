@@ -1461,6 +1461,25 @@ mod tests {
             }
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             "127.0.0.1:161".parse().unwrap()
         }
@@ -1626,6 +1645,25 @@ mod tests {
             }
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             "127.0.0.1:161".parse().unwrap()
         }
@@ -1681,6 +1719,18 @@ mod tests {
         async fn send_with_timeout(&self, _data: &[u8], timeout: Duration) -> Result<()> {
             self.timeouts.lock().unwrap().push(timeout);
             Ok(())
+        }
+
+        async fn recv_with<T, F>(
+            &self,
+            _registration: crate::transport::RequestRegistration,
+            _validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            panic!("send-timeout probe does not receive responses")
         }
 
         fn peer_addr(&self) -> SocketAddr {
@@ -1750,10 +1800,15 @@ mod tests {
             Ok(())
         }
 
-        async fn recv(
+        async fn recv_with<U, F>(
             &self,
             _registration: crate::transport::RequestRegistration,
-        ) -> Result<(Bytes, SocketAddr)> {
+            _validate: F,
+        ) -> Result<U>
+        where
+            U: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<U>> + Send,
+        {
             panic!("capacity test overrides request_with")
         }
 
@@ -1848,10 +1903,15 @@ mod tests {
             async { Ok(()) }
         }
 
-        async fn recv(
+        async fn recv_with<T, F>(
             &self,
             _registration: crate::transport::RequestRegistration,
-        ) -> Result<(Bytes, SocketAddr)> {
+            _validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
             panic!("receive must not be reached after encode failure")
         }
 
@@ -2580,6 +2640,25 @@ mod tests {
             }
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             "127.0.0.1:161".parse().unwrap()
         }
@@ -2653,6 +2732,25 @@ mod tests {
                 encoded.extend_from_slice(&[0xaa, 0xbb]);
                 Ok((Bytes::from(encoded), "127.0.0.1:161".parse().unwrap()))
             }
+        }
+
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
         }
 
         fn peer_addr(&self) -> SocketAddr {
@@ -2921,6 +3019,25 @@ mod tests {
             async move { Ok((encoded, peer)) }
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             "127.0.0.1:161".parse().unwrap()
         }
@@ -2959,7 +3076,7 @@ mod tests {
 
     /// RFC 3416 Section 4.2: an echoed request-type PDU with a matching
     /// request-id is not a Response and must be rejected.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn response_validation_rejects_echoed_request_pdu() {
         let client = adversarial_client(PduType::GetRequest, b"public", false);
         let err = client
@@ -2967,20 +3084,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
+            matches!(*err, Error::Timeout { .. }),
+            "expected Timeout after the rejected candidate, got: {err}"
         );
     }
 
     /// A custom transport cannot bypass the exact-match default.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn response_validation_rejects_community_mismatch() {
         let client = adversarial_client(PduType::Response, b"other", false);
         let err = client
             .get(&Oid::from_slice(&[1, 3, 6, 1, 1]))
             .await
             .unwrap_err();
-        assert!(matches!(*err, Error::MalformedResponse { .. }));
+        assert!(matches!(*err, Error::Timeout { .. }));
     }
 
     #[tokio::test]
@@ -2998,7 +3115,7 @@ mod tests {
     }
 
     /// A v1 response to a v2c request is rejected (version mismatch).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn response_validation_rejects_version_mismatch() {
         let client = adversarial_client(PduType::Response, b"public", true);
         let err = client
@@ -3006,8 +3123,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(*err, Error::MalformedResponse { .. }),
-            "expected MalformedResponse, got: {err}"
+            matches!(*err, Error::Timeout { .. }),
+            "expected Timeout after the rejected candidate, got: {err}"
         );
     }
 }

@@ -1643,10 +1643,16 @@ mod tests {
             Ok(())
         }
 
-        async fn recv(
+        async fn recv_with<T, F>(
             &self,
             _registration: crate::transport::RequestRegistration,
-        ) -> Result<(bytes::Bytes, std::net::SocketAddr)> {
+            _validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(bytes::Bytes, std::net::SocketAddr) -> Result<crate::transport::Candidate<T>>
+                + Send,
+        {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(Error::Config("unexpected custom transport receive".into()).boxed())

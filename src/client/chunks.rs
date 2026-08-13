@@ -495,6 +495,25 @@ mod tests {
             }
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: RequestRegistration,
+            validate: F,
+        ) -> impl Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, std::net::SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> std::net::SocketAddr {
             "127.0.0.1:161".parse().unwrap()
         }

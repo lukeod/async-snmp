@@ -384,6 +384,30 @@ pub enum Candidate<T> {
 /// handles (not the pool itself) implement Transport. A response that fails the
 /// registered correlation metadata or the caller's validator must be ignored
 /// without consuming the pending request or extending its deadline.
+///
+/// `recv_with` is required from every implementation, including implementations
+/// compiled as part of this crate's unit tests:
+///
+/// ```compile_fail,E0046
+/// use async_snmp::{RequestRegistration, Result, Transport};
+/// use std::net::{Ipv4Addr, SocketAddr};
+///
+/// struct IncompleteTransport;
+///
+/// impl Transport for IncompleteTransport {
+///     async fn send(&self, _data: &[u8]) -> Result<()> { Ok(()) }
+///
+///     fn peer_addr(&self) -> SocketAddr {
+///         SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+///     }
+///
+///     fn local_addr(&self) -> SocketAddr {
+///         SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+///     }
+///
+///     fn is_reliable(&self) -> bool { true }
+/// }
+/// ```
 pub trait Transport: Send + Sync {
     /// Send request data to the target.
     ///
@@ -462,7 +486,6 @@ pub trait Transport: Send + Sync {
     /// caller's validator; [`ResponseIdentity::Reject`] and
     /// [`Candidate::Reject`] both retain that same registration and its original
     /// absolute deadline. Validator errors are fatal local errors.
-    #[cfg(not(test))]
     fn recv_with<T, F>(
         &self,
         registration: RequestRegistration,
@@ -471,31 +494,6 @@ pub trait Transport: Send + Sync {
     where
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send;
-
-    #[cfg(test)]
-    fn recv_with<T, F>(
-        &self,
-        registration: RequestRegistration,
-        mut validate: F,
-    ) -> impl Future<Output = Result<T>> + Send
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
-    {
-        async move {
-            // Unit-test transport doubles may implement only `recv` and expect
-            // its synchronous setup to run after `send`.
-            tokio::task::yield_now().await;
-            let (data, source) = self.recv(registration).await?;
-            match validate(data, source)? {
-                Candidate::Accept(value) => Ok(value),
-                Candidate::Reject => Err(Error::MalformedResponse {
-                    target: self.peer_addr(),
-                }
-                .boxed()),
-            }
-        }
-    }
 
     /// Send request data and receive one correlated response without additional
     /// validation. This compatibility operation accepts the first candidate.
@@ -586,6 +584,408 @@ pub trait Transport: Send + Sync {
     /// helper enforces it before starting receive-side work.
     fn send_capacity(&self) -> usize {
         usize::MAX
+    }
+}
+
+/// Adapt a unit-test double's scripted response stream to the full
+/// [`Transport::recv_with`] contract.
+///
+/// The script is installed before one yield, preserving the default request
+/// helper's requirement that receive registration precedes the send. Candidate
+/// polling starts only after that yield, allowing scripted doubles to construct
+/// responses from the sent request. Identity and validation rejections retain
+/// the original deadline and advance to the next candidate. Once the script is
+/// exhausted, the adapter remains pending until that deadline instead of
+/// manufacturing an immediate timeout. Script errors are fatal, matching
+/// transport receive/framing errors.
+#[cfg(test)]
+pub(crate) async fn recv_with_scripted<T, F, R, S>(
+    registration: RequestRegistration,
+    target: SocketAddr,
+    script: R,
+    mut validate: F,
+) -> Result<T>
+where
+    T: Send,
+    F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+    R: FnOnce(RequestRegistration) -> S + Send,
+    S: futures_core::Stream<Item = Result<(Bytes, SocketAddr)>> + Send,
+{
+    use futures_util::StreamExt;
+
+    let timeout = registration.timeout();
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::Config("test transport deadline overflow".into()).boxed())?;
+
+    let timeout_error = || {
+        Error::Timeout {
+            target,
+            elapsed: timeout,
+            retries: 0,
+        }
+        .boxed()
+    };
+
+    // Match the production transports' precedence: an exhausted deadline wins
+    // over a ready or malformed candidate and the scripted source is untouched.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timeout_error());
+    }
+
+    // Install the script before returning Pending so resources it owns are
+    // cleaned up if the request is cancelled during send. Candidate polling is
+    // deferred until the next poll, after the default request helper has sent.
+    let candidates = script(registration.clone());
+    tokio::pin!(candidates);
+    tokio::task::yield_now().await;
+
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timeout_error());
+    }
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timeout_error());
+        }
+
+        let Some(candidate) = tokio::time::timeout_at(deadline, candidates.next())
+            .await
+            .map_err(|_| timeout_error())?
+        else {
+            // Exhaustion means no more packets are currently scripted, not
+            // that the transport deadline elapsed. Retain the in-flight
+            // operation until its original absolute deadline.
+            tokio::time::sleep_until(deadline).await;
+            return Err(timeout_error());
+        };
+        let (data, source) = candidate?;
+
+        if registration.evaluate_response_identity(&data, source == target)
+            == ResponseIdentity::Reject
+        {
+            continue;
+        }
+        match validate(data, source)? {
+            Candidate::Accept(value) => return Ok(value),
+            Candidate::Reject => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod cfg_test_transport_contract {
+    use super::{Candidate, RequestRegistration, Transport, recv_with_scripted};
+    use crate::{DecodeError, DecodeErrorKind, Error, Result};
+    use bytes::Bytes;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/common/transport_contract.rs"
+    ));
+
+    #[test]
+    fn transport_trait_surface_is_not_conditionally_compiled() {
+        let source = include_str!("mod.rs");
+        let (_, trait_and_after) = source
+            .split_once("pub trait Transport: Send + Sync {")
+            .expect("Transport trait declaration");
+        let (trait_body, _) = trait_and_after
+            .split_once("\n}\n\n/// Adapt a unit-test double")
+            .expect("end of Transport trait");
+
+        assert_eq!(trait_body.matches("fn recv_with").count(), 1);
+        assert!(!trait_body.contains("#[cfg("));
+    }
+
+    fn target() -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+    }
+
+    fn timeout_fields(error: &Error) -> (SocketAddr, Duration, u32) {
+        match error {
+            Error::Timeout {
+                target,
+                elapsed,
+                retries,
+            } => (*target, *elapsed, *retries),
+            other => panic!("expected timeout, got {other}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_adapter_checks_zero_and_expired_deadlines_before_source_polling() {
+        let source_starts = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::clone(&source_starts);
+        let error = recv_with_scripted(
+            RequestRegistration::test_unchecked(1, Duration::ZERO),
+            target(),
+            move |_| {
+                futures_util::stream::once(async move {
+                    starts.fetch_add(1, Ordering::Relaxed);
+                    Ok((Bytes::from_static(b"ready"), target()))
+                })
+            },
+            |_, _| Ok(Candidate::Accept(())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(timeout_fields(&error), (target(), Duration::ZERO, 0));
+        assert_eq!(source_starts.load(Ordering::Relaxed), 0);
+
+        let source_starts = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::clone(&source_starts);
+        let receive = recv_with_scripted(
+            RequestRegistration::test_unchecked(2, Duration::from_secs(5)),
+            target(),
+            move |_| {
+                futures_util::stream::once(async move {
+                    starts.fetch_add(1, Ordering::Relaxed);
+                    Ok((Bytes::from_static(b"ready"), target()))
+                })
+            },
+            |_, _| Ok(Candidate::Accept(())),
+        );
+        tokio::pin!(receive);
+
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = match futures::poll!(receive.as_mut()) {
+            std::task::Poll::Ready(Err(error)) => error,
+            result => panic!("expired receive did not return timeout: {result:?}"),
+        };
+        assert_eq!(
+            timeout_fields(&error),
+            (target(), Duration::from_secs(5), 0)
+        );
+        assert_eq!(source_starts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn scripted_adapter_skips_identity_and_validator_rejections_before_accepting() {
+        const RESPONSE: &[u8] = &[
+            0x30, 0x1c, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa2,
+            0x0f, 0x02, 0x02, 0x30, 0x39, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x03, 0x30,
+            0x01, 0x00,
+        ];
+        let registration = RequestRegistration::community(
+            12_345,
+            Duration::from_secs(1),
+            crate::CommunityVersion::V2c,
+            Bytes::from_static(b"public"),
+            crate::CommunityResponsePolicy::Exact,
+        );
+        let mut wrong_identity = RESPONSE.to_vec();
+        wrong_identity[18] = 0x38;
+        let candidates: Vec<Result<(Bytes, SocketAddr)>> = vec![
+            Ok((Bytes::from_static(b"malformed"), target())),
+            Ok((Bytes::from(wrong_identity), target())),
+            Ok((Bytes::from_static(RESPONSE), target())),
+            Ok((Bytes::from_static(RESPONSE), target())),
+        ];
+        let mut validations = 0;
+
+        let accepted = recv_with_scripted(
+            registration,
+            target(),
+            move |_| futures_util::stream::iter(candidates),
+            |data, _| {
+                validations += 1;
+                if validations == 1 {
+                    Ok(Candidate::Reject)
+                } else {
+                    Ok(Candidate::Accept(data))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(accepted, Bytes::from_static(RESPONSE));
+        assert_eq!(validations, 2);
+    }
+
+    #[tokio::test]
+    async fn scripted_adapter_propagates_receive_errors() {
+        let malformed = Error::Decode(
+            DecodeError::new(
+                0,
+                DecodeErrorKind::UnexpectedTag {
+                    expected: 0x30,
+                    actual: 0x31,
+                },
+            )
+            .with_peer(target()),
+        )
+        .boxed();
+        let candidates: Vec<Result<(Bytes, SocketAddr)>> = vec![Err(malformed)];
+        let validated = Arc::new(AtomicBool::new(false));
+        let was_validated = Arc::clone(&validated);
+
+        let error = recv_with_scripted(
+            RequestRegistration::test_unchecked(3, Duration::from_secs(1)),
+            target(),
+            move |_| futures_util::stream::iter(candidates),
+            move |_, _| {
+                was_validated.store(true, Ordering::Relaxed);
+                Ok(Candidate::Accept(()))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            *error,
+            Error::Decode(DecodeError {
+                kind: DecodeErrorKind::UnexpectedTag {
+                    expected: 0x30,
+                    actual: 0x31
+                },
+                peer: Some(peer),
+                ..
+            }) if peer == target()
+        ));
+        assert!(!validated.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_adapter_exhaustion_waits_only_original_remaining_budget() {
+        let configured_timeout = Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let receive = tokio::spawn(recv_with_scripted(
+            RequestRegistration::test_unchecked(4, configured_timeout),
+            target(),
+            move |_| {
+                futures_util::stream::once(async {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    Ok((Bytes::from_static(b"rejected"), target()))
+                })
+            },
+            |_, _| Ok::<_, Box<Error>>(Candidate::<()>::Reject),
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!receive.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let error = receive.await.unwrap().unwrap_err();
+        assert_eq!(tokio::time::Instant::now() - started, configured_timeout);
+        assert_eq!(timeout_fields(&error), (target(), configured_timeout, 0));
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_scripted_adapter_cleans_up_installed_source_before_candidate_poll() {
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source_started = Arc::clone(&started);
+        let source_dropped = Arc::clone(&dropped);
+        let mut receive = Box::pin(recv_with_scripted(
+            RequestRegistration::test_unchecked(5, Duration::from_secs(30)),
+            target(),
+            move |_| {
+                source_started.store(true, Ordering::Relaxed);
+                let drop_flag = DropFlag(source_dropped);
+                futures_util::stream::once(async move {
+                    let _drop_flag = drop_flag;
+                    std::future::pending::<Result<(Bytes, SocketAddr)>>().await
+                })
+            },
+            |_, _| Ok(Candidate::Accept(())),
+        ));
+
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+        assert!(started.load(Ordering::Relaxed));
+        assert!(!dropped.load(Ordering::Relaxed));
+
+        drop(receive);
+        assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[derive(Clone)]
+    struct ScriptedRequestTransport {
+        registered: Arc<AtomicBool>,
+        sent: Arc<AtomicBool>,
+    }
+
+    impl Transport for ScriptedRequestTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            assert!(self.registered.load(Ordering::Relaxed));
+            self.sent.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn recv_with<T, F>(
+            &self,
+            registration: RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            let registered = Arc::clone(&self.registered);
+            let sent = Arc::clone(&self.sent);
+            recv_with_scripted(
+                registration,
+                target(),
+                move |_| {
+                    assert!(!sent.load(Ordering::Relaxed));
+                    registered.store(true, Ordering::Relaxed);
+                    futures_util::stream::once(async move {
+                        assert!(sent.load(Ordering::Relaxed));
+                        Ok((Bytes::from_static(b"response"), target()))
+                    })
+                },
+                validate,
+            )
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            target()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_adapter_preserves_registration_before_send_ordering() {
+        let transport = ScriptedRequestTransport {
+            registered: Arc::new(AtomicBool::new(false)),
+            sent: Arc::new(AtomicBool::new(false)),
+        };
+        let response = transport
+            .request(
+                b"request",
+                RequestRegistration::test_unchecked(6, Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response, (Bytes::from_static(b"response"), target()));
+        assert!(transport.sent.load(Ordering::Relaxed));
     }
 }
 

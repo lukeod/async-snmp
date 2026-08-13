@@ -1062,6 +1062,25 @@ mod tests {
             }
         }
 
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
+        }
+
         fn peer_addr(&self) -> SocketAddr {
             "127.0.0.1:161".parse().unwrap()
         }
@@ -1194,6 +1213,25 @@ mod tests {
                 let msg = CommunityMessage::v2c(Bytes::from_static(b"public"), pdu).unwrap();
                 Ok((msg.encode().unwrap(), peer))
             }
+        }
+
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
         }
 
         fn peer_addr(&self) -> SocketAddr {
@@ -1473,6 +1511,25 @@ mod tests {
                     WalkReply::Closed => Err(Error::Closed { target: peer }.boxed()),
                 }
             }
+        }
+
+        fn recv_with<T, F>(
+            &self,
+            registration: crate::transport::RequestRegistration,
+            validate: F,
+        ) -> impl std::future::Future<Output = Result<T>> + Send
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            crate::transport::recv_with_scripted(
+                registration,
+                self.peer_addr(),
+                move |registration| {
+                    futures_util::stream::once(async move { self.recv(registration).await })
+                },
+                validate,
+            )
         }
 
         fn peer_addr(&self) -> SocketAddr {
