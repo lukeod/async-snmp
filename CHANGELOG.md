@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OidTable` now supports bulk construction through `FromIterator`, bulk
   extension, and owned iteration. Bulk input is sorted and deduplicated once,
   with the last value for each OID retained.
+- `ErrorStatus::from_i32` is now a pure constant conversion. Unknown or future
+  status values remain available through `ErrorStatus::Unknown` without
+  emitting a warning as a conversion side effect.
 
 - Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
   single-flight operation. Callers share success or structured failure under a

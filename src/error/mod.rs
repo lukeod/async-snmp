@@ -847,8 +847,12 @@ pub enum ErrorStatus {
 }
 
 impl ErrorStatus {
-    /// Create from raw status code.
-    pub fn from_i32(value: i32) -> Self {
+    /// Create from a raw status code without logging or other side effects.
+    ///
+    /// Unknown and future values are preserved in [`Self::Unknown`] for the
+    /// protocol caller to classify or report at the appropriate boundary.
+    #[must_use]
+    pub const fn from_i32(value: i32) -> Self {
         match value {
             0 => Self::NoError,
             1 => Self::TooBig,
@@ -869,10 +873,7 @@ impl ErrorStatus {
             16 => Self::AuthorizationError,
             17 => Self::NotWritable,
             18 => Self::InconsistentName,
-            other => {
-                tracing::warn!(target: "async_snmp::error", { snmp.error_status = other }, "unknown SNMP error status");
-                Self::Unknown(other)
-            }
+            other => Self::Unknown(other),
         }
     }
 
@@ -1174,6 +1175,17 @@ mod tests {
         let reason = WalkAbortReason::NonIncreasing;
         let err: &dyn std::error::Error = &reason;
         assert_eq!(err.to_string(), "non-increasing OID");
+    }
+
+    #[test]
+    fn error_status_conversion_is_const_and_preserves_unknown_values() {
+        const KNOWN: ErrorStatus = ErrorStatus::from_i32(2);
+        const FUTURE: ErrorStatus = ErrorStatus::from_i32(99);
+        const NEGATIVE: ErrorStatus = ErrorStatus::from_i32(-1);
+
+        assert_eq!(KNOWN, ErrorStatus::NoSuchName);
+        assert_eq!(FUTURE, ErrorStatus::Unknown(99));
+        assert_eq!(NEGATIVE, ErrorStatus::Unknown(-1));
     }
 
     #[test]
