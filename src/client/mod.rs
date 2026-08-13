@@ -627,7 +627,6 @@ impl<T: Transport> Client<T> {
     async fn send_and_recv(&self, request_id: i32, data: &[u8]) -> Result<DecodedResponse> {
         self.enforce_outbound_size(data.len(), None)?;
         let start = Instant::now();
-        let mut last_error: Option<Box<Error>> = None;
         let max_attempts = if self.inner.transport.is_reliable() {
             0
         } else {
@@ -723,7 +722,6 @@ impl<T: Transport> Client<T> {
                     return Ok(response);
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
-                    last_error = Some(e);
                     // Apply backoff delay before next retry (if not last attempt)
                     if attempt < max_attempts {
                         let delay = self.inner.config.retry.compute_delay(attempt);
@@ -746,7 +744,6 @@ impl<T: Transport> Client<T> {
         // total elapsed time and retry count rather than propagating the
         // per-attempt transport timeout, whose elapsed/retries are not
         // meaningful at this layer.
-        let _ = last_error;
         let elapsed = start.elapsed();
         Span::current().record("snmp.elapsed_ms", elapsed.as_millis() as u64);
         tracing::debug!(target: "async_snmp::client", { request_id, peer = %self.peer_addr(), ?elapsed, retries = max_attempts }, "request timed out");
