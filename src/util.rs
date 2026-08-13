@@ -47,38 +47,83 @@ pub(crate) struct PreparedAuthoritativeUsm {
     pub(crate) engine_boots: u32,
 }
 
-/// Validate inbound USM users and prepare the local authoritative engine seed.
-pub(crate) fn prepare_authoritative_usm(
+/// Validated USM users and authoritative engine state awaiting an engine ID.
+pub(crate) struct ValidatedAuthoritativeUsm {
+    users: HashMap<Bytes, UsmUser>,
+    authoritative_engine: Option<AuthoritativeEngine>,
+    configured_engine: Option<(Bytes, u32)>,
+}
+
+impl ValidatedAuthoritativeUsm {
+    /// Finish preparation, generating an engine ID only when none was configured.
+    pub(crate) fn prepare(
+        self,
+        generate_engine_id: impl FnOnce() -> Result<Bytes>,
+    ) -> Result<PreparedAuthoritativeUsm> {
+        let (engine_id, engine_boots) = match self.configured_engine {
+            Some(configured) => configured,
+            None => (generate_engine_id()?, 1),
+        };
+
+        Ok(PreparedAuthoritativeUsm {
+            users: self.users,
+            authoritative_engine: self.authoritative_engine,
+            engine_id,
+            engine_boots,
+        })
+    }
+}
+
+/// Validate inbound USM users and configured authoritative engine state.
+pub(crate) fn validate_authoritative_usm(
     mut users: HashMap<Bytes, UsmUser>,
     authoritative_engine: Option<AuthoritativeEngine>,
     requires_engine: bool,
     invalid_user_context: &str,
     missing_engine_context: &str,
-) -> Result<PreparedAuthoritativeUsm> {
+) -> Result<ValidatedAuthoritativeUsm> {
     for config in users.values_mut() {
         config.validate_and_precompute().map_err(|error| {
             Error::Config(format!("{invalid_user_context}: {error}").into()).boxed()
         })?;
     }
 
-    let (authoritative_engine, engine_id, engine_boots) = match authoritative_engine {
+    let (authoritative_engine, configured_engine) = match authoritative_engine {
         Some(engine) => {
             let (engine_boots, _) = engine.current_boots_time()?;
             let engine_id = Bytes::copy_from_slice(engine.engine_id());
-            (Some(engine), engine_id, engine_boots)
+            (Some(engine), Some((engine_id, engine_boots)))
         }
         None if requires_engine => {
             return Err(Error::Config(missing_engine_context.into()).boxed());
         }
-        None => (None, crate::v3::generate_engine_id()?, 1),
+        None => (None, None),
     };
 
-    Ok(PreparedAuthoritativeUsm {
+    Ok(ValidatedAuthoritativeUsm {
         users,
         authoritative_engine,
-        engine_id,
-        engine_boots,
+        configured_engine,
     })
+}
+
+/// Validate inbound USM users and prepare the local authoritative engine seed.
+#[cfg(feature = "agent")]
+pub(crate) fn prepare_authoritative_usm(
+    users: HashMap<Bytes, UsmUser>,
+    authoritative_engine: Option<AuthoritativeEngine>,
+    requires_engine: bool,
+    invalid_user_context: &str,
+    missing_engine_context: &str,
+) -> Result<PreparedAuthoritativeUsm> {
+    validate_authoritative_usm(
+        users,
+        authoritative_engine,
+        requires_engine,
+        invalid_user_context,
+        missing_engine_context,
+    )?
+    .prepare(crate::v3::generate_engine_id)
 }
 
 /// Create and bind a UDP socket with optional buffer sizes.

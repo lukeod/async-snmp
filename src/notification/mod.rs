@@ -200,7 +200,7 @@ use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 use crate::udp_responder::UdpResponder;
-use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, prepare_authoritative_usm};
+use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
 use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, EngineState, SaltCounter};
 use crate::varbind::VarBind;
@@ -894,6 +894,14 @@ impl NotificationReceiverBuilder {
     /// [`Error::RandomSource`] when a generated engine ID or required privacy
     /// salt cannot be initialized.
     pub async fn build(self) -> Result<NotificationReceiver> {
+        self.build_with_engine_id_generator(crate::v3::generate_engine_id)
+            .await
+    }
+
+    async fn build_with_engine_id_generator(
+        self,
+        generate_engine_id: impl FnOnce() -> Result<Bytes>,
+    ) -> Result<NotificationReceiver> {
         if !self.usm_users.is_empty() && self.acceptance_policy.is_none() {
             return Err(Error::Config(
                 "a notification receiver with USM users requires an acceptance policy".into(),
@@ -916,19 +924,13 @@ impl NotificationReceiverBuilder {
             .values()
             .any(|security| security.maximum_security_level().requires_priv());
         let requires_authoritative_engine = !self.usm_users.is_empty();
-        let PreparedAuthoritativeUsm {
-            users: usm_users,
-            authoritative_engine,
-            engine_id,
-            engine_boots,
-        } = prepare_authoritative_usm(
+        let validated_usm = validate_authoritative_usm(
             self.usm_users,
             self.authoritative_engine,
             requires_authoritative_engine,
             "invalid USM user configuration",
             "authoritative engine state is required for SNMPv3 notification receiving",
         )?;
-        let salt_counter = requires_privacy.then(SaltCounter::new).transpose()?;
 
         let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
@@ -945,6 +947,14 @@ impl NotificationReceiverBuilder {
             target: bind_addr,
             source: e,
         })?;
+
+        let PreparedAuthoritativeUsm {
+            users: usm_users,
+            authoritative_engine,
+            engine_id,
+            engine_boots,
+        } = validated_usm.prepare(generate_engine_id)?;
+        let salt_counter = requires_privacy.then(SaltCounter::new).transpose()?;
         let udp_responder = UdpResponder::new(&socket);
 
         Ok(NotificationReceiver {
@@ -1371,49 +1381,18 @@ impl NotificationReceiver {
     /// created, or the operating system cannot provide randomness for the
     /// receiver's engine ID.
     pub async fn bind(addr: impl AsRef<str>) -> Result<Self> {
-        let addr_str = addr.as_ref();
-        let bind_addr: SocketAddr = addr_str
-            .parse()
-            .map_err(|_| Error::Config(format!("invalid bind address: {addr_str}").into()))?;
+        Self::builder().bind(addr.as_ref()).build().await
+    }
 
-        let socket = bind_udp_socket(bind_addr, None, None, false)
+    #[cfg(test)]
+    async fn bind_with_engine_id_generator(
+        addr: impl AsRef<str>,
+        generate_engine_id: impl FnOnce() -> Result<Bytes>,
+    ) -> Result<Self> {
+        Self::builder()
+            .bind(addr.as_ref())
+            .build_with_engine_id_generator(generate_engine_id)
             .await
-            .map_err(|e| Error::Network {
-                target: bind_addr,
-                source: e,
-            })?;
-
-        let local_addr = socket.local_addr().map_err(|e| Error::Network {
-            target: bind_addr,
-            source: e,
-        })?;
-        let udp_responder = UdpResponder::new(&socket);
-
-        let engine_id = crate::v3::generate_engine_id()?;
-
-        Ok(Self {
-            inner: Arc::new(ReceiverInner {
-                authoritative_engine: None,
-                socket,
-                udp_responder,
-                local_addr,
-                usm_users: HashMap::new(),
-                communities: Vec::new(),
-                varbind_validation: NotificationVarbindValidation::Tolerant,
-                engine_id,
-                salt_counter: None,
-                engine_boots_base: 1,
-                engine_start: Instant::now(),
-                usm_stats: UsmStats::default(),
-                remote_engines: Mutex::new(HashMap::new()),
-                max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
-                decode_policy: crate::message::DecodePolicy::Compatible,
-                compatibility_policy: crate::CompatibilityPolicy::default(),
-                snmp_silent_drops: AtomicU32::new(0),
-                acceptance_policy: None,
-                recv_gate: AsyncMutex::new(vec![0; crate::UDP_RECEIVE_BUFFER_SIZE]),
-            }),
-        })
     }
 
     /// Get the local address this receiver is bound to.
@@ -1739,25 +1718,153 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_notification_receiver_varbind_validation_construction_paths() {
+    async fn convenience_bind_matches_default_builder_configuration() {
         let built = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
-            .varbind_validation(NotificationVarbindValidation::Strict)
             .build()
             .await
             .unwrap();
-        assert_eq!(
-            built.inner.varbind_validation,
-            NotificationVarbindValidation::Strict
-        );
-        assert!(built.inner.salt_counter.is_none());
-
         let bound = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
-        assert_eq!(
-            bound.inner.varbind_validation,
-            NotificationVarbindValidation::Tolerant
-        );
-        assert!(bound.inner.salt_counter.is_none());
+
+        for receiver in [&bound, &built] {
+            assert!(receiver.inner.authoritative_engine.is_none());
+            assert!(receiver.inner.usm_users.is_empty());
+            assert!(receiver.inner.communities.is_empty());
+            assert_eq!(
+                receiver.inner.varbind_validation,
+                NotificationVarbindValidation::Tolerant
+            );
+            crate::v3::validate_engine_id(receiver.engine_id()).unwrap();
+            assert!(receiver.inner.salt_counter.is_none());
+            assert_eq!(receiver.inner.engine_boots_base, 1);
+            assert!(receiver.inner.remote_engines.lock().unwrap().is_empty());
+            assert_eq!(
+                receiver.inner.max_message_size,
+                crate::UDP_RECEIVE_LIMITS.advertised().as_usize()
+            );
+            assert_eq!(
+                receiver.inner.decode_policy,
+                crate::message::DecodePolicy::Compatible
+            );
+            assert_eq!(
+                receiver.inner.compatibility_policy,
+                crate::CompatibilityPolicy::default()
+            );
+            assert_eq!(receiver.snmp_silent_drops(), 0);
+            assert!(receiver.inner.acceptance_policy.is_none());
+            assert_eq!(
+                receiver.inner.socket.local_addr().unwrap(),
+                receiver.local_addr()
+            );
+
+            let receive_buffer = receiver.inner.recv_gate.lock().await;
+            assert_eq!(receive_buffer.len(), crate::UDP_RECEIVE_BUFFER_SIZE);
+            assert!(receive_buffer.capacity() >= crate::UDP_RECEIVE_BUFFER_SIZE);
+        }
+
+        assert_ne!(bound.engine_id(), built.engine_id());
+
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        for receiver in [&bound, &built] {
+            let notification = receiver
+                .handle_v2c(build_v2c_trap(b"not-preconfigured"), source)
+                .await
+                .unwrap();
+            assert!(matches!(notification, Some(Notification::TrapV2c { .. })));
+        }
+    }
+
+    fn unavailable_engine_id() -> Result<Bytes> {
+        Err(Box::new(Error::RandomSource {
+            source: getrandom::Error::UNEXPECTED,
+        }))
+    }
+
+    #[tokio::test]
+    async fn bind_errors_precede_engine_id_entropy_for_both_paths() {
+        let bound_error = NotificationReceiver::bind_with_engine_id_generator(
+            "not a socket address",
+            unavailable_engine_id,
+        )
+        .await
+        .err()
+        .expect("invalid convenience bind must fail");
+        let built_error = NotificationReceiver::builder()
+            .bind("not a socket address")
+            .build_with_engine_id_generator(unavailable_engine_id)
+            .await
+            .err()
+            .expect("invalid builder bind must fail");
+        assert_eq!(bound_error.to_string(), built_error.to_string());
+        assert!(matches!(
+            *bound_error,
+            Error::Config(ref message)
+                if message.as_ref() == "invalid bind address: not a socket address"
+        ));
+
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let bound_error = NotificationReceiver::bind_with_engine_id_generator(
+            occupied_addr.to_string(),
+            unavailable_engine_id,
+        )
+        .await
+        .err()
+        .expect("occupied convenience bind must fail");
+        let built_error = NotificationReceiver::builder()
+            .bind(occupied_addr.to_string())
+            .build_with_engine_id_generator(unavailable_engine_id)
+            .await
+            .err()
+            .expect("occupied builder bind must fail");
+        for error in [bound_error, built_error] {
+            assert!(matches!(
+                *error,
+                Error::Network { target, ref source }
+                    if target == occupied_addr
+                        && source.kind() == std::io::ErrorKind::AddrInUse
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_id_entropy_failure_releases_socket_for_both_paths() {
+        let reservation = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let built_error = NotificationReceiver::builder()
+            .bind(addr.to_string())
+            .build_with_engine_id_generator(unavailable_engine_id)
+            .await
+            .err()
+            .expect("builder entropy failure must fail");
+        assert_eq!(built_error.kind(), crate::ErrorKind::RandomSource);
+        let rebound = UdpSocket::bind(addr).await.unwrap();
+        drop(rebound);
+
+        let bound_error = NotificationReceiver::bind_with_engine_id_generator(
+            addr.to_string(),
+            unavailable_engine_id,
+        )
+        .await
+        .err()
+        .expect("convenience entropy failure must fail");
+        assert_eq!(bound_error.kind(), crate::ErrorKind::RandomSource);
+        let _rebound = UdpSocket::bind(addr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_engine_id_avoids_engine_id_entropy() {
+        let configured_engine_id = b"receiver-engine";
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(configured_engine_id.to_vec())
+            .build_with_engine_id_generator(|| panic!("engine ID generator must not be called"))
+            .await
+            .unwrap();
+
+        assert_eq!(receiver.engine_id(), configured_engine_id);
     }
 
     #[test]
@@ -2616,6 +2723,45 @@ mod tests {
         msg.encode().unwrap()
     }
 
+    fn build_noauth_v3_inform(engine_id: &[u8], username: &[u8]) -> Bytes {
+        use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+        use crate::pdu::{Pdu, StandardPduType};
+        use crate::v3::UsmSecurityParams;
+        use crate::value::Value;
+
+        let pdu = Pdu::standard(
+            StandardPduType::InformRequest,
+            7,
+            0,
+            0,
+            vec![
+                VarBind::new(oids::sys_uptime(), Value::TimeTicks(1000)),
+                VarBind::new(
+                    oids::snmp_trap_oid(),
+                    Value::ObjectIdentifier(oids::cold_start()),
+                ),
+            ],
+        );
+        let global = MsgGlobalData::new(
+            7,
+            crate::UDP_RECEIVE_LIMITS.advertised(),
+            MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+        )
+        .unwrap();
+        let usm_params = UsmSecurityParams::new(
+            Bytes::copy_from_slice(engine_id),
+            1,
+            0,
+            Bytes::copy_from_slice(username),
+        )
+        .unwrap();
+        let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), pdu);
+        V3Message::new(global, usm_params.encode().unwrap(), scoped)
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_v3_discovery_gets_response() {
         use crate::message::V3Message;
@@ -2669,6 +2815,78 @@ mod tests {
             crate::v3::report_oids::unknown_engine_ids()
         );
         assert_eq!(scoped.pdu.varbinds[0].value, Value::Counter32(1));
+    }
+
+    #[tokio::test]
+    async fn convenience_bind_keeps_v3_failure_reports_and_generated_identity() {
+        use crate::message::V3Message;
+        use crate::v3::UsmSecurityParams;
+
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let destination = receiver.local_addr();
+        let engine_id = Bytes::copy_from_slice(receiver.engine_id());
+        crate::v3::validate_engine_id(&engine_id).unwrap();
+
+        let receive_receiver = receiver.clone();
+        let receive_task = tokio::spawn(async move { receive_receiver.recv().await });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client.send_to(&[0x30, 0], destination).await.unwrap();
+        client
+            .send_to(&build_v3_discovery_request(42, true), destination)
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("convenience receiver did not return a discovery Report")
+        .unwrap();
+        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        assert_eq!(report_usm.engine_id, engine_id);
+        let scoped = report.scoped_pdu().expect("Report must be plaintext");
+        assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
+        assert_eq!(
+            scoped.pdu.varbinds[0].oid,
+            crate::v3::report_oids::unknown_engine_ids()
+        );
+        assert_eq!(receiver.usm_unknown_engine_ids(), 1);
+
+        client
+            .send_to(
+                &build_noauth_v3_inform(&engine_id, b"unconfigured-user"),
+                destination,
+            )
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("convenience receiver did not return an unknown-user Report")
+        .unwrap();
+        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        assert_eq!(
+            report.global_data.msg_flags.security_level,
+            SecurityLevel::NoAuthNoPriv
+        );
+        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        assert_eq!(report_usm.engine_id, engine_id);
+        let scoped = report.scoped_pdu().expect("Report must be plaintext");
+        assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
+        assert_eq!(
+            scoped.pdu.varbinds[0].oid,
+            crate::v3::report_oids::unknown_user_names()
+        );
+        assert_eq!(receiver.usm_unknown_usernames(), 1);
+
+        receive_task.abort();
+        let _ = receive_task.await;
     }
 
     #[tokio::test]
