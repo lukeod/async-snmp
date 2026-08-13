@@ -260,6 +260,179 @@ async fn default_request_registers_before_an_immediate_response() {
 }
 
 #[derive(Clone)]
+struct ReadyReceiveTransport {
+    sends: Arc<AtomicUsize>,
+    error: bool,
+}
+
+impl Transport for ReadyReceiveTransport {
+    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+        self.sends.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn recv_with<T, F>(
+        &self,
+        _registration: RequestRegistration,
+        _validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+    {
+        if self.error {
+            Err(Error::Config("immediate receive error".into()).boxed())
+        } else {
+            std::future::pending().await
+        }
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    }
+
+    fn is_reliable(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn default_request_returns_immediate_receive_error_without_sending() {
+    let sends = Arc::new(AtomicUsize::new(0));
+    let transport = ReadyReceiveTransport {
+        sends: sends.clone(),
+        error: true,
+    };
+
+    let error = transport
+        .request(
+            b"request",
+            RequestRegistration::v3(1, Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(*error, Error::Config(_)));
+    assert_eq!(sends.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn default_request_returns_immediate_success_without_sending() {
+    #[derive(Clone)]
+    struct ImmediateSuccess(Arc<AtomicUsize>);
+
+    impl Transport for ImmediateSuccess {
+        async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn recv_with<T, F>(
+            &self,
+            _registration: RequestRegistration,
+            mut validate: F,
+        ) -> async_snmp::Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        {
+            match validate(Bytes::from_static(b"ready"), self.peer_addr())? {
+                Candidate::Accept(value) => Ok(value),
+                Candidate::Reject => unreachable!(),
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    let sends = Arc::new(AtomicUsize::new(0));
+    let transport = ImmediateSuccess(sends.clone());
+    let response = transport
+        .request_with(
+            b"request",
+            RequestRegistration::v3(1, Duration::ZERO),
+            |data, _| Ok(Candidate::Accept(data)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, Bytes::from_static(b"ready"));
+    assert_eq!(sends.load(Ordering::Relaxed), 0);
+}
+
+#[derive(Clone, Copy)]
+struct SlowExchangeTransport;
+
+impl Transport for SlowExchangeTransport {
+    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        Ok(())
+    }
+
+    async fn recv_with<T, F>(
+        &self,
+        _registration: RequestRegistration,
+        _validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+    {
+        std::future::pending().await
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    }
+
+    fn is_reliable(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_request_deadline_includes_send_and_receive() {
+    let request = SlowExchangeTransport.request(
+        b"request",
+        RequestRegistration::v3(1, Duration::from_secs(5)),
+    );
+    tokio::pin!(request);
+    assert!(futures::poll!(request.as_mut()).is_pending());
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    let error = request.await.unwrap_err();
+    assert!(matches!(
+        *error,
+        Error::Timeout {
+            elapsed,
+            retries: 0,
+            ..
+        } if elapsed == Duration::from_secs(5)
+    ));
+}
+
+#[derive(Clone)]
 struct FiniteCapacityTransport {
     receive_starts: Arc<AtomicUsize>,
     sends: Arc<AtomicUsize>,

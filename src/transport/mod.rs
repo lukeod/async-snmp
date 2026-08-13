@@ -528,6 +528,21 @@ pub trait Transport: Send + Sync {
         async move {
             crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
             checked_deadline(registration.timeout(), "transport timeout")?;
+            let timeout = registration.timeout();
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    Error::Config("transport timeout exceeds the representable deadline".into())
+                        .boxed()
+                })?;
+            let timeout_error = || {
+                Error::Timeout {
+                    target: self.peer_addr(),
+                    elapsed: timeout,
+                    retries: 0,
+                }
+                .boxed()
+            };
 
             let mut receive = std::pin::pin!(self.recv_with(registration, validate));
             let ready_response = std::future::poll_fn(|context| {
@@ -538,10 +553,22 @@ pub trait Transport: Send + Sync {
             })
             .await;
 
-            self.send(data).await?;
-            match ready_response {
-                Some(result) => result,
-                None => receive.await,
+            if let Some(result) = ready_response {
+                return result;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timeout_error());
+            }
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => return Err(timeout_error()),
+                result = self.send(data) => result?,
+            }
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
+                result = receive => result,
             }
         }
     }
