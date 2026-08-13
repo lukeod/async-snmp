@@ -8,6 +8,10 @@ use crate::oid::Oid;
 /// by maintaining a sorted list of OID-value pairs and providing efficient
 /// lookup for the next OID.
 ///
+/// For a static or otherwise already-collected table, prefer [`Iterator::collect`]
+/// or [`FromIterator`] over repeated unsorted [`insert`](Self::insert) calls.
+/// Bulk construction sorts once and retains the last value for duplicate OIDs.
+///
 /// # Example
 ///
 /// ```rust
@@ -144,6 +148,50 @@ impl<V> Default for OidTable<V> {
     }
 }
 
+impl<V> FromIterator<(Oid, V)> for OidTable<V> {
+    /// Build a table by sorting all entries once.
+    ///
+    /// When an OID occurs more than once, the last value in iteration order is
+    /// retained, matching repeated calls to [`OidTable::insert`].
+    fn from_iter<T: IntoIterator<Item = (Oid, V)>>(iter: T) -> Self {
+        let mut entries = iter.into_iter().collect::<Vec<_>>();
+        // Stable sorting preserves iteration order among duplicate OIDs so the
+        // final duplicate can replace the earlier values below.
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut deduplicated: Vec<(Oid, V)> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(previous) = deduplicated.last_mut()
+                && previous.0 == entry.0
+            {
+                *previous = entry;
+                continue;
+            }
+            deduplicated.push(entry);
+        }
+        Self {
+            entries: deduplicated,
+        }
+    }
+}
+
+impl<V> Extend<(Oid, V)> for OidTable<V> {
+    /// Add entries in bulk, retaining the last value for duplicate OIDs.
+    fn extend<T: IntoIterator<Item = (Oid, V)>>(&mut self, iter: T) {
+        let existing = std::mem::take(&mut self.entries);
+        *self = existing.into_iter().chain(iter).collect();
+    }
+}
+
+impl<V> IntoIterator for OidTable<V> {
+    type Item = (Oid, V);
+    type IntoIter = std::vec::IntoIter<(Oid, V)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
 impl<'a, V> IntoIterator for &'a OidTable<V> {
     type Item = (&'a Oid, &'a V);
     type IntoIter =
@@ -249,5 +297,40 @@ mod tests {
         assert!(table.is_empty());
         assert_eq!(table.len(), 0);
         assert!(table.get_next(&oid!(1, 3, 6, 1)).is_none());
+    }
+
+    #[test]
+    fn from_iter_sorts_once_and_retains_last_duplicate() {
+        let first = oid!(1, 3, 6, 1, 1);
+        let second = oid!(1, 3, 6, 1, 2);
+        let third = oid!(1, 3, 6, 1, 3);
+        let table = OidTable::from_iter([
+            (third.clone(), "third"),
+            (first.clone(), "old first"),
+            (second.clone(), "second"),
+            (first.clone(), "new first"),
+        ]);
+
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(&first), Some(&"new first"));
+        assert_eq!(
+            table.iter().map(|(oid, _)| oid).collect::<Vec<_>>(),
+            [&first, &second, &third]
+        );
+    }
+
+    #[test]
+    fn extend_uses_last_new_value_and_owned_iteration_is_sorted() {
+        let first = oid!(1, 3, 6, 1, 1);
+        let second = oid!(1, 3, 6, 1, 2);
+        let third = oid!(1, 3, 6, 1, 3);
+        let mut table = OidTable::from_iter([(first.clone(), 1), (second.clone(), 2)]);
+
+        table.extend([(third.clone(), 3), (first.clone(), 10), (first.clone(), 11)]);
+
+        assert_eq!(
+            table.into_iter().collect::<Vec<_>>(),
+            [(first, 11), (second, 2), (third, 3)]
+        );
     }
 }

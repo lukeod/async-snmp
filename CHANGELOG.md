@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Typed net-snmp Opaque accessors now require the declared extension payload to
   consume the complete Opaque value. Variable-width integer payloads retain
   their existing non-minimal encoding compatibility, and raw access is unchanged.
+- `OidTable` now supports bulk construction through `FromIterator`, bulk
+  extension, and owned iteration. Bulk input is sorted and deduplicated once,
+  with the last value for each OID retained.
 
 - Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
   single-flight operation. Callers share success or structured failure under a
