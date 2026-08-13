@@ -241,13 +241,6 @@ pub struct Pdu {
     pub(crate) varbinds: Vec<VarBind>,
 }
 
-/// Permissive PDU representation returned by decoders.
-///
-/// Its invariant-bearing fields are read-only. Convert it with a role-specific
-/// `try_from_raw` constructor before deliberately reusing received data for an
-/// outbound message.
-pub type RawPdu = Pdu;
-
 /// A known error-status value suitable for an outbound Response PDU.
 ///
 /// Unlike [`ErrorStatus`], this type has no `Unknown` variant. The relationship
@@ -1861,9 +1854,6 @@ pub struct TrapV1Pdu {
     /// Variable bindings containing "interesting" information
     pub(crate) varbinds: Vec<VarBind>,
 }
-
-/// Permissive SNMPv1 Trap representation returned by decoders.
-pub type RawTrapV1Pdu = TrapV1Pdu;
 
 impl TrapV1Pdu {
     /// Construct a permissive raw SNMPv1 Trap without outbound validation.

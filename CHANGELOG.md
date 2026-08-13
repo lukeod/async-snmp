@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coherent pair and surfaces authoritative rollover persistence failures.
   SNMP-ENGINE-MIB clock reads now use the same source and report `genErr` when
   the durable clock cannot advance.
+- **Breaking:** Removed the redundant `RawPdu` and `RawTrapV1Pdu` aliases.
+  Decoders continue to return `Pdu` and `TrapV1Pdu`; validated outbound wrapper
+  types remain the invariant boundary for message construction.
 
 - Concurrent ordinary SNMPv3 engine discovery is now a cancellation-safe
   single-flight operation. Callers share success or structured failure under a

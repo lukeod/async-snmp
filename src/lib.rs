@@ -637,8 +637,7 @@ pub use notification::{
 pub use oid::Oid;
 pub use pdu::{
     ErrorIndex, GenericTrap, GetBulkPdu, NotificationPdu, OutboundErrorStatus, OutboundPdu, Pdu,
-    PduBody, PduType, RawPdu, RawTrapV1Pdu, RequestPdu, ResponsePdu, StandardPduType,
-    TrapV1Notification, TrapV1Pdu,
+    PduBody, PduType, RequestPdu, ResponsePdu, StandardPduType, TrapV1Notification, TrapV1Pdu,
 };
 pub use transport::{
     BuiltinTransport, Candidate, CommunityResponsePolicy, RequestRegistration, ResponseIdentity,
