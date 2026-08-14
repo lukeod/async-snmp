@@ -64,7 +64,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 [dev-dependencies]
 # Examples use Tokio's default multi-threaded #[tokio::main] flavor.
 tokio = { version = "1.48.0", features = ["test-util", "rt-multi-thread"] }
-testcontainers = "0.27"
+testcontainers = "0.28"
 proptest = "1.9"
 dirs = "6.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
