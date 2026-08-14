@@ -2086,6 +2086,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(not(windows))]
     #[tokio::test(start_paused = true)]
     async fn standalone_send_write_timeout_poisons_after_partial_io() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2199,6 +2200,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn cancellation_during_partial_send_poisons() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

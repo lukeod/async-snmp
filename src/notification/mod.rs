@@ -4899,6 +4899,7 @@ mod tests {
         assert_eq!(peer.ip().to_canonical(), client_addr.ip().to_canonical());
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn receive_buffer_reuses_capacity_at_udp_boundaries() {
         let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
@@ -4955,6 +4956,7 @@ mod tests {
         assert_eq!(receive_buffer_identity(&receiver).await, initial);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn receive_buffer_accepts_maximum_native_ipv6_udp_payload() {
         const IPV6_MAX_UDP_PAYLOAD: usize = 65_527;

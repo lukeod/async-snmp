@@ -486,7 +486,7 @@
 //!
 //! Low-level strict decoding requires both exact envelope consumption and the
 //! strict malformed-input policy. [`ClientBuilder::strict_decoding`],
-//! [`agent::AgentBuilder::strict_decoding`], and
+//! `AgentBuilder::strict_decoding`, and
 //! [`notification::NotificationReceiverBuilder::strict_decoding`] select both
 //! together. The independent setters support strict envelopes with a targeted
 //! value workaround, or compatible envelopes with otherwise strict values.

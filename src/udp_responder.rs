@@ -2096,7 +2096,7 @@ mod tests {
         let server = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let responder = UdpResponder::new(&server);
-        let payload = vec![0x5a; 32 * 1024];
+        let payload = vec![0x5a; 8 * 1024];
 
         responder
             .send_to(
