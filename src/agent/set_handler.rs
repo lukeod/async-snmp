@@ -65,6 +65,11 @@ impl Agent {
         // The message-envelope path performs an exact preflight encoding before
         // dispatch, so an oversized SET never reaches the test/commit phases.
 
+        // One Agent owns one complete mutation lifecycle at a time. Keep this
+        // guard through test, commit, rollback/free, and success finalization so
+        // rollback from an older request cannot erase a newer SET.
+        let _set_guard = self.inner.set_coordinator.lock().await;
+
         // The coordinator retains each object across async terminal callbacks.
         // Its Drop fallback releases every still-owned object in reverse order.
         let mut transaction = SetTransaction {
@@ -250,7 +255,7 @@ impl Agent {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
     use crate::Oid;
     use crate::agent::Agent;
@@ -1226,6 +1231,251 @@ mod tests {
                 (2, "commit", 17, set_oid(2)),
             ]
         );
+    }
+
+    struct SerializedSetHandler {
+        value: Arc<AtomicI32>,
+        first_commit_finished: Arc<Semaphore>,
+        release_failed_commit: Arc<Semaphore>,
+        undo_started: Arc<Semaphore>,
+        release_undo: Arc<Semaphore>,
+        second_test_started: Arc<Semaphore>,
+    }
+
+    struct SerializedPreparedSet {
+        request_id: i32,
+        oid: Oid,
+        value: Arc<AtomicI32>,
+        previous: Option<i32>,
+        first_commit_finished: Arc<Semaphore>,
+        release_failed_commit: Arc<Semaphore>,
+        undo_started: Arc<Semaphore>,
+        release_undo: Arc<Semaphore>,
+    }
+
+    impl PreparedSet for SerializedPreparedSet {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async move {
+                assert_eq!(oid, &self.oid);
+                if self.request_id == 1 && oid == &set_oid(2) {
+                    self.release_failed_commit
+                        .acquire()
+                        .await
+                        .expect("failed-commit gate remains open")
+                        .forget();
+                    return Err(SetCommitError::Failed);
+                }
+
+                let Value::Integer(value) = value else {
+                    unreachable!("test supplies integer values")
+                };
+                self.previous = Some(self.value.swap(*value, Ordering::SeqCst));
+                if self.request_id == 1 {
+                    self.first_commit_finished.add_permits(1);
+                }
+                Ok(())
+            })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async move {
+                assert_eq!(oid, &self.oid);
+                if self.request_id == 1 && oid == &set_oid(1) {
+                    self.undo_started.add_permits(1);
+                    self.release_undo
+                        .acquire()
+                        .await
+                        .expect("undo gate remains open")
+                        .forget();
+                }
+                if let Some(previous) = self.previous.take() {
+                    self.value.store(previous, Ordering::SeqCst);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    impl MibHandler for SerializedSetHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async move {
+                Ok(GetResult::Value(Value::Integer(
+                    self.value.load(Ordering::SeqCst),
+                )))
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetTestResult> {
+            if ctx.request_id() == 2 {
+                self.second_test_started.add_permits(1);
+            }
+            let prepared = SerializedPreparedSet {
+                request_id: ctx.request_id(),
+                oid: oid.clone(),
+                value: self.value.clone(),
+                previous: None,
+                first_commit_finished: self.first_commit_finished.clone(),
+                release_failed_commit: self.release_failed_commit.clone(),
+                undo_started: self.undo_started.clone(),
+                release_undo: self.release_undo.clone(),
+            };
+            Box::pin(async move { Ok(Box::new(prepared) as Box<dyn PreparedSet>) })
+        }
+    }
+
+    #[tokio::test]
+    async fn set_transactions_are_serialized_while_retrieval_remains_concurrent() {
+        let value = Arc::new(AtomicI32::new(0));
+        let first_commit_finished = Arc::new(Semaphore::new(0));
+        let release_failed_commit = Arc::new(Semaphore::new(0));
+        let undo_started = Arc::new(Semaphore::new(0));
+        let release_undo = Arc::new(Semaphore::new(0));
+        let second_test_started = Arc::new(Semaphore::new(0));
+        let second_dispatch_started = Arc::new(Semaphore::new(0));
+        let handler = Arc::new(SerializedSetHandler {
+            value: value.clone(),
+            first_commit_finished: first_commit_finished.clone(),
+            release_failed_commit: release_failed_commit.clone(),
+            undo_started: undo_started.clone(),
+            release_undo: release_undo.clone(),
+            second_test_started: second_test_started.clone(),
+        });
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+
+        let first_pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            vec![
+                VarBind::new(set_oid(1), Value::Integer(10)),
+                VarBind::new(set_oid(2), Value::Integer(11)),
+            ],
+        );
+        let first_ctx = crate::test_support::community_request_context_with(
+            crate::CommunityVersion::V2c,
+            crate::Community::from("public"),
+            "127.0.0.1:12345".parse().unwrap(),
+            1,
+            PduType::SetRequest,
+        );
+        let first_agent = agent.clone();
+        let first =
+            tokio::spawn(async move { first_agent.dispatch_request(&first_ctx, &first_pdu).await });
+        first_commit_finished
+            .acquire()
+            .await
+            .expect("first-commit signal remains open")
+            .forget();
+
+        let second_pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            2,
+            0,
+            0,
+            vec![VarBind::new(set_oid(1), Value::Integer(20))],
+        );
+        let second_ctx = crate::test_support::community_request_context_with(
+            crate::CommunityVersion::V2c,
+            crate::Community::from("public"),
+            "127.0.0.1:12346".parse().unwrap(),
+            2,
+            PduType::SetRequest,
+        );
+        let second_agent = agent.clone();
+        let second_dispatch_signal = second_dispatch_started.clone();
+        let second = tokio::spawn(async move {
+            second_dispatch_signal.add_permits(1);
+            second_agent
+                .dispatch_request(&second_ctx, &second_pdu)
+                .await
+        });
+        second_dispatch_started
+            .acquire()
+            .await
+            .expect("second-dispatch signal remains open")
+            .forget();
+
+        let get_pdu = Pdu::standard(
+            crate::pdu::StandardPduType::GetRequest,
+            3,
+            0,
+            0,
+            vec![VarBind::new(set_oid(1), Value::Null)],
+        );
+        let get_ctx = crate::test_support::request_context(PduType::GetRequest);
+        let get_response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            agent.dispatch_request(&get_ctx, &get_pdu),
+        )
+        .await
+        .expect("retrieval must not wait for SET coordination")
+        .unwrap();
+        assert_eq!(get_response.varbinds[0].value, Value::Integer(10));
+
+        release_failed_commit.add_permits(1);
+        undo_started
+            .acquire()
+            .await
+            .expect("undo signal remains open")
+            .forget();
+        assert!(
+            second_test_started.try_acquire().is_err(),
+            "a later SET entered its test phase during rollback"
+        );
+
+        release_undo.add_permits(1);
+        let first_response = first.await.unwrap().unwrap();
+        assert_eq!(
+            first_response.error_status(),
+            ErrorStatus::CommitFailed.as_i32()
+        );
+        second_test_started
+            .acquire()
+            .await
+            .expect("second-test signal remains open")
+            .forget();
+        let second_response = second.await.unwrap().unwrap();
+        assert_eq!(
+            second_response.error_status(),
+            ErrorStatus::NoError.as_i32()
+        );
+        assert_eq!(value.load(Ordering::SeqCst), 20);
     }
 
     #[derive(Clone, Copy)]

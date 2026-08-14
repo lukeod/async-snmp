@@ -423,13 +423,8 @@ impl<T: Transport> Client<T> {
                         let delay = self.inner.config.retry.compute_delay(attempt);
                         if !delay.is_zero() {
                             tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
-                            tokio::time::sleep(delay).await;
-                        } else {
-                            // Custom transports may report an immediately ready
-                            // timeout. Yield so large zero-backoff schedules
-                            // remain cancellable and cannot monopolize a worker.
-                            tokio::task::yield_now().await;
                         }
+                        super::retry::wait_for_retry(delay).await;
                     }
                     // fall thru to next loop iteration
                 }
@@ -1345,9 +1340,7 @@ impl<T: Transport> Client<T> {
                     // interoperability deviation. A fresh msgID still distinguishes
                     // each transmission, and any current-window msgID remains valid.
                     tracing::debug!(target: "async_snmp::client", { timeout_retries, delay_ms = delay.as_millis() as u64 }, "retransmitting V3 request after timeout");
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
+                    super::retry::wait_for_retry(delay).await;
                 }
                 Err(e) => {
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
@@ -2295,6 +2288,43 @@ mod tests {
             tokio::task::yield_now().await;
         }
         discovery.abort();
+        assert!(
+            calls.load(Ordering::Relaxed) < 10_000,
+            "retry loop did not yield to cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_backoff_v3_exchange_retries_remain_cancellable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = ImmediateTimeoutTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: calls.clone(),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::fixed(u32::MAX, Duration::ZERO),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+        {
+            let security = client.inner.config.usm_config().unwrap();
+            let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
+            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
+            *client.inner.engine.write().expect("engine lock poisoned") =
+                Some(ClientEngine::new(state, derived_keys));
+        }
+
+        let request = tokio::spawn(async move {
+            client
+                .send_v3_and_recv(Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]))
+                .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
         assert!(
             calls.load(Ordering::Relaxed) < 10_000,
             "retry loop did not yield to cancellation"

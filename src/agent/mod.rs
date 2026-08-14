@@ -1265,6 +1265,7 @@ impl AgentBuilder {
                 handlers: config.handlers,
                 state,
                 salt_counter,
+                set_coordinator: tokio::sync::Mutex::new(()),
                 concurrency_limit: config.concurrency_limit,
                 authorization: config.authorization,
                 cancel: config.cancel,
@@ -1541,6 +1542,8 @@ pub(crate) struct AgentInner {
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
     pub(crate) salt_counter: Option<SaltCounter>,
+    /// Serializes complete SET transactions without restricting retrieval.
+    pub(crate) set_coordinator: tokio::sync::Mutex<()>,
     pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
     pub(crate) authorization: AgentAuthorization,
     /// Cancellation token for graceful shutdown.

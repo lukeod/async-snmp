@@ -7,6 +7,16 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Wait before another retry without allowing zero-delay loops to monopolize
+/// the current Tokio worker.
+pub(crate) async fn wait_for_retry(delay: Duration) {
+    if delay.is_zero() {
+        tokio::task::yield_now().await;
+    } else {
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// Retry configuration for SNMP requests.
 ///
 /// Controls how the client handles timeouts on UDP transports. TCP transports

@@ -727,8 +727,8 @@ impl<T: Transport> Client<T> {
                         let delay = self.inner.config.retry.compute_delay(attempt);
                         if !delay.is_zero() {
                             tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
-                            tokio::time::sleep(delay).await;
                         }
+                        retry::wait_for_retry(delay).await;
                     }
                     // fall thru to next loop iteration
                 }
@@ -1504,6 +1504,7 @@ impl<T: Transport> Client<T> {
 mod tests {
     use super::*;
     use crate::message::CommunityMessage;
+    use crate::oid;
     use crate::oid::Oid;
     use crate::pdu::{Pdu, PduType};
     use crate::varbind::VarBind;
@@ -1607,6 +1608,74 @@ mod tests {
         fn is_reliable(&self) -> bool {
             true
         }
+    }
+
+    #[derive(Clone)]
+    struct ImmediateTimeoutTransport {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Transport for ImmediateTimeoutTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv_with<T, F>(
+            &self,
+            _registration: crate::transport::RequestRegistration,
+            _validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+        {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(Error::Timeout {
+                target: self.peer_addr(),
+                elapsed: Duration::ZERO,
+                retries: 0,
+            }
+            .boxed())
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            "127.0.0.1:161".parse().unwrap()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            "127.0.0.1:0".parse().unwrap()
+        }
+
+        fn is_reliable(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_backoff_community_retries_remain_cancellable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Client::new(
+            ImmediateTimeoutTransport {
+                calls: calls.clone(),
+            },
+            ClientConfig {
+                auth: Auth::v2c("public"),
+                retry: Retry::fixed(u32::MAX, Duration::ZERO),
+                ..ClientConfig::default()
+            },
+        )
+        .unwrap();
+
+        let request =
+            tokio::spawn(async move { client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        assert!(
+            calls.load(Ordering::Relaxed) < 10_000,
+            "retry loop did not yield to cancellation"
+        );
     }
 
     fn metadata_client(auth: Auth) -> Client<TruncatingTransport> {
