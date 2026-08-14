@@ -12,15 +12,17 @@ use crate::message::{
     decode_scoped_pdu,
 };
 use crate::pdu::{Pdu, PduType};
-use crate::transport::{Candidate, RequestRegistration, Transport};
+use crate::transport::{Candidate, CorrelationWindow, RequestRegistration, Transport};
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, TimelinessCandidateOutcome,
     TimelinessPublicationOutcome, UsmSecurityParams, auth::verify_message, classify_report,
     validate_engine_id,
 };
 use bytes::Bytes;
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tracing::{Span, instrument};
 
@@ -155,6 +157,7 @@ impl<T: Transport> Client<T> {
                         let flight = Arc::new(DiscoveryFlight {
                             outcome: std::sync::Mutex::new(None),
                             complete: tokio::sync::Notify::new(),
+                            retries: AtomicU32::new(0),
                         });
                         *slot = Some(Arc::clone(&flight));
                         (flight, true)
@@ -172,7 +175,7 @@ impl<T: Transport> Client<T> {
                     Err(Error::Timeout {
                         target: self.peer_addr(),
                         elapsed: timeout,
-                        retries: self.discovery_max_attempts(),
+                        retries: flight.retries.load(Ordering::Relaxed),
                     }
                     .boxed())
                 };
@@ -184,7 +187,7 @@ impl<T: Transport> Client<T> {
                         () = tokio::time::sleep_until(deadline) => timeout_result(),
                         result = async {
                             let _rediscovery_guard = self.inner.discovery_lock.lock().await;
-                            self.discover_engine_locked(false).await
+                            self.discover_engine_locked(false, &flight.retries).await
                         } => result,
                     }
                 };
@@ -224,7 +227,7 @@ impl<T: Transport> Client<T> {
                 return Err(Error::Timeout {
                     target: self.peer_addr(),
                     elapsed: timeout,
-                    retries: self.discovery_max_attempts(),
+                    retries: flight.retries.load(Ordering::Relaxed),
                 }
                 .boxed());
             }
@@ -233,7 +236,7 @@ impl<T: Transport> Client<T> {
                 () = tokio::time::sleep_until(deadline) => return Err(Error::Timeout {
                     target: self.peer_addr(),
                     elapsed: timeout,
-                    retries: self.discovery_max_attempts(),
+                    retries: flight.retries.load(Ordering::Relaxed),
                 }.boxed()),
                 () = notified => {},
             }
@@ -253,6 +256,9 @@ impl<T: Transport> Client<T> {
     }
 
     fn discovery_timeout_budget(&self) -> Result<std::time::Duration> {
+        if let Some(timeout) = self.inner.config.exchange_timeout {
+            return Ok(timeout);
+        }
         let retries = self.discovery_max_attempts();
         let mut timeout = self
             .inner
@@ -283,7 +289,7 @@ impl<T: Transport> Client<T> {
         if self.inner.transport.is_reliable() {
             0
         } else {
-            self.inner.config.retry.max_attempts()
+            self.inner.config.retry.retries()
         }
     }
 
@@ -317,14 +323,37 @@ impl<T: Transport> Client<T> {
             return Err(Error::Config("engine discovery requires SNMPv3".into()).boxed());
         }
 
-        let _guard = self.inner.discovery_lock.lock().await;
-        self.discover_engine_locked(true).await
+        let timeout = self.discovery_timeout_budget()?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Config("engine discovery timeout overflow".into()).boxed())?;
+        let retries = AtomicU32::new(0);
+        let timeout_error = || {
+            Error::Timeout {
+                target: self.peer_addr(),
+                elapsed: timeout,
+                retries: retries.load(Ordering::Relaxed),
+            }
+            .boxed()
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timeout_error());
+        }
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
+            result = async {
+                let _guard = self.inner.discovery_lock.lock().await;
+                self.discover_engine_locked(true, &retries).await
+            } => result,
+        }
     }
 
     /// Load or discover an engine while `discovery_lock` is held.
     async fn discover_engine_locked(
         &self,
         replace_cached_identity: bool,
+        retries_performed: &AtomicU32,
     ) -> Result<ResponseMetadata> {
         // Re-check after acquiring the lock: a previous waiter may have
         // completed ordinary discovery while we were blocked. Explicit
@@ -366,16 +395,20 @@ impl<T: Transport> Client<T> {
         // Perform discovery with retry (same policy as normal requests)
         tracing::debug!(target: "async_snmp::client", "performing engine discovery");
         let start = std::time::Instant::now();
+        let exchange_deadline = self.start_exchange_deadline()?;
 
         let max_attempts = if self.inner.transport.is_reliable() {
             0
         } else {
-            self.inner.config.retry.max_attempts()
+            self.inner.config.retry.retries()
         };
 
         let mut discovery_opt: Option<DiscoveryResponse> = None;
+        let mut msg_id_window = BTreeSet::new();
+        let correlation_window = CorrelationWindow::new();
 
         'discovery: for attempt in 0..=max_attempts {
+            retries_performed.store(attempt, Ordering::Relaxed);
             if attempt > 0 {
                 tracing::debug!(target: "async_snmp::client", "retrying engine discovery");
             }
@@ -388,28 +421,66 @@ impl<T: Transport> Client<T> {
             let discovery_data = discovery_msg.encode()?;
             self.enforce_outbound_size(discovery_data.len(), None)?;
 
-            let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout)
-                .with_decode_config(self.inner.config.decode_config);
+            let attempt_deadline = self.transmission_deadline(exchange_deadline)?;
+            let retry_delay =
+                (attempt < max_attempts).then(|| self.inner.config.retry.compute_delay(attempt));
+            let registration_deadline = match retry_delay {
+                Some(delay) => {
+                    self.retry_retention_deadline(attempt_deadline, delay, exchange_deadline)?
+                }
+                None => attempt_deadline,
+            };
+            let registration = RequestRegistration::v3(msg_id, registration_deadline)
+                .with_decode_config(self.inner.config.decode_config)
+                .with_correlation_window(Arc::clone(&correlation_window))
+                .with_aliases(msg_id_window.iter().copied())?;
+            msg_id_window.insert(msg_id);
 
-            match self
-                .inner
-                .transport
-                .request_with(&discovery_data, registration, |data, source| {
-                    let Ok(decoded) = RawV3Message::decode_bounded_with_target(
-                        data,
-                        self.inner.transport.receive_limits().accepted(),
-                        source,
-                        self.inner.config.decode_config,
-                    ) else {
-                        return Ok(Candidate::Reject);
+            let discovery_exchange =
+                self.inner
+                    .transport
+                    .request_with(&discovery_data, registration, |data, source| {
+                        let Ok(decoded) = RawV3Message::decode_bounded_with_target(
+                            data,
+                            self.inner.transport.receive_limits().accepted(),
+                            source,
+                            self.inner.config.decode_config,
+                        ) else {
+                            return Ok(Candidate::Reject);
+                        };
+                        match self.validate_discovery_response(decoded, &msg_id_window, source) {
+                            Ok(response) => Ok(Candidate::Accept(response)),
+                            Err(_) => Ok(Candidate::Reject),
+                        }
+                    });
+            tokio::pin!(discovery_exchange);
+            let exchange_result = tokio::select! {
+                biased;
+                result = &mut discovery_exchange => Some(result),
+                () = tokio::time::sleep_until(attempt_deadline) => None,
+            };
+            let exchange_result = match exchange_result {
+                Some(result) => result,
+                None => {
+                    let Some(delay) = retry_delay else {
+                        break 'discovery;
                     };
-                    match self.validate_discovery_response(decoded, msg_id, source) {
-                        Ok(response) => Ok(Candidate::Accept(response)),
-                        Err(_) => Ok(Candidate::Reject),
+                    if !delay.is_zero() {
+                        tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
                     }
-                })
-                .await
-            {
+                    tokio::select! {
+                        biased;
+                        result = &mut discovery_exchange => result,
+                        retry = super::retry::wait_for_retry(delay, exchange_deadline) => {
+                            if !retry {
+                                break 'discovery;
+                            }
+                            continue 'discovery;
+                        }
+                    }
+                }
+            };
+            match exchange_result {
                 Ok(discovery) => {
                     discovery_opt = Some(discovery);
                     break 'discovery;
@@ -420,7 +491,9 @@ impl<T: Transport> Client<T> {
                         if !delay.is_zero() {
                             tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
                         }
-                        super::retry::wait_for_retry(delay).await;
+                        if !super::retry::wait_for_retry(delay, exchange_deadline).await {
+                            break 'discovery;
+                        }
                     }
                     // fall thru to next loop iteration
                 }
@@ -432,7 +505,7 @@ impl<T: Transport> Client<T> {
             Error::Timeout {
                 target: self.peer_addr(),
                 elapsed: start.elapsed(),
-                retries: max_attempts,
+                retries: retries_performed.load(Ordering::Relaxed),
             }
             .boxed()
         })?;
@@ -511,7 +584,7 @@ impl<T: Transport> Client<T> {
     fn validate_discovery_response(
         &self,
         decoded: crate::message::DecodeOutcome<RawV3Message>,
-        expected_msg_id: i32,
+        msg_id_window: &BTreeSet<i32>,
         source: std::net::SocketAddr,
     ) -> Result<DiscoveryResponse> {
         let malformed = || Error::MalformedResponse { target: source }.boxed();
@@ -562,10 +635,10 @@ impl<T: Transport> Client<T> {
         let decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, scoped.anomalies);
         let scoped_pdu = scoped.value;
 
-        // Bind the Internal-class Report to the exact outstanding discovery
-        // attempt only after Security Model processing and scoped-PDU parsing.
-        if response.global_data.msg_id != expected_msg_id {
-            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), expected_msg_id, actual_msg_id = response.global_data.msg_id }, "msgID mismatch in discovery response");
+        // Bind the Internal-class Report to a transmitted discovery msgID only
+        // after Security Model processing and scoped-PDU parsing.
+        if !msg_id_window.contains(&response.global_data.msg_id) {
+            tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), actual_msg_id = response.global_data.msg_id }, "msgID is outside the discovery correlation window");
             return Err(malformed());
         }
 
@@ -842,7 +915,7 @@ impl<T: Transport> Client<T> {
         &self,
         response_data: Bytes,
         source: SocketAddr,
-        msg_ids: &[i32],
+        msg_ids: &BTreeSet<i32>,
         request: &EncodedV3Request,
         expected_pdu_id: i32,
         expected_level: SecurityLevel,
@@ -1004,6 +1077,9 @@ impl<T: Transport> Client<T> {
         )?;
 
         let mut exchange_metadata = self.ensure_engine_discovered().await?;
+        let exchange_deadline = self
+            .start_exchange_deadline()
+            .map_err(|error| error.with_prior_response_metadata(&exchange_metadata))?;
 
         let security = self
             .inner
@@ -1016,7 +1092,7 @@ impl<T: Transport> Client<T> {
         let max_timeout_retries = if self.inner.transport.is_reliable() {
             0
         } else {
-            self.inner.config.retry.max_attempts()
+            self.inner.config.retry.retries()
         };
         let mut timeout_retries = 0;
         let mut correction_used = false;
@@ -1025,7 +1101,8 @@ impl<T: Transport> Client<T> {
         // msgIDs transmitted for the current exchange. A response correlating to
         // any of them is acceptable; corrections reset the window because the
         // corrected message is a new exchange.
-        let mut msg_id_window: Vec<i32> = Vec::new();
+        let mut msg_id_window = BTreeSet::new();
+        let mut correlation_window = CorrelationWindow::new();
 
         loop {
             Span::current().record("snmp.attempt", timeout_retries);
@@ -1044,28 +1121,71 @@ impl<T: Transport> Client<T> {
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?pdu.pdu_type(), snmp.varbind_count = pdu.varbinds.len(), snmp.msg_id = msg_id }, "sending V3 {} request", pdu.pdu_type());
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
 
-            let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout)
+            let attempt_deadline = self
+                .transmission_deadline(exchange_deadline)
+                .map_err(|error| error.with_prior_response_metadata(&exchange_metadata))?;
+            let can_timeout_retry =
+                engine_time_override.is_none() && timeout_retries < max_timeout_retries;
+            let retry_delay =
+                can_timeout_retry.then(|| self.inner.config.retry.compute_delay(timeout_retries));
+            let registration_deadline = match retry_delay {
+                Some(delay) => self
+                    .retry_retention_deadline(attempt_deadline, delay, exchange_deadline)
+                    .map_err(|error| error.with_prior_response_metadata(&exchange_metadata))?,
+                None => attempt_deadline,
+            };
+            let registration = RequestRegistration::v3(msg_id, registration_deadline)
                 .with_decode_config(self.inner.config.decode_config)
-                .with_aliases(msg_id_window.iter().copied());
-            msg_id_window.push(msg_id);
+                .with_correlation_window(Arc::clone(&correlation_window))
+                .with_aliases(msg_id_window.iter().copied())
+                .map_err(|error| error.with_prior_response_metadata(&exchange_metadata))?;
+            msg_id_window.insert(msg_id);
 
             // Send request and wait for response as a single unit so reliable
             // transports own their stream lock for the whole exchange.
-            match self
-                .inner
-                .transport
-                .request_with(&request.data, registration, |data, source| {
-                    self.validate_v3_candidate(
-                        data,
-                        source,
-                        &msg_id_window,
-                        &request,
-                        pdu.request_id,
-                        security_level,
-                    )
-                })
-                .await
-            {
+            let exchange_result = {
+                let request_exchange = self.inner.transport.request_with(
+                    &request.data,
+                    registration,
+                    |data, source| {
+                        self.validate_v3_candidate(
+                            data,
+                            source,
+                            &msg_id_window,
+                            &request,
+                            pdu.request_id,
+                            security_level,
+                        )
+                    },
+                );
+                tokio::pin!(request_exchange);
+                let exchange_result = tokio::select! {
+                    biased;
+                    result = &mut request_exchange => Some(result),
+                    () = tokio::time::sleep_until(attempt_deadline) => None,
+                };
+                match exchange_result {
+                    Some(result) => result,
+                    None => {
+                        let Some(delay) = retry_delay else {
+                            break;
+                        };
+                        tokio::select! {
+                            biased;
+                            result = &mut request_exchange => result,
+                            retry = super::retry::wait_for_retry(delay, exchange_deadline) => {
+                                if !retry {
+                                    break;
+                                }
+                                timeout_retries += 1;
+                                tracing::debug!(target: "async_snmp::client", { timeout_retries, delay_ms = delay.as_millis() as u64 }, "retransmitting V3 request after timeout");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            };
+            match exchange_result {
                 Ok(validated) => {
                     let response_usm = validated.usm;
                     let received_level = validated.received_level;
@@ -1166,6 +1286,7 @@ impl<T: Transport> Client<T> {
                             correction_used = true;
                             pdu.set_request_id(self.next_request_id());
                             msg_id_window.clear();
+                            correlation_window = CorrelationWindow::new();
                             Span::current().record("snmp.protocol_correction", true);
                             tracing::debug!(target: "async_snmp::client", { snmp.report_status = %status }, "sending SNMPv3 protocol correction");
                             continue;
@@ -1193,6 +1314,7 @@ impl<T: Transport> Client<T> {
                             });
                             pdu.set_request_id(self.next_request_id());
                             msg_id_window.clear();
+                            correlation_window = CorrelationWindow::new();
                             Span::current().record("snmp.protocol_correction", true);
                             tracing::debug!(target: "async_snmp::client", { snmp.report_status = %status }, "sending packet-local SNMPv3 compatibility correction");
                             continue;
@@ -1326,15 +1448,17 @@ impl<T: Transport> Client<T> {
                     }
 
                     let delay = self.inner.config.retry.compute_delay(timeout_retries);
-                    timeout_retries += 1;
                     // Retain the PDU request-id across timeout retransmissions,
                     // matching deployed net-snmp and SNMP4J behavior. RFC 3414
                     // Section 11.1 literally requires distinct request-ids in all
                     // Request PDUs sent during a TimeWindow, so this is a deliberate
                     // interoperability deviation. A fresh msgID still distinguishes
                     // each transmission, and any current-window msgID remains valid.
+                    if !super::retry::wait_for_retry(delay, exchange_deadline).await {
+                        break;
+                    }
+                    timeout_retries += 1;
                     tracing::debug!(target: "async_snmp::client", { timeout_retries, delay_ms = delay.as_millis() as u64 }, "retransmitting V3 request after timeout");
-                    super::retry::wait_for_retry(delay).await;
                 }
                 Err(e) => {
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
@@ -1482,35 +1606,6 @@ mod tests {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
-        }
-
-        fn recv(
-            &self,
-            _registration: RequestRegistration,
-        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
-            ready(Err(Error::Config(
-                "test transport does not receive data".into(),
-            )
-            .boxed()))
-        }
-
-        fn recv_with<T, F>(
-            &self,
-            registration: RequestRegistration,
-            validate: F,
-        ) -> impl std::future::Future<Output = Result<T>> + Send
-        where
-            T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
-        {
-            crate::transport::recv_with_scripted(
-                registration,
-                self.peer_addr(),
-                move |registration| {
-                    futures_util::stream::once(async move { self.recv(registration).await })
-                },
-                validate,
-            )
         }
 
         fn request_with<T, F>(
@@ -1776,11 +1871,7 @@ mod tests {
         }
     }
 
-    impl Transport for RetryTestTransport {
-        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            ready(Ok(()))
-        }
-
+    impl RetryTestTransport {
         fn recv(
             &self,
             registration: RequestRegistration,
@@ -1803,9 +1894,16 @@ mod tests {
                 }
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for RetryTestTransport {
+        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            ready(Ok(()))
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1813,9 +1911,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -1844,12 +1943,7 @@ mod tests {
         sends: Arc<AtomicUsize>,
     }
 
-    impl Transport for DiscoveryLimitTransport {
-        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            self.sends.fetch_add(1, Ordering::Relaxed);
-            ready(Ok(()))
-        }
-
+    impl DiscoveryLimitTransport {
         fn recv(
             &self,
             registration: RequestRegistration,
@@ -1863,9 +1957,17 @@ mod tests {
                 self.peer,
             )))
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for DiscoveryLimitTransport {
+        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            ready(Ok(()))
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1873,9 +1975,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -1951,7 +2054,7 @@ mod tests {
 
         let config = ClientConfig {
             auth: crate::Auth::Usm(UsmConfig::new("user")),
-            retry: crate::client::Retry::fixed(1, Duration::ZERO),
+            retry: crate::client::Retry::fixed(1, Duration::ZERO).unwrap(),
             ..ClientConfig::default()
         };
         let client = Client::new(transport, config).expect("valid client config");
@@ -2018,10 +2121,7 @@ mod tests {
         struct AlwaysTimeoutTransport {
             peer: SocketAddr,
         }
-        impl Transport for AlwaysTimeoutTransport {
-            fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-                ready(Ok(()))
-            }
+        impl AlwaysTimeoutTransport {
             fn recv(
                 &self,
                 _registration: RequestRegistration,
@@ -2037,8 +2137,15 @@ mod tests {
                     .boxed())
                 }
             }
-            fn recv_with<T, F>(
+        }
+
+        impl Transport for AlwaysTimeoutTransport {
+            fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+                ready(Ok(()))
+            }
+            fn request_with<T, F>(
                 &self,
+                data: &[u8],
                 registration: RequestRegistration,
                 validate: F,
             ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2046,9 +2153,10 @@ mod tests {
                 T: Send,
                 F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
             {
-                crate::transport::recv_with_scripted(
+                crate::transport::request_with_scripted(
+                    self,
+                    data,
                     registration,
-                    self.peer_addr(),
                     move |registration| {
                         futures_util::stream::once(async move { self.recv(registration).await })
                     },
@@ -2071,7 +2179,7 @@ mod tests {
         };
         let config = ClientConfig {
             auth: crate::Auth::Usm(UsmConfig::new("user")),
-            retry: crate::client::Retry::fixed(2, Duration::ZERO),
+            retry: crate::client::Retry::fixed(2, Duration::ZERO).unwrap(),
             ..ClientConfig::default()
         };
         let client = Client::new(transport, config).expect("valid client config");
@@ -2092,6 +2200,65 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn discovery_exchange_deadline_reports_only_performed_retries() {
+        #[derive(Clone)]
+        struct PendingDiscoveryTransport {
+            peer: SocketAddr,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Transport for PendingDiscoveryTransport {
+            async fn send(&self, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+
+            async fn request_with<T, F>(
+                &self,
+                _data: &[u8],
+                _registration: RequestRegistration,
+                _validate: F,
+            ) -> Result<T>
+            where
+                T: Send,
+                F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                std::future::pending().await
+            }
+
+            fn peer_addr(&self) -> SocketAddr {
+                self.peer
+            }
+
+            fn local_addr(&self) -> SocketAddr {
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+            }
+
+            fn is_reliable(&self) -> bool {
+                false
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = PendingDiscoveryTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: Arc::clone(&calls),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            exchange_timeout: Some(Duration::from_millis(10)),
+            retry: crate::client::Retry::fixed(2, Duration::ZERO).unwrap(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+
+        let error = client.ensure_engine_discovered().await.unwrap_err();
+        assert!(matches!(*error, Error::Timeout { retries: 0, .. }));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
     #[derive(Clone)]
     struct SingleFlightFailureTransport {
         peer: SocketAddr,
@@ -2105,8 +2272,9 @@ mod tests {
             Ok(())
         }
 
-        async fn recv_with<T, F>(
+        async fn request_with<T, F>(
             &self,
+            _data: &[u8],
             _registration: RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -2260,8 +2428,9 @@ mod tests {
             Ok(())
         }
 
-        async fn recv_with<T, F>(
+        async fn request_with<T, F>(
             &self,
+            _data: &[u8],
             _registration: RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -2301,7 +2470,7 @@ mod tests {
         let config = ClientConfig {
             auth: crate::Auth::Usm(UsmConfig::new("user")),
             request_timeout: Duration::from_secs(1),
-            retry: crate::client::Retry::fixed(u32::MAX, Duration::ZERO),
+            retry: crate::client::Retry::fixed(crate::MAX_RETRIES, Duration::ZERO).unwrap(),
             ..ClientConfig::default()
         };
         let client = Client::new(transport, config).unwrap();
@@ -2327,7 +2496,7 @@ mod tests {
         let config = ClientConfig {
             auth: crate::Auth::Usm(UsmConfig::new("user")),
             request_timeout: Duration::from_secs(1),
-            retry: crate::client::Retry::fixed(u32::MAX, Duration::ZERO),
+            retry: crate::client::Retry::fixed(crate::MAX_RETRIES, Duration::ZERO).unwrap(),
             ..ClientConfig::default()
         };
         let client = Client::new(transport, config).unwrap();
@@ -2354,6 +2523,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn v3_exchange_deadline_during_backoff_reports_no_unsent_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = ImmediateTimeoutTransport {
+            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+            calls: Arc::clone(&calls),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            exchange_timeout: Some(Duration::from_millis(10)),
+            retry: crate::client::Retry::fixed(2, Duration::from_millis(100)).unwrap(),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(transport, config).unwrap();
+        {
+            let security = client.inner.config.usm_config().unwrap();
+            let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
+            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
+            *client.inner.engine.write().expect("engine lock poisoned") =
+                Some(ClientEngine::new(state, derived_keys));
+        }
+
+        let error = client
+            .send_v3_and_recv(Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]))
+            .await
+            .unwrap_err();
+        assert!(matches!(*error, Error::Timeout { retries: 0, .. }));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
     #[derive(Clone)]
     struct StructuredFailureTransport {
         peer: SocketAddr,
@@ -2367,8 +2567,9 @@ mod tests {
             Ok(())
         }
 
-        async fn recv_with<T, F>(
+        async fn request_with<T, F>(
             &self,
+            _data: &[u8],
             _registration: RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -2488,6 +2689,15 @@ mod response_validation_tests {
         }
     }
 
+    impl CannedTransport {
+        fn recv(
+            &self,
+            _registration: RequestRegistration,
+        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
+            ready(Ok((self.response.clone(), self.peer)))
+        }
+    }
+
     impl Transport for CannedTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
@@ -2502,15 +2712,9 @@ mod response_validation_tests {
             self.send_size
         }
 
-        fn recv(
+        fn request_with<T, F>(
             &self,
-            _registration: RequestRegistration,
-        ) -> impl std::future::Future<Output = Result<(Bytes, SocketAddr)>> + Send {
-            ready(Ok((self.response.clone(), self.peer)))
-        }
-
-        fn recv_with<T, F>(
-            &self,
+            data: &[u8],
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2518,9 +2722,10 @@ mod response_validation_tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -2566,18 +2771,6 @@ mod response_validation_tests {
     impl Transport for DeferredUpdateTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
-        }
-
-        async fn recv_with<U, F>(
-            &self,
-            _registration: RequestRegistration,
-            _validate: F,
-        ) -> Result<U>
-        where
-            U: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
-        {
-            Err(Error::Config("DeferredUpdateTransport uses request()".into()).boxed())
         }
 
         async fn request_with<U, F>(
@@ -2638,18 +2831,6 @@ mod response_validation_tests {
     impl Transport for RediscoveryRaceTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
-        }
-
-        async fn recv_with<U, F>(
-            &self,
-            _registration: RequestRegistration,
-            _validate: F,
-        ) -> Result<U>
-        where
-            U: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
-        {
-            Err(Error::Config("RediscoveryRaceTransport uses request()".into()).boxed())
         }
 
         async fn request_with<U, F>(

@@ -168,7 +168,7 @@ async fn benchmark_non_shared(
     for target in targets {
         let client = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
             .request_timeout(Duration::from_secs(5))
-            .retry(Retry::fixed(1, Duration::ZERO))
+            .retry(Retry::fixed(1, Duration::ZERO).unwrap())
             .connect()
             .await
             .expect("Failed to connect");
@@ -205,7 +205,7 @@ async fn benchmark_shared(
     for target in targets {
         let client = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
             .request_timeout(Duration::from_secs(5))
-            .retry(Retry::fixed(1, Duration::ZERO))
+            .retry(Retry::fixed(1, Duration::ZERO).unwrap())
             .build_with(&shared)
             .await
             .expect("Failed to build client");

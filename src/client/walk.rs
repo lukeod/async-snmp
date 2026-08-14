@@ -1020,26 +1020,7 @@ mod tests {
         }
     }
 
-    impl Transport for BulkTooBigTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            let msg = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
-                crate::DecodeConfig::default(),
-            )
-            .unwrap()
-            .value;
-            let pdu = msg.pdu().standard().unwrap();
-            let (_, max_rep) = pdu
-                .get_bulk_fields()
-                .expect("walk request must contain typed GETBULK fields");
-            self.pending
-                .lock()
-                .unwrap()
-                .push_back((request_id, max_rep));
-            async { Ok(()) }
-        }
-
+    impl BulkTooBigTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -1066,9 +1047,31 @@ mod tests {
                 Ok((msg.encode().unwrap(), peer))
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for BulkTooBigTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            let msg = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
+            let pdu = msg.pdu().standard().unwrap();
+            let (_, max_rep) = pdu
+                .get_bulk_fields()
+                .expect("walk request must contain typed GETBULK fields");
+            self.pending
+                .lock()
+                .unwrap()
+                .push_back((request_id, max_rep));
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1076,9 +1079,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -1185,24 +1189,7 @@ mod tests {
         }
     }
 
-    impl Transport for EmptyWalkTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            let msg = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
-                crate::DecodeConfig::default(),
-            )
-            .unwrap()
-            .value;
-            let pdu_type = msg.pdu().standard().unwrap().pdu_type();
-            self.pending
-                .lock()
-                .unwrap()
-                .push_back((request_id, pdu_type));
-            self.requests.lock().unwrap().push(pdu_type);
-            async { Ok(()) }
-        }
-
+    impl EmptyWalkTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -1224,9 +1211,29 @@ mod tests {
                 Ok((msg.encode().unwrap(), peer))
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for EmptyWalkTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            let msg = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
+            let pdu_type = msg.pdu().standard().unwrap().pdu_type();
+            self.pending
+                .lock()
+                .unwrap()
+                .push_back((request_id, pdu_type));
+            self.requests.lock().unwrap().push(pdu_type);
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1234,9 +1241,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -1450,25 +1458,7 @@ mod tests {
         }
     }
 
-    impl Transport for ScriptedWalkTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let message = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
-                crate::DecodeConfig::default(),
-            )
-            .unwrap()
-            .value;
-            let pdu = message.pdu().standard().unwrap();
-            let request = (
-                pdu.pdu_type(),
-                pdu.get_bulk_fields()
-                    .map(|(_, max_repetitions)| max_repetitions),
-            );
-            self.pending.lock().unwrap().push_back(pdu.request_id);
-            self.requests.lock().unwrap().push(request);
-            async { Ok(()) }
-        }
-
+    impl ScriptedWalkTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -1527,9 +1517,30 @@ mod tests {
                 }
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for ScriptedWalkTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let message = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
+            let pdu = message.pdu().standard().unwrap();
+            let request = (
+                pdu.pdu_type(),
+                pdu.get_bulk_fields()
+                    .map(|(_, max_repetitions)| max_repetitions),
+            );
+            self.pending.lock().unwrap().push_back(pdu.request_id);
+            self.requests.lock().unwrap().push(request);
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1537,9 +1548,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },

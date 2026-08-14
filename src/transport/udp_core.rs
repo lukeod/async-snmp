@@ -3,14 +3,15 @@
 //! Provides a sharded pending request map with per-request wakeup.
 
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
-use super::{Candidate, RequestRegistration, ResponseIdentity, checked_deadline};
+use super::{Candidate, CorrelationWindow, RequestRegistration, ResponseIdentity};
 use crate::error::{Error, Result};
 
 const SHARDS: usize = 64;
@@ -70,6 +71,7 @@ struct RegistrationOwner {
     retries: u32,
     expired: AtomicBool,
     notify: Arc<Notify>,
+    correlation_window_id: Option<u64>,
 }
 
 impl RegistrationOwner {
@@ -113,12 +115,17 @@ impl PendingEntry {
     }
 }
 
-/// Owns one UDP correlation registration and removes only its entries on drop.
+/// Owns one UDP correlation registration.
+///
+/// Standalone registrations remove their entries on drop. Retry-window
+/// registrations remain available for atomic handoff and are removed when the
+/// exchange-lifetime [`CorrelationWindow`] is dropped.
 pub(crate) struct UdpRegistration {
     core: Arc<UdpCore>,
     primary: i32,
-    aliases: Vec<i32>,
+    aliases: BTreeSet<i32>,
     owner: Arc<RegistrationOwner>,
+    correlation_window: Option<Arc<CorrelationWindow>>,
 }
 
 impl UdpRegistration {
@@ -144,6 +151,9 @@ impl UdpRegistration {
 
 impl Drop for UdpRegistration {
     fn drop(&mut self) {
+        if self.correlation_window.is_some() {
+            return;
+        }
         self.core.remove_owned(self.primary, &self.owner);
         for alias in &self.aliases {
             self.core.remove_owned(*alias, &self.owner);
@@ -223,16 +233,14 @@ impl UdpCore {
 
         let primary = registration.request_id();
         let now = Instant::now();
-        let deadline = checked_deadline(registration.timeout(), "UDP timeout")?;
-        let aliases = registration.aliases().to_vec();
+        let deadline = registration.deadline();
+        let aliases = registration.aliases().clone();
+        let correlation_window = registration.correlation_window().cloned();
+        let correlation_window_id = correlation_window.as_deref().map(CorrelationWindow::id);
 
         let mut ids = Vec::with_capacity(1 + aliases.len());
         ids.push(primary);
-        for alias in &aliases {
-            if *alias != primary && !ids.contains(alias) {
-                ids.push(*alias);
-            }
-        }
+        ids.extend(aliases.iter().copied());
 
         // Hold every involved shard in ascending order so no observer can see
         // a partially installed alias set.
@@ -256,6 +264,7 @@ impl UdpCore {
 
         let mut expired_owners = Vec::new();
         let mut collision = None;
+        let mut replaced_owners = Vec::new();
         for id in &ids {
             let shard_index = Self::shard_index(*id);
             let guard_index = guards
@@ -267,6 +276,15 @@ impl UdpCore {
                     let owner = entry.owner().clone();
                     pending.remove(id);
                     expired_owners.push(owner);
+                } else if correlation_window_id.is_some()
+                    && entry.owner().correlation_window_id == correlation_window_id
+                {
+                    if !replaced_owners
+                        .iter()
+                        .any(|owner| Arc::ptr_eq(owner, entry.owner()))
+                    {
+                        replaced_owners.push(entry.owner().clone());
+                    }
                 } else {
                     collision = Some(*id);
                     break;
@@ -283,15 +301,41 @@ impl UdpCore {
             return Err(Error::RequestIdInUse { request_id }.boxed());
         }
 
+        // A datagram may arrive after the prior attempt future is dropped but
+        // before this handoff installs its successor. Move such candidates to
+        // the new slot while all involved shards remain locked.
+        let mut carried_responses = VecDeque::new();
+        if correlation_window_id.is_some() {
+            for id in &ids {
+                let shard_index = Self::shard_index(*id);
+                let guard_index = guards
+                    .binary_search_by_key(&shard_index, |(index, _)| *index)
+                    .unwrap();
+                if let Some(PendingEntry::Slot(slot)) = guards[guard_index].1.get_mut(id)
+                    && slot.owner.correlation_window_id == correlation_window_id
+                {
+                    while carried_responses.len() < MAX_PARKED_CANDIDATES {
+                        let Some(response) = slot.responses.pop_front() else {
+                            break;
+                        };
+                        carried_responses.push_back(response);
+                    }
+                }
+            }
+        }
+
         let owner = Arc::new(RegistrationOwner {
             registered_at: now,
             deadline,
             retries: 0,
             expired: AtomicBool::new(false),
             notify: Arc::new(Notify::new()),
+            correlation_window_id,
         });
+        let mut registration = registration;
+        registration.clear_correlation_window();
         let slot = ResponseSlot {
-            responses: VecDeque::new(),
+            responses: carried_responses,
             owner: owner.clone(),
             target_source,
             strict_source,
@@ -324,13 +368,46 @@ impl UdpCore {
             expired_owner.note_expired(&self.stats);
             expired_owner.notify.notify_one();
         }
+        for replaced_owner in replaced_owners {
+            replaced_owner.notify.notify_one();
+        }
+        if let Some(window) = &correlation_window {
+            window.register_udp_core(self);
+        }
 
         Ok(UdpRegistration {
             core: self.clone(),
             primary,
             aliases,
             owner,
+            correlation_window,
         })
+    }
+
+    /// Remove every registration retained by an exchange-lifetime V3 window.
+    pub(crate) fn remove_window(&self, window_id: u64) {
+        let mut guards: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| shard.pending.lock().unwrap())
+            .collect();
+        let mut owners = Vec::new();
+        for pending in &mut guards {
+            pending.retain(|_, entry| {
+                if entry.owner().correlation_window_id == Some(window_id) {
+                    if !owners.iter().any(|owner| Arc::ptr_eq(owner, entry.owner())) {
+                        owners.push(entry.owner().clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        drop(guards);
+        for owner in owners {
+            owner.notify.notify_one();
+        }
     }
 
     /// Deliver a response to its waiting request.
@@ -516,7 +593,7 @@ impl UdpCore {
 
             tokio::select! {
                 () = registration.owner.notify.notified() => {}
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(registration.owner.deadline)) => {}
+                () = tokio::time::sleep_until(registration.owner.deadline) => {}
             }
         }
     }
@@ -609,6 +686,10 @@ mod tests {
         "127.0.0.1:161".parse().unwrap()
     }
 
+    fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + timeout
+    }
+
     fn register_v3(
         core: &Arc<UdpCore>,
         request_id: i32,
@@ -679,6 +760,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn correlation_window_carries_gap_candidate_across_retry_handoff() {
+        let core = Arc::new(UdpCore::new());
+        let target = test_addr();
+        let window = CorrelationWindow::new();
+        let first = core
+            .register(
+                RequestRegistration::test_unchecked(10, Duration::from_secs(30))
+                    .with_correlation_window(Arc::clone(&window)),
+                target,
+                false,
+            )
+            .unwrap();
+
+        drop(first);
+        assert_eq!(core.pending_counts(), (1, 0));
+        let delayed = Bytes::from_static(b"delayed prior response");
+        assert!(core.deliver(10, delayed.clone(), target));
+
+        let second = core
+            .register(
+                RequestRegistration::test_unchecked(11, Duration::from_secs(30))
+                    .with_correlation_window(Arc::clone(&window))
+                    .with_aliases([10])
+                    .unwrap(),
+                target,
+                false,
+            )
+            .unwrap();
+        assert_eq!(core.pending_counts(), (1, 1));
+        let (accepted, source) = core.wait_for_response(&second, target).await.unwrap();
+        assert_eq!(accepted, delayed);
+        assert_eq!(source, target);
+
+        drop(second);
+        assert_eq!(core.pending_counts(), (0, 1));
+        drop(window);
+        assert_eq!(core.pending_counts(), (0, 0));
+    }
+
+    #[tokio::test]
     async fn distinct_candidates_are_queued_until_validation() {
         let core = Arc::new(UdpCore::new());
         let addr = test_addr();
@@ -721,7 +842,9 @@ mod tests {
         let target = test_addr();
         let registration = core
             .register(
-                RequestRegistration::test_unchecked(2, Duration::from_secs(5)).with_aliases([1]),
+                RequestRegistration::test_unchecked(2, Duration::from_secs(5))
+                    .with_aliases([1])
+                    .unwrap(),
                 target,
                 false,
             )
@@ -740,7 +863,9 @@ mod tests {
         let core = Arc::new(UdpCore::new());
         let registration = core
             .register(
-                RequestRegistration::v3(30, Duration::from_secs(300)).with_aliases([10, 20, 25]),
+                RequestRegistration::v3(30, deadline_after(Duration::from_secs(300)))
+                    .with_aliases([10, 20, 25])
+                    .unwrap(),
                 test_addr(),
                 false,
             )
@@ -757,16 +882,19 @@ mod tests {
         let first = core
             .register(
                 RequestRegistration::test_unchecked(20, Duration::from_secs(30))
-                    .with_aliases([10, 11]),
+                    .with_aliases([10, 11])
+                    .unwrap(),
                 target,
                 false,
             )
             .unwrap();
 
         for registration in [
-            RequestRegistration::v3(20, Duration::from_secs(30)),
-            RequestRegistration::v3(10, Duration::from_secs(30)),
-            RequestRegistration::v3(30, Duration::from_secs(30)).with_aliases([11]),
+            RequestRegistration::v3(20, deadline_after(Duration::from_secs(30))),
+            RequestRegistration::v3(10, deadline_after(Duration::from_secs(30))),
+            RequestRegistration::v3(30, deadline_after(Duration::from_secs(30)))
+                .with_aliases([11])
+                .unwrap(),
         ] {
             let error = core
                 .register(registration, target, false)
@@ -786,16 +914,22 @@ mod tests {
         let target = test_addr();
         for (left, right) in [
             (
-                RequestRegistration::v3(100, Duration::from_secs(30)),
-                RequestRegistration::v3(100, Duration::from_secs(30)),
+                RequestRegistration::v3(100, deadline_after(Duration::from_secs(30))),
+                RequestRegistration::v3(100, deadline_after(Duration::from_secs(30))),
             ),
             (
-                RequestRegistration::v3(100, Duration::from_secs(30)).with_aliases([90]),
-                RequestRegistration::v3(90, Duration::from_secs(30)),
+                RequestRegistration::v3(100, deadline_after(Duration::from_secs(30)))
+                    .with_aliases([90])
+                    .unwrap(),
+                RequestRegistration::v3(90, deadline_after(Duration::from_secs(30))),
             ),
             (
-                RequestRegistration::v3(100, Duration::from_secs(30)).with_aliases([90]),
-                RequestRegistration::v3(200, Duration::from_secs(30)).with_aliases([90]),
+                RequestRegistration::v3(100, deadline_after(Duration::from_secs(30)))
+                    .with_aliases([90])
+                    .unwrap(),
+                RequestRegistration::v3(200, deadline_after(Duration::from_secs(30)))
+                    .with_aliases([90])
+                    .unwrap(),
             ),
         ] {
             let core = Arc::new(UdpCore::new());
@@ -823,13 +957,14 @@ mod tests {
         let core = Arc::new(UdpCore::new());
         let registration = core
             .register(
-                RequestRegistration::v3(30, Duration::from_secs(30))
-                    .with_aliases([10, 10, 30, 11, 10, 11]),
+                RequestRegistration::v3(30, deadline_after(Duration::from_secs(30)))
+                    .with_aliases([10, 10, 30, 11, 10, 11])
+                    .unwrap(),
                 test_addr(),
                 false,
             )
             .unwrap();
-        assert_eq!(registration.aliases, vec![10, 11]);
+        assert_eq!(registration.aliases, BTreeSet::from([10, 11]));
         assert_eq!(core.pending_counts(), (1, 2));
     }
 
@@ -858,16 +993,12 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_deadline_creates_no_pending_state() {
+    fn over_maximum_aliases_are_rejected_before_registration() {
         let core = Arc::new(UdpCore::new());
-        let error = core
-            .register(
-                RequestRegistration::v3(50, Duration::MAX).with_aliases([49]),
-                test_addr(),
-                false,
-            )
-            .err()
-            .expect("unrepresentable deadline must fail");
+        let aliases = 0..=crate::client::MAX_RETRIES as i32;
+        let error = RequestRegistration::v3(50, deadline_after(Duration::from_secs(1)))
+            .with_aliases(aliases)
+            .unwrap_err();
         assert!(matches!(*error, Error::Config(_)));
         assert_eq!(core.pending_counts(), (0, 0));
     }
@@ -920,7 +1051,9 @@ mod tests {
         let target = test_addr();
         let registration = core
             .register(
-                RequestRegistration::v3(2, Duration::ZERO).with_aliases([1]),
+                RequestRegistration::v3(2, tokio::time::Instant::now())
+                    .with_aliases([1])
+                    .unwrap(),
                 target,
                 false,
             )
@@ -941,7 +1074,7 @@ mod tests {
             .register(
                 RequestRegistration::community(
                     request_id,
-                    Duration::from_secs(5),
+                    deadline_after(Duration::from_secs(5)),
                     crate::CommunityVersion::V2c,
                     Bytes::from_static(b"public"),
                     CommunityResponsePolicy::Exact,
@@ -993,13 +1126,14 @@ mod tests {
             .register(
                 RequestRegistration::community(
                     request_id,
-                    Duration::from_secs(5),
+                    deadline_after(Duration::from_secs(5)),
                     crate::CommunityVersion::V2c,
                     Bytes::from_static(b"public"),
                     CommunityResponsePolicy::Exact,
                 )
                 .with_decode_config(crate::DecodeConfig::STRICT)
-                .with_aliases([prior_request_id]),
+                .with_aliases([prior_request_id])
+                .unwrap(),
                 target,
                 false,
             )

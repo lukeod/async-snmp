@@ -66,7 +66,7 @@ impl TestV3Engine {
 pub struct CapturedV3Request {
     pub raw: Bytes,
     pub source: SocketAddr,
-    /// The ID passed to `Transport::request`; network peers leave this unset.
+    /// The ID passed to `Transport::request_with`; network peers leave this unset.
     pub transport_request_id: Option<i32>,
     pub global_data: MsgGlobalData,
     pub usm: UsmSecurityParams,
@@ -637,6 +637,7 @@ impl V3ReplyBuilder {
 
 enum ScriptOutput {
     Replies(Vec<Bytes>),
+    DelayedReply(Duration, Bytes),
     RepliesFromOtherSource(Vec<Bytes>),
     Silence,
     TransportError(Box<Error>),
@@ -662,6 +663,15 @@ impl ScriptStep {
     ) -> Self {
         Self(Box::new(move |request| {
             build(request).map(ScriptOutput::Replies)
+        }))
+    }
+
+    pub fn delayed_reply(
+        delay: Duration,
+        build: impl FnOnce(&CapturedV3Request) -> Result<Bytes, String> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(move |request| {
+            build(request).map(|reply| ScriptOutput::DelayedReply(delay, reply))
         }))
     }
 
@@ -792,6 +802,13 @@ impl ScriptedV3Peer {
                             }
                         }
                     }
+                    Ok(ScriptOutput::DelayedReply(delay, reply)) => {
+                        tokio::time::sleep(delay).await;
+                        if let Err(error) = socket.send_to(&reply, source).await {
+                            task_state.set_error(format!("UDP send failed: {error}"));
+                            return;
+                        }
+                    }
                     Ok(ScriptOutput::RepliesFromOtherSource(replies)) => {
                         let other = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await {
                             Ok(socket) => socket,
@@ -893,6 +910,13 @@ impl ScriptedV3Peer {
                                 task_state.set_error(format!("TCP send failed: {error}"));
                                 return;
                             }
+                        }
+                    }
+                    Ok(ScriptOutput::DelayedReply(delay, reply)) => {
+                        tokio::time::sleep(delay).await;
+                        if let Err(error) = stream.write_all(&reply).await {
+                            task_state.set_error(format!("TCP send failed: {error}"));
+                            return;
                         }
                     }
                     Ok(ScriptOutput::RepliesFromOtherSource(_)) => {
@@ -1030,18 +1054,6 @@ impl Transport for ScriptedTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(
-        &self,
-        _registration: async_snmp::RequestRegistration,
-        _validate: F,
-    ) -> async_snmp::Result<T>
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<async_snmp::Candidate<T>> + Send,
-    {
-        Err(Error::Config("ScriptedTransport uses request_with()".into()).boxed())
-    }
-
     async fn request_with<T, F>(
         &self,
         data: &[u8],
@@ -1081,6 +1093,18 @@ impl Transport for ScriptedTransport {
                     retries: 0,
                 }
                 .boxed())
+            }
+            ScriptOutput::DelayedReply(delay, reply) => {
+                tokio::time::sleep(delay).await;
+                match validate(reply, self.0.peer)? {
+                    async_snmp::Candidate::Accept(value) => Ok(value),
+                    async_snmp::Candidate::Reject => Err(Error::Timeout {
+                        target: self.0.peer,
+                        elapsed: delay,
+                        retries: 0,
+                    }
+                    .boxed()),
+                }
             }
             ScriptOutput::RepliesFromOtherSource(_) => Err(Error::Config(
                 "alternate-source script output is only supported by UDP peers".into(),

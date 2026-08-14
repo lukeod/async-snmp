@@ -37,7 +37,7 @@ fn oneshot_get(
         )
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(5))
-        .retry(Retry::fixed(2, Duration::ZERO))
+        .retry(Retry::fixed(2, Duration::ZERO).expect("valid retry count"))
         .connect()
         .await?;
 
@@ -68,7 +68,7 @@ impl SyncSnmpClient {
             )
             .response_shape_policy(ResponseShapePolicy::Strict)
             .request_timeout(Duration::from_secs(5))
-            .retry(Retry::fixed(2, Duration::ZERO))
+            .retry(Retry::fixed(2, Duration::ZERO).expect("valid retry count"))
             .connect()
             .await
         })?;

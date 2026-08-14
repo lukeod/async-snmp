@@ -1622,7 +1622,7 @@ async fn dropping_inform_stream_cancels_retries() {
             Auth::v2c("public"),
         )
         .inform_timeout(Duration::from_millis(50))
-        .inform_retry(Retry::fixed(2, Duration::ZERO))
+        .inform_retry(Retry::fixed(2, Duration::ZERO).unwrap())
         .allow_all_access()
         .build()
         .await

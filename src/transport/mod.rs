@@ -20,6 +20,7 @@ mod builtin;
 mod tcp;
 mod udp;
 mod udp_core;
+pub(crate) mod udp_error;
 
 pub use builtin::*;
 pub use tcp::*;
@@ -33,11 +34,11 @@ use crate::error::Result;
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_LIMITS};
 use crate::version::{CommunityVersion, Version};
 use bytes::Bytes;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::task::Poll;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// Global request ID counter, initialized with a cryptographically random seed.
@@ -47,6 +48,60 @@ use std::time::{Duration, Instant};
 /// transports exist or when sockets are rapidly recreated.
 static REQUEST_ID_COUNTER: LazyLock<AtomicI32> =
     LazyLock::new(|| AtomicI32::new(request_id_seed_with(getrandom::fill)));
+
+static CORRELATION_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Exchange-lifetime ownership for a sequence of V3 retry registrations.
+pub(crate) struct CorrelationWindow {
+    id: u64,
+    udp_cores: Mutex<Vec<Weak<udp_core::UdpCore>>>,
+}
+
+impl CorrelationWindow {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            id: CORRELATION_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
+            udp_cores: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn register_udp_core(&self, core: &Arc<udp_core::UdpCore>) {
+        let mut cores = self
+            .udp_cores
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cores.retain(|registered| registered.strong_count() > 0);
+        let weak = Arc::downgrade(core);
+        if !cores.iter().any(|registered| registered.ptr_eq(&weak)) {
+            cores.push(weak);
+        }
+    }
+}
+
+impl std::fmt::Debug for CorrelationWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CorrelationWindow")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CorrelationWindow {
+    fn drop(&mut self) {
+        let cores = self
+            .udp_cores
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        for core in cores.iter().filter_map(Weak::upgrade) {
+            core.remove_window(self.id);
+        }
+    }
+}
 
 fn request_id_seed_with(
     mut fill: impl FnMut(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
@@ -121,13 +176,13 @@ pub(crate) enum ResponseCorrelation {
 ///
 /// Construct registrations with [`Self::community`] or [`Self::v3`]. Identity,
 /// community, and deadline metadata is read-only after construction; aliases
-/// are normalized by [`Self::with_aliases`].
+/// are normalized and bounded by [`Self::with_aliases`].
 ///
 /// ```compile_fail
 /// use async_snmp::RequestRegistration;
-/// use std::time::Duration;
+/// use tokio::time::{Duration, Instant};
 ///
-/// let mut registration = RequestRegistration::v3(7, Duration::from_secs(1));
+/// let mut registration = RequestRegistration::v3(7, Instant::now() + Duration::from_secs(1));
 /// registration.request_id = 8;
 /// ```
 ///
@@ -144,11 +199,11 @@ pub(crate) enum ResponseCorrelation {
 /// ```compile_fail
 /// use async_snmp::{CommunityResponsePolicy, RequestRegistration, Version};
 /// use bytes::Bytes;
-/// use std::time::Duration;
+/// use tokio::time::{Duration, Instant};
 ///
 /// RequestRegistration::community(
 ///     7,
-///     Duration::from_secs(1),
+///     Instant::now() + Duration::from_secs(1),
 ///     Version::V3,
 ///     Bytes::from_static(b"public"),
 ///     CommunityResponsePolicy::Exact,
@@ -158,14 +213,16 @@ pub(crate) enum ResponseCorrelation {
 pub struct RequestRegistration {
     /// Request ID (v1/v2c) or msgID (v3).
     request_id: i32,
-    /// Overall response deadline duration.
-    timeout: Duration,
+    /// Absolute deadline for registration, write, candidate rejection, and response.
+    deadline: tokio::time::Instant,
     /// Protocol-specific response identity.
     correlation: ResponseCorrelation,
     /// Decode configuration snapshot used by correlation and validation.
     decode_config: DecodeConfig,
     /// Prior transmission IDs that may still receive a response for this operation.
-    aliases: Vec<i32>,
+    aliases: BTreeSet<i32>,
+    /// Internal lifetime shared by registrations in one V3 retry window.
+    correlation_window: Option<Arc<CorrelationWindow>>,
 }
 
 impl RequestRegistration {
@@ -173,44 +230,50 @@ impl RequestRegistration {
     #[must_use]
     pub fn community(
         request_id: i32,
-        timeout: Duration,
+        deadline: tokio::time::Instant,
         version: CommunityVersion,
         community: impl Into<Community>,
         policy: CommunityResponsePolicy,
     ) -> Self {
         Self {
             request_id,
-            timeout,
+            deadline,
             correlation: ResponseCorrelation::Community {
                 version: version.into(),
                 community: community.into(),
                 policy,
             },
             decode_config: DecodeConfig::DEFAULT,
-            aliases: Vec::new(),
+            aliases: BTreeSet::new(),
+            correlation_window: None,
         }
     }
 
     /// Construct SNMPv3 registration metadata.
     #[must_use]
-    pub const fn v3(request_id: i32, timeout: Duration) -> Self {
+    pub fn v3(request_id: i32, deadline: tokio::time::Instant) -> Self {
         Self {
             request_id,
-            timeout,
+            deadline,
             correlation: ResponseCorrelation::V3,
             decode_config: DecodeConfig::DEFAULT,
-            aliases: Vec::new(),
+            aliases: BTreeSet::new(),
+            correlation_window: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) const fn test_unchecked(request_id: i32, timeout: Duration) -> Self {
+    pub(crate) fn test_unchecked(request_id: i32, timeout: Duration) -> Self {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(tokio::time::Instant::now);
         Self {
             request_id,
-            timeout,
+            deadline,
             correlation: ResponseCorrelation::Unchecked,
             decode_config: DecodeConfig::DEFAULT,
-            aliases: Vec::new(),
+            aliases: BTreeSet::new(),
+            correlation_window: None,
         }
     }
 
@@ -218,15 +281,23 @@ impl RequestRegistration {
     ///
     /// The primary ID and duplicate aliases are omitted so transports can
     /// reserve and correlate one coherent set of IDs.
-    #[must_use]
-    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = i32>) -> Self {
-        self.aliases.clear();
-        for alias in aliases {
-            if alias != self.request_id && !self.aliases.contains(&alias) {
-                self.aliases.push(alias);
-            }
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = i32>) -> Result<Self> {
+        let aliases: BTreeSet<_> = aliases
+            .into_iter()
+            .filter(|alias| *alias != self.request_id)
+            .collect();
+        if aliases.len() > crate::client::MAX_RETRIES as usize {
+            return Err(Error::Config(
+                format!(
+                    "request aliases exceed retry limit {}",
+                    crate::client::MAX_RETRIES
+                )
+                .into(),
+            )
+            .boxed());
         }
-        self
+        self.aliases = aliases;
+        Ok(self)
     }
 
     /// Attach the decode configuration snapshot used for this exchange.
@@ -243,6 +314,19 @@ impl RequestRegistration {
         self
     }
 
+    pub(crate) fn with_correlation_window(mut self, window: Arc<CorrelationWindow>) -> Self {
+        self.correlation_window = Some(window);
+        self
+    }
+
+    pub(crate) fn correlation_window(&self) -> Option<&Arc<CorrelationWindow>> {
+        self.correlation_window.as_ref()
+    }
+
+    pub(crate) fn clear_correlation_window(&mut self) {
+        self.correlation_window = None;
+    }
+
     /// Decode configuration used by correlation and full validation.
     #[must_use]
     pub const fn decode_config(&self) -> DecodeConfig {
@@ -255,15 +339,15 @@ impl RequestRegistration {
         self.request_id
     }
 
-    /// Duration from registration to the absolute response deadline.
+    /// Absolute deadline covering registration, write, and response validation.
     #[must_use]
-    pub const fn timeout(&self) -> Duration {
-        self.timeout
+    pub const fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
     }
 
     /// Prior transmission IDs accepted for this operation.
     #[must_use]
-    pub fn aliases(&self) -> &[i32] {
+    pub fn aliases(&self) -> &BTreeSet<i32> {
         &self.aliases
     }
 
@@ -385,7 +469,7 @@ pub enum Candidate<T> {
 /// registered correlation metadata or the caller's validator must be ignored
 /// without consuming the pending request or extending its deadline.
 ///
-/// `recv_with` is required from every implementation, including implementations
+/// `request_with` is required from every implementation, including implementations
 /// compiled as part of this crate's unit tests:
 ///
 /// ```compile_fail,E0046
@@ -415,8 +499,8 @@ pub trait Transport: Send + Sync {
     /// must reject larger data with
     /// [`Error::OutboundMessageTooLarge`]
     /// before performing transport I/O. This applies to direct `send` calls;
-    /// the default [`request_with`](Self::request_with) implementation performs
-    /// the same check for request/response exchanges.
+    /// [`request_with`](Self::request_with) implementations must enforce the
+    /// same check for request/response exchanges.
     fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     /// Send data under one total timeout.
@@ -464,57 +548,17 @@ pub trait Transport: Send + Sync {
         }
     }
 
-    /// Receive one correlated response without additional validation.
-    ///
-    /// This compatibility operation is implemented in terms of
-    /// [`recv_with`](Self::recv_with); clients should use the validated boundary.
-    fn recv(
-        &self,
-        registration: RequestRegistration,
-    ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send {
-        self.recv_with(registration, |data, source| {
-            Ok(Candidate::Accept((data, source)))
-        })
-    }
-
-    /// Wait until the validator accepts a response candidate.
-    ///
-    /// Transports with out-of-band demultiplexing must install the registration
-    /// before this future first returns [`Poll::Pending`] and remove it whenever
-    /// the future completes or is dropped. Implementors use
-    /// [`RequestRegistration::evaluate_response_identity`] before invoking the
-    /// caller's validator; [`ResponseIdentity::Reject`] and
-    /// [`Candidate::Reject`] both retain that same registration and its original
-    /// absolute deadline. Validator errors are fatal local errors.
-    fn recv_with<T, F>(
-        &self,
-        registration: RequestRegistration,
-        validate: F,
-    ) -> impl Future<Output = Result<T>> + Send
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send;
-
-    /// Send request data and receive one correlated response without additional
-    /// validation. This compatibility operation accepts the first candidate.
-    fn request(
-        &self,
-        data: &[u8],
-        registration: RequestRegistration,
-    ) -> impl Future<Output = Result<(Bytes, SocketAddr)>> + Send {
-        self.request_with(data, registration, |response, source| {
-            Ok(Candidate::Accept((response, source)))
-        })
-    }
-
     /// Send request data and wait until the validator accepts a response.
     ///
-    /// The default implementation polls [`recv_with`](Self::recv_with) once
-    /// before sending, allowing an out-of-band demultiplexer to install its
-    /// correlation state before a fast response can arrive. Transports that
-    /// serialize an exchange by holding a lock (such as TCP) must override this
-    /// so one future owns the lock across the write and every rejected
-    /// candidate.
+    /// This is the required complete request/response extension hook. The
+    /// implementation must install the primary identity and every alias before
+    /// sending, use [`RequestRegistration::deadline`] across queueing, write,
+    /// candidate rejection, and response wait, and remove all registration
+    /// state on every completion or cancellation path. Identity-correlated
+    /// candidates must pass through `validate`; rejection continues under the
+    /// same deadline. Reliable transports must retain exclusive framing
+    /// ownership across the complete operation and make an unsafe partially
+    /// completed connection unusable.
     fn request_with<T, F>(
         &self,
         data: &[u8],
@@ -523,55 +567,7 @@ pub trait Transport: Send + Sync {
     ) -> impl Future<Output = Result<T>> + Send
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
-    {
-        async move {
-            crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
-            checked_deadline(registration.timeout(), "transport timeout")?;
-            let timeout = registration.timeout();
-            let deadline = tokio::time::Instant::now()
-                .checked_add(timeout)
-                .ok_or_else(|| {
-                    Error::Config("transport timeout exceeds the representable deadline".into())
-                        .boxed()
-                })?;
-            let timeout_error = || {
-                Error::Timeout {
-                    target: self.peer_addr(),
-                    elapsed: timeout,
-                    retries: 0,
-                }
-                .boxed()
-            };
-
-            let mut receive = std::pin::pin!(self.recv_with(registration, validate));
-            let ready_response = std::future::poll_fn(|context| {
-                Poll::Ready(match receive.as_mut().poll(context) {
-                    Poll::Ready(result) => Some(result),
-                    Poll::Pending => None,
-                })
-            })
-            .await;
-
-            if let Some(result) = ready_response {
-                return result;
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                return Err(timeout_error());
-            }
-            tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(deadline) => return Err(timeout_error()),
-                result = self.send(data) => result?,
-            }
-            tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
-                result = receive => result,
-            }
-        }
-    }
+        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send;
 
     /// The peer address for this transport.
     fn peer_addr(&self) -> SocketAddr;
@@ -607,28 +603,28 @@ pub trait Transport: Send + Sync {
     /// advertised value describes what the local endpoint can receive. The
     /// effectively unbounded default preserves the behavior of existing custom
     /// transports. Implementors that override this with a finite limit must
-    /// enforce it in direct [`send`](Self::send) calls; the default request
-    /// helper enforces it before starting receive-side work.
+    /// enforce it in direct [`send`](Self::send) calls and in
+    /// [`request_with`](Self::request_with) before starting receive-side work.
     fn send_capacity(&self) -> usize {
         usize::MAX
     }
 }
 
 /// Adapt a unit-test double's scripted response stream to the full
-/// [`Transport::recv_with`] contract.
+/// [`Transport::request_with`] contract.
 ///
-/// The script is installed before one yield, preserving the default request
-/// helper's requirement that receive registration precedes the send. Candidate
-/// polling starts only after that yield, allowing scripted doubles to construct
-/// responses from the sent request. Identity and validation rejections retain
-/// the original deadline and advance to the next candidate. Once the script is
-/// exhausted, the adapter remains pending until that deadline instead of
-/// manufacturing an immediate timeout. Script errors are fatal, matching
-/// transport receive/framing errors.
+/// The script is installed before sending. Candidate polling starts after the
+/// send completes, allowing scripted doubles to construct responses from the
+/// sent request. Identity and validation rejections retain the original
+/// deadline and advance to the next candidate. Once the script is exhausted,
+/// the adapter remains pending until that deadline instead of manufacturing an
+/// immediate timeout. Script errors are fatal, matching transport receive or
+/// framing errors.
 #[cfg(test)]
-pub(crate) async fn recv_with_scripted<T, F, R, S>(
+pub(crate) async fn request_with_scripted<T, F, R, S, U>(
+    transport: &U,
+    data: &[u8],
     registration: RequestRegistration,
-    target: SocketAddr,
     script: R,
     mut validate: F,
 ) -> Result<T>
@@ -637,13 +633,15 @@ where
     F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
     R: FnOnce(RequestRegistration) -> S + Send,
     S: futures_core::Stream<Item = Result<(Bytes, SocketAddr)>> + Send,
+    U: Transport + ?Sized,
 {
     use futures_util::StreamExt;
 
-    let timeout = registration.timeout();
-    let deadline = tokio::time::Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| Error::Config("test transport deadline overflow".into()).boxed())?;
+    crate::message_size::enforce_outbound_size(data.len(), transport.send_capacity())?;
+    let started = tokio::time::Instant::now();
+    let deadline = registration.deadline();
+    let timeout = deadline.saturating_duration_since(started);
+    let target = transport.peer_addr();
 
     let timeout_error = || {
         Error::Timeout {
@@ -660,12 +658,15 @@ where
         return Err(timeout_error());
     }
 
-    // Install the script before returning Pending so resources it owns are
-    // cleaned up if the request is cancelled during send. Candidate polling is
-    // deferred until the next poll, after the default request helper has sent.
+    // Install the script before sending so resources it owns are cleaned up if
+    // the request is cancelled during the write.
     let candidates = script(registration.clone());
     tokio::pin!(candidates);
-    tokio::task::yield_now().await;
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => return Err(timeout_error()),
+        result = transport.send(data) => result?,
+    }
 
     if tokio::time::Instant::now() >= deadline {
         return Err(timeout_error());
@@ -702,7 +703,7 @@ where
 
 #[cfg(test)]
 mod cfg_test_transport_contract {
-    use super::{Candidate, RequestRegistration, Transport, recv_with_scripted};
+    use super::{Candidate, RequestRegistration, Transport, request_with_scripted};
     use crate::{DecodeError, DecodeErrorKind, Error, Result};
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr};
@@ -725,12 +726,19 @@ mod cfg_test_transport_contract {
             .split_once("\n}\n\n/// Adapt a unit-test double")
             .expect("end of Transport trait");
 
-        assert_eq!(trait_body.matches("fn recv_with").count(), 1);
+        assert_eq!(trait_body.matches("fn request_with").count(), 1);
+        assert!(!trait_body.contains("fn recv("));
+        assert!(!trait_body.contains("fn recv_with"));
+        assert!(!trait_body.contains("fn request("));
         assert!(!trait_body.contains("#[cfg("));
     }
 
     fn target() -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
+    }
+
+    fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + timeout
     }
 
     fn timeout_fields(error: &Error) -> (SocketAddr, Duration, u32) {
@@ -745,12 +753,13 @@ mod cfg_test_transport_contract {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn scripted_adapter_checks_zero_and_expired_deadlines_before_source_polling() {
+    async fn scripted_adapter_checks_zero_deadline_before_setup_and_bounds_pending_source() {
         let source_starts = Arc::new(AtomicUsize::new(0));
         let starts = Arc::clone(&source_starts);
-        let error = recv_with_scripted(
+        let error = request_with_scripted(
+            &ContractTransport,
+            b"request",
             RequestRegistration::test_unchecked(1, Duration::ZERO),
-            target(),
             move |_| {
                 futures_util::stream::once(async move {
                     starts.fetch_add(1, Ordering::Relaxed);
@@ -766,14 +775,13 @@ mod cfg_test_transport_contract {
 
         let source_starts = Arc::new(AtomicUsize::new(0));
         let starts = Arc::clone(&source_starts);
-        let receive = recv_with_scripted(
+        let receive = request_with_scripted(
+            &ContractTransport,
+            b"request",
             RequestRegistration::test_unchecked(2, Duration::from_secs(5)),
-            target(),
             move |_| {
-                futures_util::stream::once(async move {
-                    starts.fetch_add(1, Ordering::Relaxed);
-                    Ok((Bytes::from_static(b"ready"), target()))
-                })
+                starts.fetch_add(1, Ordering::Relaxed);
+                futures_util::stream::pending::<Result<(Bytes, SocketAddr)>>()
             },
             |_, _| Ok(Candidate::Accept(())),
         );
@@ -789,7 +797,7 @@ mod cfg_test_transport_contract {
             timeout_fields(&error),
             (target(), Duration::from_secs(5), 0)
         );
-        assert_eq!(source_starts.load(Ordering::Relaxed), 0);
+        assert_eq!(source_starts.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -801,7 +809,7 @@ mod cfg_test_transport_contract {
         ];
         let registration = RequestRegistration::community(
             12_345,
-            Duration::from_secs(1),
+            deadline_after(Duration::from_secs(1)),
             crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             crate::CommunityResponsePolicy::Exact,
@@ -816,9 +824,10 @@ mod cfg_test_transport_contract {
         ];
         let mut validations = 0;
 
-        let accepted = recv_with_scripted(
+        let accepted = request_with_scripted(
+            &ContractTransport,
+            b"request",
             registration,
-            target(),
             move |_| futures_util::stream::iter(candidates),
             |data, _| {
                 validations += 1;
@@ -853,9 +862,10 @@ mod cfg_test_transport_contract {
         let validated = Arc::new(AtomicBool::new(false));
         let was_validated = Arc::clone(&validated);
 
-        let error = recv_with_scripted(
+        let error = request_with_scripted(
+            &ContractTransport,
+            b"request",
             RequestRegistration::test_unchecked(3, Duration::from_secs(1)),
-            target(),
             move |_| futures_util::stream::iter(candidates),
             move |_, _| {
                 was_validated.store(true, Ordering::Relaxed);
@@ -883,9 +893,10 @@ mod cfg_test_transport_contract {
     async fn scripted_adapter_exhaustion_waits_only_original_remaining_budget() {
         let configured_timeout = Duration::from_secs(10);
         let started = tokio::time::Instant::now();
-        let receive = tokio::spawn(recv_with_scripted(
+        let receive = tokio::spawn(request_with_scripted(
+            &ContractTransport,
+            b"request",
             RequestRegistration::test_unchecked(4, configured_timeout),
-            target(),
             move |_| {
                 futures_util::stream::once(async {
                     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -923,9 +934,10 @@ mod cfg_test_transport_contract {
         let dropped = Arc::new(AtomicBool::new(false));
         let source_started = Arc::clone(&started);
         let source_dropped = Arc::clone(&dropped);
-        let mut receive = Box::pin(recv_with_scripted(
+        let mut receive = Box::pin(request_with_scripted(
+            &ContractTransport,
+            b"request",
             RequestRegistration::test_unchecked(5, Duration::from_secs(30)),
-            target(),
             move |_| {
                 source_started.store(true, Ordering::Relaxed);
                 let drop_flag = DropFlag(source_dropped);
@@ -958,8 +970,9 @@ mod cfg_test_transport_contract {
             Ok(())
         }
 
-        fn recv_with<T, F>(
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -969,9 +982,10 @@ mod cfg_test_transport_contract {
         {
             let registered = Arc::clone(&self.registered);
             let sent = Arc::clone(&self.sent);
-            recv_with_scripted(
+            request_with_scripted(
+                self,
+                data,
                 registration,
-                target(),
                 move |_| {
                     assert!(!sent.load(Ordering::Relaxed));
                     registered.store(true, Ordering::Relaxed);
@@ -1004,9 +1018,10 @@ mod cfg_test_transport_contract {
             sent: Arc::new(AtomicBool::new(false)),
         };
         let response = transport
-            .request(
+            .request_with(
                 b"request",
                 RequestRegistration::test_unchecked(6, Duration::from_secs(1)),
+                |data, source| Ok(Candidate::Accept((data, source))),
             )
             .await
             .unwrap();
@@ -1315,6 +1330,10 @@ mod request_id_tests {
 mod extract_tests {
     use super::*;
 
+    fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + timeout
+    }
+
     const V1_RESPONSE: &[u8] = &[
         0x30, 0x1b, 0x02, 0x01, 0x00, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa2, 0x0e,
         0x02, 0x01, 0x2a, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x03, 0x30, 0x01, 0x00,
@@ -1334,19 +1353,19 @@ mod extract_tests {
         match version {
             Version::V1 => RequestRegistration::community(
                 42,
-                Duration::from_secs(1),
+                deadline_after(Duration::from_secs(1)),
                 CommunityVersion::V1,
                 Bytes::from_static(b"public"),
                 CommunityResponsePolicy::Exact,
             ),
             Version::V2c => RequestRegistration::community(
                 12345,
-                Duration::from_secs(1),
+                deadline_after(Duration::from_secs(1)),
                 CommunityVersion::V2c,
                 Bytes::from_static(b"public"),
                 CommunityResponsePolicy::Exact,
             ),
-            Version::V3 => RequestRegistration::v3(12345, Duration::from_secs(1)),
+            Version::V3 => RequestRegistration::v3(12345, deadline_after(Duration::from_secs(1))),
         }
     }
 

@@ -78,6 +78,7 @@
 
 use super::udp_core::UdpCore;
 pub use super::udp_core::UdpStats;
+use super::udp_error::{UdpRecvErrorBackoff, UdpRecvErrorClass, classify_udp_recv_error};
 use super::{Candidate, RequestRegistration, Transport, extract_request_id, normalize_udp_target};
 use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
@@ -89,23 +90,6 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
-
-/// Initial backoff applied after a UDP recv error before retrying, doubling up
-/// to [`UDP_RECV_ERROR_BACKOFF_MAX`] while errors persist.
-const UDP_RECV_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(1);
-
-/// Upper bound for the recv-error backoff.
-const UDP_RECV_ERROR_BACKOFF_MAX: Duration = Duration::from_millis(100);
-
-/// Computes the next recv-error backoff from the current one: the first error
-/// starts at [`UDP_RECV_ERROR_BACKOFF_MIN`], subsequent errors double up to
-/// [`UDP_RECV_ERROR_BACKOFF_MAX`]. A zero input means no prior error.
-fn next_recv_error_backoff(current: Duration) -> Duration {
-    match current {
-        Duration::ZERO => UDP_RECV_ERROR_BACKOFF_MIN,
-        d => (d * 2).min(UDP_RECV_ERROR_BACKOFF_MAX),
-    }
-}
 
 /// Configuration for UDP transport.
 #[derive(Clone)]
@@ -151,6 +135,33 @@ struct UdpTransportInner {
     // guard would never fire.
     _shutdown_guard: DropGuard,
     recv_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    receive_errors: Arc<std::sync::Mutex<std::collections::VecDeque<std::io::Error>>>,
+    #[cfg(test)]
+    receive_error_ready: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(not(test))]
+async fn recv_datagram(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    socket.recv_from(buf).await
+}
+
+#[cfg(test)]
+async fn recv_datagram(
+    socket: &UdpSocket,
+    receive_errors: &std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
+    receive_error_ready: &tokio::sync::Notify,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    loop {
+        if let Some(error) = receive_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        tokio::select! {
+            result = socket.recv_from(buf) => return result,
+            () = receive_error_ready.notified() => {}
+        }
+    }
 }
 
 struct UdpRecvTaskCleanup {
@@ -230,6 +241,12 @@ impl UdpTransport {
         }
     }
 
+    #[cfg(test)]
+    fn inject_receive_error(&self, error: std::io::Error) {
+        self.inner.receive_errors.lock().unwrap().push_back(error);
+        self.inner.receive_error_ready.notify_one();
+    }
+
     fn start_recv_loop(inner: &Arc<UdpTransportInner>) {
         // The task captures only the pieces it needs, never the inner Arc:
         // Drop-based cancellation relies on the DropGuard firing when the
@@ -244,6 +261,10 @@ impl UdpTransport {
         };
         let local_addr = inner.local_addr;
         let receive_limits = inner.receive_limits;
+        #[cfg(test)]
+        let receive_errors = Arc::clone(&inner.receive_errors);
+        #[cfg(test)]
+        let receive_error_ready = Arc::clone(&inner.receive_error_ready);
         let handle = tokio::spawn(async move {
             // Constructed before spawning so dropping an unpolled task still
             // closes the core and signals completion synchronously.
@@ -254,7 +275,7 @@ impl UdpTransport {
             // socket is in a persistent error state (e.g. ENOBUFS or a stream
             // of ICMP port-unreachable errors). Reset on any successful recv so
             // the normal success path is never delayed.
-            let mut recv_error_backoff = Duration::ZERO;
+            let mut recv_error_backoff = UdpRecvErrorBackoff::default();
 
             loop {
                 tokio::select! {
@@ -269,10 +290,15 @@ impl UdpTransport {
                         core.cleanup_expired();
                     }
 
-                    result = socket.recv_from(&mut buf) => {
+                    result = recv_datagram(
+                        &socket,
+                        #[cfg(test)] receive_errors.as_ref(),
+                        #[cfg(test)] receive_error_ready.as_ref(),
+                        &mut buf,
+                    ) => {
                         match result {
                             Ok((len, source)) => {
-                                recv_error_backoff = Duration::ZERO;
+                                recv_error_backoff.reset();
                                 if len > receive_limits.advertised().as_usize() {
                                     tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, received_size = len, advertised_size = receive_limits.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
                                 }
@@ -288,17 +314,23 @@ impl UdpTransport {
                                 }
                             }
                             Err(_) if shutdown.is_cancelled() => break,
-                            Err(e) => {
-                                tracing::error!(target: "async_snmp::transport", { error = %e }, "UDP recv error");
-                                // Exponential backoff, capped, to keep a persistent
-                                // error condition from spinning a CPU core and
-                                // flooding logs. The sleep is interruptible by
-                                // shutdown so cancellation stays responsive.
-                                recv_error_backoff = next_recv_error_backoff(recv_error_backoff);
-                                tokio::select! {
-                                    biased;
-                                    () = shutdown.cancelled() => break,
-                                    () = tokio::time::sleep(recv_error_backoff) => {}
+                            Err(e) => match classify_udp_recv_error(&e) {
+                                UdpRecvErrorClass::DatagramLocal => {
+                                    recv_error_backoff.reset();
+                                    tracing::warn!(target: "async_snmp::transport", { error = %e }, "discarding datagram with invalid receive metadata");
+                                }
+                                UdpRecvErrorClass::Transient => {
+                                    let delay = recv_error_backoff.advance();
+                                    tracing::warn!(target: "async_snmp::transport", { error = %e, backoff = ?delay }, "transient UDP recv error");
+                                    tokio::select! {
+                                        biased;
+                                        () = shutdown.cancelled() => break,
+                                        () = tokio::time::sleep(delay) => {}
+                                    }
+                                }
+                                UdpRecvErrorClass::Fatal => {
+                                    tracing::error!(target: "async_snmp::transport", { error = %e }, "fatal UDP recv error");
+                                    break;
                                 }
                             }
                         }
@@ -459,6 +491,10 @@ impl UdpTransportBuilder {
             shutdown_complete,
             operations: tokio::sync::RwLock::new(()),
             recv_task: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            receive_errors: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            #[cfg(test)]
+            receive_error_ready: Arc::new(tokio::sync::Notify::new()),
         });
 
         UdpTransport::start_recv_loop(&inner);
@@ -592,31 +628,17 @@ impl Transport for UdpHandle {
                 .core
                 .register(registration, self.target, self.strict_source)?;
         let deadline = registration.deadline();
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             return Err(registration.timeout_error(self.target));
         }
         tokio::select! {
             biased;
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            () = tokio::time::sleep_until(deadline) => {
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id = registration.request_id(), target = %self.target }, "transport timeout during UDP send");
                 return Err(registration.timeout_error(self.target));
             }
             result = self.send_datagram(data) => result?,
         }
-        self.recv_registered_with(&registration, validate).await
-    }
-
-    async fn recv_with<T, F>(&self, registration: RequestRegistration, validate: F) -> Result<T>
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
-    {
-        let _operation = self.inner.operations.read().await;
-        self.ensure_open()?;
-        let registration =
-            self.inner
-                .core
-                .register(registration, self.target, self.strict_source)?;
         self.recv_registered_with(&registration, validate).await
     }
 
@@ -718,6 +740,16 @@ mod tests {
     use super::*;
     use crate::{Auth, Client, Retry, oid};
 
+    fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + timeout
+    }
+
+    fn v3_identity(msg_id: u8) -> Bytes {
+        Bytes::from(vec![
+            0x30, 0x08, 0x02, 0x01, 0x03, 0x30, 0x03, 0x02, 0x01, msg_id,
+        ])
+    }
+
     fn register_v3(
         handle: &UdpHandle,
         request_id: i32,
@@ -732,30 +764,6 @@ mod tests {
                 handle.strict_source,
             )
             .unwrap()
-    }
-
-    #[test]
-    fn recv_error_backoff_starts_at_min_and_grows() {
-        // No prior error -> first backoff is the minimum, never zero, so a
-        // persistent recv error cannot hot-spin the loop.
-        let first = next_recv_error_backoff(Duration::ZERO);
-        assert_eq!(first, UDP_RECV_ERROR_BACKOFF_MIN);
-        assert!(first > Duration::ZERO);
-
-        // Repeated errors double the backoff.
-        let second = next_recv_error_backoff(first);
-        assert_eq!(second, first * 2);
-    }
-
-    #[test]
-    fn recv_error_backoff_is_capped() {
-        // Growth saturates at the maximum rather than increasing unbounded.
-        let capped = next_recv_error_backoff(UDP_RECV_ERROR_BACKOFF_MAX);
-        assert_eq!(capped, UDP_RECV_ERROR_BACKOFF_MAX);
-
-        let near_max =
-            next_recv_error_backoff(UDP_RECV_ERROR_BACKOFF_MAX / 2 + Duration::from_millis(1));
-        assert_eq!(near_max, UDP_RECV_ERROR_BACKOFF_MAX);
     }
 
     #[tokio::test]
@@ -1001,6 +1009,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_udp_receive_error_policy_recovers_or_closes_by_class() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let handle = transport.handle(server.local_addr().unwrap()).unwrap();
+        transport.inject_receive_error(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        transport.inject_receive_error(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+
+        let request = async {
+            handle
+                .request_with(
+                    b"request",
+                    RequestRegistration::v3(44, deadline_after(Duration::from_secs(2))),
+                    |data, source| Ok(Candidate::Accept((data, source))),
+                )
+                .await
+        };
+        let response = async {
+            let mut data = [0; 64];
+            let (_, source) = server.recv_from(&mut data).await.unwrap();
+            server.send_to(&v3_identity(44), source).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(request, response);
+        assert_eq!(result.unwrap().1, server.local_addr().unwrap());
+
+        let fatal_handle = transport.handle(server.local_addr().unwrap()).unwrap();
+        let pending = tokio::spawn(async move {
+            fatal_handle
+                .request_with(
+                    b"request",
+                    RequestRegistration::v3(45, deadline_after(Duration::from_secs(30))),
+                    |data, source| Ok(Candidate::Accept((data, source))),
+                )
+                .await
+        });
+        let mut sent = [0; 64];
+        server.recv_from(&mut sent).await.unwrap();
+        transport.inject_receive_error(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        let error = pending.await.unwrap().unwrap_err();
+        assert!(matches!(*error, Error::Closed { .. }));
+    }
+
+    #[tokio::test]
     async fn shared_clients_handles_and_control_observe_same_counters() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let control = transport.control();
@@ -1042,7 +1092,11 @@ mod tests {
         let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
         let waiter = tokio::spawn(async move {
             handle
-                .recv(RequestRegistration::v3(42, Duration::from_secs(30)))
+                .request_with(
+                    b"request",
+                    RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
+                    |data, source| Ok(Candidate::Accept((data, source))),
+                )
                 .await
         });
         // Let the waiter park on its notify before shutting down.
@@ -1151,18 +1205,14 @@ mod tests {
         let send_error = handle.send(b"must not be sent").await.unwrap_err();
         assert!(matches!(*send_error, Error::Closed { .. }));
         let request_error = handle
-            .request(
+            .request_with(
                 b"must not be sent",
-                RequestRegistration::v3(101, Duration::from_secs(30)),
+                RequestRegistration::v3(101, deadline_after(Duration::from_secs(30))),
+                |data, source| Ok(Candidate::Accept((data, source))),
             )
             .await
             .unwrap_err();
         assert!(matches!(*request_error, Error::Closed { .. }));
-        let receive_error = handle
-            .recv(RequestRegistration::v3(102, Duration::from_secs(30)))
-            .await
-            .unwrap_err();
-        assert!(matches!(*receive_error, Error::Closed { .. }));
 
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
         let mut datagram = [0u8; 32];
@@ -1179,14 +1229,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_after_shutdown_without_slot_returns_closed() {
+    async fn request_after_shutdown_without_slot_returns_closed() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
 
         transport.control().shutdown().await;
 
         let err = handle
-            .recv(RequestRegistration::v3(42, Duration::from_secs(30)))
+            .request_with(
+                b"request",
+                RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
+                |data, source| Ok(Candidate::Accept((data, source))),
+            )
             .await
             .expect_err("recv on closed transport should fail");
         assert!(
@@ -1196,12 +1250,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_zero_deadline_on_open_transport_returns_timeout() {
+    async fn request_zero_deadline_on_open_transport_returns_timeout() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
 
         let err = handle
-            .recv(RequestRegistration::v3(42, Duration::ZERO))
+            .request_with(
+                b"request",
+                RequestRegistration::v3(42, tokio::time::Instant::now()),
+                |data, source| Ok(Candidate::Accept((data, source))),
+            )
             .await
             .expect_err("zero-deadline receive should fail");
         assert!(
@@ -1220,11 +1278,15 @@ mod tests {
 
         let request_id = 55;
         let registration =
-            RequestRegistration::v3(request_id, Duration::from_secs(30)).with_aliases([53, 54]);
+            RequestRegistration::v3(request_id, deadline_after(Duration::from_secs(30)))
+                .with_aliases([53, 54])
+                .unwrap();
 
         let oversized = vec![0u8; 1473];
         let err = handle
-            .request(&oversized, registration)
+            .request_with(&oversized, registration, |data, source| {
+                Ok(Candidate::Accept((data, source)))
+            })
             .await
             .expect_err("oversized send should fail");
         assert!(
@@ -1259,9 +1321,12 @@ mod tests {
         let _owner = register_v3(&handle, 60, Duration::from_secs(30));
 
         let error = handle
-            .request(
+            .request_with(
                 b"must not be sent",
-                RequestRegistration::v3(61, Duration::from_secs(30)).with_aliases([60]),
+                RequestRegistration::v3(61, deadline_after(Duration::from_secs(30)))
+                    .with_aliases([60])
+                    .unwrap(),
+                |data, source| Ok(Candidate::Accept((data, source))),
             )
             .await
             .unwrap_err();
@@ -1281,10 +1346,13 @@ mod tests {
     async fn dropping_unpolled_request_does_not_register() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let handle = transport.handle("127.0.0.1:9".parse().unwrap()).unwrap();
-        let registration =
-            RequestRegistration::v3(70, Duration::from_secs(300)).with_aliases([68, 69]);
+        let registration = RequestRegistration::v3(70, deadline_after(Duration::from_secs(300)))
+            .with_aliases([68, 69])
+            .unwrap();
 
-        let request = handle.request(b"request", registration);
+        let request = handle.request_with(b"request", registration, |data, source| {
+            Ok(Candidate::Accept((data, source)))
+        });
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
         drop(request);
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
@@ -1300,11 +1368,18 @@ mod tests {
 
         for iteration in 0..20 {
             let request_id = 1_000 + iteration;
-            let registration = RequestRegistration::v3(request_id, Duration::from_secs(300))
-                .with_aliases([2_000 + iteration * 2, 2_001 + iteration * 2]);
+            let registration =
+                RequestRegistration::v3(request_id, deadline_after(Duration::from_secs(300)))
+                    .with_aliases([2_000 + iteration * 2, 2_001 + iteration * 2])
+                    .unwrap();
             let request_handle = handle.clone();
-            let task =
-                tokio::spawn(async move { request_handle.request(b"request", registration).await });
+            let task = tokio::spawn(async move {
+                request_handle
+                    .request_with(b"request", registration, |data, source| {
+                        Ok(Candidate::Accept((data, source)))
+                    })
+                    .await
+            });
 
             listener.recv_from(&mut datagram).await.unwrap();
             assert_eq!(transport.inner.core.pending_counts(), (1, 2));

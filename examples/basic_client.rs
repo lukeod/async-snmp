@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The builder pattern allows configuring timeout, retries, etc.
     let client = Client::builder(target, Auth::v2c("public"))
         .request_timeout(Duration::from_secs(5))
-        .retry(Retry::fixed(3, Duration::ZERO))
+        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count"))
         .connect()
         .await?;
 

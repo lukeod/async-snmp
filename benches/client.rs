@@ -53,7 +53,7 @@ fn bench_get_single(c: &mut Criterion) {
     let client = rt.block_on(async {
         Client::builder(TARGET, Auth::v2c(COMMUNITY))
             .request_timeout(Duration::from_secs(5))
-            .retry(Retry::fixed(1, Duration::ZERO))
+            .retry(Retry::fixed(1, Duration::ZERO).unwrap())
             .connect()
             .await
             .expect("Failed to connect to test container")

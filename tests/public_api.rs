@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error as _;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
@@ -416,18 +417,20 @@ fn decode_errors_are_public_structured_and_peer_free_for_standalone_input() {
 
 #[test]
 fn request_registration_exposes_read_only_normalized_metadata() {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let registration = RequestRegistration::community(
         42,
-        Duration::from_secs(3),
+        deadline,
         CommunityVersion::V2c,
         Bytes::from_static(b"public"),
         async_snmp::CommunityResponsePolicy::Exact,
     )
-    .with_aliases([40, 41, 42, 40]);
+    .with_aliases([40, 41, 42, 40])
+    .unwrap();
 
     assert_eq!(registration.request_id(), 42);
-    assert_eq!(registration.timeout(), Duration::from_secs(3));
-    assert_eq!(registration.aliases(), &[40, 41]);
+    assert_eq!(registration.deadline(), deadline);
+    assert_eq!(registration.aliases(), &BTreeSet::from([40, 41]));
 }
 
 #[tokio::test]

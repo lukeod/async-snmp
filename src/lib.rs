@@ -120,7 +120,7 @@
 //! async fn poll_device(addr: &str) -> Result<String, String> {
 //!     let client = Client::builder(addr, Auth::v2c("public"))
 //!         .request_timeout(Duration::from_secs(5))
-//!         .retry(Retry::fixed(2, Duration::ZERO))
+//!         .retry(Retry::fixed(2, Duration::ZERO).expect("valid retry count"))
 //!         .connect()
 //!         .await
 //!         .map_err(|error| format!("client construction failed: {error}"))?;
@@ -159,7 +159,7 @@
 //!     .await?;
 //!
 //! let fixed = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .retry(Retry::fixed(3, Duration::ZERO))
+//!     .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count"))
 //!     .connect()
 //!     .await?;
 //!
@@ -593,7 +593,7 @@ pub use client::{
     CommunityVersion, DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST,
     DEFAULT_MAX_REPETITIONS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
     FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
-    FixedCardinalityResponse, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
+    FixedCardinalityResponse, MAX_RETRIES, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
     ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder,
     UsmAuthBuilder, Walk, WalkCollection, WalkError, WalkItem, WalkMode, WalkStream,
     WalkStreamWithMetadata, WalkWithMetadata,

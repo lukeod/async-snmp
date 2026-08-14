@@ -15,7 +15,7 @@ pub use response_shape::{
     BulkResponse, FixedCardinalityOperation, FixedCardinalityResponse, ResponseMetadata,
     ResponseShapeAnomaly, ResponseShapePolicy,
 };
-pub use retry::{Retry, RetryBuilder, RetryConfigError};
+pub use retry::{MAX_RETRIES, Retry, RetryBuilder, RetryConfigError};
 
 // New unified entry point
 impl Client<UdpHandle> {
@@ -184,6 +184,7 @@ struct ClientEngine {
 struct DiscoveryFlight {
     outcome: Mutex<Option<DiscoveryOutcome>>,
     complete: tokio::sync::Notify,
+    retries: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Clone)]
@@ -359,6 +360,13 @@ pub struct ClientConfig {
     pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
     pub request_timeout: Duration,
+    /// Optional timeout for one complete logical exchange (default: none).
+    ///
+    /// This includes timeout retransmissions, retry backoff, transport
+    /// queueing and registration, writes, rejected candidates, and response
+    /// waits. SNMPv3 discovery and the following ordinary request are separate
+    /// exchanges and each receives its own deadline.
+    pub exchange_timeout: Option<Duration>,
     /// Standalone send timeout (default: 5 seconds).
     ///
     /// This bounds unconfirmed notifications across transport queueing and
@@ -407,6 +415,7 @@ impl Default for ClientConfig {
             decode_config: crate::DecodeConfig::default(),
             community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            exchange_timeout: None,
             send_timeout: DEFAULT_SEND_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
@@ -440,6 +449,9 @@ impl ClientConfig {
     pub(super) fn validate(&self) -> Result<()> {
         crate::transport::checked_deadline(self.request_timeout, "request timeout")?;
         crate::transport::checked_deadline(self.send_timeout, "send timeout")?;
+        if let Some(timeout) = self.exchange_timeout {
+            crate::transport::checked_deadline(timeout, "exchange timeout")?;
+        }
 
         if self.max_oids_per_request == 0 {
             return Err(
@@ -601,6 +613,51 @@ impl<T: Transport> Client<T> {
         crate::message_size::enforce_outbound_size(encoded_size, effective_limit)
     }
 
+    fn start_exchange_deadline(&self) -> Result<Option<tokio::time::Instant>> {
+        self.inner
+            .config
+            .exchange_timeout
+            .map(|timeout| {
+                tokio::time::Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| {
+                        Error::Config("exchange timeout exceeds the representable deadline".into())
+                            .boxed()
+                    })
+            })
+            .transpose()
+    }
+
+    fn transmission_deadline(
+        &self,
+        exchange_deadline: Option<tokio::time::Instant>,
+    ) -> Result<tokio::time::Instant> {
+        let attempt = tokio::time::Instant::now()
+            .checked_add(self.inner.config.request_timeout)
+            .ok_or_else(|| {
+                Error::Config("request timeout exceeds the representable deadline".into()).boxed()
+            })?;
+        Ok(exchange_deadline.map_or(attempt, |deadline| deadline.min(attempt)))
+    }
+
+    fn retry_retention_deadline(
+        &self,
+        attempt_deadline: tokio::time::Instant,
+        retry_delay: Duration,
+        exchange_deadline: Option<tokio::time::Instant>,
+    ) -> Result<tokio::time::Instant> {
+        if let Some(deadline) = exchange_deadline {
+            return Ok(deadline);
+        }
+        attempt_deadline
+            .checked_add(retry_delay)
+            .and_then(|deadline| deadline.checked_add(self.inner.config.request_timeout))
+            .ok_or_else(|| {
+                Error::Config("request retry schedule exceeds the representable deadline".into())
+                    .boxed()
+            })
+    }
+
     /// Send a request and wait for response (internal helper with pre-encoded data).
     #[instrument(
         level = "debug",
@@ -615,13 +672,18 @@ impl<T: Transport> Client<T> {
     async fn send_and_recv(&self, request_id: i32, data: &[u8]) -> Result<DecodedResponse> {
         self.enforce_outbound_size(data.len(), None)?;
         let start = Instant::now();
+        let exchange_deadline = self.start_exchange_deadline()?;
         let max_attempts = if self.inner.transport.is_reliable() {
             0
         } else {
-            self.inner.config.retry.max_attempts()
+            self.inner.config.retry.retries()
         };
+        let mut retries = 0;
 
         for attempt in 0..=max_attempts {
+            if attempt > 0 {
+                retries = attempt;
+            }
             Span::current().record("snmp.attempt", attempt);
             if attempt > 0 {
                 tracing::debug!(target: "async_snmp::client", "retrying request");
@@ -637,7 +699,7 @@ impl<T: Transport> Client<T> {
             let community = self.inner.config.community()?;
             let registration = crate::transport::RequestRegistration::community(
                 request_id,
-                self.inner.config.request_timeout,
+                self.transmission_deadline(exchange_deadline)?,
                 community_version,
                 community.clone(),
                 self.inner.config.community_response_policy,
@@ -715,7 +777,9 @@ impl<T: Transport> Client<T> {
                         if !delay.is_zero() {
                             tracing::debug!(target: "async_snmp::client", { delay_ms = delay.as_millis() as u64 }, "backing off");
                         }
-                        retry::wait_for_retry(delay).await;
+                        if !retry::wait_for_retry(delay, exchange_deadline).await {
+                            break;
+                        }
                     }
                     // fall thru to next loop iteration
                 }
@@ -733,11 +797,11 @@ impl<T: Transport> Client<T> {
         // meaningful at this layer.
         let elapsed = start.elapsed();
         Span::current().record("snmp.elapsed_ms", elapsed.as_millis() as u64);
-        tracing::debug!(target: "async_snmp::client", { request_id, peer = %self.peer_addr(), ?elapsed, retries = max_attempts }, "request timed out");
+        tracing::debug!(target: "async_snmp::client", { request_id, peer = %self.peer_addr(), ?elapsed, retries }, "request timed out");
         Err(Error::Timeout {
             target: self.peer_addr(),
             elapsed,
-            retries: max_attempts,
+            retries,
         }
         .boxed())
     }
@@ -1524,17 +1588,7 @@ mod tests {
         }
     }
 
-    impl Transport for TruncatingTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            // Decode the sent request to extract the request_id.
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            {
-                let mut q = self.pending.lock().unwrap();
-                q.push_back(request_id);
-            }
-            async { Ok(()) }
-        }
-
+    impl TruncatingTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -1564,9 +1618,22 @@ mod tests {
                 Ok((encoded, peer))
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for TruncatingTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            // Decode the sent request to extract the request_id.
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            {
+                let mut q = self.pending.lock().unwrap();
+                q.push_back(request_id);
+            }
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1574,9 +1641,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -1607,8 +1675,9 @@ mod tests {
             Ok(())
         }
 
-        async fn recv_with<T, F>(
+        async fn request_with<T, F>(
             &self,
+            _data: &[u8],
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -1647,7 +1716,7 @@ mod tests {
             },
             ClientConfig {
                 auth: Auth::v2c("public"),
-                retry: Retry::fixed(u32::MAX, Duration::ZERO),
+                retry: Retry::fixed(crate::MAX_RETRIES, Duration::ZERO).unwrap(),
                 ..ClientConfig::default()
             },
         )
@@ -1663,6 +1732,54 @@ mod tests {
             calls.load(Ordering::Relaxed) < 10_000,
             "retry loop did not yield to cancellation"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_deadline_caps_retry_backoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Client::new(
+            ImmediateTimeoutTransport {
+                calls: Arc::clone(&calls),
+            },
+            ClientConfig {
+                auth: Auth::v2c("public"),
+                request_timeout: Duration::from_secs(30),
+                exchange_timeout: Some(Duration::from_secs(5)),
+                retry: Retry::fixed(2, Duration::from_secs(10)).unwrap(),
+                ..ClientConfig::default()
+            },
+        )
+        .unwrap();
+
+        let requested_oid = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
+        let started = tokio::time::Instant::now();
+        let request = client.get(&requested_oid);
+        tokio::pin!(request);
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = request.await.unwrap_err();
+        assert!(matches!(*error, Error::Timeout { retries: 0, .. }));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(5)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unrepresentable_exchange_timeout_is_rejected_at_construction() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let result = Client::new(
+            ImmediateTimeoutTransport { calls },
+            ClientConfig {
+                auth: Auth::v2c("public"),
+                exchange_timeout: Some(Duration::MAX),
+                ..ClientConfig::default()
+            },
+        );
+        assert!(matches!(result, Err(error) if matches!(*error, Error::Config(_))));
     }
 
     fn metadata_client(auth: Auth) -> Client<TruncatingTransport> {
@@ -1794,13 +1911,7 @@ mod tests {
         }
     }
 
-    impl Transport for ScriptedResponseTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            self.pending.lock().unwrap().push_back(request_id);
-            async { Ok(()) }
-        }
-
+    impl ScriptedResponseTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -1818,9 +1929,18 @@ mod tests {
                 Ok((message.encode().unwrap(), "127.0.0.1:161".parse().unwrap()))
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for ScriptedResponseTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            self.pending.lock().unwrap().push_back(request_id);
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1828,9 +1948,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -1895,8 +2016,9 @@ mod tests {
             Ok(())
         }
 
-        async fn recv_with<T, F>(
+        async fn request_with<T, F>(
             &self,
+            _data: &[u8],
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -1972,18 +2094,6 @@ mod tests {
     impl Transport for CapacityTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
-        }
-
-        async fn recv_with<U, F>(
-            &self,
-            _registration: crate::transport::RequestRegistration,
-            _validate: F,
-        ) -> Result<U>
-        where
-            U: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<U>> + Send,
-        {
-            panic!("capacity test overrides request_with")
         }
 
         async fn request_with<U, F>(
@@ -2077,8 +2187,9 @@ mod tests {
             async { Ok(()) }
         }
 
-        async fn recv_with<T, F>(
+        async fn request_with<T, F>(
             &self,
+            _data: &[u8],
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -2768,24 +2879,7 @@ mod tests {
         }
     }
 
-    impl Transport for TooBigTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            // Decode the message to count varbinds
-            let msg = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
-                crate::DecodeConfig::default(),
-            )
-            .unwrap()
-            .value;
-            let varbind_count = msg.pdu().standard().unwrap().varbinds.len();
-            {
-                let mut q = self.pending.lock().unwrap();
-                q.push_back((request_id, varbind_count));
-            }
-            async { Ok(()) }
-        }
-
+    impl TooBigTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -2818,9 +2912,29 @@ mod tests {
                 Ok((msg.encode().unwrap(), peer))
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for TooBigTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            // Decode the message to count varbinds
+            let msg = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
+            let varbind_count = msg.pdu().standard().unwrap().varbinds.len();
+            {
+                let mut q = self.pending.lock().unwrap();
+                q.push_back((request_id, varbind_count));
+            }
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2828,9 +2942,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -2883,21 +2998,7 @@ mod tests {
         malformed_echo: bool,
     }
 
-    impl Transport for InformMetadataTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let message = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
-                crate::DecodeConfig::default(),
-            )
-            .unwrap()
-            .value;
-            self.pending
-                .lock()
-                .unwrap()
-                .push_back(message.pdu().standard().unwrap().clone());
-            async { Ok(()) }
-        }
-
+    impl InformMetadataTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -2917,9 +3018,26 @@ mod tests {
                 Ok((Bytes::from(encoded), "127.0.0.1:161".parse().unwrap()))
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for InformMetadataTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let message = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
+            self.pending
+                .lock()
+                .unwrap()
+                .push_back(message.pdu().standard().unwrap().clone());
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2927,9 +3045,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },
@@ -3169,13 +3288,7 @@ mod tests {
         }
     }
 
-    impl Transport for AdversarialTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            self.pending.lock().unwrap().push_back(request_id);
-            async { Ok(()) }
-        }
-
+    impl AdversarialTransport {
         fn recv(
             &self,
             _registration: crate::transport::RequestRegistration,
@@ -3202,9 +3315,18 @@ mod tests {
             let encoded = msg.encode().unwrap();
             async move { Ok((encoded, peer)) }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for AdversarialTransport {
+        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            self.pending.lock().unwrap().push_back(request_id);
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -3212,9 +3334,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },

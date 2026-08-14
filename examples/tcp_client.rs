@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .request_timeout(Duration::from_secs(10))
         // Timeout retries are ignored for TCP (is_reliable = true).
         // SNMPv3 protocol correction is a separate state transition.
-        .retry(Retry::fixed(3, Duration::ZERO))
+        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count"))
         .connect_tcp()
         .await?;
 
@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp_client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(2))
-        .retry(Retry::fixed(3, Duration::ZERO)) // Will retry up to 3 times on timeout
+        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count")) // Will retry up to 3 times on timeout
         .connect()
         .await;
 
@@ -181,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(2))
-        .retry(Retry::fixed(3, Duration::ZERO)) // Ignored for TCP!
+        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count")) // Ignored for TCP!
         .connect_tcp()
         .await;
 

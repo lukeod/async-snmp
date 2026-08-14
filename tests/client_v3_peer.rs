@@ -1729,7 +1729,7 @@ async fn v3_failed_packet_local_correction_preserves_authenticated_time() {
         transport,
         client_config(
             Auth::Usm(user_for(level)),
-            Retry::fixed(3, Duration::ZERO),
+            Retry::fixed(3, Duration::ZERO).unwrap(),
             true,
         ),
     )
@@ -2098,7 +2098,7 @@ async fn v3_report_on_final_timeout_attempt_still_gets_correction() {
 
     let client = Client::builder(peer.addr(), auth_for(level))
         .request_timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(1, Duration::ZERO))
+        .retry(Retry::fixed(1, Duration::ZERO).unwrap())
         .connect()
         .await
         .unwrap();
@@ -2167,7 +2167,7 @@ async fn v3_repeated_time_window_report_is_typed_and_bounded() {
         transport,
         client_config(
             Auth::Usm(user_for(level)),
-            Retry::fixed(5, Duration::ZERO),
+            Retry::fixed(5, Duration::ZERO).unwrap(),
             false,
         ),
     )
@@ -2885,7 +2885,7 @@ async fn v3_scripted_udp_timeout_retry_count() {
 
     let client = Client::builder(peer.addr(), auth_for(level))
         .request_timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(2, Duration::ZERO))
+        .retry(Retry::fixed(2, Duration::ZERO).unwrap())
         .connect()
         .await
         .unwrap();
@@ -3263,10 +3263,14 @@ async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
     );
     let log = transport.log();
 
-    let (actual, _) = Transport::request(
+    let (actual, _) = Transport::request_with(
         &transport,
         &request,
-        async_snmp::RequestRegistration::v3(999, Duration::from_secs(5)),
+        async_snmp::RequestRegistration::v3(
+            999,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ),
+        |data, source| Ok(async_snmp::Candidate::Accept((data, source))),
     )
     .await
     .unwrap();
@@ -3290,10 +3294,14 @@ async fn report_builder_uses_reporting_engine_context() {
         .encode()
         .unwrap();
 
-    let (response, _) = Transport::request(
+    let (response, _) = Transport::request_with(
         &transport,
         &request,
-        async_snmp::RequestRegistration::v3(41, Duration::from_secs(5)),
+        async_snmp::RequestRegistration::v3(
+            41,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ),
+        |data, source| Ok(async_snmp::Candidate::Accept((data, source))),
     )
     .await
     .unwrap();
@@ -3381,7 +3389,7 @@ async fn v3_udp_accepts_late_response_to_prior_attempt() {
 
     let client = Client::builder(peer.addr(), auth_for(level))
         .request_timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(1, Duration::ZERO))
+        .retry(Retry::fixed(1, Duration::ZERO).unwrap())
         .connect()
         .await
         .unwrap();
@@ -3397,6 +3405,91 @@ async fn v3_udp_accepts_late_response_to_prior_attempt() {
     assert_eq!(
         requests[1].scoped_pdu.as_ref().unwrap().pdu.request_id(),
         requests[2].scoped_pdu.as_ref().unwrap().pdu.request_id()
+    );
+}
+
+#[tokio::test]
+async fn v3_udp_accepts_response_during_retry_backoff_without_retransmitting() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let response_engine = engine.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::delayed_reply(Duration::from_millis(300), move |request| {
+                V3ReplyBuilder::response_to(request, &response_engine).build()
+            }),
+        ],
+    )
+    .await;
+    let log = peer.log();
+
+    let client = Client::builder(peer.addr(), auth_for(level))
+        .request_timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::fixed(1, Duration::from_millis(500)).unwrap())
+        .connect()
+        .await
+        .unwrap();
+
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+    peer.finish().await.unwrap();
+
+    assert_eq!(
+        log.snapshot().len(),
+        2,
+        "the delayed response must complete the first ordinary transmission"
+    );
+}
+
+#[tokio::test]
+async fn v3_custom_transport_accepts_late_discovery_response_to_prior_attempt() {
+    let level = SecurityLevel::NoAuthNoPriv;
+    let engine = engine_for(level);
+    let report_engine = engine.clone();
+    let response_engine = engine.clone();
+    let first_attempt = Arc::new(Mutex::new(None::<i32>));
+    let capture = Arc::clone(&first_attempt);
+    let transport = ScriptedTransport::new(
+        engine.clone(),
+        vec![
+            ScriptStep::silence_with(move |request| {
+                *capture.lock().unwrap() = Some(request.global_data.msg_id());
+            }),
+            ScriptStep::reply(move |request| {
+                let prior = first_attempt.lock().unwrap().take().unwrap();
+                V3ReplyBuilder::report_to(
+                    request,
+                    &report_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .msg_id(prior)
+                .build()
+            }),
+            response_step(response_engine, "response after delayed discovery"),
+        ],
+        100,
+        false,
+    );
+    let log = transport.log();
+    let client = Client::new(
+        transport,
+        client_config(
+            Auth::Usm(user_for(level)),
+            Retry::fixed(1, Duration::ZERO).unwrap(),
+            false,
+        ),
+    )
+    .unwrap();
+
+    client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
+
+    let requests = log.snapshot();
+    assert_eq!(requests.len(), 3);
+    assert_ne!(
+        requests[0].global_data.msg_id(),
+        requests[1].global_data.msg_id()
     );
 }
 
@@ -3429,7 +3522,7 @@ async fn v3_custom_transport_accepts_late_response_to_prior_attempt() {
         transport,
         client_config(
             Auth::Usm(user_for(level)),
-            Retry::fixed(1, Duration::ZERO),
+            Retry::fixed(1, Duration::ZERO).unwrap(),
             false,
         ),
     )
@@ -3539,7 +3632,7 @@ async fn v3_windowed_report_from_prior_attempt_triggers_correction() {
 
     let client = Client::builder(peer.addr(), auth_for(level))
         .request_timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(1, Duration::ZERO))
+        .retry(Retry::fixed(1, Duration::ZERO).unwrap())
         .connect()
         .await
         .unwrap();
@@ -3605,7 +3698,7 @@ async fn v3_windowed_unauthenticated_report_from_prior_attempt_triggers_correcti
 
     let client = Client::builder(peer.addr(), auth_for(level))
         .request_timeout(LOOPBACK_TIMEOUT)
-        .retry(Retry::fixed(1, Duration::ZERO))
+        .retry(Retry::fixed(1, Duration::ZERO).unwrap())
         .allow_unauthenticated_v3_time_correction(true)
         .connect()
         .await

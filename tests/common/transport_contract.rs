@@ -6,8 +6,9 @@ impl Transport for ContractTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
+        _data: &[u8],
         _registration: RequestRegistration,
         _validate: F,
     ) -> Result<T>
@@ -34,14 +35,12 @@ impl Transport for ContractTransport {
 fn assert_send<T: Send>(_value: T) {}
 
 fn compile_default_and_generic_surface<T: Transport>(transport: &T) {
-    let registration = RequestRegistration::v3(7, std::time::Duration::from_secs(1));
+    let registration = RequestRegistration::v3(
+        7,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
 
     assert_send(transport.send(b"request"));
-    assert_send(transport.recv(registration.clone()));
-    assert_send(transport.recv_with(registration.clone(), |data, source| {
-        Result::Ok(Candidate::Accept((data, source)))
-    }));
-    assert_send(transport.request(b"request", registration.clone()));
     assert_send(transport.request_with(b"request", registration, |data, source| {
         Result::Ok(Candidate::Accept((data, source)))
     }));

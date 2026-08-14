@@ -168,11 +168,10 @@ impl CommonArgs {
     pub fn retry_config(&self) -> Result<Retry, RetryConfigError> {
         Retry::validate_jitter(self.backoff_jitter)?;
         match self.backoff {
-            BackoffStrategy::None => Ok(Retry::fixed(self.retries, Duration::ZERO)),
-            BackoffStrategy::Fixed => Ok(Retry::fixed(
-                self.retries,
-                Duration::from_millis(self.backoff_delay),
-            )),
+            BackoffStrategy::None => Retry::fixed(self.retries, Duration::ZERO),
+            BackoffStrategy::Fixed => {
+                Retry::fixed(self.retries, Duration::from_millis(self.backoff_delay))
+            }
             BackoffStrategy::Exponential => Retry::exponential(self.retries)
                 .initial_delay(Duration::from_millis(self.backoff_delay))
                 .max_delay(Duration::from_millis(self.backoff_max))
@@ -670,7 +669,7 @@ mod tests {
             backoff_jitter: 0.25,
         };
         let retry = args.retry_config().unwrap();
-        assert_eq!(retry.max_attempts(), 3);
+        assert_eq!(retry.retries(), 3);
         assert_eq!(retry.compute_delay(0), Duration::ZERO);
     }
 
@@ -688,7 +687,7 @@ mod tests {
             backoff_jitter: 0.25,
         };
         let retry = args.retry_config().unwrap();
-        assert_eq!(retry.max_attempts(), 5);
+        assert_eq!(retry.retries(), 5);
         assert_eq!(retry.compute_delay(0), Duration::from_millis(200));
     }
 
@@ -706,7 +705,7 @@ mod tests {
             backoff_jitter: 0.0,
         };
         let retry = args.retry_config().unwrap();
-        assert_eq!(retry.max_attempts(), 4);
+        assert_eq!(retry.retries(), 4);
         assert_eq!(retry.compute_delay(0), Duration::from_millis(50));
         assert_eq!(retry.compute_delay(10), Duration::from_millis(2000));
     }

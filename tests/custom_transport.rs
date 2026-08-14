@@ -12,6 +12,10 @@ use async_snmp::{
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
+fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + timeout
+}
+
 #[derive(Clone)]
 struct ExternalTransport {
     inner: Arc<ExternalTransportInner>,
@@ -46,8 +50,9 @@ impl Transport for ExternalTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
+        data: &[u8],
         registration: RequestRegistration,
         mut validate: F,
     ) -> async_snmp::Result<T>
@@ -56,15 +61,24 @@ impl Transport for ExternalTransport {
         F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
     {
         self.inner.deadlines_armed.fetch_add(1, Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now()
-            .checked_add(registration.timeout())
-            .ok_or_else(|| Error::Config("custom transport deadline overflow".into()).boxed())?;
+        let started = tokio::time::Instant::now();
+        let deadline = registration.deadline();
+        tokio::time::timeout_at(deadline, self.send(data))
+            .await
+            .map_err(|_| {
+                Error::Timeout {
+                    target: self.inner.peer,
+                    elapsed: started.elapsed(),
+                    retries: 0,
+                }
+                .boxed()
+            })??;
 
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(Error::Timeout {
                     target: self.inner.peer,
-                    elapsed: registration.timeout(),
+                    elapsed: started.elapsed(),
                     retries: 0,
                 }
                 .boxed());
@@ -73,7 +87,7 @@ impl Transport for ExternalTransport {
             let Some((data, source)) = self.inner.replies.lock().unwrap().pop_front() else {
                 return Err(Error::Timeout {
                     target: self.inner.peer,
-                    elapsed: registration.timeout(),
+                    elapsed: started.elapsed(),
                     retries: 0,
                 }
                 .boxed());
@@ -158,8 +172,9 @@ impl Transport for ImmediateResponseTransport {
             .map_err(|_| Error::Config("custom transport registration closed".into()).boxed())
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
+        data: &[u8],
         registration: RequestRegistration,
         mut validate: F,
     ) -> async_snmp::Result<T>
@@ -172,12 +187,24 @@ impl Transport for ImmediateResponseTransport {
         let _registration = ImmediateResponseRegistration {
             inner: Arc::clone(&self.inner),
         };
-        let (data, source) = tokio::time::timeout(registration.timeout(), receiver)
+        let started = tokio::time::Instant::now();
+        let deadline = registration.deadline();
+        tokio::time::timeout_at(deadline, self.send(data))
             .await
             .map_err(|_| {
                 Error::Timeout {
                     target: self.inner.peer,
-                    elapsed: registration.timeout(),
+                    elapsed: started.elapsed(),
+                    retries: 0,
+                }
+                .boxed()
+            })??;
+        let (data, source) = tokio::time::timeout_at(deadline, receiver)
+            .await
+            .map_err(|_| {
+                Error::Timeout {
+                    target: self.inner.peer,
+                    elapsed: started.elapsed(),
                     retries: 0,
                 }
                 .boxed()
@@ -233,19 +260,24 @@ fn v3_identity(msg_id: u8) -> Bytes {
 }
 
 #[tokio::test]
-async fn default_request_registers_before_an_immediate_response() {
+async fn complete_exchange_registers_before_an_immediate_response() {
     let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
     let response = v2c_response(6, b"public");
     let transport = ImmediateResponseTransport::new(peer, response.clone());
     let registration = RequestRegistration::community(
         6,
-        Duration::from_millis(50),
+        deadline_after(Duration::from_millis(50)),
         CommunityVersion::V2c,
         Bytes::from_static(b"public"),
         CommunityResponsePolicy::Exact,
     );
 
-    let received = transport.request(b"request", registration).await.unwrap();
+    let received = transport
+        .request_with(b"request", registration, |data, source| {
+            Ok(Candidate::Accept((data, source)))
+        })
+        .await
+        .unwrap();
 
     assert_eq!(received, (response, peer));
     assert_eq!(
@@ -271,8 +303,9 @@ impl Transport for ReadyReceiveTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
+        _data: &[u8],
         _registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
@@ -301,7 +334,7 @@ impl Transport for ReadyReceiveTransport {
 }
 
 #[tokio::test]
-async fn default_request_returns_immediate_receive_error_without_sending() {
+async fn complete_exchange_can_return_local_error_without_sending() {
     let sends = Arc::new(AtomicUsize::new(0));
     let transport = ReadyReceiveTransport {
         sends: sends.clone(),
@@ -309,68 +342,15 @@ async fn default_request_returns_immediate_receive_error_without_sending() {
     };
 
     let error = transport
-        .request(
+        .request_with(
             b"request",
-            RequestRegistration::v3(1, Duration::from_secs(1)),
+            RequestRegistration::v3(1, deadline_after(Duration::from_secs(1))),
+            |data, source| Ok(Candidate::Accept((data, source))),
         )
         .await
         .unwrap_err();
 
     assert!(matches!(*error, Error::Config(_)));
-    assert_eq!(sends.load(Ordering::Relaxed), 0);
-}
-
-#[tokio::test]
-async fn default_request_returns_immediate_success_without_sending() {
-    #[derive(Clone)]
-    struct ImmediateSuccess(Arc<AtomicUsize>);
-
-    impl Transport for ImmediateSuccess {
-        async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn recv_with<T, F>(
-            &self,
-            _registration: RequestRegistration,
-            mut validate: F,
-        ) -> async_snmp::Result<T>
-        where
-            T: Send,
-            F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
-        {
-            match validate(Bytes::from_static(b"ready"), self.peer_addr())? {
-                Candidate::Accept(value) => Ok(value),
-                Candidate::Reject => unreachable!(),
-            }
-        }
-
-        fn peer_addr(&self) -> SocketAddr {
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
-        }
-
-        fn local_addr(&self) -> SocketAddr {
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
-        }
-
-        fn is_reliable(&self) -> bool {
-            true
-        }
-    }
-
-    let sends = Arc::new(AtomicUsize::new(0));
-    let transport = ImmediateSuccess(sends.clone());
-    let response = transport
-        .request_with(
-            b"request",
-            RequestRegistration::v3(1, Duration::ZERO),
-            |data, _| Ok(Candidate::Accept(data)),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response, Bytes::from_static(b"ready"));
     assert_eq!(sends.load(Ordering::Relaxed), 0);
 }
 
@@ -383,16 +363,30 @@ impl Transport for SlowExchangeTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
-        _registration: RequestRegistration,
+        data: &[u8],
+        registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
     where
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
     {
-        std::future::pending().await
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout_at(registration.deadline(), async {
+            self.send(data).await?;
+            std::future::pending::<async_snmp::Result<T>>().await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Timeout {
+                target: self.peer_addr(),
+                elapsed: started.elapsed(),
+                retries: 0,
+            }
+            .boxed())
+        })
     }
 
     fn peer_addr(&self) -> SocketAddr {
@@ -409,10 +403,11 @@ impl Transport for SlowExchangeTransport {
 }
 
 #[tokio::test(start_paused = true)]
-async fn default_request_deadline_includes_send_and_receive() {
-    let request = SlowExchangeTransport.request(
+async fn complete_exchange_deadline_includes_send_and_receive() {
+    let request = SlowExchangeTransport.request_with(
         b"request",
-        RequestRegistration::v3(1, Duration::from_secs(5)),
+        RequestRegistration::v3(1, deadline_after(Duration::from_secs(5))),
+        |data, source| Ok(Candidate::Accept((data, source))),
     );
     tokio::pin!(request);
     assert!(futures::poll!(request.as_mut()).is_pending());
@@ -451,8 +446,9 @@ impl Transport for FiniteCapacityTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
+        data: &[u8],
         _registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
@@ -460,7 +456,15 @@ impl Transport for FiniteCapacityTransport {
         T: Send,
         F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
     {
+        if data.len() > self.send_capacity() {
+            return Err(Error::OutboundMessageTooLarge {
+                size: data.len(),
+                limit: self.send_capacity(),
+            }
+            .boxed());
+        }
         self.receive_starts.fetch_add(1, Ordering::Relaxed);
+        self.send(data).await?;
         Err(Error::Config("receive started".into()).boxed())
     }
 
@@ -482,14 +486,19 @@ impl Transport for FiniteCapacityTransport {
 }
 
 #[tokio::test]
-async fn default_request_rejects_capacity_before_receive_setup() {
+async fn complete_exchange_rejects_capacity_before_receive_setup() {
     let transport = FiniteCapacityTransport {
         receive_starts: Arc::new(AtomicUsize::new(0)),
         sends: Arc::new(AtomicUsize::new(0)),
     };
-    let registration = RequestRegistration::v3(1, Duration::from_secs(1));
+    let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(1)));
 
-    let error = transport.request(b"12345", registration).await.unwrap_err();
+    let error = transport
+        .request_with(b"12345", registration, |data, source| {
+            Ok(Candidate::Accept((data, source)))
+        })
+        .await
+        .unwrap_err();
     assert!(matches!(
         *error,
         Error::OutboundMessageTooLarge { size: 5, limit: 4 }
@@ -506,8 +515,9 @@ impl Transport for PendingSendTransport {
         std::future::pending().await
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
+        _data: &[u8],
         _registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
@@ -590,7 +600,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
     );
     let registration = RequestRegistration::community(
         7,
-        timeout,
+        deadline_after(timeout),
         CommunityVersion::V2c,
         Bytes::from_static(b"public"),
         CommunityResponsePolicy::Exact,
@@ -621,15 +631,16 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
         ],
     );
     let accepted = target_only
-        .request(
+        .request_with(
             b"request",
             RequestRegistration::community(
                 8,
-                timeout,
+                deadline_after(timeout),
                 CommunityVersion::V2c,
                 Bytes::from_static(b"public"),
                 CommunityResponsePolicy::AllowMismatchFromTarget,
             ),
+            |data, source| Ok(Candidate::Accept((data, source))),
         )
         .await
         .unwrap();
@@ -644,15 +655,16 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
 
     let any_source = ExternalTransport::new(peer, vec![(v2c_response(9, b"rewritten"), other)]);
     let accepted = any_source
-        .request(
+        .request_with(
             b"request",
             RequestRegistration::community(
                 9,
-                timeout,
+                deadline_after(timeout),
                 CommunityVersion::V2c,
                 Bytes::from_static(b"public"),
                 CommunityResponsePolicy::AllowMismatchFromAnySource,
             ),
+            |data, source| Ok(Candidate::Accept((data, source))),
         )
         .await
         .unwrap();
@@ -665,7 +677,9 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
 
 #[test]
 fn response_identity_covers_protocols_ids_and_malformed_envelopes() {
-    let v3 = RequestRegistration::v3(11, Duration::from_secs(1)).with_aliases([10]);
+    let v3 = RequestRegistration::v3(11, deadline_after(Duration::from_secs(1)))
+        .with_aliases([10])
+        .unwrap();
 
     // Identity matching intentionally stops before security/scoped-PDU checks:
     // this minimal but correctly nested outer identity remains a candidate.
@@ -695,12 +709,13 @@ fn response_identity_covers_protocols_ids_and_malformed_envelopes() {
 
     let v2c = RequestRegistration::community(
         7,
-        Duration::from_secs(1),
+        deadline_after(Duration::from_secs(1)),
         CommunityVersion::V2c,
         Bytes::from_static(b"public"),
         CommunityResponsePolicy::Exact,
     )
-    .with_aliases([6]);
+    .with_aliases([6])
+    .unwrap();
     assert_eq!(
         v2c.evaluate_response_identity(&v2c_response(7, b"public"), false),
         ResponseIdentity::Match
@@ -722,7 +737,7 @@ fn response_identity_covers_protocols_ids_and_malformed_envelopes() {
     );
     let v1 = RequestRegistration::community(
         7,
-        Duration::from_secs(1),
+        deadline_after(Duration::from_secs(1)),
         CommunityVersion::V1,
         Bytes::from_static(b"public"),
         CommunityResponsePolicy::Exact,
@@ -761,18 +776,6 @@ struct RegistrationPolicyProbe {
 impl Transport for RegistrationPolicyProbe {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         Ok(())
-    }
-
-    async fn recv_with<T, F>(
-        &self,
-        _registration: RequestRegistration,
-        _validate: F,
-    ) -> async_snmp::Result<T>
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
-    {
-        Err(Error::Config("policy probe uses request_with".into()).boxed())
     }
 
     async fn request_with<T, F>(

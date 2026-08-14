@@ -270,7 +270,7 @@ impl Default for TcpTransportBuilder {
 /// # Serialized Operations
 ///
 /// Request-response pairs are serialized to ensure correct correlation.
-/// [`request()`](Transport::request) owns the stream lock for the whole
+/// [`request_with()`](Transport::request_with) owns the stream lock for the whole
 /// write-then-read exchange, preventing interleaving of concurrent requests.
 /// Because the lock is held by a single future (not stashed across independent
 /// await points), a dropped or cancelled request releases it instead of leaking
@@ -509,42 +509,6 @@ impl Transport for TcpTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(&self, registration: RequestRegistration, validate: F) -> Result<T>
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
-    {
-        let request_id = registration.request_id();
-        let recv_timeout = registration.timeout();
-        let target = self.inner.target;
-        let deadline = transaction_deadline(recv_timeout)?;
-        let mut stream = lock_stream_before(&self.inner, deadline, recv_timeout).await?;
-
-        if self.inner.is_poisoned() {
-            return Err(Error::Closed { target }.boxed());
-        }
-        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
-        let result = tokio::time::timeout_at(
-            deadline,
-            arm_when_polled(
-                &mut transaction,
-                read_validated_message(
-                    &mut stream,
-                    target,
-                    self.inner.receive_limits.accepted(),
-                    &registration,
-                    validate,
-                ),
-            ),
-        )
-        .await
-        .map_err(|_| CorrelatedReadError::Timeout)
-        .and_then(std::convert::identity);
-        let value = finish_correlated_read(result, target, request_id, recv_timeout)?;
-        transaction.disarm();
-        Ok(value)
-    }
-
     async fn request_with<T, F>(
         &self,
         data: &[u8],
@@ -557,9 +521,10 @@ impl Transport for TcpTransport {
     {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let request_id = registration.request_id();
-        let recv_timeout = registration.timeout();
+        let started = tokio::time::Instant::now();
+        let deadline = registration.deadline();
+        let recv_timeout = deadline.saturating_duration_since(started);
         let target = self.inner.target;
-        let deadline = transaction_deadline(recv_timeout)?;
         let mut stream = lock_stream_before(&self.inner, deadline, recv_timeout).await?;
 
         if self.inner.is_poisoned() {
@@ -613,6 +578,53 @@ impl Transport for TcpTransport {
 
     fn send_capacity(&self) -> usize {
         self.inner.send_capacity
+    }
+}
+
+#[cfg(test)]
+impl TcpTransport {
+    async fn recv(&self, registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
+        let request_id = registration.request_id();
+        let started = tokio::time::Instant::now();
+        let deadline = registration.deadline();
+        let elapsed = deadline.saturating_duration_since(started);
+        let target = self.inner.target;
+        let mut stream = lock_stream_before(&self.inner, deadline, elapsed).await?;
+
+        if self.inner.is_poisoned() {
+            return Err(Error::Closed { target }.boxed());
+        }
+        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
+        let result = tokio::time::timeout_at(
+            deadline,
+            arm_when_polled(
+                &mut transaction,
+                read_validated_message(
+                    &mut stream,
+                    target,
+                    self.inner.receive_limits.accepted(),
+                    &registration,
+                    |data, source| Ok(Candidate::Accept((data, source))),
+                ),
+            ),
+        )
+        .await
+        .map_err(|_| CorrelatedReadError::Timeout)
+        .and_then(std::convert::identity);
+        let value = finish_correlated_read(result, target, request_id, elapsed)?;
+        transaction.disarm();
+        Ok(value)
+    }
+
+    async fn request(
+        &self,
+        data: &[u8],
+        registration: RequestRegistration,
+    ) -> Result<(Bytes, SocketAddr)> {
+        self.request_with(data, registration, |response, source| {
+            Ok(Candidate::Accept((response, source)))
+        })
+        .await
     }
 }
 
@@ -908,6 +920,10 @@ mod tests {
     use tokio::io::{AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + timeout
+    }
+
     enum WriteFailure {
         Write,
         Flush,
@@ -954,37 +970,6 @@ mod tests {
             }
             assert!(poisoned.load(Ordering::Acquire));
         }
-    }
-
-    #[tokio::test]
-    async fn unrepresentable_direct_deadlines_fail_before_stream_io() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut byte = [0u8; 1];
-            tokio::time::timeout(Duration::from_millis(50), socket.read_exact(&mut byte)).await
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-
-        let request_error = transport
-            .request(
-                &build_request_with_id(1),
-                RequestRegistration::v3(1, Duration::MAX),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(*request_error, Error::Config(_)));
-        let recv_error = transport
-            .recv(RequestRegistration::v3(1, Duration::MAX))
-            .await
-            .unwrap_err();
-        assert!(matches!(*recv_error, Error::Config(_)));
-        assert!(!transport.inner.is_poisoned());
-        assert!(
-            server.await.unwrap().is_err(),
-            "invalid deadline wrote bytes"
-        );
     }
 
     #[tokio::test]
@@ -1360,7 +1345,7 @@ mod tests {
         let transport = TcpTransport::connect(addr).await.unwrap();
         let registration = RequestRegistration::community(
             77,
-            Duration::from_secs(2),
+            deadline_after(Duration::from_secs(2)),
             crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             super::super::CommunityResponsePolicy::Exact,
@@ -1391,7 +1376,7 @@ mod tests {
         let transport = TcpTransport::connect(addr).await.unwrap();
         let registration = RequestRegistration::community(
             77,
-            Duration::from_secs(2),
+            deadline_after(Duration::from_secs(2)),
             crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             super::super::CommunityResponsePolicy::Exact,
@@ -1448,7 +1433,8 @@ mod tests {
 
             let transport = TcpTransport::connect(addr).await.unwrap();
             let registration = RequestRegistration::test_unchecked(100, Duration::from_secs(2))
-                .with_aliases([101, 102]);
+                .with_aliases([101, 102])
+                .unwrap();
             let (response, _) = transport
                 .request(&build_request_with_id(100), registration)
                 .await
@@ -1484,7 +1470,7 @@ mod tests {
         let error = transport
             .request(
                 &build_request_with_id(300),
-                RequestRegistration::v3(300, Duration::from_millis(100)),
+                RequestRegistration::v3(300, deadline_after(Duration::from_millis(100))),
             )
             .await
             .unwrap_err();
@@ -1510,7 +1496,7 @@ mod tests {
         let transport = TcpTransport::connect(addr).await.unwrap();
         let registration = RequestRegistration::community(
             78,
-            Duration::from_secs(2),
+            deadline_after(Duration::from_secs(2)),
             crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             super::super::CommunityResponsePolicy::Exact,
@@ -1573,7 +1559,7 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
         let result = transport.recv(registration).await;
 
         // Should reject the message without allocating 100MB
@@ -1631,7 +1617,10 @@ mod tests {
 
         let transport = TcpTransport::connect(server_addr).await.unwrap();
         let error = transport
-            .recv(RequestRegistration::v3(1, Duration::from_secs(5)))
+            .recv(RequestRegistration::v3(
+                1,
+                deadline_after(Duration::from_secs(5)),
+            ))
             .await
             .expect_err("high-tag-number form must be rejected");
 
@@ -1881,7 +1870,7 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
         let result = transport.recv(registration).await;
 
         // Should reject 10KB message when limit is 1KB
@@ -1910,7 +1899,7 @@ mod tests {
         let held_lock = transport.inner.stream.clone().lock_owned().await;
 
         let request = build_request_with_id(1);
-        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
         let cancelled = timeout(
             Duration::from_millis(30),
             transport.request(&request, registration),
@@ -1938,7 +1927,7 @@ mod tests {
         let second_data = build_request_with_id(2);
         let mut second = Box::pin(transport.request(
             &second_data,
-            RequestRegistration::v3(2, Duration::from_secs(5)),
+            RequestRegistration::v3(2, deadline_after(Duration::from_secs(5))),
         ));
         assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
         assert!(!transport.inner.is_poisoned());
@@ -1979,7 +1968,7 @@ mod tests {
         let request_data = build_request_with_id(1);
         let mut request = Box::pin(transport.request(
             &request_data,
-            RequestRegistration::v3(1, Duration::from_secs(10)),
+            RequestRegistration::v3(1, deadline_after(Duration::from_secs(10))),
         ));
         assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
         tokio::time::advance(Duration::from_secs(6)).await;
@@ -2014,8 +2003,10 @@ mod tests {
         let held_lock = transport.inner.stream.clone().lock_owned().await;
 
         let data = build_request_with_id(1);
-        let mut request =
-            Box::pin(transport.request(&data, RequestRegistration::v3(1, Duration::from_secs(5))));
+        let mut request = Box::pin(transport.request(
+            &data,
+            RequestRegistration::v3(1, deadline_after(Duration::from_secs(5))),
+        ));
         assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
         tokio::time::advance(Duration::from_secs(5)).await;
         drop(held_lock);
@@ -2129,7 +2120,7 @@ mod tests {
             request_transport
                 .request(
                     &build_request_with_id(1),
-                    RequestRegistration::v3(1, Duration::from_secs(30)),
+                    RequestRegistration::v3(1, deadline_after(Duration::from_secs(30))),
                 )
                 .await
         });
@@ -2142,7 +2133,7 @@ mod tests {
         let error = transport
             .request(
                 &build_request_with_id(2),
-                RequestRegistration::v3(2, Duration::from_secs(1)),
+                RequestRegistration::v3(2, deadline_after(Duration::from_secs(1))),
             )
             .await
             .unwrap_err();
@@ -2169,7 +2160,7 @@ mod tests {
             request_transport
                 .request(
                     &build_request_with_id(1),
-                    RequestRegistration::v3(1, Duration::from_secs(30)),
+                    RequestRegistration::v3(1, deadline_after(Duration::from_secs(30))),
                 )
                 .await
         });
@@ -2244,7 +2235,10 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         let error = transport
-            .request(&data, RequestRegistration::v3(1, Duration::from_millis(50)))
+            .request(
+                &data,
+                RequestRegistration::v3(1, deadline_after(Duration::from_millis(50))),
+            )
             .await
             .unwrap_err();
         assert!(matches!(*error, Error::Timeout { .. }));
@@ -2292,7 +2286,7 @@ mod tests {
 
         // First request: the malformed reply is rejected and poisons the stream.
         let request = build_request_with_id(1);
-        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
         let first = transport.request(&request, registration).await;
         let err = first.expect_err("malformed frame should error");
         assert!(
@@ -2309,7 +2303,7 @@ mod tests {
         // The next request must fail fast with Closed rather than read the
         // leftover bytes of the abandoned frame.
         let request2 = build_request_with_id(2);
-        let registration = RequestRegistration::v3(2, Duration::from_secs(5));
+        let registration = RequestRegistration::v3(2, deadline_after(Duration::from_secs(5)));
         let second = timeout(
             Duration::from_secs(5),
             transport.request(&request2, registration),
@@ -2342,7 +2336,7 @@ mod tests {
         });
 
         let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let registration = RequestRegistration::v3(1, Duration::from_millis(150));
+        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_millis(150)));
 
         let start = std::time::Instant::now();
         let result = timeout(Duration::from_secs(5), transport.recv(registration))
@@ -2392,7 +2386,7 @@ mod tests {
         let request = build_request_with_id(1);
         transport.send(&request).await.unwrap();
 
-        let registration = RequestRegistration::v3(1, Duration::from_millis(100));
+        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_millis(100)));
         let first = transport.recv(registration).await;
         let err = first.expect_err("mid-frame read should time out");
         assert!(
@@ -2406,7 +2400,7 @@ mod tests {
         );
 
         // A later recv must fail fast rather than parse leftover content bytes.
-        let registration = RequestRegistration::v3(1, Duration::from_secs(5));
+        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
         let second = timeout(Duration::from_secs(5), transport.recv(registration))
             .await
             .expect("second recv should not hang");

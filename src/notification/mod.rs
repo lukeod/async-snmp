@@ -203,7 +203,8 @@ use crate::error::{Error, Result};
 use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
-use crate::udp_responder::UdpResponder;
+use crate::transport::udp_error::{UdpRecvErrorClass, classify_udp_recv_error};
+use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
 use crate::v3::process::RemoteEngineTable;
 use crate::v3::process::UsmStats;
@@ -991,6 +992,8 @@ impl NotificationReceiverBuilder {
                 response_send_gate: Mutex::new(None),
                 #[cfg(test)]
                 response_sends_started: AtomicU32::new(0),
+                #[cfg(test)]
+                receive_errors: Mutex::new(std::collections::VecDeque::new()),
                 recv_gate: AsyncMutex::new(vec![0; crate::UDP_RECEIVE_BUFFER_SIZE]),
             }),
         })
@@ -1306,6 +1309,8 @@ struct ReceiverInner {
     response_send_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     #[cfg(test)]
     response_sends_started: AtomicU32,
+    #[cfg(test)]
+    receive_errors: Mutex<std::collections::VecDeque<std::io::Error>>,
     /// Fairly serializes cloned `recv` calls and retains their shared UDP buffer.
     recv_gate: AsyncMutex<Vec<u8>>,
 }
@@ -1523,6 +1528,14 @@ impl NotificationReceiver {
             .load(Ordering::Relaxed)
     }
 
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<ReceivedDatagram> {
+        #[cfg(test)]
+        if let Some(error) = self.inner.receive_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.inner.udp_responder.recv(&self.inner.socket, buf).await
+    }
+
     /// Receive a notification.
     ///
     /// This method blocks until a notification passes protocol processing,
@@ -1564,15 +1577,31 @@ impl NotificationReceiver {
         let mut buf = self.inner.recv_gate.lock().await;
 
         loop {
-            let received = self
-                .inner
-                .udp_responder
-                .recv(&self.inner.socket, buf.as_mut_slice())
-                .await
-                .map_err(|source| Error::Network {
-                    target: self.inner.local_addr,
-                    source,
-                })?;
+            let received = match self.recv_packet(buf.as_mut_slice()).await {
+                Ok(received) => received,
+                Err(error) => match classify_udp_recv_error(&error) {
+                    UdpRecvErrorClass::DatagramLocal => {
+                        tracing::warn!(target: "async_snmp::notification", %error, "discarding datagram with invalid receive metadata");
+                        continue;
+                    }
+                    UdpRecvErrorClass::Transient => {
+                        tracing::warn!(target: "async_snmp::notification", %error, "returning transient UDP receive error to caller");
+                        return Err(Error::Network {
+                            target: self.inner.local_addr,
+                            source: error,
+                        }
+                        .boxed());
+                    }
+                    UdpRecvErrorClass::Fatal => {
+                        tracing::error!(target: "async_snmp::notification", %error, "returning fatal UDP receive error to caller");
+                        return Err(Error::Network {
+                            target: self.inner.local_addr,
+                            source: error,
+                        }
+                        .boxed());
+                    }
+                },
+            };
             let source = received.source;
             if received.len > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
                 tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, received_size = received.len, advertised_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
@@ -4903,6 +4932,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receiver.snmp_silent_drops(), 1);
+    }
+
+    #[tokio::test]
+    async fn notification_receive_error_policy_discards_datagram_local_and_returns_socket_errors() {
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        receiver
+            .inner
+            .receive_errors
+            .lock()
+            .unwrap()
+            .push_back(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
+            .await
+            .unwrap();
+        let (notification, _) = receiver.recv().await.unwrap();
+        assert!(matches!(notification, Notification::TrapV2c { .. }));
+
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::InvalidInput,
+        ] {
+            receiver
+                .inner
+                .receive_errors
+                .lock()
+                .unwrap()
+                .push_back(std::io::Error::from(kind));
+            let error = receiver.recv().await.unwrap_err();
+            assert!(matches!(
+                &*error,
+                Error::Network { source, .. } if source.kind() == kind
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]

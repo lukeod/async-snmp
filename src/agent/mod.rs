@@ -111,6 +111,9 @@ use crate::oid::Oid;
 use crate::pdu::NotificationPdu;
 use crate::pdu::{Pdu, PduBody, PduType, ResponsePdu};
 use crate::transport::normalize_udp_target;
+use crate::transport::udp_error::{
+    UdpRecvErrorBackoff, UdpRecvErrorClass, classify_udp_recv_error,
+};
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{
     EmptyCommunityPolicy, PreparedAuthoritativeUsm, ValidatedAuthoritativeUsm, bind_udp_socket,
@@ -151,107 +154,6 @@ const MAX_GETNEXT_SKIP_ITERATIONS: usize = 1000;
 
 /// Maximum number of independent handler GETNEXT probes in flight at once.
 const MAX_CONCURRENT_GETNEXT_PROBES: usize = 16;
-
-const AGENT_RECV_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(1);
-const AGENT_RECV_ERROR_BACKOFF_MAX: Duration = Duration::from_millis(100);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReceiveErrorClass {
-    DatagramLocal,
-    Transient,
-    Fatal,
-}
-
-fn next_agent_recv_error_backoff(current: Duration) -> Duration {
-    match current {
-        Duration::ZERO => AGENT_RECV_ERROR_BACKOFF_MIN,
-        duration => (duration * 2).min(AGENT_RECV_ERROR_BACKOFF_MAX),
-    }
-}
-
-fn classify_receive_error(error: &std::io::Error) -> ReceiveErrorClass {
-    if error.kind() == std::io::ErrorKind::InvalidData {
-        return ReceiveErrorClass::DatagramLocal;
-    }
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::NetworkDown
-            | std::io::ErrorKind::NetworkUnreachable
-            | std::io::ErrorKind::HostUnreachable
-            | std::io::ErrorKind::AddrNotAvailable
-            | std::io::ErrorKind::OutOfMemory
-    ) || error.raw_os_error().is_some_and(transient_recv_errno)
-    {
-        return ReceiveErrorClass::Transient;
-    }
-    ReceiveErrorClass::Fatal
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos",
-    target_os = "visionos",
-    target_os = "freebsd",
-))]
-fn transient_recv_errno(code: i32) -> bool {
-    use nix::libc;
-
-    matches!(
-        code,
-        libc::EAGAIN
-            | libc::EINTR
-            | libc::ENOBUFS
-            | libc::ENOMEM
-            | libc::ECONNREFUSED
-            | libc::ECONNRESET
-            | libc::ENETDOWN
-            | libc::ENETUNREACH
-            | libc::EHOSTUNREACH
-    )
-}
-
-#[cfg(any(target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
-fn transient_recv_errno(code: i32) -> bool {
-    matches!(
-        code,
-        libc::EAGAIN
-            | libc::EINTR
-            | libc::ENOBUFS
-            | libc::ENOMEM
-            | libc::ECONNREFUSED
-            | libc::ECONNRESET
-            | libc::ENETDOWN
-            | libc::ENETUNREACH
-            | libc::EHOSTUNREACH
-    )
-}
-
-#[cfg(windows)]
-fn transient_recv_errno(code: i32) -> bool {
-    use windows_sys::Win32::Networking::WinSock;
-
-    matches!(
-        code,
-        WinSock::WSAEINTR
-            | WinSock::WSAEWOULDBLOCK
-            | WinSock::WSAENOBUFS
-            | WinSock::WSAECONNREFUSED
-            | WinSock::WSAECONNRESET
-            | WinSock::WSAENETDOWN
-            | WinSock::WSAENETUNREACH
-            | WinSock::WSAEHOSTUNREACH
-    )
-}
 
 #[cfg(not(any(
     target_os = "linux",
@@ -1836,7 +1738,7 @@ impl Agent {
 
         let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
         let mut request_tasks = RequestTasks::new(self.inner.cancel.child_token());
-        let mut recv_error_backoff = Duration::ZERO;
+        let mut recv_error_backoff = UdpRecvErrorBackoff::default();
 
         let log_task_result = |result: std::result::Result<(), JoinError>| {
             if let Err(error) = result {
@@ -1860,28 +1762,27 @@ impl Agent {
                     result = self.recv_packet(&mut buf) => {
                         match result {
                             Ok(recv_meta) => {
-                                recv_error_backoff = Duration::ZERO;
+                                recv_error_backoff.reset();
                                 break recv_meta;
                             }
-                            Err(error) => match classify_receive_error(&error) {
-                                ReceiveErrorClass::DatagramLocal => {
-                                    recv_error_backoff = Duration::ZERO;
+                            Err(error) => match classify_udp_recv_error(&error) {
+                                UdpRecvErrorClass::DatagramLocal => {
+                                    recv_error_backoff.reset();
                                     tracing::warn!(target: "async_snmp::agent", %error, "discarding datagram with invalid receive metadata");
                                 }
-                                ReceiveErrorClass::Transient => {
-                                    recv_error_backoff =
-                                        next_agent_recv_error_backoff(recv_error_backoff);
-                                    tracing::warn!(target: "async_snmp::agent", %error, backoff = ?recv_error_backoff, "transient UDP receive error");
+                                UdpRecvErrorClass::Transient => {
+                                    let delay = recv_error_backoff.advance();
+                                    tracing::warn!(target: "async_snmp::agent", %error, backoff = ?delay, "transient UDP receive error");
                                     tokio::select! {
                                         biased;
                                         () = self.inner.cancel.cancelled() => {
                                             tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
                                             break 'service Ok(());
                                         }
-                                        () = tokio::time::sleep(recv_error_backoff) => {}
+                                        () = tokio::time::sleep(delay) => {}
                                     }
                                 }
-                                ReceiveErrorClass::Fatal => {
+                                UdpRecvErrorClass::Fatal => {
                                     break 'service Err(Error::Network {
                                         target: self.inner.local_addr,
                                         source: error,
@@ -2658,31 +2559,31 @@ mod tests {
     #[test]
     fn receive_error_classification_and_backoff_are_bounded() {
         assert_eq!(
-            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::InvalidData)),
-            ReceiveErrorClass::DatagramLocal
+            classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::InvalidData)),
+            UdpRecvErrorClass::DatagramLocal
         );
         assert_eq!(
-            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
-            ReceiveErrorClass::Transient
+            classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            UdpRecvErrorClass::Transient
         );
         assert_eq!(
-            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::NetworkDown)),
-            ReceiveErrorClass::Transient
+            classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::NetworkDown)),
+            UdpRecvErrorClass::Transient
         );
         assert_eq!(
-            classify_receive_error(&std::io::Error::from(std::io::ErrorKind::InvalidInput)),
-            ReceiveErrorClass::Fatal
+            classify_udp_recv_error(&std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            UdpRecvErrorClass::Fatal
         );
         assert_eq!(
-            classify_receive_error(&std::io::Error::other("unclassified socket failure")),
-            ReceiveErrorClass::Fatal
+            classify_udp_recv_error(&std::io::Error::other("unclassified socket failure")),
+            UdpRecvErrorClass::Fatal
         );
 
-        let mut backoff = Duration::ZERO;
+        let mut backoff = UdpRecvErrorBackoff::default();
         for _ in 0..16 {
-            backoff = next_agent_recv_error_backoff(backoff);
+            backoff.advance();
         }
-        assert_eq!(backoff, AGENT_RECV_ERROR_BACKOFF_MAX);
+        assert_eq!(backoff.current(), Duration::from_millis(100));
     }
 
     #[cfg(any(
@@ -2698,8 +2599,8 @@ mod tests {
     #[test]
     fn receive_error_classification_treats_enobufs_as_transient() {
         assert_eq!(
-            classify_receive_error(&std::io::Error::from_raw_os_error(nix::libc::ENOBUFS)),
-            ReceiveErrorClass::Transient
+            classify_udp_recv_error(&std::io::Error::from_raw_os_error(nix::libc::ENOBUFS)),
+            UdpRecvErrorClass::Transient
         );
     }
 

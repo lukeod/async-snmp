@@ -7,13 +7,43 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Maximum number of timeout retransmissions for one exchange.
+///
+/// Each SNMPv3 retransmission adds one retained correlation alias. The limit
+/// therefore bounds one active request to 17 registered message IDs (one
+/// current ID plus 16 aliases), while remaining well above conventional SNMP
+/// retry counts. For an application concurrency limit of `C`, a shared UDP
+/// endpoint therefore retains at most `17 * C` correlation keys for these
+/// exchanges; the application remains responsible for selecting `C`.
+pub const MAX_RETRIES: u32 = 16;
+
 /// Wait before another retry without allowing zero-delay loops to monopolize
 /// the current Tokio worker.
-pub(crate) async fn wait_for_retry(delay: Duration) {
+pub(crate) async fn wait_for_retry(
+    delay: Duration,
+    deadline: Option<tokio::time::Instant>,
+) -> bool {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return false;
+    }
     if delay.is_zero() {
         tokio::task::yield_now().await;
+        return deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline);
+    }
+
+    if let Some(deadline) = deadline {
+        let wake = tokio::time::Instant::now()
+            .checked_add(delay)
+            .unwrap_or(deadline);
+        if deadline <= wake {
+            tokio::time::sleep_until(deadline).await;
+            return false;
+        }
+        tokio::time::sleep_until(wake).await;
+        true
     } else {
         tokio::time::sleep(delay).await;
+        true
     }
 }
 
@@ -41,7 +71,7 @@ pub(crate) async fn wait_for_retry(delay: Duration) {
 /// let retry = Retry::none();
 ///
 /// // Fixed delay between retries
-/// let retry = Retry::fixed(3, Duration::from_millis(200));
+/// let retry = Retry::fixed(3, Duration::from_millis(200))?;
 ///
 /// // Exponential backoff with jitter (1s, 2s, 4s, 5s, 5s)
 /// let retry = Retry::exponential(5)
@@ -49,11 +79,12 @@ pub(crate) async fn wait_for_retry(delay: Duration) {
 ///     .jitter(0.25)
 ///     .build()
 ///     .expect("valid retry configuration");
+/// # Ok::<(), async_snmp::RetryConfigError>(())
 /// ```
 #[derive(Clone, Debug)]
 pub struct Retry {
-    /// Maximum number of retry attempts (0 = no retries, request sent once)
-    max_attempts: u32,
+    /// Maximum number of retransmissions (0 = request sent once).
+    retries: u32,
     /// Backoff strategy between retries
     backoff: Backoff,
 }
@@ -61,6 +92,9 @@ pub struct Retry {
 /// Error returned when a retry configuration is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 pub enum RetryConfigError {
+    /// The retransmission count exceeds [`MAX_RETRIES`].
+    #[error("retries must not exceed {maximum} (got {requested})")]
+    TooManyRetries { requested: u32, maximum: u32 },
     /// The jitter factor is not finite or lies outside the supported range.
     #[error("jitter must be finite and between 0.0 and 1.0 (got {0})")]
     InvalidJitter(f64),
@@ -97,7 +131,7 @@ impl Default for Retry {
     /// Default: 3 retries with 1-second fixed delay between attempts.
     fn default() -> Self {
         Self {
-            max_attempts: 3,
+            retries: 3,
             backoff: Backoff::Fixed {
                 delay: Duration::from_secs(1),
             },
@@ -110,7 +144,7 @@ impl Retry {
     #[must_use]
     pub fn none() -> Self {
         Self {
-            max_attempts: 0,
+            retries: 0,
             backoff: Backoff::None,
         }
     }
@@ -119,14 +153,14 @@ impl Retry {
     ///
     /// # Arguments
     ///
-    /// * `attempts` - Maximum number of retry attempts
+    /// * `retries` - Maximum number of retransmissions
     /// * `delay` - Fixed delay before each retry
-    #[must_use]
-    pub fn fixed(attempts: u32, delay: Duration) -> Self {
-        Self {
-            max_attempts: attempts,
+    pub fn fixed(retries: u32, delay: Duration) -> Result<Self, RetryConfigError> {
+        Self::validate_retries(retries)?;
+        Ok(Self {
+            retries,
             backoff: Backoff::Fixed { delay },
-        }
+        })
     }
 
     /// Start building an exponential backoff retry configuration.
@@ -135,7 +169,7 @@ impl Retry {
     ///
     /// # Arguments
     ///
-    /// * `attempts` - Maximum number of retry attempts
+    /// * `retries` - Maximum number of retransmissions
     ///
     /// # Example
     ///
@@ -150,17 +184,19 @@ impl Retry {
     ///     .expect("valid retry configuration");
     /// ```
     #[must_use]
-    pub fn exponential(attempts: u32) -> RetryBuilder {
+    pub fn exponential(retries: u32) -> RetryBuilder {
         RetryBuilder {
-            max_attempts: attempts,
+            retries,
             ..Default::default()
         }
     }
 
-    /// Return the maximum number of retry attempts.
+    /// Return the maximum number of timeout retransmissions.
+    ///
+    /// Zero means one initial transmission and no retransmission.
     #[must_use]
-    pub fn max_attempts(&self) -> u32 {
-        self.max_attempts
+    pub fn retries(&self) -> u32 {
+        self.retries
     }
 
     /// Compute the delay before the next retry attempt.
@@ -232,7 +268,7 @@ impl Retry {
 /// Builder for exponential backoff retry configuration.
 #[derive(Debug, Clone)]
 pub struct RetryBuilder {
-    max_attempts: u32,
+    retries: u32,
     initial: Duration,
     max: Duration,
     jitter: f64,
@@ -241,7 +277,7 @@ pub struct RetryBuilder {
 impl Default for RetryBuilder {
     fn default() -> Self {
         Self {
-            max_attempts: 3,
+            retries: 3,
             initial: Duration::from_secs(1),
             max: Duration::from_secs(5),
             jitter: 0.25,
@@ -280,12 +316,14 @@ impl RetryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`RetryConfigError::InvalidJitter`] when jitter is NaN,
-    /// infinite, or outside `0.0..=1.0`.
+    /// Returns [`RetryConfigError::TooManyRetries`] when the configured count
+    /// exceeds [`MAX_RETRIES`], or [`RetryConfigError::InvalidJitter`] when
+    /// jitter is NaN, infinite, or outside `0.0..=1.0`.
     pub fn build(self) -> Result<Retry, RetryConfigError> {
+        Retry::validate_retries(self.retries)?;
         Retry::validate_jitter(self.jitter)?;
         Ok(Retry {
-            max_attempts: self.max_attempts,
+            retries: self.retries,
             backoff: Backoff::Exponential {
                 initial: self.initial,
                 max: self.max,
@@ -296,6 +334,17 @@ impl RetryBuilder {
 }
 
 impl Retry {
+    const fn validate_retries(retries: u32) -> Result<(), RetryConfigError> {
+        if retries <= MAX_RETRIES {
+            Ok(())
+        } else {
+            Err(RetryConfigError::TooManyRetries {
+                requested: retries,
+                maximum: MAX_RETRIES,
+            })
+        }
+    }
+
     pub(crate) fn validate_jitter(jitter: f64) -> Result<(), RetryConfigError> {
         if jitter.is_finite() && (0.0..=1.0).contains(&jitter) {
             Ok(())
@@ -353,7 +402,7 @@ mod tests {
     #[test]
     fn test_retry_none() {
         let retry = Retry::none();
-        assert_eq!(retry.max_attempts(), 0);
+        assert_eq!(retry.retries(), 0);
         assert_eq!(retry.compute_delay(0), Duration::ZERO);
     }
 
@@ -375,32 +424,54 @@ mod tests {
 
     #[test]
     fn maximum_total_delay_handles_maximum_retry_count_in_bounded_work() {
-        let fixed = Retry::fixed(u32::MAX, Duration::from_nanos(1));
+        let fixed = Retry::fixed(MAX_RETRIES, Duration::from_nanos(1)).unwrap();
         assert_eq!(
-            fixed.maximum_total_delay(u32::MAX),
-            Some(Duration::from_nanos(u64::from(u32::MAX)))
+            fixed.maximum_total_delay(MAX_RETRIES),
+            Some(Duration::from_nanos(u64::from(MAX_RETRIES)))
         );
 
-        let exponential = Retry::exponential(u32::MAX)
+        let exponential = Retry::exponential(MAX_RETRIES)
             .initial_delay(Duration::from_nanos(1))
             .max_delay(Duration::from_nanos(32))
             .jitter(1.0)
             .build()
             .unwrap();
-        assert!(exponential.maximum_total_delay(u32::MAX).is_some());
+        assert!(exponential.maximum_total_delay(MAX_RETRIES).is_some());
+    }
+
+    #[test]
+    fn maximum_and_over_maximum_retry_counts_are_deterministic() {
+        assert_eq!(
+            Retry::fixed(MAX_RETRIES, Duration::ZERO).unwrap().retries(),
+            MAX_RETRIES
+        );
+        assert_eq!(
+            Retry::fixed(MAX_RETRIES + 1, Duration::ZERO).unwrap_err(),
+            RetryConfigError::TooManyRetries {
+                requested: MAX_RETRIES + 1,
+                maximum: MAX_RETRIES,
+            }
+        );
+        assert_eq!(
+            Retry::exponential(MAX_RETRIES + 1).build().unwrap_err(),
+            RetryConfigError::TooManyRetries {
+                requested: MAX_RETRIES + 1,
+                maximum: MAX_RETRIES,
+            }
+        );
     }
 
     #[test]
     fn test_retry_default() {
         let retry = Retry::default();
-        assert_eq!(retry.max_attempts(), 3);
+        assert_eq!(retry.retries(), 3);
         assert_eq!(retry.compute_delay(0), Duration::from_secs(1));
     }
 
     #[test]
     fn test_retry_fixed() {
-        let retry = Retry::fixed(5, Duration::from_millis(200));
-        assert_eq!(retry.max_attempts(), 5);
+        let retry = Retry::fixed(5, Duration::from_millis(200)).unwrap();
+        assert_eq!(retry.retries(), 5);
         assert_eq!(retry.compute_delay(0), Duration::from_millis(200));
     }
 
@@ -413,7 +484,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(retry.max_attempts(), 4);
+        assert_eq!(retry.retries(), 4);
         assert_eq!(retry.compute_delay(0), Duration::from_millis(50));
         assert_eq!(retry.compute_delay(1), Duration::from_millis(75));
     }
@@ -450,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_compute_delay_fixed() {
-        let retry = Retry::fixed(3, Duration::from_millis(100));
+        let retry = Retry::fixed(3, Duration::from_millis(100)).unwrap();
         assert_eq!(retry.compute_delay(0), Duration::from_millis(100));
         assert_eq!(retry.compute_delay(1), Duration::from_millis(100));
         assert_eq!(retry.compute_delay(10), Duration::from_millis(100));
@@ -562,7 +633,7 @@ mod tests {
         let configurations = [
             Retry::none(),
             Retry::default(),
-            Retry::fixed(2, Duration::MAX),
+            Retry::fixed(2, Duration::MAX).unwrap(),
             Retry::exponential(2)
                 .initial_delay(Duration::MAX)
                 .max_delay(Duration::MAX)

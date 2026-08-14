@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder(container_target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(5))
-        .retry(Retry::fixed(2, Duration::ZERO))
+        .retry(Retry::fixed(2, Duration::ZERO).expect("valid retry count"))
         .build_with(&shared)
         .await?;
 
@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder(container_target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(5))
-        .retry(Retry::fixed(2, Duration::ZERO))
+        .retry(Retry::fixed(2, Duration::ZERO).expect("valid retry count"))
         .engine_cache(engine_cache.clone())
         .build_with(&shared_v3)
         .await?;

@@ -415,32 +415,7 @@ mod tests {
         }
     }
 
-    impl Transport for ScriptTransport {
-        fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send {
-            self.sends.fetch_add(1, Ordering::Relaxed);
-            let message = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
-                crate::DecodeConfig::default(),
-            )
-            .unwrap()
-            .value;
-            let pdu = message.pdu().standard().unwrap();
-            let record = RequestRecord {
-                pdu_type: pdu.pdu_type(),
-                oids: pdu
-                    .varbinds
-                    .iter()
-                    .map(|varbind| varbind.oid.clone())
-                    .collect(),
-            };
-            self.records.lock().unwrap().push(record.clone());
-            self.pending.lock().unwrap().push_back(PendingRequest {
-                request_id: pdu.request_id,
-                record,
-            });
-            async { Ok(()) }
-        }
-
+    impl ScriptTransport {
         fn recv(
             &self,
             _registration: RequestRegistration,
@@ -499,9 +474,37 @@ mod tests {
                 Ok((Bytes::from(encoded), peer))
             }
         }
+    }
 
-        fn recv_with<T, F>(
+    impl Transport for ScriptTransport {
+        fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            let message = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
+            let pdu = message.pdu().standard().unwrap();
+            let record = RequestRecord {
+                pdu_type: pdu.pdu_type(),
+                oids: pdu
+                    .varbinds
+                    .iter()
+                    .map(|varbind| varbind.oid.clone())
+                    .collect(),
+            };
+            self.records.lock().unwrap().push(record.clone());
+            self.pending.lock().unwrap().push_back(PendingRequest {
+                request_id: pdu.request_id,
+                record,
+            });
+            async { Ok(()) }
+        }
+
+        fn request_with<T, F>(
             &self,
+            data: &[u8],
             registration: RequestRegistration,
             validate: F,
         ) -> impl Future<Output = Result<T>> + Send
@@ -509,9 +512,10 @@ mod tests {
             T: Send,
             F: FnMut(Bytes, std::net::SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
         {
-            crate::transport::recv_with_scripted(
+            crate::transport::request_with_scripted(
+                self,
+                data,
                 registration,
-                self.peer_addr(),
                 move |registration| {
                     futures_util::stream::once(async move { self.recv(registration).await })
                 },

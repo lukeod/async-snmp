@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `Transport` now requires one complete `request_with` exchange
+  hook; the public `recv`, `recv_with`, and `request` split operations are
+  removed. Registrations carry one absolute deadline and bounded normalized
+  correlation aliases, and built-in UDP/TCP transports own setup-before-send,
+  validation, cancellation cleanup, and stream framing for the full exchange.
+- **Breaking:** retry configuration consistently counts retransmissions and is
+  fallible above `MAX_RETRIES` (16). `Retry::fixed` now returns `Result`, zero
+  retries still sends once, zero-delay retries yield, and clients may set an
+  optional `exchange_timeout` covering queueing, writes, rejected candidates,
+  response waits, and backoff. SNMPv3 discovery uses a separate deadline.
+- UDP receive error classification is shared across client, agent, and
+  notification roles. Datagram-local errors are discarded, while each role
+  explicitly chooses whether transient and fatal socket errors back off,
+  terminate the service, or return to the caller.
 - Inform sinks now share one lazily created UDP endpoint per destination
   address family. Per-sink clients and protocol state remain cached, while
   same-family sinks no longer retain redundant sockets and receive tasks.

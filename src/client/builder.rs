@@ -137,7 +137,7 @@ impl From<SocketAddr> for Target {
 ///     .auth(async_snmp::AuthProtocol::Sha256, "password")
 ///     .build().unwrap())
 ///     .request_timeout(Duration::from_secs(10))
-///     .retry(Retry::fixed(5, Duration::ZERO))
+///     .retry(Retry::fixed(5, Duration::ZERO).expect("valid retry count"))
 ///     .target("192.168.1.1:161")
 ///     .connect().await?;
 /// # Ok(())
@@ -157,6 +157,7 @@ impl From<SocketAddr> for Target {
 pub struct ClientBuilder {
     auth: Auth,
     request_timeout: Duration,
+    exchange_timeout: Option<Duration>,
     send_timeout: Duration,
     retry: Retry,
     max_oids_per_request: usize,
@@ -227,6 +228,7 @@ impl ClientBuilder {
         Self {
             auth: auth.into(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            exchange_timeout: None,
             send_timeout: DEFAULT_SEND_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
@@ -277,6 +279,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Set an optional deadline for one logical request exchange.
+    ///
+    /// The deadline includes retry backoff, transport queueing and
+    /// registration, writes, rejected response candidates, and response waits.
+    /// It supplements the finite retry count and per-transmission
+    /// [`request_timeout`](Self::request_timeout). For SNMPv3, implicit engine
+    /// discovery is a separate exchange with its own deadline; the ordinary
+    /// request receives a fresh deadline after discovery completes.
+    #[must_use]
+    pub fn exchange_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.exchange_timeout = timeout;
+        self
+    }
+
     /// Set the timeout for standalone sends (default: 5 seconds).
     ///
     /// This bounds transport queueing and write I/O for unconfirmed traps.
@@ -308,11 +324,11 @@ impl ClientBuilder {
     ///
     /// // 5 retries with no delay (immediate retry on timeout)
     /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .retry(Retry::fixed(5, Duration::ZERO));
+    ///     .retry(Retry::fixed(5, Duration::ZERO).expect("valid retry count"));
     ///
     /// // Fixed delay between retries
     /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .retry(Retry::fixed(3, Duration::from_millis(200)));
+    ///     .retry(Retry::fixed(3, Duration::from_millis(200)).expect("valid retry count"));
     ///
     /// // Exponential backoff with jitter
     /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
@@ -645,6 +661,7 @@ impl ClientBuilder {
             decode_config: self.decode_config,
             community_response_policy: self.community_response_policy,
             request_timeout: self.request_timeout,
+            exchange_timeout: self.exchange_timeout,
             send_timeout: self.send_timeout,
             retry: self.retry.clone(),
             max_oids_per_request: self.max_oids_per_request,
@@ -1246,7 +1263,7 @@ mod tests {
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(5));
         assert_eq!(DEFAULT_SEND_TIMEOUT, Duration::from_secs(5));
         assert_eq!(DEFAULT_CONSTRUCTION_TIMEOUT, Duration::from_secs(5));
-        assert_eq!(builder.retry.max_attempts(), 3);
+        assert_eq!(builder.retry.retries(), 3);
         assert_eq!(builder.max_oids_per_request, DEFAULT_MAX_OIDS_PER_REQUEST);
         assert_eq!(
             builder.response_shape_policy,
@@ -1279,7 +1296,7 @@ mod tests {
         let builder = ClientBuilder::new(Auth::v2c("private"))
             .request_timeout(Duration::from_secs(10))
             .send_timeout(Duration::from_secs(8))
-            .retry(Retry::fixed(5, Duration::ZERO))
+            .retry(Retry::fixed(5, Duration::ZERO).unwrap())
             .max_oids_per_request(20)
             .response_shape_policy(crate::client::ResponseShapePolicy::Strict)
             .max_repetitions(50)
@@ -1300,7 +1317,7 @@ mod tests {
             Duration::from_secs(8)
         );
         assert_eq!(builder.construction_timeout, Duration::from_secs(7));
-        assert_eq!(builder.client.retry.max_attempts(), 5);
+        assert_eq!(builder.client.retry.retries(), 5);
         assert_eq!(builder.client.max_oids_per_request, 20);
         assert_eq!(
             builder.client.build_config().response_shape_policy,
@@ -1611,8 +1628,9 @@ mod tests {
             Ok(())
         }
 
-        async fn recv_with<T, F>(
+        async fn request_with<T, F>(
             &self,
+            _data: &[u8],
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -1661,7 +1679,7 @@ mod tests {
             .expect("valid custom-transport client");
 
         assert_eq!(client.inner.config.request_timeout, Duration::from_secs(9));
-        assert_eq!(client.inner.config.retry.max_attempts(), 0);
+        assert_eq!(client.inner.config.retry.retries(), 0);
         assert_eq!(client.inner.config.max_oids_per_request, 7);
         assert_eq!(client.inner.config.walk_mode, WalkMode::GetNext);
         assert_eq!(

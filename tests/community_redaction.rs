@@ -126,9 +126,10 @@ fn community_notification_debug_is_redacted_for_every_variant() {
 
 #[test]
 fn request_registration_debug_redacts_identity_but_keeps_correlation_details() {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(19);
     let registration = RequestRegistration::community(
         415,
-        Duration::from_secs(19),
+        deadline,
         CommunityVersion::V2c,
         Community::from(SENTINEL),
         CommunityResponsePolicy::Exact,
@@ -137,10 +138,9 @@ fn request_registration_debug_redacts_identity_but_keeps_correlation_details() {
     assert_redacted(&registration);
     let rendered = format!("{registration:?}");
     assert!(rendered.contains("415"));
-    assert!(rendered.contains("19s"));
     assert!(rendered.contains("V2c"));
     assert_eq!(registration.request_id(), 415);
-    assert_eq!(registration.timeout(), Duration::from_secs(19));
+    assert_eq!(registration.deadline(), deadline);
 }
 
 #[cfg(feature = "agent")]

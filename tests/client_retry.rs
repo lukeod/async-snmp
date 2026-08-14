@@ -15,7 +15,7 @@ async fn client_retries_on_timeout() {
 
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
         .request_timeout(Duration::from_millis(100))
-        .retry(Retry::fixed(2, Duration::ZERO))
+        .retry(Retry::fixed(2, Duration::ZERO).unwrap())
         .connect()
         .await
         .unwrap();
@@ -39,7 +39,7 @@ async fn client_fails_after_max_retries() {
 
     let client = Client::builder(addr, Auth::v2c("public"))
         .request_timeout(Duration::from_millis(50))
-        .retry(Retry::fixed(2, Duration::ZERO)) // 3 total attempts
+        .retry(Retry::fixed(2, Duration::ZERO).unwrap()) // 3 total attempts
         .connect()
         .await
         .unwrap();

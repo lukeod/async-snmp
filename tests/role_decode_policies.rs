@@ -54,8 +54,9 @@ impl Transport for CommunityPolicyTransport {
         Ok(())
     }
 
-    async fn recv_with<T, F>(
+    async fn request_with<T, F>(
         &self,
+        request: &[u8],
         registration: RequestRegistration,
         mut validate: F,
     ) -> async_snmp::Result<T>
@@ -64,11 +65,13 @@ impl Transport for CommunityPolicyTransport {
         F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
     {
         let peer = self.peer_addr();
+        let started = tokio::time::Instant::now();
+        self.send(request).await?;
         loop {
             let Some(data) = self.replies.lock().unwrap().pop_front() else {
                 return Err(Error::Timeout {
                     target: peer,
-                    elapsed: registration.timeout(),
+                    elapsed: started.elapsed(),
                     retries: 0,
                 }
                 .boxed());
@@ -82,20 +85,6 @@ impl Transport for CommunityPolicyTransport {
                 return Ok(value);
             }
         }
-    }
-
-    async fn request_with<T, F>(
-        &self,
-        data: &[u8],
-        registration: RequestRegistration,
-        validate: F,
-    ) -> async_snmp::Result<T>
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
-    {
-        self.send(data).await?;
-        self.recv_with(registration, validate).await
     }
 
     fn peer_addr(&self) -> SocketAddr {

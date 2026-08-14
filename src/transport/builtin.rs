@@ -64,35 +64,6 @@ impl Transport for BuiltinTransport {
         }
     }
 
-    async fn recv(&self, registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
-        match self {
-            Self::Udp(transport) => transport.recv(registration).await,
-            Self::Tcp(transport) => transport.recv(registration).await,
-        }
-    }
-
-    async fn recv_with<T, F>(&self, registration: RequestRegistration, validate: F) -> Result<T>
-    where
-        T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
-    {
-        match self {
-            Self::Udp(transport) => transport.recv_with(registration, validate).await,
-            Self::Tcp(transport) => transport.recv_with(registration, validate).await,
-        }
-    }
-
-    async fn request(
-        &self,
-        data: &[u8],
-        registration: RequestRegistration,
-    ) -> Result<(Bytes, SocketAddr)> {
-        match self {
-            Self::Udp(transport) => transport.request(data, registration).await,
-            Self::Tcp(transport) => transport.request(data, registration).await,
-        }
-    }
-
     async fn request_with<T, F>(
         &self,
         data: &[u8],
@@ -156,8 +127,6 @@ impl Transport for BuiltinTransport {
 mod tests {
     use super::*;
     use crate::transport::{TcpOptions, UdpTransport};
-    use futures::poll;
-    use std::task::Poll;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
@@ -192,31 +161,16 @@ mod tests {
         assert_eq!(&buffer[..length], sent);
         assert_eq!(source, expected_local);
 
-        let recv = transport.recv(registration(2));
-        tokio::pin!(recv);
-        assert!(matches!(poll!(recv.as_mut()), Poll::Pending));
-        server.send_to(&response(2), expected_local).await.unwrap();
-        let (received, source) = recv.await.unwrap();
-        assert_eq!(received.as_ref(), response(2));
-        assert_eq!(source, server_addr);
-
-        let recv = transport.recv_with(registration(3), reject_first());
-        tokio::pin!(recv);
-        assert!(matches!(poll!(recv.as_mut()), Poll::Pending));
-        server.send_to(&response(3), expected_local).await.unwrap();
-        server
-            .send_to(&alternate_response(3), expected_local)
-            .await
-            .unwrap();
-        assert_eq!(recv.await.unwrap().as_ref(), alternate_response(3));
-
         let server_exchange = async {
             let (length, source) = server.recv_from(&mut buffer).await.unwrap();
             assert_eq!(&buffer[..length], request(4));
             server.send_to(&response(4), source).await.unwrap();
         };
         let request_data = request(4);
-        let client_exchange = transport.request(&request_data, registration(4));
+        let client_exchange =
+            transport.request_with(&request_data, registration(4), |data, source| {
+                Ok(Candidate::Accept((data, source)))
+            });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         assert_eq!(result.unwrap().0.as_ref(), response(4));
 
@@ -259,26 +213,14 @@ mod tests {
         assert_eq!(read_frame(&mut server).await, request(1));
 
         let server_exchange = async {
-            server.write_all(&response(2)).await.unwrap();
-        };
-        let client_exchange = transport.recv(registration(2));
-        let ((), result) = tokio::join!(server_exchange, client_exchange);
-        assert_eq!(result.unwrap().0.as_ref(), response(2));
-
-        let server_exchange = async {
-            server.write_all(&response(3)).await.unwrap();
-            server.write_all(&alternate_response(3)).await.unwrap();
-        };
-        let client_exchange = transport.recv_with(registration(3), reject_first());
-        let ((), result) = tokio::join!(server_exchange, client_exchange);
-        assert_eq!(result.unwrap().as_ref(), alternate_response(3));
-
-        let server_exchange = async {
             assert_eq!(read_frame(&mut server).await, request(4));
             server.write_all(&response(4)).await.unwrap();
         };
         let request_data = request(4);
-        let client_exchange = transport.request(&request_data, registration(4));
+        let client_exchange =
+            transport.request_with(&request_data, registration(4), |data, source| {
+                Ok(Candidate::Accept((data, source)))
+            });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         assert_eq!(result.unwrap().0.as_ref(), response(4));
 

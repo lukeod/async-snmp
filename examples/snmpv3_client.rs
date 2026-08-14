@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder(target, auth)
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(10))
-        .retry(Retry::fixed(3, Duration::ZERO))
+        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count"))
         .connect()
         .await?;
 
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Each client reuses the master keys; only localization is performed
         match Client::builder(*target_addr, auth)
             .request_timeout(Duration::from_secs(2))
-            .retry(Retry::fixed(1, Duration::ZERO))
+            .retry(Retry::fixed(1, Duration::ZERO).expect("valid retry count"))
             .connect()
             .await
         {
