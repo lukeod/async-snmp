@@ -10,13 +10,13 @@ fuzz_target!(|data: &[u8]| {
     let bytes = Bytes::copy_from_slice(data);
 
     // Fuzz the unified Message decoder (auto-detects version)
-    let _ = Message::decode(bytes.clone());
+    let _ = Message::decode(bytes.clone(), async_snmp::DecodeConfig::default());
 
     // Fuzz v1/v2c community message decoder directly
-    let _ = CommunityMessage::decode(bytes.clone());
+    let _ = CommunityMessage::decode(bytes.clone(), async_snmp::DecodeConfig::default());
 
     // Fuzz v3 message decoder directly
-    let _ = V3Message::decode(bytes.clone());
+    let _ = V3Message::decode(bytes.clone(), async_snmp::DecodeConfig::default());
 
     // Fuzz PDU decoder
     let mut decoder = async_snmp::ber::Decoder::new(bytes.clone());

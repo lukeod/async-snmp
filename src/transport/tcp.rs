@@ -1396,7 +1396,7 @@ mod tests {
             Bytes::from_static(b"public"),
             super::super::CommunityResponsePolicy::Exact,
         )
-        .with_decode_policy(crate::message::DecodePolicy::Strict);
+        .with_decode_config(crate::DecodeConfig::STRICT);
         let (response, _) = transport
             .request(&build_request_with_id(77), registration)
             .await

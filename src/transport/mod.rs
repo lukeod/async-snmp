@@ -26,10 +26,10 @@ pub use tcp::*;
 pub use udp::*;
 
 use crate::Community;
+use crate::DecodeConfig;
 use crate::ber::length::parse_ber_length;
 use crate::error::Error;
 use crate::error::Result;
-use crate::message::DecodePolicy;
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_LIMITS};
 use crate::version::{CommunityVersion, Version};
 use bytes::Bytes;
@@ -162,8 +162,8 @@ pub struct RequestRegistration {
     timeout: Duration,
     /// Protocol-specific response identity.
     correlation: ResponseCorrelation,
-    /// Top-level SNMP message consumption policy used by correlation.
-    decode_policy: DecodePolicy,
+    /// Decode configuration snapshot used by correlation and validation.
+    decode_config: DecodeConfig,
     /// Prior transmission IDs that may still receive a response for this operation.
     aliases: Vec<i32>,
 }
@@ -186,7 +186,7 @@ impl RequestRegistration {
                 community: community.into(),
                 policy,
             },
-            decode_policy: DecodePolicy::Compatible,
+            decode_config: DecodeConfig::DEFAULT,
             aliases: Vec::new(),
         }
     }
@@ -198,7 +198,7 @@ impl RequestRegistration {
             request_id,
             timeout,
             correlation: ResponseCorrelation::V3,
-            decode_policy: DecodePolicy::Compatible,
+            decode_config: DecodeConfig::DEFAULT,
             aliases: Vec::new(),
         }
     }
@@ -209,7 +209,7 @@ impl RequestRegistration {
             request_id,
             timeout,
             correlation: ResponseCorrelation::Unchecked,
-            decode_policy: DecodePolicy::Compatible,
+            decode_config: DecodeConfig::DEFAULT,
             aliases: Vec::new(),
         }
     }
@@ -229,24 +229,24 @@ impl RequestRegistration {
         self
     }
 
-    /// Select the top-level message consumption policy for correlation.
+    /// Attach the decode configuration snapshot used for this exchange.
     ///
-    /// The default is [`DecodePolicy::Compatible`], matching the client decode
+    /// The default is [`DecodeConfig::DEFAULT`], matching the client decode
     /// default. Compatible correlation accepts a bounded UDP datagram suffix
     /// after one complete declared SNMP message TLV as an explicit deviation
     /// from RFC 3417's one-message-per-datagram mapping. Strict correlation
     /// rejects such a suffix before invoking the response validator. In either
     /// mode, identity fields are read only from the declared top-level envelope.
     #[must_use]
-    pub const fn with_decode_policy(mut self, policy: DecodePolicy) -> Self {
-        self.decode_policy = policy;
+    pub const fn with_decode_config(mut self, config: DecodeConfig) -> Self {
+        self.decode_config = config;
         self
     }
 
-    /// Top-level message consumption policy used by correlation.
+    /// Decode configuration used by correlation and full validation.
     #[must_use]
-    pub const fn decode_policy(&self) -> DecodePolicy {
-        self.decode_policy
+    pub const fn decode_config(&self) -> DecodeConfig {
+        self.decode_config
     }
 
     /// Primary request ID (v1/v2c) or message ID (v3).
@@ -288,7 +288,7 @@ impl RequestRegistration {
             return ResponseIdentity::Match;
         }
 
-        let Some(envelope) = CorrelationEnvelope::parse(data, self.decode_policy) else {
+        let Some(envelope) = CorrelationEnvelope::parse(data, self.decode_config) else {
             return ResponseIdentity::Reject;
         };
         let Some(response_id) = envelope.request_id() else {
@@ -1070,15 +1070,14 @@ struct CorrelationEnvelope<'a> {
 }
 
 impl<'a> CorrelationEnvelope<'a> {
-    fn parse(data: &'a [u8], policy: DecodePolicy) -> Option<Self> {
+    fn parse(data: &'a [u8], config: DecodeConfig) -> Option<Self> {
         if data.first().copied()? != 0x30 {
             return None;
         }
         let (outer_len, outer_len_bytes) = parse_ber_length(data.get(1..)?)?;
         let content_start = 1usize.checked_add(outer_len_bytes)?;
         let content_end = content_start.checked_add(outer_len)?;
-        if content_end > data.len() || (policy == DecodePolicy::Strict && content_end != data.len())
-        {
+        if content_end > data.len() || (!config.trailing_bytes && content_end != data.len()) {
             return None;
         }
 
@@ -1135,7 +1134,7 @@ impl<'a> CorrelationEnvelope<'a> {
 /// a datagram suffix.
 #[cfg(test)]
 pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])> {
-    CorrelationEnvelope::parse(data, DecodePolicy::Compatible)?.community_identity()
+    CorrelationEnvelope::parse(data, DecodeConfig::default())?.community_identity()
 }
 
 // ============================================================================
@@ -1158,7 +1157,7 @@ pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])
 /// find the appropriate ID. A bounded datagram suffix is ignored here so the
 /// registered strict/compatible policy can decide whether to accept it.
 pub(crate) fn extract_request_id(data: &[u8]) -> Option<i32> {
-    CorrelationEnvelope::parse(data, DecodePolicy::Compatible)?.request_id()
+    CorrelationEnvelope::parse(data, DecodeConfig::default())?.request_id()
 }
 
 /// Extract msgID from V3 message starting at msgGlobalData position.
@@ -1467,7 +1466,7 @@ mod extract_tests {
             );
             assert_eq!(
                 registration_for(version)
-                    .with_decode_policy(DecodePolicy::Strict)
+                    .with_decode_config(DecodeConfig::STRICT)
                     .evaluate_response_identity(&suffixed, true),
                 ResponseIdentity::Reject,
                 "strict {version:?} correlation accepted a datagram suffix"

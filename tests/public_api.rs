@@ -15,11 +15,11 @@ use async_snmp::{
 use async_snmp::{
     Auth, AuthoritativeEngine, AuthoritativeEnginePersistenceError,
     AuthoritativeEnginePersistenceOperation, Client, ClientConfig, CommunityVersion,
-    CompatibilityPolicy, ConstructionStage, DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_SEND_TIMEOUT, DecodeError, DecodeErrorKind, DecodeErrorOrigin, Error, ErrorIndex,
-    ErrorKind, ErrorStatus, GetBulkPdu, Oid, Pdu, PduBody, RequestPdu, RequestRegistration,
-    ResponsePdu, StandardPduType, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value,
-    ValueKind, VarBind, Version, WalkAbortReason,
+    ConstructionStage, DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT,
+    DecodeConfig, DecodeError, DecodeErrorKind, DecodeErrorOrigin, Error, ErrorIndex, ErrorKind,
+    ErrorStatus, GetBulkPdu, Oid, Pdu, PduBody, RequestPdu, RequestRegistration, ResponsePdu,
+    StandardPduType, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind,
+    VarBind, Version, WalkAbortReason,
 };
 use bytes::Bytes;
 
@@ -120,9 +120,9 @@ fn extensible_configs_support_default_plus_field_mutation() {
     assert_eq!(client.request_timeout, Duration::from_secs(2));
     assert_eq!(client.send_timeout, Duration::from_secs(3));
 
-    let mut compatibility = CompatibilityPolicy::STRICT;
-    compatibility.clamp_bounded_strings = true;
-    assert!(compatibility.clamp_bounded_strings);
+    let mut config = DecodeConfig::STRICT;
+    config.clamp_bounded_strings = true;
+    assert!(config.clamp_bounded_strings);
 
     let mut tcp = TcpOptions::default();
     tcp.max_message_size = 4096;
@@ -394,7 +394,8 @@ fn prepared_set_lifecycle_types_are_public() {
 
 #[test]
 fn decode_errors_are_public_structured_and_peer_free_for_standalone_input() {
-    let error = Message::decode(Bytes::from_static(&[0x31, 0x00])).unwrap_err();
+    let error =
+        Message::decode(Bytes::from_static(&[0x31, 0x00]), DecodeConfig::default()).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Decode);
     assert!(matches!(
         error.as_ref(),
@@ -484,7 +485,10 @@ fn retrieval_requests_reencode_ignored_non_null_values_for_each_version() {
                         .unwrap()
                         .encode()
                         .unwrap();
-                    let decoded = CommunityMessage::decode(encoded.clone()).unwrap();
+                    let decoded =
+                        CommunityMessage::decode(encoded.clone(), DecodeConfig::default())
+                            .unwrap()
+                            .value;
                     assert_eq!(decoded.encode().unwrap(), encoded);
                 }
                 Version::V3 => {
@@ -503,7 +507,9 @@ fn retrieval_requests_reencode_ignored_non_null_values_for_each_version() {
                             .unwrap()
                             .encode()
                             .unwrap();
-                    let decoded = V3Message::decode(encoded.clone()).unwrap();
+                    let decoded = V3Message::decode(encoded.clone(), DecodeConfig::default())
+                        .unwrap()
+                        .value;
                     assert_eq!(decoded.encode().unwrap(), encoded);
                 }
                 _ => unreachable!("test enumerates all supported versions"),
@@ -610,7 +616,10 @@ fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
     .encode()
     .unwrap();
     assert_invalid_message(CommunityMessage::v2c("public", too_big.clone()));
-    let decoded_v2c = CommunityMessage::decode(raw_v2c_message(&varbinds[0])).unwrap();
+    let decoded_v2c =
+        CommunityMessage::decode(raw_v2c_message(&varbinds[0]), DecodeConfig::default())
+            .unwrap()
+            .value;
     assert_invalid_message(decoded_v2c.encode());
 
     let scoped = ScopedPdu::new(Bytes::from_static(b"engine"), Bytes::new(), too_big);
@@ -635,8 +644,12 @@ fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
         security_params.clone(),
         scoped,
     ));
-    let decoded_v3 =
-        V3Message::decode(raw_v3_message(&global, &security_params, &varbinds[0])).unwrap();
+    let decoded_v3 = V3Message::decode(
+        raw_v3_message(&global, &security_params, &varbinds[0]),
+        DecodeConfig::default(),
+    )
+    .unwrap()
+    .value;
     assert_invalid_message(decoded_v3.encode());
 
     for version in [Version::V2c, Version::V3] {

@@ -1,4 +1,5 @@
-use async_snmp::message::{CommunityMessage, DecodePolicy, Message};
+use async_snmp::DecodeConfig;
+use async_snmp::message::{CommunityMessage, Message};
 use async_snmp::{Auth, Client, Oid, RequestPdu, ResponsePdu, Retry, Value, VarBind, Version};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -17,7 +18,9 @@ async fn wrong_community_does_not_consume_pending_udp_request() {
         let mut buf = [0u8; 4096];
         let (len, source) = socket.recv_from(&mut buf).await.unwrap();
         server_requests.fetch_add(1, Ordering::Relaxed);
-        let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let request = Message::decode(Bytes::copy_from_slice(&buf[..len]), DecodeConfig::default())
+            .unwrap()
+            .value;
         let request_id = request.into_pdu().unwrap().request_id();
         let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
 
@@ -77,7 +80,9 @@ async fn malformed_and_wrong_pdu_candidates_do_not_consume_udp_exchange() {
     let server = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         let (len, source) = socket.recv_from(&mut buf).await.unwrap();
-        let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let request = Message::decode(Bytes::copy_from_slice(&buf[..len]), DecodeConfig::default())
+            .unwrap()
+            .value;
         let request_id = request.into_pdu().unwrap().request_id();
         let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
 
@@ -155,7 +160,9 @@ async fn non_utf8_community_correlates_udp_response() {
         let mut buf = [0u8; 4096];
         let (len, source) = socket.recv_from(&mut buf).await.unwrap();
         let Message::Community(request) =
-            Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap()
+            Message::decode(Bytes::copy_from_slice(&buf[..len]), DecodeConfig::default())
+                .unwrap()
+                .value
         else {
             panic!("expected community request");
         };
@@ -199,13 +206,15 @@ async fn non_utf8_community_correlates_udp_response() {
     server.await.unwrap();
 }
 
-async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: DecodePolicy) {
+async fn udp_suffix_policy(version: async_snmp::CommunityVersion, config: DecodeConfig) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let peer = socket.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         let (len, source) = socket.recv_from(&mut buf).await.unwrap();
-        let request = Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let request = Message::decode(Bytes::copy_from_slice(&buf[..len]), DecodeConfig::default())
+            .unwrap()
+            .value;
         let request_id = request.into_pdu().unwrap().request_id();
         let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
         let response = CommunityMessage::new(
@@ -240,7 +249,7 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: Decode
             .as_ref(),
         );
         socket.send_to(&suffixed, source).await.unwrap();
-        if policy == DecodePolicy::Strict {
+        if !config.trailing_bytes {
             socket.send_to(&response, source).await.unwrap();
         }
     });
@@ -250,7 +259,7 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: Decode
         async_snmp::CommunityVersion::V2c => Auth::v2c("public"),
     };
     let result = Client::builder(peer, auth)
-        .decode_policy(policy)
+        .decode_config(config)
         .request_timeout(Duration::from_secs(2))
         .retry(Retry::none())
         .connect()
@@ -263,7 +272,7 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, policy: Decode
         result.varbinds[0].value,
         Value::OctetString(Bytes::from_static(b"suffix policy"))
     );
-    if policy == DecodePolicy::Compatible {
+    if config.trailing_bytes {
         assert!(matches!(
             result.metadata.decode_anomalies.as_slice(),
             [async_snmp::DecodeAnomaly::TrailingBytes {
@@ -283,7 +292,7 @@ async fn udp_client_suffix_policy_is_coherent_for_v1_and_v2c() {
         async_snmp::CommunityVersion::V1,
         async_snmp::CommunityVersion::V2c,
     ] {
-        udp_suffix_policy(version, DecodePolicy::Compatible).await;
-        udp_suffix_policy(version, DecodePolicy::Strict).await;
+        udp_suffix_policy(version, DecodeConfig::default()).await;
+        udp_suffix_policy(version, DecodeConfig::STRICT).await;
     }
 }

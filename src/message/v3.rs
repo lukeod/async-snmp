@@ -23,10 +23,10 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
-use crate::compatibility::CompatibilityPolicy;
+use crate::compatibility::DecodeConfig;
 use crate::error::internal::{DecodeErrorKind, DecodeErrorOrigin};
 use crate::error::{DecodeError, Error, Result};
-use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
+use crate::message::{DecodeOutcome, finalize_envelope};
 use crate::message_size::{MESSAGE_SIZE_MINIMUM, MessageSize};
 use crate::pdu::Pdu;
 
@@ -390,21 +390,15 @@ fn decode_scoped_pdu_with_anomalies(
     source: SocketAddr,
     privacy: Option<crate::v3::PrivProtocol>,
 ) -> Result<DecodeOutcome<ScopedPdu>> {
-    decode_scoped_pdu_with_policies(
-        data,
-        base_offset,
-        source,
-        privacy,
-        CompatibilityPolicy::default(),
-    )
+    decode_scoped_pdu(data, base_offset, source, privacy, DecodeConfig::default())
 }
 
-pub(crate) fn decode_scoped_pdu_with_policies(
+pub(crate) fn decode_scoped_pdu(
     data: Bytes,
     base_offset: usize,
     source: SocketAddr,
     privacy: Option<crate::v3::PrivProtocol>,
-    compatibility: CompatibilityPolicy,
+    config: DecodeConfig,
 ) -> Result<DecodeOutcome<ScopedPdu>> {
     let origin = if privacy.is_some() {
         DecodeErrorOrigin::DecryptedScopedPdu
@@ -413,7 +407,7 @@ pub(crate) fn decode_scoped_pdu_with_policies(
     };
     let anomalies = std::cell::RefCell::new(Vec::new());
     let mut decoder = Decoder::with_origin_context(data, base_offset, origin, Some(source))
-        .with_compatibility_policy(compatibility)
+        .with_decode_config(config)
         .with_anomaly_sink(&anomalies);
     let scoped = ScopedPdu::decode(&mut decoder)?;
     let maximum_suffix = match privacy {
@@ -549,8 +543,11 @@ impl V3Message {
             )
             .boxed());
         }
-        let usm = crate::v3::UsmSecurityParams::decode(self.security_params.clone())?;
-        self.validate_decoded_inbound_envelope(&usm)
+        let usm = crate::v3::UsmSecurityParams::decode(
+            self.security_params.clone(),
+            DecodeConfig::STRICT,
+        )?;
+        self.validate_decoded_inbound_envelope(&usm.value)
     }
 
     fn validate_decoded_inbound_envelope(&self, usm: &crate::v3::UsmSecurityParams) -> Result<()> {
@@ -633,46 +630,15 @@ impl V3Message {
         Ok(buf.finish())
     }
 
-    /// Decode from BER using the default compatible top-level policy.
+    /// Decode a complete V3 message and retain every accepted anomaly.
     ///
-    /// For encrypted messages, returns `V3MessageData::Encrypted` with the raw
-    /// ciphertext. For plaintext messages this parses the scoped PDU without
-    /// performing USM authentication. Receive paths handling untrusted input
-    /// should use [`RawV3Message::decode`] so authentication and timeliness can
-    /// precede scoped-PDU parsing. A suffix after the complete message emits
-    /// the stable `async_snmp::message` `trailing_bytes` anomaly event; use
-    /// [`Self::decode_with_policy`] to retain accepted anomaly metadata; this
-    /// convenience method discards it.
-    pub fn decode(data: Bytes) -> Result<Self> {
-        Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
-    }
-
-    /// Decode using an explicit top-level consumption policy and retain any
-    /// compatible-mode trailing-byte anomaly.
-    pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
-        Self::decode_with_policies(data, policy, CompatibilityPolicy::default())
-    }
-
-    /// Decode using an explicit malformed-input compatibility policy.
-    ///
-    /// Accepted anomaly metadata is discarded. Use [`Self::decode_with_policies`]
-    /// to retain it.
-    pub fn decode_with_compatibility_policy(
-        data: Bytes,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<Self> {
-        Ok(Self::decode_with_policies(data, DecodePolicy::Compatible, compatibility)?.value)
-    }
-
-    /// Decode using independent envelope-consumption and malformed-input policies.
-    pub fn decode_with_policies(
-        data: Bytes,
-        policy: DecodePolicy,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<DecodeOutcome<Self>> {
+    /// For encrypted messages this retains the ciphertext. Plaintext scoped
+    /// data is parsed without USM authentication; untrusted receive paths use
+    /// [`RawV3Message::decode`] and staged security processing instead.
+    pub fn decode(data: Bytes, config: DecodeConfig) -> Result<DecodeOutcome<Self>> {
         let anomalies = std::cell::RefCell::new(Vec::new());
         let mut decoder = Decoder::new(data)
-            .with_compatibility_policy(compatibility)
+            .with_decode_config(config)
             .with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
@@ -683,21 +649,13 @@ impl V3Message {
         }
 
         let value = Self::decode_from_sequence(&mut seq)?;
-        finalize_envelope(&seq, &decoder, policy)?;
+        finalize_envelope(&seq, &decoder, config)?;
         drop(seq);
         drop(decoder);
         Ok(DecodeOutcome {
             value,
             anomalies: anomalies.into_inner(),
         })
-    }
-
-    /// Decode while requiring the input to contain exactly one message TLV.
-    ///
-    /// Accepted BER/value compatibility anomaly metadata is discarded. Use
-    /// [`Self::decode_with_policies`] with [`DecodePolicy::Strict`] to retain it.
-    pub fn decode_strict(data: Bytes) -> Result<Self> {
-        Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
     }
 
     /// Decode from a sequence decoder where version has already been read.
@@ -795,64 +753,26 @@ pub enum RawMsgData {
 }
 
 impl RawV3Message {
-    /// Decode the outer envelope using the default compatible top-level policy.
-    ///
-    /// The received security level is derived from the message's own flags;
-    /// invalid flag combinations (privacy without authentication) are
-    /// rejected here, before any authentication or PDU processing. A suffix
-    /// after the complete message emits the stable `async_snmp::message`
-    /// `trailing_bytes` anomaly event; use [`Self::decode_with_policy`] to
-    /// retain accepted anomaly metadata; this convenience method discards it.
-    pub fn decode(data: Bytes) -> Result<Self> {
-        Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
-    }
-
-    /// Decode using an explicit top-level consumption policy and retain any
-    /// compatible-mode trailing-byte anomaly.
-    pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
+    /// Decode the unprocessed outer V3 envelope and retain accepted anomalies.
+    pub fn decode(data: Bytes, config: DecodeConfig) -> Result<DecodeOutcome<Self>> {
         let input_len = data.len();
-        Self::decode_bounded(data, input_len, None, policy)
+        Self::decode_bounded(data, input_len, None, config)
     }
 
-    /// Decode while requiring the input to contain exactly one message TLV.
-    ///
-    /// Accepted outer-envelope anomaly metadata is discarded. Use
-    /// [`Self::decode_with_policy`] with [`DecodePolicy::Strict`] to retain it.
-    pub fn decode_strict(data: Bytes) -> Result<Self> {
-        Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
-    }
-
-    pub(crate) fn decode_bounded_with_target_and_compatibility(
+    pub(crate) fn decode_bounded_with_target(
         data: Bytes,
         maximum: usize,
         target: SocketAddr,
-        policy: DecodePolicy,
-        compatibility: CompatibilityPolicy,
+        config: DecodeConfig,
     ) -> Result<DecodeOutcome<Self>> {
-        Self::decode_bounded_with_compatibility(data, maximum, Some(target), policy, compatibility)
+        Self::decode_bounded(data, maximum, Some(target), config)
     }
 
     fn decode_bounded(
         data: Bytes,
         maximum: usize,
         peer: Option<SocketAddr>,
-        policy: DecodePolicy,
-    ) -> Result<DecodeOutcome<Self>> {
-        Self::decode_bounded_with_compatibility(
-            data,
-            maximum,
-            peer,
-            policy,
-            CompatibilityPolicy::default(),
-        )
-    }
-
-    fn decode_bounded_with_compatibility(
-        data: Bytes,
-        maximum: usize,
-        peer: Option<SocketAddr>,
-        policy: DecodePolicy,
-        compatibility: CompatibilityPolicy,
+        config: DecodeConfig,
     ) -> Result<DecodeOutcome<Self>> {
         if data.len() > maximum {
             let mut error = DecodeError::new(
@@ -867,7 +787,7 @@ impl RawV3Message {
         }
         let anomalies = std::cell::RefCell::new(Vec::new());
         let mut decoder = Decoder::with_optional_peer(data, peer)
-            .with_compatibility_policy(compatibility)
+            .with_decode_config(config)
             .with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
@@ -900,7 +820,7 @@ impl RawV3Message {
             security_params_offset,
             msg_data,
         };
-        finalize_envelope(&seq, &decoder, policy)?;
+        finalize_envelope(&seq, &decoder, config)?;
         drop(seq);
         drop(decoder);
         Ok(DecodeOutcome {
@@ -1156,8 +1076,10 @@ mod tests {
 
     #[test]
     fn v3_decode_remains_permissive_for_noncanonical_too_big_response() {
-        let decoded = V3Message::decode(raw_too_big_message_with_varbind())
-            .expect("receive path accepts the PDU");
+        let decoded =
+            V3Message::decode(raw_too_big_message_with_varbind(), DecodeConfig::default())
+                .expect("receive path accepts the PDU")
+                .value;
         let pdu = decoded.pdu().unwrap();
         assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
         assert_eq!(pdu.error_index(), 0);
@@ -1287,7 +1209,7 @@ mod tests {
             })
             .unwrap();
 
-        let error = V3Message::decode(encoded.finish()).unwrap_err();
+        let error = V3Message::decode(encoded.finish(), DecodeConfig::default()).unwrap_err();
         assert!(matches!(&*error, Error::InvalidMessage(_)));
     }
 
@@ -1312,7 +1234,7 @@ mod tests {
             .unwrap();
         encoded[pdu_offset] = 0xbf;
 
-        let error = V3Message::decode(Bytes::from(encoded)).unwrap_err();
+        let error = V3Message::decode(Bytes::from(encoded), DecodeConfig::default()).unwrap_err();
         assert!(matches!(&*error, Error::Decode(error)
             if error.origin == DecodeErrorOrigin::Packet
                 && error.offset == pdu_offset
@@ -1340,14 +1262,17 @@ mod tests {
             .unwrap();
         encoded[pdu_offset] = 0xaf;
 
-        let standalone = V3Message::decode(Bytes::from(encoded.clone())).unwrap_err();
+        let standalone =
+            V3Message::decode(Bytes::from(encoded.clone()), DecodeConfig::default()).unwrap_err();
         assert!(matches!(&*standalone, Error::Decode(error)
             if error.origin == DecodeErrorOrigin::Packet
                 && error.offset == pdu_offset
                 && error.kind == DecodeErrorKind::UnknownPduType(0xaf)
                 && error.peer.is_none()));
 
-        let raw = RawV3Message::decode(Bytes::from(encoded)).unwrap();
+        let raw = RawV3Message::decode(Bytes::from(encoded), DecodeConfig::default())
+            .unwrap()
+            .value;
         let RawMsgData::Plaintext { data, offset } = raw.msg_data else {
             panic!("expected plaintext msgData");
         };
@@ -1382,7 +1307,7 @@ mod tests {
             .unwrap();
         encoded[usm_offset] = 0x31;
 
-        let error = V3Message::decode(Bytes::from(encoded)).unwrap_err();
+        let error = V3Message::decode(Bytes::from(encoded), DecodeConfig::default()).unwrap_err();
         assert!(matches!(&*error, Error::Decode(error)
             if error.origin == DecodeErrorOrigin::Packet
                 && error.offset == usm_offset
@@ -1589,11 +1514,13 @@ mod tests {
         let encoded = buf.finish();
 
         assert!(
-            V3Message::decode(encoded.clone()).is_err(),
+            V3Message::decode(encoded.clone(), DecodeConfig::default()).is_err(),
             "eager decode must reject the malformed scoped PDU"
         );
 
-        let raw = RawV3Message::decode(encoded).unwrap();
+        let raw = RawV3Message::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(raw.msg_id(), 7);
         assert_eq!(raw.security_level(), SecurityLevel::AuthNoPriv);
         assert_eq!(raw.security_params.as_ref(), b"usm-params");
@@ -1626,9 +1553,9 @@ mod tests {
         .unwrap();
         let encoded = buf.finish();
 
-        assert!(V3Message::decode(encoded.clone()).is_err());
-        assert!(RawV3Message::decode(encoded.clone()).is_err());
-        assert!(crate::message::Message::decode(encoded).is_err());
+        assert!(V3Message::decode(encoded.clone(), DecodeConfig::default()).is_err());
+        assert!(RawV3Message::decode(encoded.clone(), DecodeConfig::default()).is_err());
+        assert!(crate::message::Message::decode(encoded, DecodeConfig::default()).is_err());
     }
 
     /// The captured plaintext bytes are the complete ScopedPDU TLV, so a
@@ -1645,7 +1572,9 @@ mod tests {
         let scoped = ScopedPdu::new(b"engine".as_slice(), b"ctx".as_slice(), pdu);
         let msg = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
 
-        let raw = RawV3Message::decode(msg.encode().unwrap()).unwrap();
+        let raw = RawV3Message::decode(msg.encode().unwrap(), DecodeConfig::default())
+            .unwrap()
+            .value;
         let RawMsgData::Plaintext { data: bytes, .. } = raw.msg_data else {
             panic!("expected plaintext msgData");
         };
@@ -1672,7 +1601,9 @@ mod tests {
         )
         .unwrap();
 
-        let raw = RawV3Message::decode(msg.encode().unwrap()).unwrap();
+        let raw = RawV3Message::decode(msg.encode().unwrap(), DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(raw.security_level(), SecurityLevel::AuthPriv);
         let RawMsgData::Encrypted(ciphertext) = raw.msg_data else {
             panic!("expected encrypted msgData");
@@ -1706,7 +1637,7 @@ mod tests {
             .expect("msgFlags not found");
         bytes[pos + 2] = 0x02;
 
-        let error = RawV3Message::decode(Bytes::from(bytes)).unwrap_err();
+        let error = RawV3Message::decode(Bytes::from(bytes), DecodeConfig::default()).unwrap_err();
         assert!(matches!(&*error, Error::Decode(error)
             if error.origin == DecodeErrorOrigin::Packet
                 && error.offset == pos + 2
@@ -1739,7 +1670,9 @@ mod tests {
         // auth + reportable + a reserved bit
         bytes[pos + 2] = 0x01 | 0x04 | 0x08;
 
-        let raw = RawV3Message::decode(Bytes::from(bytes)).unwrap();
+        let raw = RawV3Message::decode(Bytes::from(bytes), DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(raw.security_level(), SecurityLevel::AuthNoPriv);
         assert!(raw.global_data.msg_flags.reportable);
     }
@@ -1767,9 +1700,11 @@ mod tests {
             })
             .unwrap();
         let with_outer_field = with_outer_field.finish();
-        assert!(RawV3Message::decode(with_outer_field.clone()).is_err());
-        assert!(V3Message::decode(with_outer_field.clone()).is_err());
-        assert!(crate::message::Message::decode(with_outer_field).is_err());
+        assert!(RawV3Message::decode(with_outer_field.clone(), DecodeConfig::default()).is_err());
+        assert!(V3Message::decode(with_outer_field.clone(), DecodeConfig::default()).is_err());
+        assert!(
+            crate::message::Message::decode(with_outer_field, DecodeConfig::default()).is_err()
+        );
 
         // Encode an extra INTEGER inside msgGlobalData.
         let mut with_global_field = EncodeBuf::new();
@@ -1790,27 +1725,29 @@ mod tests {
             })
             .unwrap();
         let with_global_field = with_global_field.finish();
-        assert!(RawV3Message::decode(with_global_field.clone()).is_err());
-        assert!(V3Message::decode(with_global_field.clone()).is_err());
-        assert!(crate::message::Message::decode(with_global_field).is_err());
+        assert!(RawV3Message::decode(with_global_field.clone(), DecodeConfig::default()).is_err());
+        assert!(V3Message::decode(with_global_field.clone(), DecodeConfig::default()).is_err());
+        assert!(
+            crate::message::Message::decode(with_global_field, DecodeConfig::default()).is_err()
+        );
 
         // Append another top-level TLV after an otherwise complete message.
         let message = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
         let valid = message.encode().unwrap();
         assert_eq!(
-            RawV3Message::decode_with_policy(valid.clone(), DecodePolicy::Compatible)
+            RawV3Message::decode(valid.clone(), DecodeConfig::default())
                 .unwrap()
                 .anomalies,
             Vec::<crate::DecodeAnomaly>::new()
         );
         assert_eq!(
-            V3Message::decode_with_policy(valid.clone(), DecodePolicy::Strict)
+            V3Message::decode(valid.clone(), DecodeConfig::STRICT)
                 .unwrap()
                 .anomalies,
             Vec::<crate::DecodeAnomaly>::new()
         );
         assert_eq!(
-            crate::message::Message::decode_with_policy(valid.clone(), DecodePolicy::Strict)
+            crate::message::Message::decode(valid.clone(), DecodeConfig::STRICT)
                 .unwrap()
                 .anomalies,
             Vec::<crate::DecodeAnomaly>::new()
@@ -1820,18 +1757,15 @@ mod tests {
         let with_root_trailing = Bytes::from(with_root_trailing);
 
         for anomalies in [
-            RawV3Message::decode_with_policy(with_root_trailing.clone(), DecodePolicy::Compatible)
+            RawV3Message::decode(with_root_trailing.clone(), DecodeConfig::default())
                 .unwrap()
                 .anomalies,
-            V3Message::decode_with_policy(with_root_trailing.clone(), DecodePolicy::Compatible)
+            V3Message::decode(with_root_trailing.clone(), DecodeConfig::default())
                 .unwrap()
                 .anomalies,
-            crate::message::Message::decode_with_policy(
-                with_root_trailing.clone(),
-                DecodePolicy::Compatible,
-            )
-            .unwrap()
-            .anomalies,
+            crate::message::Message::decode(with_root_trailing.clone(), DecodeConfig::default())
+                .unwrap()
+                .anomalies,
         ] {
             assert_eq!(
                 anomalies,
@@ -1842,9 +1776,9 @@ mod tests {
             );
         }
 
-        assert!(RawV3Message::decode_strict(with_root_trailing.clone()).is_err());
-        assert!(V3Message::decode_strict(with_root_trailing.clone()).is_err());
-        assert!(crate::message::Message::decode_strict(with_root_trailing).is_err());
+        assert!(RawV3Message::decode(with_root_trailing.clone(), DecodeConfig::STRICT).is_err());
+        assert!(V3Message::decode(with_root_trailing.clone(), DecodeConfig::STRICT).is_err());
+        assert!(crate::message::Message::decode(with_root_trailing, DecodeConfig::STRICT).is_err());
     }
 
     #[test]
@@ -1916,7 +1850,9 @@ mod tests {
         let msg = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
 
         let encoded = msg.encode().unwrap();
-        let decoded = V3Message::decode(encoded).unwrap();
+        let decoded = V3Message::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
 
         assert_eq!(decoded.global_data.msg_id, 100);
         assert_eq!(decoded.security_level(), SecurityLevel::NoAuthNoPriv);
@@ -1942,7 +1878,9 @@ mod tests {
         .unwrap();
 
         let encoded = msg.encode().unwrap();
-        let decoded = V3Message::decode(encoded).unwrap();
+        let decoded = V3Message::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
 
         assert_eq!(decoded.global_data.msg_id, 200);
         assert_eq!(decoded.security_level(), SecurityLevel::AuthPriv);

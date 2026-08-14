@@ -328,7 +328,7 @@ fn bench_request_overhead(c: &mut Criterion) {
     group.bench_function("decode_get_response", |b| {
         b.iter(|| {
             let data = encoded.clone();
-            black_box(CommunityMessage::decode(data).unwrap())
+            black_box(CommunityMessage::decode(data, async_snmp::DecodeConfig::default()).unwrap())
         });
     });
 

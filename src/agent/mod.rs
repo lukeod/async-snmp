@@ -436,8 +436,7 @@ pub struct AgentBuilder {
     handlers: Vec<RegisteredHandler>,
     authoritative_engine: Option<AuthoritativeEngine>,
     max_message_size: usize,
-    decode_policy: crate::message::DecodePolicy,
-    compatibility_policy: crate::CompatibilityPolicy,
+    decode_config: crate::DecodeConfig,
     max_concurrent_requests: Option<usize>,
     recv_buffer_size: Option<usize>,
     authorization: AgentAuthorization,
@@ -472,8 +471,7 @@ struct ValidatedAgentBuilder {
     handlers: Vec<RegisteredHandler>,
     max_message_size: usize,
     local_receive_capacity: MessageSize,
-    decode_policy: crate::message::DecodePolicy,
-    compatibility_policy: crate::CompatibilityPolicy,
+    decode_config: crate::DecodeConfig,
     concurrency_limit: Option<Arc<Semaphore>>,
     recv_buffer_size: Option<usize>,
     authorization: AgentAuthorization,
@@ -506,8 +504,7 @@ impl AgentBuilder {
             handlers: Vec::new(),
             authoritative_engine: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            decode_policy: crate::message::DecodePolicy::Compatible,
-            compatibility_policy: crate::CompatibilityPolicy::default(),
+            decode_config: crate::DecodeConfig::default(),
             max_concurrent_requests: Some(1000),
             recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
             authorization: AgentAuthorization::Unset,
@@ -762,31 +759,13 @@ impl AgentBuilder {
         self
     }
 
-    /// Set top-level request-envelope handling (default: compatible).
+    /// Set bounded request-decoding compatibility.
     ///
-    /// Compatible mode accepts a bounded suffix after one declared SNMP
-    /// message and reports it as a decode anomaly. Strict mode rejects it.
+    /// The same snapshot applies to community requests and every staged V3
+    /// decode. The default is [`crate::DecodeConfig::DEFAULT`].
     #[must_use]
-    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
-        self.decode_policy = policy;
-        self
-    }
-
-    /// Set BER/value interoperability handling (default: compatible).
-    ///
-    /// The policy applies to community requests and every staged v3 decode,
-    /// including security parameters and plaintext or decrypted scoped PDUs.
-    #[must_use]
-    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
-        self.compatibility_policy = policy;
-        self
-    }
-
-    /// Require canonical top-level envelopes and canonical BER/value input.
-    #[must_use]
-    pub fn strict_decoding(mut self) -> Self {
-        self.decode_policy = crate::message::DecodePolicy::Strict;
-        self.compatibility_policy = crate::CompatibilityPolicy::STRICT;
+    pub fn decode_config(mut self, config: crate::DecodeConfig) -> Self {
+        self.decode_config = config;
         self
     }
 
@@ -1214,8 +1193,7 @@ impl AgentBuilder {
             authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
             max_message_size: config.max_message_size,
             local_receive_capacity: config.local_receive_capacity,
-            decode_policy: config.decode_policy,
-            compatibility_policy: config.compatibility_policy,
+            decode_config: config.decode_config,
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(0),
             snmp_unknown_security_models: AtomicU32::new(0),
@@ -1392,8 +1370,7 @@ impl AgentBuilder {
             handlers: self.handlers,
             max_message_size: self.max_message_size,
             local_receive_capacity,
-            decode_policy: self.decode_policy,
-            compatibility_policy: self.compatibility_policy,
+            decode_config: self.decode_config,
             concurrency_limit,
             recv_buffer_size: self.recv_buffer_size,
             authorization: self.authorization,
@@ -1470,10 +1447,8 @@ pub(crate) struct AgentState {
     pub(crate) max_message_size: usize,
     /// Wire-valid `msgMaxSize` advertising this agent's UDP receive capacity.
     pub(crate) local_receive_capacity: MessageSize,
-    /// Inbound top-level envelope consumption policy.
-    pub(crate) decode_policy: crate::message::DecodePolicy,
-    /// Inbound BER/value malformed-input compatibility policy.
-    pub(crate) compatibility_policy: crate::CompatibilityPolicy,
+    /// Inbound decode configuration snapshot.
+    pub(crate) decode_config: crate::DecodeConfig,
     /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
     /// their ASN.1 representation is invalid for the received SNMP version
     pub(crate) snmp_in_asn_parse_errs: AtomicU32,
@@ -1605,16 +1580,10 @@ impl Agent {
         self.inner.local_addr
     }
 
-    /// Return the configured top-level request-envelope policy.
+    /// Return the configured request decode configuration.
     #[must_use]
-    pub fn decode_policy(&self) -> crate::message::DecodePolicy {
-        self.inner.state.decode_policy
-    }
-
-    /// Return the configured BER/value compatibility policy.
-    #[must_use]
-    pub fn compatibility_policy(&self) -> crate::CompatibilityPolicy {
-        self.inner.state.compatibility_policy
+    pub fn decode_config(&self) -> crate::DecodeConfig {
+        self.inner.state.decode_config
     }
 
     /// Iterate over credential-free notification sink summaries in configuration order.
@@ -2561,29 +2530,17 @@ mod tests {
     #[tokio::test]
     async fn decoding_policy_defaults_strict_preset_and_targeted_override() {
         let default = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
-        assert_eq!(
-            default.decode_policy(),
-            crate::message::DecodePolicy::Compatible
-        );
-        assert_eq!(
-            default.compatibility_policy(),
-            crate::CompatibilityPolicy::DEFAULT
-        );
+        assert_eq!(default.decode_config(), crate::DecodeConfig::DEFAULT);
 
-        let mut targeted = crate::CompatibilityPolicy::STRICT;
+        let mut targeted = crate::DecodeConfig::STRICT;
         targeted.empty_counter64_as_zero = true;
         let configured = Agent::builder()
             .bind("127.0.0.1:0")
-            .strict_decoding()
-            .compatibility_policy(targeted)
+            .decode_config(targeted)
             .build()
             .await
             .unwrap();
-        assert_eq!(
-            configured.decode_policy(),
-            crate::message::DecodePolicy::Strict
-        );
-        assert_eq!(configured.compatibility_policy(), targeted);
+        assert_eq!(configured.decode_config(), targeted);
     }
 
     struct TestHandler;
@@ -2679,9 +2636,12 @@ mod tests {
                 .await
                 .expect("first run stopped receiving")
                 .unwrap();
-        let decoded =
-            crate::message::CommunityMessage::decode(Bytes::copy_from_slice(&response[..len]))
-                .unwrap();
+        let decoded = crate::message::CommunityMessage::decode(
+            Bytes::copy_from_slice(&response[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         let response_pdu = decoded.pdu().standard().unwrap();
         assert_eq!(response_pdu.request_id, 7);
         assert_eq!(response_pdu.error_status(), 0);
@@ -2782,9 +2742,12 @@ mod tests {
                 .await
                 .expect("agent stopped after a recoverable receive error")
                 .unwrap();
-        let response =
-            crate::message::CommunityMessage::decode(Bytes::copy_from_slice(&response[..len]))
-                .unwrap();
+        let response = crate::message::CommunityMessage::decode(
+            Bytes::copy_from_slice(&response[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(response.pdu().standard().unwrap().request_id, 17);
 
         agent.cancel().cancel();
@@ -6052,8 +6015,9 @@ mod tests {
         }
         .unwrap()
         .unwrap();
-        crate::message::CommunityMessage::decode(bytes)
+        crate::message::CommunityMessage::decode(bytes, crate::DecodeConfig::default())
             .unwrap()
+            .value
             .pdu()
             .standard()
             .unwrap()

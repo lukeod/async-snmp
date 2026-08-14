@@ -9,10 +9,10 @@
 
 use crate::Community;
 use crate::ber::{Decoder, EncodeBuf, tag};
-use crate::compatibility::CompatibilityPolicy;
+use crate::compatibility::DecodeConfig;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
-use crate::message::{DecodeOutcome, DecodePolicy, finalize_envelope};
+use crate::message::{DecodeOutcome, finalize_envelope};
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
 use crate::version::Version;
 use bytes::Bytes;
@@ -218,57 +218,19 @@ impl CommunityMessage {
         Ok(buf.finish())
     }
 
-    /// Decode using the default compatible top-level policy.
-    ///
-    /// Suffix acceptance emits the stable `async_snmp::message`
-    /// `trailing_bytes` anomaly event. Use [`Self::decode_with_policy`] to
-    /// retain accepted anomaly metadata; this convenience method discards it.
-    pub fn decode(data: Bytes) -> Result<Self> {
-        Ok(Self::decode_with_policy(data, DecodePolicy::Compatible)?.value)
+    /// Decode a community message and retain every accepted anomaly.
+    pub fn decode(data: Bytes, config: DecodeConfig) -> Result<DecodeOutcome<Self>> {
+        Self::decode_with_target(data, None, config)
     }
 
-    /// Decode using an explicit top-level consumption policy.
-    pub fn decode_with_policy(data: Bytes, policy: DecodePolicy) -> Result<DecodeOutcome<Self>> {
-        Self::decode_with_policies(data, policy, CompatibilityPolicy::default())
-    }
-
-    /// Decode using an explicit malformed-input compatibility policy.
-    ///
-    /// Accepted anomaly metadata is discarded. Use [`Self::decode_with_policies`]
-    /// to retain it.
-    pub fn decode_with_compatibility_policy(
-        data: Bytes,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<Self> {
-        Ok(Self::decode_with_policies(data, DecodePolicy::Compatible, compatibility)?.value)
-    }
-
-    /// Decode using independent envelope-consumption and malformed-input policies.
-    pub fn decode_with_policies(
-        data: Bytes,
-        policy: DecodePolicy,
-        compatibility: CompatibilityPolicy,
-    ) -> Result<DecodeOutcome<Self>> {
-        Self::decode_with_target_and_policies(data, None, policy, compatibility)
-    }
-
-    /// Decode while requiring the input to contain exactly one message TLV.
-    ///
-    /// Accepted BER/value compatibility anomaly metadata is discarded. Use
-    /// [`Self::decode_with_policies`] with [`DecodePolicy::Strict`] to retain it.
-    pub fn decode_strict(data: Bytes) -> Result<Self> {
-        Ok(Self::decode_with_policy(data, DecodePolicy::Strict)?.value)
-    }
-
-    pub(crate) fn decode_with_target_and_policies(
+    pub(crate) fn decode_with_target(
         data: Bytes,
         peer: Option<SocketAddr>,
-        policy: DecodePolicy,
-        compatibility: CompatibilityPolicy,
+        config: DecodeConfig,
     ) -> Result<DecodeOutcome<Self>> {
         let anomalies = std::cell::RefCell::new(Vec::new());
         let mut decoder = Decoder::with_optional_peer(data, peer)
-            .with_compatibility_policy(compatibility)
+            .with_decode_config(config)
             .with_anomaly_sink(&anomalies);
         let mut seq = decoder.read_sequence()?;
 
@@ -279,7 +241,7 @@ impl CommunityMessage {
         })?;
 
         let value = Self::decode_from_sequence(&mut seq, version)?;
-        finalize_envelope(&seq, &decoder, policy)?;
+        finalize_envelope(&seq, &decoder, config)?;
         drop(seq);
         drop(decoder);
         Ok(DecodeOutcome {
@@ -454,7 +416,9 @@ mod tests {
     fn valid_messages_roundtrip() {
         let trap = trap_v1(vec![]);
         let message = CommunityMessage::v1_trap("public", trap).unwrap();
-        let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
+        let decoded = CommunityMessage::decode(message.encode().unwrap(), DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.version(), Version::V1);
         assert!(decoded.community().matches(b"public"));
         assert_eq!(
@@ -469,7 +433,10 @@ mod tests {
                 Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]),
             )
             .unwrap();
-            let decoded = CommunityMessage::decode(message.encode().unwrap()).unwrap();
+            let decoded =
+                CommunityMessage::decode(message.encode().unwrap(), DecodeConfig::default())
+                    .unwrap()
+                    .value;
             assert_eq!(decoded.version(), version);
             assert!(decoded.community().matches(b"private"));
             assert_eq!(decoded.pdu().standard().unwrap().request_id, 123);
@@ -485,7 +452,8 @@ mod tests {
             .unwrap();
         encoded[pdu_offset] = 0xbf;
 
-        let error = CommunityMessage::decode(Bytes::from(encoded)).unwrap_err();
+        let error =
+            CommunityMessage::decode(Bytes::from(encoded), DecodeConfig::default()).unwrap_err();
         assert!(matches!(&*error, Error::Decode(error)
             if error.offset == pdu_offset
                 && error.kind == DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: 0xbf }));
@@ -500,7 +468,7 @@ mod tests {
             .unwrap();
         let missing = missing.finish();
         let missing_offset = missing.len();
-        let error = CommunityMessage::decode(missing).unwrap_err();
+        let error = CommunityMessage::decode(missing, DecodeConfig::default()).unwrap_err();
         assert!(matches!(&*error, Error::Decode(error)
             if error.offset == missing_offset
                 && error.kind == DecodeErrorKind::TruncatedData));
@@ -538,7 +506,9 @@ mod tests {
 
         let v1 = CommunityMessage::v1("public", too_big.clone())
             .expect("SNMPv1 tooBig retains the request variable bindings");
-        let v1 = CommunityMessage::decode(v1.encode().unwrap()).unwrap();
+        let v1 = CommunityMessage::decode(v1.encode().unwrap(), DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(v1.pdu().standard().unwrap().varbinds, varbinds);
 
         assert_invalid_message(CommunityMessage::v2c("public", too_big));
@@ -560,7 +530,9 @@ mod tests {
             &[VarBind::null(oid!(1, 3, 6, 1))],
         );
 
-        let decoded = CommunityMessage::decode(encoded).expect("receive path accepts the PDU");
+        let decoded = CommunityMessage::decode(encoded, DecodeConfig::default())
+            .expect("receive path accepts the PDU")
+            .value;
         let pdu = decoded.pdu().standard().unwrap();
         assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
         assert_eq!(pdu.varbinds.len(), 1);
@@ -653,7 +625,9 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap();
-        let decoded = CommunityMessage::decode(encoded).unwrap();
+        let decoded = CommunityMessage::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.version(), Version::V2c);
         assert_eq!(
             decoded.pdu().standard().unwrap().pdu_type(),
@@ -735,7 +709,7 @@ mod tests {
             PduType::Report,
         ] {
             let encoded = raw_standard_message(Version::V1, &standard_pdu(pdu_type, vec![]));
-            assert!(CommunityMessage::decode(encoded).is_err());
+            assert!(CommunityMessage::decode(encoded, DecodeConfig::default()).is_err());
         }
 
         let trap = trap_v1(vec![]);
@@ -747,6 +721,6 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(CommunityMessage::decode(buf.finish()).is_err());
+        assert!(CommunityMessage::decode(buf.finish(), DecodeConfig::default()).is_err());
     }
 }

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_snmp::message::DecodePolicy;
+use async_snmp::DecodeConfig;
 use async_snmp::{
     Auth, Candidate, Client, ClientConfig, CommunityResponsePolicy, CommunityVersion, Error, Oid,
     RequestRegistration, ResponseIdentity, Retry, Transport,
@@ -755,7 +755,7 @@ fn response_identity_covers_protocols_ids_and_malformed_envelopes() {
 
 #[derive(Clone)]
 struct RegistrationPolicyProbe {
-    policies: Arc<Mutex<Vec<DecodePolicy>>>,
+    policies: Arc<Mutex<Vec<DecodeConfig>>>,
 }
 
 impl Transport for RegistrationPolicyProbe {
@@ -788,7 +788,7 @@ impl Transport for RegistrationPolicyProbe {
         self.policies
             .lock()
             .unwrap()
-            .push(registration.decode_policy());
+            .push(registration.decode_config());
         Err(Error::Config("policy captured".into()).boxed())
     }
 
@@ -806,14 +806,14 @@ impl Transport for RegistrationPolicyProbe {
 }
 
 #[tokio::test]
-async fn custom_transport_observes_client_decode_policy_in_registration() {
+async fn custom_transport_observes_client_decode_config_in_registration() {
     let policies = Arc::new(Mutex::new(Vec::new()));
     let transport = RegistrationPolicyProbe {
         policies: Arc::clone(&policies),
     };
     let mut config = ClientConfig::default();
     config.auth = Auth::v2c("public");
-    config.decode_policy = DecodePolicy::Strict;
+    config.decode_config = DecodeConfig::STRICT;
     config.retry = Retry::none();
     let client = Client::new(transport, config).unwrap();
 
@@ -823,5 +823,5 @@ async fn custom_transport_observes_client_decode_policy_in_registration() {
         .unwrap_err();
 
     assert!(matches!(*error, Error::Config(ref message) if message.as_ref() == "policy captured"));
-    assert_eq!(*policies.lock().unwrap(), vec![DecodePolicy::Strict]);
+    assert_eq!(*policies.lock().unwrap(), vec![DecodeConfig::STRICT]);
 }

@@ -630,7 +630,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let response = crate::message::CommunityMessage::decode(response).unwrap();
+        let response =
+            crate::message::CommunityMessage::decode(response, crate::DecodeConfig::default())
+                .unwrap()
+                .value;
         let response = response.pdu().standard().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
         assert_eq!(response.error_index(), 0);

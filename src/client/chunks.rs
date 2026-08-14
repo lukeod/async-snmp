@@ -418,7 +418,12 @@ mod tests {
     impl Transport for ScriptTransport {
         fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
-            let message = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let message = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             let pdu = message.pdu().standard().unwrap();
             let record = RequestRecord {
                 pdu_type: pdu.pdu_type(),

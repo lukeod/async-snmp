@@ -83,9 +83,15 @@ impl CapturedV3Request {
         transport_request_id: Option<i32>,
         engine: &TestV3Engine,
     ) -> Result<Self, String> {
-        let message = V3Message::decode(raw.clone()).map_err(|error| error.to_string())?;
-        let usm = UsmSecurityParams::decode(message.security_params().clone())
-            .map_err(|error| error.to_string())?;
+        let message = V3Message::decode(raw.clone(), async_snmp::DecodeConfig::default())
+            .map_err(|error| error.to_string())?
+            .value;
+        let usm = UsmSecurityParams::decode(
+            message.security_params().clone(),
+            async_snmp::DecodeConfig::default(),
+        )
+        .map_err(|error| error.to_string())?
+        .value;
         let level = message.global_data().msg_flags().security_level;
 
         let keys = engine

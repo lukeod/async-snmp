@@ -819,7 +819,7 @@ impl Pdu {
         }
 
         let len = decoder.read_length()?;
-        let compatibility = decoder.compatibility_policy();
+        let config = decoder.decode_config();
         let mut pdu_decoder = decoder.sub_decoder(len)?;
 
         // These are protocol Integer32 fields, so decode the complete width
@@ -840,7 +840,7 @@ impl Pdu {
                 ("max_repetitions", &mut second_field),
             ] {
                 if *value < 0 {
-                    if !compatibility.normalize_negative_get_bulk_fields {
+                    if !config.normalize_negative_get_bulk_fields {
                         return Err(pdu_decoder.malformed(DecodeErrorKind::InvalidValue));
                     }
                     tracing::warn!(target: "async_snmp::pdu", anomaly = "negative_get_bulk_field", direction = "decode", field, value = *value, normalized = 0, "normalized negative GETBULK field");
@@ -2244,13 +2244,13 @@ impl From<TrapV1Notification> for TrapV1Pdu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CompatibilityPolicy;
+    use crate::DecodeConfig;
     use crate::oid;
 
-    fn compatibility_without_negative_bulk_normalization() -> CompatibilityPolicy {
-        CompatibilityPolicy {
+    fn compatibility_without_negative_bulk_normalization() -> DecodeConfig {
+        DecodeConfig {
             normalize_negative_get_bulk_fields: false,
-            ..CompatibilityPolicy::DEFAULT
+            ..DecodeConfig::DEFAULT
         }
     }
 
@@ -3054,7 +3054,7 @@ mod tests {
         assert_eq!(decoded.get_bulk_fields(), Some((0, 10)));
 
         let mut strict = Decoder::new(encoded)
-            .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
+            .with_decode_config(compatibility_without_negative_bulk_normalization());
         let error = Pdu::decode(&mut strict).unwrap_err();
         assert!(matches!(*error, Error::Decode(_)));
     }
@@ -3069,7 +3069,7 @@ mod tests {
         assert_eq!(decoded.get_bulk_fields(), Some((0, 0)));
 
         let mut strict = Decoder::new(encoded)
-            .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
+            .with_decode_config(compatibility_without_negative_bulk_normalization());
         let error = Pdu::decode(&mut strict).unwrap_err();
         assert!(matches!(*error, Error::Decode(_)));
     }
@@ -3092,7 +3092,7 @@ mod tests {
         assert_eq!(pdu.get_bulk_fields(), Some((0, 1)));
 
         let mut strict = Decoder::new(encoded)
-            .with_compatibility_policy(compatibility_without_negative_bulk_normalization());
+            .with_decode_config(compatibility_without_negative_bulk_normalization());
         assert!(Pdu::decode(&mut strict).is_err());
     }
 

@@ -1336,8 +1336,8 @@ pub(crate) fn parse_discovery_response_with_msg_max_size(
     security_params: &Bytes,
     reported_msg_max_size: MessageSize,
 ) -> Result<DiscoveredEngine> {
-    let usm = UsmSecurityParams::decode(security_params.clone())?;
-    discovered_engine(usm.engine_id, reported_msg_max_size)
+    let usm = UsmSecurityParams::decode(security_params.clone(), crate::DecodeConfig::default())?;
+    discovered_engine(usm.value.engine_id, reported_msg_max_size)
 }
 
 /// Construct discovery state from security parameters already decoded under
@@ -1374,9 +1374,9 @@ pub fn parse_discovery_response_with_limits(
     reported_msg_max_size: MessageSize,
     session_max: MessageSize,
 ) -> Result<DiscoveredEngine> {
-    let usm = UsmSecurityParams::decode(security_params.clone())?;
+    let usm = UsmSecurityParams::decode(security_params.clone(), crate::DecodeConfig::default())?;
     discovered_engine(
-        usm.engine_id,
+        usm.value.engine_id,
         cap_msg_max_size(reported_msg_max_size, session_max),
     )
 }

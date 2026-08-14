@@ -4,8 +4,8 @@ use async_snmp::message::{
 };
 use async_snmp::v3::UsmSecurityParams;
 use async_snmp::{
-    CompatibilityPolicy, Error, GenericTrap, NotificationPdu, Oid, Pdu, PduBody, PduType,
-    RequestPdu, StandardPduType, TrapV1Pdu, Value, VarBind, Version,
+    DecodeConfig, Error, GenericTrap, NotificationPdu, Oid, Pdu, PduBody, PduType, RequestPdu,
+    StandardPduType, TrapV1Pdu, Value, VarBind, Version,
 };
 use bytes::Bytes;
 
@@ -150,7 +150,9 @@ fn valid_oid_boundaries_preserve_identity() {
             .unwrap()
             .encode()
             .unwrap();
-        let decoded = CommunityMessage::decode(bytes).unwrap();
+        let decoded = CommunityMessage::decode(bytes, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.into_pdu().unwrap().varbinds()[0].oid, oid);
     }
 }
@@ -181,7 +183,9 @@ fn root_two_u32_arc_boundaries_have_exact_ber_encodings() {
                 .any(|window| window == expected_tlv),
             "structured message omitted exact BER for {oid}"
         );
-        let decoded = CommunityMessage::decode(encoded).unwrap();
+        let decoded = CommunityMessage::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.into_pdu().unwrap().varbinds()[0].oid, oid);
     }
 }
@@ -209,8 +213,8 @@ fn empty_ber_oid_remains_receive_compatible() {
     let mut compatible = Decoder::new(encoded_varbind.clone());
     assert_eq!(VarBind::decode(&mut compatible).unwrap().oid, Oid::empty());
 
-    let mut policy = CompatibilityPolicy::DEFAULT;
-    policy.empty_object_identifier = false;
-    let mut strict = Decoder::new(encoded_varbind).with_compatibility_policy(policy);
+    let mut config = DecodeConfig::DEFAULT;
+    config.empty_object_identifier = false;
+    let mut strict = Decoder::new(encoded_varbind).with_decode_config(config);
     assert!(VarBind::decode(&mut strict).is_err());
 }

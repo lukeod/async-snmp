@@ -114,14 +114,17 @@ pub enum DecodeAnomaly {
     },
 }
 
-/// Policy for known, unambiguous interoperability deviations.
+/// Configuration for bounded, unambiguous receive compatibility.
 ///
 /// [`Default`] preserves the established receive behavior except that
 /// exception values with non-empty payloads are rejected. Every accepted
 /// deviation emits a warning with a stable `anomaly` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct CompatibilityPolicy {
+pub struct DecodeConfig {
+    /// Accept bytes after one fully consumed top-level SNMP message TLV.
+    /// Default: enabled.
+    pub trailing_bytes: bool,
     /// Truncate generic INTEGER and Unsigned32 values that exceed their public
     /// 32-bit representation (net-snmp-compatible). Default: enabled.
     pub truncate_numeric_values: bool,
@@ -141,9 +144,10 @@ pub struct CompatibilityPolicy {
     pub malformed_exception_payloads: bool,
 }
 
-impl CompatibilityPolicy {
-    /// Disable every malformed-input compatibility behavior.
+impl DecodeConfig {
+    /// Disable every receive compatibility behavior.
     pub const STRICT: Self = Self {
+        trailing_bytes: false,
         truncate_numeric_values: false,
         empty_counter64_as_zero: false,
         empty_object_identifier: false,
@@ -155,6 +159,7 @@ impl CompatibilityPolicy {
     /// Established compatibility defaults, with malformed exception payloads
     /// intentionally kept strict.
     pub const DEFAULT: Self = Self {
+        trailing_bytes: true,
         truncate_numeric_values: true,
         empty_counter64_as_zero: true,
         empty_object_identifier: true,
@@ -164,7 +169,7 @@ impl CompatibilityPolicy {
     };
 }
 
-impl Default for CompatibilityPolicy {
+impl Default for DecodeConfig {
     fn default() -> Self {
         Self::DEFAULT
     }
@@ -175,14 +180,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compatibility_policy_defaults_are_explicit() {
-        let policy = CompatibilityPolicy::default();
-        assert!(policy.truncate_numeric_values);
-        assert!(policy.empty_counter64_as_zero);
-        assert!(policy.empty_object_identifier);
-        assert!(policy.clamp_bounded_strings);
-        assert!(policy.normalize_negative_get_bulk_fields);
-        assert!(!policy.malformed_exception_payloads);
-        assert_eq!(CompatibilityPolicy::STRICT, CompatibilityPolicy::STRICT);
+    fn decode_config_defaults_are_explicit() {
+        let config = DecodeConfig::default();
+        assert!(config.trailing_bytes);
+        assert!(config.truncate_numeric_values);
+        assert!(config.empty_counter64_as_zero);
+        assert!(config.empty_object_identifier);
+        assert!(config.clamp_bounded_strings);
+        assert!(config.normalize_negative_get_bulk_fields);
+        assert!(!config.malformed_exception_payloads);
     }
 }

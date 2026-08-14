@@ -18,7 +18,7 @@ use super::{DerivedKeys, UsmUser};
 use crate::error::{Error, Result};
 use crate::message::{
     MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, combine_staged_v3_anomalies,
-    decode_scoped_pdu_with_policies,
+    decode_scoped_pdu,
 };
 use crate::message_size::MessageSize;
 use crate::oid::Oid;
@@ -155,10 +155,8 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) local_receive_capacity: MessageSize,
     /// Hard total-message bound for inbound decoding.
     pub(crate) accepted_receive_size: usize,
-    /// Top-level message envelope consumption policy.
-    pub(crate) decode_policy: crate::message::DecodePolicy,
-    /// BER/value malformed-input compatibility policy.
-    pub(crate) compatibility_policy: crate::CompatibilityPolicy,
+    /// Decode configuration snapshot for every inbound stage.
+    pub(crate) decode_config: crate::DecodeConfig,
     /// Local policy bound for outbound responses and Reports.
     pub(crate) outbound_limit: usize,
     pub(crate) usm_users: &'a HashMap<Bytes, UsmUser>,
@@ -207,12 +205,11 @@ pub(crate) fn process_v3_inbound(
 ) -> Result<V3Inbound> {
     let source = ctx.source;
 
-    let decoded = match RawV3Message::decode_bounded_with_target_and_compatibility(
+    let decoded = match RawV3Message::decode_bounded_with_target(
         data.clone(),
         ctx.accepted_receive_size,
         source,
-        ctx.decode_policy,
-        ctx.compatibility_policy,
+        ctx.decode_config,
     ) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -246,12 +243,14 @@ pub(crate) fn process_v3_inbound(
     let mut decode_anomalies = decoded.anomalies;
     let msg = decoded.value;
     let security_level = msg.global_data.msg_flags.security_level;
-    let usm_params = UsmSecurityParams::decode_with_context_and_compatibility(
+    let usm_params = UsmSecurityParams::decode_with_context(
         msg.security_params.clone(),
         msg.security_params_offset,
         source,
-        ctx.compatibility_policy,
+        ctx.decode_config,
     )?;
+    decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, usm_params.anomalies);
+    let usm_params = usm_params.value;
 
     // Encodes the Report for `failure` (counting it first), unauthenticated
     // unless `auth_key` is given (notInTimeWindows, RFC 3414 3.2 Step 7a).
@@ -461,21 +460,17 @@ pub(crate) fn process_v3_inbound(
                 }
             };
 
-            decode_scoped_pdu_with_policies(
+            decode_scoped_pdu(
                 decrypted,
                 0,
                 source,
                 Some(priv_key.protocol()),
-                ctx.compatibility_policy,
+                ctx.decode_config,
             )?
         }
-        RawMsgData::Plaintext { data, offset } => decode_scoped_pdu_with_policies(
-            data.clone(),
-            *offset,
-            source,
-            None,
-            ctx.compatibility_policy,
-        )?,
+        RawMsgData::Plaintext { data, offset } => {
+            decode_scoped_pdu(data.clone(), *offset, source, None, ctx.decode_config)?
+        }
     };
     decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, scoped_outcome.anomalies);
     let scoped_pdu = scoped_outcome.value;
@@ -524,8 +519,7 @@ mod tests {
             engine_time: 1000,
             local_receive_capacity: MessageSize::new(8192).unwrap(),
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
-            decode_policy: crate::message::DecodePolicy::Compatible,
-            compatibility_policy: crate::CompatibilityPolicy::default(),
+            decode_config: crate::DecodeConfig::default(),
             outbound_limit: 8192,
             usm_users,
             stats,
@@ -626,7 +620,12 @@ mod tests {
             panic!("expected USM failure");
         };
         assert_eq!(failure, expected_failure);
-        let report = V3Message::decode(report.expect("reportable failure gets a Report")).unwrap();
+        let report = V3Message::decode(
+            report.expect("reportable failure gets a Report"),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         let pdu = report.pdu().expect("failure Report is plaintext");
         assert_eq!(pdu.pdu_type(), PduType::Report);
         assert_eq!(pdu.varbinds.len(), 1);
@@ -722,7 +721,9 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap();
-        let request = V3Message::decode(data.clone()).unwrap();
+        let request = V3Message::decode(data.clone(), crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_ne!(
             request.global_data.msg_max_size, ctx.local_receive_capacity,
             "test requires distinct requester and local capacities"
@@ -735,13 +736,23 @@ mod tests {
         assert_eq!(failure, UsmFailure::UnknownEngineIds);
         assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 1);
 
-        let report = V3Message::decode(report.expect("reportable message gets a report")).unwrap();
+        let report = V3Message::decode(
+            report.expect("reportable message gets a report"),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(report.global_data.msg_id, 5);
         assert_eq!(
             report.global_data.msg_max_size, 8192,
             "Report must advertise the local receive capacity, not the requester's value"
         );
-        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        let report_usm = UsmSecurityParams::decode(
+            report.security_params.clone(),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(report_usm.engine_id, engine_id);
         assert_eq!(report_usm.engine_boots, 7);
         let pdu = report.pdu().unwrap();
@@ -1070,7 +1081,12 @@ mod tests {
             crate::UDP_RECEIVE_LIMITS.advertised(),
         )
         .unwrap();
-        let raw = RawV3Message::decode(Bytes::copy_from_slice(&data)).unwrap();
+        let raw = RawV3Message::decode(
+            Bytes::copy_from_slice(&data),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         let RawMsgData::Encrypted(ciphertext) = raw.msg_data else {
             panic!("authPriv encoder must produce ciphertext");
         };

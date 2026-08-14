@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::format::hex;
 use crate::message::{
     RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, V3Message, combine_staged_v3_anomalies,
-    decode_scoped_pdu_with_policies,
+    decode_scoped_pdu,
 };
 use crate::pdu::{Pdu, PduType};
 use crate::transport::{Candidate, RequestRegistration, Transport};
@@ -389,18 +389,17 @@ impl<T: Transport> Client<T> {
             self.enforce_outbound_size(discovery_data.len(), None)?;
 
             let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout)
-                .with_decode_policy(self.inner.config.decode_policy);
+                .with_decode_config(self.inner.config.decode_config);
 
             match self
                 .inner
                 .transport
                 .request_with(&discovery_data, registration, |data, source| {
-                    let Ok(decoded) = RawV3Message::decode_bounded_with_target_and_compatibility(
+                    let Ok(decoded) = RawV3Message::decode_bounded_with_target(
                         data,
                         self.inner.transport.receive_limits().accepted(),
                         source,
-                        self.inner.config.decode_policy,
-                        self.inner.config.compatibility_policy,
+                        self.inner.config.decode_config,
                     ) else {
                         return Ok(Candidate::Reject);
                     };
@@ -529,12 +528,14 @@ impl<T: Transport> Client<T> {
         // Decode and validate the candidate before parsing the plaintext PDU,
         // preserving USM-before-scoped-PDU processing order. Boots/time are
         // syntactically decoded but discarded as unauthenticated input.
-        let usm = UsmSecurityParams::decode_with_context_and_compatibility(
+        let usm = UsmSecurityParams::decode_with_context(
             response.security_params.clone(),
             response.security_params_offset,
             source,
-            self.inner.config.compatibility_policy,
+            self.inner.config.decode_config,
         )?;
+        let decode_anomalies = combine_staged_v3_anomalies(decoded.anomalies, usm.anomalies);
+        let usm = usm.value;
         let engine_state = crate::v3::discovered_engine_state(
             usm.engine_id.clone(),
             response.global_data.msg_max_size,
@@ -551,14 +552,14 @@ impl<T: Transport> Client<T> {
         else {
             return Err(malformed());
         };
-        let scoped = decode_scoped_pdu_with_policies(
+        let scoped = decode_scoped_pdu(
             bytes.clone(),
             *offset,
             source,
             None,
-            self.inner.config.compatibility_policy,
+            self.inner.config.decode_config,
         )?;
-        let decode_anomalies = combine_staged_v3_anomalies(decoded.anomalies, scoped.anomalies);
+        let decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, scoped.anomalies);
         let scoped_pdu = scoped.value;
 
         // Bind the Internal-class Report to the exact outstanding discovery
@@ -828,12 +829,12 @@ impl<T: Transport> Client<T> {
 
         tracing::trace!(target: "async_snmp::client", { plaintext_len = plaintext.len() }, "decrypted response");
 
-        decode_scoped_pdu_with_policies(
+        decode_scoped_pdu(
             plaintext,
             0,
             source,
             Some(priv_key.protocol()),
-            self.inner.config.compatibility_policy,
+            self.inner.config.decode_config,
         )
     }
 
@@ -846,12 +847,11 @@ impl<T: Transport> Client<T> {
         expected_pdu_id: i32,
         expected_level: SecurityLevel,
     ) -> Result<Candidate<ValidatedV3Response>> {
-        let Ok(decoded) = RawV3Message::decode_bounded_with_target_and_compatibility(
+        let Ok(decoded) = RawV3Message::decode_bounded_with_target(
             response_data.clone(),
             self.inner.transport.receive_limits().accepted(),
             source,
-            self.inner.config.decode_policy,
-            self.inner.config.compatibility_policy,
+            self.inner.config.decode_config,
         ) else {
             return Ok(Candidate::Reject);
         };
@@ -870,14 +870,16 @@ impl<T: Transport> Client<T> {
         let mut decode_anomalies = decoded.anomalies;
         let raw = decoded.value;
         let received_level = raw.security_level();
-        let Ok(usm) = UsmSecurityParams::decode_with_context_and_compatibility(
+        let Ok(usm) = UsmSecurityParams::decode_with_context(
             raw.security_params.clone(),
             raw.security_params_offset,
             source,
-            self.inner.config.compatibility_policy,
+            self.inner.config.decode_config,
         ) else {
             return Ok(Candidate::Reject);
         };
+        decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, usm.anomalies);
+        let usm = usm.value;
 
         let validated_generation =
             match self.verify_response_security(&authenticated_message, &usm, received_level) {
@@ -925,12 +927,12 @@ impl<T: Transport> Client<T> {
 
         let scoped_outcome = match &raw.msg_data {
             RawMsgData::Plaintext { data, offset } => {
-                match decode_scoped_pdu_with_policies(
+                match decode_scoped_pdu(
                     data.clone(),
                     *offset,
                     source,
                     None,
-                    self.inner.config.compatibility_policy,
+                    self.inner.config.decode_config,
                 ) {
                     Ok(scoped) => scoped,
                     Err(_) => return Ok(Candidate::Reject),
@@ -1043,7 +1045,7 @@ impl<T: Transport> Client<T> {
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = request.data.len() }, "sending V3 request");
 
             let registration = RequestRegistration::v3(msg_id, self.inner.config.request_timeout)
-                .with_decode_policy(self.inner.config.decode_policy)
+                .with_decode_config(self.inner.config.decode_config)
                 .with_aliases(msg_id_window.iter().copied());
             msg_id_window.push(msg_id);
 
@@ -1713,8 +1715,9 @@ mod tests {
         let encoded = client
             .build_v3_message(&pdu, 456, None)
             .expect("v3 message should encode");
-        let decoded =
-            V3Message::decode(Bytes::from(encoded.data)).expect("v3 message should decode");
+        let decoded = V3Message::decode(Bytes::from(encoded.data), crate::DecodeConfig::default())
+            .expect("v3 message should decode")
+            .value;
         let scoped = match decoded.data {
             V3MessageData::Plaintext(scoped) => scoped,
             V3MessageData::Encrypted(_) => panic!("expected plaintext scoped PDU"),
@@ -2659,8 +2662,16 @@ mod response_validation_tests {
             U: Send,
             F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
         {
-            let request = V3Message::decode(Bytes::copy_from_slice(data)).unwrap();
-            let usm = UsmSecurityParams::decode(request.security_params.clone()).unwrap();
+            let request =
+                V3Message::decode(Bytes::copy_from_slice(data), crate::DecodeConfig::default())
+                    .unwrap()
+                    .value;
+            let usm = UsmSecurityParams::decode(
+                request.security_params.clone(),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             let response = if usm.engine_id.is_empty() {
                 build_rediscovery_race_discovery_response(request)
             } else {
@@ -2829,7 +2840,12 @@ mod response_validation_tests {
     }
 
     fn build_deferred_update_response(request_data: &[u8], response_number: u32) -> Bytes {
-        let request = V3Message::decode(Bytes::copy_from_slice(request_data)).unwrap();
+        let request = V3Message::decode(
+            Bytes::copy_from_slice(request_data),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         let scoped_request = match request.data {
             V3MessageData::Plaintext(scoped) => scoped,
             V3MessageData::Encrypted(_) => panic!("expected authNoPriv request"),
@@ -3131,7 +3147,9 @@ mod response_validation_tests {
 
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         let request = client.build_v3_message(&pdu, 1, None).unwrap();
-        let msg = V3Message::decode(Bytes::from(request.data)).unwrap();
+        let msg = V3Message::decode(Bytes::from(request.data), crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(
             msg.global_data.msg_max_size, 1400,
             "request must advertise the local transport capacity, not the remote's cached 9000"

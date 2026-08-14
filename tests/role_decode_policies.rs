@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use async_snmp::{
-    Auth, BoundedStringKind, Candidate, ClientBuilder, CompatibilityPolicy, DecodeAnomaly, Error,
+    Auth, BoundedStringKind, Candidate, ClientBuilder, DecodeAnomaly, DecodeConfig, Error,
     Notification, NotificationReceiver, Oid, RequestRegistration, Retry, Transport, Value,
 };
 use bytes::Bytes;
@@ -34,7 +34,11 @@ impl CommunityPolicyTransport {
 
 impl Transport for CommunityPolicyTransport {
     async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
-        let request = async_snmp::message::CommunityMessage::decode(Bytes::copy_from_slice(data))?;
+        let request = async_snmp::message::CommunityMessage::decode(
+            Bytes::copy_from_slice(data),
+            DecodeConfig::default(),
+        )?
+        .value;
         let request_id = request.pdu().standard().unwrap().request_id();
         let version = request.version();
         let community = request.community();
@@ -155,12 +159,8 @@ fn raw_community_response(
         tlv(0x04, community),
         tlv(0xa2, &pdu_content),
     ]));
-    let _ = async_snmp::message::CommunityMessage::decode_with_policies(
-        packet.clone(),
-        async_snmp::message::DecodePolicy::Compatible,
-        CompatibilityPolicy::DEFAULT,
-    )
-    .unwrap();
+    let _ = async_snmp::message::CommunityMessage::decode(packet.clone(), DecodeConfig::DEFAULT)
+        .unwrap();
     packet
 }
 
@@ -201,7 +201,7 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
         ));
 
         let strict = ClientBuilder::new(auth.clone())
-            .compatibility_policy(CompatibilityPolicy::STRICT)
+            .decode_config(DecodeConfig::STRICT)
             .retry(Retry::none())
             .build_with_transport(CommunityPolicyTransport::new(true))
             .unwrap();
@@ -215,10 +215,10 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
                 .is_empty()
         );
 
-        let mut targeted = CompatibilityPolicy::STRICT;
+        let mut targeted = DecodeConfig::STRICT;
         targeted.truncate_numeric_values = true;
         let targeted = ClientBuilder::new(auth)
-            .compatibility_policy(targeted)
+            .decode_config(targeted)
             .retry(Retry::none())
             .build_with_transport(CommunityPolicyTransport::new(false))
             .unwrap();
@@ -238,18 +238,18 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
 #[tokio::test]
 async fn community_client_applies_only_targeted_bounded_string_clamping() {
     let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
-    let mut targeted = CompatibilityPolicy::STRICT;
+    let mut targeted = DecodeConfig::STRICT;
     targeted.clamp_bounded_strings = true;
 
     let rejects_unselected = ClientBuilder::new(Auth::v2c("public"))
-        .compatibility_policy(targeted)
+        .decode_config(targeted)
         .retry(Retry::none())
         .build_with_transport(CommunityPolicyTransport::new(false))
         .unwrap();
     assert!(rejects_unselected.get(&oid).await.is_err());
 
     let accepts_selected = ClientBuilder::new(Auth::v2c("public"))
-        .compatibility_policy(targeted)
+        .decode_config(targeted)
         .retry(Retry::none())
         .build_with_transport(CommunityPolicyTransport::with_values(vec![vec![
             0x04, 3, b'a', b'b',
@@ -272,11 +272,11 @@ async fn community_client_applies_only_targeted_bounded_string_clamping() {
 
 #[tokio::test]
 async fn notification_receiver_applies_only_targeted_empty_oid_normalization() {
-    let mut targeted = CompatibilityPolicy::STRICT;
+    let mut targeted = DecodeConfig::STRICT;
     targeted.empty_object_identifier = true;
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
-        .compatibility_policy(targeted)
+        .decode_config(targeted)
         .build()
         .await
         .unwrap();

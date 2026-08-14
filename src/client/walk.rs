@@ -1023,7 +1023,12 @@ mod tests {
     impl Transport for BulkTooBigTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let msg = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             let pdu = msg.pdu().standard().unwrap();
             let (_, max_rep) = pdu
                 .get_bulk_fields()
@@ -1183,7 +1188,12 @@ mod tests {
     impl Transport for EmptyWalkTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
-            let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let msg = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             let pdu_type = msg.pdu().standard().unwrap().pdu_type();
             self.pending
                 .lock()
@@ -1442,7 +1452,12 @@ mod tests {
 
     impl Transport for ScriptedWalkTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let message = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let message = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             let pdu = message.pdu().standard().unwrap();
             let request = (
                 pdu.pdu_type(),

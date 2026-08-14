@@ -9,6 +9,7 @@ use bytes::Bytes;
 use subtle::ConstantTimeEq;
 
 use crate::Community;
+use crate::DecodeAnomaly;
 use crate::message::SecurityLevel;
 use crate::pdu::PduType;
 use crate::version::{CommunityVersion, Version};
@@ -232,6 +233,14 @@ pub struct RequestContext {
     ///
     /// None for v1/v2c requests (no msgMaxSize field in those versions).
     msg_max_size: Option<usize>,
+
+    /// Accepted non-canonical encodings in stable wire-processing order.
+    ///
+    /// Community request anomalies are unauthenticated. V3 anomalies within
+    /// the declared envelope are exposed only after USM processing succeeds
+    /// and are attributable to the configured user only at `authNoPriv` or
+    /// `authPriv`. A top-level trailing-byte anomaly remains unauthenticated.
+    decode_anomalies: Vec<DecodeAnomaly>,
 }
 
 impl RequestContext {
@@ -241,6 +250,7 @@ impl RequestContext {
         community: Community,
         request_id: i32,
         pdu_type: PduType,
+        decode_anomalies: Vec<DecodeAnomaly>,
     ) -> Self {
         let (version, security_model) = match version {
             CommunityVersion::V1 => (Version::V1, SecurityModel::V1),
@@ -260,6 +270,7 @@ impl RequestContext {
             read_view: None,
             write_view: None,
             msg_max_size: None,
+            decode_anomalies,
         }
     }
 
@@ -272,6 +283,7 @@ impl RequestContext {
         request_id: i32,
         pdu_type: PduType,
         msg_max_size: usize,
+        decode_anomalies: Vec<DecodeAnomaly>,
     ) -> Self {
         Self {
             source,
@@ -286,6 +298,7 @@ impl RequestContext {
             read_view: None,
             write_view: None,
             msg_max_size: Some(msg_max_size),
+            decode_anomalies,
         }
     }
 
@@ -375,6 +388,19 @@ impl RequestContext {
     pub const fn msg_max_size(&self) -> Option<usize> {
         self.msg_max_size
     }
+
+    /// Return accepted request decode anomalies in stable processing order.
+    ///
+    /// Community and `noAuthNoPriv` anomalies are not authenticated. On
+    /// `authNoPriv` and `authPriv` requests, anomalies within the declared V3
+    /// envelope are exposed only after successful USM authentication and can
+    /// be attributed to the configured user. A top-level
+    /// [`DecodeAnomaly::TrailingBytes`] describes bytes outside that envelope
+    /// and remains unauthenticated.
+    #[must_use]
+    pub fn decode_anomalies(&self) -> &[DecodeAnomaly] {
+        &self.decode_anomalies
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +425,7 @@ mod tests {
                 community.clone(),
                 416,
                 PduType::GetNextRequest,
+                Vec::new(),
             );
 
             assert_eq!(context.source(), source);
@@ -439,6 +466,7 @@ mod tests {
                 -17,
                 PduType::SetRequest,
                 4096,
+                Vec::new(),
             );
             context.set_vacm_access(
                 Bytes::from_static(b"operators\xfe"),
@@ -469,6 +497,7 @@ mod tests {
             Community::from("community-redaction-sentinel-4d91"),
             416,
             PduType::GetRequest,
+            Vec::new(),
         );
         let rendered = format!("{community:?}");
         assert!(rendered.contains("REDACTED"));
@@ -484,6 +513,7 @@ mod tests {
             417,
             PduType::GetRequest,
             4096,
+            Vec::new(),
         );
         let rendered = format!("{usm:#?}");
         assert!(rendered.contains("visible-usm-user"));

@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use super::length::decode_length_with_origin;
 use super::tag;
-use crate::compatibility::{CompatibilityPolicy, DecodeAnomaly};
+use crate::compatibility::{DecodeAnomaly, DecodeConfig};
 use crate::error::internal::{DecodeErrorKind, DecodeErrorOrigin};
 use crate::error::{DecodeError, Error, Result};
 use crate::oid::Oid;
@@ -20,7 +20,7 @@ pub struct Decoder<'a> {
     base_offset: usize,
     origin: DecodeErrorOrigin,
     peer: Option<SocketAddr>,
-    compatibility: CompatibilityPolicy,
+    config: DecodeConfig,
     anomalies: Option<&'a RefCell<Vec<DecodeAnomaly>>>,
 }
 
@@ -33,7 +33,7 @@ impl Decoder<'static> {
             base_offset: 0,
             origin: DecodeErrorOrigin::Packet,
             peer: None,
-            compatibility: CompatibilityPolicy::default(),
+            config: DecodeConfig::default(),
             anomalies: None,
         }
     }
@@ -63,7 +63,7 @@ impl Decoder<'static> {
             base_offset,
             origin,
             peer,
-            compatibility: CompatibilityPolicy::default(),
+            config: DecodeConfig::default(),
             anomalies: None,
         }
     }
@@ -86,7 +86,7 @@ impl<'a> Decoder<'a> {
             base_offset: self.base_offset,
             origin: self.origin,
             peer: self.peer,
-            compatibility: self.compatibility,
+            config: self.config,
             anomalies: Some(anomalies),
         }
     }
@@ -109,7 +109,7 @@ impl<'a> Decoder<'a> {
             base_offset,
             origin,
             peer: self.peer,
-            compatibility: self.compatibility,
+            config: self.config,
             anomalies: self.anomalies,
         }
     }
@@ -118,17 +118,17 @@ impl<'a> Decoder<'a> {
         self.decoder_for(data, base_offset, self.origin)
     }
 
-    /// Apply an explicit malformed-input compatibility policy.
+    /// Apply an explicit decode configuration.
     #[must_use]
-    pub fn with_compatibility_policy(mut self, compatibility: CompatibilityPolicy) -> Self {
-        self.compatibility = compatibility;
+    pub fn with_decode_config(mut self, config: DecodeConfig) -> Self {
+        self.config = config;
         self
     }
 
-    /// Return the malformed-input compatibility policy for this decoder.
+    /// Return the decode configuration for this decoder.
     #[must_use]
-    pub fn compatibility_policy(&self) -> CompatibilityPolicy {
-        self.compatibility
+    pub fn decode_config(&self) -> DecodeConfig {
+        self.config
     }
 
     /// Get the peer address, when decoding at a network boundary.
@@ -295,7 +295,7 @@ impl<'a> Decoder<'a> {
         // `read_bounded_integer`, which never consults compatibility policy.
         let value = self.read_signed_integer_value(len)?;
         if value < i64::from(i32::MIN) || value > i64::from(i32::MAX) {
-            if !self.compatibility.truncate_numeric_values {
+            if !self.config.truncate_numeric_values {
                 return Err(self.malformed(DecodeErrorKind::IntegerOutOfRange {
                     value,
                     minimum: i32::MIN,
@@ -348,7 +348,7 @@ impl<'a> Decoder<'a> {
     /// Read 64-bit unsigned integer value given the length.
     pub fn read_integer64_value(&mut self, len: usize) -> Result<u64> {
         if len == 0 {
-            if !self.compatibility.empty_counter64_as_zero {
+            if !self.config.empty_counter64_as_zero {
                 return Err(self.malformed(DecodeErrorKind::ZeroLengthInteger));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "empty_counter64", snmp.offset = self.offset, normalized = 0_u64, "accepted zero-length Counter64");
@@ -390,7 +390,7 @@ impl<'a> Decoder<'a> {
     pub fn read_unsigned32_value(&mut self, len: usize) -> Result<u32> {
         let value = self.read_unsigned_integer_value(len)?;
         if value > u64::from(u32::MAX) {
-            if !self.compatibility.truncate_numeric_values {
+            if !self.config.truncate_numeric_values {
                 return Err(self.malformed(DecodeErrorKind::UnsignedIntegerOutOfRange {
                     value,
                     minimum: 0,
@@ -472,7 +472,7 @@ impl<'a> Decoder<'a> {
     /// Read an OID given a pre-read length.
     pub fn read_oid_value(&mut self, len: usize) -> Result<Oid> {
         if len == 0 {
-            if !self.compatibility.empty_object_identifier {
+            if !self.config.empty_object_identifier {
                 return Err(self.malformed(DecodeErrorKind::InvalidOid));
             }
             tracing::warn!(target: "async_snmp::ber", anomaly = "empty_object_identifier", snmp.offset = self.offset, encoded_length = 0, "accepted zero-length OBJECT IDENTIFIER");
@@ -512,7 +512,7 @@ impl<'a> Decoder<'a> {
             base_offset: content_offset,
             origin: self.origin,
             peer: self.peer,
-            compatibility: self.compatibility,
+            config: self.config,
             anomalies: self.anomalies,
         })
     }
@@ -552,7 +552,7 @@ impl<'a> Decoder<'a> {
             base_offset: content_offset,
             origin: self.origin,
             peer: self.peer,
-            compatibility: self.compatibility,
+            config: self.config,
             anomalies: self.anomalies,
         })
     }
@@ -731,11 +731,11 @@ mod tests {
         let mut compatible = Decoder::from_slice(&[0x46, 0x00]);
         assert_eq!(compatible.read_integer64(0x46).unwrap(), 0);
 
-        let policy = CompatibilityPolicy {
+        let config = DecodeConfig {
             empty_counter64_as_zero: false,
-            ..CompatibilityPolicy::DEFAULT
+            ..DecodeConfig::DEFAULT
         };
-        let mut strict = Decoder::from_slice(&[0x46, 0x00]).with_compatibility_policy(policy);
+        let mut strict = Decoder::from_slice(&[0x46, 0x00]).with_decode_config(config);
         assert!(strict.read_integer64(0x46).is_err());
     }
 
@@ -746,27 +746,27 @@ mod tests {
 
         let mut compatible_signed = Decoder::from_slice(&signed);
         assert_eq!(compatible_signed.read_integer().unwrap(), 0);
-        let policy = CompatibilityPolicy {
+        let config = DecodeConfig {
             truncate_numeric_values: false,
-            ..CompatibilityPolicy::DEFAULT
+            ..DecodeConfig::DEFAULT
         };
-        let mut strict_signed = Decoder::from_slice(&signed).with_compatibility_policy(policy);
+        let mut strict_signed = Decoder::from_slice(&signed).with_decode_config(config);
         assert!(strict_signed.read_integer().is_err());
 
         let mut compatible_unsigned = Decoder::from_slice(&unsigned);
         assert_eq!(compatible_unsigned.read_unsigned32(0x42).unwrap(), 0);
-        let mut strict_unsigned = Decoder::from_slice(&unsigned).with_compatibility_policy(policy);
+        let mut strict_unsigned = Decoder::from_slice(&unsigned).with_decode_config(config);
         assert!(strict_unsigned.read_unsigned32(0x42).is_err());
     }
 
     #[test]
     fn unsigned32_range_error_preserves_u64_max_and_u32_bounds() {
         let encoded = [0x42, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-        let policy = CompatibilityPolicy {
+        let config = DecodeConfig {
             truncate_numeric_values: false,
-            ..CompatibilityPolicy::DEFAULT
+            ..DecodeConfig::DEFAULT
         };
-        let mut decoder = Decoder::from_slice(&encoded).with_compatibility_policy(policy);
+        let mut decoder = Decoder::from_slice(&encoded).with_decode_config(config);
         let error = decoder.read_unsigned32(0x42).unwrap_err();
         assert!(matches!(
             error.as_ref(),

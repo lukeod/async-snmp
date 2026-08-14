@@ -998,7 +998,7 @@ mod tests {
                     Bytes::from_static(b"public"),
                     CommunityResponsePolicy::Exact,
                 )
-                .with_decode_policy(crate::message::DecodePolicy::Strict)
+                .with_decode_config(crate::DecodeConfig::STRICT)
                 .with_aliases([prior_request_id]),
                 target,
                 false,

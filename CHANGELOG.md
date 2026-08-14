@@ -253,7 +253,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol-version, source, and community-policy correlation from packet bytes.
   Custom transports must ignore a failed identity or candidate validation
   without consuming the pending request or extending its original deadline.
-- **Breaking:** `ClientConfig`, `CompatibilityPolicy`, and `TcpOptions` are
+- **Breaking:** `ClientConfig`, `DecodeConfig`, and `TcpOptions` are
   non-exhaustive configuration structs. Prefer their builders where available,
   or start with `Default`/the documented policy constants and mutate public
   fields. No protocol, operation/response, authentication, target, or transport
@@ -280,6 +280,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target mappings and authenticated-time high-water state together. Cache
   operations report the repaired state, and `recovery_count` exposes the
   monotonic number of recoveries.
+- **Breaking:** `DecodeConfig` replaces `DecodePolicy` and
+  `CompatibilityPolicy` with one permissive-by-default configuration and a
+  `STRICT` preset. `Message`, `CommunityMessage`, `V3Message`,
+  `RawV3Message`, and `UsmSecurityParams` expose one configurable `decode`
+  method returning `DecodeOutcome`; bare-value and policy-matrix decode methods
+  are removed. Client, agent, and notification-receiver builders now use only
+  `decode_config`, and agent `RequestContext` exposes accepted request
+  anomalies after protocol security processing.
 
 ### Fixed
 
@@ -303,6 +311,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace `EncodeBuf::try_push_constructed`, `try_push_sequence`, and
   `try_push_octet_string` with their `push_*` equivalents and propagate the
   returned `Result`.
+- Replace `DecodePolicy`, `CompatibilityPolicy`, `decode_with_*`, and
+  `decode_strict` usage with `DecodeConfig`. Pass a config to `decode` and read
+  the decoded value through `DecodeOutcome::value`; configure network roles
+  with their `decode_config` builder method.
 
 - Replace direct `EngineState` construction, field access, `EngineCache::insert`,
   and `EngineState::update_time` with
@@ -340,7 +352,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values, and use `GetNextResult::Value(varbind)`/`varbind.into()` or
   `EndOfMibView` for GETNEXT. Remove uses of the unused handler-level
   `Response`, and import `SecurityModel` from the crate root or `handler`.
-- Replace external struct literals for `ClientConfig`, `CompatibilityPolicy`,
+- Replace external struct literals for `ClientConfig`, `DecodeConfig`,
   and `TcpOptions` with `Default` plus public-field mutation, or use the
   preferred builders.
 - Handle the `Result` from `MasterKey::from_bytes` and

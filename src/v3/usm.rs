@@ -18,9 +18,10 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::ber::{Decoder, EncodeBuf};
+use crate::compatibility::DecodeConfig;
 use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
-use crate::message::SecurityLevel;
+use crate::message::{DecodeOutcome, SecurityLevel};
 use crate::v3::validate_engine_id;
 
 /// Maximum length of `msgUserName`, per RFC 3414 Section 2.4 (SIZE(0..32)).
@@ -236,37 +237,50 @@ impl UsmSecurityParams {
         })
     }
 
-    /// Decode from BER bytes.
-    pub fn decode(data: Bytes) -> Result<Self> {
-        let mut decoder = Decoder::new(data);
+    /// Decode from BER bytes and retain every accepted anomaly.
+    pub fn decode(data: Bytes, config: DecodeConfig) -> Result<DecodeOutcome<Self>> {
+        let anomalies = std::cell::RefCell::new(Vec::new());
+        let mut decoder = Decoder::new(data)
+            .with_decode_config(config)
+            .with_anomaly_sink(&anomalies);
         let params = Self::decode_from(&mut decoder)?;
         if !decoder.is_empty() {
             return Err(decoder.malformed(DecodeErrorKind::TrailingData {
                 remaining: decoder.remaining(),
             }));
         }
-        Ok(params)
+        drop(decoder);
+        Ok(DecodeOutcome {
+            value: params,
+            anomalies: anomalies.into_inner(),
+        })
     }
 
-    pub(crate) fn decode_with_context_and_compatibility(
+    pub(crate) fn decode_with_context(
         data: Bytes,
         base_offset: usize,
         target: SocketAddr,
-        compatibility: crate::CompatibilityPolicy,
-    ) -> Result<Self> {
+        config: DecodeConfig,
+    ) -> Result<DecodeOutcome<Self>> {
+        let anomalies = std::cell::RefCell::new(Vec::new());
         let mut decoder = Decoder::with_context(data, base_offset, Some(target))
-            .with_compatibility_policy(compatibility);
+            .with_decode_config(config)
+            .with_anomaly_sink(&anomalies);
         let params = Self::decode_from(&mut decoder)?;
         if !decoder.is_empty() {
             return Err(decoder.malformed(DecodeErrorKind::TrailingData {
                 remaining: decoder.remaining(),
             }));
         }
-        Ok(params)
+        drop(decoder);
+        Ok(DecodeOutcome {
+            value: params,
+            anomalies: anomalies.into_inner(),
+        })
     }
 
     /// Decode from an existing decoder.
-    pub fn decode_from(decoder: &mut Decoder) -> Result<Self> {
+    pub(crate) fn decode_from(decoder: &mut Decoder) -> Result<Self> {
         let mut seq = decoder.read_sequence()?;
 
         let engine_id = seq.read_octet_string()?;
@@ -468,7 +482,9 @@ mod tests {
     fn test_usm_params_empty_roundtrip() {
         let params = UsmSecurityParams::discovery();
         let encoded = params.encode().unwrap();
-        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        let decoded = UsmSecurityParams::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
 
         assert!(decoded.engine_id.is_empty());
         assert_eq!(decoded.engine_boots, 0);
@@ -489,7 +505,9 @@ mod tests {
                 .unwrap(); // 8 bytes for salt
 
         let encoded = params.encode().unwrap();
-        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        let decoded = UsmSecurityParams::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
 
         assert_eq!(decoded.engine_id.as_ref(), b"engine-id");
         assert_eq!(decoded.engine_boots, 1234);
@@ -505,14 +523,16 @@ mod tests {
 
         let mut trailing = encoded.to_vec();
         trailing.extend_from_slice(&[0x05, 0x00]);
-        assert!(UsmSecurityParams::decode(Bytes::from(trailing)).is_err());
+        assert!(UsmSecurityParams::decode(Bytes::from(trailing), DecodeConfig::default()).is_err());
 
         let mut extra_field = encoded.to_vec();
         assert_eq!(extra_field[0], 0x30);
         assert!(extra_field[1] < 0x80);
         extra_field[1] += 2;
         extra_field.extend_from_slice(&[0x05, 0x00]);
-        assert!(UsmSecurityParams::decode(Bytes::from(extra_field)).is_err());
+        assert!(
+            UsmSecurityParams::decode(Bytes::from(extra_field), DecodeConfig::default()).is_err()
+        );
     }
 
     #[test]
@@ -576,7 +596,7 @@ mod tests {
         .unwrap();
         let encoded = buf.finish();
 
-        let result = UsmSecurityParams::decode(encoded);
+        let result = UsmSecurityParams::decode(encoded, DecodeConfig::default());
         assert!(result.is_err());
         assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
@@ -597,7 +617,7 @@ mod tests {
         .unwrap();
         let encoded = buf.finish();
 
-        let result = UsmSecurityParams::decode(encoded);
+        let result = UsmSecurityParams::decode(encoded, DecodeConfig::default());
         assert!(result.is_err());
         assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
@@ -618,7 +638,9 @@ mod tests {
         .unwrap();
         let encoded = buf.finish();
 
-        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        let decoded = UsmSecurityParams::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.engine_boots, i32::MAX as u32);
         assert_eq!(decoded.engine_time, i32::MAX as u32);
     }
@@ -628,8 +650,20 @@ mod tests {
         const ZERO: &[u8] = &[0x00];
         const TWO_TO_32: &[u8] = &[0x01, 0x00, 0x00, 0x00, 0x00];
 
-        assert!(UsmSecurityParams::decode(params_with_integer_contents(TWO_TO_32, ZERO)).is_err());
-        assert!(UsmSecurityParams::decode(params_with_integer_contents(ZERO, TWO_TO_32)).is_err());
+        assert!(
+            UsmSecurityParams::decode(
+                params_with_integer_contents(TWO_TO_32, ZERO),
+                DecodeConfig::default(),
+            )
+            .is_err()
+        );
+        assert!(
+            UsmSecurityParams::decode(
+                params_with_integer_contents(ZERO, TWO_TO_32),
+                DecodeConfig::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -648,7 +682,9 @@ mod tests {
         .unwrap();
         let encoded = buf.finish();
 
-        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        let decoded = UsmSecurityParams::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.engine_boots, 0);
         assert_eq!(decoded.engine_time, 0);
     }
@@ -756,7 +792,7 @@ mod tests {
         .unwrap();
         let encoded = buf.finish();
 
-        let result = UsmSecurityParams::decode(encoded);
+        let result = UsmSecurityParams::decode(encoded, DecodeConfig::default());
         assert!(result.is_err());
         assert!(matches!(*result.unwrap_err(), Error::Decode(_)));
     }
@@ -767,7 +803,9 @@ mod tests {
         let params = UsmSecurityParams::new(b"engine".as_slice(), 0, 0, username.clone()).unwrap();
 
         let encoded = params.encode().unwrap();
-        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        let decoded = UsmSecurityParams::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.username.as_ref(), username.as_slice());
     }
 
@@ -777,7 +815,9 @@ mod tests {
             UsmSecurityParams::new(b"engine".as_slice(), 0, 0, b"admin".as_slice()).unwrap();
 
         let encoded = params.encode().unwrap();
-        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        let decoded = UsmSecurityParams::decode(encoded, DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.username.as_ref(), b"admin");
     }
 

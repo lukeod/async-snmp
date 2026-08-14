@@ -160,8 +160,7 @@ pub struct ClientBuilder {
     send_timeout: Duration,
     retry: Retry,
     max_oids_per_request: usize,
-    decode_policy: crate::message::DecodePolicy,
-    compatibility_policy: crate::CompatibilityPolicy,
+    decode_config: crate::DecodeConfig,
     response_shape_policy: crate::client::ResponseShapePolicy,
     max_repetitions: u32,
     walk_mode: WalkMode,
@@ -231,8 +230,7 @@ impl ClientBuilder {
             send_timeout: DEFAULT_SEND_TIMEOUT,
             retry: Retry::default(),
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
-            decode_policy: crate::message::DecodePolicy::Compatible,
-            compatibility_policy: crate::CompatibilityPolicy::default(),
+            decode_config: crate::DecodeConfig::default(),
             response_shape_policy: crate::client::ResponseShapePolicy::Compatible,
             max_repetitions: DEFAULT_MAX_REPETITIONS,
             walk_mode: WalkMode::Auto,
@@ -356,40 +354,15 @@ impl ClientBuilder {
         self
     }
 
-    /// Set top-level response-envelope handling (default: compatible).
+    /// Set bounded response-decoding compatibility.
     ///
-    /// Compatible mode accepts a bounded suffix following one complete
-    /// declared SNMP message in a UDP datagram. Strict mode rejects the whole
-    /// datagram. This is a device-compatibility allowance: RFC 3417 specifies
-    /// one SNMP message per UDP datagram. Correlation and full response decoding
-    /// use this same policy.
+    /// The same snapshot is used for transport correlation, community
+    /// messages, and every staged V3 decode. The default is
+    /// [`crate::DecodeConfig::DEFAULT`]; use [`crate::DecodeConfig::STRICT`] or
+    /// enable only confirmed peer-specific deviations.
     #[must_use]
-    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
-        self.decode_policy = policy;
-        self
-    }
-
-    /// Set BER/value interoperability handling (default: compatible).
-    ///
-    /// Each field of [`crate::CompatibilityPolicy`] controls one known
-    /// malformed-input deviation. This policy is applied to v1/v2c responses
-    /// and to every staged v3 decode, including discovery, Reports, security
-    /// parameters, plaintext scoped PDUs, and decrypted scoped PDUs.
-    #[must_use]
-    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
-        self.compatibility_policy = policy;
-        self
-    }
-
-    /// Require a canonical top-level envelope and canonical BER/value input.
-    ///
-    /// This is convenience for selecting [`crate::message::DecodePolicy::Strict`]
-    /// and [`crate::CompatibilityPolicy::STRICT`] together. Either policy can
-    /// subsequently be replaced independently for a targeted device quirk.
-    #[must_use]
-    pub fn strict_decoding(mut self) -> Self {
-        self.decode_policy = crate::message::DecodePolicy::Strict;
-        self.compatibility_policy = crate::CompatibilityPolicy::STRICT;
+    pub fn decode_config(mut self, config: crate::DecodeConfig) -> Self {
+        self.decode_config = config;
         self
     }
 
@@ -669,8 +642,7 @@ impl ClientBuilder {
     fn build_config(&self) -> ClientConfig {
         ClientConfig {
             auth: self.auth.clone(),
-            decode_policy: self.decode_policy,
-            compatibility_policy: self.compatibility_policy,
+            decode_config: self.decode_config,
             community_response_policy: self.community_response_policy,
             request_timeout: self.request_timeout,
             send_timeout: self.send_timeout,
@@ -771,24 +743,10 @@ impl TargetClientBuilder {
         self
     }
 
-    /// Set BER decoding policy.
+    /// Set bounded response-decoding compatibility.
     #[must_use]
-    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
-        self.client = self.client.decode_policy(policy);
-        self
-    }
-
-    /// Set protocol compatibility policy.
-    #[must_use]
-    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
-        self.client = self.client.compatibility_policy(policy);
-        self
-    }
-
-    /// Select strict decoding and compatibility policies.
-    #[must_use]
-    pub fn strict_decoding(mut self) -> Self {
-        self.client = self.client.strict_decoding();
+    pub fn decode_config(mut self, config: crate::DecodeConfig) -> Self {
+        self.client = self.client.decode_config(config);
         self
     }
 
@@ -2096,25 +2054,13 @@ mod tests {
     #[test]
     fn decoding_policy_defaults_strict_preset_and_targeted_override() {
         let default = ClientBuilder::new(Auth::v2c("public")).build_config();
-        assert_eq!(
-            default.decode_policy,
-            crate::message::DecodePolicy::Compatible
-        );
-        assert_eq!(
-            default.compatibility_policy,
-            crate::CompatibilityPolicy::DEFAULT
-        );
+        assert_eq!(default.decode_config, crate::DecodeConfig::DEFAULT);
 
-        let mut targeted = crate::CompatibilityPolicy::STRICT;
+        let mut targeted = crate::DecodeConfig::STRICT;
         targeted.empty_counter64_as_zero = true;
         let configured = ClientBuilder::new(Auth::v2c("public"))
-            .strict_decoding()
-            .compatibility_policy(targeted)
+            .decode_config(targeted)
             .build_config();
-        assert_eq!(
-            configured.decode_policy,
-            crate::message::DecodePolicy::Strict
-        );
-        assert_eq!(configured.compatibility_policy, targeted);
+        assert_eq!(configured.decode_config, targeted);
     }
 }

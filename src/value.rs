@@ -1153,7 +1153,7 @@ impl Value {
         if len == 0 {
             return Ok(value);
         }
-        if !decoder.compatibility_policy().malformed_exception_payloads {
+        if !decoder.decode_config().malformed_exception_payloads {
             return Err(decoder.malformed(DecodeErrorKind::InvalidValue));
         }
         let _ = decoder.read_bytes(len)?;
@@ -1184,7 +1184,7 @@ impl Value {
                 let len = if len > available {
                     // The decoder is bounded to the enclosing varbind SEQUENCE,
                     // so compatible clamping cannot consume the next varbind.
-                    if !decoder.compatibility_policy().clamp_bounded_strings {
+                    if !decoder.decode_config().clamp_bounded_strings {
                         return Err(decoder.malformed(DecodeErrorKind::InsufficientData {
                             needed: len,
                             available,
@@ -1241,7 +1241,7 @@ impl Value {
             tag::application::OPAQUE => {
                 let available = decoder.remaining();
                 let len = if len > available {
-                    if !decoder.compatibility_policy().clamp_bounded_strings {
+                    if !decoder.decode_config().clamp_bounded_strings {
                         return Err(decoder.malformed(DecodeErrorKind::InsufficientData {
                             needed: len,
                             available,
@@ -2119,19 +2119,19 @@ mod tests {
             let mut default_decoder = Decoder::new(malformed.clone());
             assert!(Value::decode(&mut default_decoder).is_err());
 
-            let mut strict_decoder = Decoder::new(malformed.clone())
-                .with_compatibility_policy(crate::CompatibilityPolicy::STRICT);
+            let mut strict_decoder =
+                Decoder::new(malformed.clone()).with_decode_config(crate::DecodeConfig::STRICT);
             assert!(Value::decode(&mut strict_decoder).is_err());
 
-            let policy = crate::CompatibilityPolicy {
+            let config = crate::DecodeConfig {
                 malformed_exception_payloads: true,
-                ..crate::CompatibilityPolicy::STRICT
+                ..crate::DecodeConfig::STRICT
             };
-            let mut compatible_decoder = Decoder::new(malformed).with_compatibility_policy(policy);
+            let mut compatible_decoder = Decoder::new(malformed).with_decode_config(config);
             assert_eq!(Value::decode(&mut compatible_decoder).unwrap(), expected);
 
-            let mut canonical = Decoder::from_slice(&[tag, 0x00])
-                .with_compatibility_policy(crate::CompatibilityPolicy::STRICT);
+            let mut canonical =
+                Decoder::from_slice(&[tag, 0x00]).with_decode_config(crate::DecodeConfig::STRICT);
             assert_eq!(Value::decode(&mut canonical).unwrap(), expected);
         }
     }
@@ -2145,11 +2145,11 @@ mod tests {
             Value::OctetString(Bytes::from_static(b"ab"))
         );
 
-        let policy = crate::CompatibilityPolicy {
+        let config = crate::DecodeConfig {
             clamp_bounded_strings: false,
-            ..crate::CompatibilityPolicy::DEFAULT
+            ..crate::DecodeConfig::DEFAULT
         };
-        let mut strict = Decoder::new(malformed).with_compatibility_policy(policy);
+        let mut strict = Decoder::new(malformed).with_decode_config(config);
         assert!(Value::decode(&mut strict).is_err());
     }
 

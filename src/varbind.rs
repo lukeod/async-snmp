@@ -252,11 +252,11 @@ mod tests {
         assert!(vb.oid.is_empty());
         assert_eq!(vb.value, Value::EndOfMibView);
 
-        let policy = crate::CompatibilityPolicy {
+        let config = crate::DecodeConfig {
             empty_object_identifier: false,
-            ..crate::CompatibilityPolicy::DEFAULT
+            ..crate::DecodeConfig::DEFAULT
         };
-        let mut strict = Decoder::new(bytes).with_compatibility_policy(policy);
+        let mut strict = Decoder::new(bytes).with_decode_config(config);
         assert!(VarBind::decode(&mut strict).is_err());
     }
 

@@ -572,7 +572,9 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     // Discovery request: empty engine ID triggers usmStatsUnknownEngineIDs Report
     let msg1 = build_raw_v3_get(Bytes::new(), Bytes::new());
     let resp1 = send_raw_udp(addr, msg1).await;
-    let decoded1 = V3Message::decode(resp1).unwrap();
+    let decoded1 = V3Message::decode(resp1, async_snmp::DecodeConfig::default())
+        .unwrap()
+        .value;
     let pdu1 = decoded1.pdu().unwrap();
     assert_eq!(pdu1.pdu_type(), PduType::Report, "expected Report PDU");
 
@@ -600,7 +602,9 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
     // Second discovery request: counter should be 2
     let msg2 = build_raw_v3_get(Bytes::new(), Bytes::new());
     let resp2 = send_raw_udp(addr, msg2).await;
-    let decoded2 = V3Message::decode(resp2).unwrap();
+    let decoded2 = V3Message::decode(resp2, async_snmp::DecodeConfig::default())
+        .unwrap()
+        .value;
     let pdu2 = decoded2.pdu().unwrap();
     assert_eq!(pdu2.pdu_type(), PduType::Report);
 
@@ -642,7 +646,9 @@ async fn report_pdu_counter_matches_agent_counter_unknown_user() {
     // reportable=true so the agent sends a Report PDU.
     let msg = build_raw_v3_get(engine_id, Bytes::from_static(b"unknownuser"));
     let resp = send_raw_udp(addr, msg).await;
-    let decoded = V3Message::decode(resp).unwrap();
+    let decoded = V3Message::decode(resp, async_snmp::DecodeConfig::default())
+        .unwrap()
+        .value;
     let pdu = decoded.pdu().unwrap();
     assert_eq!(pdu.pdu_type(), PduType::Report, "expected Report PDU");
 

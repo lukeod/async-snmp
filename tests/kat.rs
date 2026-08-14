@@ -349,7 +349,9 @@ fn test_rfc3414_a4_usm_encoding() {
     assert_eq!(encoded[0], 0x30, "Should start with SEQUENCE tag");
 
     // Decode it back and verify fields
-    let decoded = UsmSecurityParams::decode(encoded.clone()).unwrap();
+    let decoded = UsmSecurityParams::decode(encoded.clone(), async_snmp::DecodeConfig::default())
+        .unwrap()
+        .value;
     assert_eq!(decoded.engine_boots(), 1);
     assert_eq!(decoded.engine_time(), 257);
     assert_eq!(decoded.username().as_ref(), b"bert");

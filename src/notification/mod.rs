@@ -126,8 +126,10 @@
 //! The two mechanisms confer very different assurance. V1/v2c community and
 //! content are cleartext; without an allowlist they are unverified, while a
 //! match checks only the cleartext community value. V3 username, context, and
-//! content are authenticated at `authNoPriv` or `authPriv`, but remain
-//! spoofable at `noAuthNoPriv`. Each [`Notification`] carries the community or
+//! declared envelope content are authenticated at `authNoPriv` or `authPriv`,
+//! but remain spoofable at `noAuthNoPriv`. Top-level bytes following the
+//! declared V3 envelope are not covered by USM authentication. Each
+//! [`Notification`] carries the community or
 //! username and [`security_level`](Notification::security_level), so branch on
 //! those fields when applying per-version policy.
 //!
@@ -135,8 +137,9 @@
 //!
 //! The sender of an unconfirmed V3 trap is authoritative. The receiver applies
 //! per-sender engine processing and reports the received security level to the
-//! application; authentication of identity and content occurs only at
-//! `authNoPriv` or `authPriv`. For a V3 Inform, this receiver is authoritative:
+//! application; authentication of identity and declared envelope content
+//! occurs only at `authNoPriv` or `authPriv`. For a V3 Inform, this receiver is
+//! authoritative:
 //! the Inform must be localized to its stable engine ID, and any generated
 //! Response uses its current coherent boots/time rather than echoing the
 //! incoming tuple. Configuring any USM user therefore requires a persisted
@@ -284,7 +287,7 @@ pub type NotificationAcceptanceResult =
 /// finish before this envelope is created. Its fields have the assurance
 /// indicated by [`security_level`](Self::security_level): v1/v2c community and
 /// content are cleartext and, without an allowlist, unverified; v3 username,
-/// context, and content are authenticated only at
+/// context, and declared envelope content are authenticated only at
 /// [`SecurityLevel::AuthNoPriv`] or [`SecurityLevel::AuthPriv`] and are
 /// spoofable at [`SecurityLevel::NoAuthNoPriv`]. The policy decision is made
 /// before any Inform response attempt or delivery.
@@ -331,6 +334,11 @@ pub struct NotificationEnvelope<'a> {
     /// Request ID for v2c/v3 notifications, or `None` for v1 traps.
     pub request_id: Option<i32>,
     /// Accepted BER/value deviations from the received message, in decode order.
+    ///
+    /// Community and V3 `NoAuthNoPriv` anomalies are unauthenticated. For
+    /// authenticated V3 messages, anomalies within the declared envelope are
+    /// authenticated, but a top-level [`crate::DecodeAnomaly::TrailingBytes`]
+    /// describes bytes outside that envelope and remains unauthenticated.
     pub decode_anomalies: &'a [crate::DecodeAnomaly],
     notification: &'a Notification,
 }
@@ -584,8 +592,7 @@ pub struct NotificationReceiverBuilder {
     authoritative_engine: Option<AuthoritativeEngine>,
     varbind_validation: NotificationVarbindValidation,
     max_message_size: usize,
-    decode_policy: crate::message::DecodePolicy,
-    compatibility_policy: crate::CompatibilityPolicy,
+    decode_config: crate::DecodeConfig,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
     response_send_timeout: Duration,
 }
@@ -608,8 +615,7 @@ impl NotificationReceiverBuilder {
             authoritative_engine: None,
             varbind_validation: NotificationVarbindValidation::Tolerant,
             max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
-            decode_policy: crate::message::DecodePolicy::Compatible,
-            compatibility_policy: crate::CompatibilityPolicy::default(),
+            decode_config: crate::DecodeConfig::default(),
             acceptance_policy: None,
             response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
         }
@@ -666,31 +672,13 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Set top-level notification-envelope handling (default: compatible).
+    /// Set bounded notification-decoding compatibility.
     ///
-    /// Compatible mode accepts a bounded suffix after one declared SNMP
-    /// message and exposes a trailing-byte anomaly. Strict mode rejects it.
+    /// The same snapshot applies to community notifications and every staged
+    /// V3 decode. The default is [`crate::DecodeConfig::DEFAULT`].
     #[must_use]
-    pub fn decode_policy(mut self, policy: crate::message::DecodePolicy) -> Self {
-        self.decode_policy = policy;
-        self
-    }
-
-    /// Set BER/value interoperability handling (default: compatible).
-    ///
-    /// The policy applies to v1/v2c notifications and every staged v3 decode,
-    /// including security parameters and plaintext or decrypted scoped PDUs.
-    #[must_use]
-    pub fn compatibility_policy(mut self, policy: crate::CompatibilityPolicy) -> Self {
-        self.compatibility_policy = policy;
-        self
-    }
-
-    /// Require canonical top-level envelopes and canonical BER/value input.
-    #[must_use]
-    pub fn strict_decoding(mut self) -> Self {
-        self.decode_policy = crate::message::DecodePolicy::Strict;
-        self.compatibility_policy = crate::CompatibilityPolicy::STRICT;
+    pub fn decode_config(mut self, config: crate::DecodeConfig) -> Self {
+        self.decode_config = config;
         self
     }
 
@@ -995,8 +983,7 @@ impl NotificationReceiverBuilder {
                 usm_stats: UsmStats::default(),
                 remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
                 max_message_size: self.max_message_size,
-                decode_policy: self.decode_policy,
-                compatibility_policy: self.compatibility_policy,
+                decode_config: self.decode_config,
                 snmp_silent_drops: AtomicU32::new(0),
                 acceptance_policy: self.acceptance_policy,
                 response_send_timeout: self.response_send_timeout,
@@ -1026,8 +1013,8 @@ impl Default for NotificationReceiverBuilder {
 ///
 /// V1/v2c community and content are cleartext and have no cryptographic
 /// integrity; without a configured community allowlist they are unverified.
-/// V3 username, context, and content are authenticated only at `AuthNoPriv` or
-/// `AuthPriv`; all are spoofable at `NoAuthNoPriv`.
+/// V3 username, context, and declared envelope content are authenticated only
+/// at `AuthNoPriv` or `AuthPriv`; all are spoofable at `NoAuthNoPriv`.
 #[derive(Debug, Clone)]
 pub enum Notification {
     /// `SNMPv1` Trap with unique PDU structure.
@@ -1133,6 +1120,11 @@ pub enum Notification {
 
 impl Notification {
     /// Accepted BER/value deviations from the received message, in decode order.
+    ///
+    /// Community and V3 `NoAuthNoPriv` anomalies are unauthenticated. For
+    /// authenticated V3 messages, anomalies within the declared envelope are
+    /// authenticated, but a top-level [`crate::DecodeAnomaly::TrailingBytes`]
+    /// describes bytes outside that envelope and remains unauthenticated.
     #[must_use]
     pub fn decode_anomalies(&self) -> &[crate::DecodeAnomaly] {
         match self {
@@ -1305,8 +1297,7 @@ struct ReceiverInner {
     remote_engines: Mutex<RemoteEngineTable>,
     /// Local outbound response policy limit.
     max_message_size: usize,
-    decode_policy: crate::message::DecodePolicy,
-    compatibility_policy: crate::CompatibilityPolicy,
+    decode_config: crate::DecodeConfig,
     /// Confirmed notifications dropped because even the alternate Response did not fit.
     snmp_silent_drops: AtomicU32,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
@@ -1453,16 +1444,10 @@ impl NotificationReceiver {
         self.inner.local_addr
     }
 
-    /// Return the configured top-level notification-envelope policy.
+    /// Return the configured notification decode configuration.
     #[must_use]
-    pub fn decode_policy(&self) -> crate::message::DecodePolicy {
-        self.inner.decode_policy
-    }
-
-    /// Return the configured BER/value compatibility policy.
-    #[must_use]
-    pub fn compatibility_policy(&self) -> crate::CompatibilityPolicy {
-        self.inner.compatibility_policy
+    pub fn decode_config(&self) -> crate::DecodeConfig {
+        self.inner.decode_config
     }
 
     /// Get the local engine ID.
@@ -1698,29 +1683,17 @@ mod tests {
     #[tokio::test]
     async fn decoding_policy_defaults_strict_preset_and_targeted_override() {
         let default = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
-        assert_eq!(
-            default.decode_policy(),
-            crate::message::DecodePolicy::Compatible
-        );
-        assert_eq!(
-            default.compatibility_policy(),
-            crate::CompatibilityPolicy::DEFAULT
-        );
+        assert_eq!(default.decode_config(), crate::DecodeConfig::DEFAULT);
 
-        let mut targeted = crate::CompatibilityPolicy::STRICT;
+        let mut targeted = crate::DecodeConfig::STRICT;
         targeted.empty_counter64_as_zero = true;
         let configured = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
-            .strict_decoding()
-            .compatibility_policy(targeted)
+            .decode_config(targeted)
             .build()
             .await
             .unwrap();
-        assert_eq!(
-            configured.decode_policy(),
-            crate::message::DecodePolicy::Strict
-        );
-        assert_eq!(configured.compatibility_policy(), targeted);
+        assert_eq!(configured.decode_config(), targeted);
     }
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::Value;
@@ -1844,14 +1817,7 @@ mod tests {
                 receiver.inner.max_message_size,
                 crate::UDP_RECEIVE_LIMITS.advertised().as_usize()
             );
-            assert_eq!(
-                receiver.inner.decode_policy,
-                crate::message::DecodePolicy::Compatible
-            );
-            assert_eq!(
-                receiver.inner.compatibility_policy,
-                crate::CompatibilityPolicy::default()
-            );
+            assert_eq!(receiver.inner.decode_config, crate::DecodeConfig::default());
             assert_eq!(receiver.snmp_silent_drops(), 0);
             assert!(receiver.inner.acceptance_policy.is_none());
             assert_eq!(
@@ -3047,12 +3013,22 @@ mod tests {
         .expect("expected a discovery Report")
         .unwrap();
 
-        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let report = V3Message::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(
             report.global_data.msg_flags.security_level,
             SecurityLevel::NoAuthNoPriv
         );
-        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        let report_usm = UsmSecurityParams::decode(
+            report.security_params.clone(),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(report_usm.engine_id.as_ref(), b"test-discovery-engine");
         let scoped = report.scoped_pdu().expect("report should be plaintext");
         assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
@@ -3091,8 +3067,18 @@ mod tests {
         .await
         .expect("convenience receiver did not return a discovery Report")
         .unwrap();
-        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
-        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        let report = V3Message::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
+        let report_usm = UsmSecurityParams::decode(
+            report.security_params.clone(),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(report_usm.engine_id, engine_id);
         let scoped = report.scoped_pdu().expect("Report must be plaintext");
         assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
@@ -3116,12 +3102,22 @@ mod tests {
         .await
         .expect("convenience receiver did not return an unknown-user Report")
         .unwrap();
-        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let report = V3Message::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(
             report.global_data.msg_flags.security_level,
             SecurityLevel::NoAuthNoPriv
         );
-        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        let report_usm = UsmSecurityParams::decode(
+            report.security_params.clone(),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(report_usm.engine_id, engine_id);
         let scoped = report.scoped_pdu().expect("Report must be plaintext");
         assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
@@ -3285,7 +3281,12 @@ mod tests {
         .unwrap();
 
         use crate::message::V3Message;
-        let ack = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let ack = V3Message::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(
             ack.global_data.msg_max_size,
             crate::UDP_RECEIVE_LIMITS.advertised(),
@@ -3393,8 +3394,12 @@ mod tests {
             .expect("tooBig acknowledgement should be sent")
             .unwrap();
             assert_eq!(len, alternate_len);
-            let ack =
-                crate::message::V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+            let ack = crate::message::V3Message::decode(
+                Bytes::copy_from_slice(&buf[..len]),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             assert_eq!(
                 ack.global_data.msg_max_size,
                 crate::UDP_RECEIVE_LIMITS.advertised()
@@ -3485,8 +3490,16 @@ mod tests {
         .expect("expected the inform acknowledgement")
         .unwrap();
 
-        let ack = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
-        let ack_usm = UsmSecurityParams::decode(ack.security_params).unwrap();
+        let ack = V3Message::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
+        let ack_usm =
+            UsmSecurityParams::decode(ack.security_params, crate::DecodeConfig::default())
+                .unwrap()
+                .value;
         let ack_pair = (ack_usm.engine_boots, ack_usm.engine_time);
 
         assert_eq!(ack_usm.engine_id.as_ref(), receiver.engine_id());
@@ -3891,7 +3904,9 @@ mod tests {
         .unwrap();
         let report_bytes = Bytes::copy_from_slice(&buf[..len]);
 
-        let report = V3Message::decode(report_bytes.clone()).unwrap();
+        let report = V3Message::decode(report_bytes.clone(), crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(
             report.global_data.msg_flags.security_level,
             SecurityLevel::AuthNoPriv,
@@ -3899,7 +3914,12 @@ mod tests {
         );
         assert!(!report.global_data.msg_flags.reportable);
 
-        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        let report_usm = UsmSecurityParams::decode(
+            report.security_params.clone(),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(report_usm.engine_id.as_ref(), b"test-engine");
 
         // The HMAC must verify with the user's key localized to the
@@ -3967,7 +3987,9 @@ mod tests {
         .unwrap();
         let report_bytes = Bytes::copy_from_slice(&buf[..len]);
 
-        let report = V3Message::decode(report_bytes.clone()).unwrap();
+        let report = V3Message::decode(report_bytes.clone(), crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(
             report.global_data.msg_flags.security_level,
             SecurityLevel::AuthNoPriv,
@@ -4032,12 +4054,22 @@ mod tests {
         .expect("expected a Report in response to the failed inform")
         .unwrap();
 
-        let report = V3Message::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let report = V3Message::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(
             report.global_data.msg_flags.security_level,
             SecurityLevel::NoAuthNoPriv
         );
-        let report_usm = UsmSecurityParams::decode(report.security_params.clone()).unwrap();
+        let report_usm = UsmSecurityParams::decode(
+            report.security_params.clone(),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         assert_eq!(report_usm.engine_id.as_ref(), b"test-engine");
         let scoped = report.scoped_pdu().expect("report should be plaintext");
         assert_eq!(scoped.pdu.pdu_type(), crate::pdu::PduType::Report);
@@ -4278,7 +4310,7 @@ mod tests {
     async fn strict_receiver_rejects_suffixes_for_v1_and_v2c() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
-            .strict_decoding()
+            .decode_config(crate::DecodeConfig::STRICT)
             .build()
             .await
             .unwrap();
@@ -4303,7 +4335,7 @@ mod tests {
         for version in [crate::Version::V1, crate::Version::V2c] {
             let strict = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
-                .compatibility_policy(crate::CompatibilityPolicy::STRICT)
+                .decode_config(crate::DecodeConfig::STRICT)
                 .build()
                 .await
                 .unwrap();
@@ -4315,11 +4347,11 @@ mod tests {
             };
             assert!(result.is_err());
 
-            let mut targeted = crate::CompatibilityPolicy::STRICT;
+            let mut targeted = crate::DecodeConfig::STRICT;
             targeted.truncate_numeric_values = true;
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
-                .compatibility_policy(targeted)
+                .decode_config(targeted)
                 .build()
                 .await
                 .unwrap();
@@ -4409,7 +4441,7 @@ mod tests {
                 .usm_user(username.clone(), move |_| Ok(config))
                 .unwrap()
                 .accept_all_notifications()
-                .strict_decoding()
+                .decode_config(crate::DecodeConfig::STRICT)
                 .build()
                 .await
                 .unwrap();
@@ -4828,8 +4860,12 @@ mod tests {
 
         let mut buf = vec![0; 1024];
         let (len, _) = client.recv_from(&mut buf).await.unwrap();
-        let response =
-            crate::message::CommunityMessage::decode(Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let response = crate::message::CommunityMessage::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
         let pdu = response.pdu().standard().unwrap();
         assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
         assert!(pdu.varbinds.is_empty());

@@ -350,16 +350,11 @@ struct ClientInner<T: Transport> {
 pub struct ClientConfig {
     /// Authentication and corresponding SNMP version (default: V2c "public").
     pub auth: Auth,
-    /// Top-level response-envelope consumption policy (default: compatible).
+    /// Bounded response-decoding compatibility (default: permissive).
     ///
-    /// Compatible mode accepts bounded bytes after one complete declared SNMP
-    /// message in a UDP datagram despite RFC 3417's one-message-per-datagram
-    /// mapping. Strict mode rejects such datagrams. TCP still treats each
-    /// declared message TLV as one stream frame.
-    pub decode_policy: crate::message::DecodePolicy,
-    /// BER/value malformed-input compatibility policy (default: established
-    /// permissive receive behavior).
-    pub compatibility_policy: crate::CompatibilityPolicy,
+    /// One snapshot governs transport correlation, complete community
+    /// messages, and every staged V3 decode.
+    pub decode_config: crate::DecodeConfig,
     /// Policy for correlating v1/v2c response communities (default: exact).
     pub community_response_policy: crate::transport::CommunityResponsePolicy,
     /// Request timeout (default: 5 seconds)
@@ -409,8 +404,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             auth: Auth::default(),
-            decode_policy: crate::message::DecodePolicy::Compatible,
-            compatibility_policy: crate::CompatibilityPolicy::default(),
+            decode_config: crate::DecodeConfig::default(),
             community_response_policy: crate::transport::CommunityResponsePolicy::Exact,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
@@ -559,16 +553,10 @@ impl<T: Transport> Client<T> {
         self.inner.config.version()
     }
 
-    /// Return the configured top-level response-envelope policy.
+    /// Return the configured response decode configuration.
     #[must_use]
-    pub fn decode_policy(&self) -> crate::message::DecodePolicy {
-        self.inner.config.decode_policy
-    }
-
-    /// Return the configured BER/value compatibility policy.
-    #[must_use]
-    pub fn compatibility_policy(&self) -> crate::CompatibilityPolicy {
-        self.inner.config.compatibility_policy
+    pub fn decode_config(&self) -> crate::DecodeConfig {
+        self.inner.config.decode_config
     }
 
     /// Returns the configured SNMPv3 USM security level.
@@ -654,7 +642,7 @@ impl<T: Transport> Client<T> {
                 community.clone(),
                 self.inner.config.community_response_policy,
             )
-            .with_decode_policy(self.inner.config.decode_policy);
+            .with_decode_config(self.inner.config.decode_config);
 
             // Send request and wait for response as a single unit. Combining the
             // two lets reliable transports (TCP) own their stream lock for the
@@ -666,12 +654,11 @@ impl<T: Transport> Client<T> {
                 .transport
                 .request_with(data, registration, |response_data, source| {
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response candidate");
-                    let Ok(decoded) = Message::decode_bounded_with_target_and_compatibility(
+                    let Ok(decoded) = Message::decode_bounded_with_target(
                         response_data,
                         self.inner.transport.receive_limits().accepted(),
                         Some(source),
-                        self.inner.config.decode_policy,
-                        self.inner.config.compatibility_policy,
+                        self.inner.config.decode_config,
                     ) else {
                         return Ok(Candidate::Reject);
                     };
@@ -2785,7 +2772,12 @@ mod tests {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             // Decode the message to count varbinds
-            let msg = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let msg = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             let varbind_count = msg.pdu().standard().unwrap().varbinds.len();
             {
                 let mut q = self.pending.lock().unwrap();
@@ -2893,7 +2885,12 @@ mod tests {
 
     impl Transport for InformMetadataTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let message = CommunityMessage::decode(Bytes::copy_from_slice(data)).unwrap();
+            let message = CommunityMessage::decode(
+                Bytes::copy_from_slice(data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             self.pending
                 .lock()
                 .unwrap()

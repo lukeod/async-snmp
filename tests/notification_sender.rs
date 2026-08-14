@@ -259,7 +259,12 @@ async fn notification_varbind_validation_controls_inform_acknowledgement() {
         .await
         .expect("timeout waiting for tolerant Inform acknowledgement")
         .unwrap();
-    let response_msg = CommunityMessage::decode(Bytes::copy_from_slice(&response[..len])).unwrap();
+    let response_msg = CommunityMessage::decode(
+        Bytes::copy_from_slice(&response[..len]),
+        async_snmp::DecodeConfig::default(),
+    )
+    .unwrap()
+    .value;
     let response_pdu = response_msg.into_pdu().unwrap();
     assert_eq!(response_pdu.pdu_type(), PduType::Response);
     assert_eq!(response_pdu.request_id(), 42);

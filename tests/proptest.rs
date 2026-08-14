@@ -1567,25 +1567,27 @@ mod usm_params_boundary {
     #[test]
     fn usm_engine_boots_min_rejected() {
         let encoded = encode_usm_with_boots_time(i32::MIN, 0);
-        assert!(UsmSecurityParams::decode(encoded).is_err());
+        assert!(UsmSecurityParams::decode(encoded, async_snmp::DecodeConfig::default()).is_err());
     }
 
     #[test]
     fn usm_engine_time_min_rejected() {
         let encoded = encode_usm_with_boots_time(0, i32::MIN);
-        assert!(UsmSecurityParams::decode(encoded).is_err());
+        assert!(UsmSecurityParams::decode(encoded, async_snmp::DecodeConfig::default()).is_err());
     }
 
     #[test]
     fn usm_both_negative_rejected() {
         let encoded = encode_usm_with_boots_time(-1, -1);
-        assert!(UsmSecurityParams::decode(encoded).is_err());
+        assert!(UsmSecurityParams::decode(encoded, async_snmp::DecodeConfig::default()).is_err());
     }
 
     #[test]
     fn usm_max_values_accepted() {
         let encoded = encode_usm_with_boots_time(i32::MAX, i32::MAX);
-        let decoded = UsmSecurityParams::decode(encoded).unwrap();
+        let decoded = UsmSecurityParams::decode(encoded, async_snmp::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.engine_boots(), i32::MAX as u32);
         assert_eq!(decoded.engine_time(), i32::MAX as u32);
     }
@@ -1607,14 +1609,17 @@ proptest! {
         }).unwrap();
         let encoded = buf.finish();
 
-        let result = async_snmp::v3::UsmSecurityParams::decode(encoded);
+        let result = async_snmp::v3::UsmSecurityParams::decode(
+            encoded,
+            async_snmp::DecodeConfig::default(),
+        );
 
         if boots < 0 || time < 0 {
             prop_assert!(result.is_err());
         } else {
             let decoded = result.unwrap();
-            prop_assert_eq!(decoded.engine_boots(), boots as u32);
-            prop_assert_eq!(decoded.engine_time(), time as u32);
+            prop_assert_eq!(decoded.value.engine_boots(), boots as u32);
+            prop_assert_eq!(decoded.value.engine_time(), time as u32);
         }
     }
 }

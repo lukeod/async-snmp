@@ -380,7 +380,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
     group.bench_function("v2c_response_3_varbinds", |b| {
         b.iter(|| {
             let data = encoded.clone();
-            black_box(CommunityMessage::decode(data).unwrap())
+            black_box(CommunityMessage::decode(data, async_snmp::DecodeConfig::default()).unwrap())
         });
     });
 
@@ -403,7 +403,7 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
     group.bench_function("v2c_response_10_varbinds", |b| {
         b.iter(|| {
             let data = encoded_large.clone();
-            black_box(CommunityMessage::decode(data).unwrap())
+            black_box(CommunityMessage::decode(data, async_snmp::DecodeConfig::default()).unwrap())
         });
     });
 

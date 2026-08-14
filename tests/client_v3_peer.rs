@@ -4,12 +4,12 @@
 
 mod common;
 
-use async_snmp::message::{DecodePolicy, ScopedPdu, SecurityLevel, V3Message, V3MessageData};
+use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
 use async_snmp::transport::Transport;
 use async_snmp::v3::{AuthProtocol, DiscoveredEngine, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
-    Auth, Client, ClientConfig, CompatibilityPolicy, EngineCache, ErrorStatus, MasterKeys,
-    ReceiveLimits, Retry, UsmConfig, Value, VarBind, oid,
+    Auth, Client, ClientConfig, DecodeConfig, EngineCache, ErrorStatus, MasterKeys, ReceiveLimits,
+    Retry, UsmConfig, Value, VarBind, oid,
 };
 use bytes::Bytes;
 use common::v3::{
@@ -208,7 +208,7 @@ async fn v3_scripted_udp_success_at_all_security_levels() {
     }
 }
 
-async fn v3_udp_suffix_policy(level: SecurityLevel, policy: DecodePolicy) {
+async fn v3_udp_suffix_policy(level: SecurityLevel, config: DecodeConfig) {
     let engine = engine_for(level);
     let response_engine = engine.clone();
     let peer = ScriptedV3Peer::udp(
@@ -236,7 +236,7 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, policy: DecodePolicy) {
                     )])
                     .build()?;
                 suffixed.extend_from_slice(&plausible);
-                let replies = if policy == DecodePolicy::Strict {
+                let replies = if !config.trailing_bytes {
                     vec![Bytes::from(suffixed), response]
                 } else {
                     vec![Bytes::from(suffixed)]
@@ -248,7 +248,7 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, policy: DecodePolicy) {
     .await;
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .decode_policy(policy)
+        .decode_config(config)
         .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
@@ -259,7 +259,7 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, policy: DecodePolicy) {
     assert!(peer_result.is_ok(), "peer failed: {peer_result:?}");
     let result = result.unwrap();
     assert_eq!(result.varbinds[0].value.as_str(), Some("v3 suffix policy"));
-    if policy == DecodePolicy::Compatible {
+    if config.trailing_bytes {
         assert!(
             matches!(
                 result.metadata.decode_anomalies.as_slice(),
@@ -283,8 +283,8 @@ async fn v3_udp_client_suffix_policy_is_coherent() {
         SecurityLevel::AuthNoPriv,
         SecurityLevel::AuthPriv,
     ] {
-        v3_udp_suffix_policy(level, DecodePolicy::Compatible).await;
-        v3_udp_suffix_policy(level, DecodePolicy::Strict).await;
+        v3_udp_suffix_policy(level, DecodeConfig::default()).await;
+        v3_udp_suffix_policy(level, DecodeConfig::STRICT).await;
     }
 }
 
@@ -337,11 +337,11 @@ async fn v3_plaintext_and_authpriv_inner_anomaly_precedes_top_level_suffix() {
 
 async fn v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
     level: SecurityLevel,
-    compatibility: CompatibilityPolicy,
+    config: DecodeConfig,
 ) {
     let engine = engine_for(level);
     let response_engine = engine.clone();
-    let accept_malformed = compatibility.truncate_numeric_values;
+    let accept_malformed = config.truncate_numeric_values;
     let peer = ScriptedV3Peer::udp(
         engine.clone(),
         vec![
@@ -367,7 +367,7 @@ async fn v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
     )
     .await;
     let client = Client::builder(peer.addr(), auth_for(level))
-        .compatibility_policy(compatibility)
+        .decode_config(config)
         .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
@@ -390,19 +390,19 @@ async fn v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
 
 #[tokio::test]
 async fn v3_client_supports_strict_and_targeted_value_policy_for_plaintext_and_authpriv() {
-    let mut targeted = CompatibilityPolicy::STRICT;
+    let mut targeted = DecodeConfig::STRICT;
     targeted.truncate_numeric_values = true;
     for level in [SecurityLevel::NoAuthNoPriv, SecurityLevel::AuthPriv] {
         v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(level, targeted).await;
         v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
             level,
-            CompatibilityPolicy::STRICT,
+            DecodeConfig::STRICT,
         )
         .await;
     }
 }
 
-async fn v3_udp_discovery_suffix_policy(policy: DecodePolicy) {
+async fn v3_udp_discovery_suffix_policy(config: DecodeConfig) {
     let level = SecurityLevel::AuthNoPriv;
     let engine = engine_for(level);
     let discovery_engine = engine.clone();
@@ -428,7 +428,7 @@ async fn v3_udp_discovery_suffix_policy(policy: DecodePolicy) {
                 .build()?;
                 let mut suffixed = response.to_vec();
                 suffixed.extend_from_slice(&decoy);
-                Ok(if policy == DecodePolicy::Strict {
+                Ok(if !config.trailing_bytes {
                     vec![Bytes::from(suffixed), response]
                 } else {
                     vec![Bytes::from(suffixed)]
@@ -441,7 +441,7 @@ async fn v3_udp_discovery_suffix_policy(policy: DecodePolicy) {
     let log = peer.log();
 
     let client = Client::builder(peer.addr(), auth_for(level))
-        .decode_policy(policy)
+        .decode_config(config)
         .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
         .connect()
@@ -465,8 +465,8 @@ async fn v3_udp_discovery_suffix_policy(policy: DecodePolicy) {
 
 #[tokio::test]
 async fn v3_udp_discovery_obeys_suffix_policy() {
-    v3_udp_discovery_suffix_policy(DecodePolicy::Compatible).await;
-    v3_udp_discovery_suffix_policy(DecodePolicy::Strict).await;
+    v3_udp_discovery_suffix_policy(DecodeConfig::default()).await;
+    v3_udp_discovery_suffix_policy(DecodeConfig::STRICT).await;
 }
 
 #[tokio::test]
@@ -3297,7 +3297,9 @@ async fn report_builder_uses_reporting_engine_context() {
     )
     .await
     .unwrap();
-    let response = V3Message::decode(response).unwrap();
+    let response = V3Message::decode(response, DecodeConfig::default())
+        .unwrap()
+        .value;
     let V3MessageData::Plaintext(scoped) = response.data() else {
         panic!("Report must have a plaintext scopedPDU");
     };
@@ -3328,7 +3330,7 @@ fn raw_ber_targets_invalid_flags_and_oversized_msg_ids() {
     let (offset, before, after) = changes[0];
     assert_eq!((before, after), (0x04, 0x82));
     assert_eq!(&message[offset - 2..offset], &[0x04, 0x01]);
-    assert!(V3Message::decode(Bytes::from(message)).is_err());
+    assert!(V3Message::decode(Bytes::from(message), DecodeConfig::default()).is_err());
 
     let oversized_msg_id = [1, 0, 0, 0, 0];
     let encoded_msg_id = raw_ber::integer_from_content(&oversized_msg_id);

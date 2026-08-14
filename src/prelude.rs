@@ -16,7 +16,7 @@
 //! - The [`oid!`] macro for convenient OID construction (wire validity is checked during encoding)
 
 pub use crate::client::{Auth, Client, ClientBuilder, Retry, TargetClientBuilder};
-pub use crate::compatibility::{CompatibilityPolicy, DecodeAnomaly};
+pub use crate::compatibility::{DecodeAnomaly, DecodeConfig};
 pub use crate::error::{Error, Result};
 pub use crate::oid::Oid;
 pub use crate::v3::{AuthProtocol, PrivProtocol};

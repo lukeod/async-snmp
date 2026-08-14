@@ -41,7 +41,7 @@ pub(crate) fn community_request_context_with(
     request_id: i32,
     pdu_type: PduType,
 ) -> RequestContext {
-    RequestContext::community(source, version, community, request_id, pdu_type)
+    RequestContext::community(source, version, community, request_id, pdu_type, Vec::new())
 }
 
 pub(crate) fn usm_request_context(
@@ -77,6 +77,7 @@ pub(crate) fn usm_request_context_with(
         request_id,
         pdu_type,
         msg_max_size,
+        Vec::new(),
     )
 }
 

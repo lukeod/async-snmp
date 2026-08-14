@@ -309,8 +309,13 @@ mod tests {
             .expect("noAuthNoPriv response should be produced");
         let latest = agent.inner.state.authoritative_boots_time().unwrap();
 
-        let message = V3Message::decode(encoded).unwrap();
-        let response_usm = UsmSecurityParams::decode(message.security_params).unwrap();
+        let message = V3Message::decode(encoded, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
+        let response_usm =
+            UsmSecurityParams::decode(message.security_params, crate::DecodeConfig::default())
+                .unwrap()
+                .value;
         let response_pair = (response_usm.engine_boots, response_usm.engine_time);
 
         assert_eq!(earliest, (1, 123));
@@ -351,7 +356,9 @@ mod tests {
             .unwrap()
             .expect("noAuthNoPriv response should be produced");
 
-        let decoded = V3Message::decode(result).unwrap();
+        let decoded = V3Message::decode(result, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(
             decoded.global_data.msg_max_size, 65507,
             "response must advertise local receive capacity, not the peer value or response cap"

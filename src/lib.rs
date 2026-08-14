@@ -417,21 +417,22 @@
 //! Interoperability deviations are independent controls rather than a global
 //! "permissive" mode. Defaults either preserve a bounded, unambiguous value or
 //! narrowly accommodate common agent behavior. Security-sensitive relaxations
-//! are off by default. [`CompatibilityPolicy`] can be supplied to low-level
-//! decode calls or configured per network role. Outbound structured encoders
+//! are off by default. [`DecodeConfig`] is supplied to low-level decode calls
+//! or configured per network role. Outbound structured encoders
 //! always require canonical protocol data.
 //!
 //! ### Malformed BER and value normalization
 //!
-//! [`CompatibilityPolicy`] contains six controls.
-//! [`CompatibilityPolicy::DEFAULT`] enables the first five listed below and
+//! [`DecodeConfig`] contains the top-level suffix choice and six targeted
+//! BER/value controls. [`DecodeConfig::DEFAULT`] enables the first six listed below and
 //! leaves malformed exception payloads disabled. Every accepted deviation is
 //! returned as a typed [`DecodeAnomaly`] in [`message::DecodeOutcome::anomalies`]
 //! and emits a tracing warning with a stable `anomaly` field.
-//! [`CompatibilityPolicy::STRICT`] disables all six controls.
+//! [`DecodeConfig::STRICT`] disables all seven controls.
 //!
-//! | `CompatibilityPolicy` field | Default | Scope and boundary |
+//! | `DecodeConfig` field | Default | Scope and boundary |
 //! |---|:---:|---|
+//! | `trailing_bytes` | on | Accept bytes after one fully consumed top-level message TLV. Both settings reject extra fields inside the declared envelope. |
 //! | `truncate_numeric_values` | on | Decode out-of-range generic INTEGER and Unsigned32 values into their public 32-bit representation. |
 //! | `empty_counter64_as_zero` | on | Decode a zero-length Counter64 as zero. |
 //! | `empty_object_identifier` | on | Decode a zero-length OBJECT IDENTIFIER as [`Oid::empty`]. |
@@ -439,16 +440,14 @@
 //! | `normalize_negative_get_bulk_fields` | on | Normalize negative GETBULK non-repeaters and max-repetitions to zero while decoding; strict receive policy rejects them. Canonical fields are unsigned. |
 //! | `malformed_exception_payloads` | **off** | When enabled, discard non-empty payloads on exception values; the default rejects them. |
 //!
-//! These controls do not govern bytes after a complete top-level message. That
-//! separate envelope policy is described below. Unknown BER value tags remain
-//! preserved as [`Value::Unknown`] for receive compatibility, but structured
-//! encoders reject that receive-only variant.
+//! Unknown BER value tags remain preserved as [`Value::Unknown`] for receive
+//! compatibility, but structured encoders reject that receive-only variant.
 //!
 //! ### Other policy layers
 //!
 //! | Control | Default | Scope, tradeoff, and observation |
 //! |---|---|---|
-//! | [`message::DecodePolicy`] | `Compatible` | Accepts only bytes after a fully consumed top-level message TLV. The outcome appends [`DecodeAnomaly::TrailingBytes`] and a stable `trailing_bytes` warning is emitted; `Strict` rejects them. Client, Agent, and notification-receiver builders apply the selection to their full inbound path; client transport correlation uses the same selection. Both modes reject unconsumed fields inside the declared envelope. TCP frames one declared TLV at a time, so adjacent stream messages are not suffixes. |
+//! | [`DecodeConfig`] | `DEFAULT` | Applies one immutable snapshot to correlation and every decode stage. TCP frames one declared TLV at a time, so adjacent stream messages are not suffixes. |
 //! | [`ResponseShapePolicy`] | `Compatible` | Fixed-cardinality operations preserve all received varbinds and return bounded anomalies for count, OID, successor, or SET-echo problems. `Strict` returns [`Error::ResponseShape`] with the same data and diagnostics. |
 //! | [`NotificationVarbindValidation`] | `Tolerant` | V2c/v3 TrapV2 and Inform prefixes may use non-standard names, but still require `TimeTicks` then `ObjectIdentifier` values. `Strict` also requires the RFC names and order. Rejected notifications are dropped, rejected Informs are not acknowledged, and validation failures are traced. |
 //! | [`WalkMode`], [`OidOrdering`], and walk limits | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires [`ClientBuilder::max_walk_results`] to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
@@ -484,31 +483,22 @@
 //!
 //! ### Strict low-level inspection and network-role controls
 //!
-//! Low-level strict decoding requires both exact envelope consumption and the
-//! strict malformed-input policy. [`ClientBuilder::strict_decoding`],
-//! `AgentBuilder::strict_decoding`, and
-//! [`notification::NotificationReceiverBuilder::strict_decoding`] select both
-//! together. The independent setters support strict envelopes with a targeted
-//! value workaround, or compatible envelopes with otherwise strict values.
+//! Low-level and role decoding use the same configuration type. Start from
+//! [`DecodeConfig::STRICT`] and enable only confirmed peer-specific deviations.
 //!
 //! ```rust,no_run
 //! use async_snmp::{
-//!     Auth, Client, CommunityResponsePolicy, CompatibilityPolicy,
-//!     ResponseShapePolicy,
-//!     message::{DecodePolicy, Message},
+//!     Auth, Client, CommunityResponsePolicy, DecodeConfig, ResponseShapePolicy,
+//!     message::Message,
 //! };
 //! use bytes::Bytes;
 //!
 //! fn inspect_strictly(packet: Bytes) -> async_snmp::Result<Message> {
-//!     Ok(Message::decode_with_policies(
-//!         packet,
-//!         DecodePolicy::Strict,
-//!         CompatibilityPolicy::STRICT,
-//!     )?.value)
+//!     Ok(Message::decode(packet, DecodeConfig::STRICT)?.value)
 //! }
 //!
 //! let _client = Client::builder("192.0.2.1:161", Auth::v2c("public"))
-//!     .strict_decoding()
+//!     .decode_config(DecodeConfig::STRICT)
 //!     .response_shape_policy(ResponseShapePolicy::Strict)
 //!     .strict_source(true)
 //!     .community_response_policy(CommunityResponsePolicy::Exact)
@@ -521,25 +511,24 @@
 //! specific peer.
 //!
 //! ```rust,no_run
-//! use async_snmp::{Auth, Client, CompatibilityPolicy, WalkMode, message::Message};
+//! use async_snmp::{Auth, Client, DecodeConfig, WalkMode, message::Message};
 //! use bytes::Bytes;
 //!
 //! // This agent over-declares bounded string lengths and has broken GETBULK.
-//! let mut value_policy = CompatibilityPolicy::STRICT;
-//! value_policy.clamp_bounded_strings = true;
+//! let mut decode_config = DecodeConfig::STRICT;
+//! decode_config.clamp_bounded_strings = true;
 //!
 //! fn decode_agent_packet(
 //!     packet: Bytes,
-//!     policy: CompatibilityPolicy,
+//!     config: DecodeConfig,
 //! ) -> async_snmp::Result<Message> {
-//!     Message::decode_with_compatibility_policy(packet, policy)
+//!     Ok(Message::decode(packet, config)?.value)
 //! }
 //!
 //! let _client = Client::builder("192.0.2.2:161", Auth::v2c("public"))
-//!     .strict_decoding()
-//!     .compatibility_policy(value_policy)
+//!     .decode_config(decode_config)
 //!     .walk_mode(WalkMode::GetNext);
-//! # let _ = (value_policy, decode_agent_packet);
+//! # let _ = (decode_config, decode_agent_packet);
 //! ```
 //!
 //! ## Cargo features
@@ -611,7 +600,7 @@ pub use client::{
 };
 pub use community::Community;
 pub use compatibility::{
-    BoundedStringKind, CompatibilityPolicy, DecodeAnomaly, ExceptionKind, GetBulkField,
+    BoundedStringKind, DecodeAnomaly, DecodeConfig, ExceptionKind, GetBulkField,
 };
 pub use error::{
     ConstructionStage, DecodeError, DecodeErrorKind, DecodeErrorOrigin, Error, ErrorKind,

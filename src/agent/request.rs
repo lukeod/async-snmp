@@ -43,13 +43,13 @@ impl Agent {
         community_version: CommunityVersion,
     ) -> Result<Option<Bytes>> {
         let version = Version::from(community_version);
-        let msg = CommunityMessage::decode_with_target_and_policies(
+        let decoded = CommunityMessage::decode_with_target(
             data,
             Some(source),
-            self.inner.state.decode_policy,
-            self.inner.state.compatibility_policy,
-        )?
-        .value;
+            self.inner.state.decode_config,
+        )?;
+        let decode_anomalies = decoded.anomalies;
+        let msg = decoded.value;
 
         // Validate community
         if !self.validate_community(msg.community().as_bytes()) {
@@ -88,6 +88,7 @@ impl Agent {
             msg.community().clone(),
             pdu.request_id,
             pdu.pdu_type(),
+            decode_anomalies,
         );
 
         let encode = |response_pdu| {
@@ -155,8 +156,7 @@ impl Agent {
             engine_time,
             local_receive_capacity: state.local_receive_capacity,
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
-            decode_policy: state.decode_policy,
-            compatibility_policy: state.compatibility_policy,
+            decode_config: state.decode_config,
             outbound_limit: state.max_message_size,
             usm_users: &self.inner.usm_users,
             stats: &state.usm_stats,
@@ -241,6 +241,7 @@ impl Agent {
             pdu.request_id,
             pdu.pdu_type(),
             global_data.msg_max_size.as_usize(),
+            inbound.decode_anomalies.clone(),
         );
 
         // A successful SET echoes the request varbinds. Preserve the exact
@@ -395,6 +396,7 @@ mod tests {
         get_next: AtomicU32,
         test_set: AtomicU32,
         commit_set: Arc<AtomicU32>,
+        decode_anomalies: Mutex<Vec<Vec<crate::DecodeAnomaly>>>,
     }
 
     struct CountCommit(Arc<AtomicU32>);
@@ -423,10 +425,14 @@ mod tests {
     impl MibHandler for CallbackCounts {
         fn get<'a>(
             &'a self,
-            _ctx: &'a RequestContext,
+            ctx: &'a RequestContext,
             _oid: &'a Oid,
         ) -> BoxFuture<'a, HandlerResult<GetResult>> {
             self.get.fetch_add(1, Ordering::Relaxed);
+            self.decode_anomalies
+                .lock()
+                .unwrap()
+                .push(ctx.decode_anomalies().to_vec());
             Box::pin(async { Ok(GetResult::Value(Value::Integer(7))) })
         }
 
@@ -446,11 +452,15 @@ mod tests {
 
         fn test_set<'a>(
             &'a self,
-            _ctx: &'a RequestContext,
+            ctx: &'a RequestContext,
             _oid: &'a Oid,
             _value: &'a Value,
         ) -> BoxFuture<'a, SetTestResult> {
             self.test_set.fetch_add(1, Ordering::Relaxed);
+            self.decode_anomalies
+                .lock()
+                .unwrap()
+                .push(ctx.decode_anomalies().to_vec());
             Box::pin(async move {
                 Ok(Box::new(CountCommit(self.commit_set.clone())) as Box<dyn PreparedSet>)
             })
@@ -556,7 +566,7 @@ mod tests {
                 .community(b"public")
                 .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
                 .allow_all_access()
-                .strict_decoding()
+                .decode_config(crate::DecodeConfig::STRICT)
                 .build()
                 .await
                 .unwrap();
@@ -582,7 +592,7 @@ mod tests {
                 .community(b"public")
                 .handler(oid!(1, 3, 6, 1, 4, 1, 99999), strict_callbacks.clone())
                 .allow_all_access()
-                .compatibility_policy(crate::CompatibilityPolicy::STRICT)
+                .decode_config(crate::DecodeConfig::STRICT)
                 .build()
                 .await
                 .unwrap();
@@ -595,7 +605,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(strict_callbacks.test_set.load(Ordering::Relaxed), 0);
 
-            let mut targeted = crate::CompatibilityPolicy::STRICT;
+            let mut targeted = crate::DecodeConfig::STRICT;
             targeted.truncate_numeric_values = true;
             let callbacks = Arc::new(CallbackCounts::default());
             let agent = Agent::builder()
@@ -603,7 +613,7 @@ mod tests {
                 .community(b"public")
                 .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
                 .allow_all_access()
-                .compatibility_policy(targeted)
+                .decode_config(targeted)
                 .build()
                 .await
                 .unwrap();
@@ -617,6 +627,15 @@ mod tests {
             assert!(response.is_some());
             assert_eq!(callbacks.test_set.load(Ordering::Relaxed), 1);
             assert_eq!(callbacks.commit_set.load(Ordering::Relaxed), 1);
+            assert!(matches!(
+                callbacks.decode_anomalies.lock().unwrap().as_slice(),
+                [anomalies]
+                    if matches!(anomalies.as_slice(), [crate::DecodeAnomaly::SignedIntegerTruncation {
+                        encoded_length: 5,
+                        original: 4_294_967_305,
+                        canonical: 9,
+                    }])
+            ));
         }
     }
 
@@ -666,7 +685,9 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("VACM denial returns a response");
-            let response = CommunityMessage::decode(response).unwrap();
+            let response = CommunityMessage::decode(response, crate::DecodeConfig::default())
+                .unwrap()
+                .value;
             let response = response.pdu().standard().unwrap();
             assert_eq!(
                 response.error_status(),
@@ -692,7 +713,9 @@ mod tests {
             .await
             .unwrap()
             .expect("VACM denial returns a response");
-        let response = CommunityMessage::decode(response).unwrap();
+        let response = CommunityMessage::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         let response = response.pdu().standard().unwrap();
         assert_eq!(
             response.error_status(),
@@ -850,7 +873,9 @@ mod tests {
             .await
             .unwrap()
             .expect("ordinary SNMPv1 GET should produce a response");
-        let decoded = CommunityMessage::decode(response).unwrap();
+        let decoded = CommunityMessage::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.pdu().pdu_type(), PduType::Response);
         assert_eq!(callbacks.get.load(Ordering::Relaxed), 1);
         assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
@@ -917,7 +942,9 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("tooBig fallback should fit");
-            let decoded = CommunityMessage::decode(response).unwrap();
+            let decoded = CommunityMessage::decode(response, crate::DecodeConfig::default())
+                .unwrap()
+                .value;
             let response_pdu = decoded.pdu().standard().unwrap();
             assert_eq!(
                 response_pdu.error_status(),
@@ -950,7 +977,9 @@ mod tests {
             .await
             .unwrap()
             .expect("SNMPv2c Counter64 SET should produce a response");
-        let decoded = CommunityMessage::decode(response).unwrap();
+        let decoded = CommunityMessage::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.pdu().pdu_type(), PduType::Response);
         assert_eq!(callbacks.test_set.load(Ordering::Relaxed), 1);
         assert_eq!(callbacks.commit_set.load(Ordering::Relaxed), 1);
@@ -1100,7 +1129,7 @@ mod tests {
             .usm_user("noauthuser", Ok)
             .unwrap()
             .allow_all_access()
-            .strict_decoding()
+            .decode_config(crate::DecodeConfig::STRICT)
             .build()
             .await
             .unwrap();
@@ -1111,6 +1140,41 @@ mod tests {
                 .handle_v3(Bytes::from(request), "127.0.0.1:9999".parse().unwrap())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_v3_anomalies_reach_request_context_after_usm_processing() {
+        let engine_id = b"\x80\x00\x00\x00\x01contexta".to_vec();
+        let callbacks = Arc::new(CallbackCounts::default());
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .engine_id(engine_id.clone())
+            .usm_user("noauthuser", Ok)
+            .unwrap()
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pdu = Pdu::get_request(77, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]);
+        let mut request =
+            build_noauth_pdu(&engine_id, b"noauthuser", &engine_id, 0, 0, pdu, 65507).to_vec();
+        request.extend_from_slice(&[0x05, 0]);
+
+        let response = agent
+            .handle_v3(Bytes::from(request), "127.0.0.1:9999".parse().unwrap())
+            .await
+            .unwrap();
+
+        assert!(response.is_some());
+        assert_eq!(callbacks.get.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            callbacks.decode_anomalies.lock().unwrap().as_slice(),
+            [vec![crate::DecodeAnomaly::TrailingBytes {
+                original_length: 2,
+                canonical_length: 0,
+            }]]
         );
     }
 
@@ -1140,7 +1204,9 @@ mod tests {
             .expect("mismatched contextEngineID must produce a Report");
         assert_eq!(agent.snmp_unknown_contexts(), 1);
 
-        let decoded = V3Message::decode(report).unwrap();
+        let decoded = V3Message::decode(report, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         let pdu = decoded.pdu().expect("report carries a PDU");
         assert_eq!(pdu.pdu_type(), PduType::Report);
         assert_eq!(pdu.varbinds[0].oid, super::snmp_unknown_contexts_oid());
@@ -1175,7 +1241,9 @@ mod tests {
             .expect("matching contextEngineID must produce a Response");
         assert_eq!(agent.snmp_unknown_contexts(), 0);
 
-        let decoded = V3Message::decode(response).unwrap();
+        let decoded = V3Message::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.pdu().unwrap().pdu_type(), PduType::Response);
     }
 
@@ -1205,7 +1273,9 @@ mod tests {
             .await
             .unwrap()
             .expect("explicit unrestricted policy accepts the request");
-        let response = V3Message::decode(response).unwrap();
+        let response = V3Message::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(
             response.global_data.msg_flags.security_level,
             SecurityLevel::NoAuthNoPriv
@@ -1257,7 +1327,9 @@ mod tests {
             .await
             .unwrap()
             .expect("authorization denial returns a protected response");
-        let response = V3Message::decode(response).unwrap();
+        let response = V3Message::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(
             response.global_data.msg_flags.security_level,
             SecurityLevel::NoAuthNoPriv
@@ -1292,7 +1364,9 @@ mod tests {
             .await
             .unwrap()
             .expect("reportable discovery returns a Report");
-        let response = V3Message::decode(response).unwrap();
+        let response = V3Message::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         let pdu = response.pdu().unwrap();
         assert_eq!(pdu.pdu_type(), PduType::Report);
         assert_eq!(
@@ -1444,9 +1518,14 @@ mod tests {
         assert_eq!(handler.commits.load(Ordering::Relaxed), 1);
         assert_eq!(response.len(), exact_limit);
         assert_eq!(response, expected);
-        let decoded = V3Message::decode(response).unwrap();
+        let decoded = V3Message::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.pdu().unwrap().error_status(), 0);
-        let usm = UsmSecurityParams::decode(decoded.security_params).unwrap();
+        let usm =
+            UsmSecurityParams::decode(decoded.security_params, crate::DecodeConfig::default())
+                .unwrap()
+                .value;
         assert_eq!(usm.engine_time, 127);
         assert_eq!(agent.snmp_silent_drops(), 0);
     }
@@ -1476,7 +1555,9 @@ mod tests {
             .expect("empty contextEngineID must produce a Response");
         assert_eq!(agent.snmp_unknown_contexts(), 0);
 
-        let decoded = V3Message::decode(response).unwrap();
+        let decoded = V3Message::decode(response, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         assert_eq!(decoded.pdu().unwrap().pdu_type(), PduType::Response);
     }
 
@@ -1515,7 +1596,9 @@ mod tests {
         assert_eq!(agent.usm_not_in_time_windows(), 0);
         assert_eq!(agent.usm_wrong_digests(), 0);
 
-        let decoded = V3Message::decode(report).unwrap();
+        let decoded = V3Message::decode(report, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         let vb = &decoded.pdu().unwrap().varbinds[0];
         assert_eq!(vb.oid, crate::v3::report_oids::unsupported_sec_levels());
     }
@@ -1553,7 +1636,9 @@ mod tests {
         // Counter32(1): the counter increment and the report OID are separate
         // arguments, so the counter assertions above would still pass if the
         // OID were swapped for a sibling (e.g. wrongDigests).
-        let decoded = V3Message::decode(report).unwrap();
+        let decoded = V3Message::decode(report, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         let pdu = decoded.pdu().expect("report carries a PDU");
         assert_eq!(pdu.pdu_type(), PduType::Report);
         let vb = &pdu.varbinds[0];
@@ -1603,7 +1688,9 @@ mod tests {
         assert_eq!(agent.usm_unsupported_sec_levels(), 1);
         assert_eq!(agent.usm_not_in_time_windows(), 0);
 
-        let decoded = V3Message::decode(report).unwrap();
+        let decoded = V3Message::decode(report, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
         let vb = &decoded.pdu().unwrap().varbinds[0];
         assert_eq!(vb.oid, crate::v3::report_oids::unsupported_sec_levels());
     }

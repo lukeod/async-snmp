@@ -1,10 +1,10 @@
 use std::fmt::Debug;
 use std::time::Duration;
 
-use async_snmp::message::{CommunityMessage, DecodePolicy, Message};
+use async_snmp::message::{CommunityMessage, Message};
 use async_snmp::{
-    Auth, ClientBuilder, Community, CommunityResponsePolicy, CommunityVersion, GenericTrap,
-    Notification, Pdu, RequestPdu, RequestRegistration, TrapV1Pdu, Version, oid,
+    Auth, ClientBuilder, Community, CommunityResponsePolicy, CommunityVersion, DecodeConfig,
+    GenericTrap, Notification, Pdu, RequestPdu, RequestRegistration, TrapV1Pdu, Version, oid,
 };
 use bytes::Bytes;
 
@@ -52,11 +52,9 @@ fn auth_message_decode_outcome_and_builder_debug_are_transitively_redacted() {
     let message = Message::from(community_message.clone());
     assert_redacted(&message);
 
-    let outcome = CommunityMessage::decode_with_policy(
-        community_message.encode().unwrap(),
-        DecodePolicy::Compatible,
-    )
-    .unwrap();
+    let outcome =
+        CommunityMessage::decode(community_message.encode().unwrap(), DecodeConfig::default())
+            .unwrap();
     assert_redacted(&outcome);
     assert!(format!("{outcome:?}").contains("412"));
 
