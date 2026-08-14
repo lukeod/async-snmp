@@ -12,10 +12,9 @@ use std::time::Duration;
 
 use super::Client;
 use crate::client::retry::Retry;
-use crate::client::walk::{OidOrdering, WalkMode};
+use crate::client::walk::WalkOptions;
 use crate::client::{
-    Auth, ClientConfig, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT,
+    Auth, ClientConfig, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT,
 };
 use crate::error::{ConstructionStage, Error, Result};
 use crate::transport::{
@@ -163,10 +162,7 @@ pub struct ClientBuilder {
     max_oids_per_request: usize,
     decode_config: crate::DecodeConfig,
     response_shape_policy: crate::client::ResponseShapePolicy,
-    max_repetitions: u32,
-    walk_mode: WalkMode,
-    oid_ordering: OidOrdering,
-    max_walk_results: Option<usize>,
+    walk_options: WalkOptions,
     engine_cache: Option<Arc<EngineCache>>,
     community_response_policy: CommunityResponsePolicy,
     allow_unauthenticated_v3_time_correction: bool,
@@ -235,10 +231,7 @@ impl ClientBuilder {
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             decode_config: crate::DecodeConfig::default(),
             response_shape_policy: crate::client::ResponseShapePolicy::Compatible,
-            max_repetitions: DEFAULT_MAX_REPETITIONS,
-            walk_mode: WalkMode::Auto,
-            oid_ordering: OidOrdering::Strict,
-            max_walk_results: None,
+            walk_options: WalkOptions::default(),
             engine_cache: None,
             community_response_policy: CommunityResponsePolicy::Exact,
             allow_unauthenticated_v3_time_correction: false,
@@ -395,112 +388,14 @@ impl ClientBuilder {
         self
     }
 
-    /// Set max-repetitions for GETBULK operations (default: 25).
+    /// Set the default options snapshotted by each walk operation.
     ///
-    /// Controls how many values are requested per GETBULK PDU during walks.
-    /// This is a performance tuning parameter with trade-offs:
-    ///
-    /// - **Higher values**: Fewer network round-trips, faster walks on reliable
-    ///   networks. But larger responses risk UDP fragmentation or may exceed
-    ///   agent response buffer limits (causing truncation).
-    /// - **Lower values**: More round-trips (higher latency), but smaller
-    ///   responses that fit within MTU limits.
-    ///
-    /// The default of 25 is conservative. For local/reliable networks with
-    /// capable agents, values of 50-100 can significantly speed up large walks.
-    /// Values above `i32::MAX` are rejected when the client is built or connected.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, ClientBuilder};
-    ///
-    /// // Lower value for agents with small response buffers or lossy networks
-    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .max_repetitions(10);
-    ///
-    /// // Higher value for fast local network walks
-    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .max_repetitions(50);
-    /// ```
+    /// Individual operations can override this value through
+    /// [`Client::walk_with`](crate::Client::walk_with) or
+    /// [`Client::walk_with_metadata_and`](crate::Client::walk_with_metadata_and).
     #[must_use]
-    pub fn max_repetitions(mut self, max: u32) -> Self {
-        self.max_repetitions = max;
-        self
-    }
-
-    /// Override walk behavior for devices with buggy GETBULK (default: Auto).
-    ///
-    /// - `WalkMode::Auto`: Use GETNEXT for v1, GETBULK for v2c/v3
-    /// - `WalkMode::GetNext`: Always use GETNEXT (slower but more compatible)
-    /// - `WalkMode::GetBulk`: Always use GETBULK (faster, errors on v1)
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, ClientBuilder, WalkMode};
-    ///
-    /// // Force GETNEXT for devices with broken GETBULK implementation
-    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .walk_mode(WalkMode::GetNext);
-    ///
-    /// // Force GETBULK for faster walks (only v2c/v3)
-    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .walk_mode(WalkMode::GetBulk);
-    /// ```
-    #[must_use]
-    pub fn walk_mode(mut self, mode: WalkMode) -> Self {
-        self.walk_mode = mode;
-        self
-    }
-
-    /// Set OID ordering behavior for walk operations (default: Strict).
-    ///
-    /// - `OidOrdering::Strict`: Require strictly increasing OIDs. Most efficient.
-    /// - `OidOrdering::AllowNonIncreasing`: Allow non-increasing OIDs with cycle
-    ///   detection. Uses O(n) memory to track seen OIDs.
-    ///
-    /// Use `AllowNonIncreasing` for buggy agents that return OIDs out of order.
-    ///
-    /// **Warning**: `AllowNonIncreasing` uses O(n) memory. Always pair with
-    /// [`max_walk_results`](Self::max_walk_results) to bound memory usage.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, ClientBuilder, OidOrdering};
-    ///
-    /// // Use relaxed ordering with a safety limit
-    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .oid_ordering(OidOrdering::AllowNonIncreasing)
-    ///     .max_walk_results(10_000);
-    /// ```
-    #[must_use]
-    pub fn oid_ordering(mut self, ordering: OidOrdering) -> Self {
-        self.oid_ordering = ordering;
-        self
-    }
-
-    /// Set maximum results from a single walk operation (default: unlimited).
-    ///
-    /// Safety limit to prevent runaway walks. After yielding this many results,
-    /// the walk inspects exactly one additional candidate. Definite truncation
-    /// ends with [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded);
-    /// observed natural completion ends normally. The look-ahead can require one
-    /// extra request.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use async_snmp::{Auth, ClientBuilder};
-    ///
-    /// // Limit walks to at most 10,000 results
-    /// let builder = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
-    ///     .max_walk_results(10_000);
-    /// ```
-    #[must_use]
-    pub fn max_walk_results(mut self, limit: usize) -> Self {
-        self.max_walk_results = Some(limit);
+    pub fn walk_options(mut self, options: WalkOptions) -> Self {
+        self.walk_options = options;
         self
     }
 
@@ -679,10 +574,7 @@ impl ClientBuilder {
             max_oids_per_request: self.max_oids_per_request,
             response_shape_policy: self.response_shape_policy,
             allow_unauthenticated_v3_time_correction: self.allow_unauthenticated_v3_time_correction,
-            walk_mode: self.walk_mode,
-            oid_ordering: self.oid_ordering,
-            max_walk_results: self.max_walk_results,
-            max_repetitions: self.max_repetitions,
+            walk_options: self.walk_options,
             local_authoritative_engine: self.local_authoritative_engine.clone(),
             des_salt_state: self.des_salt_state.clone(),
             local_authoritative_time_source: None,
@@ -788,31 +680,10 @@ impl TargetClientBuilder {
         self
     }
 
-    /// Set the default GETBULK max-repetitions value.
+    /// Set the default options snapshotted by each walk operation.
     #[must_use]
-    pub fn max_repetitions(mut self, max: u32) -> Self {
-        self.client = self.client.max_repetitions(max);
-        self
-    }
-
-    /// Set walk operation mode.
-    #[must_use]
-    pub fn walk_mode(mut self, mode: WalkMode) -> Self {
-        self.client = self.client.walk_mode(mode);
-        self
-    }
-
-    /// Set walk OID ordering policy.
-    #[must_use]
-    pub fn oid_ordering(mut self, ordering: OidOrdering) -> Self {
-        self.client = self.client.oid_ordering(ordering);
-        self
-    }
-
-    /// Bound the number of results returned by a walk.
-    #[must_use]
-    pub fn max_walk_results(mut self, limit: usize) -> Self {
-        self.client = self.client.max_walk_results(limit);
+    pub fn walk_options(mut self, options: WalkOptions) -> Self {
+        self.client = self.client.walk_options(options);
         self
     }
 
@@ -1290,10 +1161,7 @@ mod tests {
             builder.response_shape_policy,
             crate::client::ResponseShapePolicy::Compatible
         );
-        assert_eq!(builder.max_repetitions, DEFAULT_MAX_REPETITIONS);
-        assert_eq!(builder.walk_mode, WalkMode::Auto);
-        assert_eq!(builder.oid_ordering, OidOrdering::Strict);
-        assert!(builder.max_walk_results.is_none());
+        assert_eq!(builder.walk_options, WalkOptions::default());
         assert!(builder.engine_cache.is_none());
         assert_eq!(
             builder.community_response_policy,
@@ -1320,10 +1188,12 @@ mod tests {
             .retry(Retry::fixed(5, Duration::ZERO).unwrap())
             .max_oids_per_request(20)
             .response_shape_policy(crate::client::ResponseShapePolicy::Strict)
-            .max_repetitions(50)
-            .walk_mode(WalkMode::GetNext)
-            .oid_ordering(OidOrdering::AllowNonIncreasing)
-            .max_walk_results(1000)
+            .walk_options(WalkOptions {
+                method: crate::WalkMethod::GetNext,
+                max_repetitions: 50,
+                ordering: crate::OidOrdering::AllowNonIncreasing,
+                result_limit: Some(1000),
+            })
             .engine_cache(cache.clone())
             .target("192.168.1.1:161")
             .construction_timeout(Duration::from_secs(7))
@@ -1344,10 +1214,15 @@ mod tests {
             builder.client.build_config().response_shape_policy,
             crate::client::ResponseShapePolicy::Strict
         );
-        assert_eq!(builder.client.max_repetitions, 50);
-        assert_eq!(builder.client.walk_mode, WalkMode::GetNext);
-        assert_eq!(builder.client.oid_ordering, OidOrdering::AllowNonIncreasing);
-        assert_eq!(builder.client.max_walk_results, Some(1000));
+        assert_eq!(
+            builder.client.walk_options,
+            WalkOptions {
+                method: crate::WalkMethod::GetNext,
+                max_repetitions: 50,
+                ordering: crate::OidOrdering::AllowNonIncreasing,
+                result_limit: Some(1000),
+            }
+        );
         assert!(builder.client.engine_cache.is_some());
         assert!(builder.strict_source);
         assert_eq!(
@@ -1692,23 +1567,27 @@ mod tests {
             .request_timeout(Duration::from_secs(9))
             .retry(Retry::none())
             .max_oids_per_request(7)
-            .walk_mode(WalkMode::GetNext)
-            .oid_ordering(OidOrdering::AllowNonIncreasing)
-            .max_walk_results(99)
-            .max_repetitions(11)
+            .walk_options(WalkOptions {
+                method: crate::WalkMethod::GetNext,
+                max_repetitions: 11,
+                ordering: crate::OidOrdering::AllowNonIncreasing,
+                result_limit: Some(99),
+            })
             .build_with_transport(transport.clone())
             .expect("valid custom-transport client");
 
         assert_eq!(client.inner.config.request_timeout, Duration::from_secs(9));
         assert_eq!(client.inner.config.retry.retries(), 0);
         assert_eq!(client.inner.config.max_oids_per_request, 7);
-        assert_eq!(client.inner.config.walk_mode, WalkMode::GetNext);
         assert_eq!(
-            client.inner.config.oid_ordering,
-            OidOrdering::AllowNonIncreasing
+            client.inner.config.walk_options,
+            WalkOptions {
+                method: crate::WalkMethod::GetNext,
+                max_repetitions: 11,
+                ordering: crate::OidOrdering::AllowNonIncreasing,
+                result_limit: Some(99),
+            }
         );
-        assert_eq!(client.inner.config.max_walk_results, Some(99));
-        assert_eq!(client.inner.config.max_repetitions, 11);
         assert!(matches!(
             &client.inner.config.auth,
             Auth::Community {

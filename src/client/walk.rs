@@ -5,33 +5,6 @@
 // which triggers this lint but is the standard pattern for storing futures.
 #![allow(clippy::type_complexity)]
 
-/// Implement `next()` and `collect()` for a Stream type that implements `poll_next`.
-macro_rules! impl_stream_helpers {
-    ($type:ident < $($gen:tt),+ >) => {
-        impl<$($gen),+> $type<$($gen),+>
-        where
-            $($gen: crate::transport::Transport + 'static,)+
-        {
-            /// Get the next varbind, or None when complete.
-            pub async fn next(&mut self) -> Option<crate::error::Result<crate::varbind::VarBind>> {
-                std::future::poll_fn(|cx| std::pin::Pin::new(&mut *self).poll_next(cx)).await
-            }
-
-            /// Collect all remaining varbinds from the walk stream.
-            ///
-            /// Definite result-limit truncation is returned as an error. Consume
-            /// the stream manually when partial bindings need to be retained.
-            pub async fn collect(mut self) -> crate::error::Result<Vec<crate::varbind::VarBind>> {
-                let mut results = Vec::new();
-                while let Some(result) = self.next().await {
-                    results.push(result?);
-                }
-                Ok(results)
-            }
-        }
-    };
-}
-
 use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -78,9 +51,9 @@ pub struct WalkError {
     pub metadata: ResponseMetadata,
 }
 
-/// Walk operation mode.
+/// Protocol operation used for a walk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WalkMode {
+pub enum WalkMethod {
     /// Auto-select based on version (default).
     /// V1 uses GETNEXT, V2c/V3 uses GETBULK.
     #[default]
@@ -89,6 +62,46 @@ pub enum WalkMode {
     GetNext,
     /// Always use GETBULK (faster, errors on v1).
     GetBulk,
+}
+
+/// Configuration snapshotted when a walk stream is constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkOptions {
+    /// GETNEXT/GETBULK selection.
+    pub method: WalkMethod,
+    /// GETBULK max-repetitions value.
+    pub max_repetitions: u32,
+    /// OID ordering validation policy.
+    pub ordering: OidOrdering,
+    /// Maximum bindings yielded before one definite-completion look-ahead.
+    pub result_limit: Option<usize>,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            method: WalkMethod::Auto,
+            max_repetitions: crate::client::DEFAULT_MAX_REPETITIONS,
+            ordering: OidOrdering::Strict,
+            result_limit: None,
+        }
+    }
+}
+
+impl WalkOptions {
+    pub(crate) fn validate(self, version: Version) -> Result<Self> {
+        Pdu::checked_get_bulk_fields(0, self.max_repetitions)?;
+        if version == Version::V1 && self.method == WalkMethod::GetBulk {
+            return Err(Error::Config("GETBULK is not supported in SNMPv1".into()).boxed());
+        }
+        if self.ordering == OidOrdering::AllowNonIncreasing && self.result_limit.is_none() {
+            return Err(Error::Config(
+                "AllowNonIncreasing requires a walk result limit to bound memory usage".into(),
+            )
+            .boxed());
+        }
+        Ok(self)
+    }
 }
 
 /// OID ordering behavior during walk operations.
@@ -123,12 +136,11 @@ pub enum OidOrdering {
     /// same OID is returned twice.
     ///
     /// **Warning**: This uses O(n) memory where n = number of walk results.
-    /// Always pair with [`ClientBuilder::max_walk_results`] to bound memory
-    /// usage. Cycle detection only catches duplicate OIDs; a pathological
-    /// agent could still return an infinite sequence of unique OIDs within
-    /// the subtree.
-    ///
-    /// [`ClientBuilder::max_walk_results`]: crate::ClientBuilder::max_walk_results
+    /// Always set [`WalkOptions::result_limit`] and install it with
+    /// [`ClientBuilder::walk_options`](crate::ClientBuilder::walk_options) to
+    /// bound memory usage. Cycle detection only catches duplicate OIDs; a
+    /// pathological agent could still return an infinite sequence of unique
+    /// OIDs within the subtree.
     AllowNonIncreasing,
 }
 
@@ -212,10 +224,8 @@ impl OidTracker {
     }
 }
 
-/// Async stream for walking an OID subtree using GETNEXT.
-///
-/// Created by [`Client::walk_getnext()`].
-pub struct Walk<T: Transport> {
+/// Private GETNEXT walk state machine.
+struct GetNextDriver<T: Transport> {
     client: Client<T>,
     base_oid: Oid,
     current_oid: Oid,
@@ -237,7 +247,7 @@ pub struct Walk<T: Transport> {
     >,
 }
 
-impl<T: Transport> Walk<T> {
+impl<T: Transport> GetNextDriver<T> {
     pub(crate) fn new(
         client: Client<T>,
         oid: Oid,
@@ -259,9 +269,7 @@ impl<T: Transport> Walk<T> {
     }
 }
 
-impl_stream_helpers!(Walk<T>);
-
-impl<T: Transport + 'static> Walk<T> {
+impl<T: Transport + 'static> GetNextDriver<T> {
     fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
         if self.done {
             return Poll::Ready(None);
@@ -365,7 +373,7 @@ impl<T: Transport + 'static> Walk<T> {
     }
 }
 
-impl<T: Transport + 'static> Stream for Walk<T> {
+impl<T: Transport + 'static> Stream for GetNextDriver<T> {
     type Item = Result<VarBind>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -378,10 +386,8 @@ impl<T: Transport + 'static> Stream for Walk<T> {
     }
 }
 
-/// Async stream for walking an OID subtree using GETBULK.
-///
-/// Created by [`Client::bulk_walk()`].
-pub struct BulkWalk<T: Transport> {
+/// Private GETBULK walk state machine.
+struct GetBulkDriver<T: Transport> {
     client: Client<T>,
     base_oid: Oid,
     current_oid: Oid,
@@ -400,7 +406,7 @@ pub struct BulkWalk<T: Transport> {
     pending: Option<Pin<Box<dyn std::future::Future<Output = Result<BulkResponse>> + Send>>>,
 }
 
-impl<T: Transport> BulkWalk<T> {
+impl<T: Transport> GetBulkDriver<T> {
     pub(crate) fn new(
         client: Client<T>,
         oid: Oid,
@@ -427,9 +433,7 @@ impl<T: Transport> BulkWalk<T> {
     }
 }
 
-impl_stream_helpers!(BulkWalk<T>);
-
-impl<T: Transport + 'static> BulkWalk<T> {
+impl<T: Transport + 'static> GetBulkDriver<T> {
     fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
         loop {
             if self.done {
@@ -547,7 +551,7 @@ impl<T: Transport + 'static> BulkWalk<T> {
     }
 }
 
-impl<T: Transport + 'static> Stream for BulkWalk<T> {
+impl<T: Transport + 'static> Stream for GetBulkDriver<T> {
     type Item = Result<VarBind>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -560,125 +564,48 @@ impl<T: Transport + 'static> Stream for BulkWalk<T> {
     }
 }
 
-/// GETNEXT walk stream that retains decode metadata.
-/// Terminal items use [`WalkError`] so both the source error and the cumulative
-/// accepted-response metadata remain available.
-#[must_use = "streams do nothing unless polled"]
-pub struct WalkWithMetadata<T: Transport> {
-    inner: Walk<T>,
+enum WalkDriver<T: Transport> {
+    GetNext(GetNextDriver<T>),
+    GetBulk(GetBulkDriver<T>),
 }
 
-impl<T: Transport> WalkWithMetadata<T> {
-    pub(crate) fn new(inner: Walk<T>) -> Self {
-        Self { inner }
-    }
-
-    /// Aggregate metadata observed so far, including non-yielding terminal responses.
-    pub fn metadata(&self) -> &ResponseMetadata {
-        &self.inner.metadata
-    }
-}
-
-impl<T: Transport + 'static> WalkWithMetadata<T> {
-    pub async fn next(&mut self) -> Option<std::result::Result<WalkItem, WalkError>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
-    }
-
-    pub async fn collect(mut self) -> std::result::Result<WalkCollection, WalkError> {
-        let mut varbinds = Vec::new();
-        while let Some(item) = self.next().await {
-            varbinds.push(item?.varbind);
-        }
-        Ok(WalkCollection {
-            varbinds,
-            metadata: self.inner.metadata,
-        })
-    }
-}
-
-impl<T: Transport + 'static> Stream for WalkWithMetadata<T> {
-    type Item = std::result::Result<WalkItem, WalkError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.poll_next_with_metadata(cx) {
-            Poll::Ready(Some(Err(source))) => Poll::Ready(Some(Err(WalkError {
-                source,
-                metadata: self.inner.metadata.clone(),
-            }))),
-            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+impl<T: Transport> WalkDriver<T> {
+    fn metadata(&self) -> &ResponseMetadata {
+        match self {
+            Self::GetNext(walk) => &walk.metadata,
+            Self::GetBulk(walk) => &walk.metadata,
         }
     }
 }
 
-/// GETBULK walk stream that retains decode metadata without duplicating it
-/// across bindings returned by the same response.
-#[must_use = "streams do nothing unless polled"]
-pub struct BulkWalkWithMetadata<T: Transport> {
-    inner: BulkWalk<T>,
-}
-
-impl<T: Transport> BulkWalkWithMetadata<T> {
-    pub(crate) fn new(inner: BulkWalk<T>) -> Self {
-        Self { inner }
-    }
-
-    /// Aggregate metadata observed so far, including non-yielding terminal responses.
-    pub fn metadata(&self) -> &ResponseMetadata {
-        &self.inner.metadata
-    }
-}
-
-impl<T: Transport + 'static> BulkWalkWithMetadata<T> {
-    pub async fn next(&mut self) -> Option<std::result::Result<WalkItem, WalkError>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
-    }
-
-    pub async fn collect(mut self) -> std::result::Result<WalkCollection, WalkError> {
-        let mut varbinds = Vec::new();
-        while let Some(item) = self.next().await {
-            varbinds.push(item?.varbind);
-        }
-        Ok(WalkCollection {
-            varbinds,
-            metadata: self.inner.metadata,
-        })
-    }
-}
-
-impl<T: Transport + 'static> Stream for BulkWalkWithMetadata<T> {
-    type Item = std::result::Result<WalkItem, WalkError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.poll_next_with_metadata(cx) {
-            Poll::Ready(Some(Err(source))) => Poll::Ready(Some(Err(WalkError {
-                source,
-                metadata: self.inner.metadata.clone(),
-            }))),
-            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+impl<T: Transport + 'static> WalkDriver<T> {
+    fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
+        match self {
+            Self::GetNext(walk) => walk.poll_next_with_metadata(cx),
+            Self::GetBulk(walk) => walk.poll_next_with_metadata(cx),
         }
     }
 }
 
-// ============================================================================
-// Unified WalkStream - auto-selects GETNEXT or GETBULK based on WalkMode
-// ============================================================================
-
-/// Unified walk stream that auto-selects between GETNEXT and GETBULK.
+/// Opaque plain walk stream.
 ///
-/// Created by [`Client::walk()`] when using `WalkMode::Auto` or explicit mode selection.
-/// This type wraps either a [`Walk`] or [`BulkWalk`] internally based on:
-/// - `WalkMode::Auto`: Uses GETNEXT for V1, GETBULK for V2c/V3
-/// - `WalkMode::GetNext`: Always uses GETNEXT
-/// - `WalkMode::GetBulk`: Always uses GETBULK (fails on V1)
-pub enum WalkStream<T: Transport> {
-    /// GETNEXT-based walk (used for V1 or when explicitly requested)
-    GetNext(Walk<T>),
-    /// GETBULK-based walk (used for V2c/V3 or when explicitly requested)
-    GetBulk(BulkWalk<T>),
+/// The private driver uses GETNEXT or GETBULK according to the snapshotted
+/// [`WalkOptions`]. Items intentionally omit response metadata; use
+/// [`WalkMetadataStream`] when accepted decode anomalies must be retained.
+/// The GETNEXT/GETBULK driver is private and cannot be matched by callers:
+///
+/// ```compile_fail
+/// use async_snmp::{UdpHandle, WalkStream};
+///
+/// fn inspect_driver(stream: WalkStream<UdpHandle>) {
+///     match stream {
+///         WalkStream::GetNext(_) => {}
+///     }
+/// }
+/// ```
+#[must_use = "streams do nothing unless polled"]
+pub struct WalkStream<T: Transport> {
+    driver: WalkDriver<T>,
 }
 
 impl<T: Transport> WalkStream<T> {
@@ -687,33 +614,32 @@ impl<T: Transport> WalkStream<T> {
         client: Client<T>,
         oid: Oid,
         version: Version,
-        walk_mode: WalkMode,
-        ordering: OidOrdering,
-        max_results: Option<usize>,
-        max_repetitions: u32,
+        options: WalkOptions,
     ) -> Result<Self> {
-        let use_bulk = match walk_mode {
-            WalkMode::Auto => version != Version::V1,
-            WalkMode::GetNext => false,
-            WalkMode::GetBulk => {
-                if version == Version::V1 {
-                    return Err(Error::Config("GETBULK is not supported in SNMPv1".into()).boxed());
-                }
-                true
-            }
+        let options = options.validate(version)?;
+        let use_bulk = match options.method {
+            WalkMethod::Auto => version != Version::V1,
+            WalkMethod::GetNext => false,
+            WalkMethod::GetBulk => true,
         };
 
-        Ok(if use_bulk {
-            WalkStream::GetBulk(BulkWalk::new(
+        let driver = if use_bulk {
+            WalkDriver::GetBulk(GetBulkDriver::new(
                 client,
                 oid,
-                max_repetitions,
-                ordering,
-                max_results,
+                options.max_repetitions,
+                options.ordering,
+                options.result_limit,
             )?)
         } else {
-            WalkStream::GetNext(Walk::new(client, oid, ordering, max_results))
-        })
+            WalkDriver::GetNext(GetNextDriver::new(
+                client,
+                oid,
+                options.ordering,
+                options.result_limit,
+            ))
+        };
+        Ok(Self { driver })
     }
 }
 
@@ -740,38 +666,37 @@ impl<T: Transport + 'static> Stream for WalkStream<T> {
     type Item = Result<VarBind>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // SAFETY: We're just projecting the pin to the inner enum variant
-        match self.get_mut() {
-            WalkStream::GetNext(walk) => Pin::new(walk).poll_next(cx),
-            WalkStream::GetBulk(bulk_walk) => Pin::new(bulk_walk).poll_next(cx),
+        match &mut self.get_mut().driver {
+            WalkDriver::GetNext(walk) => Pin::new(walk).poll_next(cx),
+            WalkDriver::GetBulk(walk) => Pin::new(walk).poll_next(cx),
         }
     }
 }
 
-/// Auto-selected GETNEXT/GETBULK walk stream with decode metadata.
-pub enum WalkStreamWithMetadata<T: Transport> {
-    GetNext(WalkWithMetadata<T>),
-    GetBulk(BulkWalkWithMetadata<T>),
+/// Opaque metadata-preserving walk stream.
+///
+/// Response-level metadata is attached to the first binding yielded from that
+/// response. [`Self::metadata`] and [`Self::collect`] also retain metadata from
+/// accepted terminal responses that yield no binding.
+#[must_use = "streams do nothing unless polled"]
+pub struct WalkMetadataStream<T: Transport> {
+    driver: WalkDriver<T>,
 }
 
-impl<T: Transport> WalkStreamWithMetadata<T> {
+impl<T: Transport> WalkMetadataStream<T> {
     pub(crate) fn new(inner: WalkStream<T>) -> Self {
-        match inner {
-            WalkStream::GetNext(walk) => Self::GetNext(WalkWithMetadata::new(walk)),
-            WalkStream::GetBulk(walk) => Self::GetBulk(BulkWalkWithMetadata::new(walk)),
+        Self {
+            driver: inner.driver,
         }
     }
 
-    /// Aggregate metadata observed so far.
+    /// Aggregate metadata observed so far, including non-yielding responses.
     pub fn metadata(&self) -> &ResponseMetadata {
-        match self {
-            Self::GetNext(walk) => walk.metadata(),
-            Self::GetBulk(walk) => walk.metadata(),
-        }
+        self.driver.metadata()
     }
 }
 
-impl<T: Transport + 'static> WalkStreamWithMetadata<T> {
+impl<T: Transport + 'static> WalkMetadataStream<T> {
     pub async fn next(&mut self) -> Option<std::result::Result<WalkItem, WalkError>> {
         std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }
@@ -788,13 +713,19 @@ impl<T: Transport + 'static> WalkStreamWithMetadata<T> {
     }
 }
 
-impl<T: Transport + 'static> Stream for WalkStreamWithMetadata<T> {
+impl<T: Transport + 'static> Stream for WalkMetadataStream<T> {
     type Item = std::result::Result<WalkItem, WalkError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.get_mut() {
-            Self::GetNext(walk) => Pin::new(walk).poll_next(cx),
-            Self::GetBulk(walk) => Pin::new(walk).poll_next(cx),
+        let this = self.get_mut();
+        match this.driver.poll_next_with_metadata(cx) {
+            Poll::Ready(Some(Err(source))) => Poll::Ready(Some(Err(WalkError {
+                source,
+                metadata: this.driver.metadata().clone(),
+            }))),
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1272,7 +1203,10 @@ mod tests {
         let config = ClientConfig {
             auth: crate::Auth::v2c("public"),
             retry: crate::client::retry::Retry::none(),
-            max_walk_results,
+            walk_options: WalkOptions {
+                result_limit: max_walk_results,
+                ..WalkOptions::default()
+            },
             ..Default::default()
         };
         (
@@ -1296,7 +1230,7 @@ mod tests {
         for max_repetitions in [0, crate::pdu::MAX_GET_BULK_VALUE] {
             let (client, requests) = empty_walk_client(None);
             assert!(
-                BulkWalk::new(
+                GetBulkDriver::new(
                     client,
                     base.clone(),
                     max_repetitions,
@@ -1309,7 +1243,7 @@ mod tests {
         }
 
         let (client, requests) = empty_walk_client(None);
-        let error = BulkWalk::new(
+        let error = GetBulkDriver::new(
             client,
             base,
             crate::pdu::MAX_GET_BULK_VALUE + 1,
@@ -1322,33 +1256,94 @@ mod tests {
         assert_requests(&requests, &[]);
     }
 
+    #[test]
+    fn explicit_constructors_share_the_two_public_stream_types() {
+        fn plain<T: Transport>(_: Result<WalkStream<T>>) {}
+        fn metadata<T: Transport>(_: Result<WalkMetadataStream<T>>) {}
+
+        let (client, requests) = empty_walk_client(None);
+        let base = oid!(1, 3, 6, 1);
+        plain(client.walk_getnext(base.clone()));
+        plain(client.bulk_walk(base.clone(), 10));
+        metadata(client.walk_getnext_with_metadata(base.clone()));
+        metadata(client.bulk_walk_with_metadata(base, 10));
+        assert_requests(&requests, &[]);
+    }
+
+    #[test]
+    fn v1_getbulk_override_is_rejected_before_transport_io() {
+        let (transport, requests) = EmptyWalkTransport::new();
+        let client = Client::new(
+            transport,
+            ClientConfig {
+                auth: crate::Auth::v1("public"),
+                retry: crate::client::retry::Retry::none(),
+                ..ClientConfig::default()
+            },
+        )
+        .unwrap();
+        let options = WalkOptions {
+            method: WalkMethod::GetBulk,
+            ..WalkOptions::default()
+        };
+
+        let error = client
+            .walk_with(oid!(1, 3, 6, 1), options)
+            .err()
+            .expect("V1 GETBULK must fail during stream construction");
+        assert!(matches!(*error, Error::Config(_)));
+        assert_requests(&requests, &[]);
+    }
+
+    #[tokio::test]
+    async fn per_operation_options_are_snapshotted_at_stream_creation() {
+        let (client, requests) = empty_walk_client(None);
+        let mut options = WalkOptions {
+            method: WalkMethod::GetNext,
+            ..WalkOptions::default()
+        };
+        let mut walk = client
+            .walk_with(oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), options)
+            .unwrap();
+        options.method = WalkMethod::GetBulk;
+
+        assert!(walk.next().await.is_none());
+        assert_eq!(options.method, WalkMethod::GetBulk);
+        assert_requests(&requests, &[PduType::GetNextRequest]);
+    }
+
     #[tokio::test]
     async fn walk_consumers_share_empty_sequence_and_request_pattern() {
         let base = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
         let (client, requests) = empty_walk_client(None);
-        let mut walk = client.walk_getnext(base.clone());
+        let mut walk = client.walk_getnext(base.clone()).unwrap();
         assert!(walk.next().await.is_none());
         assert_requests(&requests, &[PduType::GetNextRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let results = client.walk_getnext(base.clone()).collect().await.unwrap();
+        let results = client
+            .walk_getnext(base.clone())
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert!(results.is_empty());
         assert_requests(&requests, &[PduType::GetNextRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let mut walk = client.walk_getnext(base.clone());
+        let mut walk = client.walk_getnext(base.clone()).unwrap();
         assert!(futures::StreamExt::next(&mut walk).await.is_none());
         assert_requests(&requests, &[PduType::GetNextRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let walk = client.walk_getnext(base.clone());
+        let walk = client.walk_getnext(base.clone()).unwrap();
         let items: Vec<Result<VarBind>> = futures::StreamExt::collect(walk).await;
         assert!(normalize(items).unwrap().is_empty());
         assert_requests(&requests, &[PduType::GetNextRequest]);
 
         let (client, requests) = empty_walk_client(None);
-        let mut walk = client.walk_getnext(base);
+        let mut walk = client.walk_getnext(base).unwrap();
         let item = std::future::poll_fn(|cx| Stream::poll_next(Pin::new(&mut walk), cx)).await;
         assert!(item.is_none());
         assert_requests(&requests, &[PduType::GetNextRequest]);
@@ -1586,7 +1581,10 @@ mod tests {
         let config = ClientConfig {
             auth,
             retry: crate::client::retry::Retry::none(),
-            max_walk_results: Some(max_walk_results),
+            walk_options: WalkOptions {
+                result_limit: Some(max_walk_results),
+                ..WalkOptions::default()
+            },
             ..Default::default()
         };
         (
@@ -1638,7 +1636,7 @@ mod tests {
                 WalkReply::ResponseWithSuffix(vec![out_of_subtree_binding()], 2),
             ],
         );
-        let mut walk = client.walk_getnext_with_metadata(walk_base());
+        let mut walk = client.walk_getnext_with_metadata(walk_base()).unwrap();
         let item = walk.next().await.unwrap().unwrap();
         assert_eq!(item.varbind, walk_binding(1));
         assert_eq!(item.metadata.decode_anomalies, vec![trailing(1)]);
@@ -1680,6 +1678,7 @@ mod tests {
         );
         let error = client
             .walk_getnext_with_metadata(walk_base())
+            .unwrap()
             .next()
             .await
             .unwrap()
@@ -1699,7 +1698,7 @@ mod tests {
             0,
             vec![WalkReply::Response(vec![walk_binding(1)])],
         );
-        let mut walk = client.walk_getnext(walk_base());
+        let mut walk = client.walk_getnext(walk_base()).unwrap();
         let error = walk.next().await.unwrap().unwrap_err();
         assert_result_limit(&error, 0);
         assert!(walk.next().await.is_none());
@@ -1717,7 +1716,12 @@ mod tests {
                 WalkReply::Response(vec![out_of_subtree_binding()]),
             ],
         );
-        let results = client.walk_getnext(walk_base()).collect().await.unwrap();
+        let results = client
+            .walk_getnext(walk_base())
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(results, vec![walk_binding(1), walk_binding(2)]);
         assert_eq!(detailed_requests(&requests).len(), 3);
 
@@ -1730,7 +1734,7 @@ mod tests {
                 WalkReply::Response(vec![walk_binding(3)]),
             ],
         );
-        let mut walk = client.walk_getnext(walk_base());
+        let mut walk = client.walk_getnext(walk_base()).unwrap();
         assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(1));
         assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(2));
         let error = walk.next().await.unwrap().unwrap_err();
@@ -1899,6 +1903,7 @@ mod tests {
             assert!(
                 client
                     .walk_getnext(walk_base())
+                    .unwrap()
                     .collect()
                     .await
                     .unwrap()
@@ -1914,6 +1919,7 @@ mod tests {
         assert!(
             client
                 .walk_getnext(walk_base())
+                .unwrap()
                 .collect()
                 .await
                 .unwrap()
@@ -1930,6 +1936,7 @@ mod tests {
         let (client, _) = scripted_walk_client(Version::V2c, 0, vec![WalkReply::Timeout]);
         let error = client
             .walk_getnext(walk_base())
+            .unwrap()
             .collect()
             .await
             .unwrap_err();
@@ -1942,6 +1949,7 @@ mod tests {
         );
         let error = client
             .walk_getnext(walk_base())
+            .unwrap()
             .collect()
             .await
             .unwrap_err();
@@ -1960,6 +1968,7 @@ mod tests {
         );
         let error = client
             .walk_getnext(walk_base())
+            .unwrap()
             .collect()
             .await
             .unwrap_err();
@@ -1990,6 +1999,7 @@ mod tests {
         let (client, _) = scripted_walk_client(Version::V2c, 0, vec![WalkReply::Closed]);
         let error = client
             .walk_getnext(walk_base())
+            .unwrap()
             .collect()
             .await
             .unwrap_err();
@@ -2064,13 +2074,14 @@ mod tests {
         let (client, _) = scripted_walk_client(Version::V2c, 1, replies());
         let error = client
             .walk_getnext(walk_base())
+            .unwrap()
             .collect()
             .await
             .unwrap_err();
         assert_result_limit(&error, 1);
 
         let (client, _) = scripted_walk_client(Version::V2c, 1, replies());
-        let mut walk = client.walk_getnext(walk_base());
+        let mut walk = client.walk_getnext(walk_base()).unwrap();
         let mut retained = Vec::new();
         let terminal_error = loop {
             match walk.next().await {
@@ -2092,6 +2103,7 @@ mod tests {
         assert!(
             client
                 .walk_getnext(base.clone())
+                .unwrap()
                 .collect()
                 .await
                 .unwrap()

@@ -3,7 +3,7 @@
 
 mod common;
 
-use async_snmp::{Auth, Client, Value, oid};
+use async_snmp::{Auth, Client, Value, WalkOptions, oid};
 use common::{TestAgent, fixtures};
 
 /// WALK iterates through subtree.
@@ -188,7 +188,10 @@ async fn bulkwalk_respects_max_repetitions() {
     let agent = TestAgent::with_data(data).await;
 
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
-        .max_repetitions(10)
+        .walk_options(WalkOptions {
+            max_repetitions: 10,
+            ..WalkOptions::default()
+        })
         .connect()
         .await
         .unwrap();

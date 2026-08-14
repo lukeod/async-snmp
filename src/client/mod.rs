@@ -96,8 +96,8 @@ pub use crate::v3::DerivedKeys;
 use crate::v3::DerivedKeys;
 pub use crate::v3::UsmConfig;
 pub use walk::{
-    BulkWalk, BulkWalkWithMetadata, OidOrdering, Walk, WalkCollection, WalkError, WalkItem,
-    WalkMode, WalkStream, WalkStreamWithMetadata, WalkWithMetadata,
+    OidOrdering, WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod, WalkOptions,
+    WalkStream,
 };
 
 // ============================================================================
@@ -389,16 +389,8 @@ pub struct ClientConfig {
     /// engine state; only a subsequent authenticated, fully matched Response
     /// may advance that state.
     pub allow_unauthenticated_v3_time_correction: bool,
-    /// Walk operation mode (default: Auto)
-    pub walk_mode: WalkMode,
-    /// OID ordering behavior during walk operations (default: Strict)
-    pub oid_ordering: OidOrdering,
-    /// Maximum results from a single walk operation (default: None/unlimited)
-    pub max_walk_results: Option<usize>,
-    /// Max-repetitions for GETBULK operations (default: 25).
-    ///
-    /// Values above `i32::MAX` are rejected during client construction.
-    pub max_repetitions: u32,
+    /// Default walk method, repetitions, ordering, and result limit.
+    pub walk_options: WalkOptions,
     /// Local authoritative engine state for V3 trap sending (default: None).
     ///
     /// Per RFC 3412 Section 6.4, the sender is authoritative for trap PDUs.
@@ -427,10 +419,7 @@ impl Default for ClientConfig {
             max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
             response_shape_policy: ResponseShapePolicy::Compatible,
             allow_unauthenticated_v3_time_correction: false,
-            walk_mode: WalkMode::Auto,
-            oid_ordering: OidOrdering::Strict,
-            max_walk_results: None,
-            max_repetitions: DEFAULT_MAX_REPETITIONS,
+            walk_options: WalkOptions::default(),
             local_authoritative_engine: None,
             des_salt_state: None,
             local_authoritative_time_source: None,
@@ -467,20 +456,10 @@ impl ClientConfig {
             );
         }
 
-        if self.max_repetitions > crate::pdu::MAX_GET_BULK_VALUE {
+        if self.walk_options.max_repetitions > crate::pdu::MAX_GET_BULK_VALUE {
             return Err(Error::Config("max_repetitions exceeds i32::MAX".into()).boxed());
         }
-
-        if self.version() == Version::V1 && self.walk_mode == WalkMode::GetBulk {
-            return Err(Error::Config("GETBULK not supported in SNMPv1".into()).boxed());
-        }
-
-        if self.oid_ordering == OidOrdering::AllowNonIncreasing && self.max_walk_results.is_none() {
-            return Err(Error::Config(
-                "AllowNonIncreasing requires max_walk_results to bound memory usage".into(),
-            )
-            .boxed());
-        }
+        self.walk_options.validate(self.version())?;
 
         let uses_des = self
             .usm_config()
@@ -603,6 +582,13 @@ impl<T: Transport> Client<T> {
     #[must_use]
     pub fn decode_config(&self) -> crate::DecodeConfig {
         self.inner.config.decode_config
+    }
+
+    /// Return the default options snapshotted by [`Self::walk`] and
+    /// [`Self::walk_with_metadata`].
+    #[must_use]
+    pub fn walk_options(&self) -> WalkOptions {
+        self.inner.config.walk_options
     }
 
     /// Returns the configured SNMPv3 USM security level.
@@ -1368,10 +1354,8 @@ impl<T: Transport> Client<T> {
 
     /// Walk an OID subtree.
     ///
-    /// Auto-selects the optimal walk method based on SNMP version and `WalkMode`:
-    /// - `WalkMode::Auto` (default): Uses GETNEXT for V1, GETBULK for V2c/V3
-    /// - `WalkMode::GetNext`: Always uses GETNEXT
-    /// - `WalkMode::GetBulk`: Always uses GETBULK (fails on V1)
+    /// Auto-selects GETNEXT for V1 and GETBULK for V2c/V3 by default.
+    /// [`WalkOptions::method`] can select either operation explicitly.
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
     /// This convenience stream intentionally discards decode metadata; use
@@ -1381,8 +1365,7 @@ impl<T: Transport> Client<T> {
     /// GETNEXT/GETBULK sequence. A scalar instance OID is not retrieved as a
     /// fallback; use [`get()`](Self::get) to retrieve a scalar value.
     ///
-    /// Uses the client's configured `oid_ordering`, `max_walk_results`, and
-    /// `max_repetitions` (for GETBULK) settings. At a configured result limit,
+    /// Uses the client's snapshotted [`WalkOptions`]. At a configured result limit,
     /// the stream inspects one look-ahead candidate and may make one extra
     /// request. Definite truncation is emitted as
     /// [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded).
@@ -1405,183 +1388,98 @@ impl<T: Transport> Client<T> {
     where
         T: 'static,
     {
-        let ordering = self.inner.config.oid_ordering;
-        let max_results = self.inner.config.max_walk_results;
-        let walk_mode = self.inner.config.walk_mode;
-        let max_repetitions = self.inner.config.max_repetitions;
-        let version = self.inner.config.version();
-
-        WalkStream::new(
-            self.clone(),
-            oid,
-            version,
-            walk_mode,
-            ordering,
-            max_results,
-            max_repetitions,
-        )
+        self.walk_with(oid, self.inner.config.walk_options)
     }
 
-    /// Auto-selected walk retaining per-item and aggregate decode metadata.
-    pub fn walk_with_metadata(&self, oid: Oid) -> Result<WalkStreamWithMetadata<T>>
+    /// Walk using an operation-specific options snapshot.
+    ///
+    /// This override does not mutate the client default or teach the client a
+    /// persistent device capability. `GetBulk` on SNMPv1 is rejected here,
+    /// before the returned stream can perform transport I/O.
+    #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid, snmp.walk_method = ?options.method))]
+    pub fn walk_with(&self, oid: Oid, options: WalkOptions) -> Result<WalkStream<T>>
     where
         T: 'static,
     {
-        self.walk(oid).map(WalkStreamWithMetadata::new)
+        WalkStream::new(self.clone(), oid, self.inner.config.version(), options)
     }
 
-    /// Walk an OID subtree using GETNEXT.
-    ///
-    /// This method always uses GETNEXT regardless of the client's `WalkMode` configuration.
-    /// For auto-selection based on version and mode, use [`walk()`](Self::walk) instead.
-    ///
-    /// Returns an async stream that yields each variable binding in the subtree.
-    /// This convenience stream intentionally discards decode metadata; use
-    /// [`Self::walk_getnext_with_metadata`] to retain it.
-    /// The walk terminates when an OID outside the subtree is encountered or
-    /// when `EndOfMibView` is returned. All consumption methods observe this same
-    /// GETNEXT sequence. A scalar instance OID is not retrieved as a fallback;
-    /// use [`get()`](Self::get) to retrieve a scalar value.
-    ///
-    /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
-    /// At a configured result limit, the stream sends GETNEXT for one look-ahead
-    /// candidate if needed. Definite truncation is emitted as
-    /// [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded).
-    /// A walk is not an atomic MIB snapshot; values can change before the probe.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use async_snmp::{Auth, Client, oid};
-    /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
-    /// // Force GETNEXT even for V2c/V3 clients
-    /// let results = client.walk_getnext(oid!(1, 3, 6, 1, 2, 1, 1)).collect().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Walk using the client's default options while retaining response metadata.
     #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
-    pub fn walk_getnext(&self, oid: Oid) -> Walk<T>
+    pub fn walk_with_metadata(&self, oid: Oid) -> Result<WalkMetadataStream<T>>
     where
         T: 'static,
     {
-        let ordering = self.inner.config.oid_ordering;
-        let max_results = self.inner.config.max_walk_results;
-        Walk::new(self.clone(), oid, ordering, max_results)
+        self.walk_with_metadata_and(oid, self.inner.config.walk_options)
     }
 
-    /// GETNEXT walk retaining per-item and aggregate decode metadata.
-    pub fn walk_getnext_with_metadata(&self, oid: Oid) -> WalkWithMetadata<T>
+    /// Walk with metadata using an operation-specific options snapshot.
+    #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid, snmp.walk_method = ?options.method))]
+    pub fn walk_with_metadata_and(
+        &self,
+        oid: Oid,
+        options: WalkOptions,
+    ) -> Result<WalkMetadataStream<T>>
     where
         T: 'static,
     {
-        WalkWithMetadata::new(self.walk_getnext(oid))
+        self.walk_with(oid, options).map(WalkMetadataStream::new)
     }
 
-    /// Walk an OID subtree using GETBULK (more efficient than GETNEXT).
-    ///
-    /// Returns an async stream that yields each variable binding in the subtree.
-    /// This convenience stream intentionally discards decode metadata; use
-    /// [`Self::bulk_walk_with_metadata`] to retain it.
-    /// Uses GETBULK internally with `non_repeaters=0`, fetching `max_repetitions`
-    /// values per request for efficient table traversal. All consumption methods
-    /// observe this same GETBULK sequence. A scalar instance OID is not retrieved
-    /// as a fallback; use [`get()`](Self::get) to retrieve a scalar value.
-    ///
-    /// Uses the client's configured `oid_ordering` and `max_walk_results` settings.
-    /// At a configured result limit, the stream first inspects one buffered
-    /// binding, or sends GETBULK with `max_repetitions = 1` when none is buffered.
-    /// Definite truncation is emitted as
-    /// [`WalkAbortReason::ResultLimitExceeded`](crate::WalkAbortReason::ResultLimitExceeded).
-    /// A walk is not an atomic MIB snapshot; values can change before the probe.
-    ///
-    /// # Arguments
-    ///
-    /// * `oid` - The base OID of the subtree to walk
-    /// * `max_repetitions` - How many OIDs to fetch per request
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidMessage`] when `max_repetitions` exceeds
-    /// `i32::MAX`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use async_snmp::{Auth, Client, oid};
-    /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
-    /// // Walk the interfaces table efficiently
-    /// let walk = client.bulk_walk(oid!(1, 3, 6, 1, 2, 1, 2, 2), 25)?;
-    /// // Process with futures StreamExt
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid, snmp.max_repetitions = max_repetitions))]
-    pub fn bulk_walk(&self, oid: Oid, max_repetitions: u32) -> Result<BulkWalk<T>>
+    /// Explicit GETNEXT convenience returning the common plain stream type.
+    pub fn walk_getnext(&self, oid: Oid) -> Result<WalkStream<T>>
     where
         T: 'static,
     {
-        Pdu::checked_get_bulk_fields(0, max_repetitions)?;
-        let ordering = self.inner.config.oid_ordering;
-        let max_results = self.inner.config.max_walk_results;
-        BulkWalk::new(self.clone(), oid, max_repetitions, ordering, max_results)
+        let mut options = self.inner.config.walk_options;
+        options.method = WalkMethod::GetNext;
+        self.walk_with(oid, options)
     }
 
-    /// GETBULK walk retaining per-item and aggregate decode metadata.
+    /// Explicit GETNEXT convenience returning the common metadata stream type.
+    pub fn walk_getnext_with_metadata(&self, oid: Oid) -> Result<WalkMetadataStream<T>>
+    where
+        T: 'static,
+    {
+        let mut options = self.inner.config.walk_options;
+        options.method = WalkMethod::GetNext;
+        self.walk_with_metadata_and(oid, options)
+    }
+
+    /// Explicit GETBULK convenience returning the common plain stream type.
+    pub fn bulk_walk(&self, oid: Oid, max_repetitions: u32) -> Result<WalkStream<T>>
+    where
+        T: 'static,
+    {
+        let mut options = self.inner.config.walk_options;
+        options.method = WalkMethod::GetBulk;
+        options.max_repetitions = max_repetitions;
+        self.walk_with(oid, options)
+    }
+
+    /// Explicit GETBULK convenience returning the common metadata stream type.
     pub fn bulk_walk_with_metadata(
         &self,
         oid: Oid,
         max_repetitions: u32,
-    ) -> Result<BulkWalkWithMetadata<T>>
+    ) -> Result<WalkMetadataStream<T>>
     where
         T: 'static,
     {
-        self.bulk_walk(oid, max_repetitions)
-            .map(BulkWalkWithMetadata::new)
+        let mut options = self.inner.config.walk_options;
+        options.method = WalkMethod::GetBulk;
+        options.max_repetitions = max_repetitions;
+        self.walk_with_metadata_and(oid, options)
     }
 
-    /// Walk an OID subtree using the client's configured `max_repetitions`.
-    ///
-    /// Like [`bulk_walk()`](Self::bulk_walk), this yields only GETBULK walk results
-    /// and does not retrieve a scalar instance OID with a fallback GET.
-    ///
-    /// This is a convenience method that uses the client's `max_repetitions` setting
-    /// (default: 25) instead of requiring it as a parameter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidMessage`] if the configured value cannot be
-    /// represented as an RFC 3416 GETBULK field. Client construction validates
-    /// this invariant, so this can occur only if an invalid client is introduced
-    /// through future internal changes.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use async_snmp::{Auth, Client, oid};
-    /// # async fn example() -> async_snmp::Result<()> {
-    /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
-    /// // Walk using configured max_repetitions
-    /// let walk = client.bulk_walk_default(oid!(1, 3, 6, 1, 2, 1, 2, 2))?;
-    /// // Process with futures StreamExt
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[instrument(skip(self), fields(snmp.target = %self.peer_addr(), snmp.oid = %oid))]
-    pub fn bulk_walk_default(&self, oid: Oid) -> Result<BulkWalk<T>>
+    /// Explicit GETBULK convenience using the client's default repetitions.
+    pub fn bulk_walk_default(&self, oid: Oid) -> Result<WalkStream<T>>
     where
         T: 'static,
     {
-        let ordering = self.inner.config.oid_ordering;
-        let max_results = self.inner.config.max_walk_results;
-        BulkWalk::new(
-            self.clone(),
-            oid,
-            self.inner.config.max_repetitions,
-            ordering,
-            max_results,
-        )
+        let mut options = self.inner.config.walk_options;
+        options.method = WalkMethod::GetBulk;
+        self.walk_with(oid, options)
     }
 }
 
@@ -2511,7 +2409,10 @@ mod tests {
         assert_config_error(Client::new(
             transport.clone(),
             ClientConfig {
-                max_repetitions: crate::pdu::MAX_GET_BULK_VALUE + 1,
+                walk_options: WalkOptions {
+                    max_repetitions: crate::pdu::MAX_GET_BULK_VALUE + 1,
+                    ..WalkOptions::default()
+                },
                 ..ClientConfig::default()
             },
         ));
@@ -2519,15 +2420,21 @@ mod tests {
             transport.clone(),
             ClientConfig {
                 auth: Auth::v1("public"),
-                walk_mode: WalkMode::GetBulk,
+                walk_options: WalkOptions {
+                    method: WalkMethod::GetBulk,
+                    ..WalkOptions::default()
+                },
                 ..ClientConfig::default()
             },
         ));
         assert_config_error(Client::new(
             transport.clone(),
             ClientConfig {
-                oid_ordering: OidOrdering::AllowNonIncreasing,
-                max_walk_results: None,
+                walk_options: WalkOptions {
+                    ordering: OidOrdering::AllowNonIncreasing,
+                    result_limit: None,
+                    ..WalkOptions::default()
+                },
                 ..ClientConfig::default()
             },
         ));
@@ -2778,7 +2685,7 @@ mod tests {
     #[tokio::test]
     async fn walk_does_not_consume_an_anomalous_single_response() {
         let oid = Oid::from_slice(&[1, 3, 6, 1, 1]);
-        let mut walk = make_client(2).walk_getnext(oid);
+        let mut walk = make_client(2).walk_getnext(oid).unwrap();
         let error = walk.next().await.unwrap().unwrap_err();
         assert!(matches!(*error, Error::ResponseShape { .. }));
         assert!(walk.next().await.is_none());

@@ -9,7 +9,7 @@ use async_snmp::cli::output::{
     OperationType, OutputContext, RequestInfo, build_security_info, write_error,
     write_verbose_request, write_verbose_response,
 };
-use async_snmp::{Auth, Client, Oid, VarBind, Version, WalkMode};
+use async_snmp::{Auth, Client, Oid, VarBind, Version, WalkMethod, WalkOptions};
 use clap::Parser;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -162,10 +162,10 @@ async fn run_walk(
     use_getnext: bool,
 ) -> async_snmp::Result<Vec<VarBind>> {
     // Set walk mode based on CLI flags
-    let walk_mode = if use_getnext {
-        WalkMode::GetNext
+    let method = if use_getnext {
+        WalkMethod::GetNext
     } else {
-        WalkMode::GetBulk
+        WalkMethod::GetBulk
     };
 
     let timeout = args
@@ -180,8 +180,11 @@ async fn run_walk(
     let client = Client::builder(target, auth)
         .request_timeout(timeout)
         .retry(retry)
-        .walk_mode(walk_mode)
-        .max_repetitions(args.walk.max_repetitions)
+        .walk_options(WalkOptions {
+            method,
+            max_repetitions: args.walk.max_repetitions,
+            ..WalkOptions::default()
+        })
         .connect()
         .await?;
 

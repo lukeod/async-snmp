@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Walks now expose exactly two opaque stream types:
+  `WalkStream` for plain bindings and `WalkMetadataStream` for response metadata.
+  `WalkOptions` selects `Auto`, GETNEXT, or GETBULK plus repetitions, ordering,
+  and a result limit as either a client default or per-operation snapshot. The
+  public concrete `Walk`/`BulkWalk` wrappers and exhaustive driver enums are
+  removed; canonical construction uses `walk`, `walk_with`,
+  `walk_with_metadata`, or `walk_with_metadata_and`.
 - Agent request contexts now expose receipt/admission timestamps, an optional
   absolute deadline measured from receipt, and level-triggered cooperative
   cancellation. Shutdown defaults to signalling and draining dispatched work;

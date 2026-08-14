@@ -12,7 +12,7 @@
 //! Run with: cargo run --example walk_subtree
 
 use async_snmp::format::hints;
-use async_snmp::{Auth, Client, OidOrdering, WalkMode, oid};
+use async_snmp::{Auth, Client, OidOrdering, WalkMethod, WalkOptions, oid};
 use futures::TryStreamExt;
 use std::time::Duration;
 
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // walk_getnext always uses GETNEXT, regardless of version
     // Useful for compatibility with buggy agents
-    let walk = client.walk_getnext(oid!(1, 3, 6, 1, 2, 1, 1));
+    let walk = client.walk_getnext(oid!(1, 3, 6, 1, 2, 1, 1))?;
 
     let results = walk.collect().await?;
     println!("GETNEXT walk found {} OIDs", results.len());
@@ -131,14 +131,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let configured_client = Client::builder(target, Auth::v2c("public"))
         .request_timeout(Duration::from_secs(5))
-        // Force GETNEXT mode (useful for buggy agents)
-        .walk_mode(WalkMode::GetNext)
-        // Allow non-increasing OIDs (some agents have bugs)
-        .oid_ordering(OidOrdering::AllowNonIncreasing)
-        // Limit results to prevent runaway walks
-        .max_walk_results(100)
-        // Set GETBULK repetitions (when using GETBULK mode)
-        .max_repetitions(25)
+        .walk_options(WalkOptions {
+            method: WalkMethod::GetNext,
+            max_repetitions: 25,
+            ordering: OidOrdering::AllowNonIncreasing,
+            result_limit: Some(100),
+        })
         .connect()
         .await?;
 

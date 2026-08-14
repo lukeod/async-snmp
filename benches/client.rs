@@ -229,6 +229,7 @@ fn bench_walk(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let results = client
                 .walk_getnext(system_oid.clone())
+                .unwrap()
                 .collect()
                 .await
                 .unwrap();

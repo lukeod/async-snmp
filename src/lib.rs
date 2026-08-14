@@ -450,7 +450,7 @@
 //! | [`DecodeConfig`] | `DEFAULT` | Applies one immutable snapshot to correlation and every decode stage. TCP frames one declared TLV at a time, so adjacent stream messages are not suffixes. |
 //! | [`ResponseShapePolicy`] | `Compatible` | Fixed-cardinality operations preserve all received varbinds and return bounded anomalies for count, OID, successor, or SET-echo problems. `Strict` returns [`Error::ResponseShape`] with the same data and diagnostics. |
 //! | [`NotificationVarbindValidation`] | `Tolerant` | V2c/v3 TrapV2 and Inform prefixes may use non-standard names, but still require `TimeTicks` then `ObjectIdentifier` values. `Strict` also requires the RFC names and order. Rejected notifications are dropped, rejected Informs are not acknowledged, and validation failures are traced. |
-//! | [`WalkMode`], [`OidOrdering`], and walk limits | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires [`ClientBuilder::max_walk_results`] to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
+//! | [`WalkOptions`] | `Auto`, `Strict`, no result limit, 25 max-repetitions | `GetNext` avoids broken GETBULK. `AllowNonIncreasing` tracks all seen OIDs to detect cycles and therefore requires a result limit to bound O(n) memory; abort reasons and tracing identify ordering failures. Smaller max-repetitions reduce datagram size at the cost of more round trips. |
 //! | UDP source correlation | off-target replies accepted with a warning | [`TargetClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`UdpStats::discarded_datagrams`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
 //! | [`CommunityResponsePolicy`] | `Exact` | V1/v2c response communities match byte-for-byte. Rewrite policies emit warnings when used; accepting rewrites from any source weakens spoof resistance, especially with permissive UDP source handling. |
 //! | [`ClientBuilder::allow_unauthenticated_v3_time_correction`] | off | Allows one correlated, packet-local correction from an unauthenticated time-window Report. The tuple is never trusted globally, but an injector can choose one packet's time fields. Use strict UDP source correlation where possible; tracing records protocol correction. |
@@ -511,7 +511,7 @@
 //! specific peer.
 //!
 //! ```rust,no_run
-//! use async_snmp::{Auth, Client, DecodeConfig, WalkMode, message::Message};
+//! use async_snmp::{Auth, Client, DecodeConfig, WalkMethod, WalkOptions, message::Message};
 //! use bytes::Bytes;
 //!
 //! // This agent over-declares bounded string lengths and has broken GETBULK.
@@ -527,7 +527,10 @@
 //!
 //! let _client = Client::builder("192.0.2.2:161", Auth::v2c("public"))
 //!     .decode_config(decode_config)
-//!     .walk_mode(WalkMode::GetNext);
+//!     .walk_options(WalkOptions {
+//!         method: WalkMethod::GetNext,
+//!         ..WalkOptions::default()
+//!     });
 //! # let _ = (decode_config, decode_agent_packet);
 //! ```
 //!
@@ -589,14 +592,14 @@ pub use agent::{
     VacmConfig, VacmSecurityModel, View,
 };
 pub use client::{
-    Auth, BulkResponse, BulkWalk, BulkWalkWithMetadata, Client, ClientBuilder, ClientConfig,
-    CommunityVersion, DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST,
-    DEFAULT_MAX_REPETITIONS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
+    Auth, BulkResponse, Client, ClientBuilder, ClientConfig, CommunityVersion,
+    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
+    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
     FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
     FixedCardinalityResponse, MAX_RETRIES, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
     ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder,
-    UsmAuthBuilder, Walk, WalkCollection, WalkError, WalkItem, WalkMode, WalkStream,
-    WalkStreamWithMetadata, WalkWithMetadata,
+    UsmAuthBuilder, WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod,
+    WalkOptions, WalkStream,
 };
 pub use community::Community;
 pub use compatibility::{
