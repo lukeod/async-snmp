@@ -489,7 +489,7 @@ mod tests {
             .auth_priv(
                 AuthProtocol::Sha512,
                 "authpass",
-                PrivProtocol::Aes256,
+                PrivProtocol::Aes256Blumenthal,
                 "privpass",
             )
             .context_name("ctx")

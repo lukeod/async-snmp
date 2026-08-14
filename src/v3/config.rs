@@ -567,14 +567,17 @@ mod tests {
             .auth_priv(
                 AuthProtocol::Sha512,
                 b"otherauthpass",
-                PrivProtocol::Aes256,
+                PrivProtocol::Aes256Blumenthal,
                 b"otherprivpass",
             )
             .unwrap();
 
         assert_eq!(auth_priv_config.security_level(), SecurityLevel::AuthPriv);
         assert_eq!(auth_priv_config.auth_protocol(), Some(AuthProtocol::Sha512));
-        assert_eq!(auth_priv_config.priv_protocol(), Some(PrivProtocol::Aes256));
+        assert_eq!(
+            auth_priv_config.priv_protocol(),
+            Some(PrivProtocol::Aes256Blumenthal)
+        );
         assert!(
             auth_priv_config
                 .derive_keys(b"test-engine-id")

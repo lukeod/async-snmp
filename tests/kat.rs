@@ -214,35 +214,36 @@ fn test_aes128_priv_key_from_password() {
     );
 }
 
-/// AES-256 privacy key derivation (Blumenthal).
-///
-/// For AES-256, all 32 bytes from SHA-256 localization are used.
+/// SHA-256 localization already provides all 32 AES-256 key bytes, so the
+/// configured extension dialect does not change the derived cipher key.
 #[test]
-fn test_aes256_priv_key_from_password() {
+fn test_aes256_sha256_priv_key_requires_no_extension() {
     let password = b"maplesyrup";
     let engine_id = decode("000000000000000000000002").unwrap();
 
-    // AES-256 uses SHA-256 localization (32 bytes)
-    let priv_key = PrivKey::from_password(
+    let blumenthal = PrivKey::from_password(
         AuthProtocol::Sha256,
-        PrivProtocol::Aes256,
+        PrivProtocol::Aes256Blumenthal,
+        password,
+        &engine_id,
+    )
+    .unwrap();
+    let reeder = PrivKey::from_password(
+        AuthProtocol::Sha256,
+        PrivProtocol::Aes256Reeder,
         password,
         &engine_id,
     )
     .unwrap();
 
-    // Encryption key should be 32 bytes
-    assert_eq!(priv_key.encryption_key().len(), 32);
-
-    // Verify determinism
-    let priv_key2 = PrivKey::from_password(
-        AuthProtocol::Sha256,
-        PrivProtocol::Aes256,
-        password,
-        &engine_id,
-    )
-    .unwrap();
-    assert_eq!(priv_key.encryption_key(), priv_key2.encryption_key());
+    assert_eq!(blumenthal.encryption_key().len(), 32);
+    assert_eq!(
+        encode(blumenthal.encryption_key()),
+        "8982e0e549e866db361a6b625d84cccc11162d453ee8ce3a6445c2d6776f0f8b"
+    );
+    assert_eq!(blumenthal.encryption_key(), reeder.encryption_key());
+    assert_eq!(blumenthal.protocol(), PrivProtocol::Aes256Blumenthal);
+    assert_eq!(reeder.protocol(), PrivProtocol::Aes256Reeder);
 }
 
 /// Different engine IDs produce different localized keys.
@@ -392,28 +393,145 @@ fn test_mac_lengths_per_rfc() {
 }
 
 // ============================================================================
-// Blumenthal Key Extension Tests (draft-blumenthal-aes-usm-04)
+// AES localized-key extension known-answer tests
 //
-// These tests verify the key extension algorithm used for AES-192/256 when
-// the authentication protocol produces insufficient key material. This is
-// an interoperability feature for communicating with net-snmp and other
-// implementations that support AES-192/256 with shorter auth protocols.
+// MD5/SHA-1 localization starts with the RFC 3414 Appendix A vectors. The
+// Blumenthal extensions follow draft-blumenthal-aes-usm-04, while Reeder
+// extensions follow draft-reeder-snmpv3-usm-3desede-00 Appendix B. SHA-224
+// uses the same RFC 7860 authentication hash with both extension procedures.
 // ============================================================================
 
-// Key extension algorithm tests (extend_key, extend_key_reeder) are now internal
-// to the v3::auth module. See src/v3/auth.rs for KAT tests.
-
-/// AES-256 encryption/decryption roundtrip with SHA-1 (auto key extension).
+#[cfg(feature = "crypto-rustcrypto")]
 #[test]
-fn test_aes256_with_sha1_auto_key_extension_roundtrip() {
+fn aes_md5_extension_dialect_known_answers() {
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+    for (protocol, expected) in [
+        (
+            PrivProtocol::Aes192Blumenthal,
+            "526f5eed9fcce26f8964c2930787d82bfa24a92467426c2f",
+        ),
+        (
+            PrivProtocol::Aes192Reeder,
+            "526f5eed9fcce26f8964c2930787d82b79eff44a90650ee0",
+        ),
+        (
+            PrivProtocol::Aes256Blumenthal,
+            "526f5eed9fcce26f8964c2930787d82bfa24a92467426c2f4b09192be10dfaec",
+        ),
+        (
+            PrivProtocol::Aes256Reeder,
+            "526f5eed9fcce26f8964c2930787d82b79eff44a90650ee0a3a40abfac5acc12",
+        ),
+    ] {
+        let key =
+            PrivKey::from_password(AuthProtocol::Md5, protocol, password, &engine_id).unwrap();
+        assert_eq!(encode(key.encryption_key()), expected, "{protocol}");
+    }
+}
+
+#[test]
+fn aes_sha1_extension_dialect_known_answers() {
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+    for (protocol, expected) in [
+        (
+            PrivProtocol::Aes192Blumenthal,
+            "6695febc9288e36282235fc7151f128497b38f3f505e07eb",
+        ),
+        (
+            PrivProtocol::Aes192Reeder,
+            "6695febc9288e36282235fc7151f128497b38f3f9b8b6d78",
+        ),
+        (
+            PrivProtocol::Aes256Blumenthal,
+            "6695febc9288e36282235fc7151f128497b38f3f505e07eb9af25568fa1f5dbe",
+        ),
+        (
+            PrivProtocol::Aes256Reeder,
+            "6695febc9288e36282235fc7151f128497b38f3f9b8b6d78936ba6e7d19dfd9c",
+        ),
+    ] {
+        let key =
+            PrivKey::from_password(AuthProtocol::Sha1, protocol, password, &engine_id).unwrap();
+        assert_eq!(encode(key.encryption_key()), expected, "{protocol}");
+    }
+}
+
+#[test]
+fn aes256_sha224_extension_dialect_known_answers() {
+    let password = b"maplesyrup";
+    let engine_id = decode("000000000000000000000002").unwrap();
+    for (protocol, expected) in [
+        (
+            PrivProtocol::Aes256Blumenthal,
+            "0bd8827c6e29f8065e08e09237f177e410f69b90e1782be682075674e82d9bf0",
+        ),
+        (
+            PrivProtocol::Aes256Reeder,
+            "0bd8827c6e29f8065e08e09237f177e410f69b90e1782be68207567422c34be4",
+        ),
+    ] {
+        let key =
+            PrivKey::from_password(AuthProtocol::Sha224, protocol, password, &engine_id).unwrap();
+        assert_eq!(encode(key.encryption_key()), expected, "{protocol}");
+    }
+}
+
+#[test]
+fn raw_aes_keys_bypass_extension_but_preserve_protocol_identity() {
+    let raw192 = vec![0x19; 24];
+    let aes192_blumenthal =
+        PrivKey::from_bytes(PrivProtocol::Aes192Blumenthal, raw192.clone()).unwrap();
+    let aes192_reeder = PrivKey::from_bytes(PrivProtocol::Aes192Reeder, raw192).unwrap();
+    assert_eq!(
+        aes192_blumenthal.encryption_key(),
+        aes192_reeder.encryption_key()
+    );
+    assert_ne!(aes192_blumenthal.protocol(), aes192_reeder.protocol());
+    let plaintext = b"raw-key dialect equivalence";
+    let (ciphertext, priv_params) = aes192_blumenthal
+        .encrypt_aes(plaintext, 7, 99, &SaltCounter::new().unwrap())
+        .unwrap();
+    assert_eq!(
+        aes192_reeder
+            .decrypt(&ciphertext, 7, 99, &priv_params)
+            .unwrap(),
+        plaintext.as_slice()
+    );
+
+    let raw256 = vec![0x25; 32];
+    let aes256_blumenthal =
+        PrivKey::from_bytes(PrivProtocol::Aes256Blumenthal, raw256.clone()).unwrap();
+    let aes256_reeder = PrivKey::from_bytes(PrivProtocol::Aes256Reeder, raw256).unwrap();
+    assert_eq!(
+        aes256_blumenthal.encryption_key(),
+        aes256_reeder.encryption_key()
+    );
+    assert_ne!(aes256_blumenthal.protocol(), aes256_reeder.protocol());
+
+    let (ciphertext, priv_params) = aes256_blumenthal
+        .encrypt_aes(plaintext, 7, 99, &SaltCounter::new().unwrap())
+        .unwrap();
+    assert_eq!(
+        aes256_reeder
+            .decrypt(&ciphertext, 7, 99, &priv_params)
+            .unwrap(),
+        plaintext.as_slice()
+    );
+}
+
+/// AES-256 encryption/decryption roundtrip with explicit SHA-1 Blumenthal extension.
+#[test]
+fn test_aes256_with_sha1_blumenthal_extension_roundtrip() {
     let password = b"maplesyrup";
     let engine_id = decode("000000000000000000000002").unwrap();
 
-    // Create privacy key - Blumenthal extension is auto-applied because
+    // Create privacy key - the selected Blumenthal extension applies because
     // SHA-1 (20 bytes) < AES-256 (32 bytes)
     let priv_key = PrivKey::from_password(
         AuthProtocol::Sha1,
-        PrivProtocol::Aes256,
+        PrivProtocol::Aes256Blumenthal,
         password,
         &engine_id,
     )
@@ -428,7 +546,7 @@ fn test_aes256_with_sha1_auto_key_extension_roundtrip() {
     let engine_time = 12345u32;
 
     let (ciphertext, priv_params) = priv_key
-        .encrypt(
+        .encrypt_aes(
             plaintext,
             engine_boots,
             engine_time,
@@ -443,17 +561,17 @@ fn test_aes256_with_sha1_auto_key_extension_roundtrip() {
     assert_eq!(decrypted.as_ref(), plaintext);
 }
 
-/// AES-192 encryption/decryption roundtrip with SHA-1 (auto key extension).
+/// AES-192 encryption/decryption roundtrip with explicit SHA-1 Blumenthal extension.
 #[test]
-fn test_aes192_with_sha1_auto_key_extension_roundtrip() {
+fn test_aes192_with_sha1_blumenthal_extension_roundtrip() {
     let password = b"maplesyrup";
     let engine_id = decode("000000000000000000000002").unwrap();
 
-    // Create privacy key - Blumenthal extension is auto-applied because
+    // Create privacy key - the selected Blumenthal extension applies because
     // SHA-1 (20 bytes) < AES-192 (24 bytes)
     let priv_key = PrivKey::from_password(
         AuthProtocol::Sha1,
-        PrivProtocol::Aes192,
+        PrivProtocol::Aes192Blumenthal,
         password,
         &engine_id,
     )
@@ -468,7 +586,7 @@ fn test_aes192_with_sha1_auto_key_extension_roundtrip() {
     let engine_time = 54321u32;
 
     let (ciphertext, priv_params) = priv_key
-        .encrypt(
+        .encrypt_aes(
             plaintext,
             engine_boots,
             engine_time,
@@ -483,17 +601,17 @@ fn test_aes192_with_sha1_auto_key_extension_roundtrip() {
     assert_eq!(decrypted.as_ref(), plaintext);
 }
 
-/// AES-256 with MD5 (auto key extension) roundtrip.
+/// AES-256 with explicit MD5 Blumenthal extension roundtrip.
 #[cfg(feature = "crypto-rustcrypto")]
 #[test]
-fn test_aes256_with_md5_auto_key_extension_roundtrip() {
+fn test_aes256_with_md5_blumenthal_extension_roundtrip() {
     let password = b"maplesyrup";
     let engine_id = decode("000000000000000000000002").unwrap();
 
-    // Blumenthal extension is auto-applied because MD5 (16 bytes) < AES-256 (32 bytes)
+    // The selected Blumenthal extension applies because MD5 (16 bytes) < AES-256 (32 bytes)
     let priv_key = PrivKey::from_password(
         AuthProtocol::Md5,
-        PrivProtocol::Aes256,
+        PrivProtocol::Aes256Blumenthal,
         password,
         &engine_id,
     )
@@ -503,7 +621,7 @@ fn test_aes256_with_md5_auto_key_extension_roundtrip() {
 
     let plaintext = b"Test message for AES-256 with extended MD5 key";
     let (ciphertext, priv_params) = priv_key
-        .encrypt(plaintext, 300, 67890, &SaltCounter::new().unwrap())
+        .encrypt_aes(plaintext, 300, 67890, &SaltCounter::new().unwrap())
         .expect("encryption should succeed");
 
     let decrypted = priv_key
@@ -601,10 +719,10 @@ fn test_extended_keys_differ_by_engine_id() {
     let engine_id_1 = decode("000000000000000000000001").unwrap();
     let engine_id_2 = decode("000000000000000000000002").unwrap();
 
-    // Blumenthal extension is auto-applied for both
+    // The selected Blumenthal extension applies for both
     let priv_key_1 = PrivKey::from_password(
         AuthProtocol::Sha1,
-        PrivProtocol::Aes256,
+        PrivProtocol::Aes256Blumenthal,
         password,
         &engine_id_1,
     )
@@ -612,7 +730,7 @@ fn test_extended_keys_differ_by_engine_id() {
 
     let priv_key_2 = PrivKey::from_password(
         AuthProtocol::Sha1,
-        PrivProtocol::Aes256,
+        PrivProtocol::Aes256Blumenthal,
         password,
         &engine_id_2,
     )
@@ -707,10 +825,10 @@ fn both_backends_are_explicit_and_match_shared_sha_aes_vectors() {
 
     let plaintext = b"shared AES-128 provider KAT";
     let rust_encrypted = rust_priv
-        .encrypt(plaintext, 7, 11, &SaltCounter::new().unwrap())
+        .encrypt_aes(plaintext, 7, 11, &SaltCounter::new().unwrap())
         .unwrap();
     let fips_encrypted = fips_priv
-        .encrypt(plaintext, 7, 11, &SaltCounter::new().unwrap())
+        .encrypt_aes(plaintext, 7, 11, &SaltCounter::new().unwrap())
         .unwrap();
     assert_eq!(
         rust_priv
@@ -774,7 +892,7 @@ fn test_golden_aes128_roundtrip() {
     let engine_time = 1u32;
 
     let (ct, params) = priv_key
-        .encrypt(
+        .encrypt_aes(
             plaintext,
             engine_boots,
             engine_time,
@@ -798,13 +916,13 @@ fn test_golden_aes128_roundtrip() {
 #[test]
 fn test_golden_aes256_roundtrip() {
     let key = vec![0xAB; 32];
-    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key).unwrap();
+    let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256Blumenthal, key).unwrap();
     let plaintext = b"another cross-provider verification test";
     let engine_boots = 42u32;
     let engine_time = 12345u32;
 
     let (ct, params) = priv_key
-        .encrypt(
+        .encrypt_aes(
             plaintext,
             engine_boots,
             engine_time,

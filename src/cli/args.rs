@@ -207,7 +207,8 @@ pub struct V3Args {
     #[arg(short = 'A', long = "auth-password")]
     pub auth_password: Option<String>,
 
-    /// Privacy protocol: DES, 3DES, AES, AES-128, AES-192, AES-256.
+    /// Privacy protocol: DES, 3DES, AES, AES-128, and explicit
+    /// AES-192/AES-256 Blumenthal or Reeder variants.
     #[arg(short = 'x', long = "priv-protocol")]
     pub priv_protocol: Option<PrivProtocol>,
 
@@ -846,12 +847,12 @@ mod tests {
         assert!(args.validate().is_err());
         assert!(args.auth(&common_args()).is_err());
 
-        // SHA-1 with AES-256 - valid (key extension auto-applied)
+        // SHA-1 with AES-256 Blumenthal - valid (selected key extension applies)
         let args = V3Args {
             username: Some("admin".to_string()),
             auth_protocol: Some(AuthProtocol::Sha1),
             auth_password: Some("pass".to_string()),
-            priv_protocol: Some(PrivProtocol::Aes256),
+            priv_protocol: Some(PrivProtocol::Aes256Blumenthal),
             priv_password: Some("pass".to_string()),
             crypto_backend: None,
         };

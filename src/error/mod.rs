@@ -416,6 +416,8 @@ pub enum ErrorKind {
     Config,
     /// Authoritative-engine state could not be persisted.
     AuthoritativeEnginePersistence,
+    /// Privacy sender-state allocation or encryption failure.
+    Privacy,
     /// Operating-system random source failure.
     RandomSource,
     /// Available even when the `agent` feature is disabled.
@@ -446,6 +448,7 @@ impl ErrorKind {
             Self::WalkAborted => "walk_aborted",
             Self::Config => "configuration",
             Self::AuthoritativeEnginePersistence => "authoritative_engine_persistence",
+            Self::Privacy => "privacy",
             Self::RandomSource => "random_source",
             Self::AgentAlreadyRunning => "agent_already_running",
             Self::InvalidMessage => "invalid_message",
@@ -633,6 +636,10 @@ pub enum Error {
     #[error(transparent)]
     AuthoritativeEnginePersistence(#[from] crate::v3::AuthoritativeEnginePersistenceError),
 
+    /// Privacy sender-state allocation or encryption failed.
+    #[error(transparent)]
+    Privacy(#[from] crate::v3::PrivacyError),
+
     /// The operating system could not provide random bytes.
     #[error("OS random source unavailable: {source}")]
     RandomSource {
@@ -676,6 +683,7 @@ impl Error {
             Self::WalkAborted { .. } => ErrorKind::WalkAborted,
             Self::Config(_) => ErrorKind::Config,
             Self::AuthoritativeEnginePersistence(_) => ErrorKind::AuthoritativeEnginePersistence,
+            Self::Privacy(_) => ErrorKind::Privacy,
             Self::RandomSource { .. } => ErrorKind::RandomSource,
             #[cfg(feature = "agent")]
             Self::AgentAlreadyRunning => ErrorKind::AgentAlreadyRunning,

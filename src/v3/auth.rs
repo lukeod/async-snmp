@@ -791,10 +791,11 @@ impl MasterKeys {
     /// Returns (`auth_key`, `priv_key`) where `priv_key` is None if no privacy
     /// was configured.
     ///
-    /// Key extension is automatically applied when needed based on the auth/priv
-    /// protocol combination:
+    /// Key extension is applied when needed according to the selected privacy
+    /// protocol variant:
     ///
-    /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
+    /// - AES-192/256 Blumenthal variants: draft-blumenthal-aes-usm-04 extension
+    /// - AES-192/256 Reeder variants: Cisco/Reeder extension
     /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
     ///
     /// # Example
@@ -805,12 +806,12 @@ impl MasterKeys {
     /// use async_snmp::{AuthProtocol, MasterKeys, PrivProtocol};
     ///
     /// let keys = MasterKeys::new(AuthProtocol::Sha1, b"authpassword").unwrap()
-    ///     .with_privacy_same_password(PrivProtocol::Aes256).unwrap();
+    ///     .with_privacy_same_password(PrivProtocol::Aes256Blumenthal).unwrap();
     ///
     /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
     ///
     /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
-    /// // Blumenthal extension is automatically applied.
+    /// // The configured Blumenthal extension is applied.
     /// let (auth, priv_key) = keys.localize(&engine_id).unwrap();
     /// # }
     /// ```

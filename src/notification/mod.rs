@@ -208,7 +208,7 @@ use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
 use crate::v3::process::RemoteEngineTable;
 use crate::v3::process::UsmStats;
-use crate::v3::{AuthoritativeEngine, SaltCounter};
+use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
@@ -591,6 +591,7 @@ pub struct NotificationReceiverBuilder {
     usm_users: HashMap<Bytes, UsmUser>,
     communities: Vec<Community>,
     authoritative_engine: Option<AuthoritativeEngine>,
+    des_salt_state: Option<DesSaltState>,
     varbind_validation: NotificationVarbindValidation,
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
@@ -614,6 +615,7 @@ impl NotificationReceiverBuilder {
             usm_users: HashMap::new(),
             communities: Vec::new(),
             authoritative_engine: None,
+            des_salt_state: None,
             varbind_validation: NotificationVarbindValidation::Tolerant,
             max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
             decode_config: crate::DecodeConfig::default(),
@@ -867,6 +869,13 @@ impl NotificationReceiverBuilder {
         self
     }
 
+    /// Set durable local generating-engine state for DES/3DES Inform responses.
+    #[must_use]
+    pub fn des_salt_state(mut self, state: DesSaltState) -> Self {
+        self.des_salt_state = Some(state);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn engine_id(mut self, engine_id: impl Into<Vec<u8>>) -> Self {
         let boots = self
@@ -929,10 +938,31 @@ impl NotificationReceiverBuilder {
             "notification response send timeout",
         )?;
 
-        let requires_privacy = self
-            .usm_users
-            .values()
-            .any(|security| security.maximum_security_level().requires_priv());
+        let uses_des = self.usm_users.values().any(|security| {
+            security
+                .priv_protocol()
+                .is_some_and(PrivProtocol::is_des_family)
+        });
+        let uses_aes = self.usm_users.values().any(|security| {
+            security
+                .priv_protocol()
+                .is_some_and(|protocol| !protocol.is_des_family())
+        });
+        if uses_des && self.des_salt_state.is_none() {
+            return Err(Error::Config(
+                "durable DES sender state is required for DES/3DES notification receiving".into(),
+            )
+            .boxed());
+        }
+        if uses_des
+            && let (Some(engine), Some(state)) = (&self.authoritative_engine, &self.des_salt_state)
+            && engine.engine_boots() != state.engine_boots()
+        {
+            return Err(Error::Config(
+                "DES sender boots must match the receiver authoritative engine boots".into(),
+            )
+            .boxed());
+        }
         let requires_authoritative_engine = !self.usm_users.is_empty();
         let validated_usm = validate_authoritative_usm(
             self.usm_users,
@@ -964,7 +994,7 @@ impl NotificationReceiverBuilder {
             engine_id,
             engine_boots,
         } = validated_usm.prepare(generate_engine_id)?;
-        let salt_counter = requires_privacy.then(SaltCounter::new).transpose()?;
+        let salt_counter = uses_aes.then(SaltCounter::new).transpose()?;
         let udp_responder = UdpResponder::new(&socket);
 
         Ok(NotificationReceiver {
@@ -978,6 +1008,7 @@ impl NotificationReceiverBuilder {
                 varbind_validation: self.varbind_validation,
                 engine_id,
                 salt_counter,
+                des_salt_state: self.des_salt_state,
                 authoritative_snapshot: AtomicU64::new(pack_boots_time((engine_boots, 0))),
                 engine_boots_base: engine_boots,
                 engine_start: Instant::now(),
@@ -1282,6 +1313,7 @@ struct ReceiverInner {
     engine_id: Bytes,
     /// Salt counter for privacy operations
     salt_counter: Option<SaltCounter>,
+    des_salt_state: Option<DesSaltState>,
     /// Most recently sampled authoritative boots/time tuple.
     authoritative_snapshot: AtomicU64,
     /// Initial engine boots value at startup, used to compute overflow-adjusted boots.
@@ -2455,6 +2487,8 @@ mod tests {
             &config,
             Some(&keys),
             Some(&crate::v3::SaltCounter::new().unwrap()),
+            None,
+            None,
             true,
             msg_max_size,
         )
@@ -3323,6 +3357,88 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[tokio::test]
+    async fn receiver_inform_ack_rejects_des_state_after_authoritative_rollover() {
+        let mut engine = AuthoritativeEngine::for_test(&b"receiver-engine"[..], 1);
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let response_des_state =
+            crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine)
+            .des_salt_state(response_des_state.clone())
+            .usm_user("informuser", |user| {
+                user.auth_priv(
+                    AuthProtocol::Sha1,
+                    b"auth-password",
+                    crate::v3::PrivProtocol::Des,
+                    b"priv-password",
+                )
+            })
+            .unwrap()
+            .accept_all_notifications()
+            .build()
+            .await
+            .unwrap();
+
+        let security = crate::v3::UsmConfig::new("informuser")
+            .auth_priv(
+                AuthProtocol::Sha1,
+                b"auth-password",
+                crate::v3::PrivProtocol::Des,
+                b"priv-password",
+            )
+            .unwrap();
+        let keys = security.derive_keys(receiver.engine_id()).unwrap();
+        let sender_des_state = crate::v3::DesSaltState::restart(
+            crate::v3::PersistedDesSaltState::new(4).unwrap(),
+            |_| Ok::<(), std::convert::Infallible>(()),
+        )
+        .unwrap();
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::InformRequest,
+            1,
+            0,
+            0,
+            vec![
+                VarBind::new(oids::sys_uptime(), Value::TimeTicks(1000)),
+                VarBind::new(
+                    oids::snmp_trap_oid(),
+                    Value::ObjectIdentifier(oids::cold_start()),
+                ),
+            ],
+        );
+        let encoded = crate::v3::encode::encode_v3_message(
+            &pdu,
+            1,
+            receiver.engine_id(),
+            2,
+            0,
+            &security,
+            Some(&keys),
+            None,
+            Some(&sender_des_state),
+            Some(sender_des_state.engine_boots()),
+            true,
+            crate::UDP_RECEIVE_LIMITS.advertised(),
+        )
+        .unwrap();
+
+        let error = receiver
+            .handle_v3(Bytes::from(encoded), "127.0.0.1:9999".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            *error,
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        assert_eq!(response_des_state.reserve().unwrap().salt(), 1);
+    }
+
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn v3_inform_direct_fallback_and_drop_at_all_security_levels() {
@@ -3354,6 +3470,7 @@ mod tests {
                     Bytes::new(),
                     Some(&keys),
                     Some(&SaltCounter::new().unwrap()),
+                    None,
                     "127.0.0.1:9999".parse().unwrap(),
                 )
             };

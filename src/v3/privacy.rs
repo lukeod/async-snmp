@@ -3,8 +3,10 @@
 //! This module implements:
 //! - DES-CBC privacy (RFC 3414 Section 8)
 //! - AES-128-CFB privacy (RFC 3826)
-//! - AES-192-CFB privacy (draft/vendor extension, not RFC 3826)
-//! - AES-256-CFB privacy (draft/vendor extension, not RFC 3826)
+//! - AES-192-CFB privacy with explicit Blumenthal or Reeder key extension
+//!   (draft/vendor extension, not RFC 3826)
+//! - AES-256-CFB privacy with explicit Blumenthal or Reeder key extension
+//!   (draft/vendor extension, not RFC 3826)
 //!
 //! # Salt/IV Construction
 //!
@@ -17,7 +19,9 @@
 //! - IV: engineBoots (4 bytes) || engineTime (4 bytes) || salt (8 bytes) = 16 bytes
 //!   (concatenation, NOT XOR)
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -27,8 +31,7 @@ use super::{AuthProtocol, PrivProtocol};
 
 /// Error type for privacy (encryption/decryption) operations.
 ///
-/// These errors indicate cryptographic failures. Callers should convert
-/// these to `Error::Auth` with appropriate target context.
+/// These errors indicate privacy-state or cryptographic failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivacyError {
     /// Invalid privParameters length (expected 8 bytes).
@@ -37,6 +40,15 @@ pub enum PrivacyError {
     InvalidCiphertextLength { length: usize, block_size: usize },
     /// Cryptographic provider error (unsupported algorithm, invalid key, cipher failure).
     Crypto(CryptoError),
+    /// The supplied sender state does not match the key's privacy protocol.
+    SenderStateMismatch,
+    /// Every 32-bit salt in this DES generating-engine epoch has been used.
+    DesSaltExhausted { engine_boots: u32 },
+    /// Durable DES state does not match the current local generating engine.
+    DesEngineBootsMismatch {
+        state_engine_boots: u32,
+        generating_engine_boots: u32,
+    },
 }
 
 impl From<CryptoError> for PrivacyError {
@@ -61,8 +73,340 @@ impl std::fmt::Display for PrivacyError {
                 )
             }
             Self::Crypto(e) => write!(f, "{e}"),
+            Self::SenderStateMismatch => {
+                f.write_str("privacy sender state does not match protocol")
+            }
+            Self::DesSaltExhausted { engine_boots } => write!(
+                f,
+                "DES privacy salt exhausted for generating-engine boots {engine_boots}"
+            ),
+            Self::DesEngineBootsMismatch {
+                state_engine_boots,
+                generating_engine_boots,
+            } => write!(
+                f,
+                "DES sender state boots {state_engine_boots} do not match generating-engine boots {generating_engine_boots}"
+            ),
         }
     }
+}
+
+type DesPersistenceSource = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// The durable DES generating-engine transition being attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DesSaltPersistenceOperation {
+    /// Establishing a new key domain at boots epoch 1.
+    Install,
+    /// Atomically advancing a previously persisted boots epoch.
+    Restart,
+}
+
+/// Durable DES sender state loaded by an application at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedDesSaltState {
+    engine_boots: u32,
+}
+
+impl PersistedDesSaltState {
+    /// Validate a persisted local generating-engine boots epoch.
+    pub fn new(engine_boots: u32) -> std::result::Result<Self, DesSaltStateError> {
+        if !(1..=super::MAX_ENGINE_TIME).contains(&engine_boots) {
+            return Err(DesSaltStateError::InvalidEpoch { engine_boots });
+        }
+        Ok(Self { engine_boots })
+    }
+
+    /// Return the persisted generating-engine boots epoch.
+    #[must_use]
+    pub fn engine_boots(self) -> u32 {
+        self.engine_boots
+    }
+}
+
+/// A failed durable DES generating-engine transition.
+#[derive(Debug)]
+pub struct DesSaltPersistenceError {
+    operation: DesSaltPersistenceOperation,
+    previous_engine_boots: Option<u32>,
+    attempted_engine_boots: u32,
+    source: DesPersistenceSource,
+}
+
+impl DesSaltPersistenceError {
+    /// Return the failed transition.
+    #[must_use]
+    pub fn operation(&self) -> DesSaltPersistenceOperation {
+        self.operation
+    }
+
+    /// Return the last durable epoch, if this was a restart.
+    #[must_use]
+    pub fn previous_engine_boots(&self) -> Option<u32> {
+        self.previous_engine_boots
+    }
+
+    /// Return the epoch that the callback was asked to persist.
+    #[must_use]
+    pub fn attempted_engine_boots(&self) -> u32 {
+        self.attempted_engine_boots
+    }
+
+    /// Return the concrete persistence callback error.
+    #[must_use]
+    pub fn persistence_source(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.source.as_ref()
+    }
+
+    /// Downcast the callback error to its concrete type.
+    #[must_use]
+    pub fn downcast_source_ref<E: std::error::Error + 'static>(&self) -> Option<&E> {
+        self.source.downcast_ref()
+    }
+}
+
+impl std::fmt::Display for DesSaltPersistenceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DES sender-state persistence failed during {:?} at boots {}: {}",
+            self.operation, self.attempted_engine_boots, self.source
+        )
+    }
+}
+
+impl std::error::Error for DesSaltPersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Error creating or advancing durable DES sender state.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DesSaltStateError {
+    /// The persisted epoch is outside the SNMP engine-boots domain.
+    InvalidEpoch { engine_boots: u32 },
+    /// The boots epoch cannot be advanced without reuse.
+    EpochSaturated { engine_boots: u32 },
+    /// The durable compare-and-set/install operation failed.
+    Persistence(DesSaltPersistenceError),
+}
+
+impl std::fmt::Display for DesSaltStateError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEpoch { engine_boots } => {
+                write!(
+                    f,
+                    "invalid DES generating-engine boots epoch {engine_boots}"
+                )
+            }
+            Self::EpochSaturated { engine_boots } => {
+                write!(
+                    f,
+                    "DES generating-engine boots epoch {engine_boots} is saturated"
+                )
+            }
+            Self::Persistence(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for DesSaltStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Persistence(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Caller-owned durable sender state for DES and 3DES privacy.
+///
+/// One value (or its clones) must be shared by every live sender using the
+/// same effective localized encryption-key/pre-IV domain. `install` requires
+/// an atomic create-if-absent lease for a new domain, while `restart` requires
+/// an atomic compare-and-set from the supplied previous epoch to the attempted
+/// epoch. Those contracts reject a second live process starting from the same
+/// durable state.
+#[derive(Clone)]
+pub struct DesSaltState {
+    inner: Arc<DesSaltStateInner>,
+}
+
+/// One irrevocably allocated DES/3DES privacy salt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesSaltReservation {
+    engine_boots: u32,
+    salt: u32,
+}
+
+impl DesSaltReservation {
+    /// Return the local generating-engine boots encoded in this reservation.
+    #[must_use]
+    pub fn engine_boots(self) -> u32 {
+        self.engine_boots
+    }
+
+    /// Return the non-repeating low 32-bit salt value.
+    #[must_use]
+    pub fn salt(self) -> u32 {
+        self.salt
+    }
+}
+
+struct DesSaltStateInner {
+    engine_boots: u32,
+    last_salt: AtomicU32,
+}
+
+impl Debug for DesSaltState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DesSaltState")
+            .field("engine_boots", &self.engine_boots())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DesSaltState {
+    /// Install a new DES key domain, persisting boots epoch 1 before use.
+    ///
+    /// The callback must atomically create the durable record only if it does
+    /// not already exist. A competing installer for the same effective key
+    /// domain must return an error rather than lease epoch 1 twice.
+    pub fn install<E, F>(mut persist: F) -> std::result::Result<Self, DesSaltStateError>
+    where
+        E: Into<DesPersistenceSource>,
+        F: FnMut(&PersistedDesSaltState) -> std::result::Result<(), E>,
+    {
+        Self::start(None, 1, DesSaltPersistenceOperation::Install, &mut persist)
+    }
+
+    /// Atomically advance persisted state and create a fresh boots epoch.
+    ///
+    /// The callback must compare-and-set durable state from `previous` to the
+    /// supplied attempted state; a stale second live owner must return an error.
+    pub fn restart<E, F>(
+        previous: PersistedDesSaltState,
+        mut persist: F,
+    ) -> std::result::Result<Self, DesSaltStateError>
+    where
+        E: Into<DesPersistenceSource>,
+        F: FnMut(&PersistedDesSaltState) -> std::result::Result<(), E>,
+    {
+        let next = previous
+            .engine_boots
+            .checked_add(1)
+            .filter(|boots| *boots <= super::MAX_ENGINE_TIME)
+            .ok_or(DesSaltStateError::EpochSaturated {
+                engine_boots: previous.engine_boots,
+            })?;
+        Self::start(
+            Some(previous.engine_boots),
+            next,
+            DesSaltPersistenceOperation::Restart,
+            &mut persist,
+        )
+    }
+
+    fn start<E, F>(
+        previous_engine_boots: Option<u32>,
+        engine_boots: u32,
+        operation: DesSaltPersistenceOperation,
+        persist: &mut F,
+    ) -> std::result::Result<Self, DesSaltStateError>
+    where
+        E: Into<DesPersistenceSource>,
+        F: FnMut(&PersistedDesSaltState) -> std::result::Result<(), E>,
+    {
+        let persisted = PersistedDesSaltState::new(engine_boots)?;
+        persist(&persisted).map_err(|source| {
+            DesSaltStateError::Persistence(DesSaltPersistenceError {
+                operation,
+                previous_engine_boots,
+                attempted_engine_boots: engine_boots,
+                source: source.into(),
+            })
+        })?;
+        Ok(Self {
+            inner: Arc::new(DesSaltStateInner {
+                engine_boots,
+                last_salt: AtomicU32::new(0),
+            }),
+        })
+    }
+
+    /// Return the local generating-engine boots epoch used in DES salts.
+    #[must_use]
+    pub fn engine_boots(&self) -> u32 {
+        self.inner.engine_boots
+    }
+
+    /// Return the durable record needed by a later process restart.
+    #[must_use]
+    pub fn persisted_state(&self) -> PersistedDesSaltState {
+        PersistedDesSaltState {
+            engine_boots: self.inner.engine_boots,
+        }
+    }
+
+    /// Irrevocably allocate the next salt in this boots epoch.
+    ///
+    /// The reservation is burned even if later message encoding or encryption
+    /// fails. It cannot be constructed or reused with a different epoch.
+    pub fn reserve(&self) -> PrivacyResult<DesSaltReservation> {
+        let salt = self
+            .inner
+            .last_salt
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| PrivacyError::DesSaltExhausted {
+                engine_boots: self.inner.engine_boots,
+            })?;
+        Ok(DesSaltReservation {
+            engine_boots: self.inner.engine_boots,
+            salt,
+        })
+    }
+
+    pub(crate) fn validate_generating_engine_boots(
+        &self,
+        generating_engine_boots: u32,
+    ) -> PrivacyResult<()> {
+        if self.engine_boots() != generating_engine_boots {
+            return Err(PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: self.engine_boots(),
+                generating_engine_boots,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_last_salt_for_test(engine_boots: u32, last_salt: u32) -> Self {
+        Self {
+            inner: Arc::new(DesSaltStateInner {
+                engine_boots,
+                last_salt: AtomicU32::new(last_salt),
+            }),
+        }
+    }
+}
+
+/// Protocol-specific sender inputs for one privacy encryption.
+pub(crate) enum PrivacyEncryptContext<'a> {
+    /// Local generating-engine state for DES or 3DES.
+    Des(DesSaltReservation),
+    /// Remote/local authoritative tuple and random salt allocator for AES.
+    Aes {
+        engine_boots: u32,
+        engine_time: u32,
+        salt_counter: &'a SaltCounter,
+    },
 }
 
 impl std::error::Error for PrivacyError {
@@ -173,10 +517,11 @@ impl PrivKey {
     /// - 3DES: first 24 bytes = key, last 8 bytes = pre-IV
     /// - AES: first 16/24/32 bytes = key (depending on AES variant)
     ///
-    /// Key extension is automatically applied when needed based on the auth/priv
-    /// protocol combination:
+    /// Key extension is applied when needed according to the selected privacy
+    /// protocol variant:
     ///
-    /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
+    /// - AES-192/256 Blumenthal variants: draft-blumenthal-aes-usm-04 extension
+    /// - AES-192/256 Reeder variants: Cisco/Reeder extension
     /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
     ///
     /// The password length and both backend capabilities are validated before
@@ -196,10 +541,10 @@ impl PrivKey {
     /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
     ///
     /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
-    /// // Blumenthal extension is automatically applied.
+    /// // The configured Blumenthal extension is applied.
     /// let priv_key = PrivKey::from_password(
     ///     AuthProtocol::Sha1,
-    ///     PrivProtocol::Aes256,
+    ///     PrivProtocol::Aes256Blumenthal,
     ///     b"password",
     ///     &engine_id,
     /// ).unwrap();
@@ -243,10 +588,11 @@ impl PrivKey {
     ///
     /// This avoids repeating password expansion when a cached
     /// [`MasterKey`](super::MasterKey) is available.
-    /// Key extension is automatically applied when needed based on the auth/priv
-    /// protocol combination:
+    /// Key extension is applied when needed according to the selected privacy
+    /// protocol variant:
     ///
-    /// - AES-192/256 with SHA-1 or MD5: Blumenthal extension (draft-blumenthal-aes-usm-04)
+    /// - AES-192/256 Blumenthal variants: draft-blumenthal-aes-usm-04 extension
+    /// - AES-192/256 Reeder variants: Cisco/Reeder extension
     /// - 3DES with SHA-1 or MD5: Reeder extension (draft-reeder-snmpv3-usm-3desede-00)
     ///
     /// Both the master key's authentication protocol and `priv_protocol` must
@@ -263,8 +609,8 @@ impl PrivKey {
     /// let engine_id = [0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
     ///
     /// // SHA-1 only produces 20 bytes, but AES-256 needs 32.
-    /// // Blumenthal extension is automatically applied.
-    /// let priv_key = PrivKey::from_master_key(&master, PrivProtocol::Aes256, &engine_id).unwrap();
+    /// // The configured Blumenthal extension is applied.
+    /// let priv_key = PrivKey::from_master_key(&master, PrivProtocol::Aes256Blumenthal, &engine_id).unwrap();
     /// # }
     /// ```
     pub fn from_master_key(
@@ -323,6 +669,10 @@ impl PrivKey {
     /// localized key length is "at least" the required size); the extra
     /// trailing bytes are simply unused. Length validation precedes the
     /// selected backend's privacy-protocol capability check.
+    ///
+    /// This constructor treats `key` as finalized and never extends it. The
+    /// AES dialect remains part of the protocol identity, but both dialects
+    /// produce identical encryption for the same raw key bytes.
     pub fn from_bytes(
         protocol: PrivProtocol,
         key: impl Into<Vec<u8>>,
@@ -364,54 +714,115 @@ impl PrivKey {
             PrivProtocol::Des => &self.key[..8],
             PrivProtocol::Des3 => &self.key[..24],
             PrivProtocol::Aes128 => &self.key[..16],
-            PrivProtocol::Aes192 => &self.key[..24],
-            PrivProtocol::Aes256 => &self.key[..32],
+            PrivProtocol::Aes192Blumenthal | PrivProtocol::Aes192Reeder => &self.key[..24],
+            PrivProtocol::Aes256Blumenthal | PrivProtocol::Aes256Reeder => &self.key[..32],
         }
     }
 
-    /// Encrypt data and return (ciphertext, privParameters).
+    /// Encrypt with already selected protocol-specific sender inputs.
+    pub(crate) fn encrypt_with_context(
+        &self,
+        plaintext: &[u8],
+        context: PrivacyEncryptContext<'_>,
+    ) -> PrivacyResult<(Bytes, Bytes)> {
+        match (self.protocol, context) {
+            (PrivProtocol::Des, PrivacyEncryptContext::Des(reservation)) => self.encrypt_des_cbc(
+                plaintext,
+                reservation.engine_boots,
+                u64::from(reservation.salt),
+            ),
+            (PrivProtocol::Des3, PrivacyEncryptContext::Des(reservation)) => self.encrypt_des3_cbc(
+                plaintext,
+                reservation.engine_boots,
+                u64::from(reservation.salt),
+            ),
+            (
+                PrivProtocol::Aes128,
+                PrivacyEncryptContext::Aes {
+                    engine_boots,
+                    engine_time,
+                    salt_counter,
+                },
+            ) => self.encrypt_aes_cfb(
+                plaintext,
+                engine_boots,
+                engine_time,
+                salt_counter.next(),
+                16,
+            ),
+            (
+                PrivProtocol::Aes192Blumenthal | PrivProtocol::Aes192Reeder,
+                PrivacyEncryptContext::Aes {
+                    engine_boots,
+                    engine_time,
+                    salt_counter,
+                },
+            ) => self.encrypt_aes_cfb(
+                plaintext,
+                engine_boots,
+                engine_time,
+                salt_counter.next(),
+                24,
+            ),
+            (
+                PrivProtocol::Aes256Blumenthal | PrivProtocol::Aes256Reeder,
+                PrivacyEncryptContext::Aes {
+                    engine_boots,
+                    engine_time,
+                    salt_counter,
+                },
+            ) => self.encrypt_aes_cfb(
+                plaintext,
+                engine_boots,
+                engine_time,
+                salt_counter.next(),
+                32,
+            ),
+            _ => Err(PrivacyError::SenderStateMismatch),
+        }
+    }
+
+    /// Encrypt with DES or 3DES using caller-owned durable generating state.
     ///
-    /// # Arguments
-    /// * `plaintext` - The data to encrypt (typically the serialized `ScopedPDU`)
-    /// * `engine_boots` - The authoritative engine's boot count
-    /// * `engine_time` - The authoritative engine's time
-    /// * `salt_counter` - Counter owned by the authoritative engine/key domain
+    /// The local boots epoch and nonwrapping counter come only from `state`;
+    /// remote authoritative boots/time are deliberately not accepted. Pass
+    /// clones of one state to every sender using the same effective localized
+    /// key/pre-IV domain. A salt is burned before encryption is attempted.
     ///
-    /// The same counter must be shared by every encryption using this key
-    /// domain. Cloning or re-deriving a key does not create a salt owner.
+    /// # Errors
     ///
-    /// ```compile_fail,E0061
-    /// # use async_snmp::v3::{PrivKey, PrivProtocol};
-    /// # let key = PrivKey::from_bytes(PrivProtocol::Aes128, [0_u8; 16]).unwrap();
-    /// // Encryption cannot be called without an explicit owner-held counter.
-    /// let _ = key.encrypt(b"scoped PDU", 1, 1);
-    /// ```
+    /// Returns [`PrivacyError::DesSaltExhausted`] at counter exhaustion,
+    /// [`PrivacyError::SenderStateMismatch`] for an AES key, or a crypto error.
+    pub fn encrypt_des_family(
+        &self,
+        plaintext: &[u8],
+        state: &DesSaltState,
+    ) -> PrivacyResult<(Bytes, Bytes)> {
+        let reservation = state.reserve()?;
+        self.encrypt_with_context(plaintext, PrivacyEncryptContext::Des(reservation))
+    }
+
+    /// Encrypt with an AES privacy variant using authoritative boots/time.
     ///
-    /// # Returns
-    /// * `Ok((ciphertext, priv_params))` on success
-    /// * `Err` on encryption failure
-    pub fn encrypt(
+    /// # Errors
+    ///
+    /// Returns [`PrivacyError::SenderStateMismatch`] for a DES-family key or a
+    /// provider error when encryption fails.
+    pub fn encrypt_aes(
         &self,
         plaintext: &[u8],
         engine_boots: u32,
         engine_time: u32,
         salt_counter: &SaltCounter,
     ) -> PrivacyResult<(Bytes, Bytes)> {
-        let salt = salt_counter.next();
-
-        match self.protocol {
-            PrivProtocol::Des => self.encrypt_des(plaintext, engine_boots, salt),
-            PrivProtocol::Des3 => self.encrypt_des3(plaintext, engine_boots, salt),
-            PrivProtocol::Aes128 => {
-                self.encrypt_aes(plaintext, engine_boots, engine_time, salt, 16)
-            }
-            PrivProtocol::Aes192 => {
-                self.encrypt_aes(plaintext, engine_boots, engine_time, salt, 24)
-            }
-            PrivProtocol::Aes256 => {
-                self.encrypt_aes(plaintext, engine_boots, engine_time, salt, 32)
-            }
-        }
+        self.encrypt_with_context(
+            plaintext,
+            PrivacyEncryptContext::Aes {
+                engine_boots,
+                engine_time,
+                salt_counter,
+            },
+        )
     }
 
     /// Decrypt data using the privParameters from the message.
@@ -443,14 +854,18 @@ impl PrivKey {
         match self.protocol {
             PrivProtocol::Des => self.decrypt_des(ciphertext, priv_params),
             PrivProtocol::Des3 => self.decrypt_des3(ciphertext, priv_params),
-            PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
+            PrivProtocol::Aes128
+            | PrivProtocol::Aes192Blumenthal
+            | PrivProtocol::Aes192Reeder
+            | PrivProtocol::Aes256Blumenthal
+            | PrivProtocol::Aes256Reeder => {
                 self.decrypt_aes(ciphertext, engine_boots, engine_time, priv_params)
             }
         }
     }
 
     /// DES-CBC encryption (RFC 3414 Section 8.1.1).
-    fn encrypt_des(
+    fn encrypt_des_cbc(
         &self,
         plaintext: &[u8],
         engine_boots: u32,
@@ -512,7 +927,7 @@ impl PrivKey {
     }
 
     /// 3DES-EDE CBC encryption (draft-reeder-snmpv3-usm-3desede-00 Section 5.1.1.2).
-    fn encrypt_des3(
+    fn encrypt_des3_cbc(
         &self,
         plaintext: &[u8],
         engine_boots: u32,
@@ -573,7 +988,7 @@ impl PrivKey {
     }
 
     /// AES-CFB encryption (RFC 3826 Section 3.1).
-    fn encrypt_aes(
+    fn encrypt_aes_cfb(
         &self,
         plaintext: &[u8],
         engine_boots: u32,
@@ -610,8 +1025,8 @@ impl PrivKey {
     ) -> PrivacyResult<Bytes> {
         let key_len = match self.protocol {
             PrivProtocol::Aes128 => 16,
-            PrivProtocol::Aes192 => 24,
-            PrivProtocol::Aes256 => 32,
+            PrivProtocol::Aes192Blumenthal | PrivProtocol::Aes192Reeder => 24,
+            PrivProtocol::Aes256Blumenthal | PrivProtocol::Aes256Reeder => 32,
             _ => unreachable!(),
         };
 
@@ -650,8 +1065,10 @@ mod no_backend_key_tests {
             PrivProtocol::Des,
             PrivProtocol::Des3,
             PrivProtocol::Aes128,
-            PrivProtocol::Aes192,
-            PrivProtocol::Aes256,
+            PrivProtocol::Aes192Blumenthal,
+            PrivProtocol::Aes192Reeder,
+            PrivProtocol::Aes256Blumenthal,
+            PrivProtocol::Aes256Reeder,
         ] {
             let len = protocol.key_len();
             assert_eq!(
@@ -712,10 +1129,135 @@ mod entropy_tests {
     }
 }
 
+#[cfg(test)]
+mod des_state_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct PersistFailure(&'static str);
+
+    impl std::fmt::Display for PersistFailure {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for PersistFailure {}
+
+    #[test]
+    fn install_and_restart_persist_before_use() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let install_writes = Arc::clone(&writes);
+        let installed = DesSaltState::install(move |state| {
+            install_writes.lock().unwrap().push(state.engine_boots());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+        assert_eq!(installed.engine_boots(), 1);
+
+        let restart_writes = Arc::clone(&writes);
+        let restarted = DesSaltState::restart(installed.persisted_state(), move |state| {
+            restart_writes.lock().unwrap().push(state.engine_boots());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+        assert_eq!(restarted.engine_boots(), 2);
+        assert_eq!(*writes.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn persistence_failure_and_epoch_saturation_are_typed() {
+        let error = DesSaltState::install(|_| Err(PersistFailure("disk unavailable"))).unwrap_err();
+        let DesSaltStateError::Persistence(error) = error else {
+            panic!("expected persistence error");
+        };
+        assert_eq!(error.operation(), DesSaltPersistenceOperation::Install);
+        assert_eq!(error.attempted_engine_boots(), 1);
+        assert_eq!(
+            error.downcast_source_ref::<PersistFailure>().unwrap().0,
+            "disk unavailable"
+        );
+
+        assert!(matches!(
+            DesSaltState::restart(
+                PersistedDesSaltState::new(super::super::MAX_ENGINE_TIME).unwrap(),
+                |_| Ok::<(), std::convert::Infallible>(())
+            ),
+            Err(DesSaltStateError::EpochSaturated { .. })
+        ));
+    }
+
+    #[test]
+    fn atomic_restart_contract_rejects_a_second_live_owner() {
+        let durable = Arc::new(Mutex::new(1_u32));
+        let previous = PersistedDesSaltState::new(1).unwrap();
+        let lease = |durable: Arc<Mutex<u32>>| {
+            move |attempted: &PersistedDesSaltState| {
+                let mut current = durable.lock().unwrap();
+                if *current != 1 {
+                    return Err(PersistFailure("stale compare-and-set"));
+                }
+                *current = attempted.engine_boots();
+                Ok(())
+            }
+        };
+
+        assert!(DesSaltState::restart(previous, lease(Arc::clone(&durable))).is_ok());
+        let error = DesSaltState::restart(previous, lease(durable)).unwrap_err();
+        assert!(matches!(error, DesSaltStateError::Persistence(_)));
+    }
+
+    #[test]
+    fn atomic_install_contract_rejects_a_second_live_owner() {
+        let durable = Arc::new(Mutex::new(None::<u32>));
+        let lease = |durable: Arc<Mutex<Option<u32>>>| {
+            move |attempted: &PersistedDesSaltState| {
+                let mut current = durable.lock().unwrap();
+                if current.is_some() {
+                    return Err(PersistFailure("domain already installed"));
+                }
+                *current = Some(attempted.engine_boots());
+                Ok(())
+            }
+        };
+
+        assert!(DesSaltState::install(lease(Arc::clone(&durable))).is_ok());
+        let error = DesSaltState::install(lease(durable)).unwrap_err();
+        assert!(matches!(error, DesSaltStateError::Persistence(_)));
+    }
+
+    #[test]
+    fn clones_share_one_nonwrapping_allocator() {
+        let state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let clone = state.clone();
+        assert_eq!(state.reserve().unwrap().salt(), 1);
+        assert_eq!(clone.reserve().unwrap().salt(), 2);
+
+        let exhausted = DesSaltState::with_last_salt_for_test(9, u32::MAX);
+        assert!(matches!(
+            exhausted.reserve(),
+            Err(PrivacyError::DesSaltExhausted { engine_boots: 9 })
+        ));
+    }
+}
+
 #[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 mod tests {
     use super::*;
     use crate::format::hex::decode as decode_hex;
+
+    fn des_state(engine_boots: u32) -> DesSaltState {
+        if engine_boots == 1 {
+            DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap()
+        } else {
+            DesSaltState::restart(
+                PersistedDesSaltState::new(engine_boots - 1).unwrap(),
+                |_| Ok::<(), std::convert::Infallible>(()),
+            )
+            .unwrap()
+        }
+    }
 
     #[cfg(feature = "crypto-rustcrypto")]
     #[test]
@@ -732,12 +1274,7 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(
-                plaintext,
-                engine_boots,
-                engine_time,
-                &SaltCounter::new().unwrap(),
-            )
+            .encrypt_des_family(plaintext, &des_state(engine_boots))
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -772,12 +1309,7 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(
-                plaintext,
-                engine_boots,
-                engine_time,
-                &SaltCounter::new().unwrap(),
-            )
+            .encrypt_des_family(plaintext, &des_state(engine_boots))
             .expect("encryption failed");
 
         // Verify ciphertext is different from plaintext
@@ -809,7 +1341,7 @@ mod tests {
         let engine_time = 54321u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(
+            .encrypt_aes(
                 plaintext,
                 engine_boots,
                 engine_time,
@@ -892,7 +1424,7 @@ mod tests {
         // trailing bytes are unused but harmless.
         let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; 20]).unwrap();
         // Encrypting should not panic now that the key is validated as long enough.
-        let _ = priv_key.encrypt(b"data", 0, 0, &SaltCounter::new().unwrap());
+        let _ = priv_key.encrypt_aes(b"data", 0, 0, &SaltCounter::new().unwrap());
     }
 
     #[test]
@@ -901,9 +1433,11 @@ mod tests {
         assert!(PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; aes128_len - 1]).is_err());
         assert!(PrivKey::from_bytes(PrivProtocol::Aes128, vec![0u8; aes128_len]).is_ok());
 
-        let aes256_len = PrivProtocol::Aes256.key_len();
-        assert!(PrivKey::from_bytes(PrivProtocol::Aes256, vec![0u8; aes256_len - 1]).is_err());
-        assert!(PrivKey::from_bytes(PrivProtocol::Aes256, vec![0u8; aes256_len]).is_ok());
+        let aes256_len = PrivProtocol::Aes256Blumenthal.key_len();
+        assert!(
+            PrivKey::from_bytes(PrivProtocol::Aes256Blumenthal, vec![0u8; aes256_len - 1]).is_err()
+        );
+        assert!(PrivKey::from_bytes(PrivProtocol::Aes256Blumenthal, vec![0u8; aes256_len]).is_ok());
     }
 
     #[test]
@@ -912,8 +1446,10 @@ mod tests {
             PrivProtocol::Des,
             PrivProtocol::Des3,
             PrivProtocol::Aes128,
-            PrivProtocol::Aes192,
-            PrivProtocol::Aes256,
+            PrivProtocol::Aes192Blumenthal,
+            PrivProtocol::Aes192Reeder,
+            PrivProtocol::Aes256Blumenthal,
+            PrivProtocol::Aes256Reeder,
         ];
         let backends = [
             #[cfg(feature = "crypto-rustcrypto")]
@@ -946,7 +1482,11 @@ mod tests {
                     let algorithm = match protocol {
                         PrivProtocol::Des => "DES",
                         PrivProtocol::Des3 => "3DES",
-                        PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
+                        PrivProtocol::Aes128
+                        | PrivProtocol::Aes192Blumenthal
+                        | PrivProtocol::Aes192Reeder
+                        | PrivProtocol::Aes256Blumenthal
+                        | PrivProtocol::Aes256Reeder => {
                             unreachable!()
                         }
                     };
@@ -1023,8 +1563,8 @@ mod tests {
         let priv_key = PrivKey::from_bytes(PrivProtocol::Aes128, key).unwrap();
         let counter = SaltCounter::from_value(100);
 
-        let (_, salt1) = priv_key.encrypt(b"test data", 0, 0, &counter).unwrap();
-        let (_, salt2) = priv_key.encrypt(b"test data", 0, 0, &counter).unwrap();
+        let (_, salt1) = priv_key.encrypt_aes(b"test data", 0, 0, &counter).unwrap();
+        let (_, salt2) = priv_key.encrypt_aes(b"test data", 0, 0, &counter).unwrap();
 
         assert_eq!(u64::from_be_bytes(salt1[..].try_into().unwrap()), 101);
         assert_eq!(u64::from_be_bytes(salt2[..].try_into().unwrap()), 102);
@@ -1047,7 +1587,7 @@ mod tests {
         // Just verify we can encrypt/decrypt with the derived key
         let plaintext = b"test message";
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, 100, 200, &SaltCounter::new().unwrap())
+            .encrypt_aes(plaintext, 100, 200, &SaltCounter::new().unwrap())
             .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
@@ -1063,14 +1603,14 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
         ];
-        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, key).unwrap();
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes192Blumenthal, key).unwrap();
 
         let plaintext = b"Hello, SNMPv3 AES-192 World!";
         let engine_boots = 300u32;
         let engine_time = 67890u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(
+            .encrypt_aes(
                 plaintext,
                 engine_boots,
                 engine_time,
@@ -1101,14 +1641,14 @@ mod tests {
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
             0x1d, 0x1e, 0x1f, 0x20,
         ];
-        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, key).unwrap();
+        let priv_key = PrivKey::from_bytes(PrivProtocol::Aes256Blumenthal, key).unwrap();
 
         let plaintext = b"Hello, SNMPv3 AES-256 World!";
         let engine_boots = 400u32;
         let engine_time = 11111u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(
+            .encrypt_aes(
                 plaintext,
                 engine_boots,
                 engine_time,
@@ -1139,7 +1679,7 @@ mod tests {
 
         let priv_key = PrivKey::from_password(
             AuthProtocol::Sha256, // SHA-256 produces 32 bytes, enough for AES-192
-            PrivProtocol::Aes192,
+            PrivProtocol::Aes192Blumenthal,
             password,
             &engine_id,
         )
@@ -1147,7 +1687,7 @@ mod tests {
 
         let plaintext = b"test message for AES-192";
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, 100, 200, &SaltCounter::new().unwrap())
+            .encrypt_aes(plaintext, 100, 200, &SaltCounter::new().unwrap())
             .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
@@ -1164,7 +1704,7 @@ mod tests {
 
         let priv_key = PrivKey::from_password(
             AuthProtocol::Sha256, // SHA-256 produces 32 bytes, exactly enough for AES-256
-            PrivProtocol::Aes256,
+            PrivProtocol::Aes256Blumenthal,
             password,
             &engine_id,
         )
@@ -1172,7 +1712,7 @@ mod tests {
 
         let plaintext = b"test message for AES-256";
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, 100, 200, &SaltCounter::new().unwrap())
+            .encrypt_aes(plaintext, 100, 200, &SaltCounter::new().unwrap())
             .unwrap();
         let decrypted = priv_key
             .decrypt(&ciphertext, 100, 200, &priv_params)
@@ -1213,12 +1753,7 @@ mod tests {
 
         // Encrypt with correct key
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(
-                plaintext,
-                engine_boots,
-                engine_time,
-                &SaltCounter::new().unwrap(),
-            )
+            .encrypt_des_family(plaintext, &des_state(engine_boots))
             .expect("encryption failed");
 
         // Decrypt with wrong key - this will "succeed" but produce garbage
@@ -1264,7 +1799,7 @@ mod tests {
 
         // Encrypt with correct key
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(
+            .encrypt_aes(
                 plaintext,
                 engine_boots,
                 engine_time,
@@ -1302,15 +1837,17 @@ mod tests {
             0xF1, 0xF0, 0xEF, 0xEE, 0xED, 0xEC, 0xEB, 0xEA, 0xE9, 0xE8,
         ];
 
-        let correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, correct_key).unwrap();
-        let wrong_priv_key = PrivKey::from_bytes(PrivProtocol::Aes192, wrong_key).unwrap();
+        let correct_priv_key =
+            PrivKey::from_bytes(PrivProtocol::Aes192Blumenthal, correct_key).unwrap();
+        let wrong_priv_key =
+            PrivKey::from_bytes(PrivProtocol::Aes192Blumenthal, wrong_key).unwrap();
 
         let plaintext = b"Secret AES-192 message data!";
         let engine_boots = 300u32;
         let engine_time = 67890u32;
 
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(
+            .encrypt_aes(
                 plaintext,
                 engine_boots,
                 engine_time,
@@ -1342,15 +1879,17 @@ mod tests {
             0xE3, 0xE2, 0xE1, 0xE0,
         ];
 
-        let correct_priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, correct_key).unwrap();
-        let wrong_priv_key = PrivKey::from_bytes(PrivProtocol::Aes256, wrong_key).unwrap();
+        let correct_priv_key =
+            PrivKey::from_bytes(PrivProtocol::Aes256Blumenthal, correct_key).unwrap();
+        let wrong_priv_key =
+            PrivKey::from_bytes(PrivProtocol::Aes256Blumenthal, wrong_key).unwrap();
 
         let plaintext = b"Secret AES-256 message data!";
         let engine_boots = 400u32;
         let engine_time = 11111u32;
 
         let (ciphertext, priv_params) = correct_priv_key
-            .encrypt(
+            .encrypt_aes(
                 plaintext,
                 engine_boots,
                 engine_time,
@@ -1386,12 +1925,7 @@ mod tests {
         let engine_time = 12345u32;
 
         let (ciphertext, correct_priv_params) = priv_key
-            .encrypt(
-                plaintext,
-                engine_boots,
-                engine_time,
-                &SaltCounter::new().unwrap(),
-            )
+            .encrypt_des_family(plaintext, &des_state(engine_boots))
             .expect("encryption failed");
 
         // Use wrong priv_params (different salt)
@@ -1432,17 +1966,15 @@ mod tests {
         let pre_iv = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
         let priv_key = PrivKey::from_bytes(PrivProtocol::Des, key).unwrap();
 
-        // SaltCounter::next() returns fetch_add(1)'s pre-increment value plus 1
-        // (post-increment), so from_value(0x1000).next() == 0x1001.
-        let salt_counter = SaltCounter::from_value(0x1000);
         let expected_salt_value: u32 = 0x1001;
 
         let engine_boots: u32 = 0x1234_5678;
+        let des_state = DesSaltState::with_last_salt_for_test(engine_boots, 0x1000);
         let engine_time: u32 = 999;
         let plaintext = b"RFC 3414 8.1.1.1 salt/IV composition test";
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(plaintext, engine_boots, engine_time, &salt_counter)
+            .encrypt_des_family(plaintext, &des_state)
             .expect("encryption failed");
 
         // 1. Salt composition: privParameters = engineBoots || counter.
@@ -1506,23 +2038,23 @@ mod tests {
 
     #[cfg(feature = "crypto-rustcrypto")]
     #[test]
-    fn test_des_family_shared_counter_concurrency_and_low_32_bit_wrap() {
+    fn test_des_family_shared_state_concurrency_and_exhaustion() {
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
         use std::thread;
 
         for (protocol, key_len) in [(PrivProtocol::Des, 16), (PrivProtocol::Des3, 32)] {
             let key = Arc::new(PrivKey::from_bytes(protocol, vec![0x5A; key_len]).unwrap());
-            let counter = Arc::new(SaltCounter::from_value(u64::from(u32::MAX) - 2));
+            let state = Arc::new(DesSaltState::with_last_salt_for_test(7, 0));
             let portions = Arc::new(Mutex::new(HashSet::new()));
 
             let handles: Vec<_> = (0..4)
                 .map(|_| {
                     let key = Arc::clone(&key);
-                    let counter = Arc::clone(&counter);
+                    let state = Arc::clone(&state);
                     let portions = Arc::clone(&portions);
                     thread::spawn(move || {
-                        let (_, params) = key.encrypt(b"shared", 7, 11, &counter).unwrap();
+                        let (_, params) = key.encrypt_des_family(b"shared", &state).unwrap();
                         assert_eq!(&params[..4], &7_u32.to_be_bytes());
                         let low = u32::from_be_bytes(params[4..].try_into().unwrap());
                         assert_ne!(low, 0);
@@ -1534,10 +2066,13 @@ mod tests {
             for handle in handles {
                 handle.join().unwrap();
             }
-            assert_eq!(
-                *portions.lock().unwrap(),
-                HashSet::from([u32::MAX - 1, u32::MAX, 1, 2])
-            );
+            assert_eq!(*portions.lock().unwrap(), HashSet::from([1, 2, 3, 4]));
+
+            let exhausted = DesSaltState::with_last_salt_for_test(7, u32::MAX);
+            assert!(matches!(
+                key.encrypt_des_family(b"shared", &exhausted),
+                Err(PrivacyError::DesSaltExhausted { engine_boots: 7 })
+            ));
         }
     }
 
@@ -1547,8 +2082,8 @@ mod tests {
         let cloned = original.clone();
         let counter = SaltCounter::from_value(200);
 
-        let (_, salt_orig) = original.encrypt(b"test", 0, 0, &counter).unwrap();
-        let (_, salt_clone) = cloned.encrypt(b"test", 0, 0, &counter).unwrap();
+        let (_, salt_orig) = original.encrypt_aes(b"test", 0, 0, &counter).unwrap();
+        let (_, salt_clone) = cloned.encrypt_aes(b"test", 0, 0, &counter).unwrap();
 
         assert_eq!(u64::from_be_bytes(salt_orig[..].try_into().unwrap()), 201);
         assert_eq!(u64::from_be_bytes(salt_clone[..].try_into().unwrap()), 202);
@@ -1571,10 +2106,10 @@ mod tests {
         let fips_counter = SaltCounter::from_value(41);
 
         let rust_encrypted = rust
-            .encrypt(b"shared AES-128 provider KAT", 7, 11, &rust_counter)
+            .encrypt_aes(b"shared AES-128 provider KAT", 7, 11, &rust_counter)
             .unwrap();
         let fips_encrypted = fips
-            .encrypt(b"shared AES-128 provider KAT", 7, 11, &fips_counter)
+            .encrypt_aes(b"shared AES-128 provider KAT", 7, 11, &fips_counter)
             .unwrap();
 
         assert_eq!(rust_encrypted, fips_encrypted);
@@ -1596,7 +2131,7 @@ mod tests {
         let engine_time = 54321u32;
 
         let (ciphertext, priv_params) = priv_key
-            .encrypt(
+            .encrypt_aes(
                 plaintext,
                 engine_boots,
                 engine_time,

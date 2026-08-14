@@ -107,9 +107,11 @@ impl CryptoProvider for RustCryptoProvider {
                     _ => encrypt_des3_cbc(key, iv, data),
                 }
             }
-            PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
-                encrypt_aes_cfb(key, iv, data)
-            }
+            PrivProtocol::Aes128
+            | PrivProtocol::Aes192Blumenthal
+            | PrivProtocol::Aes192Reeder
+            | PrivProtocol::Aes256Blumenthal
+            | PrivProtocol::Aes256Reeder => encrypt_aes_cfb(key, iv, data),
         }
     }
 
@@ -123,9 +125,11 @@ impl CryptoProvider for RustCryptoProvider {
         match protocol {
             PrivProtocol::Des => decrypt_des_cbc(key, iv, data),
             PrivProtocol::Des3 => decrypt_des3_cbc(key, iv, data),
-            PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
-                decrypt_aes_cfb(key, iv, data)
-            }
+            PrivProtocol::Aes128
+            | PrivProtocol::Aes192Blumenthal
+            | PrivProtocol::Aes192Reeder
+            | PrivProtocol::Aes256Blumenthal
+            | PrivProtocol::Aes256Reeder => decrypt_aes_cfb(key, iv, data),
         }
     }
 }

@@ -348,6 +348,7 @@ mod tests {
                     context_name.clone(),
                     Some(&keys),
                     Some(&salt),
+                    None,
                     "127.0.0.1:161".parse().unwrap(),
                 )
             };

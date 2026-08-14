@@ -86,8 +86,13 @@ pub use engine::{
 pub(crate) use engine::{
     TimelinessCandidateOutcome, TimelinessPublicationOutcome, discovered_engine_state,
 };
+pub(crate) use privacy::PrivacyEncryptContext;
+pub use privacy::{
+    DesSaltPersistenceError, DesSaltPersistenceOperation, DesSaltState, DesSaltStateError,
+    PersistedDesSaltState, PrivacyError, PrivacyResult,
+};
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-pub use privacy::{PrivKey, PrivacyError, PrivacyResult, SaltCounter};
+pub use privacy::{DesSaltReservation, PrivKey, SaltCounter};
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 pub(crate) use privacy::{PrivKey, SaltCounter};
 pub use report::{MalformedReport, ReportStatus, classify_report};
@@ -132,7 +137,7 @@ impl std::fmt::Display for ParseProtocolError {
             ),
             ProtocolKind::Priv => write!(
                 f,
-                "unknown privacy protocol '{}'; expected one of: DES, 3DES, 3DES-EDE, DES3, TDES, AES, AES-128, AES-192, AES-256",
+                "unknown privacy protocol '{}'; expected one of: DES, 3DES, 3DES-EDE, DES3, TDES, AES, AES-128, AES-192-BLUMENTHAL, AES-192-REEDER, AES-256-BLUMENTHAL, AES-256-REEDER",
                 self.input
             ),
         }
@@ -221,6 +226,11 @@ impl AuthProtocol {
 }
 
 /// Privacy protocol identifiers.
+///
+/// The AES-192 and AES-256 variants select how a localized key is extended
+/// when the authentication digest is too short. They use the same AES cipher
+/// and are equivalent when localization already supplies enough key bytes or
+/// when a finalized raw key is provided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrivProtocol {
     /// DES-CBC (RFC 3414).
@@ -235,12 +245,20 @@ pub enum PrivProtocol {
     Des3,
     /// AES-128-CFB (RFC 3826)
     Aes128,
-    /// AES-192-CFB (draft/vendor extension; e.g. Cisco/Blumenthal-Lamm draft,
-    /// not standardized by RFC 3826 which only covers AES-128).
-    Aes192,
-    /// AES-256-CFB (draft/vendor extension; e.g. Cisco/Blumenthal-Lamm draft,
-    /// not standardized by RFC 3826 which only covers AES-128).
-    Aes256,
+    /// AES-192-CFB using Blumenthal localized-key extension when required.
+    Aes192Blumenthal,
+    /// AES-192-CFB using Reeder/Cisco localized-key extension when required.
+    ///
+    /// Parsing accepts `CISCO` as an operator-facing synonym; display uses
+    /// `REEDER` as the canonical form.
+    Aes192Reeder,
+    /// AES-256-CFB using Blumenthal localized-key extension when required.
+    Aes256Blumenthal,
+    /// AES-256-CFB using Reeder/Cisco localized-key extension when required.
+    ///
+    /// Parsing accepts `CISCO` as an operator-facing synonym; display uses
+    /// `REEDER` as the canonical form.
+    Aes256Reeder,
 }
 
 impl std::fmt::Display for PrivProtocol {
@@ -249,8 +267,10 @@ impl std::fmt::Display for PrivProtocol {
             Self::Des => write!(f, "DES"),
             Self::Des3 => write!(f, "3DES"),
             Self::Aes128 => write!(f, "AES"),
-            Self::Aes192 => write!(f, "AES-192"),
-            Self::Aes256 => write!(f, "AES-256"),
+            Self::Aes192Blumenthal => write!(f, "AES-192-BLUMENTHAL"),
+            Self::Aes192Reeder => write!(f, "AES-192-REEDER"),
+            Self::Aes256Blumenthal => write!(f, "AES-256-BLUMENTHAL"),
+            Self::Aes256Reeder => write!(f, "AES-256-REEDER"),
         }
     }
 }
@@ -263,8 +283,14 @@ impl std::str::FromStr for PrivProtocol {
             "DES" => Ok(Self::Des),
             "3DES" | "3DES-EDE" | "DES3" | "TDES" => Ok(Self::Des3),
             "AES" | "AES128" | "AES-128" => Ok(Self::Aes128),
-            "AES192" | "AES-192" => Ok(Self::Aes192),
-            "AES256" | "AES-256" => Ok(Self::Aes256),
+            "AES192-BLUMENTHAL" | "AES-192-BLUMENTHAL" => Ok(Self::Aes192Blumenthal),
+            "AES192-REEDER" | "AES-192-REEDER" | "AES192-CISCO" | "AES-192-CISCO" => {
+                Ok(Self::Aes192Reeder)
+            }
+            "AES256-BLUMENTHAL" | "AES-256-BLUMENTHAL" => Ok(Self::Aes256Blumenthal),
+            "AES256-REEDER" | "AES-256-REEDER" | "AES256-CISCO" | "AES-256-CISCO" => {
+                Ok(Self::Aes256Reeder)
+            }
             _ => Err(ParseProtocolError {
                 input: s.to_string(),
                 kind: ProtocolKind::Priv,
@@ -281,8 +307,8 @@ impl PrivProtocol {
             Self::Des => 16,  // 8 key + 8 pre-IV
             Self::Des3 => 32, // 24 key + 8 pre-IV
             Self::Aes128 => 16,
-            Self::Aes192 => 24,
-            Self::Aes256 => 32,
+            Self::Aes192Blumenthal | Self::Aes192Reeder => 24,
+            Self::Aes256Blumenthal | Self::Aes256Reeder => 32,
         }
     }
 
@@ -297,8 +323,9 @@ impl PrivProtocol {
     ///
     /// Key extension is needed when the auth protocol's digest is shorter than
     /// the privacy protocol's key requirement. The algorithm is determined by
-    /// the privacy protocol:
-    /// - AES-192/256: Blumenthal (draft-blumenthal-aes-usm-04)
+    /// the privacy protocol variant:
+    /// - AES-192/256 Blumenthal variants: draft-blumenthal-aes-usm-04
+    /// - AES-192/256 Reeder variants: Cisco/Reeder extension
     /// - 3DES: Reeder (draft-reeder-snmpv3-usm-3desede-00)
     pub(crate) fn key_extension_for(self, auth_protocol: AuthProtocol) -> KeyExtension {
         let auth_len = auth_protocol.digest_len();
@@ -310,9 +337,16 @@ impl PrivProtocol {
 
         match self {
             Self::Des3 => KeyExtension::Reeder,
-            Self::Aes192 | Self::Aes256 => KeyExtension::Blumenthal,
+            Self::Aes192Blumenthal | Self::Aes256Blumenthal => KeyExtension::Blumenthal,
+            Self::Aes192Reeder | Self::Aes256Reeder => KeyExtension::Reeder,
             Self::Des | Self::Aes128 => KeyExtension::None, // Never need extension
         }
+    }
+
+    /// Whether outbound privacy uses the DES-family generating-engine salt.
+    #[must_use]
+    pub const fn is_des_family(self) -> bool {
+        matches!(self, Self::Des | Self::Des3)
     }
 }
 
@@ -366,8 +400,16 @@ mod tests {
         assert_eq!(format!("{}", PrivProtocol::Des), "DES");
         assert_eq!(format!("{}", PrivProtocol::Des3), "3DES");
         assert_eq!(format!("{}", PrivProtocol::Aes128), "AES");
-        assert_eq!(format!("{}", PrivProtocol::Aes192), "AES-192");
-        assert_eq!(format!("{}", PrivProtocol::Aes256), "AES-256");
+        assert_eq!(
+            format!("{}", PrivProtocol::Aes192Blumenthal),
+            "AES-192-BLUMENTHAL"
+        );
+        assert_eq!(format!("{}", PrivProtocol::Aes192Reeder), "AES-192-REEDER");
+        assert_eq!(
+            format!("{}", PrivProtocol::Aes256Blumenthal),
+            "AES-256-BLUMENTHAL"
+        );
+        assert_eq!(format!("{}", PrivProtocol::Aes256Reeder), "AES-256-REEDER");
     }
 
     #[test]
@@ -392,22 +434,41 @@ mod tests {
             "AES-128".parse::<PrivProtocol>().unwrap(),
             PrivProtocol::Aes128
         );
-        assert_eq!(
-            "aes192".parse::<PrivProtocol>().unwrap(),
-            PrivProtocol::Aes192
-        );
-        assert_eq!(
-            "AES-192".parse::<PrivProtocol>().unwrap(),
-            PrivProtocol::Aes192
-        );
-        assert_eq!(
-            "aes256".parse::<PrivProtocol>().unwrap(),
-            PrivProtocol::Aes256
-        );
-        assert_eq!(
-            "AES-256".parse::<PrivProtocol>().unwrap(),
-            PrivProtocol::Aes256
-        );
+        for (input, expected) in [
+            ("aes192-blumenthal", PrivProtocol::Aes192Blumenthal),
+            ("AES-192-BLUMENTHAL", PrivProtocol::Aes192Blumenthal),
+            ("aes192-reeder", PrivProtocol::Aes192Reeder),
+            ("AES-192-REEDER", PrivProtocol::Aes192Reeder),
+            ("aes192-cisco", PrivProtocol::Aes192Reeder),
+            ("AES-192-CISCO", PrivProtocol::Aes192Reeder),
+            ("aes256-blumenthal", PrivProtocol::Aes256Blumenthal),
+            ("AES-256-BLUMENTHAL", PrivProtocol::Aes256Blumenthal),
+            ("aes256-reeder", PrivProtocol::Aes256Reeder),
+            ("AES-256-REEDER", PrivProtocol::Aes256Reeder),
+            ("aes256-cisco", PrivProtocol::Aes256Reeder),
+            ("AES-256-CISCO", PrivProtocol::Aes256Reeder),
+        ] {
+            assert_eq!(input.parse::<PrivProtocol>().unwrap(), expected);
+        }
+
+        for ambiguous in ["AES192", "AES-192", "AES256", "AES-256"] {
+            assert!(ambiguous.parse::<PrivProtocol>().is_err());
+        }
+
+        for protocol in [
+            PrivProtocol::Des,
+            PrivProtocol::Des3,
+            PrivProtocol::Aes128,
+            PrivProtocol::Aes192Blumenthal,
+            PrivProtocol::Aes192Reeder,
+            PrivProtocol::Aes256Blumenthal,
+            PrivProtocol::Aes256Reeder,
+        ] {
+            assert_eq!(
+                protocol.to_string().parse::<PrivProtocol>().unwrap(),
+                protocol
+            );
+        }
 
         assert!("invalid".parse::<PrivProtocol>().is_err());
     }
@@ -421,7 +482,60 @@ mod tests {
         let err = "bogus".parse::<PrivProtocol>().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown privacy protocol 'bogus'; expected one of: DES, 3DES, 3DES-EDE, DES3, TDES, AES, AES-128, AES-192, AES-256"
+            "unknown privacy protocol 'bogus'; expected one of: DES, 3DES, 3DES-EDE, DES3, TDES, AES, AES-128, AES-192-BLUMENTHAL, AES-192-REEDER, AES-256-BLUMENTHAL, AES-256-REEDER"
         );
+    }
+
+    #[test]
+    fn aes_extension_variant_selects_only_required_extension() {
+        for auth in [AuthProtocol::Md5, AuthProtocol::Sha1] {
+            assert_eq!(
+                PrivProtocol::Aes192Blumenthal.key_extension_for(auth),
+                KeyExtension::Blumenthal
+            );
+            assert_eq!(
+                PrivProtocol::Aes192Reeder.key_extension_for(auth),
+                KeyExtension::Reeder
+            );
+        }
+        for auth in [AuthProtocol::Md5, AuthProtocol::Sha1, AuthProtocol::Sha224] {
+            assert_eq!(
+                PrivProtocol::Aes256Blumenthal.key_extension_for(auth),
+                KeyExtension::Blumenthal
+            );
+            assert_eq!(
+                PrivProtocol::Aes256Reeder.key_extension_for(auth),
+                KeyExtension::Reeder
+            );
+        }
+        for auth in [
+            AuthProtocol::Sha224,
+            AuthProtocol::Sha256,
+            AuthProtocol::Sha384,
+            AuthProtocol::Sha512,
+        ] {
+            assert_eq!(
+                PrivProtocol::Aes192Blumenthal.key_extension_for(auth),
+                KeyExtension::None
+            );
+            assert_eq!(
+                PrivProtocol::Aes192Reeder.key_extension_for(auth),
+                KeyExtension::None
+            );
+        }
+        for auth in [
+            AuthProtocol::Sha256,
+            AuthProtocol::Sha384,
+            AuthProtocol::Sha512,
+        ] {
+            assert_eq!(
+                PrivProtocol::Aes256Blumenthal.key_extension_for(auth),
+                KeyExtension::None
+            );
+            assert_eq!(
+                PrivProtocol::Aes256Reeder.key_extension_for(auth),
+                KeyExtension::None
+            );
+        }
     }
 }

@@ -335,6 +335,8 @@ impl TrapSink {
     async fn get_or_create_inform_client(
         &self,
         transports: &InformTransportPool,
+        des_salt_state: Option<&crate::v3::DesSaltState>,
+        local_authoritative_engine: Option<&crate::v3::AuthoritativeEngine>,
     ) -> Result<Client<UdpHandle>> {
         let mut guard = self.inform_client.lock().await;
         if let Some(ref client) = *guard {
@@ -348,6 +350,8 @@ impl TrapSink {
             auth: self.auth.clone(),
             request_timeout: self.inform_timeout,
             retry: self.inform_retry.clone(),
+            des_salt_state: des_salt_state.cloned(),
+            local_authoritative_engine: local_authoritative_engine.cloned(),
             ..ClientConfig::default()
         };
 
@@ -853,6 +857,8 @@ impl super::Agent {
                     security,
                     derived.as_ref(),
                     self.inner.salt_counter.as_ref(),
+                    self.inner.des_salt_state.as_ref(),
+                    Some(engine_boots),
                     false, // reportable=false for traps
                     self.inner.state.local_receive_capacity,
                 )?;
@@ -881,7 +887,11 @@ impl super::Agent {
         varbinds: &[VarBind],
     ) -> Result<crate::client::ResponseMetadata> {
         let client = sink
-            .get_or_create_inform_client(&self.inner.inform_transports)
+            .get_or_create_inform_client(
+                &self.inner.inform_transports,
+                self.inner.des_salt_state.as_ref(),
+                self.inner.state.authoritative_engine.as_ref(),
+            )
             .await?;
         client
             .send_inform_with_metadata(trap_oid, uptime, varbinds.to_vec())
@@ -981,8 +991,16 @@ mod tests {
 
         assert!(agent.inner.inform_transports.ipv4.lock().await.is_none());
         let (first, second) = tokio::join!(
-            agent.inner.trap_sinks[0].get_or_create_inform_client(&agent.inner.inform_transports),
-            agent.inner.trap_sinks[1].get_or_create_inform_client(&agent.inner.inform_transports),
+            agent.inner.trap_sinks[0].get_or_create_inform_client(
+                &agent.inner.inform_transports,
+                None,
+                None
+            ),
+            agent.inner.trap_sinks[1].get_or_create_inform_client(
+                &agent.inner.inform_transports,
+                None,
+                None
+            ),
         );
         let first = first.unwrap();
         let second = second.unwrap();
@@ -993,6 +1011,52 @@ mod tests {
         let endpoint = transport.as_ref().expect("IPv4 endpoint was not cached");
         assert_ne!(endpoint.local_addr().port(), agent.local_addr().port());
         assert!(agent.inner.inform_transports.ipv6.lock().await.is_none());
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[tokio::test]
+    async fn agent_trap_rejects_des_state_after_authoritative_rollover() {
+        let mut engine = crate::v3::AuthoritativeEngine::for_test(&b"agent-engine"[..], 1);
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let des_state =
+            crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let auth = Auth::usm_builder("trapuser")
+            .auth_priv(
+                crate::v3::AuthProtocol::Sha1,
+                b"auth-password",
+                crate::v3::PrivProtocol::Des,
+                b"priv-password",
+            )
+            .build()
+            .unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine)
+            .des_salt_state(des_state.clone())
+            .trap_sink(
+                NotificationSinkId::new("des-sink").unwrap(),
+                "127.0.0.1:9",
+                auth,
+            )
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+
+        let outcome = agent
+            .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
+            .await;
+        let SinkStatus::Failed(error) = &outcome.sinks()[0].status else {
+            panic!("stale DES state must fail the trap sink")
+        };
+        assert!(matches!(
+            &**error,
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        assert_eq!(des_state.reserve().unwrap().salt(), 1);
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]

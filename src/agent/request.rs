@@ -1476,6 +1476,7 @@ mod tests {
             Bytes::new(),
             None,
             Some(&SaltCounter::new().unwrap()),
+            None,
             "127.0.0.1:9999".parse().unwrap(),
         )
         .unwrap();

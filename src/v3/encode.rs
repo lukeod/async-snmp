@@ -15,7 +15,9 @@ use crate::message_size::MessageSize;
 use crate::oid::Oid;
 use crate::pdu::{Pdu, ResponsePdu};
 use crate::v3::auth::authenticate_message;
-use crate::v3::{LocalizedKey, SaltCounter, UsmSecurityParams};
+use crate::v3::{
+    DesSaltState, LocalizedKey, PrivProtocol, PrivacyEncryptContext, SaltCounter, UsmSecurityParams,
+};
 use crate::value::Value;
 use crate::varbind::VarBind;
 
@@ -23,7 +25,7 @@ use crate::varbind::VarBind;
 ///
 /// This is the shared encoding path used by both `Client` (for requests and
 /// traps) and `Agent` (for trap sink sending). All inputs are explicit so
-/// callers can supply engine state, keys, and salt counters from whatever
+/// callers can supply engine state, keys, and sender state from whatever
 /// context they own.
 ///
 /// # Parameters
@@ -35,8 +37,12 @@ use crate::varbind::VarBind;
 /// - `engine_time` - Current engine time value
 /// - `security` - USM security configuration (username, context, security level)
 /// - `derived_keys` - Keys derived against `engine_id`
-/// - `salt_counter` - Salt counter for encryption IV generation; required for
+/// - `salt_counter` - AES-only salt counter; required for AES `authPriv`
+/// - `des_salt_state` - Durable DES/3DES sender state; required for DES-family
 ///   `authPriv`
+/// - `des_generating_engine_boots` - Current local generating-engine boots for
+///   DES/3DES. This is intentionally separate from the authoritative
+///   `engine_boots` used by USM and AES.
 /// - `reportable` - Whether the receiver should send Report PDUs on error
 /// - `msg_max_size` - Maximum message size to advertise
 #[allow(clippy::too_many_arguments)]
@@ -49,12 +55,53 @@ pub fn encode_v3_message(
     security: &UsmConfig,
     derived_keys: Option<&DerivedKeys>,
     salt_counter: Option<&SaltCounter>,
+    des_salt_state: Option<&DesSaltState>,
+    des_generating_engine_boots: Option<u32>,
     reportable: bool,
     msg_max_size: MessageSize,
 ) -> Result<Vec<u8>> {
     let security_level = security.security_level();
 
-    // Build scoped PDU
+    let privacy_context = if security_level.requires_priv() {
+        let priv_key = derived_keys
+            .and_then(|d| d.priv_key.as_ref())
+            .ok_or_else(|| Error::Config("privacy key not available".into()).boxed())?;
+        Some(match priv_key.protocol() {
+            PrivProtocol::Des | PrivProtocol::Des3 => {
+                let state = des_salt_state.ok_or_else(|| {
+                    Error::Config(
+                        "durable DES sender state is required for DES/3DES privacy".into(),
+                    )
+                    .boxed()
+                })?;
+                let generating_engine_boots = des_generating_engine_boots.ok_or_else(|| {
+                    Error::Config(
+                        "local generating-engine boots are required for DES/3DES privacy".into(),
+                    )
+                    .boxed()
+                })?;
+                state
+                    .validate_generating_engine_boots(generating_engine_boots)
+                    .map_err(|error| Error::Privacy(error).boxed())?;
+                PrivacyEncryptContext::Des(
+                    state
+                        .reserve()
+                        .map_err(|error| Error::Privacy(error).boxed())?,
+                )
+            }
+            _ => PrivacyEncryptContext::Aes {
+                engine_boots,
+                engine_time,
+                salt_counter: salt_counter.ok_or_else(|| {
+                    Error::Config("AES privacy salt counter not initialized".into()).boxed()
+                })?,
+            },
+        })
+    } else {
+        None
+    };
+
+    // Build scoped PDU after DES allocation so any later failure burns it.
     let scoped_pdu = ScopedPdu::new(
         Bytes::copy_from_slice(engine_id),
         security.configured_context_name().clone(),
@@ -66,13 +113,13 @@ pub fn encode_v3_message(
         let priv_key = derived_keys
             .and_then(|d| d.priv_key.as_ref())
             .ok_or_else(|| Error::Config("privacy key not available".into()).boxed())?;
-        let salt_counter = salt_counter
-            .ok_or_else(|| Error::Config("privacy salt counter not initialized".into()).boxed())?;
-
         let scoped_pdu_bytes = scoped_pdu.encode_to_bytes()?;
         let (ciphertext, salt) = priv_key
-            .encrypt(&scoped_pdu_bytes, engine_boots, engine_time, salt_counter)
-            .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+            .encrypt_with_context(
+                &scoped_pdu_bytes,
+                privacy_context.expect("privacy context prepared for authPriv"),
+            )
+            .map_err(|error| Error::Privacy(error).boxed())?;
 
         (V3MessageData::Encrypted(ciphertext), salt)
     } else {
@@ -240,6 +287,7 @@ pub(crate) fn encode_v3_response(
     context_name: Bytes,
     derived_keys: Option<&DerivedKeys>,
     salt_counter: Option<&SaltCounter>,
+    des_salt_state: Option<&DesSaltState>,
     target: SocketAddr,
 ) -> Result<Bytes> {
     response_pdu.validate_outbound(crate::Version::V3, crate::pdu::PduDirection::Response)?;
@@ -265,21 +313,39 @@ pub(crate) fn encode_v3_response(
                 tracing::debug!(target: "async_snmp::v3", { kind = %CryptoErrorKind::NoPrivKey }, "no privacy key for response");
                 Error::Auth { target }.boxed()
             })?;
-            let salt_counter = salt_counter.ok_or_else(|| {
-                Error::Config("privacy salt counter not initialized".into()).boxed()
-            })?;
+            let privacy_context = match priv_key.protocol() {
+                PrivProtocol::Des | PrivProtocol::Des3 => {
+                    let state = des_salt_state.ok_or_else(|| {
+                        Error::Config(
+                            "durable DES sender state is required for DES/3DES privacy".into(),
+                        )
+                        .boxed()
+                    })?;
+                    state
+                        .validate_generating_engine_boots(usm.engine_boots)
+                        .map_err(|error| Error::Privacy(error).boxed())?;
+                    PrivacyEncryptContext::Des(
+                        state
+                            .reserve()
+                            .map_err(|error| Error::Privacy(error).boxed())?,
+                    )
+                }
+                _ => PrivacyEncryptContext::Aes {
+                    engine_boots: usm.engine_boots,
+                    engine_time: usm.engine_time,
+                    salt_counter: salt_counter.ok_or_else(|| {
+                        Error::Config("AES privacy salt counter not initialized".into()).boxed()
+                    })?,
+                },
+            };
 
+            // DES reservation deliberately precedes fallible scoped-PDU encoding.
             let scoped_pdu_bytes = scoped.encode_to_bytes()?;
             let (encrypted, priv_params) = priv_key
-                .encrypt(
-                    &scoped_pdu_bytes,
-                    usm.engine_boots,
-                    usm.engine_time,
-                    salt_counter,
-                )
+                .encrypt_with_context(&scoped_pdu_bytes, privacy_context)
                 .map_err(|e| {
                     tracing::debug!(target: "async_snmp::v3", { error = %e }, "encryption failed for response");
-                    Error::Auth { target }.boxed()
+                    Error::Privacy(e).boxed()
                 })?;
 
             let usm = usm
@@ -344,6 +410,8 @@ mod tests {
             &security,
             None,
             Some(&salt),
+            None,
+            None,
             true,
             message_size(),
         );
@@ -373,6 +441,8 @@ mod tests {
             &security,
             None,
             Some(&salt),
+            None,
+            None,
             false,
             message_size(),
         );
@@ -402,9 +472,188 @@ mod tests {
             Bytes::new(),
             None,
             Some(&salt),
+            None,
             "127.0.0.1:161".parse().unwrap(),
         );
 
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn polling_des_uses_local_sender_boots_not_remote_authoritative_boots() {
+        let pdu = Pdu::get_request(7, &[oid!(1, 3, 6, 1)]);
+        let mut security = UsmConfig::new("user")
+            .auth_priv(
+                crate::v3::AuthProtocol::Sha1,
+                b"auth-password",
+                PrivProtocol::Des,
+                b"priv-password",
+            )
+            .unwrap();
+        security.validate_and_precompute().unwrap();
+        let keys = security.derive_keys(b"remote-engine-id").unwrap();
+        let state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+
+        let encoded = encode_v3_message(
+            &pdu,
+            11,
+            b"remote-engine-id",
+            77,
+            123,
+            &security,
+            Some(&keys),
+            None,
+            Some(&state),
+            Some(state.engine_boots()),
+            true,
+            message_size(),
+        )
+        .unwrap();
+        let message =
+            crate::message::V3Message::decode(Bytes::from(encoded), crate::DecodeConfig::default())
+                .unwrap()
+                .value;
+        let usm = UsmSecurityParams::decode(
+            message.security_params().clone(),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
+
+        assert_eq!(usm.engine_boots, 77);
+        assert_eq!(&usm.priv_params()[..4], &state.engine_boots().to_be_bytes());
+        assert_ne!(&usm.priv_params()[..4], &77_u32.to_be_bytes());
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn authoritative_des_message_rejects_stale_sender_epoch_before_reservation() {
+        let pdu = Pdu::get_request(7, &[oid!(1, 3, 6, 1)]);
+        let mut security = UsmConfig::new("user")
+            .auth_priv(
+                crate::v3::AuthProtocol::Sha1,
+                b"auth-password",
+                PrivProtocol::Des,
+                b"priv-password",
+            )
+            .unwrap();
+        security.validate_and_precompute().unwrap();
+        let keys = security.derive_keys(b"local-engine-id").unwrap();
+        let state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+
+        let error = encode_v3_message(
+            &pdu,
+            11,
+            b"local-engine-id",
+            2,
+            0,
+            &security,
+            Some(&keys),
+            None,
+            Some(&state),
+            Some(2),
+            false,
+            message_size(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            *error,
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        assert_eq!(state.reserve().unwrap().salt(), 1);
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn authoritative_des_response_rejects_stale_sender_epoch_before_reservation() {
+        let response = Pdu::response(7, 0, 0, vec![VarBind::null(oid!(1, 3, 6, 1))]);
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                crate::v3::AuthProtocol::Sha1,
+                b"auth-password",
+                PrivProtocol::Des,
+                b"priv-password",
+            )
+            .unwrap();
+        let keys = security.derive_keys(b"local-engine-id").unwrap();
+        let state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let usm = UsmSecurityParams::new(
+            Bytes::from_static(b"local-engine-id"),
+            2,
+            0,
+            Bytes::from_static(b"user"),
+        )
+        .unwrap();
+
+        let error = encode_v3_response(
+            response,
+            11,
+            message_size(),
+            SecurityLevel::AuthPriv,
+            usm,
+            Bytes::from_static(b"local-engine-id"),
+            Bytes::new(),
+            Some(&keys),
+            None,
+            Some(&state),
+            "127.0.0.1:161".parse().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            *error,
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        assert_eq!(state.reserve().unwrap().salt(), 1);
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn des_reservation_is_burned_before_later_encoding_failure() {
+        let pdu = Pdu {
+            request_id: 7,
+            body: crate::pdu::PduBody::GetBulk {
+                non_repeaters: crate::pdu::MAX_GET_BULK_VALUE + 1,
+                max_repetitions: 0,
+            },
+            varbinds: vec![VarBind::null(oid!(1, 3, 6, 1))],
+        };
+        let mut security = UsmConfig::new("user")
+            .auth_priv(
+                crate::v3::AuthProtocol::Sha1,
+                b"auth-password",
+                PrivProtocol::Des,
+                b"priv-password",
+            )
+            .unwrap();
+        security.validate_and_precompute().unwrap();
+        let keys = security.derive_keys(b"engine-id").unwrap();
+        let state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+
+        let result = encode_v3_message(
+            &pdu,
+            11,
+            b"engine-id",
+            77,
+            123,
+            &security,
+            Some(&keys),
+            None,
+            Some(&state),
+            Some(state.engine_boots()),
+            true,
+            message_size(),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(state.reserve().unwrap().salt(), 2);
     }
 }

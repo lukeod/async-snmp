@@ -3,7 +3,9 @@
 //! Tests the performance of V3 crypto operations which are on the hot path
 //! for all `SNMPv3` communications.
 
-use async_snmp::v3::{AuthProtocol, LocalizedKey, PrivKey, PrivProtocol, SaltCounter};
+use async_snmp::v3::{
+    AuthProtocol, DesSaltState, LocalizedKey, PrivKey, PrivProtocol, SaltCounter,
+};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -116,7 +118,7 @@ fn bench_encrypt(c: &mut Criterion) {
     .unwrap();
 
     let aes256_key = PrivKey::from_bytes(
-        PrivProtocol::Aes256,
+        PrivProtocol::Aes256Blumenthal,
         vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
@@ -128,6 +130,7 @@ fn bench_encrypt(c: &mut Criterion) {
     let engine_boots = 100u32;
     let engine_time = 12345u32;
     let salt_counter = SaltCounter::new().unwrap();
+    let des_state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
 
     for size in data_sizes {
         let data = vec![0xABu8; size];
@@ -139,12 +142,7 @@ fn bench_encrypt(c: &mut Criterion) {
         {
             let key = des_key.clone();
             group.bench_with_input(BenchmarkId::new("DES", size), &data, |b, data| {
-                b.iter(|| {
-                    black_box(
-                        key.encrypt(data, engine_boots, engine_time, &salt_counter)
-                            .unwrap(),
-                    )
-                });
+                b.iter(|| black_box(key.encrypt_des_family(data, &des_state).unwrap()));
             });
         }
 
@@ -153,7 +151,7 @@ fn bench_encrypt(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("AES-128", size), &data, |b, data| {
             b.iter(|| {
                 black_box(
-                    key.encrypt(data, engine_boots, engine_time, &salt_counter)
+                    key.encrypt_aes(data, engine_boots, engine_time, &salt_counter)
                         .unwrap(),
                 )
             });
@@ -164,7 +162,7 @@ fn bench_encrypt(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("AES-256", size), &data, |b, data| {
             b.iter(|| {
                 black_box(
-                    key.encrypt(data, engine_boots, engine_time, &salt_counter)
+                    key.encrypt_aes(data, engine_boots, engine_time, &salt_counter)
                         .unwrap(),
                 )
             });
@@ -200,7 +198,7 @@ fn bench_decrypt(c: &mut Criterion) {
     .unwrap();
 
     let aes256_key = PrivKey::from_bytes(
-        PrivProtocol::Aes256,
+        PrivProtocol::Aes256Blumenthal,
         vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
@@ -212,6 +210,7 @@ fn bench_decrypt(c: &mut Criterion) {
     let engine_boots = 100u32;
     let engine_time = 12345u32;
     let salt_counter = SaltCounter::new().unwrap();
+    let des_state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
 
     for size in data_sizes {
         let plaintext = vec![0xABu8; size];
@@ -221,9 +220,8 @@ fn bench_decrypt(c: &mut Criterion) {
         // DES
         #[cfg(feature = "crypto-rustcrypto")]
         {
-            let (ciphertext, priv_params) = des_key
-                .encrypt(&plaintext, engine_boots, engine_time, &salt_counter)
-                .unwrap();
+            let (ciphertext, priv_params) =
+                des_key.encrypt_des_family(&plaintext, &des_state).unwrap();
             group.bench_with_input(
                 BenchmarkId::new("DES", size),
                 &(&ciphertext, &priv_params),
@@ -237,7 +235,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
         // AES-128
         let (ciphertext, priv_params) = aes128_key
-            .encrypt(&plaintext, engine_boots, engine_time, &salt_counter)
+            .encrypt_aes(&plaintext, engine_boots, engine_time, &salt_counter)
             .unwrap();
         group.bench_with_input(
             BenchmarkId::new("AES-128", size),
@@ -255,7 +253,7 @@ fn bench_decrypt(c: &mut Criterion) {
 
         // AES-256
         let (ciphertext, priv_params) = aes256_key
-            .encrypt(&plaintext, engine_boots, engine_time, &salt_counter)
+            .encrypt_aes(&plaintext, engine_boots, engine_time, &salt_counter)
             .unwrap();
         group.bench_with_input(
             BenchmarkId::new("AES-256", size),
@@ -304,7 +302,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
     group.bench_function("outgoing_encrypt_then_auth", |b| {
         b.iter(|| {
             let (encrypted, _priv_params) = priv_key
-                .encrypt(&scoped_pdu, engine_boots, engine_time, &salt_counter)
+                .encrypt_aes(&scoped_pdu, engine_boots, engine_time, &salt_counter)
                 .unwrap();
             let _hmac = auth_key.compute_hmac(&full_message).unwrap();
             black_box(encrypted)
@@ -313,7 +311,7 @@ fn bench_authpriv_overhead(c: &mut Criterion) {
 
     // Incoming: verify HMAC, then decrypt
     let (ciphertext, priv_params) = priv_key
-        .encrypt(&scoped_pdu, engine_boots, engine_time, &salt_counter)
+        .encrypt_aes(&scoped_pdu, engine_boots, engine_time, &salt_counter)
         .unwrap();
     let hmac = auth_key.compute_hmac(&full_message).unwrap();
 

@@ -302,6 +302,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are removed. Client, agent, and notification-receiver builders now use only
   `decode_config`, and agent `RequestContext` exposes accepted request
   anomalies after protocol security processing.
+- **Breaking:** `PrivProtocol::Aes192` and `Aes256` are replaced by explicit
+  `Aes192Blumenthal`, `Aes192Reeder`, `Aes256Blumenthal`, and `Aes256Reeder`
+  key-extension variants. Configuration strings must likewise select
+  `AES-192-BLUMENTHAL`, `AES-192-REEDER`, `AES-256-BLUMENTHAL`, or
+  `AES-256-REEDER`; the ambiguous old strings are rejected. `CISCO` is accepted
+  as a parsing synonym for `REEDER`, while display uses the canonical `REEDER`
+  name. Dialects remain equivalent when localization already supplies enough
+  key bytes or callers provide finalized raw privacy keys.
+- **Breaking:** DES and 3DES sending now requires caller-owned durable
+  `DesSaltState`. Install or atomically restart a persisted local
+  generating-engine boots epoch before constructing a client, agent, or
+  notification receiver, then share state clones across every live sender in
+  the same localized key/pre-IV domain. The old generic `PrivKey::encrypt` is
+  replaced by protocol-specific `encrypt_des_family` and `encrypt_aes` methods;
+  DES no longer uses remote authoritative boots or the wrapping AES counter.
 
 ### Fixed
 
@@ -329,6 +344,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decode_strict` usage with `DecodeConfig`. Pass a config to `decode` and read
   the decoded value through `DecodeOutcome::value`; configure network roles
   with their `decode_config` builder method.
+- Replace `PrivProtocol::Aes192`/`Aes256` and `AES-192`/`AES-256` configuration
+  with an explicit Blumenthal or Reeder variant. Existing async-snmp-derived
+  keys used Blumenthal; Cisco/Reeder deployments should select Reeder.
+- Create `DesSaltState` with `install` for a new key domain or `restart` from
+  `PersistedDesSaltState` on startup. The persistence callback must perform an
+  atomic install/compare-and-set so a second live owner cannot lease the same
+  boots epoch. Supply it through the client, agent, or notification-receiver
+  `des_salt_state` builder method.
 
 - Replace direct `EngineState` construction, field access, `EngineCache::insert`,
   and `EngineState::update_time` with

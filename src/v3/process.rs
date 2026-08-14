@@ -1077,6 +1077,8 @@ mod tests {
             &security,
             Some(&keys),
             Some(&SaltCounter::from_value(1)),
+            None,
+            None,
             true,
             crate::UDP_RECEIVE_LIMITS.advertised(),
         )
@@ -1409,6 +1411,8 @@ mod tests {
             1000,
             &outbound,
             Some(&keys),
+            None,
+            None,
             None,
             true,
             crate::UDP_RECEIVE_LIMITS.advertised(),

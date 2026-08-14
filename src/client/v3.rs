@@ -695,6 +695,27 @@ impl<T: Transport> Client<T> {
             .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
+        let des_generating_engine_boots = match security.priv_protocol() {
+            Some(crate::v3::PrivProtocol::Des | crate::v3::PrivProtocol::Des3) => Some(
+                if let Some(local_engine) = &self.inner.config.local_authoritative_engine {
+                    local_engine.current_boots_time()?.0
+                } else {
+                    self.inner
+                        .config
+                        .des_salt_state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::Config(
+                                "durable DES sender state is required for DES/3DES privacy".into(),
+                            )
+                            .boxed()
+                        })?
+                        .engine_boots()
+                },
+            ),
+            _ => None,
+        };
+
         self.refresh_engine_from_cache()?;
         let engine = self
             .inner
@@ -730,6 +751,8 @@ impl<T: Transport> Client<T> {
             security,
             Some(&engine.derived_keys),
             self.inner.salt_counter.as_ref(),
+            self.inner.config.des_salt_state.as_ref(),
+            des_generating_engine_boots,
             true, // reportable=true for requests
             // RFC 3412 Section 6.3: msgMaxSize advertises THIS sender's own
             // receive capacity, not the remote's. `engine_state.msg_max_size()`
@@ -1560,6 +1583,8 @@ impl<T: Transport> Client<T> {
             security,
             derived.as_ref(),
             self.inner.salt_counter.as_ref(),
+            self.inner.config.des_salt_state.as_ref(),
+            Some(engine_boots),
             false, // reportable=false for traps
             self.inner.transport.receive_limits().advertised(),
         )
@@ -1702,6 +1727,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(*err, Error::Config(_)));
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn authoritative_rollover_rejects_stale_des_state_for_requests_and_traps() {
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                crate::v3::AuthProtocol::Sha1,
+                b"auth-password",
+                crate::v3::PrivProtocol::Des,
+                b"priv-password",
+            )
+            .unwrap();
+        let des_state =
+            crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let mut local_engine = crate::v3::AuthoritativeEngine::for_test(&b"local-engine"[..], 1);
+        local_engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(security.clone()),
+            local_authoritative_engine: Some(local_engine),
+            des_salt_state: Some(des_state.clone()),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(TestTransport::new(), config).unwrap();
+        let remote = EngineState::new(Bytes::from_static(b"remote-engine"), 77, 123);
+        let remote_keys = security.derive_keys(remote.engine_id()).unwrap();
+        *client.inner.engine.write().unwrap() = Some(ClientEngine::new(remote, remote_keys));
+        let pdu = Pdu::get_request(7, &[oid!(1, 3, 6, 1)]);
+
+        let request_error = client
+            .build_v3_message(&pdu, 11, None)
+            .err()
+            .expect("stale DES state must reject request encoding");
+        assert!(matches!(
+            *request_error,
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+
+        client.ensure_local_keys_derived().unwrap();
+        let trap_error = client.build_v3_trap_message(&pdu, 12).unwrap_err();
+        assert!(matches!(
+            *trap_error,
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        assert_eq!(des_state.reserve().unwrap().salt(), 1);
     }
 
     #[test]

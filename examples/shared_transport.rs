@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // more expensive than per-engine localization, and these keys can be reused
     // across clients with the same credentials.
     let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")?
-        .with_privacy(PrivProtocol::Aes192, b"privpass123")?;
+        .with_privacy(PrivProtocol::Aes192Blumenthal, b"privpass123")?;
 
     println!("Master keys derived (one-time cost)");
     println!("Engine cache created for sharing\n");

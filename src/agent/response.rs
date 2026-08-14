@@ -63,6 +63,7 @@ impl Agent {
                     context_name.clone(),
                     derived_keys,
                     self.inner.salt_counter.as_ref(),
+                    self.inner.des_salt_state.as_ref(),
                     self.inner.local_addr,
                 )
             },
@@ -186,6 +187,54 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(&*error, crate::Error::InvalidMessage(_)));
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[tokio::test]
+    async fn agent_response_rejects_des_state_after_authoritative_rollover() {
+        let mut engine = crate::v3::AuthoritativeEngine::for_test(&b"agent-engine"[..], 1);
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let des_state =
+            crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine)
+            .des_salt_state(des_state.clone())
+            .usm_user("testuser", |user| {
+                user.auth_priv(
+                    crate::v3::AuthProtocol::Sha1,
+                    b"auth-password",
+                    crate::v3::PrivProtocol::Des,
+                    b"priv-password",
+                )
+            })
+            .unwrap()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let user = agent.inner.usm_users.get(b"testuser".as_slice()).unwrap();
+        let keys = user.derive_keys(b"agent-engine").unwrap();
+
+        let error = agent
+            .build_v3_response(
+                &dummy_v3_msg(SecurityLevel::AuthPriv),
+                &dummy_usm(),
+                dummy_response_pdu(),
+                Bytes::from_static(b"agent-engine"),
+                Bytes::new(),
+                Some(&keys),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            *error,
+            crate::Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        assert_eq!(des_state.reserve().unwrap().salt(), 1);
     }
 
     #[tokio::test]

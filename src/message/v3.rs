@@ -414,8 +414,10 @@ pub(crate) fn decode_scoped_pdu(
         Some(crate::v3::PrivProtocol::Des | crate::v3::PrivProtocol::Des3) => 7,
         Some(
             crate::v3::PrivProtocol::Aes128
-            | crate::v3::PrivProtocol::Aes192
-            | crate::v3::PrivProtocol::Aes256,
+            | crate::v3::PrivProtocol::Aes192Blumenthal
+            | crate::v3::PrivProtocol::Aes192Reeder
+            | crate::v3::PrivProtocol::Aes256Blumenthal
+            | crate::v3::PrivProtocol::Aes256Reeder,
         )
         | None => 0,
     };
@@ -1126,26 +1128,19 @@ mod tests {
                 .is_ok(),
                 suffix == 0
             );
-            assert_eq!(
-                decode_scoped_pdu_with_consumption(
-                    bytes.clone(),
-                    0,
-                    source,
-                    Some(crate::v3::PrivProtocol::Aes192)
-                )
-                .is_ok(),
-                suffix == 0
-            );
-            assert_eq!(
-                decode_scoped_pdu_with_consumption(
-                    bytes.clone(),
-                    0,
-                    source,
-                    Some(crate::v3::PrivProtocol::Aes256)
-                )
-                .is_ok(),
-                suffix == 0
-            );
+            for protocol in [
+                crate::v3::PrivProtocol::Aes192Blumenthal,
+                crate::v3::PrivProtocol::Aes192Reeder,
+                crate::v3::PrivProtocol::Aes256Blumenthal,
+                crate::v3::PrivProtocol::Aes256Reeder,
+            ] {
+                assert_eq!(
+                    decode_scoped_pdu_with_consumption(bytes.clone(), 0, source, Some(protocol),)
+                        .is_ok(),
+                    suffix == 0,
+                    "{protocol}",
+                );
+            }
             assert_eq!(
                 decode_scoped_pdu_with_consumption(bytes, 0, source, None).is_ok(),
                 suffix == 0

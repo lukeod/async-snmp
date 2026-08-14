@@ -77,7 +77,7 @@ use crate::message::{CommunityMessage, Message, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::{GetBulkPdu, NotificationPdu, Pdu, PduType, RequestPdu, TrapV1Notification};
 use crate::transport::{Candidate, Transport, UdpHandle, UdpStats};
-use crate::v3::{EngineCache, EngineState, SaltCounter};
+use crate::v3::{DesSaltState, EngineCache, EngineState, PrivProtocol, SaltCounter};
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -403,6 +403,8 @@ pub struct ClientConfig {
     /// Construct this through the persistence-enforcing
     /// [`AuthoritativeEngine`](crate::v3::AuthoritativeEngine) API.
     pub local_authoritative_engine: Option<crate::v3::AuthoritativeEngine>,
+    /// Durable local generating-engine state required by DES and 3DES.
+    pub des_salt_state: Option<DesSaltState>,
 }
 
 impl Default for ClientConfig {
@@ -426,6 +428,7 @@ impl Default for ClientConfig {
             max_walk_results: None,
             max_repetitions: DEFAULT_MAX_REPETITIONS,
             local_authoritative_engine: None,
+            des_salt_state: None,
         }
     }
 }
@@ -470,6 +473,27 @@ impl ClientConfig {
         if self.oid_ordering == OidOrdering::AllowNonIncreasing && self.max_walk_results.is_none() {
             return Err(Error::Config(
                 "AllowNonIncreasing requires max_walk_results to bound memory usage".into(),
+            )
+            .boxed());
+        }
+
+        let uses_des = self
+            .usm_config()
+            .and_then(UsmConfig::priv_protocol)
+            .is_some_and(PrivProtocol::is_des_family);
+        if uses_des && self.des_salt_state.is_none() {
+            return Err(Error::Config(
+                "durable DES sender state is required for DES/3DES privacy".into(),
+            )
+            .boxed());
+        }
+        if uses_des
+            && let (Some(engine), Some(state)) =
+                (&self.local_authoritative_engine, &self.des_salt_state)
+            && engine.engine_boots() != state.engine_boots()
+        {
+            return Err(Error::Config(
+                "DES sender boots must match the local authoritative engine boots".into(),
             )
             .boxed());
         }
@@ -528,7 +552,12 @@ impl<T: Transport> Client<T> {
         config.validate_and_precompute()?;
         let salt_counter = config
             .usm_config()
-            .filter(|security| security.security_level().requires_priv())
+            .filter(|security| {
+                security.security_level().requires_priv()
+                    && !security
+                        .priv_protocol()
+                        .is_some_and(PrivProtocol::is_des_family)
+            })
             .map(|_| SaltCounter::new())
             .transpose()?;
         Ok(Self {
@@ -1838,6 +1867,70 @@ mod tests {
             assert_eq!(auth_priv.security_level(), Some(SecurityLevel::AuthPriv));
             assert!(auth_priv.inner.salt_counter.is_some());
         }
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn independent_des_clients_require_and_share_caller_state() {
+        let auth = Auth::usm_builder("des-user")
+            .auth_priv(
+                crate::AuthProtocol::Sha1,
+                "auth-password",
+                crate::PrivProtocol::Des,
+                "priv-password",
+            )
+            .build()
+            .unwrap();
+        let without_state = Client::new(
+            TruncatingTransport::new(0),
+            ClientConfig {
+                auth: auth.clone(),
+                ..ClientConfig::default()
+            },
+        );
+        assert!(matches!(without_state, Err(error) if matches!(*error, Error::Config(_))));
+
+        let state =
+            crate::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let build = || {
+            Client::new(
+                TruncatingTransport::new(0),
+                ClientConfig {
+                    auth: auth.clone(),
+                    des_salt_state: Some(state.clone()),
+                    ..ClientConfig::default()
+                },
+            )
+            .unwrap()
+        };
+        let first = build();
+        let second = build();
+        assert!(first.inner.salt_counter.is_none());
+        assert!(second.inner.salt_counter.is_none());
+        assert_eq!(
+            first
+                .inner
+                .config
+                .des_salt_state
+                .as_ref()
+                .unwrap()
+                .reserve()
+                .unwrap()
+                .salt(),
+            1
+        );
+        assert_eq!(
+            second
+                .inner
+                .config
+                .des_salt_state
+                .as_ref()
+                .unwrap()
+                .reserve()
+                .unwrap()
+                .salt(),
+            2
+        );
     }
 
     #[tokio::test]

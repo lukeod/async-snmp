@@ -120,7 +120,7 @@ use crate::util::{
     community_matches, validate_authoritative_usm_deferred,
 };
 use crate::v3::process::UsmStats;
-use crate::v3::{AuthoritativeEngine, UsmUser};
+use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, UsmUser};
 use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
 use crate::varbind::VarBind;
@@ -337,6 +337,7 @@ pub struct AgentBuilder {
     usm_users: HashMap<Bytes, UsmUser>,
     handlers: Vec<RegisteredHandler>,
     authoritative_engine: Option<AuthoritativeEngine>,
+    des_salt_state: Option<DesSaltState>,
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
     max_concurrent_requests: Option<usize>,
@@ -385,6 +386,7 @@ struct ValidatedAgentBuilder {
     response_send_timeout: Duration,
     disabled_builtins: HashSet<BuiltinMib>,
     requires_privacy: bool,
+    des_salt_state: Option<DesSaltState>,
 }
 
 impl AgentBuilder {
@@ -405,6 +407,7 @@ impl AgentBuilder {
             usm_users: HashMap::new(),
             handlers: Vec::new(),
             authoritative_engine: None,
+            des_salt_state: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             decode_config: crate::DecodeConfig::default(),
             max_concurrent_requests: Some(1000),
@@ -615,6 +618,14 @@ impl AgentBuilder {
     #[must_use]
     pub fn authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
         self.authoritative_engine = Some(engine);
+        self
+    }
+
+    /// Set durable generating-engine state for every DES/3DES response and
+    /// notification sent by this agent.
+    #[must_use]
+    pub fn des_salt_state(mut self, state: DesSaltState) -> Self {
+        self.des_salt_state = Some(state);
         self
     }
 
@@ -1145,6 +1156,7 @@ impl AgentBuilder {
                 handlers: config.handlers,
                 state,
                 salt_counter,
+                des_salt_state: config.des_salt_state,
                 set_coordinator: tokio::sync::Mutex::new(()),
                 concurrency_limit: config.concurrency_limit,
                 authorization: config.authorization,
@@ -1215,13 +1227,37 @@ impl AgentBuilder {
             );
         }
 
-        let requires_privacy = self
-            .usm_users
-            .values()
-            .any(|security| security.maximum_security_level().requires_priv())
-            || self.trap_sinks.iter().any(|(_, _, auth)| {
-                matches!(auth, crate::client::Auth::Usm(security) if security.security_level().requires_priv())
-            });
+        let uses_des = self.usm_users.values().any(|security| {
+            security
+                .priv_protocol()
+                .is_some_and(PrivProtocol::is_des_family)
+        }) || self.trap_sinks.iter().any(|(_, _, auth)| {
+            matches!(auth, crate::client::Auth::Usm(security)
+                if security.priv_protocol().is_some_and(PrivProtocol::is_des_family))
+        });
+        let uses_aes = self.usm_users.values().any(|security| {
+            security
+                .priv_protocol()
+                .is_some_and(|protocol| !protocol.is_des_family())
+        }) || self.trap_sinks.iter().any(|(_, _, auth)| {
+            matches!(auth, crate::client::Auth::Usm(security)
+                if security.priv_protocol().is_some_and(|protocol| !protocol.is_des_family()))
+        });
+        if uses_des && self.des_salt_state.is_none() {
+            return Err(Error::Config(
+                "durable DES sender state is required for DES/3DES agent roles".into(),
+            )
+            .boxed());
+        }
+        if uses_des
+            && let (Some(engine), Some(state)) = (&self.authoritative_engine, &self.des_salt_state)
+            && engine.engine_boots() != state.engine_boots()
+        {
+            return Err(Error::Config(
+                "DES sender boots must match the agent authoritative engine boots".into(),
+            )
+            .boxed());
+        }
         let requires_authoritative_engine = !self.usm_users.is_empty()
             || self
                 .trap_sinks
@@ -1283,7 +1319,8 @@ impl AgentBuilder {
             inform_retry: self.inform_retry,
             response_send_timeout: self.response_send_timeout,
             disabled_builtins: self.disabled_builtins,
-            requires_privacy,
+            requires_privacy: uses_aes,
+            des_salt_state: self.des_salt_state,
         })
     }
 }
@@ -1419,6 +1456,7 @@ pub(crate) struct AgentInner {
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
     pub(crate) salt_counter: Option<SaltCounter>,
+    pub(crate) des_salt_state: Option<DesSaltState>,
     /// Serializes complete SET transactions without restricting retrieval.
     pub(crate) set_coordinator: tokio::sync::Mutex<()>,
     pub(crate) concurrency_limit: Option<Arc<Semaphore>>,

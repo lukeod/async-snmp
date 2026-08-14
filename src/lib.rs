@@ -635,8 +635,9 @@ pub use transport::{
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, AuthoritativeEnginePersistenceError,
     AuthoritativeEnginePersistenceOperation, CryptoBackend, CryptoError, CryptoResult,
-    DiscoveredEngine, EngineCache, ParseProtocolError, PersistedAuthoritativeEngine, PrivProtocol,
-    UsmConfig, UsmUser, generate_engine_id,
+    DesSaltPersistenceError, DesSaltPersistenceOperation, DesSaltState, DesSaltStateError,
+    DiscoveredEngine, EngineCache, ParseProtocolError, PersistedAuthoritativeEngine,
+    PersistedDesSaltState, PrivProtocol, UsmConfig, UsmUser, generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{LocalizedKey, MasterKey, MasterKeys};

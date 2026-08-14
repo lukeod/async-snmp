@@ -48,7 +48,11 @@ impl CryptoProvider for AwsLcFipsProvider {
         match protocol {
             PrivProtocol::Des => Err(CryptoError::UnsupportedAlgorithm("DES")),
             PrivProtocol::Des3 => Err(CryptoError::UnsupportedAlgorithm("3DES")),
-            PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => Ok(()),
+            PrivProtocol::Aes128
+            | PrivProtocol::Aes192Blumenthal
+            | PrivProtocol::Aes192Reeder
+            | PrivProtocol::Aes256Blumenthal
+            | PrivProtocol::Aes256Reeder => Ok(()),
         }
     }
 
@@ -139,9 +143,11 @@ impl CryptoProvider for AwsLcFipsProvider {
                 tracing::debug!(target: "async_snmp::crypto", "3DES is not supported in FIPS mode");
                 Err(CryptoError::UnsupportedAlgorithm("3DES"))
             }
-            PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
-                encrypt_aes_cfb(key, iv, data)
-            }
+            PrivProtocol::Aes128
+            | PrivProtocol::Aes192Blumenthal
+            | PrivProtocol::Aes192Reeder
+            | PrivProtocol::Aes256Blumenthal
+            | PrivProtocol::Aes256Reeder => encrypt_aes_cfb(key, iv, data),
         }
     }
 
@@ -161,9 +167,11 @@ impl CryptoProvider for AwsLcFipsProvider {
                 tracing::debug!(target: "async_snmp::crypto", "3DES is not supported in FIPS mode");
                 Err(CryptoError::UnsupportedAlgorithm("3DES"))
             }
-            PrivProtocol::Aes128 | PrivProtocol::Aes192 | PrivProtocol::Aes256 => {
-                decrypt_aes_cfb(key, iv, data)
-            }
+            PrivProtocol::Aes128
+            | PrivProtocol::Aes192Blumenthal
+            | PrivProtocol::Aes192Reeder
+            | PrivProtocol::Aes256Blumenthal
+            | PrivProtocol::Aes256Reeder => decrypt_aes_cfb(key, iv, data),
         }
     }
 }

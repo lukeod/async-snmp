@@ -21,7 +21,7 @@ use crate::error::{ConstructionStage, Error, Result};
 use crate::transport::{
     CommunityResponsePolicy, TcpTransport, Transport, UdpControl, UdpHandle, UdpTransport,
 };
-use crate::v3::{AuthoritativeEngine, EngineCache};
+use crate::v3::{AuthoritativeEngine, DesSaltState, EngineCache};
 
 /// Target address for an SNMP client.
 ///
@@ -171,6 +171,7 @@ pub struct ClientBuilder {
     community_response_policy: CommunityResponsePolicy,
     allow_unauthenticated_v3_time_correction: bool,
     local_authoritative_engine: Option<AuthoritativeEngine>,
+    des_salt_state: Option<DesSaltState>,
 }
 
 /// Builder for constructing a client using a library-maintained target
@@ -242,6 +243,7 @@ impl ClientBuilder {
             community_response_policy: CommunityResponsePolicy::Exact,
             allow_unauthenticated_v3_time_correction: false,
             local_authoritative_engine: None,
+            des_salt_state: None,
         }
     }
 
@@ -533,6 +535,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Set durable local generating-engine state for DES or 3DES privacy.
+    ///
+    /// Pass clones of the same value to independently constructed senders that
+    /// use the same localized DES-family key/pre-IV domain.
+    #[must_use]
+    pub fn des_salt_state(mut self, state: DesSaltState) -> Self {
+        self.des_salt_state = Some(state);
+        self
+    }
+
     /// Set shared engine cache (V3 only, for polling many targets).
     ///
     /// Allows multiple clients to share target-to-engine identity mappings and
@@ -672,6 +684,7 @@ impl ClientBuilder {
             max_walk_results: self.max_walk_results,
             max_repetitions: self.max_repetitions,
             local_authoritative_engine: self.local_authoritative_engine.clone(),
+            des_salt_state: self.des_salt_state.clone(),
         }
     }
 
@@ -806,6 +819,13 @@ impl TargetClientBuilder {
     #[must_use]
     pub fn local_authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
         self.client = self.client.local_authoritative_engine(engine);
+        self
+    }
+
+    /// Set durable local generating-engine state for DES or 3DES privacy.
+    #[must_use]
+    pub fn des_salt_state(mut self, state: DesSaltState) -> Self {
+        self.client = self.client.des_salt_state(state);
         self
     }
 

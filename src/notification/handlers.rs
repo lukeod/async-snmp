@@ -365,6 +365,7 @@ fn build_v3_response(
         context_name,
         derived_keys,
         inner.salt_counter.as_ref(),
+        inner.des_salt_state.as_ref(),
         inner.local_addr,
     )
 }

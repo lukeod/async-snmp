@@ -568,14 +568,28 @@ impl V3ReplyBuilder {
                 &scoped,
                 self.first_integer_value_content_override.as_deref(),
             )?;
-            let (ciphertext, generated_priv_params) = priv_key
-                .encrypt(
+            let encrypted = if priv_key.protocol().is_des_family() {
+                let state = if self.engine_boots == 1 {
+                    async_snmp::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(()))
+                        .unwrap()
+                } else {
+                    async_snmp::DesSaltState::restart(
+                        async_snmp::PersistedDesSaltState::new(self.engine_boots - 1).unwrap(),
+                        |_| Ok::<(), std::convert::Infallible>(()),
+                    )
+                    .unwrap()
+                };
+                priv_key.encrypt_des_family(&scoped_bytes, &state)
+            } else {
+                priv_key.encrypt_aes(
                     &scoped_bytes,
                     self.engine_boots,
                     self.engine_time,
                     &self.salt,
                 )
-                .map_err(|error| error.to_string())?;
+            };
+            let (ciphertext, generated_priv_params) =
+                encrypted.map_err(|error| error.to_string())?;
             let ciphertext = self.ciphertext_override.unwrap_or(ciphertext);
             priv_params = generated_priv_params;
             if let Some(auth_key) = keys.as_ref().and_then(|keys| keys.auth_key.as_ref()) {

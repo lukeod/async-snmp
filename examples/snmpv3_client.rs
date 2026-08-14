@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Uses container user: privaes192_user (SHA-256 + AES-192)
     let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")?
-        .with_privacy(PrivProtocol::Aes192, b"privpass123")?;
+        .with_privacy(PrivProtocol::Aes192Blumenthal, b"privpass123")?;
 
     println!("Master keys derived once (expensive operation)");
 
@@ -176,21 +176,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - PrivProtocol::Des      (legacy, not recommended)
     // - PrivProtocol::Des3     (legacy 3DES, not recommended)
     // - PrivProtocol::Aes128   (recommended; RFC 3826)
-    // - PrivProtocol::Aes192   (draft/vendor extension)
-    // - PrivProtocol::Aes256   (draft/vendor extension)
+    // - PrivProtocol::Aes192Blumenthal / Aes192Reeder (draft/vendor extensions)
+    // - PrivProtocol::Aes256Blumenthal / Aes256Reeder (draft/vendor extensions)
 
     let strong_auth = Auth::usm_builder("admin")
         .auth_priv(
             AuthProtocol::Sha512,
             "strongauthpass",
-            PrivProtocol::Aes256,
+            PrivProtocol::Aes256Blumenthal,
             "strongprivpass",
         )
         .build()?;
 
     println!("Created auth config: SHA-512 + AES-256");
     println!("Auth protocol: {:?}", AuthProtocol::Sha512);
-    println!("Priv protocol: {:?}", PrivProtocol::Aes256);
+    println!("Priv protocol: {:?}", PrivProtocol::Aes256Blumenthal);
 
     // Build but don't connect (just demonstrate configuration)
     let _builder = Client::builder(target, strong_auth).request_timeout(Duration::from_secs(10));
