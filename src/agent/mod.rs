@@ -91,19 +91,22 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::error::{Error, ErrorStatus, Result};
-use crate::handler::{GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext};
+use crate::handler::{
+    GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, RequestLifecycle,
+    RequestTaskPhase,
+};
 use crate::message_size::{MessageSize, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS};
 use crate::oid;
 use crate::oid::Oid;
@@ -173,34 +176,78 @@ fn transient_recv_errno(_code: i32) -> bool {
     false
 }
 
-/// Clears the shared active-run flag whenever an [`Agent::run`] future exits or
-/// is dropped.
+/// Clears the shared active-run flag after orderly exit, or after the last
+/// retained request exits when [`Agent::run`] is dropped.
 struct RunGuard<'a> {
-    active: &'a AtomicBool,
+    inner: &'a AgentInner,
+    completed: bool,
+}
+
+impl RunGuard<'_> {
+    fn complete(&mut self) {
+        self.completed = true;
+        self.inner.run_active.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
+        if self.completed {
+            return;
+        }
+        self.inner.run_orphaned.store(true, Ordering::Release);
+        if self.inner.active_request_tasks.load(Ordering::Acquire) == 0 {
+            self.inner.run_active.store(false, Ordering::Release);
+        }
     }
+}
+
+struct ActiveRequestGuard {
+    inner: Arc<AgentInner>,
+    task_id: u64,
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.inner
+            .live_request_tasks
+            .lock()
+            .unwrap()
+            .remove(&self.task_id);
+        if self
+            .inner
+            .active_request_tasks
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+            && self.inner.run_orphaned.load(Ordering::Acquire)
+        {
+            self.inner.run_active.store(false, Ordering::Release);
+        }
+    }
+}
+
+struct RequestTaskControl {
+    phase: Arc<AtomicU8>,
+    abort: AbortHandle,
 }
 
 /// Request tasks owned by one [`Agent::run`] invocation.
 ///
-/// Tokio's [`JoinSet`] aborts its tasks when dropped. If the `run` future is
-/// dropped or aborted, detach dispatched requests instead so their handler
-/// lifecycles and response attempts can finish. The cancellation token only
-/// stops tasks that have not crossed the pre-dispatch boundary.
+/// Each task also has an entry in the Agent-owned registry. If `run` is
+/// dropped, detaching the local join handles does not lose ownership or
+/// observability; the shared entry remains until the task guard exits.
 struct RequestTasks {
     tasks: JoinSet<()>,
     cancel: CancellationToken,
+    inner: Arc<AgentInner>,
 }
 
 impl RequestTasks {
-    fn new(cancel: CancellationToken) -> Self {
+    fn new(cancel: CancellationToken, inner: Arc<AgentInner>) -> Self {
         Self {
             tasks: JoinSet::new(),
             cancel,
+            inner,
         }
     }
 
@@ -216,12 +263,43 @@ impl RequestTasks {
         self.tasks.is_empty()
     }
 
-    fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) {
-        self.tasks.spawn(task);
+    fn spawn(&mut self, phase: Arc<AtomicU8>, task: impl Future<Output = ()> + Send + 'static) {
+        let task_id = self
+            .inner
+            .next_request_task_id
+            .fetch_add(1, Ordering::Relaxed);
+        let activity = ActiveRequestGuard {
+            inner: Arc::clone(&self.inner),
+            task_id,
+        };
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        self.inner
+            .active_request_tasks
+            .fetch_add(1, Ordering::AcqRel);
+        let abort = self.tasks.spawn(async move {
+            let _activity = activity;
+            let _ = start_rx.await;
+            task.await;
+        });
+        self.inner
+            .live_request_tasks
+            .lock()
+            .unwrap()
+            .insert(task_id, RequestTaskControl { phase, abort });
+        let _ = start_tx.send(());
     }
 
     async fn join_next(&mut self) -> Option<std::result::Result<(), JoinError>> {
         self.tasks.join_next().await
+    }
+
+    fn abort_retrievals(&mut self) {
+        let tasks = self.inner.live_request_tasks.lock().unwrap();
+        for control in tasks.values() {
+            if control.phase.load(Ordering::Acquire) == RequestTaskPhase::Retrieval as u8 {
+                control.abort.abort();
+            }
+        }
     }
 }
 
@@ -262,6 +340,21 @@ pub enum BuiltinMib {
     ///
     /// Provides snmpUnknownSecurityModels and snmpInvalidMsgs.
     MpdStats,
+}
+
+/// Shutdown handling for already-dispatched agent requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AgentShutdownPolicy {
+    /// Signal every request and drain handlers and response attempts without a bound.
+    #[default]
+    Drain,
+    /// After `grace`, abort only positively classified retrieval tasks.
+    ///
+    /// Selecting this variant is an affirmative contract that every registered
+    /// handler's GET, GETNEXT, and GETBULK futures are cancellation-safe when
+    /// dropped. SET, Inform, and unclassified tasks are always drained.
+    AbortCancellationSafeRetrievalsAfter(Duration),
 }
 
 /// Current health of the Agent's local authoritative V3 state.
@@ -374,6 +467,8 @@ pub struct AgentBuilder {
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
     response_send_timeout: Duration,
+    request_deadline: Option<Duration>,
+    shutdown_policy: AgentShutdownPolicy,
     disabled_builtins: HashSet<BuiltinMib>,
 }
 
@@ -409,6 +504,8 @@ struct ValidatedAgentBuilder {
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
     response_send_timeout: Duration,
+    request_deadline: Option<Duration>,
+    shutdown_policy: AgentShutdownPolicy,
     disabled_builtins: HashSet<BuiltinMib>,
     requires_privacy: bool,
     des_salt_state: Option<DesSaltState>,
@@ -444,6 +541,8 @@ impl AgentBuilder {
             inform_timeout: Duration::from_secs(5),
             inform_retry: crate::client::Retry::default(),
             response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
+            request_deadline: None,
+            shutdown_policy: AgentShutdownPolicy::Drain,
             disabled_builtins: HashSet::new(),
         }
     }
@@ -978,6 +1077,29 @@ impl AgentBuilder {
         self
     }
 
+    /// Set an optional cooperative deadline for each inbound request.
+    ///
+    /// The deadline is measured from receipt, before concurrency-permit
+    /// queueing, and is exposed through [`RequestContext::deadline`]. Expiry
+    /// signals the request cancellation token but does not drop the handler.
+    #[must_use]
+    pub fn request_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.request_deadline = deadline;
+        self
+    }
+
+    /// Configure shutdown handling for already-dispatched requests.
+    ///
+    /// The default is [`AgentShutdownPolicy::Drain`]. Selecting
+    /// [`AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter`] affirms
+    /// that every registered retrieval handler is cancellation-safe when its
+    /// future is dropped.
+    #[must_use]
+    pub fn shutdown_policy(mut self, policy: AgentShutdownPolicy) -> Self {
+        self.shutdown_policy = policy;
+        self
+    }
+
     /// Disable a specific built-in MIB handler group.
     ///
     /// By default, the agent registers handlers for snmpEngine, USM stats,
@@ -1191,11 +1313,21 @@ impl AgentBuilder {
                 inform_transports: notification::InformTransportPool::new(),
                 notification_id: std::sync::atomic::AtomicI32::new(1),
                 run_active: AtomicBool::new(false),
+                run_orphaned: AtomicBool::new(false),
+                active_request_tasks: AtomicUsize::new(0),
+                next_request_task_id: AtomicU64::new(1),
+                live_request_tasks: std::sync::Mutex::new(HashMap::new()),
                 response_send_timeout: config.response_send_timeout,
+                request_deadline: config.request_deadline,
+                shutdown_policy: config.shutdown_policy,
                 #[cfg(test)]
                 response_send_gate: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 response_sends_started: AtomicU32::new(0),
+                #[cfg(test)]
+                received_datagrams: AtomicU32::new(0),
+                #[cfg(test)]
+                pre_permit_gate: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 receive_errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 #[cfg(test)]
@@ -1211,6 +1343,14 @@ impl AgentBuilder {
         crate::transport::checked_deadline(self.trap_send_timeout, "trap send timeout")?;
         crate::transport::checked_deadline(self.inform_timeout, "inform timeout")?;
         crate::transport::checked_deadline(self.response_send_timeout, "response send timeout")?;
+        if let Some(deadline) = self.request_deadline {
+            crate::transport::checked_deadline(deadline, "agent request deadline")?;
+        }
+        if let AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(grace) =
+            self.shutdown_policy
+        {
+            crate::transport::checked_deadline(grace, "agent shutdown grace")?;
+        }
 
         if matches!(self.authorization, AgentAuthorization::Conflict) {
             return Err(Error::Config(
@@ -1344,6 +1484,8 @@ impl AgentBuilder {
             inform_timeout: self.inform_timeout,
             inform_retry: self.inform_retry,
             response_send_timeout: self.response_send_timeout,
+            request_deadline: self.request_deadline,
+            shutdown_policy: self.shutdown_policy,
             disabled_builtins: self.disabled_builtins,
             requires_privacy: uses_aes,
             des_salt_state: self.des_salt_state,
@@ -1537,11 +1679,23 @@ pub(crate) struct AgentInner {
     pub(crate) notification_id: std::sync::atomic::AtomicI32,
     /// Shared across clones to enforce one active service loop.
     pub(crate) run_active: AtomicBool,
+    /// True while a dropped run future still owns live request tasks.
+    run_orphaned: AtomicBool,
+    /// Dispatched request tasks, including work retained after `run` is dropped.
+    active_request_tasks: AtomicUsize,
+    next_request_task_id: AtomicU64,
+    live_request_tasks: std::sync::Mutex<HashMap<u64, RequestTaskControl>>,
     pub(crate) response_send_timeout: Duration,
+    request_deadline: Option<Duration>,
+    shutdown_policy: AgentShutdownPolicy,
     #[cfg(test)]
     pub(crate) response_send_gate: std::sync::Mutex<Option<Arc<Semaphore>>>,
     #[cfg(test)]
     pub(crate) response_sends_started: AtomicU32,
+    #[cfg(test)]
+    received_datagrams: AtomicU32,
+    #[cfg(test)]
+    pre_permit_gate: std::sync::Mutex<Option<Arc<Semaphore>>>,
     #[cfg(test)]
     receive_errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
     #[cfg(test)]
@@ -1645,6 +1799,21 @@ impl Agent {
     #[must_use]
     pub fn cancel(&self) -> CancellationToken {
         self.inner.cancel.clone()
+    }
+
+    /// Return the number of dispatched request tasks still owned by the agent.
+    ///
+    /// This includes protected SET work retained after a `run` future is
+    /// dropped. A second `run` remains rejected until such orphaned work exits.
+    #[must_use]
+    pub fn active_request_count(&self) -> usize {
+        self.inner.active_request_tasks.load(Ordering::Acquire)
+    }
+
+    /// Return whether a dropped `run` future left observable request work.
+    #[must_use]
+    pub fn has_orphaned_requests(&self) -> bool {
+        self.inner.run_orphaned.load(Ordering::Acquire) && self.active_request_count() != 0
     }
 
     /// Get the snmpInASNParseErrs counter value.
@@ -1832,15 +2001,18 @@ impl Agent {
     /// until the cancellation token is triggered.
     ///
     /// Cancellation stops receiving datagrams and waiting for concurrency
-    /// permits. A received request whose task has not started request handling
-    /// may be dropped. Once request handling starts, including SET processing,
-    /// it is allowed to finish through its response attempt before this method
-    /// returns. There is no forced shutdown timeout, so a user handler that
-    /// never returns can cause shutdown to wait indefinitely. Dropping or
-    /// aborting the `run` future cannot provide that completion guarantee;
-    /// already-dispatched requests are detached to finish in the background
-    /// rather than being forcibly aborted. For orderly shutdown, cancel the
-    /// configured token and await this method.
+    /// permits, signals every dispatched request context, and by default drains
+    /// handler work and response attempts without a forced timeout. A received
+    /// request still waiting for admission may be dropped. Configure
+    /// [`AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter`] only when
+    /// every retrieval handler satisfies its cancellation-safety contract;
+    /// SET and unclassified work always drain.
+    ///
+    /// Dropping or aborting `run` signals its request contexts but cannot await
+    /// them. Live tasks remain in the Agent-owned registry and are observable
+    /// through [`active_request_count`](Self::active_request_count); a second
+    /// `run` is rejected until retained work finishes. For orderly shutdown,
+    /// cancel the configured token and await this method.
     ///
     /// Only one active call to `run` is supported for an agent. Cloned handles
     /// may still be used for other agent operations while that call is active.
@@ -1853,17 +2025,24 @@ impl Agent {
             .run_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::AgentAlreadyRunning.boxed())?;
-        let _run_guard = RunGuard {
-            active: &self.inner.run_active,
+        self.inner.run_orphaned.store(false, Ordering::Release);
+        let mut run_guard = RunGuard {
+            inner: &self.inner,
+            completed: false,
         };
 
         let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
-        let mut request_tasks = RequestTasks::new(self.inner.cancel.child_token());
+        let mut request_tasks =
+            RequestTasks::new(self.inner.cancel.child_token(), Arc::clone(&self.inner));
         let mut recv_error_backoff = UdpRecvErrorBackoff::default();
 
         let log_task_result = |result: std::result::Result<(), JoinError>| {
             if let Err(error) = result {
-                tracing::error!(target: "async_snmp::agent", %error, "request task failed");
+                if error.is_cancelled() {
+                    tracing::debug!(target: "async_snmp::agent", "cancellation-safe retrieval task aborted by shutdown policy");
+                } else {
+                    tracing::error!(target: "async_snmp::agent", %error, "request task failed");
+                }
             }
         };
 
@@ -1916,6 +2095,28 @@ impl Agent {
                 }
             };
 
+            // Capture receipt before copying the datagram or waiting for an
+            // execution permit so queueing consumes the request budget.
+            let received_at = tokio::time::Instant::now();
+            let deadline = self.inner.request_deadline.map(|duration| {
+                received_at
+                    .checked_add(duration)
+                    .expect("agent request deadline validated by builder")
+            });
+            #[cfg(test)]
+            self.inner
+                .received_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            let pre_permit_gate = self.inner.pre_permit_gate.lock().unwrap().clone();
+            #[cfg(test)]
+            if let Some(gate) = pre_permit_gate {
+                gate.acquire()
+                    .await
+                    .expect("test pre-permit gate remains open")
+                    .forget();
+            }
+
             let data = Bytes::copy_from_slice(&buf[..recv_meta.len]);
             if data.len() > UDP_RECEIVE_LIMITS.advertised().as_usize() {
                 tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, received_size = data.len(), advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
@@ -1945,35 +2146,90 @@ impl Agent {
             };
 
             let task_cancel = request_tasks.cancellation_token();
-            request_tasks.spawn(async move {
+            let request_cancel = task_cancel.child_token();
+            let phase = Arc::new(AtomicU8::new(RequestTaskPhase::Unclassified as u8));
+            let lifecycle = RequestLifecycle::new(
+                received_at,
+                tokio::time::Instant::now(),
+                deadline,
+                request_cancel.clone(),
+                phase.clone(),
+            );
+            request_tasks.spawn(phase, async move {
                 let _permit = permit;
 
-                // This is the only cooperative cancellation boundary. Once
-                // handle_request is entered, its handler lifecycle and response
-                // attempt must run to completion and must never be aborted.
-                if task_cancel.is_cancelled() {
-                    return;
-                }
-
-                match agent.handle_request(data, recv_meta.source).await {
-                    Ok(Some(response_bytes)) => {
-                        if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
-                            tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "failed to send response");
+                let request = async {
+                    match agent
+                        .handle_request_with_lifecycle(data, recv_meta.source, lifecycle)
+                        .await
+                    {
+                        Ok(Some(response_bytes)) => {
+                            if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
+                                tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "failed to send response");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "error handling request");
                         }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "error handling request");
+                };
+                tokio::pin!(request);
+                if let Some(deadline) = deadline {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source }, "request deadline expired before admission");
+                        request_cancel.cancel();
+                        request.await;
+                    } else {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(deadline) => {
+                                tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source }, "request deadline expired");
+                                request_cancel.cancel();
+                                request.await;
+                            }
+                            () = &mut request => {}
+                        }
                     }
+                } else {
+                    request.await;
                 }
             });
         };
 
         request_tasks.cancel();
-        while let Some(result) = request_tasks.join_next().await {
-            log_task_result(result);
+        match self.inner.shutdown_policy {
+            AgentShutdownPolicy::Drain => {
+                while let Some(result) = request_tasks.join_next().await {
+                    log_task_result(result);
+                }
+            }
+            AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(grace) => {
+                let deadline = tokio::time::Instant::now()
+                    .checked_add(grace)
+                    .expect("agent shutdown grace validated by builder");
+                loop {
+                    if request_tasks.is_empty() {
+                        break;
+                    }
+                    tokio::select! {
+                        result = request_tasks.join_next() => {
+                            if let Some(result) = result {
+                                log_task_result(result);
+                            }
+                        }
+                        () = tokio::time::sleep_until(deadline) => {
+                            request_tasks.abort_retrievals();
+                            break;
+                        }
+                    }
+                }
+                while let Some(result) = request_tasks.join_next().await {
+                    log_task_result(result);
+                }
+            }
         }
 
+        run_guard.complete();
         run_result
     }
 
@@ -2021,8 +2277,30 @@ impl Agent {
     /// Process a single request and return the response bytes.
     ///
     /// Returns `None` if no response should be sent.
+    #[cfg(test)]
     async fn handle_request(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
-        let result = self.handle_request_inner(data, source).await;
+        let now = tokio::time::Instant::now();
+        self.handle_request_with_lifecycle(
+            data,
+            source,
+            RequestLifecycle::new(
+                now,
+                now,
+                None,
+                CancellationToken::new(),
+                Arc::new(AtomicU8::new(RequestTaskPhase::Unclassified as u8)),
+            ),
+        )
+        .await
+    }
+
+    async fn handle_request_with_lifecycle(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        lifecycle: RequestLifecycle,
+    ) -> Result<Option<Bytes>> {
+        let result = self.handle_request_inner(data, source, lifecycle).await;
         if matches!(
             &result,
             Err(error) if matches!(
@@ -2044,11 +2322,19 @@ impl Agent {
         result
     }
 
-    async fn handle_request_inner(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
+    async fn handle_request_inner(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        lifecycle: RequestLifecycle,
+    ) -> Result<Option<Bytes>> {
         match crate::message::peek_version(data.clone(), source)? {
-            Version::V1 => self.handle_v1(data, source).await,
-            Version::V2c => self.handle_v2c(data, source).await,
-            Version::V3 => self.handle_v3(data, source).await,
+            Version::V1 => self.handle_v1_with_lifecycle(data, source, lifecycle).await,
+            Version::V2c => {
+                self.handle_v2c_with_lifecycle(data, source, lifecycle)
+                    .await
+            }
+            Version::V3 => self.handle_v3_with_lifecycle(data, source, lifecycle).await,
         }
     }
 
@@ -2543,8 +2829,9 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use crate::handler::{
-        BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler,
-        RequestContext, SecurityModel, SetTestError,
+        BoxFuture, GetNextResult, GetResult, HandlerError, HandlerResult, MibHandler, PreparedSet,
+        RequestContext, SecurityModel, SetCommitError, SetCommitResult, SetTestError,
+        SetTestResult, SetUndoResult,
     };
     use crate::message::SecurityLevel;
     use crate::oid;
@@ -2607,6 +2894,263 @@ mod tests {
                 Ok(GetNextResult::EndOfMibView)
             })
         }
+    }
+
+    type RequestObservation = (
+        tokio::time::Instant,
+        tokio::time::Instant,
+        Option<tokio::time::Instant>,
+        bool,
+    );
+    type RequestObservations = Arc<std::sync::Mutex<Vec<RequestObservation>>>;
+
+    struct BlockingGetHandler {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        observe_cancellation: bool,
+        observations: RequestObservations,
+    }
+
+    impl MibHandler for BlockingGetHandler {
+        fn get<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async move {
+                self.started.add_permits(1);
+                if self.observe_cancellation {
+                    ctx.cancelled().await;
+                } else {
+                    self.release
+                        .acquire()
+                        .await
+                        .expect("blocking GET release remains open")
+                        .forget();
+                }
+                self.observations.lock().unwrap().push((
+                    ctx.received_at(),
+                    ctx.admitted_at(),
+                    ctx.deadline(),
+                    ctx.is_cancelled(),
+                ));
+                Ok(GetResult::Value(Value::Integer(42)))
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
+        }
+    }
+
+    fn encoded_get(request_id: i32) -> Bytes {
+        crate::message::CommunityMessage::new(
+            Version::V2c,
+            Bytes::from_static(b"public"),
+            Pdu::get_request(request_id, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProtectedSetMode {
+        Undo,
+        Finalize,
+    }
+
+    struct ProtectedSetHandler {
+        mode: ProtectedSetMode,
+        cleanup_started: Arc<Semaphore>,
+        release_cleanup: Arc<Semaphore>,
+        calls: Arc<std::sync::Mutex<Vec<(&'static str, Oid)>>>,
+    }
+
+    struct ProtectedSetPrepared {
+        mode: ProtectedSetMode,
+        cleanup_started: Arc<Semaphore>,
+        release_cleanup: Arc<Semaphore>,
+        calls: Arc<std::sync::Mutex<Vec<(&'static str, Oid)>>>,
+    }
+
+    impl PreparedSet for ProtectedSetPrepared {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("commit", oid.clone()));
+                if matches!(self.mode, ProtectedSetMode::Undo) && oid == &protected_set_oid(2) {
+                    Err(SetCommitError::Failed)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("undo", oid.clone()));
+                if matches!(self.mode, ProtectedSetMode::Undo) && oid == &protected_set_oid(2) {
+                    self.cleanup_started.add_permits(1);
+                    self.release_cleanup.acquire().await.unwrap().forget();
+                }
+                Ok(())
+            })
+        }
+
+        fn finalize<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("finalize", oid.clone()));
+                if matches!(self.mode, ProtectedSetMode::Finalize) && oid == &protected_set_oid(2) {
+                    self.cleanup_started.add_permits(1);
+                    self.release_cleanup.acquire().await.unwrap().forget();
+                }
+            })
+        }
+    }
+
+    impl MibHandler for ProtectedSetHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetTestResult> {
+            Box::pin(async move {
+                Ok(Box::new(ProtectedSetPrepared {
+                    mode: self.mode,
+                    cleanup_started: self.cleanup_started.clone(),
+                    release_cleanup: self.release_cleanup.clone(),
+                    calls: self.calls.clone(),
+                }) as Box<dyn PreparedSet>)
+            })
+        }
+    }
+
+    fn protected_set_oid(index: u32) -> Oid {
+        oid!(1, 3, 6, 1, 4, 1, 99999, index, 0)
+    }
+
+    fn encoded_set(request_id: i32) -> Bytes {
+        crate::message::CommunityMessage::new(
+            Version::V2c,
+            Bytes::from_static(b"public"),
+            Pdu::standard(
+                crate::pdu::StandardPduType::SetRequest,
+                request_id,
+                0,
+                0,
+                vec![
+                    VarBind::new(protected_set_oid(1), Value::Integer(1)),
+                    VarBind::new(protected_set_oid(2), Value::Integer(2)),
+                ],
+            ),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+
+    async fn run_protected_set_shutdown(mode: ProtectedSetMode) -> (i32, Vec<(&'static str, Oid)>) {
+        let cleanup_started = Arc::new(Semaphore::new(0));
+        let release_cleanup = Arc::new(Semaphore::new(0));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let grace = Duration::from_millis(10);
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999),
+                Arc::new(ProtectedSetHandler {
+                    mode,
+                    cleanup_started: cleanup_started.clone(),
+                    release_cleanup: release_cleanup.clone(),
+                    calls: calls.clone(),
+                }),
+            )
+            .without_builtin_handlers()
+            .shutdown_policy(AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(
+                grace,
+            ))
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&encoded_set(41), agent.local_addr())
+            .await
+            .unwrap();
+        cleanup_started.acquire().await.unwrap().forget();
+
+        agent.cancel().cancel();
+        tokio::time::sleep(grace + Duration::from_millis(20)).await;
+        assert!(!run.is_finished());
+        assert_eq!(agent.active_request_count(), 1);
+        assert_eq!(agent.inner.live_request_tasks.lock().unwrap().len(), 1);
+
+        release_cleanup.add_permits(1);
+        let mut response = [0_u8; 2048];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response))
+                .await
+                .expect("protected SET response was not attempted")
+                .unwrap();
+        let response = crate::message::CommunityMessage::decode(
+            Bytes::copy_from_slice(&response[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
+        let error_status = response.pdu().standard().unwrap().error_status();
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.active_request_count(), 0);
+        assert!(agent.inner.live_request_tasks.lock().unwrap().is_empty());
+        wait_for_run_state(&agent, false).await;
+
+        let calls = calls.lock().unwrap().clone();
+        (error_status, calls)
     }
 
     fn test_ctx() -> RequestContext {
@@ -2865,6 +3409,272 @@ mod tests {
             .expect("graceful shutdown remained blocked on response send")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cooperative_get_observes_shutdown_cancellation() {
+        let started = Arc::new(Semaphore::new(0));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler = BlockingGetHandler {
+            started: started.clone(),
+            release: Arc::new(Semaphore::new(0)),
+            observe_cancellation: true,
+            observations: observations.clone(),
+        };
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(handler))
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&encoded_get(1), agent.local_addr())
+            .await
+            .unwrap();
+        started.acquire().await.unwrap().forget();
+
+        agent.cancel().cancel();
+        run.await.unwrap().unwrap();
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_includes_concurrency_permit_queueing() {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler = BlockingGetHandler {
+            started: started.clone(),
+            release: release.clone(),
+            observe_cancellation: false,
+            observations: observations.clone(),
+        };
+        let budget = Duration::from_millis(20);
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(handler))
+            .without_builtin_handlers()
+            .max_concurrent_requests(Some(1))
+            .request_deadline(Some(budget))
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pre_permit_gate = Arc::new(Semaphore::new(1));
+        *agent.inner.pre_permit_gate.lock().unwrap() = Some(pre_permit_gate.clone());
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&encoded_get(1), agent.local_addr())
+            .await
+            .unwrap();
+        started.acquire().await.unwrap().forget();
+        client
+            .send_to(&encoded_get(2), agent.local_addr())
+            .await
+            .unwrap();
+        while agent.inner.received_datagrams.load(Ordering::Relaxed) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(agent.active_request_count(), 1);
+        tokio::time::advance(budget + Duration::from_millis(1)).await;
+        pre_permit_gate.add_permits(1);
+        release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observations.lock().unwrap().len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let queued = {
+            let observations = observations.lock().unwrap();
+            observations[1]
+        };
+        assert_eq!(queued.2, queued.0.checked_add(budget));
+        assert!(queued.1.duration_since(queued.0) >= budget);
+        assert!(queued.3);
+        agent.cancel().cancel();
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_shutdown_drains_blocked_retrieval() {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let handler = BlockingGetHandler {
+            started: started.clone(),
+            release: release.clone(),
+            observe_cancellation: false,
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(handler))
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let run_agent = agent.clone();
+        let mut run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&encoded_get(1), agent.local_addr())
+            .await
+            .unwrap();
+        started.acquire().await.unwrap().forget();
+        agent.cancel().cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut run)
+                .await
+                .is_err()
+        );
+        assert_eq!(agent.active_request_count(), 1);
+        release.add_permits(1);
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_retrieval_abort_releases_request_permit() {
+        let started = Arc::new(Semaphore::new(0));
+        let handler = BlockingGetHandler {
+            started: started.clone(),
+            release: Arc::new(Semaphore::new(0)),
+            observe_cancellation: false,
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(handler))
+            .without_builtin_handlers()
+            .max_concurrent_requests(Some(1))
+            .shutdown_policy(AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(
+                Duration::from_millis(10),
+            ))
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&encoded_get(1), agent.local_addr())
+            .await
+            .unwrap();
+        started.acquire().await.unwrap().forget();
+        agent.cancel().cancel();
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.active_request_count(), 0);
+        assert_eq!(
+            agent
+                .inner
+                .concurrency_limit
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_retrieval_policy_drains_set_undo_after_shutdown_grace() {
+        let (status, calls) = run_protected_set_shutdown(ProtectedSetMode::Undo).await;
+        assert_eq!(status, ErrorStatus::CommitFailed.as_i32());
+        assert_eq!(
+            calls,
+            vec![
+                ("commit", protected_set_oid(1)),
+                ("commit", protected_set_oid(2)),
+                ("undo", protected_set_oid(2)),
+                ("undo", protected_set_oid(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_retrieval_policy_drains_set_finalize_after_shutdown_grace() {
+        let (status, calls) = run_protected_set_shutdown(ProtectedSetMode::Finalize).await;
+        assert_eq!(status, ErrorStatus::NoError.as_i32());
+        assert_eq!(
+            calls,
+            vec![
+                ("commit", protected_set_oid(1)),
+                ("commit", protected_set_oid(2)),
+                ("finalize", protected_set_oid(2)),
+                ("finalize", protected_set_oid(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_run_keeps_live_request_observable_and_blocks_second_run() {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let handler = BlockingGetHandler {
+            started: started.clone(),
+            release: release.clone(),
+            observe_cancellation: false,
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(handler))
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let run_agent = agent.clone();
+        let run = tokio::spawn(async move { run_agent.run().await });
+        wait_for_run_state(&agent, true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&encoded_get(1), agent.local_addr())
+            .await
+            .unwrap();
+        started.acquire().await.unwrap().forget();
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+        assert_eq!(agent.active_request_count(), 1);
+        assert!(agent.has_orphaned_requests());
+        assert!(matches!(
+            &*agent.run().await.unwrap_err(),
+            Error::AgentAlreadyRunning
+        ));
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while agent.active_request_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        wait_for_run_state(&agent, false).await;
     }
 
     #[tokio::test]

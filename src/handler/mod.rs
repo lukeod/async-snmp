@@ -174,6 +174,7 @@ mod results;
 mod traits;
 
 pub use context::{RequestContext, SecurityName};
+pub(crate) use context::{RequestLifecycle, RequestTaskPhase};
 pub use oid_table::OidTable;
 pub use results::{
     GetNextResult, GetResult, HandlerError, HandlerResult, SetCommitError, SetCommitResult,

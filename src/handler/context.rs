@@ -1,12 +1,16 @@
 //! Request context for MIB handlers.
 //!
 //! This module provides [`RequestContext`], which contains information about
-//! incoming SNMP requests for use in handler authorization decisions.
+//! incoming SNMP requests for use in handler authorization decisions and
+//! cooperative deadline/shutdown handling.
 
 use std::net::SocketAddr;
 
 use bytes::Bytes;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use subtle::ConstantTimeEq;
+use tokio_util::sync::CancellationToken;
 
 use crate::Community;
 use crate::DecodeAnomaly;
@@ -83,6 +87,10 @@ impl SecurityName {
 ///
 /// Contains information about the incoming request for authorization decisions,
 /// including VACM-resolved access control information when VACM is enabled.
+/// Receipt and admission timestamps expose concurrency queueing, while the
+/// optional absolute deadline and level-triggered token let handlers propagate
+/// cooperative cancellation into downstream work. Cancellation is advisory:
+/// it does not itself drop a handler future.
 ///
 /// # Example
 ///
@@ -174,6 +182,21 @@ impl SecurityName {
 /// passed to a test handler.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
+    /// Monotonic instant when the datagram was received.
+    received_at: tokio::time::Instant,
+
+    /// Monotonic instant when request processing was admitted.
+    admitted_at: tokio::time::Instant,
+
+    /// Absolute request deadline measured from receipt.
+    deadline: Option<tokio::time::Instant>,
+
+    /// Level-triggered advisory cancellation for this request.
+    cancellation: CancellationToken,
+
+    /// Agent-owned phase record used to protect mutation cleanup.
+    phase: Arc<AtomicU8>,
+
     /// Source address of the request.
     ///
     /// Use this for logging or additional access control beyond VACM.
@@ -244,6 +267,7 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    #[cfg(test)]
     pub(crate) fn community(
         source: SocketAddr,
         version: CommunityVersion,
@@ -252,12 +276,37 @@ impl RequestContext {
         pdu_type: PduType,
         decode_anomalies: Vec<DecodeAnomaly>,
     ) -> Self {
+        Self::community_with_lifecycle(
+            source,
+            version,
+            community,
+            request_id,
+            pdu_type,
+            decode_anomalies,
+            RequestLifecycle::for_test(pdu_type),
+        )
+    }
+
+    pub(crate) fn community_with_lifecycle(
+        source: SocketAddr,
+        version: CommunityVersion,
+        community: Community,
+        request_id: i32,
+        pdu_type: PduType,
+        decode_anomalies: Vec<DecodeAnomaly>,
+        lifecycle: RequestLifecycle,
+    ) -> Self {
         let (version, security_model) = match version {
             CommunityVersion::V1 => (Version::V1, SecurityModel::V1),
             CommunityVersion::V2c => (Version::V2c, SecurityModel::V2c),
         };
-
+        lifecycle.classify(pdu_type);
         Self {
+            received_at: lifecycle.received_at,
+            admitted_at: lifecycle.admitted_at,
+            deadline: lifecycle.deadline,
+            cancellation: lifecycle.cancellation,
+            phase: lifecycle.phase,
             source,
             version,
             security_model,
@@ -274,6 +323,7 @@ impl RequestContext {
         }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn usm(
         source: SocketAddr,
@@ -285,7 +335,38 @@ impl RequestContext {
         msg_max_size: usize,
         decode_anomalies: Vec<DecodeAnomaly>,
     ) -> Self {
+        Self::usm_with_lifecycle(
+            source,
+            username,
+            security_level,
+            context_name,
+            request_id,
+            pdu_type,
+            msg_max_size,
+            decode_anomalies,
+            RequestLifecycle::for_test(pdu_type),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn usm_with_lifecycle(
+        source: SocketAddr,
+        username: Bytes,
+        security_level: SecurityLevel,
+        context_name: Bytes,
+        request_id: i32,
+        pdu_type: PduType,
+        msg_max_size: usize,
+        decode_anomalies: Vec<DecodeAnomaly>,
+        lifecycle: RequestLifecycle,
+    ) -> Self {
+        lifecycle.classify(pdu_type);
         Self {
+            received_at: lifecycle.received_at,
+            admitted_at: lifecycle.admitted_at,
+            deadline: lifecycle.deadline,
+            cancellation: lifecycle.cancellation,
+            phase: lifecycle.phase,
             source,
             version: Version::V3,
             security_model: SecurityModel::Usm,
@@ -300,6 +381,56 @@ impl RequestContext {
             msg_max_size: Some(msg_max_size),
             decode_anomalies,
         }
+    }
+
+    /// Return the monotonic instant when the request datagram was received.
+    #[must_use]
+    pub const fn received_at(&self) -> tokio::time::Instant {
+        self.received_at
+    }
+
+    /// Return the monotonic instant when the request received an execution permit.
+    #[must_use]
+    pub const fn admitted_at(&self) -> tokio::time::Instant {
+        self.admitted_at
+    }
+
+    /// Return the absolute request deadline, measured from receipt.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    /// Clone the level-triggered advisory cancellation signal.
+    ///
+    /// The token is cancelled when the request deadline expires or agent
+    /// shutdown begins. Cancellation-aware handlers should return normally
+    /// after releasing their own resources. For SET, cancellation is observed
+    /// before commit; once commit begins, undo, free, and finalize callbacks
+    /// remain protected and must run to completion even though this token stays
+    /// cancelled.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    /// Return whether request cancellation has already been signalled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Wait until request cancellation is signalled.
+    ///
+    /// This is advisory. In a protected SET terminal callback it remains
+    /// signalled but does not authorize abandoning rollback or cleanup.
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    pub(crate) fn protect_set(&self) {
+        self.phase
+            .store(RequestTaskPhase::SetProtected as u8, Ordering::Release);
     }
 
     pub(crate) fn set_vacm_access(
@@ -400,6 +531,73 @@ impl RequestContext {
     #[must_use]
     pub fn decode_anomalies(&self) -> &[DecodeAnomaly] {
         &self.decode_anomalies
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RequestTaskPhase {
+    Unclassified,
+    Retrieval,
+    SetPreCommit,
+    SetProtected,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RequestLifecycle {
+    pub(crate) received_at: tokio::time::Instant,
+    pub(crate) admitted_at: tokio::time::Instant,
+    pub(crate) deadline: Option<tokio::time::Instant>,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) phase: Arc<AtomicU8>,
+}
+
+impl RequestLifecycle {
+    pub(crate) fn new(
+        received_at: tokio::time::Instant,
+        admitted_at: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
+        cancellation: CancellationToken,
+        phase: Arc<AtomicU8>,
+    ) -> Self {
+        Self {
+            received_at,
+            admitted_at,
+            deadline,
+            cancellation,
+            phase,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(pdu_type: PduType) -> Self {
+        let lifecycle = Self::standalone();
+        lifecycle.classify(pdu_type);
+        lifecycle
+    }
+
+    #[cfg(test)]
+    pub(crate) fn standalone() -> Self {
+        let now = tokio::time::Instant::now();
+        Self::new(
+            now,
+            now,
+            None,
+            CancellationToken::new(),
+            Arc::new(AtomicU8::new(RequestTaskPhase::Unclassified as u8)),
+        )
+    }
+
+    fn classify(&self, pdu_type: PduType) {
+        let phase = match pdu_type {
+            PduType::GetRequest | PduType::GetNextRequest | PduType::GetBulkRequest => {
+                RequestTaskPhase::Retrieval
+            }
+            PduType::SetRequest => RequestTaskPhase::SetPreCommit,
+            _ => RequestTaskPhase::Other,
+        };
+        self.phase.store(phase as u8, Ordering::Release);
     }
 }
 

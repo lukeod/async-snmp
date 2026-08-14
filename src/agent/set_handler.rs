@@ -52,9 +52,11 @@ impl Agent {
     ///    the failing binding, in reverse order. Call `PreparedSet::free` for later
     ///    tested bindings whose commit was never attempted.
     ///
-    /// Cancellation or panic instead invokes synchronous `Drop` fallback in
-    /// reverse order. Since `Drop` cannot await protocol rollback, atomicity is
-    /// not guaranteed if interruption occurs after commit starts.
+    /// Cooperative cancellation is observed at test-phase boundaries. Before
+    /// commit it runs asynchronous `free` callbacks in reverse order. Once the
+    /// first commit starts, the Agent never externally aborts the task and
+    /// commit, rollback, free, and finalization remain protected. Panic or an
+    /// out-of-band task abort can only invoke the synchronous `Drop` fallback.
     ///
     /// Per RFC 3416 Section 4.2.5 step (1), the size of the Response (which
     /// echoes the request varbinds) is checked up front: if it would exceed the
@@ -76,9 +78,17 @@ impl Agent {
             pending: Vec::with_capacity(pdu.varbinds.len()),
         };
 
+        if ctx.is_cancelled() {
+            return cancelled_set_response(ctx, pdu);
+        }
+
         // ========== PHASE 1: TEST ==========
         // Check VACM and call test_set for all varbinds
         for (index, vb) in pdu.varbinds.iter().enumerate() {
+            if ctx.is_cancelled() {
+                free_pending(&mut transaction, ctx).await;
+                return cancelled_set_response(ctx, pdu);
+            }
             // VACM write access check
             if let Some(vacm) = self.inner.authorization.vacm()
                 && !vacm.check_access(ctx.write_view(), &vb.oid)
@@ -160,6 +170,17 @@ impl Agent {
         }
 
         // ========== PHASE 2: COMMIT ==========
+        if ctx.is_cancelled() {
+            free_pending(&mut transaction, ctx).await;
+            return cancelled_set_response(ctx, pdu);
+        }
+
+        // From the first commit invocation onward external task abortion is
+        // forbidden; rollback and finalization retain agent ownership.
+        if !transaction.pending.is_empty() {
+            ctx.protect_set();
+        }
+
         // All tests passed, now commit each varbind
         for index in 0..transaction.pending.len() {
             let p = &mut transaction.pending[index];
@@ -249,6 +270,24 @@ impl Agent {
 
         pdu.to_response(ctx.version())
     }
+}
+
+async fn free_pending(transaction: &mut SetTransaction<'_>, ctx: &RequestContext) {
+    while let Some(index) = transaction.pending.len().checked_sub(1) {
+        let pending = &mut transaction.pending[index];
+        pending
+            .prepared
+            .as_mut()
+            .expect("pending SET state must be present")
+            .free(ctx, pending.oid, pending.value)
+            .await;
+        transaction.pending.pop();
+    }
+}
+
+fn cancelled_set_response(ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    let error_index = usize::from(!pdu.varbinds.is_empty());
+    pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, error_index)
 }
 
 #[cfg(test)]
@@ -1479,6 +1518,237 @@ mod tests {
             ErrorStatus::NoError.as_i32()
         );
         assert_eq!(value.load(Ordering::SeqCst), 20);
+    }
+
+    #[derive(Clone, Copy)]
+    enum CancellationPhaseMode {
+        PreCommit,
+        Undo,
+        Finalize,
+    }
+
+    struct CancellationPhaseHandler {
+        mode: CancellationPhaseMode,
+        callback_started: Arc<Semaphore>,
+        release_callback: Arc<Semaphore>,
+        calls: Arc<Mutex<Vec<(&'static str, Oid)>>>,
+    }
+
+    struct CancellationPhasePrepared {
+        mode: CancellationPhaseMode,
+        callback_started: Arc<Semaphore>,
+        release_callback: Arc<Semaphore>,
+        calls: Arc<Mutex<Vec<(&'static str, Oid)>>>,
+    }
+
+    impl PreparedSet for CancellationPhasePrepared {
+        fn commit<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetCommitResult> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("commit", oid.clone()));
+                if matches!(self.mode, CancellationPhaseMode::Undo) && oid == &set_oid(2) {
+                    Err(SetCommitError::Failed)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn undo<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetUndoResult> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("undo", oid.clone()));
+                if matches!(self.mode, CancellationPhaseMode::Undo) && oid == &set_oid(2) {
+                    self.callback_started.add_permits(1);
+                    self.release_callback.acquire().await.unwrap().forget();
+                }
+                Ok(())
+            })
+        }
+
+        fn free<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("free", oid.clone()));
+            })
+        }
+
+        fn finalize<'a>(
+            &'a mut self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("finalize", oid.clone()));
+                if matches!(self.mode, CancellationPhaseMode::Finalize) && oid == &set_oid(2) {
+                    self.callback_started.add_permits(1);
+                    self.release_callback.acquire().await.unwrap().forget();
+                }
+            })
+        }
+    }
+
+    impl MibHandler for CancellationPhaseHandler {
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async { Ok(GetResult::NoSuchObject) })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async { Ok(GetNextResult::EndOfMibView) })
+        }
+
+        fn test_set<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            oid: &'a Oid,
+            _value: &'a Value,
+        ) -> BoxFuture<'a, SetTestResult> {
+            Box::pin(async move {
+                if matches!(self.mode, CancellationPhaseMode::PreCommit) && oid == &set_oid(2) {
+                    self.callback_started.add_permits(1);
+                    self.release_callback.acquire().await.unwrap().forget();
+                }
+                Ok(Box::new(CancellationPhasePrepared {
+                    mode: self.mode,
+                    callback_started: self.callback_started.clone(),
+                    release_callback: self.release_callback.clone(),
+                    calls: self.calls.clone(),
+                }) as Box<dyn PreparedSet>)
+            })
+        }
+    }
+
+    async fn cancellation_phase_scenario(
+        mode: CancellationPhaseMode,
+    ) -> (
+        tokio::task::JoinHandle<crate::Result<Pdu>>,
+        RequestContext,
+        Arc<Semaphore>,
+        Arc<Semaphore>,
+        Arc<Mutex<Vec<(&'static str, Oid)>>>,
+    ) {
+        let callback_started = Arc::new(Semaphore::new(0));
+        let release_callback = Arc::new(Semaphore::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .handler(
+                oid!(1, 3, 6, 1, 4, 1, 99999),
+                Arc::new(CancellationPhaseHandler {
+                    mode,
+                    callback_started: callback_started.clone(),
+                    release_callback: release_callback.clone(),
+                    calls: calls.clone(),
+                }),
+            )
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let pdu = Pdu::standard(
+            crate::pdu::StandardPduType::SetRequest,
+            1,
+            0,
+            0,
+            (1..=2)
+                .map(|index| VarBind::new(set_oid(index), Value::Integer(index as i32)))
+                .collect(),
+        );
+        let ctx = test_ctx();
+        let task_ctx = ctx.clone();
+        let task = tokio::spawn(async move { agent.dispatch_request(&task_ctx, &pdu).await });
+        (task, ctx, callback_started, release_callback, calls)
+    }
+
+    #[tokio::test]
+    async fn cooperative_cancellation_before_commit_frees_every_prepared_binding() {
+        let (task, ctx, started, release, calls) =
+            cancellation_phase_scenario(CancellationPhaseMode::PreCommit).await;
+        started.acquire().await.unwrap().forget();
+        ctx.cancellation_token().cancel();
+        release.add_permits(1);
+        let response = task.await.unwrap().unwrap();
+
+        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("free", set_oid(2)), ("free", set_oid(1))]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_undo_does_not_interrupt_rollback() {
+        let (mut task, ctx, started, release, calls) =
+            cancellation_phase_scenario(CancellationPhaseMode::Undo).await;
+        started.acquire().await.unwrap().forget();
+        ctx.cancellation_token().cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut task)
+                .await
+                .is_err()
+        );
+        release.add_permits(1);
+        let response = task.await.unwrap().unwrap();
+
+        assert_eq!(response.error_status(), ErrorStatus::CommitFailed.as_i32());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("commit", set_oid(1)),
+                ("commit", set_oid(2)),
+                ("undo", set_oid(2)),
+                ("undo", set_oid(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_finalize_does_not_interrupt_cleanup() {
+        let (mut task, ctx, started, release, calls) =
+            cancellation_phase_scenario(CancellationPhaseMode::Finalize).await;
+        started.acquire().await.unwrap().forget();
+        ctx.cancellation_token().cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut task)
+                .await
+                .is_err()
+        );
+        release.add_permits(1);
+        let response = task.await.unwrap().unwrap();
+
+        assert_eq!(response.error_status(), ErrorStatus::NoError.as_i32());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("commit", set_oid(1)),
+                ("commit", set_oid(2)),
+                ("finalize", set_oid(2)),
+                ("finalize", set_oid(1)),
+            ]
+        );
     }
 
     #[derive(Clone, Copy)]

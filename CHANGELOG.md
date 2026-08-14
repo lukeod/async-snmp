@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Agent request contexts now expose receipt/admission timestamps, an optional
+  absolute deadline measured from receipt, and level-triggered cooperative
+  cancellation. Shutdown defaults to signalling and draining dispatched work;
+  `AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter` is an explicit
+  cancellation-safety contract that can bound only GET/GETNEXT/GETBULK work.
+  SET cancellation before commit runs asynchronous cleanup, while commit,
+  rollback, and finalization remain protected and agent-owned. Live work
+  retained after a dropped `run` is observable through
+  `Agent::active_request_count` and gates a second run.
 - **Breaking:** `NotificationReceiver::recv` now returns an owning
   `ReceivedNotification` with source and wire-transmission identity. Traps have
   no acknowledgement outcome; accepted Informs report `Sent`,

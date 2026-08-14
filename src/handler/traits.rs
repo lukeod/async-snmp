@@ -40,23 +40,26 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// The explicit async terminal methods [`undo`](Self::undo), [`free`](Self::free),
 /// and [`finalize`](Self::finalize) perform protocol cleanup during normal
-/// execution. `Drop` is only a synchronous fallback for reservations and local
-/// resources if the request is cancelled or panics. It cannot await rollback
-/// and therefore cannot guarantee transactional atomicity once commit has
-/// started.
+/// execution. Cooperative request cancellation before commit runs `free`;
+/// after commit starts the Agent protects all remaining phases from its
+/// retrieval-only abort policy. `Drop` is only a synchronous fallback for a
+/// panic or an out-of-band task abort and cannot guarantee transactional
+/// atomicity once commit has started.
 ///
 /// Terminal methods must disarm the `Drop` fallback *before* creating a future
 /// that can reach an `.await`. Store fallback state in an `Option`, call
 /// `take()` synchronously in the method body, then move the taken state into
 /// the returned future. `Drop` must be idempotent when that `Option` is already
 /// empty. The agent retains the prepared object while each callback runs and
-/// drops all still-owned objects in reverse varbind order on cancellation.
+/// drops all still-owned objects in reverse varbind order on an out-of-band abort.
 pub trait PreparedSet: Send + 'static {
     /// Apply the prepared change.
     ///
     /// The agent retains ownership of this object after a successful commit so
     /// an earlier change can still be undone if a later binding fails. A
     /// failure may follow partial mutation and is followed by [`undo`](Self::undo).
+    /// A commit that cooperatively reacts to request cancellation may return a
+    /// normal failure only if it retains enough state for that undo lifecycle.
     fn commit<'a>(
         &'a mut self,
         ctx: &'a RequestContext,
@@ -66,9 +69,13 @@ pub trait PreparedSet: Send + 'static {
 
     /// Roll back an attempted commit and release its reservation.
     ///
-    /// Disarm synchronous fallback state before returning the future. On
-    /// cancellation, the future and then the still-owned prepared object are
-    /// dropped; `Drop` must tolerate the already-disarmed state.
+    /// Disarm synchronous fallback state before returning the future. On an
+    /// out-of-band task abort, the future and then the still-owned prepared
+    /// object are dropped; `Drop` must tolerate the already-disarmed state.
+    /// Agent deadline or shutdown cancellation does not interrupt this
+    /// protected callback: it must run to completion. Cleanup that performs I/O
+    /// must provide its own bounded or durable recovery mechanism rather than
+    /// abandoning rollback when the request token is cancelled.
     fn undo<'a>(
         &'a mut self,
         ctx: &'a RequestContext,
@@ -80,6 +87,9 @@ pub trait PreparedSet: Send + 'static {
     ///
     /// Disarm synchronous fallback state before returning the future. Override
     /// this when releasing a reservation must await I/O.
+    /// Agent deadline or shutdown cancellation does not interrupt this
+    /// protected callback. I/O-backed cleanup must use its own bounded or
+    /// durable recovery mechanism and still complete the ownership transfer.
     fn free<'a>(
         &'a mut self,
         _ctx: &'a RequestContext,
@@ -94,6 +104,9 @@ pub trait PreparedSet: Send + 'static {
     /// This is the successful terminal path. It does not roll back the applied
     /// value. As with `undo` and `free`, take `Option`-held fallback state
     /// synchronously before returning a future that may await.
+    /// Agent deadline or shutdown cancellation does not interrupt this
+    /// protected callback. I/O-backed cleanup must use its own bounded or
+    /// durable recovery mechanism and still complete.
     fn finalize<'a>(
         &'a mut self,
         _ctx: &'a RequestContext,
@@ -178,7 +191,7 @@ pub trait PreparedSet: Send + 'static {
 /// reservations and rollback data directly in it instead of maintaining a
 /// side table. Explicit terminal callbacks are the normal protocol cleanup.
 /// Its [`Drop`] implementation is only a synchronous, idempotent fallback when
-/// a request future is cancelled or panics; it cannot perform async rollback.
+/// a request future is externally aborted or panics; it cannot perform async rollback.
 ///
 /// By default, handlers are read-only and return [`SetTestError::NotWritable`].
 ///

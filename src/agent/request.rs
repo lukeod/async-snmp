@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 #[cfg(test)]
 use crate::Value;
 use crate::error::Result;
-use crate::handler::RequestContext;
+use crate::handler::{RequestContext, RequestLifecycle};
 use crate::message::CommunityMessage;
 use crate::pdu::{PduType, ResponsePdu};
 use crate::v3::process::{MpdCounters, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
@@ -20,18 +20,40 @@ use super::RESPONSE_OVERHEAD;
 
 impl Agent {
     /// Handle `SNMPv1` request.
+    #[cfg(test)]
     pub(super) async fn handle_v1(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
-        self.handle_community(data, source, CommunityVersion::V1)
+        self.handle_v1_with_lifecycle(data, source, RequestLifecycle::standalone())
+            .await
+    }
+
+    pub(super) async fn handle_v1_with_lifecycle(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        lifecycle: RequestLifecycle,
+    ) -> Result<Option<Bytes>> {
+        self.handle_community(data, source, CommunityVersion::V1, lifecycle)
             .await
     }
 
     /// Handle `SNMPv2c` request.
+    #[cfg(test)]
     pub(super) async fn handle_v2c(
         &self,
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<Bytes>> {
-        self.handle_community(data, source, CommunityVersion::V2c)
+        self.handle_v2c_with_lifecycle(data, source, RequestLifecycle::standalone())
+            .await
+    }
+
+    pub(super) async fn handle_v2c_with_lifecycle(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        lifecycle: RequestLifecycle,
+    ) -> Result<Option<Bytes>> {
+        self.handle_community(data, source, CommunityVersion::V2c, lifecycle)
             .await
     }
 
@@ -41,6 +63,7 @@ impl Agent {
         data: Bytes,
         source: SocketAddr,
         community_version: CommunityVersion,
+        lifecycle: RequestLifecycle,
     ) -> Result<Option<Bytes>> {
         let version = Version::from(community_version);
         let decoded = CommunityMessage::decode_with_target(
@@ -82,13 +105,14 @@ impl Agent {
         }
 
         // Build request context
-        let mut ctx = RequestContext::community(
+        let mut ctx = RequestContext::community_with_lifecycle(
             source,
             community_version,
             msg.community().clone(),
             pdu.request_id,
             pdu.pdu_type(),
             decode_anomalies,
+            lifecycle,
         );
 
         let encode = |response_pdu| {
@@ -147,7 +171,18 @@ impl Agent {
     ///
     /// USM processing (RFC 3414 Section 3.2) runs in the shared
     /// [`process_v3_inbound`] core in the authoritative role.
+    #[cfg(test)]
     pub(super) async fn handle_v3(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
+        self.handle_v3_with_lifecycle(data, source, RequestLifecycle::standalone())
+            .await
+    }
+
+    pub(super) async fn handle_v3_with_lifecycle(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        lifecycle: RequestLifecycle,
+    ) -> Result<Option<Bytes>> {
         let state = &self.inner.state;
         let (engine_boots, engine_time) = state.authoritative_boots_time()?;
         let usm_ctx = V3LocalContext {
@@ -234,7 +269,7 @@ impl Agent {
         }
 
         // Build request context
-        let mut ctx = RequestContext::usm(
+        let mut ctx = RequestContext::usm_with_lifecycle(
             source,
             usm_params.username.clone(),
             security_level,
@@ -243,6 +278,7 @@ impl Agent {
             pdu.pdu_type(),
             global_data.msg_max_size.as_usize(),
             inbound.decode_anomalies.clone(),
+            lifecycle,
         );
 
         // A successful SET echoes the request varbinds. Preserve the exact
