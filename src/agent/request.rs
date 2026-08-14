@@ -459,7 +459,7 @@ mod tests {
 
     fn encode_community_pdu(version: Version, community: &[u8], pdu: &Pdu) -> Bytes {
         let mut buf = crate::ber::EncodeBuf::new();
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             let (pdu_type, first, second) = match pdu.body {
                 crate::pdu::PduBody::Standard {
                     pdu_type,
@@ -475,14 +475,14 @@ mod tests {
                     i32::try_from(max_repetitions).unwrap(),
                 ),
             };
-            buf.try_push_constructed(pdu_type.tag(), |buf| {
+            buf.push_constructed(pdu_type.tag(), |buf| {
                 crate::varbind::encode_varbind_list(buf, &pdu.varbinds)?;
                 buf.push_integer(second);
                 buf.push_integer(first);
                 buf.push_integer(pdu.request_id);
                 Ok(())
             })?;
-            buf.push_octet_string(community);
+            buf.push_octet_string(community)?;
             buf.push_integer(version.as_i32());
             Ok(())
         })
@@ -511,10 +511,10 @@ mod tests {
 
     fn community_set_with_integer_content(version: Version, content: &[u8]) -> Bytes {
         let mut buf = crate::ber::EncodeBuf::new();
-        buf.try_push_sequence(|buf| {
-            buf.try_push_constructed(PduType::SetRequest.tag(), |buf| {
-                buf.try_push_sequence(|buf| {
-                    buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
+            buf.push_constructed(PduType::SetRequest.tag(), |buf| {
+                buf.push_sequence(|buf| {
+                    buf.push_sequence(|buf| {
                         let mut encoded = vec![crate::ber::tag::universal::INTEGER];
                         encoded.push(u8::try_from(content.len()).unwrap());
                         encoded.extend_from_slice(content);
@@ -527,7 +527,7 @@ mod tests {
                 buf.push_integer(41);
                 Ok(())
             })?;
-            buf.push_octet_string(b"public");
+            buf.push_octet_string(b"public")?;
             buf.push_integer(version.as_i32());
             Ok(())
         })

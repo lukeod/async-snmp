@@ -208,9 +208,9 @@ impl CommunityMessage {
         self.validate()?;
         let mut buf = EncodeBuf::new();
 
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             self.pdu.encode(buf, self.version)?;
-            buf.try_push_octet_string(self.community.as_bytes())?;
+            buf.push_octet_string(self.community.as_bytes())?;
             buf.push_integer(self.version.as_i32());
             Ok(())
         })?;
@@ -384,7 +384,7 @@ mod tests {
 
     fn raw_standard_message(version: Version, pdu: &Pdu) -> Bytes {
         let mut buf = EncodeBuf::new();
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             let (pdu_type, first, second) = match pdu.body {
                 crate::pdu::PduBody::Standard {
                     pdu_type,
@@ -400,14 +400,14 @@ mod tests {
                     i32::try_from(max_repetitions).unwrap(),
                 ),
             };
-            buf.try_push_constructed(pdu_type.tag(), |buf| {
+            buf.push_constructed(pdu_type.tag(), |buf| {
                 crate::varbind::encode_varbind_list(buf, &pdu.varbinds)?;
                 buf.push_integer(second);
                 buf.push_integer(first);
                 buf.push_integer(pdu.request_id);
                 Ok(())
             })?;
-            buf.push_octet_string(b"public");
+            buf.push_octet_string(b"public")?;
             buf.push_integer(version.as_i32());
             Ok(())
         })
@@ -428,10 +428,13 @@ mod tests {
                 buf.push_integer(error_index);
                 buf.push_integer(error_status);
                 buf.push_integer(1);
-            });
-            buf.push_octet_string(b"public");
+                Ok(())
+            })?;
+            buf.push_octet_string(b"public")?;
             buf.push_integer(version.as_i32());
-        });
+            Ok(())
+        })
+        .unwrap();
         buf.finish()
     }
 
@@ -488,10 +491,13 @@ mod tests {
                 && error.kind == DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: 0xbf }));
 
         let mut missing = EncodeBuf::new();
-        missing.push_sequence(|buf| {
-            buf.push_octet_string(b"public");
-            buf.push_integer(Version::V2c.as_i32());
-        });
+        missing
+            .push_sequence(|buf| {
+                buf.push_octet_string(b"public")?;
+                buf.push_integer(Version::V2c.as_i32());
+                Ok(())
+            })
+            .unwrap();
         let missing = missing.finish();
         let missing_offset = missing.len();
         let error = CommunityMessage::decode(missing).unwrap_err();
@@ -736,9 +742,11 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             trap.encode(buf).unwrap();
-            buf.push_octet_string(b"public");
+            buf.push_octet_string(b"public")?;
             buf.push_integer(Version::V2c.as_i32());
-        });
+            Ok(())
+        })
+        .unwrap();
         assert!(CommunityMessage::decode(buf.finish()).is_err());
     }
 }

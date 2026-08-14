@@ -225,10 +225,10 @@ impl MsgGlobalData {
     /// Encode to buffer after revalidating all construction invariants.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.validate()?;
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             buf.push_integer(self.msg_security_model.as_i32());
             // msgFlags is a 1-byte OCTET STRING
-            buf.try_push_octet_string(&[self.msg_flags.to_byte()])?;
+            buf.push_octet_string(&[self.msg_flags.to_byte()])?;
             buf.push_integer(self.msg_max_size.as_i32());
             buf.push_integer(self.msg_id);
             Ok(())
@@ -331,11 +331,11 @@ impl ScopedPdu {
     /// Encode to buffer after applying SNMPv3 outbound PDU validation.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.validate_outbound()?;
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             self.pdu
                 .encode_for(buf, crate::Version::V3, self.pdu.outbound_direction())?;
-            buf.try_push_octet_string(&self.context_name)?;
-            buf.try_push_octet_string(&self.context_engine_id)?;
+            buf.push_octet_string(&self.context_name)?;
+            buf.push_octet_string(&self.context_engine_id)?;
             Ok(())
         })
     }
@@ -612,15 +612,15 @@ impl V3Message {
         self.validate_outbound()?;
         let mut buf = EncodeBuf::new();
 
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             // msgData
             match &self.data {
                 V3MessageData::Plaintext(scoped_pdu) => scoped_pdu.encode(buf)?,
-                V3MessageData::Encrypted(ciphertext) => buf.try_push_octet_string(ciphertext)?,
+                V3MessageData::Encrypted(ciphertext) => buf.push_octet_string(ciphertext)?,
             }
 
             // msgSecurityParameters (as OCTET STRING)
-            buf.try_push_octet_string(&self.security_params)?;
+            buf.push_octet_string(&self.security_params)?;
 
             // msgGlobalData
             self.global_data.encode(buf)?;
@@ -1057,18 +1057,19 @@ mod tests {
         let security_params = no_auth_security_params();
         let varbinds = [crate::VarBind::null(oid!(1, 3, 6, 1))];
         let mut buf = EncodeBuf::new();
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             buf.push_sequence(|buf| {
                 buf.push_constructed(crate::ber::tag::pdu::RESPONSE, |buf| {
                     crate::varbind::encode_varbind_list(buf, &varbinds).unwrap();
                     buf.push_integer(0);
                     buf.push_integer(crate::ErrorStatus::TooBig.as_i32());
                     buf.push_integer(1);
-                });
-                buf.push_octet_string(b"");
-                buf.push_octet_string(b"engine");
-            });
-            buf.try_push_octet_string(&security_params)?;
+                    Ok(())
+                })?;
+                buf.push_octet_string(b"")?;
+                buf.push_octet_string(b"engine")
+            })?;
+            buf.push_octet_string(&security_params)?;
             global.encode(buf)?;
             buf.push_integer(3);
             Ok(())
@@ -1277,9 +1278,9 @@ mod tests {
         let scoped = ScopedPdu::with_empty_context(Pdu::get_request(42, &[]));
         let mut encoded = EncodeBuf::new();
         encoded
-            .try_push_sequence(|buf| {
+            .push_sequence(|buf| {
                 scoped.encode(buf)?;
-                buf.try_push_octet_string(&security_params)?;
+                buf.push_octet_string(&security_params)?;
                 global.encode(buf)?;
                 buf.push_integer(3);
                 Ok(())
@@ -1441,10 +1442,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             push_integer_content(buf, security_model);
-            buf.push_octet_string(&[0x04]);
+            buf.push_octet_string(&[0x04])?;
             push_integer_content(buf, msg_max_size);
             push_integer_content(buf, msg_id);
-        });
+            Ok(())
+        })
+        .unwrap();
         buf.finish()
     }
 
@@ -1568,8 +1571,9 @@ mod tests {
             // msgData: structurally a SEQUENCE TLV, but garbage inside
             buf.push_sequence(|buf| {
                 buf.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]);
-            });
-            buf.push_octet_string(b"usm-params");
+                Ok(())
+            })?;
+            buf.push_octet_string(b"usm-params")?;
             MsgGlobalData::new(
                 7,
                 crate::MessageSize::new(65507).unwrap(),
@@ -1579,7 +1583,9 @@ mod tests {
             .encode(buf)
             .unwrap();
             buf.push_integer(3);
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         assert!(
@@ -1611,11 +1617,13 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             scoped.encode(buf).unwrap();
-            buf.push_octet_string(&security_params);
+            buf.push_octet_string(&security_params)?;
             global.encode(buf).unwrap();
             // 2^32 + 3 previously narrowed to the accepted v3 value.
             push_integer_content(buf, &[0x01, 0x00, 0x00, 0x00, 0x03]);
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         assert!(V3Message::decode(encoded.clone()).is_err());
@@ -1748,13 +1756,16 @@ mod tests {
 
         // Encode an extra INTEGER after msgData inside the outer sequence.
         let mut with_outer_field = EncodeBuf::new();
-        with_outer_field.push_sequence(|buf| {
-            buf.push_integer(99);
-            scoped.encode(buf).unwrap();
-            buf.push_octet_string(&no_auth_security_params());
-            global.encode(buf).unwrap();
-            buf.push_integer(3);
-        });
+        with_outer_field
+            .push_sequence(|buf| {
+                buf.push_integer(99);
+                scoped.encode(buf).unwrap();
+                buf.push_octet_string(&no_auth_security_params())?;
+                global.encode(buf).unwrap();
+                buf.push_integer(3);
+                Ok(())
+            })
+            .unwrap();
         let with_outer_field = with_outer_field.finish();
         assert!(RawV3Message::decode(with_outer_field.clone()).is_err());
         assert!(V3Message::decode(with_outer_field.clone()).is_err());
@@ -1762,18 +1773,22 @@ mod tests {
 
         // Encode an extra INTEGER inside msgGlobalData.
         let mut with_global_field = EncodeBuf::new();
-        with_global_field.push_sequence(|buf| {
-            scoped.encode(buf).unwrap();
-            buf.push_octet_string(&no_auth_security_params());
-            buf.push_sequence(|buf| {
-                buf.push_integer(99);
-                buf.push_integer(V3SecurityModel::Usm.as_i32());
-                buf.push_octet_string(&[0]);
-                buf.push_integer(1472);
-                buf.push_integer(17);
-            });
-            buf.push_integer(3);
-        });
+        with_global_field
+            .push_sequence(|buf| {
+                scoped.encode(buf).unwrap();
+                buf.push_octet_string(&no_auth_security_params())?;
+                buf.push_sequence(|buf| {
+                    buf.push_integer(99);
+                    buf.push_integer(V3SecurityModel::Usm.as_i32());
+                    buf.push_octet_string(&[0])?;
+                    buf.push_integer(1472);
+                    buf.push_integer(17);
+                    Ok(())
+                })?;
+                buf.push_integer(3);
+                Ok(())
+            })
+            .unwrap();
         let with_global_field = with_global_field.finish();
         assert!(RawV3Message::decode(with_global_field.clone()).is_err());
         assert!(V3Message::decode(with_global_field.clone()).is_err());
@@ -1879,9 +1894,10 @@ mod tests {
         buf.push_sequence(|buf| {
             buf.push_integer(99);
             pdu.encode(buf).unwrap();
-            buf.push_octet_string(b"ctx");
-            buf.push_octet_string(b"engine");
-        });
+            buf.push_octet_string(b"ctx")?;
+            buf.push_octet_string(b"engine")
+        })
+        .unwrap();
 
         let mut decoder = Decoder::new(buf.finish());
         assert!(ScopedPdu::decode(&mut decoder).is_err());
@@ -1946,10 +1962,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(V3SecurityModel::Usm.as_i32());
-            buf.push_octet_string(&[MsgFlags::new(SecurityLevel::NoAuthNoPriv, true).to_byte()]);
+            buf.push_octet_string(&[MsgFlags::new(SecurityLevel::NoAuthNoPriv, true).to_byte()])?;
             buf.push_integer(400);
             buf.push_integer(100);
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -1993,10 +2011,12 @@ mod tests {
             let mut buf = EncodeBuf::new();
             buf.push_sequence(|buf| {
                 buf.push_integer(model);
-                buf.push_octet_string(&[0x04]);
+                buf.push_octet_string(&[0x04])?;
                 buf.push_integer(1472);
                 buf.push_integer(100);
-            });
+                Ok(())
+            })
+            .unwrap();
 
             let mut decoder = Decoder::new(buf.finish());
             assert!(matches!(
@@ -2033,10 +2053,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // Usm
-            buf.push_octet_string(&[]); // zero-length msgFlags
+            buf.push_octet_string(&[])?; // zero-length msgFlags
             buf.push_integer(1472); // msg_max_size
             buf.push_integer(100); // msg_id
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -2053,10 +2075,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // Usm
-            buf.push_octet_string(&[0x04, 0x00]); // two-byte msgFlags
+            buf.push_octet_string(&[0x04, 0x00])?; // two-byte msgFlags
             buf.push_integer(1472); // msg_max_size
             buf.push_integer(100); // msg_id
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -2073,10 +2097,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // Usm
-            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
+            buf.push_octet_string(&[0x04])?; // reportable, noAuthNoPriv
             buf.push_integer(1472); // msg_max_size
             buf.push_integer(100); // msg_id
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -2121,10 +2147,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // USM security model
-            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
+            buf.push_octet_string(&[0x04])?; // reportable, noAuthNoPriv
             buf.push_integer(1472); // valid msg_max_size
             buf.push_integer(-1); // negative msg_id
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -2141,10 +2169,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // USM security model
-            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
+            buf.push_octet_string(&[0x04])?; // reportable, noAuthNoPriv
             buf.push_integer(-1); // negative msg_max_size (would be > 2^31-1 unsigned)
             buf.push_integer(100); // valid msg_id
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -2160,10 +2190,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // USM
-            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
+            buf.push_octet_string(&[0x04])?; // reportable, noAuthNoPriv
             buf.push_integer(1472); // valid msg_max_size
             buf.push_integer(0); // msg_id at lower bound
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -2178,10 +2210,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // USM
-            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
+            buf.push_octet_string(&[0x04])?; // reportable, noAuthNoPriv
             buf.push_integer(1472); // valid msg_max_size
             buf.push_integer(i32::MAX); // msg_id at upper bound (2147483647)
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);
@@ -2196,10 +2230,12 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
             buf.push_integer(3); // USM
-            buf.push_octet_string(&[0x04]); // reportable, noAuthNoPriv
+            buf.push_octet_string(&[0x04])?; // reportable, noAuthNoPriv
             buf.push_integer(i32::MAX); // msg_max_size at upper bound (2147483647)
             buf.push_integer(100); // valid msg_id
-        });
+            Ok(())
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let mut decoder = Decoder::new(encoded);

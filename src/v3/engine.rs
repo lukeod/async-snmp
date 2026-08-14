@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -560,21 +561,6 @@ struct EngineCacheInner {
     authenticated_times: HashMap<Bytes, AuthenticatedEngineTime>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EngineCacheAccessError {
-    Poisoned,
-}
-
-impl EngineCacheAccessError {
-    pub(crate) fn into_public(self) -> Box<Error> {
-        match self {
-            Self::Poisoned => Error::Config("engine cache lock poisoned".into()).boxed(),
-        }
-    }
-}
-
-type CacheResult<T> = std::result::Result<T, EngineCacheAccessError>;
-
 #[derive(Debug)]
 enum StoreOutcome {
     Stored(EngineState),
@@ -627,6 +613,14 @@ pub(crate) enum TimelinessPublicationOutcome {
 /// The cache is unbounded by default. Applications that need a fixed bound can
 /// use [`with_max_capacity`](Self::with_max_capacity), which evicts the oldest
 /// entry when inserting at capacity.
+///
+/// # Panic recovery
+///
+/// Cache mutations are unwind-safe. If a mutation panics, or a previously
+/// poisoned writer is detected, target mappings and authenticated-time
+/// high-water state are cleared together before later operations proceed. The
+/// panicking call still unwinds. [`recovery_count`](Self::recovery_count)
+/// reports how many recoveries have completed.
 ///
 /// # Trust boundary
 ///
@@ -695,8 +689,11 @@ pub(crate) enum TimelinessPublicationOutcome {
 #[derive(Debug)]
 pub struct EngineCache {
     inner: RwLock<EngineCacheInner>,
+    recoveries: AtomicU64,
     max_capacity: Option<usize>,
     ttl: Duration,
+    #[cfg(test)]
+    panic_stage: std::sync::atomic::AtomicU8,
 }
 
 impl Default for EngineCache {
@@ -711,8 +708,65 @@ impl EngineCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(EngineCacheInner::default()),
+            recoveries: AtomicU64::new(0),
             max_capacity: None,
             ttl: DEFAULT_ENGINE_CACHE_TTL,
+            #[cfg(test)]
+            panic_stage: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    fn record_recovery(&self) {
+        let _ = self
+            .recoveries
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            });
+    }
+
+    fn clear_inner(inner: &mut EngineCacheInner) {
+        inner.targets.clear();
+        inner.authenticated_times.clear();
+    }
+
+    fn with_inner<R>(&self, mutation: impl FnOnce(&mut EngineCacheInner) -> R) -> R {
+        let mut inner = match self.inner.write() {
+            Ok(inner) => inner,
+            Err(poisoned) => {
+                let mut inner = poisoned.into_inner();
+                Self::clear_inner(&mut inner);
+                self.record_recovery();
+                self.inner.clear_poison();
+                inner
+            }
+        };
+
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mutation(&mut inner))) {
+            Ok(result) => result,
+            Err(payload) => {
+                Self::clear_inner(&mut inner);
+                self.record_recovery();
+                drop(inner);
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    /// Return the number of cache recoveries completed after a mutation panic
+    /// or detection of a previously poisoned writer.
+    #[must_use]
+    pub fn recovery_count(&self) -> u64 {
+        self.recoveries.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn mutation_checkpoint(&self, stage: CacheMutationStage) {
+        if self
+            .panic_stage
+            .compare_exchange(stage as u8, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            panic!("injected engine cache mutation panic at {stage:?}");
         }
     }
 
@@ -736,25 +790,14 @@ impl EngineCache {
     /// Returns `None` if the entry does not exist or has expired.
     /// Expired entries are removed from the cache.
     pub fn get(&self, target: &SocketAddr) -> Option<EngineState> {
-        self.get_result_at(target, Instant::now()).ok().flatten()
+        self.get_at(target, Instant::now())
     }
 
-    #[cfg(test)]
     fn get_at(&self, target: &SocketAddr, now: Instant) -> Option<EngineState> {
-        self.get_result_at(target, now).ok().flatten()
-    }
-
-    pub(crate) fn get_result(&self, target: &SocketAddr) -> CacheResult<Option<EngineState>> {
-        self.get_result_at(target, Instant::now())
-    }
-
-    fn get_result_at(&self, target: &SocketAddr, now: Instant) -> CacheResult<Option<EngineState>> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| EngineCacheAccessError::Poisoned)?;
-        expire_target_if_needed(&mut inner, target, now, self.ttl);
-        Ok(compose_cached_state(&inner, target))
+        self.with_inner(|inner| {
+            self.expire_target_if_needed(inner, target, now);
+            compose_cached_state(inner, target)
+        })
     }
 
     /// Store a validated, unauthenticated discovery identity for a target.
@@ -764,9 +807,7 @@ impl EngineCache {
     pub fn insert_discovered(&self, target: SocketAddr, engine: DiscoveredEngine) -> Result<()> {
         let expected_engine_id = engine.engine_id.clone();
         let state = EngineState::from_discovery(engine.engine_id, engine.msg_max_size);
-        let outcome = self
-            .store_at(target, state, Instant::now(), false)
-            .map_err(EngineCacheAccessError::into_public)?;
+        let outcome = self.store_at(target, state, Instant::now(), false);
         match outcome {
             StoreOutcome::Stored(stored) if stored.engine_id() == &expected_engine_id => Ok(()),
             StoreOutcome::IdentityConflict(_) | StoreOutcome::Stored(_) => Err(Error::Config(
@@ -776,23 +817,13 @@ impl EngineCache {
         }
     }
 
-    pub(crate) fn insert_state(
-        &self,
-        target: SocketAddr,
-        state: EngineState,
-    ) -> Result<EngineState> {
+    pub(crate) fn insert_state(&self, target: SocketAddr, state: EngineState) -> EngineState {
         self.insert_state_at(target, state, Instant::now())
-            .map_err(EngineCacheAccessError::into_public)
     }
 
-    fn insert_state_at(
-        &self,
-        target: SocketAddr,
-        state: EngineState,
-        now: Instant,
-    ) -> CacheResult<EngineState> {
-        match self.store_at(target, state, now, false)? {
-            StoreOutcome::Stored(state) | StoreOutcome::IdentityConflict(state) => Ok(state),
+    fn insert_state_at(&self, target: SocketAddr, state: EngineState, now: Instant) -> EngineState {
+        match self.store_at(target, state, now, false) {
+            StoreOutcome::Stored(state) | StoreOutcome::IdentityConflict(state) => state,
         }
     }
 
@@ -805,9 +836,8 @@ impl EngineCache {
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid engine ID, boots or time above
-    /// `MAX_ENGINE_TIME`, or a poisoned cache
-    /// lock.
+    /// Returns an error for an invalid engine ID or boots/time above
+    /// `MAX_ENGINE_TIME`.
     pub fn seed_authenticated(
         &self,
         target: SocketAddr,
@@ -823,9 +853,7 @@ impl EngineCache {
             engine_time,
             engine.msg_max_size,
         );
-        let outcome = self
-            .store_at(target, state, Instant::now(), false)
-            .map_err(EngineCacheAccessError::into_public)?;
+        let outcome = self.store_at(target, state, Instant::now(), false);
         match outcome {
             StoreOutcome::Stored(stored) if stored.engine_id() == &expected_engine_id => Ok(()),
             StoreOutcome::IdentityConflict(_) | StoreOutcome::Stored(_) => Err(Error::Config(
@@ -843,16 +871,9 @@ impl EngineCache {
     /// in flight; subsequent ordinary inserts cannot replace the new mapping.
     /// The returned state includes authenticated time already shared under the new
     /// authoritative engine ID.
-    pub(crate) fn replace_target(
-        &self,
-        target: SocketAddr,
-        state: EngineState,
-    ) -> Result<EngineState> {
-        match self
-            .store_at(target, state, Instant::now(), true)
-            .map_err(EngineCacheAccessError::into_public)?
-        {
-            StoreOutcome::Stored(state) => Ok(state),
+    pub(crate) fn replace_target(&self, target: SocketAddr, state: EngineState) -> EngineState {
+        match self.store_at(target, state, Instant::now(), true) {
+            StoreOutcome::Stored(state) => state,
             StoreOutcome::IdentityConflict(_) => {
                 unreachable!("explicit replacement cannot report an identity conflict")
             }
@@ -865,70 +886,77 @@ impl EngineCache {
         state: EngineState,
         now: Instant,
         replace_identity: bool,
-    ) -> CacheResult<StoreOutcome> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| EngineCacheAccessError::Poisoned)?;
+    ) -> StoreOutcome {
+        self.with_inner(|inner| {
+            self.expire_target_if_needed(inner, &target, now);
 
-        expire_target_if_needed(&mut inner, &target, now, self.ttl);
+            if !replace_identity
+                && let Some(existing) = inner.targets.get(&target)
+                && existing.engine_id != *state.engine_id()
+            {
+                return StoreOutcome::IdentityConflict(
+                    compose_cached_state(inner, &target)
+                        .expect("existing target must compose into cached state"),
+                );
+            }
 
-        if !replace_identity
-            && let Some(existing) = inner.targets.get(&target)
-            && existing.engine_id != *state.engine_id()
-        {
-            return Ok(StoreOutcome::IdentityConflict(
-                compose_cached_state(&inner, &target)
-                    .expect("existing target must compose into cached state"),
-            ));
-        }
+            let evicted = if let Some(cap) = self.max_capacity
+                && !inner.targets.contains_key(&target)
+                && inner.targets.len() >= cap
+            {
+                inner
+                    .targets
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.refreshed_at)
+                    .map(|(target, cached)| (*target, cached.engine_id.clone()))
+            } else {
+                None
+            };
 
-        let evicted = if let Some(cap) = self.max_capacity
-            && !inner.targets.contains_key(&target)
-            && inner.targets.len() >= cap
-        {
-            inner
+            let replaced_engine = inner
                 .targets
-                .iter()
-                .min_by_key(|(_, cached)| cached.refreshed_at)
-                .map(|(target, cached)| (*target, cached.engine_id.clone()))
-        } else {
-            None
-        };
-
-        let replaced_engine = inner
-            .targets
-            .get(&target)
-            .filter(|cached| cached.engine_id != *state.engine_id())
-            .map(|cached| cached.engine_id.clone());
-        if let Some(authenticated) = &state.authenticated_time {
-            merge_authenticated_time(
-                &mut inner.authenticated_times,
-                state.engine_id(),
-                authenticated,
+                .get(&target)
+                .filter(|cached| cached.engine_id != *state.engine_id())
+                .map(|cached| cached.engine_id.clone());
+            if let Some(authenticated) = &state.authenticated_time {
+                merge_authenticated_time(
+                    &mut inner.authenticated_times,
+                    state.engine_id(),
+                    authenticated,
+                );
+                #[cfg(test)]
+                self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeStored);
+            }
+            let engine_id = state.discovered.engine_id;
+            let msg_max_size = state.discovered.msg_max_size;
+            inner.targets.insert(
+                target,
+                CachedTarget {
+                    engine_id,
+                    msg_max_size,
+                    refreshed_at: now,
+                },
             );
-        }
-        let engine_id = state.discovered.engine_id;
-        let msg_max_size = state.discovered.msg_max_size;
-        inner.targets.insert(
-            target,
-            CachedTarget {
-                engine_id,
-                msg_max_size,
-                refreshed_at: now,
-            },
-        );
-        if let Some((oldest_target, oldest_engine)) = evicted {
-            inner.targets.remove(&oldest_target);
-            remove_orphaned_time(&mut inner, &oldest_engine);
-        }
-        if let Some(replaced_engine) = replaced_engine {
-            remove_orphaned_time(&mut inner, &replaced_engine);
-        }
-        Ok(StoreOutcome::Stored(
-            compose_cached_state(&inner, &target)
-                .expect("stored target must compose into cached state"),
-        ))
+            #[cfg(test)]
+            self.mutation_checkpoint(CacheMutationStage::TargetStored);
+            if let Some((oldest_target, oldest_engine)) = evicted {
+                inner.targets.remove(&oldest_target);
+                #[cfg(test)]
+                self.mutation_checkpoint(CacheMutationStage::TargetRemoved);
+                remove_orphaned_time(inner, &oldest_engine);
+                #[cfg(test)]
+                self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeRemoved);
+            }
+            if let Some(replaced_engine) = replaced_engine {
+                remove_orphaned_time(inner, &replaced_engine);
+                #[cfg(test)]
+                self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeRemoved);
+            }
+            StoreOutcome::Stored(
+                compose_cached_state(inner, &target)
+                    .expect("stored target must compose into cached state"),
+            )
+        })
     }
 
     /// Update time after internal processing authenticated the message and
@@ -946,30 +974,31 @@ impl EngineCache {
         response_time: u32,
         now: Instant,
     ) -> bool {
-        let Ok(mut inner) = self.inner.write() else {
-            return false;
-        };
-        let Some(engine_id) = inner
-            .targets
-            .get(target)
-            .map(|cached| cached.engine_id.clone())
-        else {
-            return false;
-        };
-        let changed = match inner.authenticated_times.get_mut(&engine_id) {
-            Some(time) => time.update_at(response_boots, response_time, now),
-            None => {
-                inner.authenticated_times.insert(
-                    engine_id,
-                    AuthenticatedEngineTime::new_at(response_boots, response_time, now),
-                );
-                true
+        self.with_inner(|inner| {
+            let Some(engine_id) = inner
+                .targets
+                .get(target)
+                .map(|cached| cached.engine_id.clone())
+            else {
+                return false;
+            };
+            let changed = match inner.authenticated_times.get_mut(&engine_id) {
+                Some(time) => time.update_at(response_boots, response_time, now),
+                None => {
+                    inner.authenticated_times.insert(
+                        engine_id,
+                        AuthenticatedEngineTime::new_at(response_boots, response_time, now),
+                    );
+                    true
+                }
+            };
+            #[cfg(test)]
+            self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeStored);
+            if let Some(cached) = inner.targets.get_mut(target) {
+                cached.refreshed_at = now;
             }
-        };
-        if let Some(cached) = inner.targets.get_mut(target) {
-            cached.refreshed_at = now;
-        }
-        changed
+            changed
+        })
     }
 
     /// Atomically apply authenticated timeliness processing to shared state.
@@ -987,7 +1016,7 @@ impl EngineCache {
         engine_id: &[u8],
         msg_boots: u32,
         msg_time: u32,
-    ) -> CacheResult<TimelinessPublicationOutcome> {
+    ) -> TimelinessPublicationOutcome {
         self.check_and_update_timeliness_at(
             target,
             local_state,
@@ -1011,7 +1040,7 @@ impl EngineCache {
         engine_id: &[u8],
         msg_boots: u32,
         msg_time: u32,
-    ) -> CacheResult<TimelinessCandidateOutcome> {
+    ) -> TimelinessCandidateOutcome {
         self.timeliness_candidate_at(
             target,
             local_state,
@@ -1030,47 +1059,41 @@ impl EngineCache {
         msg_boots: u32,
         msg_time: u32,
         now: Instant,
-    ) -> CacheResult<TimelinessCandidateOutcome> {
+    ) -> TimelinessCandidateOutcome {
         if local_state.engine_id().as_ref() != engine_id {
-            return Ok(TimelinessCandidateOutcome::IdentityConflict);
+            return TimelinessCandidateOutcome::IdentityConflict;
         }
 
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| EngineCacheAccessError::Poisoned)?;
-        expire_target_if_needed(&mut inner, target, now, self.ttl);
+        self.with_inner(|inner| {
+            self.expire_target_if_needed(inner, target, now);
 
-        let Some(cached_engine_id) = inner
-            .targets
-            .get(target)
-            .map(|cached| cached.engine_id.clone())
-        else {
-            let mut candidate = local_state.clone();
-            return Ok(
-                if candidate.check_and_update_timeliness_at(msg_boots, msg_time, now) {
+            let Some(cached_engine_id) = inner
+                .targets
+                .get(target)
+                .map(|cached| cached.engine_id.clone())
+            else {
+                let mut candidate = local_state.clone();
+                return if candidate.check_and_update_timeliness_at(msg_boots, msg_time, now) {
                     TimelinessCandidateOutcome::MissingMapping
                 } else {
                     TimelinessCandidateOutcome::Stale
-                },
-            );
-        };
-        if cached_engine_id.as_ref() != engine_id {
-            return Ok(TimelinessCandidateOutcome::IdentityConflict);
-        }
+                };
+            };
+            if cached_engine_id.as_ref() != engine_id {
+                return TimelinessCandidateOutcome::IdentityConflict;
+            }
 
-        let mut candidate = local_state.clone();
-        candidate.merge_from(
-            &compose_cached_state(&inner, target)
-                .expect("existing target must compose into cached state"),
-        );
-        Ok(
+            let mut candidate = local_state.clone();
+            candidate.merge_from(
+                &compose_cached_state(inner, target)
+                    .expect("existing target must compose into cached state"),
+            );
             if candidate.check_and_update_timeliness_at(msg_boots, msg_time, now) {
                 TimelinessCandidateOutcome::Timely
             } else {
                 TimelinessCandidateOutcome::Stale
-            },
-        )
+            }
+        })
     }
 
     fn check_and_update_timeliness_at(
@@ -1081,111 +1104,126 @@ impl EngineCache {
         msg_boots: u32,
         msg_time: u32,
         now: Instant,
-    ) -> CacheResult<TimelinessPublicationOutcome> {
+    ) -> TimelinessPublicationOutcome {
         if local_state.engine_id().as_ref() != engine_id {
-            return Ok(TimelinessPublicationOutcome::IdentityConflict);
+            return TimelinessPublicationOutcome::IdentityConflict;
         }
 
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| EngineCacheAccessError::Poisoned)?;
-        expire_target_if_needed(&mut inner, target, now, self.ttl);
+        self.with_inner(|inner| {
+            self.expire_target_if_needed(inner, target, now);
 
-        let mapping_missing = match inner.targets.get(target) {
-            Some(cached) if cached.engine_id.as_ref() != engine_id => {
-                return Ok(TimelinessPublicationOutcome::IdentityConflict);
+            let mapping_missing = match inner.targets.get(target) {
+                Some(cached) if cached.engine_id.as_ref() != engine_id => {
+                    return TimelinessPublicationOutcome::IdentityConflict;
+                }
+                Some(_) => false,
+                None => true,
+            };
+
+            let engine_id = local_state.engine_id().clone();
+            let mut state = local_state.clone();
+            if let Some(shared_time) = inner.authenticated_times.get(&engine_id) {
+                state.merge_from(&EngineState {
+                    discovered: state.discovered.clone(),
+                    authenticated_time: Some(shared_time.clone()),
+                });
             }
-            Some(_) => false,
-            None => true,
-        };
 
-        let engine_id = local_state.engine_id().clone();
-        let mut state = local_state.clone();
-        if let Some(shared_time) = inner.authenticated_times.get(&engine_id) {
-            state.merge_from(&EngineState {
-                discovered: state.discovered.clone(),
-                authenticated_time: Some(shared_time.clone()),
-            });
-        }
+            let timely = state.check_and_update_timeliness_at(msg_boots, msg_time, now);
+            if let Some(authenticated) = &state.authenticated_time {
+                merge_authenticated_time(&mut inner.authenticated_times, &engine_id, authenticated);
+                #[cfg(test)]
+                self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeStored);
+            }
 
-        let timely = state.check_and_update_timeliness_at(msg_boots, msg_time, now);
-        if let Some(authenticated) = &state.authenticated_time {
-            merge_authenticated_time(&mut inner.authenticated_times, &engine_id, authenticated);
-        }
-
-        if timely {
-            if mapping_missing {
-                let evicted = if let Some(cap) = self.max_capacity
-                    && inner.targets.len() >= cap
-                {
+            if timely {
+                if mapping_missing {
+                    let evicted = if let Some(cap) = self.max_capacity
+                        && inner.targets.len() >= cap
+                    {
+                        inner
+                            .targets
+                            .iter()
+                            .min_by_key(|(_, cached)| cached.refreshed_at)
+                            .map(|(target, cached)| (*target, cached.engine_id.clone()))
+                    } else {
+                        None
+                    };
+                    inner.targets.insert(
+                        *target,
+                        CachedTarget {
+                            engine_id: engine_id.clone(),
+                            msg_max_size: local_state.msg_max_size(),
+                            refreshed_at: now,
+                        },
+                    );
+                    #[cfg(test)]
+                    self.mutation_checkpoint(CacheMutationStage::TargetStored);
+                    if let Some((oldest_target, oldest_engine)) = evicted {
+                        inner.targets.remove(&oldest_target);
+                        #[cfg(test)]
+                        self.mutation_checkpoint(CacheMutationStage::TargetRemoved);
+                        remove_orphaned_time(inner, &oldest_engine);
+                        #[cfg(test)]
+                        self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeRemoved);
+                    }
+                } else {
                     inner
                         .targets
-                        .iter()
-                        .min_by_key(|(_, cached)| cached.refreshed_at)
-                        .map(|(target, cached)| (*target, cached.engine_id.clone()))
-                } else {
-                    None
-                };
-                inner.targets.insert(
-                    *target,
-                    CachedTarget {
-                        engine_id: engine_id.clone(),
-                        msg_max_size: local_state.msg_max_size(),
-                        refreshed_at: now,
-                    },
-                );
-                if let Some((oldest_target, oldest_engine)) = evicted {
-                    inner.targets.remove(&oldest_target);
-                    remove_orphaned_time(&mut inner, &oldest_engine);
+                        .get_mut(target)
+                        .expect("current target mapping must remain present")
+                        .refreshed_at = now;
                 }
-            } else {
-                inner
-                    .targets
-                    .get_mut(target)
-                    .expect("current target mapping must remain present")
-                    .refreshed_at = now;
+
+                let state = compose_cached_state(inner, target)
+                    .expect("published target must compose into cached state");
+                return if mapping_missing {
+                    TimelinessPublicationOutcome::RestoredMapping(state)
+                } else {
+                    TimelinessPublicationOutcome::Published(state)
+                };
             }
 
-            let state = compose_cached_state(&inner, target)
-                .expect("published target must compose into cached state");
-            return Ok(if mapping_missing {
-                TimelinessPublicationOutcome::RestoredMapping(state)
+            if mapping_missing {
+                remove_orphaned_time(inner, &engine_id);
+                #[cfg(test)]
+                self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeRemoved);
             } else {
-                TimelinessPublicationOutcome::Published(state)
-            });
-        }
-
-        if mapping_missing {
-            remove_orphaned_time(&mut inner, &engine_id);
-        } else {
-            state = compose_cached_state(&inner, target)
-                .expect("existing target must compose into cached state");
-        }
-        Ok(TimelinessPublicationOutcome::Stale(state))
+                state = compose_cached_state(inner, target)
+                    .expect("existing target must compose into cached state");
+            }
+            TimelinessPublicationOutcome::Stale(state)
+        })
     }
 
     /// Remove cached identity for a target. Shared authenticated time remains while
     /// another target still maps to the same authoritative engine.
     pub fn remove(&self, target: &SocketAddr) -> Option<EngineState> {
-        let mut inner = self.inner.write().ok()?;
-        let state = compose_cached_state(&inner, target)?;
-        let cached = inner.targets.remove(target)?;
-        remove_orphaned_time(&mut inner, &cached.engine_id);
-        Some(state)
+        self.with_inner(|inner| {
+            let state = compose_cached_state(inner, target)?;
+            let cached = inner.targets.remove(target)?;
+            #[cfg(test)]
+            self.mutation_checkpoint(CacheMutationStage::TargetRemoved);
+            remove_orphaned_time(inner, &cached.engine_id);
+            #[cfg(test)]
+            self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeRemoved);
+            Some(state)
+        })
     }
 
     /// Clear all cached identities and authenticated time.
     pub fn clear(&self) {
-        if let Ok(mut inner) = self.inner.write() {
+        self.with_inner(|inner| {
             inner.targets.clear();
+            #[cfg(test)]
+            self.mutation_checkpoint(CacheMutationStage::TargetsCleared);
             inner.authenticated_times.clear();
-        }
+        });
     }
 
     /// Get the number of cached target identities (including expired entries).
     pub fn len(&self) -> usize {
-        self.inner.read().map_or(0, |inner| inner.targets.len())
+        self.with_inner(|inner| inner.targets.len())
     }
 
     /// Check if the cache is empty.
@@ -1201,6 +1239,44 @@ impl EngineCache {
         }));
         assert!(self.inner.is_poisoned());
     }
+
+    #[cfg(test)]
+    fn inject_panic_at(&self, stage: CacheMutationStage) {
+        self.panic_stage.store(stage as u8, Ordering::Relaxed);
+    }
+
+    fn expire_target_if_needed(
+        &self,
+        inner: &mut EngineCacheInner,
+        target: &SocketAddr,
+        now: Instant,
+    ) {
+        let expired_engine = inner.targets.get(target).and_then(|cached| {
+            (now.checked_duration_since(cached.refreshed_at)
+                .unwrap_or_default()
+                > self.ttl)
+                .then(|| cached.engine_id.clone())
+        });
+        if let Some(engine_id) = expired_engine {
+            inner.targets.remove(target);
+            #[cfg(test)]
+            self.mutation_checkpoint(CacheMutationStage::TargetRemoved);
+            remove_orphaned_time(inner, &engine_id);
+            #[cfg(test)]
+            self.mutation_checkpoint(CacheMutationStage::AuthenticatedTimeRemoved);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum CacheMutationStage {
+    AuthenticatedTimeStored = 1,
+    TargetStored = 2,
+    TargetRemoved = 3,
+    AuthenticatedTimeRemoved = 4,
+    TargetsCleared = 5,
 }
 
 fn compose_cached_state(inner: &EngineCacheInner, target: &SocketAddr) -> Option<EngineState> {
@@ -1240,24 +1316,6 @@ fn remove_orphaned_time(inner: &mut EngineCacheInner, engine_id: &Bytes) {
         .any(|cached| cached.engine_id == engine_id)
     {
         inner.authenticated_times.remove(engine_id);
-    }
-}
-
-fn expire_target_if_needed(
-    inner: &mut EngineCacheInner,
-    target: &SocketAddr,
-    now: Instant,
-    ttl: Duration,
-) {
-    let expired_engine = inner.targets.get(target).and_then(|cached| {
-        (now.checked_duration_since(cached.refreshed_at)
-            .unwrap_or_default()
-            > ttl)
-            .then(|| cached.engine_id.clone())
-    });
-    if let Some(engine_id) = expired_engine {
-        inner.targets.remove(target);
-        remove_orphaned_time(inner, &engine_id);
     }
 }
 
@@ -1791,7 +1849,7 @@ mod tests {
 
         // Insert
         let state = EngineState::new(Bytes::from_static(b"engine1"), 1, 1000);
-        cache.insert_state(addr, state).unwrap();
+        cache.insert_state(addr, state);
 
         assert_eq!(cache.len(), 1);
         assert!(!cache.is_empty());
@@ -1894,12 +1952,16 @@ mod tests {
     }
 
     #[test]
-    fn discovery_insert_reports_poison_as_local_configuration_error() {
+    fn public_insert_recovers_a_poisoned_cache() {
         let cache = EngineCache::new();
         let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        cache.insert_state(
+            addr,
+            EngineState::new(Bytes::from_static(b"previous-engine"), 1, 10),
+        );
         cache.poison_for_test();
 
-        let error = cache
+        cache
             .insert_discovered(
                 addr,
                 DiscoveredEngine::new(
@@ -1908,9 +1970,119 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(*error, Error::Config(_)));
+        assert_eq!(cache.recovery_count(), 1);
+        let recovered = cache.get(&addr).unwrap();
+        assert_eq!(recovered.engine_id(), b"remote-engine".as_slice());
+        assert!(recovered.authenticated_time().is_none());
+    }
+
+    #[test]
+    fn public_operations_repair_poison_before_reporting_state() {
+        for operation in 0..4 {
+            let cache = EngineCache::new();
+            let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+            cache.insert_state(addr, EngineState::new(Bytes::from_static(b"engine"), 1, 10));
+            cache.poison_for_test();
+
+            match operation {
+                0 => assert!(cache.get(&addr).is_none()),
+                1 => assert_eq!(cache.len(), 0),
+                2 => assert!(cache.remove(&addr).is_none()),
+                3 => cache.clear(),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(cache.recovery_count(), 1);
+            assert!(!cache.inner.is_poisoned());
+            let inner = cache.inner.read().unwrap();
+            assert!(inner.targets.is_empty());
+            assert!(inner.authenticated_times.is_empty());
+        }
+    }
+
+    #[test]
+    fn mutation_panics_clear_coupled_state_and_preserve_cache_policies() {
+        let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
+        let other: SocketAddr = "192.0.2.2:161".parse().unwrap();
+
+        for stage in [
+            CacheMutationStage::AuthenticatedTimeStored,
+            CacheMutationStage::TargetStored,
+            CacheMutationStage::TargetRemoved,
+            CacheMutationStage::AuthenticatedTimeRemoved,
+            CacheMutationStage::TargetsCleared,
+        ] {
+            let cache = EngineCache::new()
+                .with_max_capacity(1)
+                .with_ttl(Duration::from_secs(5));
+            let now = Instant::now();
+
+            if matches!(
+                stage,
+                CacheMutationStage::TargetRemoved
+                    | CacheMutationStage::AuthenticatedTimeRemoved
+                    | CacheMutationStage::TargetsCleared
+            ) {
+                cache.insert_state_at(
+                    addr,
+                    EngineState::new(Bytes::from_static(b"seed-engine"), 1, 10),
+                    now,
+                );
+            }
+
+            cache.inject_panic_at(stage);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match stage {
+                CacheMutationStage::AuthenticatedTimeStored => {
+                    cache.insert_state_at(
+                        addr,
+                        EngineState::new(Bytes::from_static(b"engine"), 1, 10),
+                        now,
+                    );
+                }
+                CacheMutationStage::TargetStored => {
+                    cache.insert_state_at(
+                        addr,
+                        EngineState::from_discovery(
+                            Bytes::from_static(b"engine"),
+                            crate::MessageSize::new(1400).unwrap(),
+                        ),
+                        now,
+                    );
+                }
+                CacheMutationStage::TargetRemoved
+                | CacheMutationStage::AuthenticatedTimeRemoved => {
+                    let _ = cache.remove(&addr);
+                }
+                CacheMutationStage::TargetsCleared => cache.clear(),
+            }));
+
+            assert!(panic.is_err(), "stage {stage:?} must preserve the panic");
+            assert_eq!(cache.recovery_count(), 1, "stage {stage:?}");
+            assert!(!cache.inner.is_poisoned(), "stage {stage:?}");
+            {
+                let inner = cache.inner.read().unwrap();
+                assert!(inner.targets.is_empty(), "stage {stage:?}");
+                assert!(inner.authenticated_times.is_empty(), "stage {stage:?}");
+            }
+
+            cache.insert_state_at(
+                addr,
+                EngineState::new(Bytes::from_static(b"first"), 1, 20),
+                now,
+            );
+            cache.insert_state_at(
+                other,
+                EngineState::new(Bytes::from_static(b"second"), 1, 30),
+                now + Duration::from_secs(1),
+            );
+            assert!(cache.get_at(&addr, now + Duration::from_secs(1)).is_none());
+            assert!(cache.get_at(&other, now + Duration::from_secs(5)).is_some());
+            assert!(cache.get_at(&other, now + Duration::from_secs(7)).is_none());
+            let inner = cache.inner.read().unwrap();
+            assert!(inner.authenticated_times.is_empty(), "stage {stage:?}");
+        }
     }
 
     #[test]
@@ -1928,10 +2100,10 @@ mod tests {
         );
         let shared = EngineState::new(Bytes::from_static(b"new-engine"), 7, 500);
 
-        cache.insert_state(addr, old.clone()).unwrap();
-        cache.insert_state(shared_addr, shared).unwrap();
-        let replaced = cache.replace_target(addr, new).unwrap();
-        cache.insert_state(addr, old).unwrap();
+        cache.insert_state(addr, old.clone());
+        cache.insert_state(shared_addr, shared);
+        let replaced = cache.replace_target(addr, new);
+        cache.insert_state(addr, old);
 
         assert_eq!(replaced.engine_id().as_ref(), b"new-engine");
         let trusted = replaced.authenticated_time().unwrap();
@@ -1949,21 +2121,14 @@ mod tests {
         let addr2: SocketAddr = "192.168.1.2:161".parse().unwrap();
         let engine_id = Bytes::from_static(b"shared-engine");
 
-        cache
-            .insert_state(
-                addr1,
-                EngineState::from_discovery(
-                    engine_id.clone(),
-                    crate::MessageSize::new(1400).unwrap(),
-                ),
-            )
-            .unwrap();
-        cache
-            .insert_state(
-                addr2,
-                EngineState::from_discovery(engine_id, crate::MessageSize::new(1500).unwrap()),
-            )
-            .unwrap();
+        cache.insert_state(
+            addr1,
+            EngineState::from_discovery(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
+        );
+        cache.insert_state(
+            addr2,
+            EngineState::from_discovery(engine_id, crate::MessageSize::new(1500).unwrap()),
+        );
         assert!(cache.update_time(&addr1, 4, 500));
 
         let state2 = cache.get(&addr2).unwrap();
@@ -1978,18 +2143,12 @@ mod tests {
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
         let engine_id = Bytes::from_static(b"engine1");
 
-        cache
-            .insert_state(addr, EngineState::new(engine_id.clone(), 7, 500))
-            .unwrap();
-        cache
-            .insert_state(addr, EngineState::new(engine_id.clone(), 6, 9000))
-            .unwrap();
-        cache
-            .insert_state(
-                addr,
-                EngineState::from_discovery(engine_id, crate::MessageSize::new(1400).unwrap()),
-            )
-            .unwrap();
+        cache.insert_state(addr, EngineState::new(engine_id.clone(), 7, 500));
+        cache.insert_state(addr, EngineState::new(engine_id.clone(), 6, 9000));
+        cache.insert_state(
+            addr,
+            EngineState::from_discovery(engine_id, crate::MessageSize::new(1400).unwrap()),
+        );
 
         let state = cache.get(&addr).unwrap();
         let trusted = state.authenticated_time().unwrap();
@@ -2042,7 +2201,7 @@ mod tests {
         let now = Instant::now();
 
         let state = EngineState::new(Bytes::from_static(b"engine1"), 1, 1000);
-        cache.insert_state_at(addr, state, now).unwrap();
+        cache.insert_state_at(addr, state, now);
         assert!(cache.get_at(&addr, now + Duration::from_secs(5)).is_some());
         assert!(
             cache.get_at(&addr, now + Duration::from_secs(6)).is_none(),
@@ -2058,20 +2217,16 @@ mod tests {
         let now = Instant::now();
         let engine_id = Bytes::from_static(b"engine1");
         let local_state = EngineState::new(engine_id.clone(), 1, 1000);
-        cache
-            .insert_state_at(addr, local_state.clone(), now)
-            .unwrap();
+        cache.insert_state_at(addr, local_state.clone(), now);
 
-        let outcome = cache
-            .check_and_update_timeliness_at(
-                &addr,
-                &local_state,
-                &engine_id,
-                1,
-                1100,
-                now + Duration::from_secs(6),
-            )
-            .unwrap();
+        let outcome = cache.check_and_update_timeliness_at(
+            &addr,
+            &local_state,
+            &engine_id,
+            1,
+            1100,
+            now + Duration::from_secs(6),
+        );
 
         let TimelinessPublicationOutcome::RestoredMapping(state) = outcome else {
             panic!("authenticated publication must restore the expired mapping");
@@ -2092,28 +2247,22 @@ mod tests {
         let now = Instant::now();
         let engine_id = Bytes::from_static(b"engine1");
         let local_state = EngineState::new(engine_id.clone(), 1, 1000);
-        cache
-            .insert_state_at(addr, local_state.clone(), now)
-            .unwrap();
-        cache
-            .insert_state_at(
-                other,
-                EngineState::new(Bytes::from_static(b"engine2"), 1, 50),
-                now + Duration::from_secs(1),
-            )
-            .unwrap();
+        cache.insert_state_at(addr, local_state.clone(), now);
+        cache.insert_state_at(
+            other,
+            EngineState::new(Bytes::from_static(b"engine2"), 1, 50),
+            now + Duration::from_secs(1),
+        );
         assert!(cache.get_at(&addr, now + Duration::from_secs(1)).is_none());
 
-        let outcome = cache
-            .check_and_update_timeliness_at(
-                &addr,
-                &local_state,
-                &engine_id,
-                1,
-                1100,
-                now + Duration::from_secs(2),
-            )
-            .unwrap();
+        let outcome = cache.check_and_update_timeliness_at(
+            &addr,
+            &local_state,
+            &engine_id,
+            1,
+            1100,
+            now + Duration::from_secs(2),
+        );
 
         assert!(matches!(
             outcome,
@@ -2138,16 +2287,15 @@ mod tests {
             let addr: SocketAddr = "192.0.2.1:161".parse().unwrap();
             let engine_id = Bytes::from_static(b"engine1");
             let local_state = EngineState::new(engine_id.clone(), 1, 1000);
-            cache.insert_state(addr, local_state.clone()).unwrap();
+            cache.insert_state(addr, local_state.clone());
             if clear {
                 cache.clear();
             } else {
                 cache.remove(&addr).expect("seeded mapping");
             }
 
-            let outcome = cache
-                .check_and_update_timeliness(&addr, &local_state, &engine_id, 1, 1100)
-                .unwrap();
+            let outcome =
+                cache.check_and_update_timeliness(&addr, &local_state, &engine_id, 1, 1100);
             assert!(matches!(
                 outcome,
                 TimelinessPublicationOutcome::RestoredMapping(_)
@@ -2171,16 +2319,12 @@ mod tests {
         let replacement: SocketAddr = "192.0.2.2:161".parse().unwrap();
         let now = Instant::now();
         let engine_id = Bytes::from_static(b"shared-engine");
-        cache
-            .insert_state_at(first, EngineState::new(engine_id.clone(), 5, 500), now)
-            .unwrap();
-        cache
-            .insert_state_at(
-                replacement,
-                EngineState::new(engine_id, 4, 9000),
-                now + Duration::from_secs(1),
-            )
-            .unwrap();
+        cache.insert_state_at(first, EngineState::new(engine_id.clone(), 5, 500), now);
+        cache.insert_state_at(
+            replacement,
+            EngineState::new(engine_id, 4, 9000),
+            now + Duration::from_secs(1),
+        );
 
         assert!(cache.get_at(&first, now + Duration::from_secs(1)).is_none());
         let state = cache
@@ -2208,9 +2352,13 @@ mod tests {
             let publishing_id = local_id.clone();
             let publisher = std::thread::spawn(move || {
                 publishing_barrier.wait();
-                publishing_cache
-                    .check_and_update_timeliness(&addr, &publishing_state, &publishing_id, 1, 1100)
-                    .unwrap()
+                publishing_cache.check_and_update_timeliness(
+                    &addr,
+                    &publishing_state,
+                    &publishing_id,
+                    1,
+                    1100,
+                )
             });
 
             let rebinding_cache = Arc::clone(&cache);
@@ -2255,19 +2403,15 @@ mod tests {
         let engine_id = Bytes::from_static(b"engine1");
         let local_state = EngineState::new(engine_id.clone(), 1, 1000);
 
-        cache
-            .insert_state_at(addr, local_state.clone(), now)
-            .unwrap();
-        let outcome = cache
-            .check_and_update_timeliness_at(
-                &addr,
-                &local_state,
-                &engine_id,
-                1,
-                900,
-                now + Duration::from_secs(4),
-            )
-            .unwrap();
+        cache.insert_state_at(addr, local_state.clone(), now);
+        let outcome = cache.check_and_update_timeliness_at(
+            &addr,
+            &local_state,
+            &engine_id,
+            1,
+            900,
+            now + Duration::from_secs(4),
+        );
         assert!(matches!(
             outcome,
             TimelinessPublicationOutcome::Published(_)
@@ -2287,26 +2431,19 @@ mod tests {
         let mut local_state = EngineState::new(engine_id.clone(), 5, 1000);
         local_state.authenticated_time.as_mut().unwrap().received_at = now;
 
-        cache
-            .insert_state_at(
-                addr,
-                EngineState::from_discovery(
-                    engine_id.clone(),
-                    crate::MessageSize::new(1400).unwrap(),
-                ),
-                now,
-            )
-            .unwrap();
-        let outcome = cache
-            .check_and_update_timeliness_at(
-                &addr,
-                &local_state,
-                &engine_id,
-                4,
-                5000,
-                now + Duration::from_secs(1),
-            )
-            .unwrap();
+        cache.insert_state_at(
+            addr,
+            EngineState::from_discovery(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
+            now,
+        );
+        let outcome = cache.check_and_update_timeliness_at(
+            &addr,
+            &local_state,
+            &engine_id,
+            4,
+            5000,
+            now + Duration::from_secs(1),
+        );
 
         let TimelinessPublicationOutcome::Stale(canonical) = outcome else {
             panic!("rebuilt cache must reject stale input");
@@ -2324,19 +2461,15 @@ mod tests {
         let mut local_state = EngineState::new(engine_id.clone(), 5, 1000);
         local_state.authenticated_time.as_mut().unwrap().received_at = now;
 
-        cache
-            .insert_state_at(addr, local_state.clone(), now)
-            .unwrap();
-        let outcome = cache
-            .check_and_update_timeliness_at(
-                &addr,
-                &local_state,
-                &engine_id,
-                4,
-                5000,
-                now + Duration::from_secs(4),
-            )
-            .unwrap();
+        cache.insert_state_at(addr, local_state.clone(), now);
+        let outcome = cache.check_and_update_timeliness_at(
+            &addr,
+            &local_state,
+            &engine_id,
+            4,
+            5000,
+            now + Duration::from_secs(4),
+        );
         assert!(matches!(outcome, TimelinessPublicationOutcome::Stale(_)));
         assert!(cache.get_at(&addr, now + Duration::from_secs(6)).is_none());
     }
@@ -2350,19 +2483,15 @@ mod tests {
         let mut local_state = EngineState::new(engine_id.clone(), 5, 1000);
         local_state.authenticated_time.as_mut().unwrap().received_at = now;
 
-        cache
-            .insert_state_at(addr, local_state.clone(), now)
-            .unwrap();
-        let outcome = cache
-            .check_and_update_timeliness_at(
-                &addr,
-                &local_state,
-                &engine_id,
-                4,
-                5000,
-                now + Duration::from_secs(6),
-            )
-            .unwrap();
+        cache.insert_state_at(addr, local_state.clone(), now);
+        let outcome = cache.check_and_update_timeliness_at(
+            &addr,
+            &local_state,
+            &engine_id,
+            4,
+            5000,
+            now + Duration::from_secs(6),
+        );
         assert!(matches!(outcome, TimelinessPublicationOutcome::Stale(_)));
         assert!(cache.get_at(&addr, now + Duration::from_secs(6)).is_none());
         assert!(cache.is_empty());
@@ -2376,31 +2505,25 @@ mod tests {
         let addr3: SocketAddr = "192.168.1.3:161".parse().unwrap();
 
         let now = Instant::now();
-        cache
-            .insert_state_at(
-                addr1,
-                EngineState::new(Bytes::from_static(b"e1"), 1, 100),
-                now,
-            )
-            .unwrap();
-        cache
-            .insert_state_at(
-                addr2,
-                EngineState::new(Bytes::from_static(b"e2"), 1, 200),
-                now + Duration::from_secs(1),
-            )
-            .unwrap();
+        cache.insert_state_at(
+            addr1,
+            EngineState::new(Bytes::from_static(b"e1"), 1, 100),
+            now,
+        );
+        cache.insert_state_at(
+            addr2,
+            EngineState::new(Bytes::from_static(b"e2"), 1, 200),
+            now + Duration::from_secs(1),
+        );
 
         assert_eq!(cache.len(), 2);
 
         // Third insert should evict the least recently refreshed target.
-        cache
-            .insert_state_at(
-                addr3,
-                EngineState::new(Bytes::from_static(b"e3"), 1, 300),
-                now + Duration::from_secs(2),
-            )
-            .unwrap();
+        cache.insert_state_at(
+            addr3,
+            EngineState::new(Bytes::from_static(b"e3"), 1, 300),
+            now + Duration::from_secs(2),
+        );
         assert_eq!(cache.len(), 2);
         assert!(
             cache.get(&addr1).is_none(),
@@ -2413,13 +2536,14 @@ mod tests {
     fn raw_usm_with_engine_id(engine_id: &[u8]) -> Bytes {
         let mut buf = crate::ber::EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             buf.push_integer(1);
             buf.push_integer(1);
-            buf.push_octet_string(engine_id);
-        });
+            buf.push_octet_string(engine_id)
+        })
+        .unwrap();
         buf.finish()
     }
 
@@ -2631,12 +2755,10 @@ mod tests {
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
 
         // Insert latched engine
-        cache
-            .insert_state(
-                addr,
-                EngineState::new(Bytes::from_static(b"latched"), 2_147_483_647, 1000),
-            )
-            .unwrap();
+        cache.insert_state(
+            addr,
+            EngineState::new(Bytes::from_static(b"latched"), 2_147_483_647, 1000),
+        );
 
         // Time tracking still works
         assert!(

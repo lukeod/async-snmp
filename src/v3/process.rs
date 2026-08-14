@@ -583,32 +583,36 @@ mod tests {
         .unwrap();
         let mut usm = crate::ber::EncodeBuf::new();
         usm.push_sequence(|buf| {
-            buf.push_octet_string(priv_params);
-            buf.push_octet_string(auth_params);
-            buf.push_octet_string(username);
+            buf.push_octet_string(priv_params)?;
+            buf.push_octet_string(auth_params)?;
+            buf.push_octet_string(username)?;
             buf.push_integer(1000);
             buf.push_integer(7);
-            buf.push_octet_string(engine_id);
-        });
+            buf.push_octet_string(engine_id)
+        })
+        .unwrap();
 
         let mut message = crate::ber::EncodeBuf::new();
-        message.push_sequence(|buf| {
-            if level.requires_priv() {
-                buf.push_octet_string(b"ciphertext");
-            } else {
-                let scoped = ScopedPdu::new(
-                    Bytes::copy_from_slice(engine_id),
-                    Bytes::new(),
-                    Pdu::get_request(42, &[]),
-                )
-                .encode_to_bytes()
-                .unwrap();
-                buf.push_bytes(&scoped);
-            }
-            buf.push_octet_string(&usm.finish());
-            global.encode(buf).unwrap();
-            buf.push_integer(3);
-        });
+        message
+            .push_sequence(|buf| {
+                if level.requires_priv() {
+                    buf.push_octet_string(b"ciphertext")?;
+                } else {
+                    let scoped = ScopedPdu::new(
+                        Bytes::copy_from_slice(engine_id),
+                        Bytes::new(),
+                        Pdu::get_request(42, &[]),
+                    )
+                    .encode_to_bytes()
+                    .unwrap();
+                    buf.push_bytes(&scoped);
+                }
+                buf.push_octet_string(&usm.finish())?;
+                global.encode(buf).unwrap();
+                buf.push_integer(3);
+                Ok(())
+            })
+            .unwrap();
         message.finish()
     }
 
@@ -1207,8 +1211,9 @@ mod tests {
             // msgData: SEQUENCE TLV wrapping garbage, not a parsable ScopedPDU
             buf.push_sequence(|buf| {
                 buf.push_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]);
-            });
-            buf.push_octet_string(&usm.encode().unwrap());
+                Ok(())
+            })?;
+            buf.push_octet_string(&usm.encode().unwrap())?;
             crate::message::MsgGlobalData::new(
                 1,
                 crate::MessageSize::new(65507).unwrap(),
@@ -1218,7 +1223,9 @@ mod tests {
             .encode(buf)
             .unwrap();
             buf.push_integer(3);
-        });
+            Ok(())
+        })
+        .unwrap();
         let data = buf.finish();
 
         let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
@@ -1246,20 +1253,24 @@ mod tests {
         .unwrap();
         let mut usm = crate::ber::EncodeBuf::new();
         usm.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(b"user");
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(b"user")?;
             buf.push_integer(0);
             buf.push_integer(0);
-            buf.push_octet_string(engine_id);
-        });
+            buf.push_octet_string(engine_id)
+        })
+        .unwrap();
         let mut message = crate::ber::EncodeBuf::new();
-        message.push_sequence(|buf| {
-            buf.push_bytes(&scoped);
-            buf.push_octet_string(&usm.finish());
-            global.encode(buf).unwrap();
-            buf.push_integer(3);
-        });
+        message
+            .push_sequence(|buf| {
+                buf.push_bytes(&scoped);
+                buf.push_octet_string(&usm.finish())?;
+                global.encode(buf).unwrap();
+                buf.push_integer(3);
+                Ok(())
+            })
+            .unwrap();
         message.finish()
     }
 

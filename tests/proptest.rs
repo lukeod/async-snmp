@@ -591,7 +591,7 @@ proptest! {
     #[test]
     fn octet_string_ber_roundtrip(data in prop::collection::vec(any::<u8>(), 0..=1024)) {
         let mut buf = EncodeBuf::new();
-        buf.push_octet_string(&data);
+        buf.push_octet_string(&data).unwrap();
         let bytes = buf.finish();
 
         let mut decoder = Decoder::new(bytes);
@@ -1553,13 +1553,14 @@ mod usm_params_boundary {
     fn encode_usm_with_boots_time(boots: i32, time: i32) -> Bytes {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             buf.push_integer(time);
             buf.push_integer(boots);
-            buf.push_octet_string(b"engine");
-        });
+            buf.push_octet_string(b"engine")
+        })
+        .unwrap();
         buf.finish()
     }
 
@@ -1597,13 +1598,13 @@ proptest! {
     fn usm_params_decode_no_panic(boots in any::<i32>(), time in any::<i32>()) {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             buf.push_integer(time);
             buf.push_integer(boots);
-            buf.push_octet_string(b"engine");
-        });
+            buf.push_octet_string(b"engine")
+        }).unwrap();
         let encoded = buf.finish();
 
         let result = async_snmp::v3::UsmSecurityParams::decode(encoded);

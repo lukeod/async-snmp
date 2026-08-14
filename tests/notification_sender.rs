@@ -118,9 +118,9 @@ fn encode_raw_v2c_notification(
     use async_snmp::ber::EncodeBuf;
 
     let mut buf = EncodeBuf::new();
-    buf.try_push_sequence(|buf| {
-        buf.try_push_constructed(pdu_type.tag(), |buf| {
-            buf.try_push_sequence(|buf| {
+    buf.push_sequence(|buf| {
+        buf.push_constructed(pdu_type.tag(), |buf| {
+            buf.push_sequence(|buf| {
                 for varbind in varbinds.iter().rev() {
                     varbind.encode(buf)?;
                 }
@@ -131,7 +131,7 @@ fn encode_raw_v2c_notification(
             buf.push_integer(request_id);
             Ok(())
         })?;
-        buf.try_push_octet_string(b"public")?;
+        buf.push_octet_string(b"public")?;
         buf.push_integer(Version::V2c.as_i32());
         Ok(())
     })

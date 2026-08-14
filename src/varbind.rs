@@ -33,7 +33,7 @@ impl VarBind {
 
     /// Encode to BER.
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             self.value.encode(buf)?;
             buf.push_oid(&self.oid)
         })
@@ -80,7 +80,7 @@ impl std::fmt::Display for VarBind {
 /// Writes the `VarBind`s as a SEQUENCE of SEQUENCE elements, where each inner
 /// SEQUENCE contains an OID and its associated value.
 pub fn encode_varbind_list(buf: &mut EncodeBuf, varbinds: &[VarBind]) -> Result<()> {
-    buf.try_push_sequence(|buf| {
+    buf.push_sequence(|buf| {
         // Encode in reverse order since we're using reverse buffer
         for vb in varbinds.iter().rev() {
             vb.encode(buf)?;
@@ -112,9 +112,9 @@ pub fn decode_varbind_list(decoder: &mut Decoder) -> Result<Vec<VarBind>> {
 /// Creates a `VarBind` list where each OID is paired with a NULL value,
 /// as required by SNMP GET, GETNEXT, and GETBULK request PDUs.
 pub fn encode_null_varbinds(buf: &mut EncodeBuf, oids: &[Oid]) -> Result<()> {
-    buf.try_push_sequence(|buf| {
+    buf.push_sequence(|buf| {
         for oid in oids.iter().rev() {
-            buf.try_push_sequence(|buf| {
+            buf.push_sequence(|buf| {
                 buf.push_null();
                 buf.push_oid(oid)
             })?;

@@ -4173,7 +4173,7 @@ mod tests {
     }
 
     fn push_malformed_integer_varbind(buf: &mut crate::ber::EncodeBuf) -> crate::Result<()> {
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             buf.push_bytes(&[0x02, 0x05, 1, 0, 0, 0, 9]);
             buf.push_oid(&oid!(1, 3, 6, 1, 4, 1, 9999, 1, 0))
         })
@@ -4181,11 +4181,11 @@ mod tests {
 
     fn build_notification_with_malformed_integer(version: crate::Version) -> Bytes {
         let mut buf = crate::ber::EncodeBuf::new();
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             match version {
                 crate::Version::V1 => {
-                    buf.try_push_constructed(crate::ber::tag::pdu::TRAP_V1, |buf| {
-                        buf.try_push_sequence(push_malformed_integer_varbind)?;
+                    buf.push_constructed(crate::ber::tag::pdu::TRAP_V1, |buf| {
+                        buf.push_sequence(push_malformed_integer_varbind)?;
                         buf.push_unsigned32(crate::ber::tag::application::TIMETICKS, 123);
                         buf.push_integer(0);
                         buf.push_integer(0);
@@ -4194,8 +4194,8 @@ mod tests {
                     })?;
                 }
                 crate::Version::V2c => {
-                    buf.try_push_constructed(crate::ber::tag::pdu::TRAP_V2, |buf| {
-                        buf.try_push_sequence(|buf| {
+                    buf.push_constructed(crate::ber::tag::pdu::TRAP_V2, |buf| {
+                        buf.push_sequence(|buf| {
                             push_malformed_integer_varbind(buf)?;
                             crate::VarBind::new(
                                 oids::snmp_trap_oid(),
@@ -4213,7 +4213,7 @@ mod tests {
                 }
                 crate::Version::V3 => unreachable!(),
             }
-            buf.push_octet_string(b"public");
+            buf.push_octet_string(b"public")?;
             buf.push_integer(version.as_i32());
             Ok(())
         })

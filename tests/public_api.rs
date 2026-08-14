@@ -65,6 +65,7 @@ fn engine_cache_public_seeding_encodes_and_validates_trust() {
     let capacity = MessageSize::new(1400).unwrap();
     let discovered = || DiscoveredEngine::new(Bytes::from_static(b"remote-engine"), capacity);
     let cache = EngineCache::new();
+    assert_eq!(cache.recovery_count(), 0);
 
     cache
         .insert_discovered(target, discovered().unwrap())
@@ -550,8 +551,8 @@ fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
     }
 
     fn push_noncanonical_too_big(buf: &mut EncodeBuf, varbind: &VarBind) {
-        buf.try_push_constructed(tag::pdu::RESPONSE, |buf| {
-            buf.try_push_sequence(|buf| varbind.encode(buf))?;
+        buf.push_constructed(tag::pdu::RESPONSE, |buf| {
+            buf.push_sequence(|buf| varbind.encode(buf))?;
             buf.push_integer(0);
             buf.push_integer(ErrorStatus::TooBig.as_i32());
             buf.push_integer(7);
@@ -562,9 +563,9 @@ fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
 
     fn raw_v2c_message(varbind: &VarBind) -> Bytes {
         let mut buf = EncodeBuf::new();
-        buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
             push_noncanonical_too_big(buf, varbind);
-            buf.try_push_octet_string(b"public")?;
+            buf.push_octet_string(b"public")?;
             buf.push_integer(Version::V2c.as_i32());
             Ok(())
         })
@@ -574,14 +575,14 @@ fn public_structured_envelopes_enforce_version_specific_too_big_shape() {
 
     fn raw_v3_message(global: &MsgGlobalData, security_params: &[u8], varbind: &VarBind) -> Bytes {
         let mut buf = EncodeBuf::new();
-        buf.try_push_sequence(|buf| {
-            buf.try_push_sequence(|buf| {
+        buf.push_sequence(|buf| {
+            buf.push_sequence(|buf| {
                 push_noncanonical_too_big(buf, varbind);
-                buf.try_push_octet_string(b"")?;
-                buf.try_push_octet_string(b"engine")?;
+                buf.push_octet_string(b"")?;
+                buf.push_octet_string(b"engine")?;
                 Ok(())
             })?;
-            buf.try_push_octet_string(security_params)?;
+            buf.push_octet_string(security_params)?;
             global.encode(buf)?;
             buf.push_integer(Version::V3.as_i32());
             Ok(())

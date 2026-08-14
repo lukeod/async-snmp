@@ -84,8 +84,7 @@ pub use engine::{
     validate_engine_id,
 };
 pub(crate) use engine::{
-    EngineCacheAccessError, TimelinessCandidateOutcome, TimelinessPublicationOutcome,
-    discovered_engine_state,
+    TimelinessCandidateOutcome, TimelinessPublicationOutcome, discovered_engine_state,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use privacy::{PrivKey, PrivacyError, PrivacyResult, SaltCounter};

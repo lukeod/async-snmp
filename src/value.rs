@@ -1094,7 +1094,7 @@ impl Value {
     pub fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         match self {
             Value::Integer(v) => buf.push_integer(*v),
-            Value::OctetString(data) => buf.try_push_octet_string(data)?,
+            Value::OctetString(data) => buf.push_octet_string(data)?,
             Value::Null => buf.push_null(),
             Value::ObjectIdentifier(oid) => buf.push_oid(oid)?,
             Value::IpAddress(addr) => buf.push_ip_address(*addr),

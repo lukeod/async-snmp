@@ -777,7 +777,7 @@ impl Pdu {
             }
         };
 
-        buf.try_push_constructed(pdu_type.tag(), |buf| {
+        buf.push_constructed(pdu_type.tag(), |buf| {
             encode_varbind_list(buf, &self.varbinds)?;
             buf.push_integer(second_field);
             buf.push_integer(first_field);
@@ -2048,7 +2048,7 @@ impl TrapV1Pdu {
     /// Encode to BER after applying outbound validation.
     pub(crate) fn encode(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.validate_outbound()?;
-        buf.try_push_constructed(tag::pdu::TRAP_V1, |buf| {
+        buf.push_constructed(tag::pdu::TRAP_V1, |buf| {
             encode_varbind_list(buf, &self.varbinds)?;
             buf.push_unsigned32(tag::application::TIMETICKS, self.time_stamp);
             buf.push_integer(self.specific_trap);
@@ -2295,7 +2295,9 @@ mod tests {
                 buf.push_integer(self.error_index);
                 buf.push_integer(self.error_status);
                 buf.push_integer(self.request_id);
-            });
+                Ok(())
+            })
+            .unwrap();
             buf.finish()
         }
     }
@@ -2330,7 +2332,9 @@ mod tests {
                 buf.push_integer(self.max_repetitions);
                 buf.push_integer(self.non_repeaters);
                 buf.push_integer(self.request_id);
-            });
+                Ok(())
+            })
+            .unwrap();
             buf.finish()
         }
     }

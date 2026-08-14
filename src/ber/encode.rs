@@ -75,23 +75,10 @@ impl EncodeBuf {
 
     /// Encode a constructed type (SEQUENCE, PDU, etc).
     ///
-    /// Calls the closure to encode contents, then wraps with length and tag.
-    pub fn push_constructed<F>(&mut self, tag: u8, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        let start_len = self.len();
-        f(self);
-        let content_len = self.len() - start_len;
-        if let Err(error) = self.push_length(content_len) {
-            self.buf.truncate(start_len);
-            panic!("constructed BER content length is not representable: {error}");
-        }
-        self.push_tag(tag);
-    }
-
-    /// Encode a constructed type with rollback if nested encoding fails.
-    pub fn try_push_constructed<F>(&mut self, tag: u8, f: F) -> Result<()>
+    /// Calls the closure to encode contents, then wraps them with a length and
+    /// tag. If nested encoding or length representation fails, the buffer is
+    /// restored to its entry length.
+    pub fn push_constructed<F>(&mut self, tag: u8, f: F) -> Result<()>
     where
         F: FnOnce(&mut Self) -> Result<()>,
     {
@@ -101,6 +88,10 @@ impl EncodeBuf {
             return Err(error);
         }
         let content_len = self.len() - start_len;
+        self.finish_constructed(tag, start_len, content_len)
+    }
+
+    fn finish_constructed(&mut self, tag: u8, start_len: usize, content_len: usize) -> Result<()> {
         if let Err(error) = self.push_length(content_len) {
             self.buf.truncate(start_len);
             return Err(error);
@@ -109,20 +100,12 @@ impl EncodeBuf {
         Ok(())
     }
 
-    /// Encode a SEQUENCE.
-    pub fn push_sequence<F>(&mut self, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        self.push_constructed(tag::universal::SEQUENCE, f);
-    }
-
-    /// Encode a SEQUENCE with rollback if nested encoding fails.
-    pub fn try_push_sequence<F>(&mut self, f: F) -> Result<()>
+    /// Encode a SEQUENCE, rolling back if nested encoding fails.
+    pub fn push_sequence<F>(&mut self, f: F) -> Result<()>
     where
         F: FnOnce(&mut Self) -> Result<()>,
     {
-        self.try_push_constructed(tag::universal::SEQUENCE, f)
+        self.push_constructed(tag::universal::SEQUENCE, f)
     }
 
     /// Encode an INTEGER.
@@ -155,21 +138,16 @@ impl EncodeBuf {
         self.push_tag(tag);
     }
 
-    /// Encode an OCTET STRING.
-    ///
-    /// This convenience method is intended for content whose length is known
-    /// to be representable. Fallible structured encoders should use
-    /// [`Self::try_push_octet_string`].
-    pub fn push_octet_string(&mut self, data: &[u8]) {
-        self.try_push_octet_string(data)
-            .expect("OCTET STRING BER content length is representable");
-    }
-
     /// Encode an OCTET STRING after checking its length.
     ///
     /// Length representability is checked before the buffer is modified.
-    pub fn try_push_octet_string(&mut self, data: &[u8]) -> Result<()> {
-        let (bytes, count) = encode_length(data.len())?;
+    pub fn push_octet_string(&mut self, data: &[u8]) -> Result<()> {
+        self.push_octet_string_with_len(data, data.len())
+    }
+
+    fn push_octet_string_with_len(&mut self, data: &[u8], len: usize) -> Result<()> {
+        let (bytes, count) = encode_length(len)?;
+        debug_assert_eq!(data.len(), len);
         self.push_bytes(data);
         self.push_encoded_length(&bytes, count);
         self.push_tag(tag::universal::OCTET_STRING);
@@ -338,6 +316,35 @@ mod tests {
         assert_eq!(buf.len(), before);
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_octet_string_does_not_modify_buffer() {
+        let mut buf = EncodeBuf::new();
+        buf.push_byte(0xaa);
+        let before = buf.len();
+
+        assert!(
+            buf.push_octet_string_with_len(&[0xbb], u32::MAX as usize + 1)
+                .is_err()
+        );
+        assert_eq!(buf.len(), before);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_constructed_length_rolls_back() {
+        let mut buf = EncodeBuf::new();
+        buf.push_integer(7);
+        let start_len = buf.len();
+        buf.push_null();
+
+        assert!(
+            buf.finish_constructed(tag::universal::SEQUENCE, start_len, u32::MAX as usize + 1)
+                .is_err()
+        );
+        assert_eq!(buf.len(), start_len);
+    }
+
     #[test]
     fn test_encode_integer() {
         assert_eq!(encode_integer(0), vec![0]);
@@ -381,7 +388,9 @@ mod tests {
             // Reverse buffer: push in reverse order for forward output
             buf.push_integer(2);
             buf.push_integer(1);
-        });
+            Ok(())
+        })
+        .unwrap();
         let bytes = buf.finish();
         // SEQUENCE { INTEGER 1, INTEGER 2 }
         assert_eq!(
@@ -416,7 +425,7 @@ mod tests {
         let mut buf = EncodeBuf::new();
         buf.push_integer(7);
         let original_len = buf.len();
-        let result = buf.try_push_sequence(|buf| {
+        let result = buf.push_sequence(|buf| {
             buf.push_null();
             buf.push_oid(&crate::oid::Oid::empty())
         });

@@ -188,14 +188,14 @@ fn encode_raw_scoped_pdu_with_first_integer(
     };
 
     let mut buf = EncodeBuf::new();
-    buf.try_push_sequence(|buf| {
-        buf.try_push_constructed(tag, |buf| {
-            buf.try_push_sequence(|buf| {
+    buf.push_sequence(|buf| {
+        buf.push_constructed(tag, |buf| {
+            buf.push_sequence(|buf| {
                 for (index, varbind) in scoped.pdu.varbinds().iter().enumerate().rev() {
                     if index == 0
                         && let Some(content) = first_integer_value_content
                     {
-                        buf.try_push_sequence(|buf| {
+                        buf.push_sequence(|buf| {
                             buf.push_bytes(&raw_ber::integer_from_content(content));
                             buf.push_oid(&varbind.oid)
                         })?;
@@ -210,8 +210,8 @@ fn encode_raw_scoped_pdu_with_first_integer(
             buf.push_integer(scoped.pdu.request_id());
             Ok(())
         })?;
-        buf.push_octet_string(&scoped.context_name);
-        buf.push_octet_string(&scoped.context_engine_id);
+        buf.push_octet_string(&scoped.context_name)?;
+        buf.push_octet_string(&scoped.context_engine_id)?;
         Ok(())
     })
     .map_err(|error| error.to_string())?;
@@ -228,13 +228,14 @@ fn encode_raw_usm(
 ) -> Bytes {
     let mut buf = EncodeBuf::new();
     buf.push_sequence(|buf| {
-        buf.push_octet_string(priv_params);
-        buf.push_octet_string(auth_params);
-        buf.push_octet_string(username);
+        buf.push_octet_string(priv_params)?;
+        buf.push_octet_string(auth_params)?;
+        buf.push_octet_string(username)?;
         buf.push_unsigned32(async_snmp::ber::tag::universal::INTEGER, engine_time);
         buf.push_unsigned32(async_snmp::ber::tag::universal::INTEGER, engine_boots);
-        buf.push_octet_string(engine_id);
-    });
+        buf.push_octet_string(engine_id)
+    })
+    .unwrap();
     buf.finish()
 }
 
@@ -253,9 +254,9 @@ fn encode_raw_plaintext_message_bytes(
     scoped: &[u8],
 ) -> Result<Vec<u8>, String> {
     let mut buf = EncodeBuf::new();
-    buf.try_push_sequence(|buf| {
+    buf.push_sequence(|buf| {
         buf.push_bytes(scoped);
-        buf.push_octet_string(security_params);
+        buf.push_octet_string(security_params)?;
         global.encode(buf)?;
         buf.push_integer(3);
         Ok(())
@@ -270,9 +271,9 @@ fn encode_raw_encrypted_message(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, String> {
     let mut buf = EncodeBuf::new();
-    buf.try_push_sequence(|buf| {
-        buf.push_octet_string(ciphertext);
-        buf.push_octet_string(security_params);
+    buf.push_sequence(|buf| {
+        buf.push_octet_string(ciphertext)?;
+        buf.push_octet_string(security_params)?;
         global.encode(buf)?;
         buf.push_integer(3);
         Ok(())

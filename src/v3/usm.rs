@@ -225,13 +225,13 @@ impl UsmSecurityParams {
     /// Encode to an existing buffer after revalidating all invariants.
     pub fn encode_to_buf(&self, buf: &mut EncodeBuf) -> Result<()> {
         self.validate_common()?;
-        buf.try_push_sequence(|buf| {
-            buf.try_push_octet_string(&self.priv_params)?;
-            buf.try_push_octet_string(&self.auth_params)?;
-            buf.try_push_octet_string(&self.username)?;
+        buf.push_sequence(|buf| {
+            buf.push_octet_string(&self.priv_params)?;
+            buf.push_octet_string(&self.auth_params)?;
+            buf.push_octet_string(&self.username)?;
             buf.push_unsigned32(crate::ber::tag::universal::INTEGER, self.engine_time);
             buf.push_unsigned32(crate::ber::tag::universal::INTEGER, self.engine_boots);
-            buf.try_push_octet_string(&self.engine_id)?;
+            buf.push_octet_string(&self.engine_id)?;
             Ok(())
         })
     }
@@ -376,13 +376,14 @@ mod tests {
     fn params_with_integer_contents(engine_boots: &[u8], engine_time: &[u8]) -> Bytes {
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             push_integer_content(buf, engine_time);
             push_integer_content(buf, engine_boots);
-            buf.push_octet_string(&[]);
-        });
+            buf.push_octet_string(&[])
+        })
+        .unwrap();
         buf.finish()
     }
 
@@ -565,13 +566,14 @@ mod tests {
 
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             buf.push_integer(100);
             buf.push_integer(-1);
-            buf.push_octet_string(&[]);
-        });
+            buf.push_octet_string(&[])
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let result = UsmSecurityParams::decode(encoded);
@@ -585,13 +587,14 @@ mod tests {
 
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             buf.push_integer(-1);
             buf.push_integer(100);
-            buf.push_octet_string(&[]);
-        });
+            buf.push_octet_string(&[])
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let result = UsmSecurityParams::decode(encoded);
@@ -605,13 +608,14 @@ mod tests {
 
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             buf.push_integer(i32::MAX);
             buf.push_integer(i32::MAX);
-            buf.push_octet_string(&[]);
-        });
+            buf.push_octet_string(&[])
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
@@ -634,13 +638,14 @@ mod tests {
 
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
             buf.push_integer(0);
             buf.push_integer(0);
-            buf.push_octet_string(&[]);
-        });
+            buf.push_octet_string(&[])
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let decoded = UsmSecurityParams::decode(encoded).unwrap();
@@ -741,13 +746,14 @@ mod tests {
 
         let mut buf = EncodeBuf::new();
         buf.push_sequence(|buf| {
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&[]);
-            buf.push_octet_string(&long_username);
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&[])?;
+            buf.push_octet_string(&long_username)?;
             buf.push_integer(0);
             buf.push_integer(0);
-            buf.push_octet_string(&[]);
-        });
+            buf.push_octet_string(&[])
+        })
+        .unwrap();
         let encoded = buf.finish();
 
         let result = UsmSecurityParams::decode(encoded);

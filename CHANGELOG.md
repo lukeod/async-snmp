@@ -271,6 +271,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-round-trippable OIDs return `Error::InvalidOid` before transport I/O,
   encryption, or authentication. Receive-side empty OIDs and in-memory tree
   operations remain supported.
+- **Breaking:** `EncodeBuf::push_constructed`, `push_sequence`, and
+  `push_octet_string` now return representability errors. The parallel
+  `try_push_constructed`, `try_push_sequence`, and `try_push_octet_string`
+  methods are removed; constructed encoding rolls back on nested or length
+  failure.
+- `EngineCache` now repairs poisoned or partially mutated state by clearing
+  target mappings and authenticated-time high-water state together. Cache
+  operations report the repaired state, and `recovery_count` exposes the
+  monotonic number of recoveries.
 
 ### Fixed
 
@@ -290,6 +299,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cleanup continues after an undo failure.
 
 ### Migration
+
+- Replace `EncodeBuf::try_push_constructed`, `try_push_sequence`, and
+  `try_push_octet_string` with their `push_*` equivalents and propagate the
+  returned `Result`.
 
 - Replace direct `EngineState` construction, field access, `EngineCache::insert`,
   and `EngineState::update_time` with
