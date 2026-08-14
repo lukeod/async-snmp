@@ -319,6 +319,7 @@ mod tests {
                 stats.decryption_errors.store(90, Ordering::Relaxed);
                 stats
             },
+            health: tokio::sync::watch::channel(crate::agent::AgentHealth::Healthy).0,
         })
     }
 

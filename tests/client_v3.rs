@@ -8,7 +8,7 @@ mod common;
 
 use async_snmp::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
 use async_snmp::pdu::{PduType, RequestPdu};
-use async_snmp::v3::{AuthProtocol, PrivProtocol, ReportStatus, UsmSecurityParams};
+use async_snmp::v3::{AuthProtocol, DesSaltState, PrivProtocol, ReportStatus, UsmSecurityParams};
 use async_snmp::{Auth, Client, Error, Retry, Value, oid};
 use bytes::Bytes;
 use common::{TestAgentBuilder, V3User};
@@ -346,7 +346,9 @@ async fn v3_auth_md5() {
 #[cfg(feature = "crypto-rustcrypto")]
 #[tokio::test]
 async fn v3_auth_priv_sha1_des() {
+    let des_salt_state = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
     let agent = TestAgentBuilder::new()
+        .des_salt_state(des_salt_state.clone())
         .usm_user(V3User::auth_priv(
             b"desuser".to_vec(),
             AuthProtocol::Sha1,
@@ -364,6 +366,7 @@ async fn v3_auth_priv_sha1_des() {
             .build()
             .unwrap(),
     )
+    .des_salt_state(des_salt_state)
     .connect()
     .await
     .unwrap();

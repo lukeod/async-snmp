@@ -618,10 +618,11 @@ pub use message_size::{
     ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
 };
 pub use notification::{
-    Notification, NotificationAcceptance, NotificationAcceptanceError,
+    InformAckOutcome, Notification, NotificationAcceptance, NotificationAcceptanceError,
     NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationEnvelope,
     NotificationPduClass, NotificationReceiver, NotificationReceiverBuilder,
-    NotificationVarbindValidation, validate_notification_varbinds,
+    NotificationVarbindValidation, NotificationWireIdentity, ReceivedNotification,
+    V3NotificationWireIdentity, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{

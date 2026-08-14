@@ -192,7 +192,7 @@ mod tests {
     #[cfg(feature = "crypto-rustcrypto")]
     #[tokio::test]
     async fn agent_response_rejects_des_state_after_authoritative_rollover() {
-        let mut engine = crate::v3::AuthoritativeEngine::for_test(&b"agent-engine"[..], 1);
+        let engine = crate::v3::AuthoritativeEngine::for_test(&b"agent-engine"[..], 1);
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
         let des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();

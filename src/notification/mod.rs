@@ -25,8 +25,9 @@
 //!
 //!     loop {
 //!         match receiver.recv().await {
-//!             Ok((notification, source)) => {
-//!                 println!("Received notification from {}: {:?}", source, notification);
+//!             Ok(received) => {
+//!                 println!("Received notification from {}: {:?}", received.source, received.notification);
+//!                 println!("Inform acknowledgement: {:?}", received.inform_ack);
 //!             }
 //!             Err(e) => {
 //!                 eprintln!("Error receiving notification: {}", e);
@@ -174,9 +175,10 @@
 //! before [`NotificationReceiver::recv`] delivers the notification. If both
 //! the ordinary response and its `tooBig` alternate exceed that limit, no
 //! response is sent, [`NotificationReceiver::snmp_silent_drops`] increments,
-//! and the accepted notification is still delivered. The response attempt
-//! therefore does not guarantee that the originator received an
-//! acknowledgement.
+//! and the accepted notification is still delivered. The owning
+//! [`ReceivedNotification`] reports the completed local attempt through
+//! [`InformAckOutcome`]. Even [`InformAckOutcome::Sent`] does not guarantee
+//! that the originator received an acknowledgement.
 //!
 //! [`NotificationReceiverBuilder::accept_all_notifications`] is the explicit
 //! auto-accept convenience for receivers with USM users. It also accepts
@@ -231,14 +233,104 @@ pub enum NotificationPduClass {
     Inform,
 }
 
+/// Wire identity retained for one received notification.
+///
+/// These fields identify one protocol transmission, not one semantic event.
+/// In particular, an Inform retry can carry a different V3 message ID and is
+/// delivered as another application event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationWireIdentity {
+    /// Protocol version decoded from the datagram.
+    pub version: Version,
+    /// PDU request ID, absent only for an SNMPv1 Trap-PDU.
+    pub request_id: Option<i32>,
+    /// V3 message and USM identity, or `None` for v1/v2c.
+    pub v3: Option<V3NotificationWireIdentity>,
+}
+
+/// V3 message and USM identity retained from a received notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3NotificationWireIdentity {
+    /// V3 message ID from msgGlobalData.
+    pub msg_id: i32,
+    /// Authoritative engine ID carried in the USM security parameters.
+    pub authoritative_engine_id: Bytes,
+    /// USM username carried on the wire.
+    pub username: Bytes,
+    /// Actual security level carried on the wire.
+    pub security_level: SecurityLevel,
+}
+
+/// Local acknowledgement result for an application-accepted Inform.
+///
+/// `Sent` means only that response construction and the local socket send
+/// completed. It does not establish that the originator received the response.
+#[derive(Debug)]
+pub enum InformAckOutcome {
+    /// Response construction and the local send completed.
+    Sent,
+    /// The normal response and its exact `tooBig` alternate both exceeded the
+    /// effective response limit; `snmpSilentDrops` was incremented.
+    SuppressedBySize,
+    /// A response could not be constructed or sent after application
+    /// acceptance.
+    Failed(Box<Error>),
+}
+
+/// One application-accepted notification and its local acknowledgement result.
+///
+/// Traps always have `inform_ack` set to `None`. Informs always have one
+/// outcome, and the response attempt completes before this value is returned.
+/// The source and wire identity are transmission metadata and must not be
+/// treated as a semantic-event deduplication key.
+#[derive(Debug)]
+pub struct ReceivedNotification {
+    /// Accepted notification value.
+    pub notification: Notification,
+    /// Datagram source address; SNMP does not cryptographically authenticate it.
+    pub source: SocketAddr,
+    /// Version, request ID, and V3 message/security identity from the wire.
+    pub wire_identity: NotificationWireIdentity,
+    /// Local acknowledgement outcome for an Inform, or `None` for a trap.
+    pub inform_ack: Option<InformAckOutcome>,
+}
+
+impl ReceivedNotification {
+    fn trap(
+        notification: Notification,
+        source: SocketAddr,
+        wire_identity: NotificationWireIdentity,
+    ) -> Self {
+        Self {
+            notification,
+            source,
+            wire_identity,
+            inform_ack: None,
+        }
+    }
+
+    fn inform(
+        notification: Notification,
+        source: SocketAddr,
+        wire_identity: NotificationWireIdentity,
+        outcome: InformAckOutcome,
+    ) -> Self {
+        Self {
+            notification,
+            source,
+            wire_identity,
+            inform_ack: Some(outcome),
+        }
+    }
+}
+
 /// Decision returned by a [`NotificationAcceptancePolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationAcceptance {
     /// Deliver the notification and attempt a response when it is an Inform.
     ///
-    /// The response is attempted before delivery, but response-size
-    /// finalization can increment `snmpSilentDrops` and deliver the accepted
-    /// notification without sending a response.
+    /// The response attempt completes before delivery. Its local result is
+    /// retained in [`ReceivedNotification::inform_ack`].
     Accept,
     /// Drop the notification without acknowledging it.
     Reject,
@@ -1024,6 +1116,10 @@ impl NotificationReceiverBuilder {
                 #[cfg(test)]
                 response_sends_started: AtomicU32::new(0),
                 #[cfg(test)]
+                response_send_errors: Mutex::new(std::collections::VecDeque::new()),
+                #[cfg(test)]
+                response_construction_errors: Mutex::new(std::collections::VecDeque::new()),
+                #[cfg(test)]
                 receive_errors: Mutex::new(std::collections::VecDeque::new()),
                 recv_gate: AsyncMutex::new(vec![0; crate::UDP_RECEIVE_BUFFER_SIZE]),
             }),
@@ -1342,6 +1438,10 @@ struct ReceiverInner {
     #[cfg(test)]
     response_sends_started: AtomicU32,
     #[cfg(test)]
+    response_send_errors: Mutex<std::collections::VecDeque<std::io::Error>>,
+    #[cfg(test)]
+    response_construction_errors: Mutex<std::collections::VecDeque<Box<Error>>>,
+    #[cfg(test)]
     receive_errors: Mutex<std::collections::VecDeque<std::io::Error>>,
     /// Fairly serializes cloned `recv` calls and retains their shared UDP buffer.
     recv_gate: AsyncMutex<Vec<u8>>,
@@ -1576,15 +1676,13 @@ impl NotificationReceiver {
     /// Inform response while this method continues waiting.
     ///
     /// For an accepted `InformRequest`, the receiver finalizes and attempts a
-    /// Response-PDU before returning. A successful send completes before
-    /// delivery. If the response and exact `tooBig` alternate both exceed the
-    /// effective response limit, however, no response is sent,
-    /// [`Self::snmp_silent_drops`] increments, and this method still returns
-    /// the accepted notification. Return therefore does not prove that the
-    /// originator received an acknowledgement.
-    /// A response write that exceeds the configured
-    /// [`NotificationReceiverBuilder::response_send_timeout`] returns a
-    /// network timeout error and releases this call's FIFO turn.
+    /// Response-PDU before returning. The local result is reported through
+    /// [`ReceivedNotification::inform_ack`]; even [`InformAckOutcome::Sent`]
+    /// does not prove that the originator received the response. Response
+    /// construction, persistence, crypto, send timeout, and other send errors
+    /// after acceptance are delivered as [`InformAckOutcome::Failed`].
+    /// Persistence failure before application acceptance is returned directly
+    /// from this method as [`Error::AuthoritativeEnginePersistence`].
     ///
     /// V1/v2c community and content are cleartext and unverified unless a
     /// community allowlist was configured. Even an allowlist match provides no
@@ -1598,11 +1696,15 @@ impl NotificationReceiver {
     /// order. The active call retains its queue position while it skips
     /// malformed, rejected, or non-notification datagrams. Cancelling a queued
     /// or active call releases its position and leaves the shared buffer ready
-    /// for the next waiter.
+    /// for the next waiter. Dropping this future before it returns does not
+    /// guarantee delivery of a datagram whose processing had begun; acceptance
+    /// callbacks must therefore remain side-effect-free. The receiver does not
+    /// retain an internal delivery queue across this cancellation boundary.
     ///
-    /// Returns the notification and the source address.
+    /// Returns the owning notification, source/wire identity, and Inform
+    /// acknowledgement outcome.
     #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
-    pub async fn recv(&self) -> Result<(Notification, SocketAddr)> {
+    pub async fn recv(&self) -> Result<ReceivedNotification> {
         // Tokio's mutex queues callers in FIFO order. Keeping the guard while
         // malformed/non-notification datagrams are skipped prevents a later
         // cloned receiver from overtaking the earlier call.
@@ -1644,12 +1746,12 @@ impl NotificationReceiver {
                 .parse_and_respond(data, source, received.destination)
                 .await
             {
-                Ok(Some(notification)) => return Ok((notification, source)),
+                Ok(Some(notification)) => return Ok(notification),
                 Ok(None) => {} // Not a notification PDU, ignore
-                Err(e) if matches!(&*e, Error::Network { source, .. } if source.kind() == std::io::ErrorKind::TimedOut) =>
-                {
-                    // A bounded response-write failure terminates this call so
-                    // its FIFO turn is released to the next cloned receiver.
+                Err(e) if e.kind() == crate::ErrorKind::AuthoritativeEnginePersistence => {
+                    // Shared local authoritative state prevented this datagram
+                    // from reaching application acceptance. Return the typed
+                    // failure instead of hiding it in the receive loop.
                     return Err(e);
                 }
                 Err(e) => {
@@ -1668,7 +1770,7 @@ impl NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
         response_source: Option<crate::udp_responder::DestinationMetadata>,
-    ) -> Result<Option<Notification>> {
+    ) -> Result<Option<ReceivedNotification>> {
         match crate::message::peek_version(data.clone(), source)? {
             Version::V1 => self.handle_v1(data, source).await,
             Version::V2c => self.handle_v2c_at(data, source, response_source).await,
@@ -1702,6 +1804,10 @@ impl NotificationReceiver {
             result = async {
                 #[cfg(test)]
                 self.inner.response_sends_started.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                if let Some(error) = self.inner.response_send_errors.lock().unwrap().pop_front() {
+                    return Err(error);
+                }
                 #[cfg(test)]
                 if let Some(gate) = &response_send_gate {
                     gate.acquire().await.expect("test send gate remains open").forget();
@@ -1899,7 +2005,13 @@ mod tests {
                 .handle_v2c(build_v2c_trap(b"not-preconfigured"), source)
                 .await
                 .unwrap();
-            assert!(matches!(notification, Some(Notification::TrapV2c { .. })));
+            assert!(matches!(
+                notification,
+                Some(ReceivedNotification {
+                    notification: Notification::TrapV2c { .. },
+                    ..
+                })
+            ));
         }
     }
 
@@ -2125,7 +2237,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let error = receiver
-            .handle_v3(Bytes::new(), "127.0.0.1:1162".parse().unwrap())
+            .handle_v3(
+                build_v3_discovery_request(1, true),
+                "127.0.0.1:1162".parse().unwrap(),
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -2134,6 +2249,116 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(receiver.engine_boots(), 1);
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn recv_returns_pre_acceptance_persistence_failure() {
+        let engine_id = Bytes::from_static(b"local-persist-engine");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let engine = AuthoritativeEngine::install(engine_id.clone(), move |_| {
+            if callback_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("persistence unavailable"))
+            }
+        })
+        .unwrap();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine.clone())
+            .usm_user("informuser", |user| {
+                user.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .unwrap()
+            .accept_all_notifications()
+            .build()
+            .await
+            .unwrap();
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &build_authed_v3_inform(
+                    &engine_id,
+                    1,
+                    0,
+                    b"informuser",
+                    b"authpass12345678",
+                    AuthProtocol::Sha1,
+                ),
+                receiver.local_addr(),
+            )
+            .await
+            .unwrap();
+
+        let error = receiver.recv().await.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::ErrorKind::AuthoritativeEnginePersistence
+        );
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn post_acceptance_persistence_failure_does_not_block_remote_trap() {
+        let engine_id = Bytes::from_static(b"local-persist-engine-2");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let engine = AuthoritativeEngine::install(engine_id.clone(), move |_| {
+            if callback_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("persistence unavailable"))
+            }
+        })
+        .unwrap();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine.clone())
+            .usm_user("informuser", Ok)
+            .unwrap()
+            .usm_user("trapuser", |user| {
+                user.auth(AuthProtocol::Sha1, b"authpass12345678")
+            })
+            .unwrap()
+            .accept_all_notifications()
+            .build()
+            .await
+            .unwrap();
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+
+        let inform = receiver
+            .handle_v3(
+                build_noauth_v3_inform(&engine_id, b"informuser"),
+                "127.0.0.1:9999".parse().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            inform.inform_ack,
+            Some(InformAckOutcome::Failed(error))
+                if error.kind() == crate::ErrorKind::AuthoritativeEnginePersistence
+        ));
+        let calls_after_failure = calls.load(Ordering::Relaxed);
+
+        let trap = receiver
+            .handle_v3(
+                build_authed_v3_trap(b"remote-sender-engine", 7, 123_456),
+                "127.0.0.1:9999".parse().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(trap.notification, Notification::TrapV3 { .. }));
+        assert!(trap.inform_ack.is_none());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            calls_after_failure,
+            "remote-authoritative trap must not sample local persistence"
+        );
     }
 
     #[tokio::test]
@@ -2573,9 +2798,13 @@ mod tests {
 
         let result = receiver.handle_v3(msg, source).await.unwrap();
         match result {
-            Some(Notification::TrapV3 {
-                username,
-                security_level,
+            Some(ReceivedNotification {
+                notification:
+                    Notification::TrapV3 {
+                        username,
+                        security_level,
+                        ..
+                    },
                 ..
             }) => {
                 assert_eq!(username.as_ref(), b"trapuser");
@@ -2596,9 +2825,13 @@ mod tests {
 
         let msg = build_noauth_v3_trap(b"remote-sender-engine", b"trapuser");
         match receiver.handle_v3(msg, source).await.unwrap() {
-            Some(Notification::TrapV3 {
-                security_level,
-                username,
+            Some(ReceivedNotification {
+                notification:
+                    Notification::TrapV3 {
+                        security_level,
+                        username,
+                        ..
+                    },
                 ..
             }) => {
                 assert_eq!(security_level, SecurityLevel::NoAuthNoPriv);
@@ -3289,7 +3522,13 @@ mod tests {
 
         let result = receiver.handle_v3(msg, source).await.unwrap();
         assert!(
-            matches!(result, Some(Notification::InformV3 { .. })),
+            matches!(
+                result,
+                Some(ReceivedNotification {
+                    notification: Notification::InformV3 { .. },
+                    ..
+                })
+            ),
             "inform under the local engine ID should be accepted, got {result:?}"
         );
     }
@@ -3330,7 +3569,13 @@ mod tests {
 
         let result = receiver.handle_v3(msg, client_addr).await.unwrap();
         assert!(
-            matches!(result, Some(Notification::InformV3 { .. })),
+            matches!(
+                result,
+                Some(ReceivedNotification {
+                    notification: Notification::InformV3 { .. },
+                    ..
+                })
+            ),
             "inform should be accepted, got {result:?}"
         );
 
@@ -3360,7 +3605,7 @@ mod tests {
     #[cfg(feature = "crypto-rustcrypto")]
     #[tokio::test]
     async fn receiver_inform_ack_rejects_des_state_after_authoritative_rollover() {
-        let mut engine = AuthoritativeEngine::for_test(&b"receiver-engine"[..], 1);
+        let engine = AuthoritativeEngine::for_test(&b"receiver-engine"[..], 1);
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
         let response_des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
@@ -3425,16 +3670,21 @@ mod tests {
         )
         .unwrap();
 
-        let error = receiver
+        let received = receiver
             .handle_v3(Bytes::from(encoded), "127.0.0.1:9999".parse().unwrap())
             .await
-            .unwrap_err();
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            *error,
-            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
-                state_engine_boots: 1,
-                generating_engine_boots: 2,
-            })
+            received.inform_ack,
+            Some(InformAckOutcome::Failed(error))
+                if matches!(
+                    *error,
+                    Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                        state_engine_boots: 1,
+                        generating_engine_boots: 2,
+                    })
+                )
         ));
         assert_eq!(response_des_state.reserve().unwrap().salt(), 1);
     }
@@ -3526,11 +3776,26 @@ mod tests {
                 .unwrap();
             let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let client_addr = client.local_addr().unwrap();
-            let notification = receiver
+            let received = receiver
                 .handle_v3(message.clone(), client_addr)
                 .await
+                .unwrap()
                 .unwrap();
-            assert!(matches!(notification, Some(Notification::InformV3 { .. })));
+            assert!(matches!(
+                received.notification,
+                Notification::InformV3 { .. }
+            ));
+            assert!(matches!(received.inform_ack, Some(InformAckOutcome::Sent)));
+            assert_eq!(received.wire_identity.version, Version::V3);
+            assert_eq!(received.wire_identity.request_id, Some(1));
+            let v3_identity = received
+                .wire_identity
+                .v3
+                .expect("V3 Inform must retain its wire identity");
+            assert_eq!(v3_identity.msg_id, 1);
+            assert_eq!(v3_identity.authoritative_engine_id, engine_id);
+            assert_eq!(v3_identity.username, username);
+            assert_eq!(v3_identity.security_level, level);
             let mut buf = vec![0_u8; 4096];
             let (len, _) = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
@@ -3566,11 +3831,19 @@ mod tests {
                 .unwrap();
             let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let client_addr = client.local_addr().unwrap();
-            let notification = receiver
+            let received = receiver
                 .handle_v3(message.clone(), client_addr)
                 .await
+                .unwrap()
                 .unwrap();
-            assert!(matches!(notification, Some(Notification::InformV3 { .. })));
+            assert!(matches!(
+                received.notification,
+                Notification::InformV3 { .. }
+            ));
+            assert!(matches!(
+                received.inform_ack,
+                Some(InformAckOutcome::SuppressedBySize)
+            ));
             assert_eq!(receiver.snmp_silent_drops(), 1);
             let mut buf = [0_u8; 1];
             assert!(
@@ -3625,7 +3898,13 @@ mod tests {
         let earliest = receiver.inner.authoritative_boots_time().unwrap();
         let result = receiver.handle_v3(msg, client_addr).await.unwrap();
         let latest = receiver.inner.authoritative_boots_time().unwrap();
-        assert!(matches!(result, Some(Notification::InformV3 { .. })));
+        assert!(matches!(
+            result,
+            Some(ReceivedNotification {
+                notification: Notification::InformV3 { .. },
+                ..
+            })
+        ));
 
         let mut buf = vec![0u8; 4096];
         let (len, _) = tokio::time::timeout(
@@ -4413,7 +4692,13 @@ mod tests {
             .handle_v2c(build_v2c_trap(b"public"), source)
             .await
             .unwrap();
-        assert!(matches!(result, Some(Notification::TrapV2c { .. })));
+        assert!(matches!(
+            result,
+            Some(ReceivedNotification {
+                notification: Notification::TrapV2c { .. },
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -4447,7 +4732,7 @@ mod tests {
                 original_length: 2,
                 canonical_length: 0,
             }];
-            assert_eq!(notification.decode_anomalies(), expected);
+            assert_eq!(notification.notification.decode_anomalies(), expected);
             assert_eq!(observed.lock().unwrap().as_slice(), expected);
         }
     }
@@ -4510,7 +4795,7 @@ mod tests {
             .unwrap()
             .unwrap();
             assert!(matches!(
-                notification.decode_anomalies(),
+                notification.notification.decode_anomalies(),
                 [crate::DecodeAnomaly::SignedIntegerTruncation {
                     encoded_length: 5,
                     ..
@@ -4555,7 +4840,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                notification.decode_anomalies(),
+                notification.notification.decode_anomalies(),
                 [crate::DecodeAnomaly::TrailingBytes {
                     original_length: 2,
                     canonical_length: 0,
@@ -4626,7 +4911,13 @@ mod tests {
             .handle_v2c(build_v2c_trap(b"anything"), source)
             .await
             .unwrap();
-        assert!(matches!(result, Some(Notification::TrapV2c { .. })));
+        assert!(matches!(
+            result,
+            Some(ReceivedNotification {
+                notification: Notification::TrapV2c { .. },
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -4651,7 +4942,10 @@ mod tests {
                 .handle_v1(build_v1_trap(b"public"), source)
                 .await
                 .unwrap(),
-            Some(Notification::TrapV1 { .. })
+            Some(ReceivedNotification {
+                notification: Notification::TrapV1 { .. },
+                ..
+            })
         ));
     }
 
@@ -4692,7 +4986,10 @@ mod tests {
                 .handle_v1(build_v1_trap(b"public"), source)
                 .await
                 .unwrap(),
-            Some(Notification::TrapV1 { .. })
+            Some(ReceivedNotification {
+                notification: Notification::TrapV1 { .. },
+                ..
+            })
         ));
     }
 
@@ -4853,14 +5150,16 @@ mod tests {
             .send_to(&build_v2c_trap(b"public"), receiver_addr)
             .await
             .unwrap();
-        let (notification, source) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), receive)
-                .await
-                .expect("receiver did not continue after policy panic")
-                .unwrap()
-                .unwrap();
-        assert_eq!(source, sender.local_addr().unwrap());
-        assert!(matches!(notification, Notification::TrapV2c { .. }));
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+            .await
+            .expect("receiver did not continue after policy panic")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.source, sender.local_addr().unwrap());
+        assert!(matches!(
+            received.notification,
+            Notification::TrapV2c { .. }
+        ));
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -4878,11 +5177,19 @@ mod tests {
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client.local_addr().unwrap();
 
-        let result = receiver
+        let received = receiver
             .handle_v2c(build_v2c_inform(b"public"), client_addr)
             .await
+            .unwrap()
             .unwrap();
-        assert!(matches!(result, Some(Notification::InformV2c { .. })));
+        assert!(matches!(
+            received.notification,
+            Notification::InformV2c { .. }
+        ));
+        assert_eq!(received.wire_identity.version, Version::V2c);
+        assert_eq!(received.wire_identity.request_id, Some(1));
+        assert!(received.wire_identity.v3.is_none());
+        assert!(matches!(received.inform_ack, Some(InformAckOutcome::Sent)));
 
         let mut buf = vec![0u8; 4096];
         let (len, ack_source) = tokio::time::timeout(
@@ -4903,6 +5210,45 @@ mod tests {
             .is_err(),
             "one accepted Inform must produce exactly one acknowledgement"
         );
+    }
+
+    #[tokio::test]
+    async fn each_accepted_inform_datagram_is_returned_exactly_once() {
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let message = build_v2c_inform(b"public");
+
+        sender
+            .send_to(&message, receiver.local_addr())
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("accepted Inform was not returned")
+            .unwrap();
+        assert_eq!(first.source, sender.local_addr().unwrap());
+        assert_eq!(first.wire_identity.request_id, Some(1));
+        assert!(matches!(first.inform_ack, Some(InformAckOutcome::Sent)));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err(),
+            "one accepted datagram was returned more than once"
+        );
+
+        // An identical retry is a second accepted datagram and therefore a
+        // second application event; wire identity is not semantic deduplication.
+        sender
+            .send_to(&message, receiver.local_addr())
+            .await
+            .unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("accepted Inform retry was not returned")
+            .unwrap();
+        assert_eq!(retry.wire_identity, first.wire_identity);
+        assert!(matches!(retry.inform_ack, Some(InformAckOutcome::Sent)));
     }
 
     #[tokio::test]
@@ -4942,21 +5288,26 @@ mod tests {
             .await
             .unwrap();
 
-        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+        let first_received = tokio::time::timeout(Duration::from_secs(1), first)
             .await
             .expect("first receiver did not release its FIFO turn")
             .unwrap()
-            .unwrap_err();
+            .unwrap();
         assert!(matches!(
-            &*first_error,
-            Error::Network { source, .. } if source.kind() == std::io::ErrorKind::TimedOut
+            first_received.inform_ack,
+            Some(InformAckOutcome::Failed(error))
+                if matches!(&*error, Error::Network { source, .. }
+                    if source.kind() == std::io::ErrorKind::TimedOut)
         ));
-        let (notification, _) = tokio::time::timeout(Duration::from_secs(1), second)
+        let received = tokio::time::timeout(Duration::from_secs(1), second)
             .await
             .expect("second receiver remained blocked after response timeout")
             .unwrap()
             .unwrap();
-        assert!(matches!(notification, Notification::TrapV2c { .. }));
+        assert!(matches!(
+            received.notification,
+            Notification::TrapV2c { .. }
+        ));
     }
 
     #[tokio::test]
@@ -4969,13 +5320,16 @@ mod tests {
             .unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let error = receiver
+        let received = receiver
             .handle_v2c(build_v2c_inform(b"public"), sender.local_addr().unwrap())
             .await
-            .unwrap_err();
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            &*error,
-            Error::Network { source, .. } if source.kind() == std::io::ErrorKind::TimedOut
+            received.inform_ack,
+            Some(InformAckOutcome::Failed(error))
+                if matches!(&*error, Error::Network { source, .. }
+                    if source.kind() == std::io::ErrorKind::TimedOut)
         ));
         let mut buf = [0u8; 16];
         assert!(
@@ -4983,6 +5337,108 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_v2c_inform_reports_construction_and_non_timeout_send_failures() {
+        let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        receiver
+            .inner
+            .response_construction_errors
+            .lock()
+            .unwrap()
+            .push_back(Error::InvalidMessage("injected construction failure".into()).boxed());
+        let received = receiver
+            .handle_v2c(build_v2c_inform(b"public"), source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            received.inform_ack,
+            Some(InformAckOutcome::Failed(error))
+                if error.kind() == crate::ErrorKind::InvalidMessage
+        ));
+
+        receiver
+            .inner
+            .response_send_errors
+            .lock()
+            .unwrap()
+            .push_back(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let received = receiver
+            .handle_v2c(build_v2c_inform(b"public"), source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            received.inform_ack,
+            Some(InformAckOutcome::Failed(error))
+                if matches!(&*error, Error::Network { source, .. }
+                    if source.kind() == std::io::ErrorKind::BrokenPipe)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_v3_inform_reports_construction_send_and_timeout_failures() {
+        let engine_id = Bytes::from_static(b"local-inform-engine");
+        for failure in ["construction", "send", "timeout"] {
+            let receiver = NotificationReceiver::builder()
+                .bind("127.0.0.1:0")
+                .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
+                .usm_user("informuser", Ok)
+                .unwrap()
+                .accept_all_notifications()
+                .response_send_timeout(if failure == "timeout" {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                })
+                .build()
+                .await
+                .unwrap();
+            if failure == "construction" {
+                receiver
+                    .inner
+                    .response_construction_errors
+                    .lock()
+                    .unwrap()
+                    .push_back(
+                        Error::InvalidMessage("injected construction failure".into()).boxed(),
+                    );
+            } else if failure == "send" {
+                receiver
+                    .inner
+                    .response_send_errors
+                    .lock()
+                    .unwrap()
+                    .push_back(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            let received = receiver
+                .handle_v3(
+                    build_noauth_v3_inform(&engine_id, b"informuser"),
+                    "127.0.0.1:9999".parse().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            match (failure, received.inform_ack) {
+                ("construction", Some(InformAckOutcome::Failed(error))) => {
+                    assert_eq!(error.kind(), crate::ErrorKind::InvalidMessage);
+                }
+                ("send", Some(InformAckOutcome::Failed(error))) => assert!(matches!(
+                    &*error,
+                    Error::Network { source, .. }
+                        if source.kind() == std::io::ErrorKind::BrokenPipe
+                )),
+                ("timeout", Some(InformAckOutcome::Failed(error))) => assert!(matches!(
+                    &*error,
+                    Error::Network { source, .. }
+                        if source.kind() == std::io::ErrorKind::TimedOut
+                )),
+                other => panic!("unexpected acknowledgement result: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -4995,14 +5451,19 @@ mod tests {
             .unwrap();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let notification = receiver
+        let received = receiver
             .handle_v2c(
                 build_oversized_v2c_inform(b"public"),
                 client.local_addr().unwrap(),
             )
             .await
+            .unwrap()
             .unwrap();
-        assert!(matches!(notification, Some(Notification::InformV2c { .. })));
+        assert!(matches!(
+            received.notification,
+            Notification::InformV2c { .. }
+        ));
+        assert!(matches!(received.inform_ack, Some(InformAckOutcome::Sent)));
 
         let mut buf = vec![0; 1024];
         let (len, _) = client.recv_from(&mut buf).await.unwrap();
@@ -5028,13 +5489,18 @@ mod tests {
             .unwrap();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        receiver
+        let received = receiver
             .handle_v2c(
                 build_oversized_v2c_inform(b"public"),
                 client.local_addr().unwrap(),
             )
             .await
+            .unwrap()
             .unwrap();
+        assert!(matches!(
+            received.inform_ack,
+            Some(InformAckOutcome::SuppressedBySize)
+        ));
         assert_eq!(receiver.snmp_silent_drops(), 1);
 
         let mut buf = [0; 64];
@@ -5065,8 +5531,11 @@ mod tests {
             .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
             .await
             .unwrap();
-        let (notification, _) = receiver.recv().await.unwrap();
-        assert!(matches!(notification, Notification::TrapV2c { .. }));
+        let received = receiver.recv().await.unwrap();
+        assert!(matches!(
+            received.notification,
+            Notification::TrapV2c { .. }
+        ));
 
         for kind in [
             std::io::ErrorKind::ConnectionRefused,
@@ -5109,11 +5578,17 @@ mod tests {
         .unwrap();
         assert_eq!(source.ip(), destination.ip());
 
-        let (notification, peer) = receive_task.await.unwrap().unwrap();
-        assert!(matches!(notification, Notification::InformV2c { .. }));
+        let received = receive_task.await.unwrap().unwrap();
+        assert!(matches!(
+            received.notification,
+            Notification::InformV2c { .. }
+        ));
         let client_addr = client.local_addr().unwrap();
-        assert_eq!(peer.port(), client_addr.port());
-        assert_eq!(peer.ip().to_canonical(), client_addr.ip().to_canonical());
+        assert_eq!(received.source.port(), client_addr.port());
+        assert_eq!(
+            received.source.ip().to_canonical(),
+            client_addr.ip().to_canonical()
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5137,16 +5612,15 @@ mod tests {
             crate::MAX_UDP_PAYLOAD
         );
 
-        let (notification, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
-                .await
-                .expect("maximum UDP notification stalled")
-                .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("maximum UDP notification stalled")
+            .unwrap();
         let Notification::TrapV2c {
             request_id,
             decode_anomalies,
             ..
-        } = notification
+        } = received.notification
         else {
             panic!("expected v2c trap")
         };
@@ -5165,9 +5639,9 @@ mod tests {
             .send_to(&build_v2c_trap_with_request_id(b"public", 71), destination)
             .await
             .unwrap();
-        let (notification, _) = receiver.recv().await.unwrap();
+        let received = receiver.recv().await.unwrap();
         assert!(matches!(
-            notification,
+            received.notification,
             Notification::TrapV2c { request_id: 71, .. }
         ));
         assert_eq!(receive_buffer_identity(&receiver).await, initial);
@@ -5196,16 +5670,15 @@ mod tests {
             IPV6_MAX_UDP_PAYLOAD
         );
 
-        let (notification, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
-                .await
-                .expect("maximum native IPv6 UDP notification stalled")
-                .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("maximum native IPv6 UDP notification stalled")
+            .unwrap();
         let Notification::TrapV2c {
             request_id,
             decode_anomalies,
             ..
-        } = notification
+        } = received.notification
         else {
             panic!("expected v2c trap")
         };
@@ -5250,13 +5723,12 @@ mod tests {
             client.send_to(&datagram, destination).await.unwrap();
         }
 
-        let (notification, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
-                .await
-                .expect("receiver did not advance past skipped datagrams")
-                .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("receiver did not advance past skipped datagrams")
+            .unwrap();
         assert!(matches!(
-            notification,
+            received.notification,
             Notification::TrapV2c { request_id: 4, .. }
         ));
         assert_eq!(receive_buffer_identity(&receiver).await, initial);
@@ -5289,8 +5761,11 @@ mod tests {
             .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
             .await
             .unwrap();
-        let (notification, _) = receiver.recv().await.unwrap();
-        assert!(matches!(notification, Notification::TrapV2c { .. }));
+        let received = receiver.recv().await.unwrap();
+        assert!(matches!(
+            received.notification,
+            Notification::TrapV2c { .. }
+        ));
         assert_eq!(receive_buffer_identity(&receiver).await, initial);
     }
 
@@ -5332,10 +5807,11 @@ mod tests {
         })
         .await
         .expect("concurrent recv waiters stalled");
-        let request_ids = [results.0, results.1, results.2].map(|result| match result.unwrap().0 {
-            Notification::TrapV2c { request_id, .. } => request_id,
-            other => panic!("unexpected notification: {other:?}"),
-        });
+        let request_ids =
+            [results.0, results.1, results.2].map(|result| match result.unwrap().notification {
+                Notification::TrapV2c { request_id, .. } => request_id,
+                other => panic!("unexpected notification: {other:?}"),
+            });
         assert_eq!(request_ids, [11, 12, 13]);
         assert_eq!(receive_buffer_identity(&receiver).await, initial);
     }
@@ -5366,11 +5842,17 @@ mod tests {
         .unwrap();
         assert_eq!(source.ip(), destination.ip());
 
-        let (notification, peer) = receive_task.await.unwrap().unwrap();
-        assert!(matches!(notification, Notification::InformV2c { .. }));
+        let received = receive_task.await.unwrap().unwrap();
+        assert!(matches!(
+            received.notification,
+            Notification::InformV2c { .. }
+        ));
         let client_addr = client.local_addr().unwrap();
-        assert_eq!(peer.port(), client_addr.port());
-        assert_eq!(peer.ip().to_canonical(), client_addr.ip().to_canonical());
+        assert_eq!(received.source.port(), client_addr.port());
+        assert_eq!(
+            received.source.ip().to_canonical(),
+            client_addr.ip().to_canonical()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5450,7 +5932,10 @@ mod tests {
         .unwrap();
         assert_eq!(source.ip(), destination.ip());
 
-        let (notification, _) = receive_task.await.unwrap().unwrap();
-        assert!(matches!(notification, Notification::InformV3 { .. }));
+        let received = receive_task.await.unwrap().unwrap();
+        assert!(matches!(
+            received.notification,
+            Notification::InformV3 { .. }
+        ));
     }
 }

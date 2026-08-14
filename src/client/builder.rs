@@ -685,6 +685,7 @@ impl ClientBuilder {
             max_repetitions: self.max_repetitions,
             local_authoritative_engine: self.local_authoritative_engine.clone(),
             des_salt_state: self.des_salt_state.clone(),
+            local_authoritative_time_source: None,
         }
     }
 

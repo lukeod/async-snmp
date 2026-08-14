@@ -151,6 +151,10 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) engine_id: &'a Bytes,
     pub(crate) engine_boots: u32,
     pub(crate) engine_time: u32,
+    /// Optional lazy authoritative-time source. Notification receivers use
+    /// this so remote-authoritative traps do not sample unrelated local
+    /// persistence unless a Report or local-authoritative operation needs it.
+    pub(crate) authoritative_time: Option<&'a (dyn Fn() -> Result<(u32, u32)> + Send + Sync)>,
     /// Wire-valid `msgMaxSize` advertising this receiver's local capacity.
     pub(crate) local_receive_capacity: MessageSize,
     /// Hard total-message bound for inbound decoding.
@@ -163,6 +167,13 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) stats: &'a UsmStats,
     pub(crate) mpd: Option<MpdCounters<'a>>,
     pub(crate) source: SocketAddr,
+}
+
+impl V3LocalContext<'_> {
+    fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
+        self.authoritative_time
+            .map_or(Ok((self.engine_boots, self.engine_time)), |sample| sample())
+    }
 }
 
 /// A fully USM-processed inbound message.
@@ -261,13 +272,14 @@ pub(crate) fn process_v3_inbound(
         // (the case here: the message failed USM processing), when the
         // reportableFlag is set.
         let report = if msg.global_data.msg_flags.reportable {
+            let (engine_boots, engine_time) = ctx.authoritative_boots_time()?;
             let encoded = encode_v3_report(
                 msg.global_data.msg_id,
                 ctx.local_receive_capacity,
                 UsmSecurityParams::new(
                     ctx.engine_id.clone(),
-                    ctx.engine_boots,
-                    ctx.engine_time,
+                    engine_boots,
+                    engine_time,
                     usm_params.username.clone(),
                 )?,
                 failure.report_oid(),
@@ -355,13 +367,14 @@ pub(crate) fn process_v3_inbound(
             // Step 7a: this engine is authoritative for the message; local
             // boots must not be latched at maximum (RFC 3414 Section 2.3),
             // boots must match, and time must be within 150 seconds.
+            let (engine_boots, engine_time) = ctx.authoritative_boots_time()?;
             if !in_authoritative_time_window(
-                ctx.engine_boots,
-                ctx.engine_time,
+                engine_boots,
+                engine_time,
                 usm_params.engine_boots,
                 usm_params.engine_time,
             ) {
-                tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = ctx.engine_boots, snmp.our_time = ctx.engine_time }, "message outside time window");
+                tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.msg_boots = usm_params.engine_boots, snmp.msg_time = usm_params.engine_time, snmp.our_boots = engine_boots, snmp.our_time = engine_time }, "message outside time window");
                 // RFC 3414 Section 3.2 Step 7a: the report must be
                 // authenticated at authNoPriv so the sender can authenticate
                 // the tuple and apply normal Step 7(b) timeliness processing.
@@ -517,6 +530,7 @@ mod tests {
             engine_id,
             engine_boots: 7,
             engine_time: 1000,
+            authoritative_time: None,
             local_receive_capacity: MessageSize::new(8192).unwrap(),
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             decode_config: crate::DecodeConfig::default(),

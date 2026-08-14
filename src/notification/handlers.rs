@@ -17,7 +17,10 @@ use crate::v3::encode::encode_v3_response;
 use crate::v3::process::{UsmFailure, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
 
 use super::varbind::extract_notification_varbinds;
-use super::{Notification, NotificationPduClass, ReceiverInner};
+use super::{
+    InformAckOutcome, Notification, NotificationPduClass, NotificationWireIdentity,
+    ReceivedNotification, ReceiverInner, V3NotificationWireIdentity,
+};
 use crate::v3::DerivedKeys;
 
 impl super::NotificationReceiver {
@@ -26,7 +29,7 @@ impl super::NotificationReceiver {
         &self,
         data: Bytes,
         source: SocketAddr,
-    ) -> Result<Option<Notification>> {
+    ) -> Result<Option<ReceivedNotification>> {
         let decoded =
             CommunityMessage::decode_with_target(data, Some(source), self.inner.decode_config)?;
         let decode_anomalies = decoded.anomalies;
@@ -53,7 +56,15 @@ impl super::NotificationReceiver {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v1 trap");
                     return Ok(None);
                 }
-                Ok(Some(notification))
+                Ok(Some(ReceivedNotification::trap(
+                    notification,
+                    source,
+                    NotificationWireIdentity {
+                        version: crate::Version::V1,
+                        request_id: None,
+                        v3: None,
+                    },
+                )))
             }
             crate::message::CommunityPdu::Standard(_) => Ok(None),
         }
@@ -65,7 +76,7 @@ impl super::NotificationReceiver {
         &self,
         data: Bytes,
         source: SocketAddr,
-    ) -> Result<Option<Notification>> {
+    ) -> Result<Option<ReceivedNotification>> {
         self.handle_v2c_at(data, source, None).await
     }
 
@@ -74,7 +85,7 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
-    ) -> Result<Option<Notification>> {
+    ) -> Result<Option<ReceivedNotification>> {
         let decoded =
             CommunityMessage::decode_with_target(data, Some(source), self.inner.decode_config)?;
         let decode_anomalies = decoded.anomalies;
@@ -110,7 +121,15 @@ impl super::NotificationReceiver {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c trap");
                     return Ok(None);
                 }
-                Ok(Some(notification))
+                Ok(Some(ReceivedNotification::trap(
+                    notification,
+                    source,
+                    NotificationWireIdentity {
+                        version: crate::Version::V2c,
+                        request_id: Some(pdu.request_id),
+                        v3: None,
+                    },
+                )))
             }
             PduType::InformRequest => {
                 let (uptime, trap_oid, varbinds) =
@@ -129,29 +148,71 @@ impl super::NotificationReceiver {
                     return Ok(None);
                 }
 
-                let finalized = crate::response_finalizer::finalize_response(
-                    crate::Version::V2c,
-                    pdu,
-                    pdu.to_response(crate::Version::V2c)?,
-                    self.inner.max_message_size,
-                    None,
-                    &self.inner.snmp_silent_drops,
-                    |response| CommunityMessage::v2c(msg.community().clone(), response)?.encode(),
-                )?;
-
-                if let Some(response_bytes) = finalized.into_bytes() {
-                    self.send_response(&response_bytes, source, response_source)
-                        .await
-                        .map_err(|e| Error::Network {
-                            target: source,
-                            source: e,
-                        })?;
-                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
+                #[cfg(test)]
+                let injected_error = self
+                    .inner
+                    .response_construction_errors
+                    .lock()
+                    .unwrap()
+                    .pop_front();
+                #[cfg(not(test))]
+                let injected_error: Option<Box<Error>> = None;
+                let finalized = if let Some(error) = injected_error {
+                    Err(error)
                 } else {
-                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "Inform response and tooBig alternate exceed max message size");
-                }
+                    pdu.to_response(crate::Version::V2c).and_then(|response| {
+                        crate::response_finalizer::finalize_response(
+                            crate::Version::V2c,
+                            pdu,
+                            response,
+                            self.inner.max_message_size,
+                            None,
+                            &self.inner.snmp_silent_drops,
+                            |response| {
+                                CommunityMessage::v2c(msg.community().clone(), response)?.encode()
+                            },
+                        )
+                    })
+                };
+                let outcome = match finalized {
+                    Ok(crate::response_finalizer::FinalizedResponse::Dropped) => {
+                        tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "Inform response and tooBig alternate exceed max message size");
+                        InformAckOutcome::SuppressedBySize
+                    }
+                    Ok(finalized) => {
+                        let response_bytes = finalized
+                            .into_bytes()
+                            .expect("non-dropped response contains bytes");
+                        match self
+                            .send_response(&response_bytes, source, response_source)
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
+                                InformAckOutcome::Sent
+                            }
+                            Err(error) => InformAckOutcome::Failed(
+                                Error::Network {
+                                    target: source,
+                                    source: error,
+                                }
+                                .boxed(),
+                            ),
+                        }
+                    }
+                    Err(error) => InformAckOutcome::Failed(error),
+                };
 
-                Ok(Some(notification))
+                Ok(Some(ReceivedNotification::inform(
+                    notification,
+                    source,
+                    NotificationWireIdentity {
+                        version: crate::Version::V2c,
+                        request_id: Some(request_id),
+                        v3: None,
+                    },
+                    outcome,
+                )))
             }
             _ => Ok(None), // Not a notification PDU
         }
@@ -169,7 +230,7 @@ impl super::NotificationReceiver {
         &self,
         data: Bytes,
         source: SocketAddr,
-    ) -> Result<Option<Notification>> {
+    ) -> Result<Option<ReceivedNotification>> {
         self.handle_v3_at(data, source, None).await
     }
 
@@ -178,12 +239,18 @@ impl super::NotificationReceiver {
         data: Bytes,
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
-    ) -> Result<Option<Notification>> {
-        let (our_boots, our_time) = self.inner.authoritative_boots_time()?;
+    ) -> Result<Option<ReceivedNotification>> {
+        let (our_boots, our_time) = super::unpack_boots_time(
+            self.inner
+                .authoritative_snapshot
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let sample_authoritative_time = || self.inner.authoritative_boots_time();
         let usm_ctx = V3LocalContext {
             engine_id: &self.inner.engine_id,
             engine_boots: our_boots,
             engine_time: our_time,
+            authoritative_time: Some(&sample_authoritative_time),
             local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             decode_config: self.inner.decode_config,
@@ -232,6 +299,16 @@ impl super::NotificationReceiver {
         let security_level = inbound.security_level;
         let decode_anomalies = inbound.decode_anomalies.clone();
         let username = usm_params.username.clone();
+        let wire_identity = NotificationWireIdentity {
+            version: crate::Version::V3,
+            request_id: Some(inbound.scoped_pdu.pdu.request_id),
+            v3: Some(V3NotificationWireIdentity {
+                msg_id: global_data.msg_id,
+                authoritative_engine_id: usm_params.engine_id.clone(),
+                username: username.clone(),
+                security_level,
+            }),
+        };
 
         let context_engine_id = scoped_pdu.context_engine_id.clone();
         let context_name = scoped_pdu.context_name.clone();
@@ -268,7 +345,11 @@ impl super::NotificationReceiver {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
                     return Ok(None);
                 }
-                Ok(Some(notification))
+                Ok(Some(ReceivedNotification::trap(
+                    notification,
+                    source,
+                    wire_identity,
+                )))
             }
             PduType::InformRequest => {
                 let (uptime, trap_oid, varbinds) =
@@ -290,39 +371,75 @@ impl super::NotificationReceiver {
                     return Ok(None);
                 }
 
-                let finalized = crate::response_finalizer::finalize_response(
-                    crate::Version::V3,
-                    pdu,
-                    pdu.to_response(crate::Version::V3)?,
-                    self.inner.max_message_size,
-                    Some(global_data.msg_max_size.as_usize()),
-                    &self.inner.snmp_silent_drops,
-                    |response_pdu| {
-                        build_v3_response(
-                            &self.inner,
-                            global_data,
-                            usm_params,
-                            response_pdu,
-                            context_engine_id.clone(),
-                            context_name.clone(),
-                            Some(&inbound.derived_keys),
-                        )
-                    },
-                )?;
-
-                if let Some(response_bytes) = finalized.into_bytes() {
-                    self.send_response(&response_bytes, source, response_source)
-                        .await
-                        .map_err(|e| Error::Network {
-                            target: source,
-                            source: e,
-                        })?;
-                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "sent V3 Inform response");
+                #[cfg(test)]
+                let injected_error = self
+                    .inner
+                    .response_construction_errors
+                    .lock()
+                    .unwrap()
+                    .pop_front();
+                #[cfg(not(test))]
+                let injected_error: Option<Box<Error>> = None;
+                let finalized = if let Some(error) = injected_error {
+                    Err(error)
                 } else {
-                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "V3 Inform response and tooBig alternate exceed max message size");
-                }
+                    pdu.to_response(crate::Version::V3).and_then(|response| {
+                        crate::response_finalizer::finalize_response(
+                            crate::Version::V3,
+                            pdu,
+                            response,
+                            self.inner.max_message_size,
+                            Some(global_data.msg_max_size.as_usize()),
+                            &self.inner.snmp_silent_drops,
+                            |response_pdu| {
+                                build_v3_response(
+                                    &self.inner,
+                                    global_data,
+                                    usm_params,
+                                    response_pdu,
+                                    context_engine_id.clone(),
+                                    context_name.clone(),
+                                    Some(&inbound.derived_keys),
+                                )
+                            },
+                        )
+                    })
+                };
+                let outcome = match finalized {
+                    Ok(crate::response_finalizer::FinalizedResponse::Dropped) => {
+                        tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "V3 Inform response and tooBig alternate exceed max message size");
+                        InformAckOutcome::SuppressedBySize
+                    }
+                    Ok(finalized) => {
+                        let response_bytes = finalized
+                            .into_bytes()
+                            .expect("non-dropped response contains bytes");
+                        match self
+                            .send_response(&response_bytes, source, response_source)
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "sent V3 Inform response");
+                                InformAckOutcome::Sent
+                            }
+                            Err(error) => InformAckOutcome::Failed(
+                                Error::Network {
+                                    target: source,
+                                    source: error,
+                                }
+                                .boxed(),
+                            ),
+                        }
+                    }
+                    Err(error) => InformAckOutcome::Failed(error),
+                };
 
-                Ok(Some(notification))
+                Ok(Some(ReceivedNotification::inform(
+                    notification,
+                    source,
+                    wire_identity,
+                    outcome,
+                )))
             }
             _ => Ok(None),
         }

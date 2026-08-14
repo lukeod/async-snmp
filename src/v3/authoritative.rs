@@ -184,7 +184,7 @@ struct AuthoritativeEngineInner {
     clock: AuthoritativeClock,
     engine_start: Instant,
     #[cfg(test)]
-    elapsed_override: Option<u64>,
+    elapsed_override: std::sync::atomic::AtomicU64,
     persist: Mutex<PersistCallback>,
 }
 
@@ -294,7 +294,7 @@ impl AuthoritativeEngine {
                 },
                 engine_start: Instant::now(),
                 #[cfg(test)]
-                elapsed_override: None,
+                elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
                 persist: Mutex::new(Box::new(persist)),
             }),
         })
@@ -337,10 +337,16 @@ impl AuthoritativeEngine {
         #[cfg(not(test))]
         let elapsed = self.inner.engine_start.elapsed().as_secs();
         #[cfg(test)]
-        let elapsed = self
+        let elapsed_override = self
             .inner
             .elapsed_override
-            .unwrap_or_else(|| self.inner.engine_start.elapsed().as_secs());
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let elapsed = if elapsed_override == u64::MAX {
+            self.inner.engine_start.elapsed().as_secs()
+        } else {
+            elapsed_override
+        };
         self.current_boots_time_at(elapsed)
     }
 
@@ -437,7 +443,7 @@ impl AuthoritativeEngine {
     #[cfg(test)]
     pub(crate) fn with_rollover_persistence_failure_for_test(engine_id: impl Into<Bytes>) -> Self {
         let mut first_persist = true;
-        let mut engine = Self::install(engine_id, move |_| {
+        let engine = Self::install(engine_id, move |_| {
             if std::mem::replace(&mut first_persist, false) {
                 Ok(())
             } else {
@@ -445,14 +451,18 @@ impl AuthoritativeEngine {
             }
         })
         .unwrap();
-        Arc::get_mut(&mut engine.inner).unwrap().elapsed_override =
-            Some(u64::from(MAX_ENGINE_TIME) + 1);
+        engine.inner.elapsed_override.store(
+            u64::from(MAX_ENGINE_TIME) + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         engine
     }
 
     #[cfg(test)]
-    pub(crate) fn set_elapsed_for_test(&mut self, elapsed: u64) {
-        Arc::get_mut(&mut self.inner).unwrap().elapsed_override = Some(elapsed);
+    pub(crate) fn set_elapsed_for_test(&self, elapsed: u64) {
+        self.inner
+            .elapsed_override
+            .store(elapsed, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]

@@ -169,9 +169,12 @@ fn spawn_receiver(
     tokio::spawn(async move {
         loop {
             match receiver.recv().await {
-                Ok((notification, source)) => {
+                Ok(received) => {
                     println!("[{label} receiver]");
-                    handle_notification(&notification, source);
+                    handle_notification(&received.notification, received.source);
+                    if let Some(outcome) = received.inform_ack {
+                        println!("  Inform acknowledgement: {outcome:?}");
+                    }
                 }
                 Err(e) => eprintln!("{label} receive error: {e}"),
             }

@@ -697,7 +697,9 @@ impl<T: Transport> Client<T> {
 
         let des_generating_engine_boots = match security.priv_protocol() {
             Some(crate::v3::PrivProtocol::Des | crate::v3::PrivProtocol::Des3) => Some(
-                if let Some(local_engine) = &self.inner.config.local_authoritative_engine {
+                if let Some(sample) = &self.inner.config.local_authoritative_time_source {
+                    sample()?.0
+                } else if let Some(local_engine) = &self.inner.config.local_authoritative_engine {
                     local_engine.current_boots_time()?.0
                 } else {
                     self.inner
@@ -1742,7 +1744,7 @@ mod tests {
             .unwrap();
         let des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
-        let mut local_engine = crate::v3::AuthoritativeEngine::for_test(&b"local-engine"[..], 1);
+        let local_engine = crate::v3::AuthoritativeEngine::for_test(&b"local-engine"[..], 1);
         local_engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
         let config = ClientConfig {
             auth: crate::Auth::Usm(security.clone()),

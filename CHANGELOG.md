@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `NotificationReceiver::recv` now returns an owning
+  `ReceivedNotification` with source and wire-transmission identity. Traps have
+  no acknowledgement outcome; accepted Informs report `Sent`,
+  `SuppressedBySize`, or the construction, persistence, crypto, timeout, or
+  send failure that occurred after acceptance. Pre-acceptance authoritative
+  persistence failures remain errors from `recv`.
+- `Agent::health` and `Agent::subscribe_health` expose bounded, coalesced
+  authoritative-persistence degradation and recovery state. An outage fails
+  affected local-authoritative V3 processing closed while v1/v2c service and
+  later persistence retries continue.
 - **Breaking:** `Transport` now requires one complete `request_with` exchange
   hook; the public `recv`, `recv_with`, and `request` split operations are
   removed. Registrations carry one absolute deadline and bounded normalized
@@ -72,9 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Agent replies and notification Inform/Report responses now have configurable
   send deadlines through `AgentBuilder::response_send_timeout` and
   `NotificationReceiverBuilder::response_send_timeout`, defaulting to five
-  seconds. A notification response timeout terminates that `recv` call and
-  releases its FIFO turn; agent shutdown drains response attempts only through
-  their bounded deadline.
+  seconds. An accepted Inform response timeout is returned in its
+  acknowledgement outcome and releases the receiver's FIFO turn; agent
+  shutdown drains response attempts only through their bounded deadline.
 - Agent `snmpInASNParseErrs` accounting now covers actual ASN.1/BER decode
   failures at the message-processing boundary. Unknown versions and decoded
   SNMPv1 `Counter64` values remain version-semantic failures rather than parse

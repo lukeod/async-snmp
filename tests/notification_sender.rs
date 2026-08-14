@@ -9,6 +9,7 @@ use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::message::CommunityMessage;
 use async_snmp::notification::{
     Notification, NotificationAcceptance, NotificationReceiver, NotificationVarbindValidation,
+    ReceivedNotification,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 use async_snmp::v3::{AuthProtocol, PrivProtocol};
@@ -166,10 +167,8 @@ fn valid_sentinel_trap(request_id: i32) -> Bytes {
     .unwrap()
 }
 
-async fn assert_sentinel_received(
-    handle: tokio::task::JoinHandle<(Notification, std::net::SocketAddr)>,
-) {
-    let (notification, _) = handle.await.unwrap();
+async fn assert_sentinel_received(handle: tokio::task::JoinHandle<ReceivedNotification>) {
+    let notification = handle.await.unwrap().notification;
     assert!(matches!(
         notification,
         Notification::TrapV2c {
@@ -191,10 +190,11 @@ async fn notification_varbind_validation_controls_trap_delivery() {
         .await
         .unwrap();
 
-    let (notification, _) = tokio::time::timeout(Duration::from_secs(5), tolerant.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), tolerant.recv())
         .await
         .expect("timeout waiting for tolerant trap")
-        .unwrap();
+        .unwrap()
+        .notification;
     assert!(matches!(
         notification,
         Notification::TrapV2c {
@@ -268,7 +268,7 @@ async fn notification_varbind_validation_controls_inform_acknowledgement() {
     let response_pdu = response_msg.into_pdu().unwrap();
     assert_eq!(response_pdu.pdu_type(), PduType::Response);
     assert_eq!(response_pdu.request_id(), 42);
-    let (notification, _) = recv_handle.await.unwrap();
+    let notification = recv_handle.await.unwrap().notification;
     assert!(matches!(
         notification,
         Notification::InformV2c {
@@ -388,10 +388,11 @@ async fn v2c_trap_send_receive() {
 
     client.send_trap(&trap_oid, 12345, extra).await.unwrap();
 
-    let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for trap")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     match notification {
         Notification::TrapV2c {
@@ -438,7 +439,7 @@ async fn v2c_inform_send_receive() {
     // send_inform waits for acknowledgement
     client.send_inform(&trap_oid, 5000, vec![]).await.unwrap();
 
-    let (notification, _source) = recv_handle.await.unwrap();
+    let notification = recv_handle.await.unwrap().notification;
 
     match notification {
         Notification::InformV2c {
@@ -499,10 +500,11 @@ async fn v3_trap_send_receive() {
 
     client.send_trap(&trap_oid, 99, vec![]).await.unwrap();
 
-    let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for v3 trap")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     match notification {
         Notification::TrapV3 {
@@ -572,7 +574,7 @@ async fn v3_inform_send_receive() {
 
     client.send_inform(&trap_oid, 7777, vec![]).await.unwrap();
 
-    let (notification, _source) = recv_handle.await.unwrap();
+    let notification = recv_handle.await.unwrap().notification;
 
     match notification {
         Notification::InformV3 {
@@ -613,10 +615,11 @@ async fn v1_trap_send_receive() {
     let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3); // linkDown
     client.send_trap(&trap_oid, 5000, vec![]).await.unwrap();
 
-    let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for v1 trap")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     match notification {
         Notification::TrapV1 {
@@ -656,10 +659,11 @@ async fn v1_trap_send_v1_trap_explicit() {
     .unwrap();
     client.send_v1_trap(trap).await.unwrap();
 
-    let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for v1 trap")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     match notification {
         Notification::TrapV1 {
@@ -781,10 +785,11 @@ async fn agent_v2c_trap_to_sink() {
     assert!(outcome.all_succeeded());
     assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
-    let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for agent trap")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     match notification {
         Notification::TrapV2c {
@@ -890,10 +895,11 @@ async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
     assert!(matches!(sink.status, SinkStatus::Succeeded));
     assert!(stream.next().await.is_none());
 
-    let (notification, _) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for lazily sent trap")
-        .unwrap();
+        .unwrap()
+        .notification;
     assert_eq!(notification.uptime(), 321);
 }
 
@@ -927,7 +933,7 @@ async fn agent_v2c_inform_to_sink() {
     assert!(outcome.all_succeeded());
     assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
-    let (notification, _source) = recv_handle.await.unwrap();
+    let notification = recv_handle.await.unwrap().notification;
 
     match notification {
         Notification::InformV2c {
@@ -971,8 +977,8 @@ async fn agent_inform_sinks_share_source_endpoint() {
         .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2), 1000, vec![])
         .await;
     assert!(outcome.all_succeeded());
-    let (_, first_source) = first.await.unwrap();
-    let (_, second_source) = second.await.unwrap();
+    let first_source = first.await.unwrap().source;
+    let second_source = second.await.unwrap().source;
     assert_eq!(first_source, second_source);
     assert_ne!(first_source.port(), agent.local_addr().port());
 }
@@ -1023,10 +1029,11 @@ async fn agent_v3_trap_to_sink() {
     assert!(outcome.all_succeeded());
     assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
-    let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for v3 agent trap")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     match notification {
         Notification::TrapV3 {
@@ -1074,14 +1081,16 @@ async fn agent_multiple_sinks() {
     assert_eq!(outcome.len(), 2);
 
     // Both receivers should get the trap
-    let (n1, _) = tokio::time::timeout(Duration::from_secs(5), recv1.recv())
+    let n1 = tokio::time::timeout(Duration::from_secs(5), recv1.recv())
         .await
         .expect("timeout on receiver 1")
-        .unwrap();
-    let (n2, _) = tokio::time::timeout(Duration::from_secs(5), recv2.recv())
+        .unwrap()
+        .notification;
+    let n2 = tokio::time::timeout(Duration::from_secs(5), recv2.recv())
         .await
         .expect("timeout on receiver 2")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     assert_eq!(n1.uptime(), 42);
     assert_eq!(n2.uptime(), 42);
@@ -1126,10 +1135,11 @@ async fn agent_v1_trap_to_sink() {
     assert!(outcome.all_succeeded());
     assert!(matches!(&outcome.sinks()[0].status, SinkStatus::Succeeded));
 
-    let (notification, _source) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("timeout waiting for v1 agent trap")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     match notification {
         Notification::TrapV1 {
@@ -1175,14 +1185,16 @@ async fn agent_mixed_v1_v2c_sinks() {
     assert!(outcome.all_succeeded());
     assert_eq!(outcome.len(), 2);
 
-    let (n1, _) = tokio::time::timeout(Duration::from_secs(5), recv_v1.recv())
+    let n1 = tokio::time::timeout(Duration::from_secs(5), recv_v1.recv())
         .await
         .expect("timeout on v1 receiver")
-        .unwrap();
-    let (n2, _) = tokio::time::timeout(Duration::from_secs(5), recv_v2.recv())
+        .unwrap()
+        .notification;
+    let n2 = tokio::time::timeout(Duration::from_secs(5), recv_v2.recv())
         .await
         .expect("timeout on v2 receiver")
-        .unwrap();
+        .unwrap()
+        .notification;
 
     // V1 sink gets a TrapV1
     match n1 {
@@ -1598,7 +1610,7 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
     assert_eq!(live.sink.dest(), live_addr);
     assert!(matches!(live.status, SinkStatus::Succeeded));
 
-    let (notification, _) = receive.await.unwrap().unwrap();
+    let notification = receive.await.unwrap().unwrap().notification;
     assert!(matches!(notification, Notification::InformV2c { .. }));
 
     let dead = stream.next().await.expect("dead sink outcome");
@@ -1773,10 +1785,11 @@ async fn agent_trap_reports_ordered_partial_success() {
     assert_eq!(outcome.sinks()[1].sink.dest(), v2_addr);
     assert!(matches!(&outcome.sinks()[1].status, SinkStatus::Succeeded));
 
-    let (notification, _) = tokio::time::timeout(Duration::from_secs(5), v2_receiver.recv())
+    let notification = tokio::time::timeout(Duration::from_secs(5), v2_receiver.recv())
         .await
         .expect("timeout waiting for successful partial trap")
-        .unwrap();
+        .unwrap()
+        .notification;
     assert_eq!(notification.uptime(), 7);
     assert!(matches!(notification, Notification::TrapV2c { .. }));
 }

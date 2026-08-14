@@ -154,6 +154,7 @@ impl Agent {
             engine_id: &state.engine_id,
             engine_boots,
             engine_time,
+            authoritative_time: None,
             local_receive_capacity: state.local_receive_capacity,
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             decode_config: state.decode_config,

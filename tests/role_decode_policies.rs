@@ -284,7 +284,7 @@ async fn notification_receiver_applies_only_targeted_empty_oid_normalization() {
         .await
         .expect("timeout waiting for targeted empty-OID trap")
         .unwrap()
-        .0;
+        .notification;
     assert_eq!(
         notification.decode_anomalies(),
         [DecodeAnomaly::EmptyObjectIdentifier {

@@ -331,6 +331,8 @@ struct ClientInner<T: Transport> {
     authenticated_response_validated_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
+pub(crate) type LocalAuthoritativeTimeSource = Arc<dyn Fn() -> Result<(u32, u32)> + Send + Sync>;
+
 /// Client configuration.
 ///
 /// Most users should use [`ClientBuilder`] rather than constructing this directly.
@@ -405,6 +407,8 @@ pub struct ClientConfig {
     pub local_authoritative_engine: Option<crate::v3::AuthoritativeEngine>,
     /// Durable local generating-engine state required by DES and 3DES.
     pub des_salt_state: Option<DesSaltState>,
+    /// Internal observer-aware source for Agent-owned authoritative time.
+    pub(crate) local_authoritative_time_source: Option<LocalAuthoritativeTimeSource>,
 }
 
 impl Default for ClientConfig {
@@ -429,6 +433,7 @@ impl Default for ClientConfig {
             max_repetitions: DEFAULT_MAX_REPETITIONS,
             local_authoritative_engine: None,
             des_salt_state: None,
+            local_authoritative_time_source: None,
         }
     }
 }

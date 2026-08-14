@@ -264,6 +264,31 @@ pub enum BuiltinMib {
     MpdStats,
 }
 
+/// Current health of the Agent's local authoritative V3 state.
+///
+/// Health changes use a bounded, coalescing watch channel. Repeated packets
+/// during one persistence outage increment `consecutive_failures` in the
+/// current value instead of enqueueing an unbounded sequence. A later
+/// successful authoritative-state publication restores `Healthy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentHealth {
+    /// No unresolved authoritative-engine persistence failure is known.
+    Healthy,
+    /// Local-authoritative V3 processing is degraded until persistence
+    /// succeeds on a later attempt.
+    AuthoritativePersistenceDegraded {
+        /// Failed publication attempts observed in this outage.
+        consecutive_failures: u64,
+        /// Durable transition that most recently failed.
+        operation: crate::v3::AuthoritativeEnginePersistenceOperation,
+        /// Last durable boots value before the attempted transition.
+        previous_engine_boots: Option<u32>,
+        /// Boots value passed to the persistence callback.
+        attempted_engine_boots: u32,
+    },
+}
+
 /// Registered handler with its OID prefix.
 pub(crate) struct RegisteredHandler {
     pub(crate) prefix: Oid,
@@ -1113,6 +1138,7 @@ impl AgentBuilder {
             snmp_silent_drops: AtomicU32::new(0),
             snmp_unknown_contexts: AtomicU32::new(0),
             usm_stats: UsmStats::default(),
+            health: tokio::sync::watch::channel(AgentHealth::Healthy).0,
         });
 
         // Register built-in handlers for any not disabled
@@ -1406,6 +1432,8 @@ pub(crate) struct AgentState {
     pub(crate) snmp_unknown_contexts: AtomicU32,
     /// RFC 3414 usmStats counters
     pub(crate) usm_stats: UsmStats,
+    /// Bounded/coalescing current-health publication.
+    health: tokio::sync::watch::Sender<AgentHealth>,
 }
 
 impl AgentState {
@@ -1414,7 +1442,7 @@ impl AgentState {
         #[cfg(test)]
         let override_elapsed = self.authoritative_elapsed_override.load(Ordering::Relaxed);
         #[cfg(test)]
-        return if override_elapsed != u64::MAX {
+        let result = if override_elapsed != u64::MAX {
             Ok(compute_engine_boots_time(
                 self.engine_boots_base,
                 override_elapsed,
@@ -1423,7 +1451,10 @@ impl AgentState {
             self.sample_authoritative_boots_time()
         };
         #[cfg(not(test))]
-        self.sample_authoritative_boots_time()
+        let result = self.sample_authoritative_boots_time();
+
+        self.observe_authoritative_result(&result);
+        result
     }
 
     fn sample_authoritative_boots_time(&self) -> Result<(u32, u32)> {
@@ -1435,6 +1466,41 @@ impl AgentState {
                     self.engine_boots_base,
                     total_secs,
                 ))
+            }
+        }
+    }
+
+    fn observe_authoritative_result(&self, result: &Result<(u32, u32)>) {
+        match result {
+            Ok(_) => {
+                self.health.send_if_modified(|health| {
+                    if matches!(health, AgentHealth::Healthy) {
+                        false
+                    } else {
+                        *health = AgentHealth::Healthy;
+                        true
+                    }
+                });
+            }
+            Err(error) => {
+                let Some(persistence) = error.authoritative_engine_persistence() else {
+                    return;
+                };
+                self.health.send_modify(|health| {
+                    let consecutive_failures = match *health {
+                        AgentHealth::AuthoritativePersistenceDegraded {
+                            consecutive_failures,
+                            ..
+                        } => consecutive_failures.saturating_add(1),
+                        AgentHealth::Healthy => 1,
+                    };
+                    *health = AgentHealth::AuthoritativePersistenceDegraded {
+                        consecutive_failures,
+                        operation: persistence.operation(),
+                        previous_engine_boots: persistence.previous_engine_boots(),
+                        attempted_engine_boots: persistence.attempted_engine_boots(),
+                    };
+                });
             }
         }
     }
@@ -1554,6 +1620,23 @@ impl Agent {
     /// be persisted. The previously durable pair remains authoritative.
     pub fn engine_boots_time(&self) -> Result<(u32, u32)> {
         self.inner.state.authoritative_boots_time()
+    }
+
+    /// Return the Agent's current local-authoritative persistence health.
+    #[must_use]
+    pub fn health(&self) -> AgentHealth {
+        *self.inner.state.health.borrow()
+    }
+
+    /// Observe bounded, coalesced health changes.
+    ///
+    /// The returned watch receiver starts with the current value. Slow
+    /// observers see the latest state instead of one queued item per failed
+    /// packet. Recovery is published only after authoritative-state sampling
+    /// succeeds on a later attempt.
+    #[must_use]
+    pub fn subscribe_health(&self) -> tokio::sync::watch::Receiver<AgentHealth> {
+        self.inner.state.health.subscribe()
     }
 
     /// Get the cancellation token for this agent.
@@ -4988,6 +5071,132 @@ mod tests {
 
         assert_eq!(agent.engine_boots_time().unwrap().0, 1);
         assert_eq!(agent.engine_id(), b"test-agent-engine");
+    }
+
+    #[tokio::test]
+    async fn authoritative_persistence_health_coalesces_failures_and_recovers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let engine = AuthoritativeEngine::install(b"health-agent-engine".to_vec(), move |_| {
+            match callback_calls.fetch_add(1, Ordering::Relaxed) {
+                0 | 3.. => Ok(()),
+                _ => Err(std::io::Error::other("persistence unavailable")),
+            }
+        })
+        .unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine.clone())
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        let mut health = agent.subscribe_health();
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+
+        assert_eq!(agent.health(), AgentHealth::Healthy);
+        assert_eq!(
+            agent.engine_boots_time().unwrap_err().kind(),
+            crate::ErrorKind::AuthoritativeEnginePersistence
+        );
+        assert_eq!(
+            agent.engine_boots_time().unwrap_err().kind(),
+            crate::ErrorKind::AuthoritativeEnginePersistence
+        );
+        assert!(health.has_changed().unwrap());
+        assert!(matches!(
+            agent.health(),
+            AgentHealth::AuthoritativePersistenceDegraded {
+                consecutive_failures: 2,
+                operation: crate::AuthoritativeEnginePersistenceOperation::EngineTimeRollover,
+                previous_engine_boots: Some(1),
+                attempted_engine_boots: 2,
+            }
+        ));
+        health.borrow_and_update();
+        assert!(!health.has_changed().unwrap());
+
+        assert_eq!(agent.engine_boots_time().unwrap(), (2, 0));
+        health.changed().await.unwrap();
+        assert_eq!(*health.borrow_and_update(), AgentHealth::Healthy);
+        assert_eq!(agent.health(), AgentHealth::Healthy);
+    }
+
+    #[tokio::test]
+    async fn persistence_outage_fails_v3_closed_while_community_requests_continue() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let engine = AuthoritativeEngine::install(b"mixed-agent-engine".to_vec(), move |_| {
+            if callback_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("persistence unavailable"))
+            }
+        })
+        .unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .usm_user("user", Ok)
+            .unwrap()
+            .authoritative_engine(engine.clone())
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
+            .without_builtin_handlers()
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+
+        let discovery =
+            crate::message::V3Message::discovery_request(9, crate::UDP_RECEIVE_LIMITS.advertised())
+                .unwrap()
+                .encode()
+                .unwrap();
+        let source = "127.0.0.1:9999".parse().unwrap();
+        assert_eq!(
+            agent
+                .handle_request(discovery.clone(), source)
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::AuthoritativeEnginePersistence
+        );
+
+        for version in [Version::V1, Version::V2c] {
+            let request = crate::message::CommunityMessage::new(
+                version,
+                Bytes::from_static(b"public"),
+                Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            assert!(
+                agent
+                    .handle_request(request, source)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{version:?} service stopped during V3 persistence outage"
+            );
+        }
+
+        assert_eq!(
+            agent
+                .handle_request(discovery, source)
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::AuthoritativeEnginePersistence
+        );
+        assert!(matches!(
+            agent.health(),
+            AgentHealth::AuthoritativePersistenceDegraded {
+                consecutive_failures: 2,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

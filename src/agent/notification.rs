@@ -18,7 +18,9 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::Community;
-use crate::client::{Auth, Client, ClientConfig, CommunityVersion, Retry};
+use crate::client::{
+    Auth, Client, ClientConfig, CommunityVersion, LocalAuthoritativeTimeSource, Retry,
+};
 use crate::error::{Error, Result};
 use crate::handler::SecurityModel;
 use crate::message::{CommunityMessage, SecurityLevel};
@@ -336,7 +338,7 @@ impl TrapSink {
         &self,
         transports: &InformTransportPool,
         des_salt_state: Option<&crate::v3::DesSaltState>,
-        local_authoritative_engine: Option<&crate::v3::AuthoritativeEngine>,
+        agent_state: Option<&Arc<super::AgentState>>,
     ) -> Result<Client<UdpHandle>> {
         let mut guard = self.inform_client.lock().await;
         if let Some(ref client) = *guard {
@@ -346,12 +348,19 @@ impl TrapSink {
         if self.summary.version == Version::V1 {
             unreachable!("v1 does not support informs");
         }
+        let local_authoritative_engine =
+            agent_state.and_then(|state| state.authoritative_engine.clone());
+        let local_authoritative_time_source = agent_state.map(|state| {
+            let state = Arc::clone(state);
+            Arc::new(move || state.authoritative_boots_time()) as LocalAuthoritativeTimeSource
+        });
         let config = ClientConfig {
             auth: self.auth.clone(),
             request_timeout: self.inform_timeout,
             retry: self.inform_retry.clone(),
             des_salt_state: des_salt_state.cloned(),
-            local_authoritative_engine: local_authoritative_engine.cloned(),
+            local_authoritative_engine,
+            local_authoritative_time_source,
             ..ClientConfig::default()
         };
 
@@ -890,7 +899,7 @@ impl super::Agent {
             .get_or_create_inform_client(
                 &self.inner.inform_transports,
                 self.inner.des_salt_state.as_ref(),
-                self.inner.state.authoritative_engine.as_ref(),
+                Some(&self.inner.state),
             )
             .await?;
         client
@@ -1016,7 +1025,7 @@ mod tests {
     #[cfg(feature = "crypto-rustcrypto")]
     #[tokio::test]
     async fn agent_trap_rejects_des_state_after_authoritative_rollover() {
-        let mut engine = crate::v3::AuthoritativeEngine::for_test(&b"agent-engine"[..], 1);
+        let engine = crate::v3::AuthoritativeEngine::for_test(&b"agent-engine"[..], 1);
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
         let des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
@@ -1057,6 +1066,112 @@ mod tests {
             })
         ));
         assert_eq!(des_state.reserve().unwrap().salt(), 1);
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[tokio::test]
+    async fn agent_des_inform_persistence_updates_health_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let receiver_engine =
+            crate::v3::AuthoritativeEngine::for_test(&b"receiver-inform-health"[..], 5);
+        let receiver_des_state = crate::v3::DesSaltState::restart(
+            crate::v3::PersistedDesSaltState::new(4).unwrap(),
+            |_| Ok::<(), std::convert::Infallible>(()),
+        )
+        .unwrap();
+        let receiver = crate::NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(receiver_engine)
+            .des_salt_state(receiver_des_state)
+            .usm_user("informuser", |user| {
+                user.auth_priv(
+                    AuthProtocol::Sha1,
+                    b"auth-password",
+                    PrivProtocol::Des,
+                    b"priv-password",
+                )
+            })
+            .unwrap()
+            .accept_all_notifications()
+            .build()
+            .await
+            .unwrap();
+        let receiver_addr = receiver.local_addr();
+        let receiver_task = tokio::spawn(async move { receiver.recv().await });
+
+        let persistence_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let callback_calls = std::sync::Arc::clone(&persistence_calls);
+        let engine =
+            crate::v3::AuthoritativeEngine::install(b"agent-inform-health".to_vec(), move |_| {
+                match callback_calls.fetch_add(1, Ordering::Relaxed) {
+                    0 | 3.. => Ok(()),
+                    _ => Err(std::io::Error::other("persistence unavailable")),
+                }
+            })
+            .unwrap();
+        let des_state =
+            crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let sink_auth = Auth::usm_builder("informuser")
+            .auth_priv(
+                AuthProtocol::Sha1,
+                b"auth-password",
+                PrivProtocol::Des,
+                b"priv-password",
+            )
+            .build()
+            .unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(engine.clone())
+            .des_salt_state(des_state)
+            .trap_sink(
+                NotificationSinkId::new("des-inform").unwrap(),
+                receiver_addr.to_string(),
+                sink_auth,
+            )
+            .inform_timeout(std::time::Duration::from_secs(1))
+            .inform_retry(crate::Retry::none())
+            .allow_all_access()
+            .build()
+            .await
+            .unwrap();
+        engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+
+        for expected_failures in [1, 2] {
+            let outcome = agent.send_inform(&trap_oid, 0, vec![]).await;
+            assert!(matches!(
+                &outcome.sinks()[0].status,
+                SinkStatus::Failed(error)
+                    if error.kind() == crate::ErrorKind::AuthoritativeEnginePersistence
+            ));
+            assert!(matches!(
+                agent.health(),
+                crate::agent::AgentHealth::AuthoritativePersistenceDegraded {
+                    consecutive_failures,
+                    ..
+                } if consecutive_failures == expected_failures
+            ));
+        }
+
+        let recovered = agent.send_inform(&trap_oid, 0, vec![]).await;
+        assert!(matches!(
+            &recovered.sinks()[0].status,
+            SinkStatus::Failed(error)
+                if matches!(
+                    &**error,
+                    Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                        state_engine_boots: 1,
+                        generating_engine_boots: 2,
+                    })
+                )
+        ));
+        assert_eq!(agent.health(), crate::agent::AgentHealth::Healthy);
+        assert_eq!(persistence_calls.load(Ordering::Relaxed), 4);
+
+        receiver_task.abort();
+        let _ = receiver_task.await;
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]

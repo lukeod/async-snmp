@@ -7,7 +7,9 @@ use crate::common::fixtures;
 use crate::common::handler::TestHandler;
 
 use async_snmp::handler::MibHandler;
-use async_snmp::v3::{AuthProtocol, AuthoritativeEngine, PrivProtocol, generate_engine_id};
+use async_snmp::v3::{
+    AuthProtocol, AuthoritativeEngine, DesSaltState, PrivProtocol, generate_engine_id,
+};
 use async_snmp::{Agent, Oid, Value, oid};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -203,6 +205,7 @@ pub struct TestAgentBuilder {
     data: BTreeMap<Oid, Value>,
     communities: Vec<Vec<u8>>,
     usm_users: Vec<V3User>,
+    des_salt_state: Option<DesSaltState>,
 }
 
 impl TestAgentBuilder {
@@ -212,6 +215,7 @@ impl TestAgentBuilder {
             data: fixtures::system_mib(),
             communities: vec![b"public".to_vec()],
             usm_users: Vec::new(),
+            des_salt_state: None,
         }
     }
 
@@ -233,8 +237,26 @@ impl TestAgentBuilder {
         self
     }
 
+    /// Set durable DES sender state shared with other test senders in the same
+    /// localized privacy-key domain.
+    pub fn des_salt_state(mut self, state: DesSaltState) -> Self {
+        self.des_salt_state = Some(state);
+        self
+    }
+
     /// Build the agent.
     pub async fn build(self) -> TestAgent {
+        let uses_des = self.usm_users.iter().any(|user| {
+            user.priv_
+                .as_ref()
+                .is_some_and(|(protocol, _)| protocol.is_des_family())
+        });
+        let des_salt_state = uses_des.then(|| {
+            self.des_salt_state.unwrap_or_else(|| {
+                DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(()))
+                    .expect("failed to initialize test DES sender state")
+            })
+        });
         let handler = Arc::new(TestHandler::new(self.data));
         let cancel = CancellationToken::new();
 
@@ -269,6 +291,9 @@ impl TestAgentBuilder {
             })
             .expect("failed to initialize test authoritative engine");
             builder = builder.authoritative_engine(engine);
+        }
+        if let Some(state) = des_salt_state {
+            builder = builder.des_salt_state(state);
         }
 
         let agent = builder

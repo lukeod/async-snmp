@@ -66,8 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recv_handle = tokio::spawn(async move {
         for _ in 0..5 {
             match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
-                Ok(Ok((notification, source))) => {
-                    print_notification(&notification, source);
+                Ok(Ok(received)) => {
+                    print_notification(&received.notification, received.source);
+                    if let Some(outcome) = received.inform_ack {
+                        println!("  Inform acknowledgement: {outcome:?}");
+                    }
                 }
                 Ok(Err(e)) => eprintln!("Receive error: {e}"),
                 Err(_) => eprintln!("Timeout waiting for notification"),
