@@ -73,18 +73,18 @@
 //! ### SNMPv3 authentication and privacy
 //!
 //! ```rust,no_run
-//! use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, oid};
+//! use async_snmp::{AuthProtocol, Client, PrivProtocol, UsmConfig, oid};
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> async_snmp::Result<()> {
-//!     let auth = Auth::usm_builder("admin")
+//!     let auth = UsmConfig::new("admin")
 //!         .auth_priv(
 //!             AuthProtocol::Sha256,
 //!             "authpass123",
 //!             PrivProtocol::Aes128,
 //!             "privpass123",
 //!         )
-//!         .build().unwrap();
+//!         .unwrap();
 //!
 //!     let client = Client::builder(("192.168.1.1", 161), auth)
 //!         .connect()
@@ -239,7 +239,7 @@
 //! # {
 //! use async_snmp::{
 //!     Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol,
-//!     UdpTransport, oid,
+//!     UdpTransport, UsmConfig, oid,
 //! };
 //! use std::sync::Arc;
 //!
@@ -252,9 +252,9 @@
 //! let transport = UdpTransport::bind("0.0.0.0:0").await?;
 //!
 //! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
-//!     let auth = Auth::usm_builder("snmpuser")
+//!     let auth = UsmConfig::new("snmpuser")
 //!         .with_master_keys(master_keys.clone())
-//!         .build().unwrap();
+//!         .unwrap();
 //!     let client = Client::builder(target, auth)
 //!         .engine_cache(engine_cache.clone())
 //!         .build_with(&transport)
@@ -454,7 +454,7 @@
 //! | UDP source correlation | off-target replies accepted with a warning | [`TargetClientBuilder::strict_source`] drops off-target datagrams while leaving the request pending; drops increment [`UdpStats::discarded_datagrams`]. Permissive source handling supports multihomed agents but weakens peer identity. TCP remains bound to its connected peer. |
 //! | [`CommunityResponsePolicy`] | `Exact` | V1/v2c response communities match byte-for-byte. Rewrite policies emit warnings when used; accepting rewrites from any source weakens spoof resistance, especially with permissive UDP source handling. |
 //! | [`ClientBuilder::allow_unauthenticated_v3_time_correction`] | off | Allows one correlated, packet-local correction from an unauthenticated time-window Report. The tuple is never trusted globally, but an injector can choose one packet's time fields. Use strict UDP source correlation where possible; tracing records protocol correction. |
-//! | Request, send, and construction timeouts | 5 seconds each | [`ClientBuilder::request_timeout`] and [`ClientBuilder::send_timeout`] configure client I/O. [`TargetClientBuilder::construction_timeout`] uses one absolute deadline across resolution and built-in transport creation. Preconfigured transports and [`ClientBuilder::build_with_transport`] leave construction deadlines to the application. |
+//! | Request, send, and construction timeouts | 5 seconds each | [`ClientBuilder::request_timeout`] and [`ClientBuilder::send_timeout`] configure client I/O. [`TargetClientBuilder::construction_timeout`] uses one absolute deadline across resolution and built-in transport creation. `AgentBuilder::construction_timeout` spans bind, every configured sink lookup, and Agent setup when the `agent` feature is enabled. Preconfigured transports and [`ClientBuilder::build_with_transport`] leave construction deadlines to the application. |
 //!
 //! [`UdpStats`] exposes UDP `correlated_datagrams`, `expired_registrations`,
 //! `discarded_datagrams`, and `malformed_datagrams` counters for endpoint
@@ -598,8 +598,7 @@ pub use client::{
     FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
     FixedCardinalityResponse, MAX_RETRIES, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
     ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder,
-    UsmAuthBuilder, WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod,
-    WalkOptions, WalkStream,
+    WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod, WalkOptions, WalkStream,
 };
 pub use community::Community;
 pub use compatibility::{

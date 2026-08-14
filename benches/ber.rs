@@ -373,7 +373,12 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
 
     let pdu = ResponsePdu::success(Version::V2c, 12345, varbinds).unwrap();
 
-    let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
+    let msg = CommunityMessage::new(
+        async_snmp::CommunityVersion::V2c,
+        Bytes::from_static(b"public"),
+        pdu,
+    )
+    .unwrap();
     let encoded = msg.encode().unwrap();
 
     group.throughput(Throughput::Bytes(encoded.len() as u64));
@@ -396,7 +401,12 @@ fn bench_message_decode_throughput(c: &mut Criterion) {
 
     let pdu = ResponsePdu::success(Version::V2c, 12346, many_varbinds).unwrap();
 
-    let msg = CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
+    let msg = CommunityMessage::new(
+        async_snmp::CommunityVersion::V2c,
+        Bytes::from_static(b"public"),
+        pdu,
+    )
+    .unwrap();
     let encoded_large = msg.encode().unwrap();
 
     group.throughput(Throughput::Bytes(encoded_large.len() as u64));

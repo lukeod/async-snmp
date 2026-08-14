@@ -778,7 +778,7 @@ fn both_backends_are_explicit_and_match_shared_sha_aes_vectors() {
     let engine_id = decode("000000000000000000000002").unwrap();
     assert_eq!(
         async_snmp::UsmConfig::new("default").crypto_backend(),
-        CryptoBackend::RustCrypto
+        Some(CryptoBackend::RustCrypto)
     );
 
     let rust = async_snmp::UsmConfig::new("user")
@@ -802,8 +802,8 @@ fn both_backends_are_explicit_and_match_shared_sha_aes_vectors() {
         )
         .unwrap();
 
-    assert_eq!(rust.crypto_backend(), CryptoBackend::RustCrypto);
-    assert_eq!(fips.crypto_backend(), CryptoBackend::AwsLcFips);
+    assert_eq!(rust.crypto_backend(), Some(CryptoBackend::RustCrypto));
+    assert_eq!(fips.crypto_backend(), Some(CryptoBackend::AwsLcFips));
 
     let rust_keys = rust.derive_keys(&engine_id).unwrap();
     let fips_keys = fips.derive_keys(&engine_id).unwrap();

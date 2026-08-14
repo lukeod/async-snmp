@@ -304,8 +304,12 @@ fn bench_request_overhead(c: &mut Criterion) {
     group.bench_function("encode_get_request", |b| {
         b.iter(|| {
             let pdu = RequestPdu::get(Version::V2c, 12345, &oids).unwrap();
-            let msg =
-                CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), pdu).unwrap();
+            let msg = CommunityMessage::new(
+                async_snmp::CommunityVersion::V2c,
+                Bytes::from_static(b"public"),
+                pdu,
+            )
+            .unwrap();
             black_box(msg.encode())
         });
     });
@@ -322,8 +326,12 @@ fn bench_request_overhead(c: &mut Criterion) {
         )],
     )
     .unwrap();
-    let msg =
-        CommunityMessage::new(Version::V2c, Bytes::from_static(b"public"), response_pdu).unwrap();
+    let msg = CommunityMessage::new(
+        async_snmp::CommunityVersion::V2c,
+        Bytes::from_static(b"public"),
+        response_pdu,
+    )
+    .unwrap();
     let encoded = msg.encode().unwrap();
 
     group.bench_function("decode_get_response", |b| {

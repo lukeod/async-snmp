@@ -61,19 +61,19 @@ fn user_for(level: SecurityLevel) -> UsmConfig {
 fn auth_for(level: SecurityLevel) -> Auth {
     match level {
         SecurityLevel::NoAuthNoPriv => Auth::usm(USERNAME),
-        SecurityLevel::AuthNoPriv => Auth::usm_builder(USERNAME)
+        SecurityLevel::AuthNoPriv => async_snmp::UsmConfig::new(USERNAME)
             .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
-            .build()
-            .unwrap(),
-        SecurityLevel::AuthPriv => Auth::usm_builder(USERNAME)
+            .unwrap()
+            .into(),
+        SecurityLevel::AuthPriv => async_snmp::UsmConfig::new(USERNAME)
             .auth_priv(
                 AuthProtocol::Sha256,
                 AUTH_PASSWORD,
                 PrivProtocol::Aes128,
                 PRIV_PASSWORD,
             )
-            .build()
-            .unwrap(),
+            .unwrap()
+            .into(),
     }
 }
 

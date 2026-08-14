@@ -907,7 +907,7 @@ mod tests {
         let Auth::Usm(config) = args.auth(&common_args()).unwrap() else {
             panic!("expected USM config");
         };
-        assert_eq!(config.crypto_backend(), CryptoBackend::RustCrypto);
+        assert_eq!(config.crypto_backend(), Some(CryptoBackend::RustCrypto));
     }
 
     #[cfg(feature = "crypto-fips")]
@@ -924,7 +924,7 @@ mod tests {
         let Auth::Usm(config) = args.auth(&common_args()).unwrap() else {
             panic!("expected USM config");
         };
-        assert_eq!(config.crypto_backend(), CryptoBackend::AwsLcFips);
+        assert_eq!(config.crypto_backend(), Some(CryptoBackend::AwsLcFips));
     }
 
     #[cfg(not(feature = "crypto-rustcrypto"))]

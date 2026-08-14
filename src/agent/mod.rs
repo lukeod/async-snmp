@@ -102,7 +102,7 @@ use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
-use crate::error::{Error, ErrorStatus, Result};
+use crate::error::{ConstructionStage, Error, ErrorStatus, Result};
 use crate::handler::{
     GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, RequestLifecycle,
     RequestTaskPhase,
@@ -469,6 +469,8 @@ pub struct AgentBuilder {
     response_send_timeout: Duration,
     request_deadline: Option<Duration>,
     shutdown_policy: AgentShutdownPolicy,
+    construction_timeout: Duration,
+    notification_fanout_limit: usize,
     disabled_builtins: HashSet<BuiltinMib>,
 }
 
@@ -506,6 +508,8 @@ struct ValidatedAgentBuilder {
     response_send_timeout: Duration,
     request_deadline: Option<Duration>,
     shutdown_policy: AgentShutdownPolicy,
+    construction_timeout: Duration,
+    notification_fanout_limit: usize,
     disabled_builtins: HashSet<BuiltinMib>,
     requires_privacy: bool,
     des_salt_state: Option<DesSaltState>,
@@ -543,6 +547,8 @@ impl AgentBuilder {
             response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
             request_deadline: None,
             shutdown_policy: AgentShutdownPolicy::Drain,
+            construction_timeout: crate::client::DEFAULT_CONSTRUCTION_TIMEOUT,
+            notification_fanout_limit: 32,
             disabled_builtins: HashSet::new(),
         }
     }
@@ -962,9 +968,10 @@ impl AgentBuilder {
 
     /// Set a cancellation token for graceful shutdown.
     ///
-    /// If not set, the agent creates its own token accessible via `Agent::cancel()`.
+    /// If not set, the agent creates its own token accessible via
+    /// [`Agent::cancellation_token`].
     #[must_use]
-    pub fn cancel(mut self, token: CancellationToken) -> Self {
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
     }
@@ -1009,14 +1016,14 @@ impl AgentBuilder {
     ///     .authoritative_engine(engine)
     ///     .community(b"public")
     ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
-    ///     .trap_sink(NotificationSinkId::new("secure").unwrap(), "10.0.0.1:162", Auth::usm_builder("trapuser")
+    ///     .trap_sink(NotificationSinkId::new("secure").unwrap(), "10.0.0.1:162", async_snmp::UsmConfig::new("trapuser")
     ///         .auth_priv(
     ///             AuthProtocol::Sha256,
     ///             "authpass",
     ///             PrivProtocol::Aes128,
     ///             "privpass",
     ///         )
-    ///         .build().unwrap())
+    ///         .unwrap())
     ///     .allow_all_access()
     ///     .build()
     ///     .await?;
@@ -1064,6 +1071,28 @@ impl AgentBuilder {
     #[must_use]
     pub fn inform_retry(mut self, retry: crate::client::Retry) -> Self {
         self.inform_retry = retry;
+        self
+    }
+
+    /// Set one total deadline for Agent construction (default: 5 seconds).
+    ///
+    /// Pure configuration validation runs first. The deadline then spans UDP
+    /// binding, every hostname sink lookup in configuration order, and local
+    /// protocol-state setup. [`Duration::ZERO`] is an immediate deadline.
+    #[must_use]
+    pub fn construction_timeout(mut self, timeout: Duration) -> Self {
+        self.construction_timeout = timeout;
+        self
+    }
+
+    /// Bound concurrently admitted trap or Inform sink operations (default: 32).
+    ///
+    /// A notification stream admits at most this many sink futures and admits
+    /// the next configured sink after a prior outcome completes. Outcomes are
+    /// still yielded in completion order.
+    #[must_use]
+    pub fn notification_fanout_limit(mut self, limit: usize) -> Self {
+        self.notification_fanout_limit = limit;
         self
     }
 
@@ -1183,12 +1212,22 @@ impl AgentBuilder {
         // preparation, privacy salt.
         let mut config = self.validate_and_normalize()?;
 
-        let socket = bind_socket(config.bind_addr, config.recv_buffer_size)
-            .await
-            .map_err(|source| Error::Network {
-                target: config.bind_addr,
-                source,
-            })?;
+        let construction =
+            AgentConstructionDeadline::new(config.bind_addr, config.construction_timeout)?;
+
+        let socket = construction
+            .run(ConstructionStage::Bind, None, None, async {
+                bind_socket(config.bind_addr, config.recv_buffer_size)
+                    .await
+                    .map_err(|source| {
+                        Error::Network {
+                            target: config.bind_addr,
+                            source,
+                        }
+                        .boxed()
+                    })
+            })
+            .await?;
         let local_addr = socket.local_addr().map_err(|source| Error::Network {
             target: config.bind_addr,
             source,
@@ -1203,7 +1242,14 @@ impl AgentBuilder {
                     host,
                     port,
                 } => {
-                    let addresses = resolve_host(host, port).await?;
+                    let addresses = construction
+                        .run(
+                            ConstructionStage::Resolve,
+                            Some(index),
+                            Some(original.clone()),
+                            resolve_host(host, port),
+                        )
+                        .await?;
                     addresses
                         .into_iter()
                         .find_map(|address| {
@@ -1237,11 +1283,15 @@ impl AgentBuilder {
             authoritative_engine,
             engine_id,
             engine_boots,
-        } = config.usm.prepare(generate_engine_id)?;
+        } = {
+            construction.check(ConstructionStage::Prepare, None, None)?;
+            config.usm.prepare(generate_engine_id)?
+        };
         let salt_counter = config
             .requires_privacy
             .then(create_salt_counter)
             .transpose()?;
+        construction.check(ConstructionStage::Prepare, None, None)?;
         let udp_responder = UdpResponder::new(&socket);
 
         let state = Arc::new(AgentState {
@@ -1294,7 +1344,7 @@ impl AgentBuilder {
             .handlers
             .sort_by_key(|h| std::cmp::Reverse(h.prefix.len()));
 
-        Ok(Agent {
+        let agent = Agent {
             inner: Arc::new(AgentInner {
                 socket: Arc::new(socket),
                 udp_responder,
@@ -1320,6 +1370,7 @@ impl AgentBuilder {
                 response_send_timeout: config.response_send_timeout,
                 request_deadline: config.request_deadline,
                 shutdown_policy: config.shutdown_policy,
+                notification_fanout_limit: config.notification_fanout_limit,
                 #[cfg(test)]
                 response_send_gate: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -1333,7 +1384,9 @@ impl AgentBuilder {
                 #[cfg(test)]
                 receive_attempts: AtomicU32::new(0),
             }),
-        })
+        };
+        construction.check(ConstructionStage::Prepare, None, None)?;
+        Ok(agent)
     }
 
     fn validate_and_normalize(mut self) -> Result<ValidatedAgentBuilder> {
@@ -1346,6 +1399,10 @@ impl AgentBuilder {
         if let Some(deadline) = self.request_deadline {
             crate::transport::checked_deadline(deadline, "agent request deadline")?;
         }
+        crate::transport::checked_deadline(
+            self.construction_timeout,
+            "agent construction timeout",
+        )?;
         if let AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(grace) =
             self.shutdown_policy
         {
@@ -1390,6 +1447,11 @@ impl AgentBuilder {
         if self.max_concurrent_requests == Some(0) {
             return Err(
                 Error::Config("max_concurrent_requests must be greater than 0".into()).boxed(),
+            );
+        }
+        if self.notification_fanout_limit == 0 {
+            return Err(
+                Error::Config("notification_fanout_limit must be greater than 0".into()).boxed(),
             );
         }
 
@@ -1486,10 +1548,77 @@ impl AgentBuilder {
             response_send_timeout: self.response_send_timeout,
             request_deadline: self.request_deadline,
             shutdown_policy: self.shutdown_policy,
+            construction_timeout: self.construction_timeout,
+            notification_fanout_limit: self.notification_fanout_limit,
             disabled_builtins: self.disabled_builtins,
             requires_privacy: uses_aes,
             des_salt_state: self.des_salt_state,
         })
+    }
+}
+
+struct AgentConstructionDeadline {
+    bind_addr: SocketAddr,
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+}
+
+impl AgentConstructionDeadline {
+    fn new(bind_addr: SocketAddr, timeout: Duration) -> Result<Self> {
+        let started = tokio::time::Instant::now();
+        let deadline = started.checked_add(timeout).ok_or_else(|| {
+            Error::Config("agent construction timeout exceeds the representable deadline".into())
+                .boxed()
+        })?;
+        Ok(Self {
+            bind_addr,
+            started,
+            deadline,
+        })
+    }
+
+    async fn run<T, F>(
+        &self,
+        stage: ConstructionStage,
+        sink_index: Option<usize>,
+        sink_destination: Option<String>,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        self.check(stage, sink_index, sink_destination.clone())?;
+        tokio::time::timeout_at(self.deadline, future)
+            .await
+            .map_err(|_| self.timeout_error(stage, sink_index, sink_destination))?
+    }
+
+    fn check(
+        &self,
+        stage: ConstructionStage,
+        sink_index: Option<usize>,
+        sink_destination: Option<String>,
+    ) -> Result<()> {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(self.timeout_error(stage, sink_index, sink_destination));
+        }
+        Ok(())
+    }
+
+    fn timeout_error(
+        &self,
+        stage: ConstructionStage,
+        sink_index: Option<usize>,
+        sink_destination: Option<String>,
+    ) -> Box<Error> {
+        Error::AgentConstructionTimeout {
+            bind_addr: self.bind_addr,
+            stage,
+            sink_index,
+            sink_destination,
+            elapsed: self.started.elapsed(),
+        }
+        .boxed()
     }
 }
 
@@ -1677,6 +1806,8 @@ pub(crate) struct AgentInner {
     pub(crate) inform_transports: notification::InformTransportPool,
     /// Per-agent monotonic counter for trap request-ids and v3 notification msgIDs.
     pub(crate) notification_id: std::sync::atomic::AtomicI32,
+    /// Maximum sink futures admitted by one notification stream.
+    pub(crate) notification_fanout_limit: usize,
     /// Shared across clones to enforce one active service loop.
     pub(crate) run_active: AtomicBool,
     /// True while a dropped run future still owns live request tasks.
@@ -1793,11 +1924,14 @@ impl Agent {
         self.inner.state.health.subscribe()
     }
 
-    /// Get the cancellation token for this agent.
-    ///
-    /// Call `token.cancel()` to initiate graceful shutdown.
+    /// Initiate graceful shutdown.
+    pub fn cancel(&self) {
+        self.inner.cancel.cancel();
+    }
+
+    /// Get a clone of the cancellation token for this agent.
     #[must_use]
-    pub fn cancel(&self) -> CancellationToken {
+    pub fn cancellation_token(&self) -> CancellationToken {
         self.inner.cancel.clone()
     }
 
@@ -2949,7 +3083,7 @@ mod tests {
 
     fn encoded_get(request_id: i32) -> Bytes {
         crate::message::CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             Pdu::get_request(request_id, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
         )
@@ -3067,7 +3201,7 @@ mod tests {
 
     fn encoded_set(request_id: i32) -> Bytes {
         crate::message::CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             Pdu::standard(
                 crate::pdu::StandardPduType::SetRequest,
@@ -3120,7 +3254,7 @@ mod tests {
             .unwrap();
         cleanup_started.acquire().await.unwrap().forget();
 
-        agent.cancel().cancel();
+        agent.cancel();
         tokio::time::sleep(grace + Duration::from_millis(20)).await;
         assert!(!run.is_finished());
         assert_eq!(agent.active_request_count(), 1);
@@ -3188,7 +3322,7 @@ mod tests {
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let request = crate::message::CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
         )
@@ -3212,7 +3346,7 @@ mod tests {
         assert_eq!(response_pdu.request_id, 7);
         assert_eq!(response_pdu.error_status(), 0);
 
-        agent.cancel().cancel();
+        agent.cancel();
         first.await.unwrap().unwrap();
         wait_for_run_state(&agent, false).await;
         assert!(
@@ -3293,7 +3427,7 @@ mod tests {
         wait_for_run_state(&agent, true).await;
 
         let request = crate::message::CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             Pdu::get_request(17, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
         )
@@ -3316,7 +3450,7 @@ mod tests {
         .value;
         assert_eq!(response.pdu().standard().unwrap().request_id, 17);
 
-        agent.cancel().cancel();
+        agent.cancel();
         run.await.unwrap().unwrap();
     }
 
@@ -3363,7 +3497,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        agent.cancel().cancel();
+        agent.cancel();
         run.await.unwrap().unwrap();
         assert_eq!(tokio::time::Instant::now(), before);
     }
@@ -3387,7 +3521,7 @@ mod tests {
         wait_for_run_state(&agent, true).await;
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let request = crate::message::CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
         )
@@ -3403,7 +3537,7 @@ mod tests {
         .await
         .unwrap();
 
-        agent.cancel().cancel();
+        agent.cancel();
         tokio::time::timeout(Duration::from_secs(1), run)
             .await
             .expect("graceful shutdown remained blocked on response send")
@@ -3440,7 +3574,7 @@ mod tests {
             .unwrap();
         started.acquire().await.unwrap().forget();
 
-        agent.cancel().cancel();
+        agent.cancel();
         run.await.unwrap().unwrap();
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
@@ -3507,7 +3641,7 @@ mod tests {
         assert_eq!(queued.2, queued.0.checked_add(budget));
         assert!(queued.1.duration_since(queued.0) >= budget);
         assert!(queued.3);
-        agent.cancel().cancel();
+        agent.cancel();
         run.await.unwrap().unwrap();
     }
 
@@ -3539,7 +3673,7 @@ mod tests {
             .await
             .unwrap();
         started.acquire().await.unwrap().forget();
-        agent.cancel().cancel();
+        agent.cancel();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut run)
                 .await
@@ -3581,7 +3715,7 @@ mod tests {
             .await
             .unwrap();
         started.acquire().await.unwrap().forget();
-        agent.cancel().cancel();
+        agent.cancel();
         tokio::time::timeout(Duration::from_secs(1), run)
             .await
             .unwrap()
@@ -3694,7 +3828,7 @@ mod tests {
         wait_for_run_state(&agent, true).await;
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let request = crate::message::CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             Pdu::get_request(8, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
         )
@@ -3708,7 +3842,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        agent.cancel().cancel();
+        agent.cancel();
         run.await.unwrap().unwrap();
     }
 
@@ -3730,7 +3864,7 @@ mod tests {
         wait_for_run_state(&agent, true).await;
 
         let request = crate::message::CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             Bytes::from_static(b"public"),
             Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
         )
@@ -3748,7 +3882,7 @@ mod tests {
                 .unwrap();
         assert_eq!(source.ip(), destination.ip());
 
-        agent.cancel().cancel();
+        agent.cancel();
         run_task.await.unwrap().unwrap();
     }
 
@@ -3766,7 +3900,7 @@ mod tests {
         assert!(timed_out.is_err());
         wait_for_run_state(&agent, false).await;
 
-        agent.cancel().cancel();
+        agent.cancel();
         assert!(agent.run().await.is_ok());
     }
 
@@ -3786,7 +3920,7 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         wait_for_run_state(&agent, false).await;
 
-        agent.cancel().cancel();
+        agent.cancel();
         assert!(agent.run().await.is_ok());
     }
 
@@ -5974,8 +6108,13 @@ mod tests {
         );
 
         for version in [Version::V1, Version::V2c] {
+            let community_version = match version {
+                Version::V1 => crate::CommunityVersion::V1,
+                Version::V2c => crate::CommunityVersion::V2c,
+                Version::V3 => unreachable!(),
+            };
             let request = crate::message::CommunityMessage::new(
-                version,
+                community_version,
                 Bytes::from_static(b"public"),
                 Pdu::get_request(7, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]),
             )
@@ -6298,6 +6437,78 @@ mod tests {
         assert!(matches!(
             *error,
             Error::Config(ref message) if message.contains("response send timeout")
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_construction_timeout_precedes_bind_and_resolution() {
+        let error = Agent::builder()
+            .bind("not a socket address")
+            .construction_timeout(Duration::MAX)
+            .trap_sink(
+                NotificationSinkId::new("never-resolved").unwrap(),
+                "sink.example:162",
+                crate::Auth::v2c("public"),
+            )
+            .build_with_dependencies(
+                |_, _| async { panic!("socket binder must not run") },
+                |_, _| async { panic!("resolver must not run") },
+                || panic!("engine ID generator must not run"),
+                || panic!("salt generator must not run"),
+            )
+            .await
+            .err()
+            .expect("invalid construction timeout must fail");
+
+        assert!(matches!(
+            *error,
+            Error::Config(ref message) if message.contains("agent construction timeout")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_agent_construction_deadline_spans_all_sink_dns() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let error = Agent::builder()
+            .bind("127.0.0.1:0")
+            .construction_timeout(Duration::from_millis(100))
+            .trap_sink(
+                NotificationSinkId::new("first").unwrap(),
+                "first.example:162",
+                crate::Auth::v2c("public"),
+            )
+            .trap_sink(
+                NotificationSinkId::new("second").unwrap(),
+                "second.example:162",
+                crate::Auth::v2c("public"),
+            )
+            .build_with_dependencies(
+                |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
+                move |_, _| {
+                    let calls = Arc::clone(&resolver_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        Ok(vec!["127.0.0.1:162".parse().unwrap()])
+                    }
+                },
+                || Ok(Bytes::from_static(b"generated-engine")),
+                || panic!("privacy salt must not be created"),
+            )
+            .await
+            .err()
+            .expect("aggregate DNS deadline must expire");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            *error,
+            Error::AgentConstructionTimeout {
+                stage: ConstructionStage::Resolve,
+                sink_index: Some(1),
+                ref sink_destination,
+                ..
+            } if sink_destination.as_deref() == Some("second.example:162")
         ));
     }
 
@@ -6954,10 +7165,16 @@ mod tests {
     }
 
     async fn finalized_community_response(agent: &Agent, version: Version, pdu: Pdu) -> Pdu {
-        let request = crate::message::CommunityMessage::new(version, b"public".as_slice(), pdu)
-            .unwrap()
-            .encode()
-            .unwrap();
+        let community_version = match version {
+            Version::V1 => crate::CommunityVersion::V1,
+            Version::V2c => crate::CommunityVersion::V2c,
+            Version::V3 => unreachable!(),
+        };
+        let request =
+            crate::message::CommunityMessage::new(community_version, b"public".as_slice(), pdu)
+                .unwrap()
+                .encode()
+                .unwrap();
         let bytes = match version {
             Version::V1 => {
                 agent

@@ -95,7 +95,7 @@ impl Oid {
     /// or `"0.40"` (arc2 must be ≤39 when arc1 < 2) will parse successfully.
     ///
     /// To validate arc constraints, call [`validate()`](Self::validate) after parsing,
-    /// or use [`to_ber_checked()`](Self::to_ber_checked) which validates before encoding.
+    /// or use [`to_ber()`](Self::to_ber) which validates before encoding.
     ///
     /// # Examples
     ///
@@ -477,26 +477,6 @@ impl Oid {
         Ok(self.to_ber_smallvec().to_vec())
     }
 
-    /// Compatibility alias for [`to_ber()`](Self::to_ber).
-    ///
-    /// This published alias retains the same strict, wire-safe behavior. It
-    /// rejects OIDs that do not have a well-formed, round-trippable BER encoding:
-    ///
-    /// - empty OIDs (no arcs): BER content would be zero bytes, which is not a
-    ///   valid OBJECT IDENTIFIER value (X.690 Section 8.19.4 requires at least one
-    ///   subidentifier);
-    /// - single-arc OIDs: rejected by [`validate()`](Self::validate) because the
-    ///   first subidentifier packs two arcs (`arc1 * 40 + arc2`) and `[n]` decodes
-    ///   back to `[n, 0]`;
-    /// - OIDs exceeding [`MAX_OID_LEN`] subidentifiers (RFC 2578 Section 3.5),
-    ///   rejected by [`validate_length()`](Self::validate_length);
-    /// - OIDs with invalid arc constraints per X.690 Section 8.19.4.
-    ///
-    /// Returns an error if any of the above hold.
-    pub fn to_ber_checked(&self) -> Result<Vec<u8>> {
-        self.to_ber()
-    }
-
     /// Returns the BER content size (excluding tag and length bytes).
     pub(crate) fn ber_content_size(&self) -> usize {
         use crate::ber::base128_len;
@@ -806,10 +786,10 @@ impl Ord for Oid {
     }
 }
 
-/// Macro to create an OID at compile time.
+/// Macro to create an OID from inline arc expressions.
 ///
-/// This is the preferred way to create OID constants since it's concise
-/// and avoids parsing overhead.
+/// This is a concise way to construct an OID without dotted-string parsing.
+/// `Oid` owns a `SmallVec`, so the expansion is not a Rust `const` expression.
 ///
 /// # Examples
 ///
@@ -823,7 +803,7 @@ impl Ord for Oid {
 /// // Trailing commas are allowed
 /// let sys_name = oid!(1, 3, 6, 1, 2, 1, 1, 5, 0,);
 ///
-/// // Can use in const contexts (via from_slice)
+/// // Arc expressions are evaluated at runtime.
 /// let interfaces = oid!(1, 3, 6, 1, 2, 1, 2);
 /// assert!(sys_descr.starts_with(&oid!(1, 3, 6, 1, 2, 1, 1)));
 /// ```
@@ -1001,31 +981,28 @@ mod tests {
     #[test]
     fn test_validate_rejects_single_arc() {
         // A single-arc OID has no invertible BER encoding (encode [1] -> subid 40,
-        // decode -> [1, 0]); validate() and to_ber_checked() must reject it.
+        // decode -> [1, 0]); validate() and to_ber() must reject it.
         let oid = Oid::from_slice(&[1]);
         assert!(oid.validate().is_err(), "single-arc OID must be rejected");
-        assert!(
-            oid.to_ber_checked().is_err(),
-            "to_ber_checked must reject single-arc OID"
-        );
+        assert!(oid.to_ber().is_err(), "to_ber must reject single-arc OID");
         // parse still accepts it (only validate() is stricter)
         assert_eq!(Oid::parse("1").unwrap().arcs(), &[1]);
     }
 
     #[test]
-    fn test_to_ber_checked_rejects_non_wire_safe_oids() {
+    fn test_to_ber_rejects_non_wire_safe_oids() {
         // Empty OID: no subidentifiers, not a valid OBJECT IDENTIFIER value
         // (X.690 Section 8.19.4). The strict encode entry point must reject it
         // even though empty OIDs are usable as a prefix concept elsewhere.
         assert!(
-            Oid::empty().to_ber_checked().is_err(),
-            "to_ber_checked must reject empty OID"
+            Oid::empty().to_ber().is_err(),
+            "to_ber must reject empty OID"
         );
 
         // Single-arc OID: no invertible BER encoding ([n] -> subid n*40 -> [n, 0]).
         assert!(
-            Oid::from_slice(&[1]).to_ber_checked().is_err(),
-            "to_ber_checked must reject single-arc OID"
+            Oid::from_slice(&[1]).to_ber().is_err(),
+            "to_ber must reject single-arc OID"
         );
 
         // Over-MAX_OID_LEN OID: RFC 2578 Section 3.5 caps values at MAX_OID_LEN
@@ -1036,27 +1013,24 @@ mod tests {
         let at_limit = Oid::new(arcs.clone());
         assert_eq!(at_limit.arcs().len(), MAX_OID_LEN);
         assert!(
-            at_limit.to_ber_checked().is_ok(),
-            "to_ber_checked should accept OID at MAX_OID_LEN"
+            at_limit.to_ber().is_ok(),
+            "to_ber should accept OID at MAX_OID_LEN"
         );
         arcs.push(0);
         let over_limit = Oid::new(arcs);
         assert_eq!(over_limit.arcs().len(), MAX_OID_LEN + 1);
         assert!(
-            over_limit.to_ber_checked().is_err(),
-            "to_ber_checked must reject OID exceeding MAX_OID_LEN"
+            over_limit.to_ber().is_err(),
+            "to_ber must reject OID exceeding MAX_OID_LEN"
         );
     }
 
     #[test]
     fn test_to_ber_validates_arcs() {
-        // Invalid OID should return error from to_ber_checked
+        // Invalid OID should return error from to_ber
         let oid = Oid::from_slice(&[3, 0]); // arc1=3 is invalid
-        let result = oid.to_ber_checked();
-        assert!(
-            result.is_err(),
-            "to_ber_checked should fail for invalid arc1"
-        );
+        let result = oid.to_ber();
+        assert!(result.is_err(), "to_ber should fail for invalid arc1");
     }
 
     // AUDIT-002: Test first subidentifier encoding for large arc2 values
@@ -1241,7 +1215,7 @@ mod tests {
         for arc2 in [u32::MAX - 80, u32::MAX - 79, u32::MAX] {
             let oid = Oid::from_slice(&[2, arc2]);
             assert!(oid.validate().is_ok(), "arc2={arc2} should be valid");
-            assert_eq!(oid.to_ber_checked().unwrap(), oid.to_ber().unwrap());
+            assert!(!oid.to_ber().unwrap().is_empty());
         }
     }
 

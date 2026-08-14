@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn bounded_decode_replaces_the_previous_global_two_mib_ceiling() {
         let message = CommunityMessage::new(
-            Version::V2c,
+            crate::CommunityVersion::V2c,
             vec![b'x'; 3 * 1024 * 1024],
             Pdu::get_request(1, &[]),
         )

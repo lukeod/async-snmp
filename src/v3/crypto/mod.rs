@@ -22,6 +22,8 @@ pub enum CryptoError {
     /// `noAuthNoPriv` remains available without a backend, but configuring
     /// authentication or privacy credentials returns this error immediately.
     BackendUnavailable,
+    /// The selected backend identity is stable, but its implementation was not compiled.
+    BackendNotCompiled(CryptoBackend),
     /// The crypto backend does not support the requested algorithm.
     ///
     /// For example, the FIPS provider does not support MD5 or DES.
@@ -53,6 +55,9 @@ impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BackendUnavailable => write!(f, "no crypto backend is enabled"),
+            Self::BackendNotCompiled(backend) => {
+                write!(f, "cryptographic backend {backend:?} is not compiled")
+            }
             Self::UnsupportedAlgorithm(name) => {
                 write!(f, "unsupported algorithm: {name}")
             }
@@ -179,7 +184,8 @@ pub(crate) trait CryptoProvider: Send + Sync + 'static {
 
 /// Cryptographic backend selected for a USM configuration.
 ///
-/// Cargo features only determine which variants are available. Enabling the
+/// Cargo features determine which implementations are compiled, never which
+/// identity variants exist. Enabling the
 /// FIPS backend does not by itself make an operation FIPS-compliant; callers
 /// must select the `AwsLcFips` variant of [`CryptoBackend`] and can inspect that
 /// choice through `UsmConfig::crypto_backend`.
@@ -187,31 +193,34 @@ pub(crate) trait CryptoProvider: Send + Sync + 'static {
 #[non_exhaustive]
 pub enum CryptoBackend {
     /// The RustCrypto implementation (the default when available).
-    #[cfg(feature = "crypto-rustcrypto")]
     RustCrypto,
     /// The AWS-LC FIPS implementation.
-    #[cfg(feature = "crypto-fips")]
     AwsLcFips,
-    /// No backend is compiled into this build.
-    #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-    Unavailable,
-}
-
-impl Default for CryptoBackend {
-    fn default() -> Self {
-        #[cfg(feature = "crypto-rustcrypto")]
-        return Self::RustCrypto;
-        #[cfg(all(not(feature = "crypto-rustcrypto"), feature = "crypto-fips"))]
-        return Self::AwsLcFips;
-        #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-        return Self::Unavailable;
-    }
 }
 
 impl CryptoBackend {
-    #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-    fn unavailable() -> CryptoError {
-        CryptoError::BackendUnavailable
+    /// Return the default compiled backend, if this build has one.
+    #[must_use]
+    pub const fn default_backend() -> Option<Self> {
+        #[cfg(feature = "crypto-rustcrypto")]
+        return Some(Self::RustCrypto);
+        #[cfg(all(not(feature = "crypto-rustcrypto"), feature = "crypto-fips"))]
+        return Some(Self::AwsLcFips);
+        #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+        return None;
+    }
+
+    /// Return whether this backend implementation is compiled in.
+    #[must_use]
+    pub const fn is_compiled(self) -> bool {
+        match self {
+            Self::RustCrypto => cfg!(feature = "crypto-rustcrypto"),
+            Self::AwsLcFips => cfg!(feature = "crypto-fips"),
+        }
+    }
+
+    pub(crate) fn require_default() -> CryptoResult<Self> {
+        Self::default_backend().ok_or(CryptoError::BackendUnavailable)
     }
 
     pub(crate) fn validate_auth_protocol(self, _protocol: AuthProtocol) -> CryptoResult<()> {
@@ -220,8 +229,10 @@ impl CryptoBackend {
             Self::RustCrypto => RustCryptoProvider.validate_auth_protocol(_protocol),
             #[cfg(feature = "crypto-fips")]
             Self::AwsLcFips => AwsLcFipsProvider.validate_auth_protocol(_protocol),
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 
@@ -231,8 +242,10 @@ impl CryptoBackend {
             Self::RustCrypto => RustCryptoProvider.validate_priv_protocol(_protocol),
             #[cfg(feature = "crypto-fips")]
             Self::AwsLcFips => AwsLcFipsProvider.validate_priv_protocol(_protocol),
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 
@@ -246,8 +259,10 @@ impl CryptoBackend {
             Self::RustCrypto => RustCryptoProvider.password_to_key(_protocol, _password),
             #[cfg(feature = "crypto-fips")]
             Self::AwsLcFips => AwsLcFipsProvider.password_to_key(_protocol, _password),
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 
@@ -262,8 +277,10 @@ impl CryptoBackend {
             Self::RustCrypto => RustCryptoProvider.localize_key(_protocol, _master_key, _engine_id),
             #[cfg(feature = "crypto-fips")]
             Self::AwsLcFips => AwsLcFipsProvider.localize_key(_protocol, _master_key, _engine_id),
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 
@@ -283,8 +300,10 @@ impl CryptoBackend {
             Self::AwsLcFips => {
                 AwsLcFipsProvider.compute_hmac(_protocol, _key, _slices, _truncate_len)
             }
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 
@@ -294,8 +313,10 @@ impl CryptoBackend {
             Self::RustCrypto => RustCryptoProvider.hash(_protocol, _data),
             #[cfg(feature = "crypto-fips")]
             Self::AwsLcFips => AwsLcFipsProvider.hash(_protocol, _data),
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 
@@ -315,8 +336,10 @@ impl CryptoBackend {
             Self::RustCrypto => RustCryptoProvider.encrypt(_protocol, _key, _iv, _data),
             #[cfg(feature = "crypto-fips")]
             Self::AwsLcFips => AwsLcFipsProvider.encrypt(_protocol, _key, _iv, _data),
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 
@@ -332,8 +355,10 @@ impl CryptoBackend {
             Self::RustCrypto => RustCryptoProvider.decrypt(_protocol, _key, _iv, _data),
             #[cfg(feature = "crypto-fips")]
             Self::AwsLcFips => AwsLcFipsProvider.decrypt(_protocol, _key, _iv, _data),
-            #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-            Self::Unavailable => Err(Self::unavailable()),
+            #[cfg(not(feature = "crypto-rustcrypto"))]
+            Self::RustCrypto => Err(CryptoError::BackendNotCompiled(Self::RustCrypto)),
+            #[cfg(not(feature = "crypto-fips"))]
+            Self::AwsLcFips => Err(CryptoError::BackendNotCompiled(Self::AwsLcFips)),
         }
     }
 }

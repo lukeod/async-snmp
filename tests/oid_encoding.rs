@@ -168,7 +168,7 @@ fn root_two_u32_arc_boundaries_have_exact_ber_encodings() {
     for &(arc2, expected) in cases {
         let oid = Oid::from_slice(&[2, arc2]);
         assert_eq!(oid.to_ber().unwrap(), expected);
-        assert_eq!(oid.to_ber_checked().unwrap(), expected);
+        assert_eq!(oid.to_ber().unwrap(), expected);
         assert_eq!(Oid::from_ber(expected).unwrap(), oid);
 
         let pdu = RequestPdu::get(Version::V2c, 7, std::slice::from_ref(&oid)).unwrap();

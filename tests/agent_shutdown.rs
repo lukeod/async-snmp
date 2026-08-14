@@ -40,7 +40,7 @@ async fn start_agent(
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .cancel(cancel.clone())
+        .cancellation_token(cancel.clone())
         .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
         .max_concurrent_requests(max_concurrent_requests)
         .without_builtin_handlers()

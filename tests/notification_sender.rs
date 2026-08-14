@@ -486,9 +486,8 @@ async fn v3_trap_send_receive() {
 
     let client = Client::builder(
         recv_addr.to_string(),
-        Auth::usm_builder("trapuser")
+        async_snmp::UsmConfig::new("trapuser")
             .auth(AuthProtocol::Sha256, "authpass12345678")
-            .build()
             .unwrap(),
     )
     .local_authoritative_engine(shared_engine)
@@ -556,14 +555,13 @@ async fn v3_inform_send_receive() {
 
     let client = Client::builder(
         recv_addr.to_string(),
-        Auth::usm_builder("informuser")
+        async_snmp::UsmConfig::new("informuser")
             .auth_priv(
                 AuthProtocol::Sha256,
                 "authpass12345678",
                 PrivProtocol::Aes128,
                 "privpass12345678",
             )
-            .build()
             .unwrap(),
     )
     .connect()
@@ -743,9 +741,8 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
 
     let client = Client::builder(
         recv_addr.to_string(),
-        Auth::usm_builder("user")
+        async_snmp::UsmConfig::new("user")
             .auth(AuthProtocol::Sha256, "authpass12345678")
-            .build()
             .unwrap(),
     )
     // No local authoritative engine state set.
@@ -1014,9 +1011,8 @@ async fn agent_v3_trap_to_sink() {
         .trap_sink(
             NotificationSinkId::new("v3").unwrap(),
             recv_addr.to_string(),
-            Auth::usm_builder("trapuser")
+            async_snmp::UsmConfig::new("trapuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
-                .build()
                 .unwrap(),
         )
         .allow_all_access()
@@ -1315,10 +1311,7 @@ async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
         .trap_sink(
             NotificationSinkId::new("usm").unwrap(),
             dest.to_string(),
-            Auth::usm_builder(USER_SECRET)
-                .context_name(CONTEXT_SECRET)
-                .build()
-                .unwrap(),
+            async_snmp::UsmConfig::new(USER_SECRET).context_name(CONTEXT_SECRET),
         )
         .build()
         .await
@@ -1445,9 +1438,8 @@ async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
         .trap_sink(
             NotificationSinkId::new("metadata").unwrap(),
             peer.addr().to_string(),
-            Auth::usm_builder("informuser")
+            async_snmp::UsmConfig::new("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
-                .build()
                 .unwrap(),
         )
         .inform_timeout(Duration::from_millis(50))
@@ -1532,9 +1524,8 @@ async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
         .trap_sink(
             NotificationSinkId::new("malformed").unwrap(),
             peer.addr().to_string(),
-            Auth::usm_builder("informuser")
+            async_snmp::UsmConfig::new("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
-                .build()
                 .unwrap(),
         )
         .inform_timeout(Duration::from_millis(50))

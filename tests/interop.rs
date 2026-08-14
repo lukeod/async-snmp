@@ -364,9 +364,8 @@ async fn v3_auth_no_priv() {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::AUTHSHA256_USER)
+        async_snmp::UsmConfig::new(users::AUTHSHA256_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -389,14 +388,13 @@ async fn v3_auth_priv() {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::PRIVAES128_USER)
+        async_snmp::UsmConfig::new(users::PRIVAES128_USER)
             .auth_priv(
                 AuthProtocol::Sha1,
                 AUTH_PASS,
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -424,9 +422,8 @@ async fn v3_auth_md5() {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::AUTHMD5_USER)
+        async_snmp::UsmConfig::new(users::AUTHMD5_USER)
             .auth(AuthProtocol::Md5, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -449,9 +446,8 @@ async fn v3_auth_sha1() {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::AUTHSHA1_USER)
+        async_snmp::UsmConfig::new(users::AUTHSHA1_USER)
             .auth(AuthProtocol::Sha1, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -474,9 +470,8 @@ async fn v3_auth_sha256() {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::AUTHSHA256_USER)
+        async_snmp::UsmConfig::new(users::AUTHSHA256_USER)
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -496,9 +491,8 @@ async fn v3_auth_interop(user: &str, protocol: AuthProtocol) {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(user)
+        async_snmp::UsmConfig::new(bytes::Bytes::copy_from_slice(user.as_bytes()))
             .auth(protocol, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -547,9 +541,8 @@ async fn v3_priv_des() {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::PRIVDES_USER)
+        async_snmp::UsmConfig::new(users::PRIVDES_USER)
             .auth_priv(AuthProtocol::Sha1, AUTH_PASS, PrivProtocol::Des, PRIV_PASS)
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -572,14 +565,13 @@ async fn v3_priv_aes128() {
 
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::PRIVAES128_USER)
+        async_snmp::UsmConfig::new(users::PRIVAES128_USER)
             .auth_priv(
                 AuthProtocol::Sha1,
                 AUTH_PASS,
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
@@ -767,14 +759,13 @@ async fn v3_engine_discovery_and_request() {
     // This test verifies the full V3 flow: discovery + authenticated request
     let client = Client::builder(
         &target,
-        Auth::usm_builder(users::PRIVAES128_USER)
+        async_snmp::UsmConfig::new(users::PRIVAES128_USER)
             .auth_priv(
                 AuthProtocol::Sha1,
                 AUTH_PASS,
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))

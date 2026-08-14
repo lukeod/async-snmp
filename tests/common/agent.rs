@@ -68,7 +68,7 @@ impl TestAgent {
         let agent = Agent::builder()
             .bind(bind_addr)
             .community(b"public")
-            .cancel(cancel.clone())
+            .cancellation_token(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
             .without_builtin_handlers()
             .allow_all_access()
@@ -262,7 +262,7 @@ impl TestAgentBuilder {
 
         let mut builder = Agent::builder()
             .bind("127.0.0.1:0")
-            .cancel(cancel.clone())
+            .cancellation_token(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone());
 
         for community in &self.communities {

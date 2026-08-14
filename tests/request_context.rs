@@ -144,7 +144,7 @@ async fn agent_captures_complete_v1_and_v2c_contexts() {
                 .view(READ_VIEW, |view| view.include(oid!(1, 3, 6)))
                 .view(WRITE_VIEW, |view| view.include(oid!(1, 3, 6)))
         })
-        .cancel(cancel.clone())
+        .cancellation_token(cancel.clone())
         .build()
         .await
         .unwrap();
@@ -246,7 +246,7 @@ async fn agent_captures_complete_v3_contexts_at_every_security_level() {
             vacm.view(READ_VIEW, |view| view.include(oid!(1, 3, 6)))
                 .view(WRITE_VIEW, |view| view.include(oid!(1, 3, 6)))
         })
-        .cancel(cancel.clone())
+        .cancellation_token(cancel.clone())
         .build()
         .await
         .unwrap();
@@ -266,20 +266,21 @@ async fn agent_captures_complete_v3_contexts_at_every_security_level() {
         .unwrap();
     let source = transport.local_addr();
 
-    let auth = |level| {
-        let builder = Auth::usm_builder(USERNAME).context_name(CONTEXT_NAME);
-        match level {
-            SecurityLevel::NoAuthNoPriv => builder.build(),
-            SecurityLevel::AuthNoPriv => builder.auth(AuthProtocol::Sha256, AUTH_PASSWORD).build(),
-            SecurityLevel::AuthPriv => builder
-                .auth_priv(
-                    AuthProtocol::Sha256,
-                    AUTH_PASSWORD,
-                    PrivProtocol::Aes128,
-                    PRIV_PASSWORD,
-                )
-                .build(),
-        }
+    let auth = |level| match level {
+        SecurityLevel::NoAuthNoPriv => Ok(Auth::from(
+            async_snmp::UsmConfig::new(USERNAME).context_name(CONTEXT_NAME),
+        )),
+        SecurityLevel::AuthNoPriv => async_snmp::UsmConfig::new(USERNAME)
+            .auth(AuthProtocol::Sha256, AUTH_PASSWORD)
+            .map(|config| Auth::from(config.context_name(CONTEXT_NAME))),
+        SecurityLevel::AuthPriv => async_snmp::UsmConfig::new(USERNAME)
+            .auth_priv(
+                AuthProtocol::Sha256,
+                AUTH_PASSWORD,
+                PrivProtocol::Aes128,
+                PRIV_PASSWORD,
+            )
+            .map(|config| Auth::from(config.context_name(CONTEXT_NAME))),
     };
 
     for level in [

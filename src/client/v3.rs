@@ -380,7 +380,7 @@ impl<T: Transport> Client<T> {
                         Error::Config("V3 security not configured".into()).boxed()
                     })?;
                 let derived_keys = security
-                    .derive_keys(cached_state.engine_id())
+                    .derive_keys_inner(cached_state.engine_id())
                     .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
                 let mut engine = self
                     .inner
@@ -527,7 +527,7 @@ impl<T: Transport> Client<T> {
             let replacement_keys = if replace_cached_identity {
                 Some(
                     security
-                        .derive_keys(engine_state.engine_id())
+                        .derive_keys_inner(engine_state.engine_id())
                         .map_err(|e| Error::Config(e.to_string().into()).boxed())?,
                 )
             } else {
@@ -565,7 +565,7 @@ impl<T: Transport> Client<T> {
                 engine_state
             };
             let derived_keys = security
-                .derive_keys(engine_state.engine_id())
+                .derive_keys_inner(engine_state.engine_id())
                 .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
             let mut engine = self
                 .inner
@@ -1528,7 +1528,7 @@ impl<T: Transport> Client<T> {
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
         let keys = security
-            .derive_keys(local_engine.engine_id())
+            .derive_keys_inner(local_engine.engine_id())
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
         let mut derived = self
@@ -1878,7 +1878,7 @@ mod tests {
         {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
-            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
+            let derived_keys = security.derive_keys_inner(state.engine_id()).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") =
                 Some(ClientEngine::new(state, derived_keys));
         }
@@ -1911,7 +1911,7 @@ mod tests {
         {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine-a"), 1, 42);
-            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
+            let derived_keys = security.derive_keys_inner(state.engine_id()).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") =
                 Some(ClientEngine::new(state, derived_keys));
         }
@@ -2581,7 +2581,7 @@ mod tests {
         {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
-            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
+            let derived_keys = security.derive_keys_inner(state.engine_id()).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") =
                 Some(ClientEngine::new(state, derived_keys));
         }
@@ -2619,7 +2619,7 @@ mod tests {
         {
             let security = client.inner.config.usm_config().unwrap();
             let state = EngineState::new(Bytes::from_static(b"engine"), 1, 42);
-            let derived_keys = security.derive_keys(state.engine_id()).unwrap();
+            let derived_keys = security.derive_keys_inner(state.engine_id()).unwrap();
             *client.inner.engine.write().expect("engine lock poisoned") =
                 Some(ClientEngine::new(state, derived_keys));
         }

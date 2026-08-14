@@ -21,7 +21,7 @@
 //! transition.
 //!
 //! Cargo features determine which crypto backends are available. Each
-//! Each [`UsmConfig`] or [`UsmUser`] selects a backend; RustCrypto remains the
+//! [`UsmConfig`] or [`UsmUser`] selects a backend; RustCrypto remains the
 //! default when both backends are enabled.
 
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]

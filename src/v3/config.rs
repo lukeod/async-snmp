@@ -49,6 +49,7 @@ pub struct UsmConfig {
     credentials: UsmCredentials,
     context_name: Bytes,
     crypto_backend: CryptoBackend,
+    crypto_backend_explicit: bool,
 }
 
 /// USM user accepted by an inbound `SNMPv3` application.
@@ -99,16 +100,14 @@ impl UsmUser {
     }
 
     /// Select the cryptographic backend for this inbound user.
-    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     pub fn with_crypto_backend(mut self, backend: CryptoBackend) -> CryptoResult<Self> {
         self.config = self.config.with_crypto_backend(backend)?;
         Ok(self)
     }
 
     /// Return the selected cryptographic backend.
-    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[must_use]
-    pub fn crypto_backend(&self) -> CryptoBackend {
+    pub fn crypto_backend(&self) -> Option<CryptoBackend> {
         self.config.crypto_backend()
     }
 
@@ -173,7 +172,8 @@ impl UsmConfig {
             username: username.into(),
             credentials: UsmCredentials::NoAuthNoPriv,
             context_name: Bytes::new(),
-            crypto_backend: CryptoBackend::default(),
+            crypto_backend: CryptoBackend::default_backend().unwrap_or(CryptoBackend::RustCrypto),
+            crypto_backend_explicit: false,
         }
     }
 
@@ -218,9 +218,12 @@ impl UsmConfig {
     ///
     /// When both backend features are enabled the default remains RustCrypto;
     /// select `AwsLcFips` explicitly for FIPS operations.
-    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     pub fn with_crypto_backend(mut self, backend: CryptoBackend) -> CryptoResult<Self> {
+        if !backend.is_compiled() {
+            return Err(CryptoError::BackendNotCompiled(backend));
+        }
         self.crypto_backend = backend;
+        self.crypto_backend_explicit = true;
         self.validate_credential_capabilities()?;
         if let UsmCredentials::MasterKeys(master_keys) = &mut self.credentials {
             master_keys.set_crypto_backend(backend);
@@ -229,10 +232,11 @@ impl UsmConfig {
     }
 
     /// Return the selected cryptographic backend.
-    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[must_use]
-    pub fn crypto_backend(&self) -> CryptoBackend {
+    pub fn crypto_backend(&self) -> Option<CryptoBackend> {
         self.crypto_backend
+            .is_compiled()
+            .then_some(self.crypto_backend)
     }
 
     /// Set the `SNMPv3` context name for scoped PDUs.
@@ -321,6 +325,9 @@ impl UsmConfig {
         match &self.credentials {
             UsmCredentials::NoAuthNoPriv => Ok(()),
             UsmCredentials::MasterKeys(master_keys) => {
+                if !self.crypto_backend_explicit && CryptoBackend::default_backend().is_none() {
+                    return Err(CryptoError::BackendUnavailable);
+                }
                 self.crypto_backend
                     .validate_auth_protocol(master_keys.auth_protocol())?;
                 if let Some(protocol) = master_keys.priv_protocol() {
@@ -335,6 +342,9 @@ impl UsmConfig {
                     })
                 {
                     return Err(CryptoError::PasswordTooShort);
+                }
+                if !self.crypto_backend_explicit && CryptoBackend::default_backend().is_none() {
+                    return Err(CryptoError::BackendUnavailable);
                 }
                 self.crypto_backend.validate_auth_protocol(auth.0)?;
                 if let Some((protocol, _)) = privacy {
@@ -380,18 +390,20 @@ impl UsmConfig {
         }
     }
 
-    /// Derive localized keys for a specific engine ID.
+    /// Derive the localized keys used for one authoritative engine.
+    ///
+    /// A `noAuthNoPriv` configuration returns empty key slots. Credentialed
+    /// configurations return a capability error when their selected backend is
+    /// unavailable.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     pub fn derive_keys(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
         self.derive_keys_inner(engine_id)
     }
 
-    #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-    pub(crate) fn derive_keys(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
-        self.derive_keys_inner(engine_id)
-    }
-
-    fn derive_keys_inner(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
+    pub(crate) fn derive_keys_inner(
+        &self,
+        engine_id: &[u8],
+    ) -> crate::v3::CryptoResult<DerivedKeys> {
         match &self.credentials {
             UsmCredentials::NoAuthNoPriv => Ok(DerivedKeys {
                 auth_key: None,
@@ -469,7 +481,11 @@ impl std::fmt::Debug for UsmConfig {
 
 /// Derived keys for a specific engine ID.
 ///
-/// Used internally for V3 authentication in both client and notification receiver.
+/// Localized authentication and privacy keys for one authoritative engine.
+///
+/// Applications may derive and reuse this public value through
+/// [`UsmConfig::derive_keys`]. The key wrapper types redact their material from
+/// diagnostics and zeroize owned key bytes when dropped.
 #[derive(Debug)]
 pub struct DerivedKeys {
     /// Localized authentication key
@@ -821,6 +837,23 @@ mod tests {
                 ),
             Err(CryptoError::UnsupportedAlgorithm("DES"))
         ));
+    }
+
+    #[cfg(all(feature = "crypto-fips", not(feature = "crypto-rustcrypto")))]
+    #[test]
+    fn fips_only_build_exposes_stable_backend_identities_and_capabilities() {
+        assert_eq!(
+            CryptoBackend::default_backend(),
+            Some(CryptoBackend::AwsLcFips)
+        );
+        assert!(CryptoBackend::AwsLcFips.is_compiled());
+        assert!(!CryptoBackend::RustCrypto.is_compiled());
+        assert_eq!(
+            UsmConfig::new("user")
+                .with_crypto_backend(CryptoBackend::RustCrypto)
+                .unwrap_err(),
+            CryptoError::BackendNotCompiled(CryptoBackend::RustCrypto)
+        );
     }
 
     #[cfg(feature = "crypto-fips")]

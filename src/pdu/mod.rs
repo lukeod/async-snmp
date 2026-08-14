@@ -1949,6 +1949,13 @@ impl TrapV1Pdu {
     /// - For enterprise-specific traps (`generic_trap` = 6):
     ///   The trap OID is `enterprise.0.specific_trap`
     ///
+    /// Received nonnegative unknown generic-trap values use the arithmetic
+    /// `snmpTraps.{generic_trap + 1}` extension implemented by net-snmp, even
+    /// though RFC 3584 defines the standard mapping only for values 0 through
+    /// 6. This compatibility applies only to decoded/receive-side conversion;
+    /// [`TrapV1Notification::new`] and structured encoding reject unknown
+    /// generic-trap values for direct origination.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidOid`] if:
@@ -3393,6 +3400,34 @@ mod tests {
 
         // Third: original varbind
         assert_eq!(pdu.varbinds()[2].oid, oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1));
+    }
+
+    #[test]
+    fn unknown_v1_generic_trap_seven_uses_net_snmp_arithmetic_mapping() {
+        let trap = TrapV1Pdu::from_raw_parts(
+            oid!(1, 3, 6, 1, 4, 1, 9999),
+            [192, 0, 2, 1],
+            GenericTrap::Unknown(7),
+            0,
+            1,
+            vec![],
+        );
+
+        assert_eq!(
+            trap.v2_trap_oid().unwrap(),
+            oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 8)
+        );
+        assert!(
+            TrapV1Notification::new(
+                oid!(1, 3, 6, 1, 4, 1, 9999),
+                [192, 0, 2, 1],
+                GenericTrap::Unknown(7),
+                0,
+                1,
+                vec![],
+            )
+            .is_err()
+        );
     }
 
     #[test]

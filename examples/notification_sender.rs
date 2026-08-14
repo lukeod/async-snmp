@@ -145,9 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Client: sending v3 trap ---");
     let v3_client = Client::builder(
         recv_addr.to_string(),
-        Auth::usm_builder("v3user")
-            .auth(AuthProtocol::Sha256, "authpass12345678")
-            .build()?,
+        async_snmp::UsmConfig::new("v3user").auth(AuthProtocol::Sha256, "authpass12345678")?,
     )
     .local_authoritative_engine(engine)
     .connect()
@@ -160,14 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Client: sending v3 inform ---");
     let v3_priv_client = Client::builder(
         recv_addr.to_string(),
-        Auth::usm_builder("v3user")
-            .auth_priv(
-                AuthProtocol::Sha256,
-                "authpass12345678",
-                PrivProtocol::Aes128,
-                "privpass12345678",
-            )
-            .build()?,
+        async_snmp::UsmConfig::new("v3user").auth_priv(
+            AuthProtocol::Sha256,
+            "authpass12345678",
+            PrivProtocol::Aes128,
+            "privpass12345678",
+        )?,
     )
     .connect()
     .await?;

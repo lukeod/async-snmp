@@ -50,9 +50,8 @@ async fn v3_auth_sha256() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authuser")
+        async_snmp::UsmConfig::new("authuser")
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .connect()
@@ -78,9 +77,8 @@ async fn auth_only_roundtrip(protocol: AuthProtocol) {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authuser")
+        async_snmp::UsmConfig::new("authuser")
             .auth(protocol, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .connect()
@@ -131,9 +129,8 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
     let cache = Arc::new(EngineCache::new());
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authuser")
+        async_snmp::UsmConfig::new("authuser")
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .engine_cache(cache.clone())
@@ -169,9 +166,8 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
 
     let client2 = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authuser")
+        async_snmp::UsmConfig::new("authuser")
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .engine_cache(cache)
@@ -213,14 +209,13 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
     let cache = Arc::new(EngineCache::new());
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authprivuser")
+        async_snmp::UsmConfig::new("authprivuser")
             .auth_priv(
                 AuthProtocol::Sha256,
                 AUTH_PASS,
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build()
             .unwrap(),
     )
     .engine_cache(cache.clone())
@@ -251,14 +246,13 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
 
     let client2 = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authprivuser")
+        async_snmp::UsmConfig::new("authprivuser")
             .auth_priv(
                 AuthProtocol::Sha256,
                 AUTH_PASS,
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build()
             .unwrap(),
     )
     .engine_cache(cache)
@@ -292,14 +286,13 @@ async fn v3_auth_priv_sha256_aes128() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authprivuser")
+        async_snmp::UsmConfig::new("authprivuser")
             .auth_priv(
                 AuthProtocol::Sha256,
                 AUTH_PASS,
                 PrivProtocol::Aes128,
                 PRIV_PASS,
             )
-            .build()
             .unwrap(),
     )
     .connect()
@@ -327,9 +320,8 @@ async fn v3_auth_md5() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("md5user")
+        async_snmp::UsmConfig::new("md5user")
             .auth(AuthProtocol::Md5, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .connect()
@@ -361,9 +353,8 @@ async fn v3_auth_priv_sha1_des() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("desuser")
+        async_snmp::UsmConfig::new("desuser")
             .auth_priv(AuthProtocol::Sha1, AUTH_PASS, PrivProtocol::Des, PRIV_PASS)
-            .build()
             .unwrap(),
     )
     .des_salt_state(des_salt_state)
@@ -391,9 +382,8 @@ async fn v3_wrong_password_fails() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authuser")
+        async_snmp::UsmConfig::new("authuser")
             .auth(AuthProtocol::Sha256, "wrongpassword")
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_millis(500))
@@ -427,9 +417,8 @@ async fn v3_unknown_user_auth_fails() {
     // Try to use unknown user with authentication - should fail
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("unknownuser")
+        async_snmp::UsmConfig::new("unknownuser")
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .request_timeout(Duration::from_millis(500))
@@ -496,9 +485,8 @@ async fn v3_engine_discovery() {
 
     let client = Client::builder(
         agent.addr().to_string(),
-        Auth::usm_builder("authuser")
+        async_snmp::UsmConfig::new("authuser")
             .auth(AuthProtocol::Sha256, AUTH_PASS)
-            .build()
             .unwrap(),
     )
     .connect()

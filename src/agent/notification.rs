@@ -321,7 +321,7 @@ impl TrapSink {
         })?;
 
         let keys = security
-            .derive_keys(engine_id)
+            .derive_keys_inner(engine_id)
             .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
 
         let mut derived = self
@@ -432,7 +432,24 @@ type PendingSinkOutcome<'a> = Pin<Box<dyn Future<Output = SinkOutcome> + Send + 
 /// [`NotificationOutcome`].
 #[must_use = "notification streams must be polled to send notifications"]
 pub struct NotificationSendStream<'a> {
+    agent: &'a super::Agent,
+    operation: NotificationOperation,
+    next_sink: usize,
+    admission_limit: usize,
     pending: FuturesUnordered<PendingSinkOutcome<'a>>,
+}
+
+enum NotificationOperation {
+    Trap {
+        trap_oid: Arc<Oid>,
+        uptime: u32,
+        varbinds: Arc<[VarBind]>,
+    },
+    Inform {
+        trap_oid: Arc<Oid>,
+        uptime: u32,
+        varbinds: Arc<[VarBind]>,
+    },
 }
 
 impl NotificationSendStream<'_> {
@@ -445,7 +462,7 @@ impl NotificationSendStream<'_> {
     ///
     /// Outcomes already yielded by [`next`](Self::next) are not included.
     pub async fn into_outcome(mut self) -> NotificationOutcome {
-        let mut sinks = Vec::with_capacity(self.pending.len());
+        let mut sinks = Vec::with_capacity(self.agent.inner.trap_sinks.len());
         while let Some(outcome) = self.next().await {
             sinks.push(outcome);
         }
@@ -454,18 +471,62 @@ impl NotificationSendStream<'_> {
     }
 }
 
+impl<'a> NotificationSendStream<'a> {
+    fn admit(&mut self) {
+        while self.pending.len() < self.admission_limit
+            && self.next_sink < self.agent.inner.trap_sinks.len()
+        {
+            let sink = &self.agent.inner.trap_sinks[self.next_sink];
+            let agent = self.agent;
+            self.next_sink += 1;
+            let future: PendingSinkOutcome<'a> = match &self.operation {
+                NotificationOperation::Trap {
+                    trap_oid,
+                    uptime,
+                    varbinds,
+                } => {
+                    let trap_oid = Arc::clone(trap_oid);
+                    let varbinds = Arc::clone(varbinds);
+                    let uptime = *uptime;
+                    Box::pin(async move {
+                        agent
+                            .trap_sink_outcome(sink, &trap_oid, uptime, &varbinds)
+                            .await
+                    })
+                }
+                NotificationOperation::Inform {
+                    trap_oid,
+                    uptime,
+                    varbinds,
+                } => {
+                    let trap_oid = Arc::clone(trap_oid);
+                    let varbinds = Arc::clone(varbinds);
+                    let uptime = *uptime;
+                    Box::pin(async move {
+                        agent
+                            .inform_sink_outcome(sink, &trap_oid, uptime, &varbinds)
+                            .await
+                    })
+                }
+            };
+            self.pending.push(future);
+        }
+    }
+}
+
 impl Stream for NotificationSendStream<'_> {
     type Item = SinkOutcome;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        this.admit();
         Pin::new(&mut this.pending).poll_next(context)
     }
 }
 
 impl FusedStream for NotificationSendStream<'_> {
     fn is_terminated(&self) -> bool {
-        self.pending.is_empty()
+        self.next_sink == self.agent.inner.trap_sinks.len() && self.pending.is_empty()
     }
 }
 
@@ -527,6 +588,73 @@ impl NotificationOutcome {
 }
 
 impl super::Agent {
+    async fn trap_sink_outcome(
+        &self,
+        sink: &TrapSink,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: &[VarBind],
+    ) -> SinkOutcome {
+        let status = if !self.notification_allowed(sink, trap_oid, varbinds) {
+            SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
+        } else {
+            match NotificationPdu::trap_v2(
+                Version::V3,
+                self.next_notification_id(),
+                uptime,
+                trap_oid,
+                varbinds.to_vec(),
+            ) {
+                Ok(pdu) => match self.send_trap_to_sink(sink, &pdu).await {
+                    Ok(()) => SinkStatus::Succeeded,
+                    Err(error) => SinkStatus::Failed(error),
+                },
+                Err(error) => SinkStatus::Failed(error),
+            }
+        };
+        SinkOutcome {
+            sink: sink.summary.clone(),
+            status,
+            metadata: crate::client::ResponseMetadata::default(),
+        }
+    }
+
+    async fn inform_sink_outcome(
+        &self,
+        sink: &TrapSink,
+        trap_oid: &Oid,
+        uptime: u32,
+        varbinds: &[VarBind],
+    ) -> SinkOutcome {
+        let (status, metadata) = if sink.summary.version == Version::V1 {
+            (
+                SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1),
+                crate::client::ResponseMetadata::default(),
+            )
+        } else if !self.notification_allowed(sink, trap_oid, varbinds) {
+            (
+                SinkStatus::Skipped(SinkSkipReason::NotInNotifyView),
+                crate::client::ResponseMetadata::default(),
+            )
+        } else {
+            match self
+                .send_inform_to_sink(sink, trap_oid, uptime, varbinds)
+                .await
+            {
+                Ok(metadata) => (SinkStatus::Succeeded, metadata),
+                Err(error) => {
+                    let metadata = error.response_metadata().cloned().unwrap_or_default();
+                    (SinkStatus::Failed(error), metadata)
+                }
+            }
+        };
+        SinkOutcome {
+            sink: sink.summary.clone(),
+            status,
+            metadata,
+        }
+    }
+
     /// Lazily send a trap to all configured sinks.
     ///
     /// No sink operation or request-ID allocation occurs until the returned
@@ -541,41 +669,19 @@ impl super::Agent {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> NotificationSendStream<'_> {
-        let pending = FuturesUnordered::new();
         let trap_oid = Arc::new(trap_oid.clone());
         let varbinds: Arc<[VarBind]> = Arc::from(varbinds);
-
-        for sink in &self.inner.trap_sinks {
-            let trap_oid = Arc::clone(&trap_oid);
-            let varbinds = Arc::clone(&varbinds);
-            pending.push(Box::pin(async move {
-                let status = if !self.notification_allowed(sink, &trap_oid, &varbinds) {
-                    SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
-                } else {
-                    let pdu = NotificationPdu::trap_v2(
-                        Version::V3,
-                        self.next_notification_id(),
-                        uptime,
-                        &trap_oid,
-                        varbinds.to_vec(),
-                    );
-                    match pdu {
-                        Ok(pdu) => match self.send_trap_to_sink(sink, &pdu).await {
-                            Ok(()) => SinkStatus::Succeeded,
-                            Err(error) => SinkStatus::Failed(error),
-                        },
-                        Err(error) => SinkStatus::Failed(error),
-                    }
-                };
-                SinkOutcome {
-                    sink: sink.summary.clone(),
-                    status,
-                    metadata: crate::client::ResponseMetadata::default(),
-                }
-            }) as PendingSinkOutcome<'_>);
+        NotificationSendStream {
+            agent: self,
+            operation: NotificationOperation::Trap {
+                trap_oid,
+                uptime,
+                varbinds,
+            },
+            next_sink: 0,
+            admission_limit: self.inner.notification_fanout_limit,
+            pending: FuturesUnordered::new(),
         }
-
-        NotificationSendStream { pending }
     }
 
     /// Send a trap to all configured trap sinks, reporting every outcome.
@@ -655,45 +761,19 @@ impl super::Agent {
         uptime: u32,
         varbinds: Vec<VarBind>,
     ) -> NotificationSendStream<'_> {
-        let pending = FuturesUnordered::new();
         let trap_oid = Arc::new(trap_oid.clone());
         let varbinds: Arc<[VarBind]> = Arc::from(varbinds);
-
-        for sink in &self.inner.trap_sinks {
-            let trap_oid = Arc::clone(&trap_oid);
-            let varbinds = Arc::clone(&varbinds);
-            pending.push(Box::pin(async move {
-                let (status, metadata) = if sink.summary.version == Version::V1 {
-                    (
-                        SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1),
-                        crate::client::ResponseMetadata::default(),
-                    )
-                } else if !self.notification_allowed(sink, &trap_oid, &varbinds) {
-                    (
-                        SinkStatus::Skipped(SinkSkipReason::NotInNotifyView),
-                        crate::client::ResponseMetadata::default(),
-                    )
-                } else {
-                    match self
-                        .send_inform_to_sink(sink, &trap_oid, uptime, &varbinds)
-                        .await
-                    {
-                        Ok(metadata) => (SinkStatus::Succeeded, metadata),
-                        Err(error) => {
-                            let metadata = error.response_metadata().cloned().unwrap_or_default();
-                            (SinkStatus::Failed(error), metadata)
-                        }
-                    }
-                };
-                SinkOutcome {
-                    sink: sink.summary.clone(),
-                    status,
-                    metadata,
-                }
-            }) as PendingSinkOutcome<'_>);
+        NotificationSendStream {
+            agent: self,
+            operation: NotificationOperation::Inform {
+                trap_oid,
+                uptime,
+                varbinds,
+            },
+            next_sink: 0,
+            admission_limit: self.inner.notification_fanout_limit,
+            pending: FuturesUnordered::new(),
         }
-
-        NotificationSendStream { pending }
     }
 
     /// Send an inform to all configured trap sinks, reporting every outcome.
@@ -838,7 +918,7 @@ impl super::Agent {
             }
             Version::V2c => {
                 let msg = CommunityMessage::new(
-                    Version::V2c,
+                    CommunityVersion::V2c,
                     sink.community.clone(),
                     pdu.as_raw().clone(),
                 )?;
@@ -956,12 +1036,17 @@ async fn send_datagram_with_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::{NotificationSinkId, SinkSkipReason, SinkStatus, TrapSink};
+    use super::{
+        NotificationOperation, NotificationSendStream, NotificationSinkId, PendingSinkOutcome,
+        SinkOutcome, SinkSkipReason, SinkStatus, TrapSink,
+    };
     use crate::agent::{Agent, SecurityModel, VacmSecurityModel};
     use crate::{Auth, Error, SecurityLevel, Value, VarBind, oid};
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::{AuthProtocol, PrivProtocol};
     use bytes::Bytes;
+    use futures_util::stream::FuturesUnordered;
+    use std::sync::Arc;
 
     fn test_sink(auth: impl Into<Auth>) -> TrapSink {
         TrapSink::new(
@@ -1029,14 +1114,13 @@ mod tests {
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
         let des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
-        let auth = Auth::usm_builder("trapuser")
+        let auth = crate::UsmConfig::new("trapuser")
             .auth_priv(
                 crate::v3::AuthProtocol::Sha1,
                 b"auth-password",
                 crate::v3::PrivProtocol::Des,
                 b"priv-password",
             )
-            .build()
             .unwrap();
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
@@ -1112,14 +1196,13 @@ mod tests {
             .unwrap();
         let des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
-        let sink_auth = Auth::usm_builder("informuser")
+        let sink_auth = crate::UsmConfig::new("informuser")
             .auth_priv(
                 AuthProtocol::Sha1,
                 b"auth-password",
                 PrivProtocol::Des,
                 b"priv-password",
             )
-            .build()
             .unwrap();
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
@@ -1228,38 +1311,23 @@ mod tests {
 
         assert!(agent.notification_allowed(&test_sink(Auth::v1("v1-community")), &trap_oid, &[]));
         assert!(agent.notification_allowed(&test_sink(Auth::v2c("v2-community")), &trap_oid, &[]));
-        assert!(
-            agent.notification_allowed(
-                &test_sink(
-                    Auth::usm_builder("context-user")
-                        .context_name("tenant/blue")
-                        .build()
-                        .unwrap(),
-                ),
-                &trap_oid,
-                &[]
-            )
-        );
+        assert!(agent.notification_allowed(
+            &test_sink(crate::UsmConfig::new("context-user").context_name("tenant/blue"),),
+            &trap_oid,
+            &[]
+        ));
+        assert!(!agent.notification_allowed(
+            &test_sink(crate::UsmConfig::new("context-user").context_name("tenant/red"),),
+            &trap_oid,
+            &[]
+        ));
         assert!(
             !agent.notification_allowed(
                 &test_sink(
-                    Auth::usm_builder("context-user")
-                        .context_name("tenant/red")
-                        .build()
-                        .unwrap(),
-                ),
-                &trap_oid,
-                &[]
-            )
-        );
-        assert!(
-            !agent.notification_allowed(
-                &test_sink(
-                    Auth::usm_builder("security-user")
+                    crate::UsmConfig::new("security-user")
                         .auth(AuthProtocol::Sha256, "auth-password")
-                        .context_name("secure")
-                        .build()
                         .unwrap()
+                        .context_name("secure")
                 ),
                 &trap_oid,
                 &[]
@@ -1268,16 +1336,15 @@ mod tests {
         assert!(
             agent.notification_allowed(
                 &test_sink(
-                    Auth::usm_builder("security-user")
+                    crate::UsmConfig::new("security-user")
                         .auth_priv(
                             AuthProtocol::Sha256,
                             "auth-password",
                             PrivProtocol::Aes128,
                             "privacy-password",
                         )
-                        .context_name("secure")
-                        .build()
                         .unwrap()
+                        .context_name("secure")
                 ),
                 &trap_oid,
                 &[]
@@ -1539,6 +1606,72 @@ mod tests {
             SinkStatus::Succeeded
         ));
         assert_eq!(agent.next_notification_id(), 2);
+    }
+
+    #[tokio::test]
+    async fn trap_stream_admits_at_most_the_configured_fanout_limit() {
+        let mut builder = Agent::builder()
+            .bind("127.0.0.1:0")
+            .notification_fanout_limit(2);
+        for index in 0..5 {
+            builder = builder.trap_sink(
+                NotificationSinkId::new(format!("sink-{index}")).unwrap(),
+                format!("127.0.0.1:{}", 20_000 + index),
+                Auth::v2c("public"),
+            );
+        }
+        let agent = builder.build().await.unwrap();
+        let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+        let mut stream = agent.send_trap_stream(&trap_oid, 0, vec![]);
+
+        assert_eq!(stream.pending.len(), 0);
+        stream.admit();
+        assert_eq!(stream.pending.len(), 2);
+        assert_eq!(stream.next_sink, 2);
+
+        let first = stream.next().await.unwrap();
+        assert!(matches!(first.status, SinkStatus::Succeeded));
+        assert!(stream.pending.len() <= 2);
+        stream.admit();
+        assert_eq!(stream.pending.len(), 2);
+        assert_eq!(stream.next_sink, 3);
+
+        let outcome = stream.into_outcome().await;
+        assert_eq!(outcome.len(), 4);
+        assert!(outcome.all_succeeded());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notification_stream_yields_admitted_futures_in_completion_order() {
+        let agent = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
+        let pending = FuturesUnordered::new();
+        for (index, delay) in [(0, 20), (1, 1)] {
+            let mut sink = test_sink(Auth::v2c("public")).summary;
+            sink.index = index;
+            pending.push(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                SinkOutcome {
+                    sink,
+                    status: SinkStatus::Succeeded,
+                    metadata: crate::client::ResponseMetadata::default(),
+                }
+            }) as PendingSinkOutcome<'_>);
+        }
+        let trap_oid = Arc::new(oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1));
+        let mut stream = NotificationSendStream {
+            agent: &agent,
+            operation: NotificationOperation::Trap {
+                trap_oid,
+                uptime: 0,
+                varbinds: Arc::from([]),
+            },
+            next_sink: 0,
+            admission_limit: 2,
+            pending,
+        };
+
+        assert_eq!(stream.next().await.unwrap().sink.index(), 1);
+        assert_eq!(stream.next().await.unwrap().sink.index(), 0);
     }
 
     #[tokio::test]

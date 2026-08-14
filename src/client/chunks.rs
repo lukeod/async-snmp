@@ -54,7 +54,7 @@ pub struct FixedCardinalityChunkError {
     pub source: Box<Error>,
 }
 
-type PendingResponse<'a> = Pin<Box<dyn Future<Output = Result<DecodedResponse>> + Send + 'a>>;
+type PendingResponse = Pin<Box<dyn Future<Output = Result<DecodedResponse>> + Send>>;
 
 /// Lazy sequential stream of wire-level GET or GETNEXT response leaves.
 ///
@@ -70,22 +70,22 @@ type PendingResponse<'a> = Pin<Box<dyn Future<Output = Result<DecodedResponse>> 
 /// source retains any recovered response metadata not already emitted with a
 /// successful leaf.
 #[must_use = "streams do nothing unless polled"]
-pub struct FixedCardinalityChunkStream<'a, T: Transport> {
-    client: &'a Client<T>,
+pub struct FixedCardinalityChunkStream<T: Transport> {
+    client: Client<T>,
     oids: Arc<[Oid]>,
     operation: FixedCardinalityOperation,
     ranges: VecDeque<Range<usize>>,
     active_range: Option<Range<usize>>,
-    pending: Option<PendingResponse<'a>>,
+    pending: Option<PendingResponse>,
     completed_request_count: usize,
     completed_response_count: usize,
     deferred_metadata: super::ResponseMetadata,
     done: bool,
 }
 
-impl<'a, T: Transport> FixedCardinalityChunkStream<'a, T> {
+impl<T: Transport + 'static> FixedCardinalityChunkStream<T> {
     pub(crate) fn new(
-        client: &'a Client<T>,
+        client: &Client<T>,
         oids: &[Oid],
         operation: FixedCardinalityOperation,
     ) -> Result<Self> {
@@ -100,7 +100,7 @@ impl<'a, T: Transport> FixedCardinalityChunkStream<'a, T> {
             .collect();
 
         Ok(Self {
-            client,
+            client: client.clone(),
             oids: Arc::from(oids),
             operation,
             ranges,
@@ -157,7 +157,7 @@ impl<'a, T: Transport> FixedCardinalityChunkStream<'a, T> {
             self.done = true;
             return false;
         };
-        let client = self.client;
+        let client = self.client.clone();
         let oids = Arc::clone(&self.oids);
         let operation = self.operation;
         let request_range = range.clone();
@@ -211,7 +211,7 @@ impl FixedCardinalityResponse {
     }
 }
 
-impl<T: Transport> Stream for FixedCardinalityChunkStream<'_, T> {
+impl<T: Transport + 'static> Stream for FixedCardinalityChunkStream<T> {
     type Item = std::result::Result<FixedCardinalityChunk, FixedCardinalityChunkError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -599,6 +599,21 @@ mod tests {
         let second = stream.next().await.unwrap().unwrap();
         assert_eq!(second.request_range, 2..4);
         assert_eq!(transport.sends.load(Ordering::Relaxed), 2);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_owns_the_client_after_the_original_is_dropped() {
+        let transport = ScriptTransport::new([Action::Echo]);
+        let client = client(transport.clone(), 2, ResponseShapePolicy::Compatible);
+        let oids = test_oids(2);
+        let mut stream = client.get_many_chunks(&oids).unwrap();
+
+        drop(client);
+
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk.request_range, 0..2);
+        assert_eq!(transport.sends.load(Ordering::Relaxed), 1);
         assert!(stream.next().await.is_none());
     }
 

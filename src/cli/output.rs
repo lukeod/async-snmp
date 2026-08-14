@@ -704,10 +704,11 @@ mod tests {
             SecurityInfo::Community
         ));
 
-        let usm = crate::Auth::usm_builder("operator")
-            .auth(crate::AuthProtocol::Sha256, "authpassword")
-            .build()
-            .unwrap();
+        let usm = crate::Auth::from(
+            crate::UsmConfig::new("operator")
+                .auth(crate::AuthProtocol::Sha256, "authpassword")
+                .unwrap(),
+        );
         assert_eq!(usm.version(), Version::V3);
         assert!(matches!(
             build_security_info(&usm),

@@ -59,9 +59,7 @@ fn no_auth_no_priv_is_independent_of_crypto_features() {
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[test]
 fn supported_password_and_master_key_credentials_are_accepted_during_configuration() {
-    use async_snmp::{
-        Auth, AuthProtocol, MasterKeys, PrivProtocol, SecurityLevel, UsmConfig, UsmUser,
-    };
+    use async_snmp::{AuthProtocol, MasterKeys, PrivProtocol, SecurityLevel, UsmConfig, UsmUser};
 
     let password_auth = UsmConfig::new("user")
         .auth(AuthProtocol::Sha256, b"authpassword")
@@ -98,13 +96,9 @@ fn supported_password_and_master_key_credentials_are_accepted_during_configurati
         .unwrap();
     assert_eq!(master_priv.security_level(), SecurityLevel::AuthPriv);
 
-    let Auth::Usm(config) = Auth::usm_builder("user")
+    let config = async_snmp::UsmConfig::new("user")
         .auth(AuthProtocol::Sha256, b"authpassword")
-        .build()
-        .unwrap()
-    else {
-        panic!("expected USM configuration");
-    };
+        .unwrap();
     assert_eq!(config.security_level(), SecurityLevel::AuthNoPriv);
 }
 
@@ -152,9 +146,12 @@ fn fips_capability_errors_are_returned_by_credential_configuration() {
 fn rustcrypto_has_operational_precedence_when_both_providers_compile() {
     use async_snmp::{CryptoBackend, UsmConfig};
 
-    assert_eq!(CryptoBackend::default(), CryptoBackend::RustCrypto);
+    assert_eq!(
+        CryptoBackend::default_backend(),
+        Some(CryptoBackend::RustCrypto)
+    );
     assert_eq!(
         UsmConfig::new("user").crypto_backend(),
-        CryptoBackend::RustCrypto
+        Some(CryptoBackend::RustCrypto)
     );
 }

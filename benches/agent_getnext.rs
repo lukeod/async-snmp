@@ -88,7 +88,7 @@ fn bench_io_backed_handlers(c: &mut Criterion) {
             },
         );
 
-        agent.cancel().cancel();
+        agent.cancel();
         runtime.block_on(run).unwrap().unwrap();
     }
 }

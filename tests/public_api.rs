@@ -445,9 +445,6 @@ async fn udp_handle_construction_is_publicly_fallible() {
 
 #[test]
 fn intentional_compatibility_surface_remains_available() {
-    let oid = Oid::from_slice(&[2, u32::MAX]);
-    assert_eq!(oid.to_ber_checked().unwrap(), oid.to_ber().unwrap());
-
     let result: async_snmp::Result<()> = Ok(());
     let _: std::result::Result<(), Box<async_snmp::Error>> = result;
 }
@@ -484,7 +481,13 @@ fn retrieval_requests_reencode_ignored_non_null_values_for_each_version() {
 
             match version {
                 Version::V1 | Version::V2c => {
-                    let encoded = CommunityMessage::new(version, "public", request)
+                    let community_version = match version {
+                        Version::V1 => async_snmp::CommunityVersion::V1,
+                        Version::V2c => async_snmp::CommunityVersion::V2c,
+                        Version::V3 => unreachable!(),
+                        _ => unreachable!(),
+                    };
+                    let encoded = CommunityMessage::new(community_version, "public", request)
                         .unwrap()
                         .encode()
                         .unwrap();

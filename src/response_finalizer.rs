@@ -117,6 +117,11 @@ mod tests {
     fn encode_structured_response(version: Version, pdu: Pdu) -> Result<Bytes> {
         match version {
             Version::V1 | Version::V2c => {
+                let version = match version {
+                    Version::V1 => crate::CommunityVersion::V1,
+                    Version::V2c => crate::CommunityVersion::V2c,
+                    Version::V3 => unreachable!("V3 handled separately"),
+                };
                 crate::message::CommunityMessage::new(version, "public", pdu)?.encode()
             }
             Version::V3 => {
@@ -270,6 +275,11 @@ mod tests {
                 )],
             );
             let encode = |pdu| {
+                let version = match version {
+                    Version::V1 => crate::CommunityVersion::V1,
+                    Version::V2c => crate::CommunityVersion::V2c,
+                    Version::V3 => unreachable!("V3 handled separately"),
+                };
                 crate::message::CommunityMessage::new(version, community.clone(), pdu)?.encode()
             };
             let exact = encode(candidate.clone()).unwrap().len();

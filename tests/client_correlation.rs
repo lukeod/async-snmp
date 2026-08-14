@@ -218,7 +218,7 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, config: Decode
         let request_id = request.into_pdu().unwrap().request_id();
         let oid = Oid::from_slice(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
         let response = CommunityMessage::new(
-            version.into(),
+            version,
             "public",
             ResponsePdu::success(
                 version.into(),
@@ -238,7 +238,7 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, config: Decode
         // remain opaque suffix data during correlation.
         suffixed.extend_from_slice(
             CommunityMessage::new(
-                version.into(),
+                version,
                 "public",
                 ResponsePdu::success(version.into(), request_id.wrapping_add(1), Vec::new())
                     .unwrap(),

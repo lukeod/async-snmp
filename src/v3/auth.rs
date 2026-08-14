@@ -107,7 +107,10 @@ impl MasterKey {
     /// [`from_bytes`](Self::from_bytes), which take key material rather than a
     /// plaintext password.
     pub fn from_password(protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Self> {
-        Self::from_password_with_backend(protocol, password, CryptoBackend::default())
+        if password.len() < MIN_PASSWORD_LENGTH {
+            return Err(super::CryptoError::PasswordTooShort);
+        }
+        Self::from_password_with_backend(protocol, password, CryptoBackend::require_default()?)
     }
 
     /// Derive a master key using an explicitly selected backend.
@@ -150,7 +153,11 @@ impl MasterKey {
     /// length validation, returns a capability error if the selected backend
     /// cannot use `protocol`.
     pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> CryptoResult<Self> {
-        Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
+        let key = key.into();
+        if key.len() != protocol.digest_len() {
+            return Err(super::CryptoError::InvalidKeyLength);
+        }
+        Self::from_bytes_with_backend(protocol, key, CryptoBackend::require_default()?)
     }
 
     /// Create a master key from raw bytes for an explicitly selected backend.
@@ -270,7 +277,15 @@ impl LocalizedKey {
         password: &[u8],
         engine_id: &[u8],
     ) -> CryptoResult<Self> {
-        Self::from_password_with_backend(protocol, password, engine_id, CryptoBackend::default())
+        if password.len() < MIN_PASSWORD_LENGTH {
+            return Err(super::CryptoError::PasswordTooShort);
+        }
+        Self::from_password_with_backend(
+            protocol,
+            password,
+            engine_id,
+            CryptoBackend::require_default()?,
+        )
     }
 
     /// Derive a localized key using an explicitly selected backend.
@@ -314,7 +329,11 @@ impl LocalizedKey {
     /// length validation, returns a capability error if the selected backend
     /// cannot use `protocol`.
     pub fn from_bytes(protocol: AuthProtocol, key: impl Into<Vec<u8>>) -> CryptoResult<Self> {
-        Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
+        let key = key.into();
+        if key.len() != protocol.digest_len() {
+            return Err(super::CryptoError::InvalidKeyLength);
+        }
+        Self::from_bytes_with_backend(protocol, key, CryptoBackend::require_default()?)
     }
 
     /// Create a localized key from raw bytes for an explicitly selected backend.
@@ -419,7 +438,7 @@ mod no_backend_tests {
             auth_master: MasterKey {
                 key: vec![0_u8; AuthProtocol::Sha256.digest_len()],
                 protocol: AuthProtocol::Sha256,
-                backend: CryptoBackend::Unavailable,
+                backend: CryptoBackend::RustCrypto,
             },
             priv_protocol: None,
             priv_master: None,
@@ -476,7 +495,7 @@ mod no_backend_tests {
             unavailable_master_keys()
                 .with_privacy(PrivProtocol::Aes128, b"12345678")
                 .unwrap_err(),
-            super::super::CryptoError::BackendUnavailable
+            super::super::CryptoError::BackendNotCompiled(CryptoBackend::RustCrypto)
         );
     }
 }
@@ -486,7 +505,7 @@ mod no_backend_tests {
 /// Routes through the active [`CryptoProvider`](super::crypto::CryptoProvider).
 #[cfg(test)]
 fn password_to_key(protocol: AuthProtocol, password: &[u8]) -> CryptoResult<Vec<u8>> {
-    password_to_key_with_backend(CryptoBackend::default(), protocol, password)
+    password_to_key_with_backend(CryptoBackend::require_default()?, protocol, password)
 }
 
 fn password_to_key_with_backend(
@@ -672,7 +691,11 @@ impl MasterKeys {
     /// # }
     /// ```
     pub fn new(auth_protocol: AuthProtocol, auth_password: &[u8]) -> CryptoResult<Self> {
-        Self::new_with_backend(auth_protocol, auth_password, CryptoBackend::default())
+        Self::new_with_backend(
+            auth_protocol,
+            auth_password,
+            CryptoBackend::require_default()?,
+        )
     }
 
     /// Create authentication master keys with an explicitly selected backend.
@@ -861,7 +884,7 @@ pub(crate) fn extend_key(
     key: &[u8],
     target_len: usize,
 ) -> CryptoResult<Vec<u8>> {
-    extend_key_with_backend(CryptoBackend::default(), protocol, key, target_len)
+    extend_key_with_backend(CryptoBackend::require_default()?, protocol, key, target_len)
 }
 
 pub(crate) fn extend_key_with_backend(
@@ -915,7 +938,7 @@ pub(crate) fn extend_key_reeder(
     target_len: usize,
 ) -> CryptoResult<Vec<u8>> {
     extend_key_reeder_with_backend(
-        CryptoBackend::default(),
+        CryptoBackend::require_default()?,
         protocol,
         key,
         engine_id,
@@ -1198,9 +1221,7 @@ mod tests {
                     LocalizedKey::from_bytes_with_backend(protocol, vec![0xAA; len], backend);
 
                 let is_supported = match backend {
-                    #[cfg(feature = "crypto-rustcrypto")]
                     CryptoBackend::RustCrypto => true,
-                    #[cfg(feature = "crypto-fips")]
                     CryptoBackend::AwsLcFips => protocol != AuthProtocol::Md5,
                 };
                 if !is_supported {
@@ -1223,7 +1244,13 @@ mod tests {
     #[test]
     fn test_generic_hmac_vectors_use_internal_arbitrary_key_helper() {
         fn generic_hmac(protocol: AuthProtocol, key: &[u8], data: &[u8]) -> Vec<u8> {
-            compute_hmac(CryptoBackend::default(), protocol, key, data).unwrap()
+            compute_hmac(
+                CryptoBackend::default_backend().unwrap(),
+                protocol,
+                key,
+                data,
+            )
+            .unwrap()
         }
 
         let cases = [

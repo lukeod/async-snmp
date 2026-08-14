@@ -367,7 +367,7 @@ impl std::fmt::Display for WalkAbortReason {
 
 impl std::error::Error for WalkAbortReason {}
 
-/// Asynchronous phase active when bounded client construction timed out.
+/// Asynchronous phase active when bounded client or Agent construction timed out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ConstructionStage {
@@ -377,6 +377,8 @@ pub enum ConstructionStage {
     Bind,
     /// Establishing a TCP connection.
     Connect,
+    /// Preparing local protocol state after socket and destination setup.
+    Prepare,
 }
 
 /// Payload-free classification of a top-level [`Error`].
@@ -537,7 +539,7 @@ pub enum Error {
         retries: u32,
     },
 
-    /// Client construction exceeded its single total deadline.
+    /// Client or Agent construction exceeded its single total deadline.
     #[error("construction timed out during {stage:?} after {elapsed:?} for {target}")]
     ConstructionTimeout {
         /// Original builder target, retained even when it is unresolved.
@@ -545,6 +547,24 @@ pub enum Error {
         /// Phase active when the absolute construction deadline expired.
         stage: ConstructionStage,
         /// Total time elapsed since bounded construction began.
+        elapsed: Duration,
+    },
+
+    /// Agent construction exceeded its single total deadline.
+    #[cfg(feature = "agent")]
+    #[error(
+        "Agent construction timed out during {stage:?} after {elapsed:?} for bind {bind_addr} (sink index {sink_index:?}, destination {sink_destination:?})"
+    )]
+    AgentConstructionTimeout {
+        /// Configured local bind address.
+        bind_addr: SocketAddr,
+        /// Phase active when the absolute construction deadline expired.
+        stage: ConstructionStage,
+        /// Zero-based configured sink index when resolving a notification sink.
+        sink_index: Option<usize>,
+        /// Original notification sink destination, including its port.
+        sink_destination: Option<String>,
+        /// Total elapsed time since environmental construction began.
         elapsed: Duration,
     },
 
@@ -671,6 +691,8 @@ impl Error {
             Self::Network { .. } => ErrorKind::Network,
             Self::Timeout { .. } => ErrorKind::Timeout,
             Self::ConstructionTimeout { .. } => ErrorKind::ConstructionTimeout,
+            #[cfg(feature = "agent")]
+            Self::AgentConstructionTimeout { .. } => ErrorKind::ConstructionTimeout,
             Self::Closed { .. } => ErrorKind::Closed,
             Self::RequestIdInUse { .. } => ErrorKind::RequestIdInUse,
             Self::OutboundMessageTooLarge { .. } => ErrorKind::OutboundMessageTooLarge,

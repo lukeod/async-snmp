@@ -8,7 +8,7 @@ mod retry;
 mod v3;
 mod walk;
 
-pub use auth::{Auth, CommunityVersion, UsmAuthBuilder};
+pub use auth::{Auth, CommunityVersion};
 pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target, TargetClientBuilder};
 pub use chunks::{FixedCardinalityChunk, FixedCardinalityChunkError, FixedCardinalityChunkStream};
 pub use response_shape::{
@@ -403,6 +403,39 @@ pub struct ClientConfig {
     pub(crate) local_authoritative_time_source: Option<LocalAuthoritativeTimeSource>,
 }
 
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("auth", &self.auth)
+            .field("decode_config", &self.decode_config)
+            .field("community_response_policy", &self.community_response_policy)
+            .field("request_timeout", &self.request_timeout)
+            .field("exchange_timeout", &self.exchange_timeout)
+            .field("send_timeout", &self.send_timeout)
+            .field("retry", &self.retry)
+            .field("max_oids_per_request", &self.max_oids_per_request)
+            .field("response_shape_policy", &self.response_shape_policy)
+            .field(
+                "allow_unauthenticated_v3_time_correction",
+                &self.allow_unauthenticated_v3_time_correction,
+            )
+            .field("walk_options", &self.walk_options)
+            .field(
+                "local_authoritative_engine",
+                &self.local_authoritative_engine,
+            )
+            .field("des_salt_state", &self.des_salt_state)
+            .field(
+                "local_authoritative_time_source",
+                &self
+                    .local_authoritative_time_source
+                    .as_ref()
+                    .map(|_| "<callback>"),
+            )
+            .finish()
+    }
+}
+
 impl Default for ClientConfig {
     /// Returns configuration for `SNMPv2c` with community "public".
     ///
@@ -436,6 +469,12 @@ impl ClientConfig {
         self.auth
             .community()
             .cloned()
+            .ok_or_else(|| Error::Config("community authentication required".into()).boxed())
+    }
+
+    fn community_version(&self) -> Result<CommunityVersion> {
+        self.auth
+            .community_version()
             .ok_or_else(|| Error::Config("community authentication required".into()).boxed())
     }
 
@@ -837,7 +876,7 @@ impl<T: Transport> Client<T> {
 
         let request_id = pdu.request_id;
         let message = CommunityMessage::new(
-            self.inner.config.version(),
+            self.inner.config.community_version()?,
             self.inner.config.community()?,
             pdu,
         )?;
@@ -913,7 +952,10 @@ impl<T: Transport> Client<T> {
     /// # }
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
-    pub async fn get_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse> {
+    pub async fn get_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse>
+    where
+        T: 'static,
+    {
         self.get_many_chunks(oids)?.collect_response().await
     }
 
@@ -937,7 +979,10 @@ impl<T: Transport> Client<T> {
     ///
     /// Returns [`Error::InvalidOid`] before any I/O if any input OID cannot be
     /// represented on the wire.
-    pub fn get_many_chunks(&self, oids: &[Oid]) -> Result<FixedCardinalityChunkStream<'_, T>> {
+    pub fn get_many_chunks(&self, oids: &[Oid]) -> Result<FixedCardinalityChunkStream<T>>
+    where
+        T: 'static,
+    {
         FixedCardinalityChunkStream::new(self, oids, FixedCardinalityOperation::Get)
     }
 
@@ -986,7 +1031,10 @@ impl<T: Transport> Client<T> {
     /// # }
     /// ```
     #[instrument(skip(self, oids), err, fields(snmp.target = %self.peer_addr(), snmp.oid_count = oids.len()))]
-    pub async fn get_next_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse> {
+    pub async fn get_next_many(&self, oids: &[Oid]) -> Result<FixedCardinalityResponse>
+    where
+        T: 'static,
+    {
         self.get_next_many_chunks(oids)?.collect_response().await
     }
 
@@ -994,7 +1042,10 @@ impl<T: Transport> Client<T> {
     ///
     /// This has the same validation, backpressure, bisection, terminal-error,
     /// and TCP cancellation behavior as [`get_many_chunks()`](Self::get_many_chunks).
-    pub fn get_next_many_chunks(&self, oids: &[Oid]) -> Result<FixedCardinalityChunkStream<'_, T>> {
+    pub fn get_next_many_chunks(&self, oids: &[Oid]) -> Result<FixedCardinalityChunkStream<T>>
+    where
+        T: 'static,
+    {
         FixedCardinalityChunkStream::new(self, oids, FixedCardinalityOperation::GetNext)
     }
 
@@ -1135,7 +1186,7 @@ impl<T: Transport> Client<T> {
                 .await?;
         } else {
             let message = CommunityMessage::new(
-                self.inner.config.version(),
+                self.inner.config.community_version()?,
                 self.inner.config.community()?,
                 pdu,
             )?;
@@ -1746,25 +1797,25 @@ mod tests {
         #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
         {
             let auth = metadata_client(
-                Auth::usm_builder("auth-user")
+                crate::UsmConfig::new("auth-user")
                     .auth(crate::AuthProtocol::Sha256, "authpassword")
-                    .build()
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             );
             assert_eq!(auth.version(), Version::V3);
             assert_eq!(auth.security_level(), Some(SecurityLevel::AuthNoPriv));
             assert!(auth.inner.salt_counter.is_none());
 
             let auth_priv = metadata_client(
-                Auth::usm_builder("private-user")
+                crate::UsmConfig::new("private-user")
                     .auth_priv(
                         crate::AuthProtocol::Sha256,
                         "authpassword",
                         crate::PrivProtocol::Aes128,
                         "privpassword",
                     )
-                    .build()
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             );
             assert_eq!(auth_priv.version(), Version::V3);
             assert_eq!(auth_priv.security_level(), Some(SecurityLevel::AuthPriv));
@@ -1775,19 +1826,18 @@ mod tests {
     #[cfg(feature = "crypto-rustcrypto")]
     #[test]
     fn independent_des_clients_require_and_share_caller_state() {
-        let auth = Auth::usm_builder("des-user")
+        let auth = crate::UsmConfig::new("des-user")
             .auth_priv(
                 crate::AuthProtocol::Sha1,
                 "auth-password",
                 crate::PrivProtocol::Des,
                 "priv-password",
             )
-            .build()
             .unwrap();
         let without_state = Client::new(
             TruncatingTransport::new(0),
             ClientConfig {
-                auth: auth.clone(),
+                auth: auth.clone().into(),
                 ..ClientConfig::default()
             },
         );
@@ -1799,7 +1849,7 @@ mod tests {
             Client::new(
                 TruncatingTransport::new(0),
                 ClientConfig {
-                    auth: auth.clone(),
+                    auth: auth.clone().into(),
                     des_salt_state: Some(state.clone()),
                     ..ClientConfig::default()
                 },
@@ -2125,17 +2175,20 @@ mod tests {
 
     #[tokio::test]
     async fn community_atomic_requests_enforce_exact_transport_boundary_before_send() {
-        for (version, auth) in [
-            (Version::V1, crate::Auth::v1("public")),
-            (Version::V2c, crate::Auth::v2c("public")),
+        for (community_version, auth) in [
+            (CommunityVersion::V1, crate::Auth::v1("public")),
+            (CommunityVersion::V2c, crate::Auth::v2c("public")),
         ] {
             let pdu = Pdu::get_request(7, &[crate::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]);
-            let exact_size =
-                CommunityMessage::new(version, Bytes::from_static(b"public"), pdu.clone())
-                    .unwrap()
-                    .encode()
-                    .unwrap()
-                    .len();
+            let exact_size = CommunityMessage::new(
+                community_version,
+                Bytes::from_static(b"public"),
+                pdu.clone(),
+            )
+            .unwrap()
+            .encode()
+            .unwrap()
+            .len();
 
             let exact_requests = Arc::new(AtomicUsize::new(0));
             let exact_client = Client::new(

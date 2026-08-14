@@ -556,12 +556,15 @@ impl PrivKey {
         password: &[u8],
         engine_id: &[u8],
     ) -> super::crypto::CryptoResult<Self> {
+        if password.len() < super::auth::MIN_PASSWORD_LENGTH {
+            return Err(CryptoError::PasswordTooShort);
+        }
         Self::from_password_with_backend(
             auth_protocol,
             priv_protocol,
             password,
             engine_id,
-            CryptoBackend::default(),
+            CryptoBackend::require_default()?,
         )
     }
 
@@ -677,7 +680,11 @@ impl PrivKey {
         protocol: PrivProtocol,
         key: impl Into<Vec<u8>>,
     ) -> super::crypto::CryptoResult<Self> {
-        Self::from_bytes_with_backend(protocol, key, CryptoBackend::default())
+        let key = key.into();
+        if key.len() < protocol.key_len() {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        Self::from_bytes_with_backend(protocol, key, CryptoBackend::require_default()?)
     }
 
     /// Create a privacy key for an explicitly selected backend.
@@ -1247,6 +1254,7 @@ mod tests {
     use super::*;
     use crate::format::hex::decode as decode_hex;
 
+    #[cfg(feature = "crypto-rustcrypto")]
     fn des_state(engine_boots: u32) -> DesSaltState {
         if engine_boots == 1 {
             DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap()
@@ -1402,7 +1410,8 @@ mod tests {
     #[test]
     fn test_from_bytes_accepts_exact_length_key() {
         let priv_key = PrivKey::from_bytes(PrivProtocol::Des, vec![0u8; 16]);
-        if CryptoBackend::default()
+        if CryptoBackend::default_backend()
+            .unwrap()
             .validate_priv_protocol(PrivProtocol::Des)
             .is_ok()
         {
@@ -1469,9 +1478,7 @@ mod tests {
 
                 let result = PrivKey::from_bytes_with_backend(protocol, vec![0_u8; len], backend);
                 let is_supported = match backend {
-                    #[cfg(feature = "crypto-rustcrypto")]
                     CryptoBackend::RustCrypto => true,
-                    #[cfg(feature = "crypto-fips")]
                     CryptoBackend::AwsLcFips => {
                         !matches!(protocol, PrivProtocol::Des | PrivProtocol::Des3)
                     }

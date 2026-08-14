@@ -13,9 +13,7 @@ use std::time::Duration;
 use super::Client;
 use crate::client::retry::Retry;
 use crate::client::walk::WalkOptions;
-use crate::client::{
-    Auth, ClientConfig, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT,
-};
+use crate::client::{Auth, ClientConfig};
 use crate::error::{ConstructionStage, Error, Result};
 use crate::transport::{
     CommunityResponsePolicy, TcpTransport, Transport, UdpControl, UdpHandle, UdpTransport,
@@ -132,9 +130,9 @@ impl From<SocketAddr> for Target {
 ///     .connect().await?;
 ///
 /// // v3 client with authentication
-/// let client = ClientBuilder::new(Auth::usm_builder("admin")
+/// let client = ClientBuilder::new(async_snmp::UsmConfig::new("admin")
 ///     .auth(async_snmp::AuthProtocol::Sha256, "password")
-///     .build().unwrap())
+///     .unwrap())
 ///     .request_timeout(Duration::from_secs(10))
 ///     .retry(Retry::fixed(5, Duration::ZERO).expect("valid retry count"))
 ///     .target("192.168.1.1:161")
@@ -154,20 +152,8 @@ impl From<SocketAddr> for Target {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ClientBuilder {
-    auth: Auth,
-    request_timeout: Duration,
-    exchange_timeout: Option<Duration>,
-    send_timeout: Duration,
-    retry: Retry,
-    max_oids_per_request: usize,
-    decode_config: crate::DecodeConfig,
-    response_shape_policy: crate::client::ResponseShapePolicy,
-    walk_options: WalkOptions,
+    config: ClientConfig,
     engine_cache: Option<Arc<EngineCache>>,
-    community_response_policy: CommunityResponsePolicy,
-    allow_unauthenticated_v3_time_correction: bool,
-    local_authoritative_engine: Option<AuthoritativeEngine>,
-    des_salt_state: Option<DesSaltState>,
 }
 
 /// Builder for constructing a client using a library-maintained target
@@ -216,27 +202,19 @@ impl ClientBuilder {
     /// // Using Auth::v1() for SNMPv1
     /// let builder = ClientBuilder::new(Auth::v1("private"));
     ///
-    /// // Using Auth::usm_builder() for authenticated SNMPv3
-    /// let builder = ClientBuilder::new(Auth::usm_builder("admin")
+    /// // Using UsmConfig for authenticated SNMPv3
+    /// let builder = ClientBuilder::new(async_snmp::UsmConfig::new("admin")
     ///     .auth(async_snmp::AuthProtocol::Sha256, "password")
-    ///     .build().unwrap());
+    ///     .unwrap());
     /// ```
     pub fn new(auth: impl Into<Auth>) -> Self {
-        Self {
+        let config = ClientConfig {
             auth: auth.into(),
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
-            exchange_timeout: None,
-            send_timeout: DEFAULT_SEND_TIMEOUT,
-            retry: Retry::default(),
-            max_oids_per_request: DEFAULT_MAX_OIDS_PER_REQUEST,
-            decode_config: crate::DecodeConfig::default(),
-            response_shape_policy: crate::client::ResponseShapePolicy::Compatible,
-            walk_options: WalkOptions::default(),
+            ..ClientConfig::default()
+        };
+        Self {
+            config,
             engine_cache: None,
-            community_response_policy: CommunityResponsePolicy::Exact,
-            allow_unauthenticated_v3_time_correction: false,
-            local_authoritative_engine: None,
-            des_salt_state: None,
         }
     }
 
@@ -270,7 +248,7 @@ impl ClientBuilder {
     /// ```
     #[must_use]
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+        self.config.request_timeout = timeout;
         self
     }
 
@@ -284,7 +262,7 @@ impl ClientBuilder {
     /// request receives a fresh deadline after discovery completes.
     #[must_use]
     pub fn exchange_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.exchange_timeout = timeout;
+        self.config.exchange_timeout = timeout;
         self
     }
 
@@ -295,7 +273,7 @@ impl ClientBuilder {
     /// [`request_timeout`](Self::request_timeout) instead.
     #[must_use]
     pub fn send_timeout(mut self, timeout: Duration) -> Self {
-        self.send_timeout = timeout;
+        self.config.send_timeout = timeout;
         self
     }
 
@@ -335,7 +313,7 @@ impl ClientBuilder {
     /// ```
     #[must_use]
     pub fn retry(mut self, retry: impl Into<Retry>) -> Self {
-        self.retry = retry.into();
+        self.config.retry = retry.into();
         self
     }
 
@@ -361,7 +339,7 @@ impl ClientBuilder {
     /// ```
     #[must_use]
     pub fn max_oids_per_request(mut self, max: usize) -> Self {
-        self.max_oids_per_request = max;
+        self.config.max_oids_per_request = max;
         self
     }
 
@@ -373,7 +351,7 @@ impl ClientBuilder {
     /// enable only confirmed peer-specific deviations.
     #[must_use]
     pub fn decode_config(mut self, config: crate::DecodeConfig) -> Self {
-        self.decode_config = config;
+        self.config.decode_config = config;
         self
     }
 
@@ -384,7 +362,7 @@ impl ClientBuilder {
     /// whenever the count, OID, GETNEXT successor, or SET echo shape is invalid.
     #[must_use]
     pub fn response_shape_policy(mut self, policy: crate::client::ResponseShapePolicy) -> Self {
-        self.response_shape_policy = policy;
+        self.config.response_shape_policy = policy;
         self
     }
 
@@ -395,7 +373,7 @@ impl ClientBuilder {
     /// [`Client::walk_with_metadata_and`](crate::Client::walk_with_metadata_and).
     #[must_use]
     pub fn walk_options(mut self, options: WalkOptions) -> Self {
-        self.walk_options = options;
+        self.config.walk_options = options;
         self
     }
 
@@ -420,13 +398,13 @@ impl ClientBuilder {
     ///     Ok::<(), Infallible>(())
     /// }).unwrap();
     /// let builder = async_snmp::Client::builder(("192.168.1.1", 162),
-    ///     Auth::usm_builder("trapuser").auth(AuthProtocol::Sha256, "password").build().unwrap())
+    ///     async_snmp::UsmConfig::new("trapuser").auth(AuthProtocol::Sha256, "password").unwrap())
     ///     .local_authoritative_engine(engine);
     /// # }
     /// ```
     #[must_use]
     pub fn local_authoritative_engine(mut self, engine: AuthoritativeEngine) -> Self {
-        self.local_authoritative_engine = Some(engine);
+        self.config.local_authoritative_engine = Some(engine);
         self
     }
 
@@ -436,7 +414,7 @@ impl ClientBuilder {
     /// use the same localized DES-family key/pre-IV domain.
     #[must_use]
     pub fn des_salt_state(mut self, state: DesSaltState) -> Self {
-        self.des_salt_state = Some(state);
+        self.config.des_salt_state = Some(state);
         self
     }
 
@@ -463,11 +441,11 @@ impl ClientBuilder {
     ///
     /// // Multiple clients can share the same cache
     /// let builder1 = async_snmp::Client::builder("192.168.1.1:161",
-    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build().unwrap())
+    ///     async_snmp::UsmConfig::new("admin").auth(AuthProtocol::Sha256, "password").unwrap())
     ///     .engine_cache(cache.clone());
     ///
     /// let builder2 = async_snmp::Client::builder("192.168.1.2:161",
-    ///     Auth::usm_builder("admin").auth(AuthProtocol::Sha256, "password").build().unwrap())
+    ///     async_snmp::UsmConfig::new("admin").auth(AuthProtocol::Sha256, "password").unwrap())
     ///     .engine_cache(cache.clone());
     /// # }
     /// ```
@@ -488,7 +466,7 @@ impl ClientBuilder {
     /// remains independent and always rejects off-target UDP responses.
     #[must_use]
     pub fn community_response_policy(mut self, policy: CommunityResponsePolicy) -> Self {
-        self.community_response_policy = policy;
+        self.config.community_response_policy = policy;
         self
     }
 
@@ -509,7 +487,7 @@ impl ClientBuilder {
     /// device does not legitimately reply from another address.
     #[must_use]
     pub fn allow_unauthenticated_v3_time_correction(mut self, allow: bool) -> Self {
-        self.allow_unauthenticated_v3_time_correction = allow;
+        self.config.allow_unauthenticated_v3_time_correction = allow;
         self
     }
 
@@ -520,9 +498,7 @@ impl ClientBuilder {
     }
 
     fn validate_and_precompute(&mut self) -> Result<()> {
-        let mut config = self.build_config();
-        config.validate_and_precompute()?;
-        self.auth = config.auth;
+        self.config.validate_and_precompute()?;
         Ok(())
     }
 
@@ -562,28 +538,14 @@ impl ClientBuilder {
     }
 
     /// Build `ClientConfig` from the builder settings.
+    #[cfg(test)]
     fn build_config(&self) -> ClientConfig {
-        ClientConfig {
-            auth: self.auth.clone(),
-            decode_config: self.decode_config,
-            community_response_policy: self.community_response_policy,
-            request_timeout: self.request_timeout,
-            exchange_timeout: self.exchange_timeout,
-            send_timeout: self.send_timeout,
-            retry: self.retry.clone(),
-            max_oids_per_request: self.max_oids_per_request,
-            response_shape_policy: self.response_shape_policy,
-            allow_unauthenticated_v3_time_correction: self.allow_unauthenticated_v3_time_correction,
-            walk_options: self.walk_options,
-            local_authoritative_engine: self.local_authoritative_engine.clone(),
-            des_salt_state: self.des_salt_state.clone(),
-            local_authoritative_time_source: None,
-        }
+        self.config.clone()
     }
 
     /// Build the client with the given transport.
     fn build_inner<T: Transport>(self, transport: T) -> Result<Client<T>> {
-        let config = self.build_config();
+        let config = self.config;
 
         if let Some(cache) = self.engine_cache {
             Client::with_engine_cache(transport, config, cache)
@@ -1142,12 +1104,13 @@ mod tests {
     use crate::v3::UsmConfig;
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::v3::{AuthProtocol, PrivProtocol};
+    use crate::{DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT};
 
     #[test]
     fn test_builder_defaults() {
         let builder = ClientBuilder::new(Auth::default());
-        assert_eq!(builder.request_timeout, DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(builder.send_timeout, DEFAULT_SEND_TIMEOUT);
+        assert_eq!(builder.config.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(builder.config.send_timeout, DEFAULT_SEND_TIMEOUT);
         assert_eq!(
             ClientConfig::default().request_timeout,
             Duration::from_secs(5)
@@ -1155,23 +1118,26 @@ mod tests {
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(5));
         assert_eq!(DEFAULT_SEND_TIMEOUT, Duration::from_secs(5));
         assert_eq!(DEFAULT_CONSTRUCTION_TIMEOUT, Duration::from_secs(5));
-        assert_eq!(builder.retry.retries(), 3);
-        assert_eq!(builder.max_oids_per_request, DEFAULT_MAX_OIDS_PER_REQUEST);
+        assert_eq!(builder.config.retry.retries(), 3);
         assert_eq!(
-            builder.response_shape_policy,
+            builder.config.max_oids_per_request,
+            DEFAULT_MAX_OIDS_PER_REQUEST
+        );
+        assert_eq!(
+            builder.config.response_shape_policy,
             crate::client::ResponseShapePolicy::Compatible
         );
-        assert_eq!(builder.walk_options, WalkOptions::default());
+        assert_eq!(builder.config.walk_options, WalkOptions::default());
         assert!(builder.engine_cache.is_none());
         assert_eq!(
-            builder.community_response_policy,
+            builder.config.community_response_policy,
             CommunityResponsePolicy::Exact
         );
         assert_eq!(
             builder.build_config().community_response_policy,
             ClientConfig::default().community_response_policy
         );
-        assert!(!builder.allow_unauthenticated_v3_time_correction);
+        assert!(!builder.config.allow_unauthenticated_v3_time_correction);
 
         let target = builder.target("192.168.1.1:161");
         assert!(matches!(target.target, Target::Address(ref s) if s == "192.168.1.1:161"));
@@ -1201,21 +1167,24 @@ mod tests {
             .community_response_policy(CommunityResponsePolicy::AllowMismatchFromTarget)
             .allow_unauthenticated_v3_time_correction(true);
 
-        assert_eq!(builder.client.request_timeout, Duration::from_secs(10));
-        assert_eq!(builder.client.send_timeout, Duration::from_secs(8));
+        assert_eq!(
+            builder.client.config.request_timeout,
+            Duration::from_secs(10)
+        );
+        assert_eq!(builder.client.config.send_timeout, Duration::from_secs(8));
         assert_eq!(
             builder.client.build_config().send_timeout,
             Duration::from_secs(8)
         );
         assert_eq!(builder.construction_timeout, Duration::from_secs(7));
-        assert_eq!(builder.client.retry.retries(), 5);
-        assert_eq!(builder.client.max_oids_per_request, 20);
+        assert_eq!(builder.client.config.retry.retries(), 5);
+        assert_eq!(builder.client.config.max_oids_per_request, 20);
         assert_eq!(
             builder.client.build_config().response_shape_policy,
             crate::client::ResponseShapePolicy::Strict
         );
         assert_eq!(
-            builder.client.walk_options,
+            builder.client.config.walk_options,
             WalkOptions {
                 method: crate::WalkMethod::GetNext,
                 max_repetitions: 50,
@@ -1226,10 +1195,15 @@ mod tests {
         assert!(builder.client.engine_cache.is_some());
         assert!(builder.strict_source);
         assert_eq!(
-            builder.client.community_response_policy,
+            builder.client.config.community_response_policy,
             CommunityResponsePolicy::AllowMismatchFromTarget
         );
-        assert!(builder.client.allow_unauthenticated_v3_time_correction);
+        assert!(
+            builder
+                .client
+                .config
+                .allow_unauthenticated_v3_time_correction
+        );
         assert!(
             builder
                 .client
@@ -1659,7 +1633,10 @@ mod tests {
             .target("192.0.2.1:161")
             .request_timeout(Duration::from_secs(11))
             .target("192.0.2.2:1161");
-        assert_eq!(targeted.client.request_timeout, Duration::from_secs(11));
+        assert_eq!(
+            targeted.client.config.request_timeout,
+            Duration::from_secs(11)
+        );
         assert_eq!(
             targeted.target,
             Target::Address("192.0.2.2:1161".to_owned())
@@ -1710,9 +1687,8 @@ mod tests {
     fn test_validate_usm_auth_no_priv_ok() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm_builder("admin")
+            crate::UsmConfig::new("admin")
                 .auth(AuthProtocol::Sha256, "authpass")
-                .build()
                 .unwrap(),
         );
         assert!(builder.validate().is_ok());
@@ -1723,14 +1699,13 @@ mod tests {
     fn test_validate_usm_auth_priv_ok() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm_builder("admin")
+            crate::UsmConfig::new("admin")
                 .auth_priv(
                     AuthProtocol::Sha256,
                     "authpass",
                     PrivProtocol::Aes128,
                     "privpass",
                 )
-                .build()
                 .unwrap(),
         );
         assert!(builder.validate().is_ok());
@@ -1741,9 +1716,8 @@ mod tests {
     fn test_builder_with_usm_config() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm_builder("admin")
+            crate::UsmConfig::new("admin")
                 .auth(AuthProtocol::Sha256, "password")
-                .build()
                 .unwrap(),
         );
         assert!(builder.validate().is_ok());
@@ -1755,9 +1729,8 @@ mod tests {
         let auth_only = MasterKeys::new(AuthProtocol::Sha256, b"authpass").unwrap();
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm_builder("user")
+            crate::UsmConfig::new("user")
                 .with_master_keys(auth_only)
-                .build()
                 .unwrap(),
         );
         assert!(builder.validate().is_ok());
@@ -1768,9 +1741,8 @@ mod tests {
             .unwrap();
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm_builder("user")
+            crate::UsmConfig::new("user")
                 .with_master_keys(auth_priv)
-                .build()
                 .unwrap(),
         );
         assert!(builder.validate().is_ok());
@@ -1781,11 +1753,10 @@ mod tests {
     fn test_build_config_preserves_v3_context_name() {
         let builder = Client::builder(
             "192.168.1.1:161",
-            Auth::usm_builder("admin")
+            crate::UsmConfig::new("admin")
                 .auth(AuthProtocol::Sha256, "authpass")
-                .context_name("vlan100")
-                .build()
-                .unwrap(),
+                .unwrap()
+                .context_name("vlan100"),
         );
 
         let config = builder.build_config();

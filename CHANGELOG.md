@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Agent construction now has one checked `construction_timeout` spanning UDP
+  bind, configuration-order notification-sink DNS, and local setup after pure
+  validation. Timeout errors retain the bind address and the active sink's
+  configuration index and original destination. Notification streams admit at
+  most `notification_fanout_limit` sink operations at once, refill on
+  completion, and continue to yield completion-order per-sink outcomes.
+- **Breaking:** `CryptoBackend::RustCrypto` and `AwsLcFips` are unconditional
+  identities. The `Unavailable` variant and `Default` trait implementation are
+  removed;
+  `CryptoBackend::default_backend` and `is_compiled` query build capability,
+  and explicit selection of an uncompiled identity returns
+  `CryptoError::BackendNotCompiled`.
+- **Breaking:** `ClientBuilder` stores one `ClientConfig`; `UsmAuthBuilder` and
+  `Auth::usm_builder` are removed. `Auth::usm(username)` remains the direct
+  `noAuthNoPriv` constructor, while credentialed/context USM uses `UsmConfig`
+  and its `From<UsmConfig> for Auth` conversion.
+- **Breaking:** Fixed-cardinality chunk streams own a cloned `Client`; chunked
+  operations therefore require a `'static` transport. `CommunityMessage::new`
+  accepts `CommunityVersion`, so V3 community messages are unrepresentable.
+- **Breaking:** `Agent::cancel()` now initiates cancellation;
+  `Agent::cancellation_token()` is the token accessor and
+  `AgentBuilder::cancellation_token()` installs a caller token.
+  `Oid::to_ber_checked` is removed; `Oid::to_ber` is the sole checked BER
+  content encoder.
+- Received unknown, nonnegative SNMPv1 generic-trap values retain the
+  net-snmp-compatible `snmpTraps.{value + 1}` conversion extension. Structured
+  direct V1 origination continues to reject unknown generic-trap values.
+
 - **Breaking:** Walks now expose exactly two opaque stream types:
   `WalkStream` for plain bindings and `WalkMetadataStream` for response metadata.
   `WalkOptions` selects `Auto`, GETNEXT, or GETBULK plus repetitions, ordering,
@@ -135,7 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `Auth::usm` now accepts username octets and returns `Auth`
   directly, consistently with `Auth::v1` and `Auth::v2c`. Credentialed,
   private, context-specific, and precomputed-key configurations use
-  `Auth::usm_builder(...).build()`. USM username diagnostics preserve exact
+  `UsmConfig`. USM username diagnostics preserve exact
   octets instead of applying lossy UTF-8 conversion.
 - **Breaking:** VACM access rows are keyed by the RFC 3415
   `(groupName, contextPrefix, securityModel, securityLevel)` index.

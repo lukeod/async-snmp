@@ -14,7 +14,7 @@ use crate::error::internal::DecodeErrorKind;
 use crate::error::{Error, Result};
 use crate::message::{DecodeOutcome, finalize_envelope};
 use crate::pdu::{Pdu, PduType, TrapV1Pdu};
-use crate::version::Version;
+use crate::version::{CommunityVersion, Version};
 use bytes::Bytes;
 use std::net::SocketAddr;
 
@@ -129,12 +129,12 @@ impl CommunityMessage {
     /// Returns [`Error::InvalidMessage`] when the version cannot carry the PDU
     /// or an SNMPv1 PDU contains a `Counter64` value.
     pub fn new(
-        version: Version,
+        version: CommunityVersion,
         community: impl Into<Community>,
         pdu: impl Into<Pdu>,
     ) -> Result<Self> {
         let message = Self {
-            version,
+            version: version.into(),
             community: community.into(),
             pdu: CommunityPdu::Standard(pdu.into()),
         };
@@ -148,7 +148,7 @@ impl CommunityMessage {
     ///
     /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv2c.
     pub fn v2c(community: impl Into<Community>, pdu: impl Into<Pdu>) -> Result<Self> {
-        Self::new(Version::V2c, community, pdu)
+        Self::new(CommunityVersion::V2c, community, pdu)
     }
 
     /// Create a V1 message with a standard PDU (convenience constructor).
@@ -157,7 +157,7 @@ impl CommunityMessage {
     ///
     /// Returns [`Error::InvalidMessage`] when the PDU is not valid in SNMPv1.
     pub fn v1(community: impl Into<Community>, pdu: impl Into<Pdu>) -> Result<Self> {
-        Self::new(Version::V1, community, pdu)
+        Self::new(CommunityVersion::V1, community, pdu)
     }
 
     /// Create a V1 message carrying a `TrapV1` PDU.
@@ -426,9 +426,12 @@ mod tests {
             oid!(1, 3, 6, 1, 4, 1, 9999)
         );
 
-        for version in [Version::V1, Version::V2c] {
+        for (community_version, version) in [
+            (CommunityVersion::V1, Version::V1),
+            (CommunityVersion::V2c, Version::V2c),
+        ] {
             let message = CommunityMessage::new(
-                version,
+                community_version,
                 "private",
                 Pdu::get_request(123, &[oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)]),
             )
@@ -491,11 +494,6 @@ mod tests {
         assert_invalid_message(CommunityMessage::v2c(
             "public",
             standard_pdu(PduType::Report, vec![]),
-        ));
-        assert_invalid_message(CommunityMessage::new(
-            Version::V3,
-            "public",
-            standard_pdu(PduType::GetRequest, vec![]),
         ));
     }
 
@@ -619,7 +617,6 @@ mod tests {
     fn get_bulk_uses_ordinary_message_path_and_requires_v2c() {
         let bulk = Pdu::get_bulk(7, 0, 10, vec![]).unwrap();
         assert_invalid_message(CommunityMessage::v1("public", bulk.clone()));
-        assert_invalid_message(CommunityMessage::new(Version::V3, "public", bulk.clone()));
 
         let encoded = CommunityMessage::v2c("public", bulk)
             .unwrap()
