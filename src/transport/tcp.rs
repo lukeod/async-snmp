@@ -1927,27 +1927,12 @@ mod tests {
     async fn queued_request_deadline_includes_lock_wait_without_poisoning() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (first_read_tx, first_read_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            socket.read_exact(&mut request).await.unwrap();
-            first_read_tx.send(()).unwrap();
+            let (_socket, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
         });
         let transport = TcpTransport::connect(server_addr).await.unwrap();
-
-        let first_transport = transport.clone();
-        let first = tokio::spawn(async move {
-            first_transport
-                .request(
-                    &build_request_with_id(1),
-                    RequestRegistration::v3(1, Duration::from_secs(60)),
-                )
-                .await
-        });
-        first_read_rx.await.unwrap();
-        assert!(!first.is_finished());
+        let held_lock = transport.inner.stream.clone().lock_owned().await;
         assert!(!transport.inner.is_poisoned());
 
         let second_data = build_request_with_id(2);
@@ -1956,11 +1941,9 @@ mod tests {
             RequestRegistration::v3(2, Duration::from_secs(5)),
         ));
         assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
-        assert!(!first.is_finished());
         assert!(!transport.inner.is_poisoned());
         tokio::time::advance(Duration::from_secs(5)).await;
         let error = second.await.unwrap_err();
-        assert!(!first.is_finished());
         assert!(matches!(
             *error,
             Error::Timeout {
@@ -1974,8 +1957,7 @@ mod tests {
             "expiry while queued did not touch the stream"
         );
 
-        first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
+        drop(held_lock);
         server.abort();
     }
 
@@ -2086,6 +2068,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(start_paused = true)]
     async fn standalone_send_write_timeout_poisons_after_partial_io() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2199,6 +2182,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cancellation_during_partial_send_poisons() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

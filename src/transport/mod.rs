@@ -717,7 +717,7 @@ mod cfg_test_transport_contract {
 
     #[test]
     fn transport_trait_surface_is_not_conditionally_compiled() {
-        let source = include_str!("mod.rs");
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
         let (_, trait_and_after) = source
             .split_once("pub trait Transport: Send + Sync {")
             .expect("Transport trait declaration");
