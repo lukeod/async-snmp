@@ -47,6 +47,7 @@ jobs:
             arguments: --no-default-features
           - name: agent without crypto
             arguments: --no-default-features --features agent
+            complete_lib: true
           - name: RustCrypto client
             arguments: --no-default-features --features crypto-rustcrypto
           - name: FIPS client
@@ -57,11 +58,15 @@ jobs:
             arguments: --no-default-features --features agent,crypto-rustcrypto
           - name: agent with FIPS
             arguments: --no-default-features --features agent,crypto-fips
+            complete_lib: true
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: "cargo test --locked ${{ matrix.arguments }} --test feature_contract"
+      - name: Complete agent library tests
+        if: matrix.complete_lib == true
+        run: "cargo test --locked ${{ matrix.arguments }} --lib"
 
   minimal-features:
     name: No defaults (library, integrations, docs, examples)

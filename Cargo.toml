@@ -70,8 +70,10 @@ dirs = "6.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 futures = "0.3"
+fs2 = "0.4"
 hdrhistogram = "7"
 static_assertions = "1.1"
+tempfile = "3"
 
 [profile.profiling]
 inherits = "release"

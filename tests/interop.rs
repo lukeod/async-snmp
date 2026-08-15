@@ -6,11 +6,29 @@
 //!
 //! Run with: cargo test --test interop --all-features -- --ignored
 
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+use std::fs::{self, File, OpenOptions};
+#[cfg(feature = "crypto-rustcrypto")]
+use std::io;
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+use std::path::{Path, PathBuf};
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(feature = "crypto-rustcrypto")]
+use async_snmp::DesSaltState;
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+use async_snmp::PersistedDesSaltState;
 use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, Retry, UdpTransport, Value, oid};
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+use fs2::FileExt;
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+use tempfile::NamedTempFile;
 use testcontainers::{
     ContainerAsync, GenericImage,
     core::{IntoContainerPort, WaitFor},
@@ -170,6 +188,129 @@ impl Snmpd {
 const COMMUNITY: &str = "public";
 const AUTH_PASS: &str = "authpass123";
 const PRIV_PASS: &str = "privpass123";
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+static DES_FIXTURE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn des_fixture_state_path() -> PathBuf {
+    let root = std::env::var_os("ASYNC_SNMP_INTEROP_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::state_dir)
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    root.join("async-snmp")
+        .join("interop")
+        .join("net-snmp-privdes-sha1-des-v1.state")
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn read_des_fixture_record(path: &Path) -> io::Result<Option<PersistedDesSaltState>> {
+    let encoded = match fs::read_to_string(path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let engine_boots = encoded.trim().parse::<u32>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid DES fixture epoch in {}: {error}", path.display()),
+        )
+    })?;
+    PersistedDesSaltState::new(engine_boots)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn write_des_fixture_temp(path: &Path, state: &PersistedDesSaltState) -> io::Result<NamedTempFile> {
+    let mut temp = NamedTempFile::new_in(path.parent().expect("DES fixture record has a parent"))?;
+    writeln!(temp, "{}", state.engine_boots())?;
+    temp.as_file().sync_all()?;
+    Ok(temp)
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn sync_des_fixture_parent(path: &Path) -> io::Result<()> {
+    File::open(path.parent().expect("DES fixture record has a parent"))?.sync_all()
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn install_des_fixture_record(path: &Path, state: &PersistedDesSaltState) -> io::Result<()> {
+    let temp = write_des_fixture_temp(path, state)?;
+    temp.persist_noclobber(path).map_err(|error| error.error)?;
+    sync_des_fixture_parent(path)
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn restart_des_fixture_record(
+    path: &Path,
+    previous: PersistedDesSaltState,
+    state: &PersistedDesSaltState,
+) -> io::Result<()> {
+    let current = read_des_fixture_record(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "DES fixture record disappeared during restart",
+        )
+    })?;
+    if current != previous {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "stale DES fixture epoch: expected {}, found {}",
+                previous.engine_boots(),
+                current.engine_boots()
+            ),
+        ));
+    }
+
+    let temp = write_des_fixture_temp(path, state)?;
+    temp.persist(path).map_err(|error| error.error)?;
+    sync_des_fixture_parent(path)
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn open_des_fixture_state_at(
+    path: &Path,
+) -> Result<DesSaltState, Box<dyn std::error::Error + Send + Sync>> {
+    let _process_guard = DES_FIXTURE_PROCESS_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("DES fixture process lock poisoned"))?;
+    fs::create_dir_all(path.parent().expect("DES fixture record has a parent"))?;
+
+    let lock_path = path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    FileExt::lock_exclusive(&lock)?;
+
+    let result = match read_des_fixture_record(path)? {
+        Some(previous) => DesSaltState::restart(previous, |attempted| {
+            restart_des_fixture_record(path, previous, attempted)
+        }),
+        None => DesSaltState::install(|attempted| install_des_fixture_record(path, attempted)),
+    };
+    FileExt::unlock(&lock)?;
+    result.map_err(Into::into)
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+fn open_des_fixture_state() -> Result<DesSaltState, Box<dyn std::error::Error + Send + Sync>> {
+    open_des_fixture_state_at(&des_fixture_state_path())
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", not(unix)))]
+fn open_des_fixture_state() -> Result<DesSaltState, Box<dyn std::error::Error + Send + Sync>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable DES interoperability fixture requires Unix atomic rename semantics",
+    )
+    .into())
+}
 
 mod users {
     pub const NOAUTH_USER: &str = "noauth_user";
@@ -546,6 +687,7 @@ async fn v3_priv_des() {
             .unwrap(),
     )
     .request_timeout(Duration::from_secs(5))
+    .des_salt_state(open_des_fixture_state().expect("open durable DES sender state"))
     .connect()
     .await
     .unwrap();
@@ -553,6 +695,55 @@ async fn v3_priv_des() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert!(result.anomalies.is_empty());
     assert!(matches!(result.varbinds[0].value, Value::OctetString(_)));
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+#[test]
+fn des_fixture_record_advances_across_restarts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("des.state");
+
+    let first = open_des_fixture_state_at(&path).unwrap();
+    assert_eq!(first.engine_boots(), 1);
+    drop(first);
+
+    let restarted = open_des_fixture_state_at(&path).unwrap();
+    assert_eq!(restarted.engine_boots(), 2);
+    assert_eq!(
+        read_des_fixture_record(&path)
+            .unwrap()
+            .unwrap()
+            .engine_boots(),
+        2
+    );
+}
+
+#[cfg(all(feature = "crypto-rustcrypto", unix))]
+#[test]
+fn abandoned_restart_temp_does_not_replace_the_committed_epoch() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("des.state");
+
+    let installed = open_des_fixture_state_at(&path).unwrap();
+    let restarted = open_des_fixture_state_at(&path).unwrap();
+    assert_eq!(installed.engine_boots(), 1);
+    assert_eq!(restarted.engine_boots(), 2);
+
+    let attempted = PersistedDesSaltState::new(3).unwrap();
+    let abandoned = write_des_fixture_temp(&path, &attempted).unwrap();
+    let abandoned_path = abandoned.path().to_owned();
+    assert_eq!(
+        read_des_fixture_record(&path)
+            .unwrap()
+            .unwrap()
+            .engine_boots(),
+        2
+    );
+    drop(abandoned);
+    assert!(!abandoned_path.exists());
+
+    let next = open_des_fixture_state_at(&path).unwrap();
+    assert_eq!(next.engine_boots(), 3);
 }
 
 #[tokio::test]

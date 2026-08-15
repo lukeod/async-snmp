@@ -8,7 +8,9 @@ mod common;
 
 use async_snmp::message::{MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message};
 use async_snmp::pdu::{PduType, RequestPdu};
-use async_snmp::v3::{AuthProtocol, DesSaltState, PrivProtocol, ReportStatus, UsmSecurityParams};
+#[cfg(feature = "crypto-rustcrypto")]
+use async_snmp::v3::DesSaltState;
+use async_snmp::v3::{AuthProtocol, PrivProtocol, ReportStatus, UsmSecurityParams};
 use async_snmp::{Auth, Client, Error, Retry, Value, oid};
 use bytes::Bytes;
 use common::{TestAgentBuilder, V3User};
