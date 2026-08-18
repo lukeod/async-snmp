@@ -1,15 +1,15 @@
-//! SNMP Notification Sender Example
+//! Send SNMP notifications
 //!
-//! Demonstrates two approaches to sending SNMP traps and informs:
+//! The library provides two ways to send SNMP traps and Inform requests:
 //!
-//! 1. **Agent-based** (recommended for devices running an agent): trap sinks are
-//!    configured on the agent builder; the agent sends to all sinks using its own
-//!    socket, engine ID, and credentials. No persistent per-destination state.
+//! 1. Agent-based sending configures notification sinks on the agent builder.
+//!    The agent sends through its own socket, engine ID, and credentials without
+//!    retaining persistent per-destination state.
 //!
-//! 2. **Client-based** (for standalone tools like snmptrap/snmpinform): a Client
-//!    is created per destination, useful for one-shot sends.
+//! 2. Client-based sending creates one `Client` per destination. This approach
+//!    suits standalone tools such as `snmptrap` and `snmpinform`.
 //!
-//! Run with: cargo run --example notification_sender --features agent
+//! Run `cargo run --example notification_sender --features agent`.
 
 use async_snmp::agent::{Agent, NotificationOutcome, SinkStatus};
 use async_snmp::notification::{Notification, NotificationAcceptance, NotificationReceiver};
@@ -29,12 +29,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Start a local receiver so we can verify the notifications arrive.
+    // Start a local receiver to observe each notification.
     let engine_id = b"example-sender-engine".to_vec();
     // This example uses a no-op persistence callback. A deployed application
-    // must store both fields durably and use AuthoritativeEngine::restart on
-    // subsequent process starts. Concrete Error + Send + Sync callback failures
-    // are preserved by AuthoritativeEnginePersistenceError.
+    // must store the engine state durably and call AuthoritativeEngine::restart
+    // after later process starts. AuthoritativeEnginePersistenceError preserves
+    // concrete Error + Send + Sync callback failures.
     let engine =
         AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(()))?;
     let receiver = NotificationReceiver::builder()
@@ -49,9 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .unwrap()
-        // This local demo also receives cleartext v2c messages. For v3, require
-        // authentication because configured keyed users also support spoofable
-        // noAuthNoPriv input.
+        // This local example also receives cleartext SNMPv2c messages. For
+        // SNMPv3, require authentication because configured keyed users also
+        // support spoofable noAuthNoPriv input.
         .acceptance_policy(|notification| match notification.security_level {
             None => NotificationAcceptance::Accept,
             Some(level) if level >= SecurityLevel::AuthNoPriv => NotificationAcceptance::Accept,
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recv_addr = receiver.local_addr();
     println!("Receiver listening on {recv_addr}\n");
 
-    // Spawn receiver loop (expects 5 notifications total)
+    // Spawn a receive loop for the five notifications sent below.
     let recv_handle = tokio::spawn(async move {
         for _ in 0..5 {
             match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // =========================================================================
-    // Agent-based sending (recommended for embedded devices)
+    // Agent-based sending for devices that run an agent
     // =========================================================================
     println!("=== Agent-based sending ===\n");
 
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .unwrap()
-        // Configure trap sinks - agent sends to all of them
+        // Configure a sink. The agent sends each notification to all sinks.
         .trap_sink(
             NotificationSinkId::new("local-receiver").unwrap(),
             recv_addr.to_string(),
@@ -108,14 +108,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    // Send v2c trap to all configured sinks
-    println!("--- Agent: sending v2c trap ---");
+    // Send an SNMPv2c trap to all configured sinks.
+    println!("--- Agent: sending SNMPv2c trap ---");
     let cold_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
     let outcome = agent.send_trap(&cold_start, 12345, vec![]).await;
-    print_outcome("v2c trap (coldStart)", &outcome);
+    print_outcome("SNMPv2c trap (coldStart)", &outcome);
 
-    // Send v2c inform and process each sink as its acknowledgement completes.
-    println!("--- Agent: sending v2c inform ---");
+    // Send an SNMPv2c Inform and process each completed acknowledgement.
+    println!("--- Agent: sending SNMPv2c Inform ---");
     let warm_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2);
     let extra = vec![VarBind::new(
         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
@@ -123,26 +123,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )];
     let mut completions = agent.send_inform_stream(&warm_start, 5000, extra);
     while let Some(sink) = completions.next().await {
-        print_sink_outcome("v2c inform (warmStart)", &sink);
+        print_sink_outcome("SNMPv2c Inform (warmStart)", &sink);
     }
     println!();
 
     // =========================================================================
-    // Client-based sending (for standalone tools)
+    // Client-based sending for standalone tools
     // =========================================================================
     println!("=== Client-based sending ===\n");
 
-    // V2c trap via client
-    println!("--- Client: sending v2c trap ---");
+    // Send an SNMPv2c trap through a client.
+    println!("--- Client: sending SNMPv2c trap ---");
     let client = Client::builder(recv_addr.to_string(), Auth::v2c("public"))
         .connect()
         .await?;
     let link_down = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 3);
     client.send_trap(&link_down, 99999, vec![]).await?;
-    println!("Sent v2c trap (linkDown)\n");
+    println!("Sent SNMPv2c trap (linkDown)\n");
 
-    // V3 trap via client (needs local authoritative engine state)
-    println!("--- Client: sending v3 trap ---");
+    // Send an SNMPv3 trap through a client with local authoritative state.
+    println!("--- Client: sending SNMPv3 trap ---");
     let v3_client = Client::builder(
         recv_addr.to_string(),
         async_snmp::UsmConfig::new("v3user").auth(AuthProtocol::Sha256, "authpass12345678")?,
@@ -152,10 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let link_up = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 4);
     v3_client.send_trap(&link_up, 100_000, vec![]).await?;
-    println!("Sent v3 trap (linkUp, authNoPriv)\n");
+    println!("Sent SNMPv3 trap (linkUp, authNoPriv)\n");
 
-    // V3 inform via client (uses engine discovery)
-    println!("--- Client: sending v3 inform ---");
+    // Send an SNMPv3 Inform through a client that performs engine discovery.
+    println!("--- Client: sending SNMPv3 Inform ---");
     let v3_priv_client = Client::builder(
         recv_addr.to_string(),
         async_snmp::UsmConfig::new("v3user").auth_priv(
@@ -171,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     v3_priv_client
         .send_inform(&auth_failure, 200_000, vec![])
         .await?;
-    println!("Sent v3 inform (authenticationFailure, authPriv) - acknowledged\n");
+    println!("Sent SNMPv3 Inform (authenticationFailure, authPriv) - acknowledged\n");
 
     recv_handle.await?;
     println!("Done!");
@@ -208,7 +208,7 @@ fn print_sink_outcome(label: &str, sink: &async_snmp::SinkOutcome) {
 fn print_notification(notification: &Notification, source: std::net::SocketAddr) {
     let trap_oid = notification.trap_oid().unwrap();
     println!(
-        "  Received from {}: {:?} trap_oid={} uptime={} varbinds={}",
+        "  Received from {}: {:?} trap_oid={} uptime={} variable_bindings={}",
         source,
         notification.version(),
         trap_oid,

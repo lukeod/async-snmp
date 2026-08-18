@@ -1,78 +1,89 @@
 # Contributing to async-snmp
 
-Thank you for your interest in contributing!
+## Set up your development environment
 
-## Getting Started
+1. Fork and clone the repository.
+2. Install Rust 1.88 or later with [rustup](https://rustup.rs/).
+3. Install the toolchains and components used by continuous integration:
 
-1. Fork and clone the repository
-2. Install Rust 1.88 or later via [rustup](https://rustup.rs/)
-3. Run the test suite: `cargo test`
+   ```bash
+   rustup toolchain install stable --component clippy
+   rustup toolchain install nightly --component rustfmt
+   ```
 
-## Development
+4. Run the default test suite:
 
-### Code Style
+   ```bash
+   cargo test --locked
+   ```
+
+## Format and lint the code
 
 Format code before committing:
 
 ```bash
-cargo fmt
+cargo +nightly fmt --all
 ```
 
-Check for lint issues:
+Verify formatting and run Clippy with all features:
 
 ```bash
-cargo clippy --all-targets --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
+cargo +nightly fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-### Testing
+## Run tests
 
 Run the full test suite:
 
 ```bash
-cargo test --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread
+cargo test --locked --all-features
+cargo check --locked --all-features --all-targets
 ```
 
-To test with the FIPS crypto backend (requires aws-lc-rs build dependencies):
+Test the AWS-LC FIPS backend without the default RustCrypto backend:
 
 ```bash
-cargo test --no-default-features --features agent,crypto-fips
+cargo test --locked --no-default-features --features agent,crypto-fips
 ```
 
-The crypto backend features are additive. Run `cargo test --all-features` to cover explicit dispatch through both providers.
+The cryptographic backend features are additive. The full test suite enables
+both providers and tests explicit provider selection.
 
-Container integration tests require Docker:
+The interoperability tests require Docker and the local net-snmp test image:
 
 ```bash
 docker build -t async-snmp-test:latest tests/containers/snmpd/
-cargo test --test interop -- --ignored
+cargo test --locked --test interop --all-features -- --ignored
 ```
 
-### Documentation
+## Build the documentation
 
-Build and preview documentation:
+Test, build, and open the documentation:
 
 ```bash
-cargo doc --features agent,crypto-rustcrypto,cli,mib,rt-multi-thread --open
+cargo test --locked --doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+cargo doc --locked --all-features --no-deps --open
 ```
 
-## Pull Requests
+## Prepare a pull request
 
-- Keep changes focused on a single feature or fix
-- Add tests for new functionality
-- Update documentation as needed
-- Ensure CI passes before requesting review
-- Follow existing code style and patterns
+- Focus each pull request on one feature or fix.
+- Add tests for new functionality and bug fixes.
+- Update affected documentation and examples.
+- Run the relevant checks before requesting review.
+- Follow the existing code style and patterns.
 
+## Report an issue
 
-## Reporting Issues
+Include the following information in a bug report:
 
-When reporting bugs, please include:
-
-- Rust version (`rustc --version`)
-- Operating system
-- Minimal reproduction case
-- Expected vs actual behavior
+- Rust version from `rustc --version`.
+- Operating system and version.
+- Minimal reproduction case.
+- Expected and actual behavior.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the same terms as the project (MIT OR Apache-2.0).
+Contributions use the project's dual MIT or Apache-2.0 license.

@@ -305,7 +305,7 @@ impl UsmConfig {
         }
     }
 
-    /// Get the configured security level.
+    /// Returns the configured security level.
     #[must_use]
     pub fn security_level(&self) -> SecurityLevel {
         match &self.credentials {

@@ -1,30 +1,30 @@
-//! Value Extraction Examples
+//! Extract typed values
 //!
-//! This example demonstrates the Value type methods designed for NMS (Network
-//! Management Systems) and metrics collection use cases:
+//! `Value` provides methods for network management systems (NMSs) and metrics
+//! collectors:
 //!
-//! - Numeric extraction for metrics pipelines (f64, wrapped counters, fixed-point)
-//! - RFC 2579 enumeration helpers (TruthValue, RowStatus, StorageType)
-//! - Opaque sub-type extraction (net-snmp float/double extensions)
-//! - OID suffix methods for SNMP table index extraction
+//! - numeric extraction for `f64`, wrapped counters, and fixed-point values;
+//! - RFC 2579 helpers for TruthValue, RowStatus, and StorageType;
+//! - Opaque subtype extraction for net-snmp floating-point extensions; and
+//! - OID suffix methods for SNMP table indexes.
 //!
-//! Run with: cargo run --example value_extraction
+//! Run `cargo run --example value_extraction`.
 
 use async_snmp::{RowStatus, StorageType, Value, oid};
 use bytes::Bytes;
 
 fn main() {
     // =========================================================================
-    // Section 1: Numeric Extraction for Metrics
+    // Section 1: Numeric extraction for metrics
     // =========================================================================
     //
-    // Metrics systems (Prometheus, InfluxDB, etc.) typically work with f64.
-    // These methods convert SNMP values to f64 for easy integration.
+    // Metrics systems commonly represent samples as f64. These methods convert
+    // numeric SNMP values to that representation.
 
-    println!("=== Numeric Extraction for Metrics ===\n");
+    println!("=== Numeric extraction for metrics ===\n");
 
-    // --- as_f64(): Universal numeric conversion ---
-    // Converts any numeric SNMP value to f64. Works for Integer, Counter32,
+    // --- as_f64(): Numeric conversion ---
+    // Converts any numeric SNMP value to f64. It supports Integer, Counter32,
     // Gauge32, TimeTicks, and Counter64.
 
     let interface_speed = Value::Gauge32(1_000_000_000); // 1 Gbps
@@ -37,19 +37,20 @@ fn main() {
     println!("Bytes in (Counter64): {:?}", bytes_in_64.as_f64());
     println!("Error count (Integer): {:?}", error_count.as_f64());
 
-    // Non-numeric values return None
+    // Non-numeric values return None.
     let sys_descr = Value::OctetString(Bytes::from_static(b"Linux router"));
     println!("String value: {:?}", sys_descr.as_f64());
 
     // --- as_f64_wrapped(): Exact Counter64 samples modulo 2^53 ---
-    // IEEE 754 double-precision floats have a 53-bit mantissa, so Counter64
-    // values above 2^53 lose precision. This method wraps at 2^53 so each
-    // converted sample remains exact, at the cost of an artificial wrap point.
+    // IEEE 754 double-precision floats have 53 bits of integer precision, so
+    // f64 cannot represent every integer above 2^53. This method wraps at 2^53
+    // so each converted sample remains exact, at the cost of an artificial wrap
+    // point.
 
-    println!("\n--- Counter64 Precision Handling ---");
+    println!("\n--- Counter64 precision handling ---");
 
     let small_counter = Value::Counter64(1_000_000_000);
-    let large_counter = Value::Counter64(1u64 << 54); // 2^54, beyond f64 precision
+    let large_counter = Value::Counter64((1u64 << 54) + 1); // Not exactly representable as f64.
 
     println!(
         "Small counter (direct): {:?}",
@@ -79,7 +80,7 @@ fn main() {
     // Many sensors report values as integers with an implied decimal point.
     // The DISPLAY-HINT "d-2" means 2350 represents 23.50 degrees.
 
-    println!("\n--- Fixed-Point Sensor Values ---");
+    println!("\n--- Fixed-point sensor values ---");
 
     // Temperature sensor: 2350 = 23.50 degrees (d-2 hint)
     let temp_raw = Value::Integer(2350);
@@ -105,7 +106,7 @@ fn main() {
         percent_raw.as_decimal(2)
     );
 
-    // Negative values work too
+    // Negative values use the same scaling.
     let negative_temp = Value::Integer(-500);
     println!(
         "Negative temp raw: {}, as decimal(2): {:?}",
@@ -117,7 +118,7 @@ fn main() {
     // TimeTicks are hundredths of a second. as_duration() converts to Duration
     // for idiomatic Rust time handling.
 
-    println!("\n--- TimeTicks to Duration ---");
+    println!("\n--- TimeTicks to duration ---");
 
     // sysUpTime: 360000 ticks = 3600 seconds = 1 hour
     let sys_uptime = Value::TimeTicks(360_000);
@@ -138,18 +139,18 @@ fn main() {
     let ten_ms = Value::TimeTicks(1);
     println!("1 tick = {:?}", ten_ms.as_duration());
 
-    // Non-TimeTicks return None
+    // Values other than TimeTicks return None.
     let not_ticks = Value::Integer(100);
     println!("Integer value: {:?}", not_ticks.as_duration());
 
     // =========================================================================
-    // Section 2: RFC 2579 Enumeration Helpers
+    // Section 2: RFC 2579 enumeration helpers
     // =========================================================================
     //
     // RFC 2579 defines common textual conventions used across MIBs.
     // These methods extract typed enumerations from SNMP Integer values.
 
-    println!("\n=== RFC 2579 Enumeration Helpers ===\n");
+    println!("\n=== RFC 2579 enumeration helpers ===\n");
 
     // --- as_truth_value(): Boolean from TruthValue ---
     // TruthValue: true(1), false(2)
@@ -172,7 +173,7 @@ fn main() {
 
     println!("\n--- RowStatus (table management) ---");
 
-    // Reading existing rows
+    // Read the state of existing rows.
     let active_row = Value::Integer(1);
     let not_in_service = Value::Integer(2);
     let not_ready = Value::Integer(3);
@@ -194,7 +195,7 @@ fn main() {
         not_ready.as_row_status().unwrap()
     );
 
-    // Creating values for SET operations
+    // Create values for SET operations.
     println!("\nRowStatus values for SET operations:");
     let create_and_go: Value = RowStatus::CreateAndGo.into();
     let create_and_wait: Value = RowStatus::CreateAndWait.into();
@@ -204,8 +205,8 @@ fn main() {
     println!("  CreateAndWait -> {create_and_wait:?}");
     println!("  Destroy -> {destroy:?}");
 
-    // Display trait for logging
-    println!("\nRowStatus Display representations:");
+    // Use Display representations in logs and user output.
+    println!("\nRowStatus display representations:");
     for status in [
         RowStatus::Active,
         RowStatus::NotInService,
@@ -230,7 +231,7 @@ fn main() {
         }
     }
 
-    // Creating values for SET operations
+    // Create values for SET operations.
     println!("\nCreating StorageType values:");
     let volatile: Value = StorageType::Volatile.into();
     let non_volatile: Value = StorageType::NonVolatile.into();
@@ -238,20 +239,20 @@ fn main() {
     println!("  NonVolatile -> {non_volatile:?}");
 
     // =========================================================================
-    // Section 3: Opaque Sub-type Extraction (net-snmp Extensions)
+    // Section 3: Opaque subtype extraction for net-snmp extensions
     // =========================================================================
     //
-    // Standard SNMP doesn't support floating-point values. Net-snmp encodes
-    // floats inside Opaque values with a special ASN.1 structure.
+    // Standard SNMP does not define floating-point application types. net-snmp
+    // encodes floats inside Opaque values with a special ASN.1 structure.
 
-    println!("\n=== Opaque Sub-type Extraction ===\n");
+    println!("\n=== Opaque subtype extraction ===\n");
 
     // --- as_opaque_float(): IEEE 754 single-precision ---
     // Encoding: 0x9f (extension) + 0x78 (float type) + 0x04 (length) + 4 bytes
 
-    println!("--- Opaque Float (net-snmp extension) ---");
+    println!("--- Opaque float (net-snmp extension) ---");
 
-    // Pi encoded as IEEE 754 single-precision float
+    // Encode pi as an IEEE 754 single-precision float.
     let pi_float_data = Bytes::from_static(&[0x9f, 0x78, 0x04, 0x40, 0x49, 0x0f, 0xdb]);
     let pi_float = Value::Opaque(pi_float_data);
 
@@ -263,8 +264,7 @@ fn main() {
         );
     }
 
-    // Temperature from a sensor that uses Opaque floats
-    // 23.5 degrees in IEEE 754: 0x41BC0000
+    // Encode 23.5 degrees as the IEEE 754 value 0x41BC0000.
     let temp_float_data = Bytes::from_static(&[0x9f, 0x78, 0x04, 0x41, 0xbc, 0x00, 0x00]);
     let temp_float = Value::Opaque(temp_float_data);
     println!(
@@ -272,7 +272,7 @@ fn main() {
         temp_float.as_opaque_float()
     );
 
-    // Non-float Opaque returns None
+    // An Opaque value with another representation returns None.
     let raw_opaque = Value::Opaque(Bytes::from_static(&[0x01, 0x02, 0x03]));
     println!(
         "Raw Opaque (not a float): {:?}",
@@ -282,9 +282,9 @@ fn main() {
     // --- as_opaque_double(): IEEE 754 double-precision ---
     // Encoding: 0x9f (extension) + 0x79 (double type) + 0x08 (length) + 8 bytes
 
-    println!("\n--- Opaque Double (net-snmp extension) ---");
+    println!("\n--- Opaque double (net-snmp extension) ---");
 
-    // Pi encoded as IEEE 754 double-precision
+    // Encode pi as an IEEE 754 double-precision float.
     let pi_double_data = Bytes::from_static(&[
         0x9f, 0x79, 0x08, 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18,
     ]);
@@ -301,7 +301,7 @@ fn main() {
     // --- as_opaque_counter64(): 64-bit counter for SNMPv1 ---
     // SNMPv1 doesn't support Counter64 natively. Net-snmp encodes it in Opaque.
 
-    println!("\n--- Opaque Counter64 (SNMPv1 compatibility) ---");
+    println!("\n--- Opaque Counter64 for SNMPv1 compatibility ---");
 
     let counter64_data = Bytes::from_static(&[
         0x9f, 0x76, 0x08, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
@@ -314,25 +314,25 @@ fn main() {
     );
 
     // =========================================================================
-    // Section 4: OID Suffix Methods for Table Indexing
+    // Section 4: OID suffix methods for table indexing
     // =========================================================================
     //
     // SNMP tables use OID suffixes as row indexes. These methods help extract
     // and work with table indexes from walked OIDs.
 
-    println!("\n=== OID Suffix Methods for Table Indexing ===\n");
+    println!("\n=== OID suffix methods for table indexing ===\n");
 
     // --- strip_prefix(): Extract table row index ---
     // Given a column OID and a row OID, extract the index suffix.
 
-    println!("--- strip_prefix(): Extracting table indexes ---");
+    println!("--- strip_prefix(): extracting table indexes ---");
 
     // ifTable example: ifDescr.5 = ifEntry.2.5
     let if_entry = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1); // ifEntry
     let if_descr = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2); // ifDescr column
     let if_descr_5 = oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 5); // ifDescr for interface 5
 
-    // Extract the column and index from a walked OID
+    // Extract the column and index from a walked OID.
     if let Some(suffix) = if_descr_5.strip_prefix(&if_entry) {
         println!("ifEntry OID: {if_entry}");
         println!("Walked OID:  {if_descr_5}");
@@ -343,7 +343,7 @@ fn main() {
         }
     }
 
-    // Extract just the index from a column OID
+    // Extract the index relative to a column OID.
     if let Some(index) = if_descr_5.strip_prefix(&if_descr) {
         println!("\nColumn OID:  {if_descr}");
         println!("Walked OID:  {if_descr_5}");
@@ -374,14 +374,14 @@ fn main() {
         }
     }
 
-    // --- suffix(): Get last N arcs ---
-    // Useful when you know the index size but not the full prefix.
+    // --- suffix(): Get the last N arcs ---
+    // Use suffix() when the index size is known but the full prefix is not.
 
-    println!("\n--- suffix(): Get last N arcs ---");
+    println!("\n--- suffix(): get the last N arcs ---");
 
     let walked_oid = oid!(1, 3, 6, 1, 2, 1, 4, 22, 1, 2, 1, 192, 168, 1, 100);
 
-    // Get the 5-arc composite index (ifIndex + 4-byte IP)
+    // Get the five-arc composite index: ifIndex and a four-byte IP address.
     if let Some(index) = walked_oid.suffix(5) {
         println!("Last 5 arcs of {walked_oid}: {index:?}");
         if let [if_index, a, b, c, d] = index {
@@ -391,23 +391,23 @@ fn main() {
         }
     }
 
-    // Get just the last arc (useful for simple integer indexes)
+    // Get the last arc for a simple integer index.
     if let Some(last) = walked_oid.suffix(1) {
         println!("Last arc: {last:?}");
     }
 
-    // suffix(0) returns empty slice
+    // suffix(0) returns an empty slice.
     println!("suffix(0): {:?}", walked_oid.suffix(0));
 
-    // Too large returns None
+    // A length greater than the OID length returns None.
     println!("suffix(100): {:?}", walked_oid.suffix(100));
 
     // --- Table grouping pattern ---
-    // Common pattern: group walk results by table index.
+    // Group walk results by table index.
 
     println!("\n--- Table grouping pattern ---");
 
-    // Simulated walk results for ifTable
+    // Simulate walk results for ifTable.
     let walk_results = vec![
         (oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1), "ifIndex.1"),
         (oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 2), "ifIndex.2"),

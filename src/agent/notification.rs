@@ -36,8 +36,8 @@ const MAX_NOTIFICATION_SINK_ID_LEN: usize = 32;
 /// Stable caller-supplied identifier for a notification sink.
 ///
 /// The identifier is operational metadata and is never derived from sink
-/// credentials. Callers should keep it stable across agent restarts when sink
-/// delivery outcomes are retained outside the library. Configured identifiers
+/// credentials. Keep it stable across agent restarts when retaining sink
+/// delivery outcomes outside the library. Configured identifiers
 /// contain 1 to 32 octets, matching the `snmpTargetAddrName` size defined by
 /// RFC 3413. Identifiers are opaque octets and need not contain UTF-8.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

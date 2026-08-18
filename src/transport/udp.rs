@@ -1,8 +1,8 @@
 //! UDP transport for SNMP clients.
 //!
-//! This module provides [`UdpTransport`] (the socket owner), [`UdpHandle`]
-//! (per-target handles that implement [`Transport`]), and [`UdpControl`]
-//! (explicit endpoint-wide lifecycle authority).
+//! Provides [`UdpTransport`] as the socket owner, [`UdpHandle`] as a per-target
+//! [`Transport`], and [`UdpControl`] as the explicit endpoint-wide lifecycle
+//! authority.
 //!
 //! # Architecture
 //!
@@ -24,7 +24,7 @@
 //! +------------------+     +------------------+     +------------------+
 //! ```
 //!
-//! # Response Demultiplexing
+//! # Response demultiplexing
 //!
 //! A single background task reads all datagrams from the socket. Each incoming
 //! response is matched to its caller by extracting the request ID (or msgID for
@@ -68,7 +68,7 @@
 //! # }
 //! ```
 //!
-//! # Address Family
+//! # Address family
 //!
 //! Bind to `0.0.0.0:0` for IPv4-only targets, `[::]:0` for IPv6-only targets,
 //! or `[::]:0` for mixed IPv4/IPv6 targets. When an IPv6 transport is given an
@@ -214,7 +214,7 @@ impl UdpTransport {
         })
     }
 
-    /// Get the local bind address.
+    /// Returns the local bind address.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
@@ -355,7 +355,7 @@ pub struct UdpTransportBuilder {
 }
 
 impl UdpTransportBuilder {
-    /// Create a new builder with default settings.
+    /// Create a builder with the default settings.
     ///
     /// Default bind address is `0.0.0.0:0` (IPv4).
     #[must_use]

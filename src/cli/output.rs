@@ -447,7 +447,7 @@ pub struct OutputContext<'a> {
 }
 
 impl<'a> OutputContext<'a> {
-    /// Create a new output context with default settings.
+    /// Create an output context with the default settings.
     pub fn new(format: OutputFormat) -> Self {
         Self {
             format,

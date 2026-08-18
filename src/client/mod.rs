@@ -19,7 +19,7 @@ pub use retry::{MAX_RETRIES, Retry, RetryBuilder, RetryConfigError};
 
 // New unified entry point
 impl Client<UdpHandle> {
-    /// Create a new SNMP client builder.
+    /// Create an SNMP client builder.
     ///
     /// This convenience entry point configures a library-maintained target
     /// transport. Use [`ClientBuilder::new`] when supplying an existing
@@ -82,6 +82,7 @@ use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
 use response_shape::{RequestShape, classify};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -181,15 +182,84 @@ struct ClientEngine {
     generation: Arc<()>,
 }
 
-struct DiscoveryFlight {
+#[derive(Debug)]
+pub(crate) struct DiscoveryCoordinator {
+    flights: Mutex<HashMap<SocketAddr, Arc<DiscoveryFlight>>>,
+}
+
+impl DiscoveryCoordinator {
+    pub(crate) fn new() -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock_flights(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, Arc<DiscoveryFlight>>> {
+        match self.flights.lock() {
+            Ok(flights) => flights,
+            Err(poisoned) => {
+                let mut flights = poisoned.into_inner();
+                flights.clear();
+                self.flights.clear_poison();
+                flights
+            }
+        }
+    }
+
+    pub(crate) fn acquire(&self, target: SocketAddr) -> (Arc<DiscoveryFlight>, bool) {
+        let mut flights = self.lock_flights();
+        match flights.get(&target) {
+            Some(flight) => (Arc::clone(flight), false),
+            None => {
+                let flight = Arc::new(DiscoveryFlight::new());
+                flights.insert(target, Arc::clone(&flight));
+                (flight, true)
+            }
+        }
+    }
+
+    pub(crate) fn remove(&self, target: SocketAddr, flight: &Arc<DiscoveryFlight>) {
+        let mut flights = self.lock_flights();
+        if flights
+            .get(&target)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            flights.remove(&target);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flight_count(&self) -> usize {
+        self.lock_flights().len()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscoveryFlight {
     outcome: Mutex<Option<DiscoveryOutcome>>,
     complete: tokio::sync::Notify,
     retries: std::sync::atomic::AtomicU32,
 }
 
-#[derive(Clone)]
-enum DiscoveryOutcome {
-    Success(ResponseMetadata),
+impl DiscoveryFlight {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            complete: tokio::sync::Notify::new(),
+            retries: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredState {
+    state: EngineState,
+    metadata: ResponseMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum DiscoveryOutcome {
+    Success(DiscoveredState),
     Timeout {
         target: SocketAddr,
         elapsed: Duration,
@@ -216,9 +286,9 @@ enum DiscoveryOutcome {
 }
 
 impl DiscoveryOutcome {
-    fn share_result(result: Result<ResponseMetadata>) -> (Self, Result<ResponseMetadata>) {
+    fn share_result(result: Result<DiscoveredState>) -> (Self, Result<DiscoveredState>) {
         match result {
-            Ok(metadata) => (Self::Success(metadata.clone()), Ok(metadata)),
+            Ok(discovered) => (Self::Success(discovered.clone()), Ok(discovered)),
             Err(error) => {
                 let outcome = match &*error {
                     Error::Timeout {
@@ -262,7 +332,7 @@ impl DiscoveryOutcome {
         }
     }
 
-    fn into_result(self) -> Result<ResponseMetadata> {
+    fn into_result(self) -> Result<DiscoveredState> {
         match self {
             Self::Success(metadata) => Ok(metadata),
             Self::Timeout {
@@ -323,8 +393,8 @@ struct ClientInner<T: Transport> {
     engine_cache: Option<Arc<EngineCache>>,
     /// Serializes explicit rediscovery against ordinary discovery.
     discovery_lock: AsyncMutex<()>,
-    /// Cancellation-safe ordinary-discovery single flight.
-    discovery_flight: Mutex<Option<Arc<DiscoveryFlight>>>,
+    /// Cancellation-safe ordinary-discovery flights, shared through the cache.
+    discovery_coordinator: Arc<DiscoveryCoordinator>,
     /// Keys derived against the local authoritative engine ID for V3 traps.
     local_derived_keys: RwLock<Option<DerivedKeys>>,
     #[cfg(test)]
@@ -536,7 +606,7 @@ impl ClientConfig {
 }
 
 impl<T: Transport> Client<T> {
-    /// Create a new client with the given transport and config.
+    /// Create a client with the given transport and configuration.
     ///
     /// For most use cases, prefer [`Client::builder()`] for a library-created
     /// transport or [`ClientBuilder::build_with_transport`] for an existing or
@@ -552,7 +622,7 @@ impl<T: Transport> Client<T> {
         Self::with_optional_engine_cache(transport, config, None)
     }
 
-    /// Create a new V3 client with a shared engine cache.
+    /// Create an SNMPv3 client with a shared engine cache.
     ///
     /// # Errors
     ///
@@ -583,6 +653,10 @@ impl<T: Transport> Client<T> {
             })
             .map(|_| SaltCounter::new())
             .transpose()?;
+        let discovery_coordinator = engine_cache.as_ref().map_or_else(
+            || Arc::new(DiscoveryCoordinator::new()),
+            |cache| Arc::clone(&cache.discovery_coordinator),
+        );
         Ok(Self {
             inner: Arc::new(ClientInner {
                 transport,
@@ -591,7 +665,7 @@ impl<T: Transport> Client<T> {
                 salt_counter,
                 engine_cache,
                 discovery_lock: AsyncMutex::new(()),
-                discovery_flight: Mutex::new(None),
+                discovery_coordinator,
                 local_derived_keys: RwLock::new(None),
                 #[cfg(test)]
                 authenticated_response_validated_hook: RwLock::new(None),
@@ -599,7 +673,7 @@ impl<T: Transport> Client<T> {
         })
     }
 
-    /// Get the peer (target) address.
+    /// Returns the peer address.
     ///
     /// Returns the remote address that this client sends requests to.
     /// Named to match [`std::net::TcpStream::peer_addr()`].

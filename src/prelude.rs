@@ -1,7 +1,4 @@
-//! Prelude module for convenient imports.
-//!
-//! This module provides a convenient set of commonly-used types and traits
-//! for working with the async-snmp library.
+//! Common types, traits, and macros for async-snmp applications.
 //!
 //! # Usage
 //!
@@ -9,11 +6,16 @@
 //! use async_snmp::prelude::*;
 //! ```
 //!
-//! This imports:
-//! - Core types: [`Client`], [`Oid`], [`Value`], [`VarBind`]
-//! - Error handling: [`Error`], [`Result`]
-//! - V3 protocols: [`AuthProtocol`], [`PrivProtocol`]
-//! - The [`oid!`] macro for convenient OID construction (wire validity is checked during encoding)
+//! The prelude imports:
+//!
+//! - Client configuration: [`Auth`], [`Client`], [`ClientBuilder`], [`Retry`],
+//!   and [`TargetClientBuilder`]
+//! - Protocol data: [`Oid`], [`Value`], [`VarBind`], and [`Version`]
+//! - Decode compatibility: [`DecodeAnomaly`] and [`DecodeConfig`]
+//! - Error handling: [`Error`] and [`Result`]
+//! - SNMPv3 protocols: [`AuthProtocol`] and [`PrivProtocol`]
+//! - The [`oid!`] macro for OID construction (wire validity is checked during
+//!   encoding)
 
 pub use crate::client::{Auth, Client, ClientBuilder, Retry, TargetClientBuilder};
 pub use crate::compatibility::{DecodeAnomaly, DecodeConfig};

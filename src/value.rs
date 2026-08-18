@@ -14,7 +14,7 @@ use bytes::Bytes;
 /// Used by SNMP tables to control row creation, modification, and deletion.
 /// The state machine for `RowStatus` is defined in RFC 2579 Section 7.1.
 ///
-/// # State Transitions
+/// # State transitions
 ///
 /// | Current State | Set to | Result |
 /// |--------------|--------|--------|
@@ -103,7 +103,7 @@ impl std::fmt::Display for RowStatus {
 ///
 /// Describes how an SNMP row's data is stored and persisted.
 ///
-/// # Persistence Levels
+/// # Persistence levels
 ///
 /// | Type | Survives Reboot | Writable |
 /// |------|-----------------|----------|
@@ -268,8 +268,8 @@ pub enum Value {
     ///
     /// Per RFC 2578 (`SMIv2`), OCTET STRING values have a maximum size of 65535 octets.
     /// This limit is **not enforced** during decoding to maintain permissive parsing
-    /// behavior. Applications that require strict compliance should validate size
-    /// after decoding.
+    /// behavior. Applications that require strict compliance must validate the
+    /// size after decoding.
     OctetString(Bytes),
 
     /// NULL
@@ -644,8 +644,8 @@ impl Value {
     ///
     /// Keeps converted samples exact for large counters. IEEE 754 double-precision
     /// floats have a 53-bit mantissa, so Counter64 values above 2^53 lose
-    /// precision when converted directly. This method reduces the value modulo
-    /// 2^53 before conversion.
+    /// precision when converted directly. The conversion reduces the value
+    /// modulo 2^53 first.
     ///
     /// This introduces an artificial wrap at 2^53. Rate calculations must use a
     /// modulo-2^53 delta rather than ordinary subtraction when that boundary is
@@ -682,8 +682,8 @@ impl Value {
     /// Extract integer with implied decimal places.
     ///
     /// Many SNMP sensors report fixed-point values as integers with an
-    /// implied decimal point. This method applies the scaling directly,
-    /// returning a usable f64 value.
+    /// implied decimal point. This conversion applies the scaling and returns
+    /// an `f64` value.
     ///
     /// This complements `format_with_hint("d-2")` which returns a String
     /// for display. Use `as_decimal()` when you need the numeric value
@@ -713,8 +713,8 @@ impl Value {
 
     /// `TimeTicks` as Duration (hundredths of seconds).
     ///
-    /// `TimeTicks` represents time in hundredths of a second. This method
-    /// converts to `std::time::Duration` for idiomatic Rust time handling.
+    /// `TimeTicks` represents time in hundredths of a second. This conversion
+    /// returns the equivalent [`std::time::Duration`].
     ///
     /// Common use: sysUpTime, interface last-change timestamps.
     ///

@@ -232,7 +232,9 @@
 //! Password-to-key derivation expands the password to one megabyte before
 //! hashing it. `MasterKeys` allows that result to be reused across engines
 //! that share credentials. [`EngineCache`] shares discovered engine identities,
-//! remote message-size limits, and trusted engine time between clients.
+//! remote message-size limits, and trusted engine time between clients. It also
+//! coalesces simultaneous ordinary discovery by independently constructed
+//! clients for the same resolved address.
 //!
 //! ```rust,no_run
 //! # #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
@@ -408,7 +410,7 @@
 //! # Trace client operations, debug everything else
 //! RUST_LOG=async_snmp=debug,async_snmp::client=trace cargo run
 //!
-//! # Debug just BER decoding issues
+//! # Debug only BER decoding issues
 //! RUST_LOG=async_snmp::ber=debug cargo run
 //! ```
 //!

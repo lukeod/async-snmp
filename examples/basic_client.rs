@@ -1,27 +1,27 @@
-//! Basic SNMPv2c Client Example
+//! Use an SNMPv2c client
 //!
-//! This example demonstrates fundamental SNMP operations using SNMPv2c:
-//! - GET: Retrieve a single OID value
-//! - GET_MANY: Retrieve multiple OIDs in one request
-//! - GETNEXT: Get the next OID in the MIB tree
-//! - SET: Modify a writable OID value
+//! The client performs these SNMPv2c operations:
 //!
-//! Run with: cargo run --example basic_client
+//! - GET retrieves one OID.
+//! - `get_many` retrieves multiple OIDs in one request.
+//! - GETNEXT retrieves the next OID in lexicographic order.
+//! - SET modifies a writable object.
 //!
-//! Test against net-snmp:
-//!   # Start snmpd with a writable community
-//!   sudo snmpd -f -Lo -c /etc/snmp/snmpd.conf
+//! Run `cargo run --example basic_client`.
 //!
-//! Or use the project's net-snmp test image:
-//!   docker build -t async-snmp-test:latest tests/containers/snmpd/
-//!   docker run --rm -p 11161:161/udp async-snmp-test:latest
+//! To use the project's net-snmp test image, run:
+//!
+//! ```text
+//! docker build -t async-snmp-test:latest tests/containers/snmpd/
+//! docker run --rm -p 11161:161/udp async-snmp-test:latest
+//! ```
 
 use async_snmp::{Auth, Client, Error, ErrorStatus, Retry, Value, oid};
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for debug output (optional)
+    // Initialize tracing for optional diagnostic output.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -29,11 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Target address - change to match your SNMP agent
+    // Change the target to match your SNMP agent.
     let target = ("127.0.0.1", 11161);
 
-    // Create a v2c client with the "public" community string
-    // The builder pattern allows configuring timeout, retries, etc.
+    // Create an SNMPv2c client with the "public" community string.
     let client = Client::builder(target, Auth::v2c("public"))
         .request_timeout(Duration::from_secs(5))
         .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count"))
@@ -47,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\n--- GET sysDescr.0 ---");
 
-    // The oid! macro creates OIDs at compile time
+    // The oid! macro creates an OID at compile time.
     let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
 
     match client.get(&sys_descr).await {
@@ -59,9 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_varbind(varbind);
             }
 
-            // Extract a singleton string only when correspondence is unambiguous.
-            if response.anomalies.is_empty()
-                && let [varbind] = response.varbinds.as_slice()
+            // Extract a value only from an unambiguous singleton response.
+            if let Some(varbind) = response.single()
                 && let Some(s) = varbind.value.as_str()
             {
                 println!("As string: {s}");
@@ -77,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\n--- GET_MANY (system MIB) ---");
 
-    // Define multiple OIDs to fetch
+    // Define the OIDs to retrieve.
     let oids = [
         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), // sysDescr
         oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), // sysUpTime
@@ -104,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\n--- GETNEXT from system ---");
 
-    // Start from the system subtree (1.3.6.1.2.1.1)
+    // Start at the system subtree (1.3.6.1.2.1.1).
     let system_oid = oid!(1, 3, 6, 1, 2, 1, 1);
 
     match client.get_next(&system_oid).await {
@@ -127,8 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\n--- SET sysContact.0 ---");
 
-    // sysContact.0 is typically writable with the "private" community
-    // Create a new client with write access
+    // Create a client with the "private" community to write sysContact.0.
     let write_client = Client::builder(target, Auth::v2c("private"))
         .request_timeout(Duration::from_secs(5))
         .connect()
@@ -147,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            // SET operations commonly fail due to access control
+            // Access-control policy commonly rejects SET operations.
             handle_error("SET", &e);
         }
     }
@@ -175,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Print a varbind while distinguishing SNMPv2 exception values from ordinary data.
+/// Prints a variable binding and distinguishes SNMPv2 exception values from data.
 fn print_varbind(varbind: &async_snmp::VarBind) {
     match &varbind.value {
         Value::NoSuchObject => {
@@ -191,12 +188,10 @@ fn print_varbind(varbind: &async_snmp::VarBind) {
     }
 }
 
-/// Handle SNMP errors with informative messages.
-///
-/// This demonstrates proper error handling patterns for SNMP operations.
+/// Reports an SNMP operation error with relevant diagnostic details.
 fn handle_error(operation: &str, error: &Error) {
     match error {
-        // SNMP protocol errors from the agent
+        // Report an SNMP error-status returned by the agent.
         Error::Snmp {
             status, index, oid, ..
         } => {
@@ -205,7 +200,7 @@ fn handle_error(operation: &str, error: &Error) {
                 println!("  Problematic OID: {oid}");
             }
 
-            // Provide specific guidance based on error type
+            // Provide guidance for selected error-status values.
             match status {
                 ErrorStatus::NoSuchName => {
                     println!("  -> OID does not exist on this SNMPv1 agent");
@@ -220,7 +215,7 @@ fn handle_error(operation: &str, error: &Error) {
             }
         }
 
-        // Network timeout
+        // Report timeouts separately from other network errors.
         Error::Timeout {
             target,
             elapsed,
@@ -231,13 +226,13 @@ fn handle_error(operation: &str, error: &Error) {
             println!("  -> Check if agent at {target} is reachable");
         }
 
-        // Network errors
+        // Report other network errors and their target.
         Error::Network { target, source, .. } => {
             println!("{operation} failed: Network error - {source}");
             println!("  -> Target: {target}");
         }
 
-        // Other errors
+        // Use the error's display representation for all other variants.
         _ => {
             println!("{operation} failed: {error}");
         }

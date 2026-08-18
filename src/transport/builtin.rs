@@ -12,7 +12,7 @@ use std::time::Duration;
 /// API. Configure and construct the concrete transport first, convert it with
 /// [`From`], and pass it to
 /// [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport).
-/// Custom transports should continue to use `Client<T>` directly.
+/// Use `Client<T>` directly for custom transports.
 ///
 /// ```rust,no_run
 /// use async_snmp::{Auth, BuiltinTransport, ClientBuilder, RuntimeClient, TcpTransport};

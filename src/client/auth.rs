@@ -1,7 +1,6 @@
-//! Authentication configuration types for the SNMP client.
+//! Client authentication configuration.
 //!
-//! This module provides the [`Auth`] enum for specifying authentication
-//! configuration, supporting SNMPv1/v2c community identifiers and `SNMPv3` USM.
+//! [`Auth`] supports SNMPv1/v2c community identifiers and SNMPv3 USM.
 //!
 //! # Reusing master keys
 //!

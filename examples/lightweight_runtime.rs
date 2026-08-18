@@ -1,20 +1,18 @@
-//! Lightweight Runtime Configuration
+//! Configure a lightweight runtime
 //!
-//! Most async-snmp examples use #[tokio::main], which spawns a multi-threaded
-//! runtime by default. This is overkill for simple tools that talk to one or
-//! a few devices.
+//! Most async-snmp examples use `#[tokio::main]`, which creates a multithreaded
+//! runtime by default. A tool that communicates with one or a few devices might
+//! not need worker threads.
 //!
-//! This example shows how to use a single-threaded runtime instead, which
-//! avoids spawning worker threads and reduces overhead for simple use cases.
+//! This example uses a single-threaded runtime to reduce overhead.
 //!
-//! Run with: cargo run --example lightweight_runtime
+//! Run `cargo run --example lightweight_runtime`.
 
 use async_snmp::{Auth, Client, ResponseShapePolicy, Retry, oid};
 use std::time::Duration;
 
-// current_thread: single-threaded runtime, no worker threads.
-// All async work runs on the main thread. This is the lightest option
-// and works well for CLI tools, scripts, and simple applications.
+// The current-thread runtime runs all asynchronous work on the main thread
+// without spawning worker threads.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = ("127.0.0.1", 11161);
@@ -26,11 +24,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect()
         .await?;
 
-    // GET
+    // Retrieve sysDescr.0.
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-    println!("sysDescr: {:?}", response.varbinds[0].value);
+    let varbind = response
+        .single()
+        .expect("strict response policy returns a singleton");
+    println!("sysDescr: {:?}", varbind.value);
 
-    // WALK
+    // Walk the system subtree.
     let mut walk = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;
     while let Some(result) = walk.next().await {
         let vb = result?;

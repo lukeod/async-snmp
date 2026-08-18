@@ -692,7 +692,7 @@ pub struct NotificationReceiverBuilder {
 }
 
 impl NotificationReceiverBuilder {
-    /// Create a new builder with default settings.
+    /// Create a builder with the default settings.
     ///
     /// Defaults:
     /// - Bind address: `0.0.0.0:162` (UDP, standard SNMP trap port)
@@ -1135,8 +1135,9 @@ impl Default for NotificationReceiverBuilder {
 
 /// Received SNMP notification.
 ///
-/// This enum represents all types of SNMP notifications that can be received:
-/// - `SNMPv1` Trap (different PDU structure)
+/// An SNMP notification received from the network.
+///
+/// - SNMPv1 Trap (different PDU structure)
 /// - SNMPv2c/v3 Trap (standard PDU with sysUpTime.0 and snmpTrapOID.0)
 /// - `InformRequest` (confirmed notification, with a response attempted after
 ///   application acceptance and before delivery)
@@ -1276,7 +1277,7 @@ impl Notification {
         }
     }
 
-    /// Get the trap/notification OID.
+    /// Returns the trap or notification OID.
     ///
     /// For `TrapV1`, this is derived from enterprise + generic/specific trap.
     /// For v2c/v3, this is the snmpTrapOID.0 value.
@@ -1290,7 +1291,7 @@ impl Notification {
         }
     }
 
-    /// Get the uptime value (sysUpTime.0 or `time_stamp` for v1).
+    /// Returns the uptime value (`sysUpTime.0` or `time_stamp` for SNMPv1).
     pub fn uptime(&self) -> u32 {
         match self {
             Notification::TrapV1 { trap, .. } => trap.time_stamp,
@@ -1301,7 +1302,7 @@ impl Notification {
         }
     }
 
-    /// Get the variable bindings.
+    /// Returns the variable bindings.
     pub fn varbinds(&self) -> &[VarBind] {
         match self {
             Notification::TrapV1 { trap, .. } => &trap.varbinds,
@@ -1312,7 +1313,7 @@ impl Notification {
         }
     }
 
-    /// Get the security level the notification was received at.
+    /// Returns the security level at which the notification was received.
     ///
     /// Returns `None` for v1/v2c notifications (community-based, no USM
     /// security level); their community and content are cleartext and not
@@ -1337,7 +1338,7 @@ impl Notification {
         )
     }
 
-    /// Get the SNMP version of this notification.
+    /// Returns the SNMP version of this notification.
     pub fn version(&self) -> Version {
         match self {
             Notification::TrapV1 { .. } => Version::V1,
@@ -1355,7 +1356,7 @@ impl Notification {
 /// exceed the effective response limit, it sends neither, increments
 /// [`Self::snmp_silent_drops`], and still delivers the notification.
 ///
-/// # V3 Authentication
+/// # SNMPv3 authentication
 ///
 /// To receive authenticated V3 notifications, use the builder pattern to
 /// configure USM credentials and persisted authoritative engine state:
@@ -1575,7 +1576,7 @@ impl NotificationReceiver {
             .await
     }
 
-    /// Get the local address this receiver is bound to.
+    /// Returns the local address that this receiver is bound to.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
@@ -1587,7 +1588,7 @@ impl NotificationReceiver {
         self.inner.decode_config
     }
 
-    /// Get the local engine ID.
+    /// Returns the local engine ID.
     ///
     /// With an [`AuthoritativeEngine`] this is the stable persisted V3
     /// identity. A receiver without USM users instead has a generated
@@ -1597,7 +1598,7 @@ impl NotificationReceiver {
         &self.inner.engine_id
     }
 
-    /// Get the most recently sampled local engine boots value.
+    /// Returns the most recently sampled local engine boots value.
     ///
     /// V3 processing samples the authoritative clock. Any rollover increment
     /// has already been stored through the retained persistence callback before
@@ -1609,7 +1610,7 @@ impl NotificationReceiver {
         unpack_boots_time(self.inner.authoritative_snapshot.load(Ordering::Relaxed)).0
     }
 
-    /// Get the usmStatsUnknownEngineIDs counter value.
+    /// Returns the usmStatsUnknownEngineIDs counter value.
     #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
         self.inner
@@ -1618,7 +1619,7 @@ impl NotificationReceiver {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsUnknownUserNames counter value.
+    /// Returns the usmStatsUnknownUserNames counter value.
     #[must_use]
     pub fn usm_unknown_usernames(&self) -> u32 {
         self.inner
@@ -1627,13 +1628,13 @@ impl NotificationReceiver {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsWrongDigests counter value.
+    /// Returns the usmStatsWrongDigests counter value.
     #[must_use]
     pub fn usm_wrong_digests(&self) -> u32 {
         self.inner.usm_stats.wrong_digests.load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsNotInTimeWindows counter value.
+    /// Returns the usmStatsNotInTimeWindows counter value.
     #[must_use]
     pub fn usm_not_in_time_windows(&self) -> u32 {
         self.inner
@@ -1642,7 +1643,7 @@ impl NotificationReceiver {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsUnsupportedSecLevels counter value.
+    /// Returns the usmStatsUnsupportedSecLevels counter value.
     #[must_use]
     pub fn usm_unsupported_sec_levels(&self) -> u32 {
         self.inner
@@ -1651,7 +1652,7 @@ impl NotificationReceiver {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsDecryptionErrors counter value.
+    /// Returns the usmStatsDecryptionErrors counter value.
     #[must_use]
     pub fn usm_decryption_errors(&self) -> u32 {
         self.inner
@@ -1670,7 +1671,7 @@ impl NotificationReceiver {
 
     /// Receive a notification.
     ///
-    /// This method blocks until a notification passes protocol processing,
+    /// Waits until a notification passes protocol processing,
     /// prefix validation, and the application acceptance policy. Policy
     /// rejection, error, or panic drops the notification and withholds an
     /// Inform response while this method continues waiting.

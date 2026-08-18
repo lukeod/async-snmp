@@ -1,20 +1,19 @@
-//! SNMP Agent with Writable Objects
+//! Run an SNMP agent with writable objects
 //!
-//! Demonstrates a MibHandler that supports SET operations using the
-//! library's two-phase SET protocol (RFC 3416):
+//! The `MibHandler` implementation handles SET operations with the library's
+//! two-phase protocol from RFC 3416:
 //!
-//! 1. **test_set** - Validate and return request-owned prepared state
-//! 2. **PreparedSet::commit** - Apply the change
-//! 3. **PreparedSet::finalize** - Release successful transaction state
+//! 1. `test_set` validates the value and returns request-owned prepared state.
+//! 2. `PreparedSet::commit` applies the change.
+//! 3. `PreparedSet::finalize` releases successful transaction state.
 //!
 //! Each prepared change retains the previous value so `undo` can restore it if
 //! a later binding's commit fails.
 //!
-//! The example exposes a small configuration subtree under a private
-//! enterprise OID with two writable scalars (a string and an integer)
-//! and one read-only counter.
+//! The agent exposes a private enterprise subtree with two writable scalars, an
+//! octet string and an integer, and one read-only counter.
 //!
-//! Run with: cargo run --example agent_with_set --features agent
+//! Run `cargo run --example agent_with_set --features agent`.
 
 use async_snmp::agent::Agent;
 use async_snmp::handler::{
@@ -28,7 +27,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-// Private enterprise OID: 1.3.6.1.4.1.99999
+// Private enterprise OID: 1.3.6.1.4.1.99999.
 // .1.0 = configName (read-write, OctetString, max 64 bytes)
 // .2.0 = configInterval (read-write, Integer, 1..3600)
 // .3.0 = configChangeCount (read-only, Counter32)
@@ -240,7 +239,7 @@ impl MibHandler for ConfigHandler {
                     _ => Err(SetTestError::WrongType),
                 }
             } else if oid.as_ref() == OID_CONFIG_CHANGES {
-                // Read-only counter
+                // Reject attempts to set the read-only counter.
                 Err(SetTestError::NotWritable)
             } else {
                 Err(SetTestError::NoAccess)

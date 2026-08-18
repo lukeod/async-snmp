@@ -1,6 +1,6 @@
 //! Result types for MIB handler operations.
 //!
-//! This module provides the result types returned by [`MibHandler`](super::MibHandler)
+//! Defines the result types returned by [`MibHandler`](super::MibHandler)
 //! methods:
 //!
 //! - [`GetResult`] - Result of a GET operation
@@ -270,12 +270,12 @@ impl SetUndoError {
 /// - `NoSuchInstance`: The object type exists but this specific instance doesn't
 ///   (e.g., table row doesn't exist)
 ///
-/// # Version Differences
+/// # Version differences
 ///
 /// - **`SNMPv1`**: Both exception types result in a `noSuchName` error response
 /// - **SNMPv2c/v3**: Returns the appropriate exception value in the response varbind
 ///
-/// # Choosing `NoSuchObject` vs `NoSuchInstance`
+/// # Choosing `NoSuchObject` or `NoSuchInstance`
 ///
 /// | Situation | Variant |
 /// |-----------|---------|
@@ -285,7 +285,7 @@ impl SetUndoError {
 /// | Table row doesn't exist | [`NoSuchInstance`](GetResult::NoSuchInstance) |
 /// | Scalar has no value (optional) | [`NoSuchInstance`](GetResult::NoSuchInstance) |
 ///
-/// # Example: Scalar Objects
+/// # Example: scalar objects
 ///
 /// ```rust
 /// use async_snmp::handler::GetResult;
@@ -302,7 +302,7 @@ impl SetUndoError {
 /// }
 /// ```
 ///
-/// # Example: Table Objects
+/// # Example: table objects
 ///
 /// ```rust
 /// use async_snmp::handler::GetResult;
@@ -363,12 +363,12 @@ impl From<Value> for GetResult {
 /// This is the foundation of SNMP walking (iterating through MIB subtrees)
 /// and is also used internally by GETBULK.
 ///
-/// # Version Differences
+/// # Version differences
 ///
 /// - **`SNMPv1`**: `EndOfMibView` results in a `noSuchName` error response
 /// - **SNMPv2c/v3**: Returns the `endOfMibView` exception value in the response
 ///
-/// # Lexicographic Ordering
+/// # Lexicographic ordering
 ///
 /// OIDs are compared arc-by-arc as unsigned integers:
 /// - `1.3.6.1.2` < `1.3.6.1.2.1` (shorter is less than longer with same prefix)

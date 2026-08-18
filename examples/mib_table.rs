@@ -1,18 +1,16 @@
 //! Walk a table and decode results using MIB metadata.
 //!
-//! Uses `describe_varbind` to group columns by row and `decode_indexes` to
-//! interpret each row's INDEX components. Shows programmatic use of MIB
-//! metadata beyond simple string formatting.
+//! This example uses `describe_varbind` to group columns by row and compiles an
+//! `IndexSchema` to decode each row's INDEX components. It demonstrates
+//! programmatic MIB metadata access beyond string formatting.
 //!
-//! Requires the `mib` feature:
-//!   cargo run --example mib_table --features mib -- 192.168.1.1
-//!
-//! This example requires an SNMP agent to be running at the specified target.
+//! Run `cargo run --example mib_table --features mib -- 192.168.1.1`. The target
+//! must run an SNMP agent.
 
-use async_snmp::mib_support::{self, Loader};
+use async_snmp::mib_support::{self, DecodeOptions, IndexSchema, Loader};
 use async_snmp::{Auth, Client, VarBind};
 use smallvec::SmallVec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,10 +18,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
-    // Load MIBs from system paths
+    // Load MIB modules from the system search paths.
     let mib = tokio::task::spawn_blocking(|| Loader::new().system_paths().load()).await??;
 
-    // Resolve ifTable and walk it
+    // Resolve and walk ifTable.
     let if_table = mib_support::resolve_oid(&mib, "ifTable")?;
 
     let client = Client::builder(target, Auth::v2c("public"))
@@ -32,20 +30,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let results: Vec<_> = client.walk(if_table)?.collect().await?;
 
-    // Group varbinds by row index using describe_varbind
+    // Group variable bindings by row index and decode each index from MIB metadata.
     type Row<'a> = (
         Vec<String>,
         Vec<(&'a VarBind, mib_support::VarBindInfo<'a>)>,
     );
     let mut rows: BTreeMap<SmallVec<[u32; 4]>, Row<'_>> = BTreeMap::new();
+    let mut index_schemas = BTreeMap::new();
 
     for vb in &results {
         if let Some(info) = mib_support::describe_varbind(&mib, vb) {
-            let indexes = mib
-                .lookup_instance(&vb.oid.to_mib_oid())
-                .decode_indexes()
-                .into_iter()
-                .map(|index| index.to_string())
+            let mib_oid = vb.oid.to_mib_oid();
+            let lookup = mib.lookup_instance(&mib_oid);
+            let node = lookup.node();
+            let object = node.object().expect("describe_varbind found an object");
+            let schema = match index_schemas.entry(node.oid().clone()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(IndexSchema::compile(object)?),
+            };
+            let decoded = lookup
+                .decode_indexes_exact(schema, DecodeOptions::new(lookup.suffix().len()))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let indexes = decoded
+                .components()
+                .map(|component| format!("{}={}", component.name(), component.value()))
                 .collect();
             let suffix = info.suffix.clone();
             rows.entry(suffix)
@@ -55,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Display grouped by row
+    // Display the columns grouped by row.
     for (raw_index, (indexes, columns)) in &rows {
         if indexes.is_empty() {
             let raw: Vec<_> = raw_index.iter().map(|arc| arc.to_string()).collect();
@@ -77,6 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    println!("{} rows, {} total varbinds", rows.len(), results.len());
+    println!(
+        "{} rows, {} total variable bindings",
+        rows.len(),
+        results.len()
+    );
     Ok(())
 }

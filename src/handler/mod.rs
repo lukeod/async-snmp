@@ -1,6 +1,6 @@
 //! Handler types and traits for SNMP MIB operations.
 //!
-//! This module provides the interface for implementing SNMP agent handlers:
+//! Defines the interface for implementing SNMP agent handlers:
 //!
 //! - [`MibHandler`] - Trait for handling GET, GETNEXT, and SET operations
 //! - [`RequestContext`] - Information about the incoming request
@@ -23,7 +23,7 @@
 //! handler failed to produce one (e.g. its backing store was unreachable) and
 //! makes the agent answer the request with `genErr` (RFC 3416 Section 4.2.1).
 //!
-//! # Basic Handler Example
+//! # Basic handler example
 //!
 //! A minimal handler that provides two scalar values:
 //!
@@ -55,53 +55,11 @@
 //! }
 //! ```
 //!
-//! # Result migration
-//!
-//! Handler results require explicit protocol outcomes. The pre-1.0
-//! `Option` conversions and the unused handler-level `Response` type are no
-//! longer available:
-//!
-//! ```compile_fail
-//! use async_snmp::{Value, handler::GetResult};
-//!
-//! let _ = GetResult::from_option(Some(Value::Null));
-//! ```
-//!
-//! ```compile_fail
-//! use async_snmp::{Value, handler::GetResult};
-//!
-//! let _: GetResult = Some(Value::Null).into();
-//! ```
-//!
-//! ```compile_fail
-//! use async_snmp::{Value, VarBind, handler::GetNextResult, oid};
-//!
-//! let value = VarBind::new(oid!(1, 3, 6, 1), Value::Null);
-//! let _ = GetNextResult::from_option(Some(value));
-//! ```
-//!
-//! ```compile_fail
-//! use async_snmp::{Value, VarBind, handler::GetNextResult, oid};
-//!
-//! let value = VarBind::new(oid!(1, 3, 6, 1), Value::Null);
-//! let _: GetNextResult = Some(value).into();
-//! ```
-//!
-//! ```compile_fail
-//! use async_snmp::handler::GetNextResult;
-//!
-//! let _ = GetNextResult::EndOfMibView.into_option();
-//! ```
-//!
-//! ```compile_fail
-//! use async_snmp::handler::Response;
-//! ```
-//!
 //! Choose `GetResult::NoSuchObject` or `GetResult::NoSuchInstance`, and
 //! `GetNextResult::EndOfMibView`, explicitly. `From<Value>` and
-//! `From<VarBind>` remain available for unambiguous value results.
+//! `From<VarBind>` provide conversions for unambiguous value results.
 //!
-//! # SET Operations and Multi-Phase Protocol
+//! # SET operations and multi-phase protocol
 //!
 //! SET operations follow a multi-phase protocol as defined in RFC 3416, modeled
 //! after net-snmp's RESERVE/ACTION/COMMIT/FREE/UNDO phases:

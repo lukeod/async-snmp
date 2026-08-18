@@ -48,7 +48,7 @@ impl V3SecurityModel {
         }
     }
 
-    /// Get the raw value.
+    /// Returns the raw value.
     #[must_use]
     pub fn as_i32(self) -> i32 {
         self as i32
@@ -240,7 +240,7 @@ impl MsgGlobalData {
     /// Validates that:
     /// - `msgID` is in range 0..2147483647 (RFC 3412 `HeaderData`)
     /// - `msgMaxSize` is in range 484..2147483647 (RFC 3412 `HeaderData`)
-    /// - `msgSecurityModel` is a known value (currently only USM=3)
+    /// - `msgSecurityModel` identifies USM (3)
     pub fn decode(decoder: &mut Decoder) -> Result<Self> {
         let mut seq = decoder.read_sequence()?;
 
@@ -300,7 +300,7 @@ pub struct ScopedPdu {
 }
 
 impl ScopedPdu {
-    /// Create a new scoped PDU.
+    /// Create a scoped PDU.
     pub fn new(
         context_engine_id: impl Into<Bytes>,
         context_name: impl Into<Bytes>,
@@ -565,7 +565,7 @@ impl V3Message {
         Ok(())
     }
 
-    /// Get the scoped PDU if available (plaintext only).
+    /// Returns the scoped PDU when the message data is plaintext.
     pub fn scoped_pdu(&self) -> Option<&ScopedPdu> {
         match &self.data {
             V3MessageData::Plaintext(pdu) => Some(pdu),
@@ -581,7 +581,7 @@ impl V3Message {
         }
     }
 
-    /// Get the PDU if available (convenience method).
+    /// Returns the PDU when the message data is plaintext.
     pub fn pdu(&self) -> Option<&Pdu> {
         self.scoped_pdu().map(|s| &s.pdu)
     }
@@ -591,12 +591,12 @@ impl V3Message {
         self.into_scoped_pdu().map(|s| s.pdu)
     }
 
-    /// Get the message ID.
+    /// Returns the message ID.
     pub fn msg_id(&self) -> i32 {
         self.global_data.msg_id
     }
 
-    /// Get the security level.
+    /// Returns the security level.
     pub fn security_level(&self) -> SecurityLevel {
         self.global_data.msg_flags.security_level
     }
@@ -831,27 +831,27 @@ impl RawV3Message {
         })
     }
 
-    /// Get the decoded global header.
+    /// Returns the decoded global header.
     pub fn global_data(&self) -> &MsgGlobalData {
         &self.global_data
     }
 
-    /// Get the opaque security parameters.
+    /// Returns the opaque security parameters.
     pub fn security_params(&self) -> &Bytes {
         &self.security_params
     }
 
-    /// Get the unprocessed message data.
+    /// Returns the unprocessed message data.
     pub fn msg_data(&self) -> &RawMsgData {
         &self.msg_data
     }
 
-    /// Get the message ID.
+    /// Returns the message ID.
     pub fn msg_id(&self) -> i32 {
         self.global_data.msg_id
     }
 
-    /// Get the security level indicated by the received flags.
+    /// Returns the security level indicated by the received flags.
     pub fn security_level(&self) -> SecurityLevel {
         self.global_data.msg_flags.security_level
     }

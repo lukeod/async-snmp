@@ -1,4 +1,8 @@
-//! Select a configured built-in transport at runtime.
+//! Select a configured built-in transport at runtime
+//!
+//! Pass `udp` or `tcp`, followed by an optional socket address:
+//!
+//! `cargo run --example runtime_transport -- tcp 127.0.0.1:161`
 
 use async_snmp::{
     Auth, BuiltinTransport, ClientBuilder, RuntimeClient, TcpTransport, UdpTransport, oid,
@@ -14,8 +18,8 @@ async fn main() -> async_snmp::Result<()> {
         .parse()
         .expect("target must be a socket address");
 
-    // Transport-specific settings are applied before erasing the choice into
-    // BuiltinTransport. The client builder does not reinterpret those settings.
+    // Apply transport-specific settings before erasing the concrete type into
+    // BuiltinTransport. The client builder preserves these settings.
     let transport = match protocol.as_str() {
         "udp" => {
             let endpoint = UdpTransport::builder()

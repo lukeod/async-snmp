@@ -1,15 +1,17 @@
-//! SNMPv3 Client Example
+//! Use an SNMPv3 client
 //!
-//! This example demonstrates SNMPv3 operations with authentication and privacy:
-//! - authPriv security level (SHA-1 authentication + AES-128 encryption)
-//! - Various security levels (noAuthNoPriv, authNoPriv, authPriv)
-//! - Master key caching for polling many engines
+//! The client performs SNMPv3 operations at the noAuthNoPriv, authNoPriv, and
+//! authPriv security levels. It also caches master keys when polling multiple
+//! authoritative engines.
 //!
-//! Run with: cargo run --example snmpv3_client
+//! Run `cargo run --example snmpv3_client`.
 //!
-//! Uses the async-snmp test container which has pre-configured users:
-//!   docker build -t async-snmp-test:latest tests/containers/snmpd/
-//!   docker run -d -p 11161:161/udp async-snmp-test:latest
+//! To start the async-snmp test container with its preconfigured users, run:
+//!
+//! ```text
+//! docker build -t async-snmp-test:latest tests/containers/snmpd/
+//! docker run -d -p 11161:161/udp async-snmp-test:latest
+//! ```
 
 use async_snmp::{
     Auth, AuthProtocol, Client, MasterKeys, PrivProtocol, ResponseShapePolicy, Retry, oid,
@@ -18,7 +20,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for debug output
+    // Initialize tracing for diagnostic output.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -29,12 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = ("127.0.0.1", 11161);
 
     // =========================================================================
-    // Example 1: legacy-interoperable authPriv (SHA-1 + AES-128)
+    // Example 1: Legacy-compatible authPriv with SHA-1 and AES-128
     // =========================================================================
     println!("--- SNMPv3 authPriv (SHA-1 + AES-128) ---\n");
 
-    // Build authentication using the USM configuration API
-    // Uses container user: privaes128_user (SHA + AES-128)
+    // Configure the container's privaes128_user user with SHA-1 and AES-128.
     let auth = async_snmp::UsmConfig::new("privaes128_user").auth_priv(
         AuthProtocol::Sha1,
         "authpass123",
@@ -54,16 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.peer_addr()
     );
 
-    // Perform a GET request
+    // Retrieve sysDescr.0.
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
-    println!("sysDescr: {:?}\n", result.varbinds[0].value);
+    println!(
+        "sysDescr: {:?}\n",
+        result
+            .single()
+            .expect("strict response policy returns a singleton")
+            .value
+    );
 
     // =========================================================================
-    // Example 2: authNoPriv (Authentication only, no encryption)
+    // Example 2: authNoPriv with authentication and no privacy
     // =========================================================================
     println!("--- SNMPv3 authNoPriv (SHA-256 only) ---\n");
 
-    // Uses container user: authsha256_user (SHA-256 auth, no privacy)
+    // Configure the container's authsha256_user user with SHA-256.
     let auth_only =
         async_snmp::UsmConfig::new("authsha256_user").auth(AuthProtocol::Sha256, "authpass123")?;
     // auth() selects authNoPriv.
@@ -77,17 +84,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("UDP authNoPriv client configured; the GET below tests reachability");
 
     match client_auth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
-        Ok(result) => println!("sysName: {:?}\n", result.varbinds[0].value),
+        Ok(result) => println!(
+            "sysName: {:?}\n",
+            result
+                .single()
+                .expect("strict response policy returns a singleton")
+                .value
+        ),
         Err(e) => println!("Error: {e}\n"),
     }
 
     // =========================================================================
-    // Example 3: noAuthNoPriv (No security - use with caution!)
+    // Example 3: noAuthNoPriv without authentication or privacy
     // =========================================================================
     println!("--- SNMPv3 noAuthNoPriv ---\n");
 
-    // Uses container user: noauth_user (no auth, no privacy)
-    // Just specify username, no auth or privacy
+    // Specify only the container's noauth_user username.
     let no_auth = Auth::usm("noauth_user");
 
     let client_noauth = Client::builder(target, no_auth)
@@ -99,16 +111,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("UDP noAuthNoPriv client configured; the GET below tests reachability");
 
     match client_noauth.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-        Ok(result) => println!("sysUpTime: {:?}\n", result.varbinds[0].value),
+        Ok(result) => println!(
+            "sysUpTime: {:?}\n",
+            result
+                .single()
+                .expect("strict response policy returns a singleton")
+                .value
+        ),
         Err(e) => println!("Error: {e}\n"),
     }
 
     // =========================================================================
     // Example 4: Master key caching for polling many engines
     // =========================================================================
-    println!("--- Master Key Caching ---\n");
+    println!("--- Master key caching ---\n");
 
-    // For polling many devices with the same credentials, pre-compute master
+    // When polling many devices with the same credentials, precompute master
     // keys. This avoids repeating password-to-key derivation; only the much
     // cheaper per-engine localization remains for each target.
 
@@ -118,8 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Master keys derived once (expensive operation)");
 
-    // Create multiple clients using the cached master keys
-    // These TEST-NET-1 addresses are for configuration demonstration only.
+    // Create clients that use the cached master keys. These TEST-NET-1
+    // addresses demonstrate configuration only.
     // UDP `connect()` resolves/binds/configures a peer; it does not probe reachability.
     let targets = [("192.0.2.1", 161), ("192.0.2.2", 161), ("192.0.2.3", 161)];
 
@@ -129,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let auth =
             async_snmp::UsmConfig::new("privaes192_user").with_master_keys(master_keys.clone())?;
 
-        // Each client reuses the master keys; only localization is performed
+        // Each client reuses the master keys and performs only localization.
         match Client::builder(*target_addr, auth)
             .request_timeout(Duration::from_secs(2))
             .retry(Retry::fixed(1, Duration::ZERO).expect("valid retry count"))
@@ -141,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Configured UDP client for {} (using cached master keys)",
                     client.peer_addr()
                 );
-                // In a real scenario, you would poll OIDs here
+                // A polling application can issue requests through this client.
                 drop(client);
             }
             Err(e) => {
@@ -158,20 +176,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 5: Different authentication and privacy protocols
     // =========================================================================
-    println!("\n--- Protocol Options ---\n");
+    println!("\n--- Protocol options ---\n");
 
-    // Available authentication protocols:
-    // - AuthProtocol::Md5      (legacy, not recommended)
+    // Supported authentication protocols:
+    // - AuthProtocol::Md5      (legacy)
     // - AuthProtocol::Sha1     (legacy)
     // - AuthProtocol::Sha224
-    // - AuthProtocol::Sha256   (recommended)
+    // - AuthProtocol::Sha256
     // - AuthProtocol::Sha384
-    // - AuthProtocol::Sha512   (strongest)
+    // - AuthProtocol::Sha512
 
-    // Available privacy protocols:
-    // - PrivProtocol::Des      (legacy, not recommended)
-    // - PrivProtocol::Des3     (legacy 3DES, not recommended)
-    // - PrivProtocol::Aes128   (recommended; RFC 3826)
+    // Supported privacy protocols:
+    // - PrivProtocol::Des      (legacy)
+    // - PrivProtocol::Des3     (legacy 3DES)
+    // - PrivProtocol::Aes128   (RFC 3826)
     // - PrivProtocol::Aes192Blumenthal / Aes192Reeder (draft/vendor extensions)
     // - PrivProtocol::Aes256Blumenthal / Aes256Reeder (draft/vendor extensions)
 
@@ -186,15 +204,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Auth protocol: {:?}", AuthProtocol::Sha512);
     println!("Priv protocol: {:?}", PrivProtocol::Aes256Blumenthal);
 
-    // Build but don't connect (just demonstrate configuration)
+    // Create a builder without connecting.
     let _builder = Client::builder(target, strong_auth).request_timeout(Duration::from_secs(10));
 
     // =========================================================================
     // Example 6: Context name for VACM
     // =========================================================================
-    println!("\n--- Context Name (VACM) ---\n");
+    println!("\n--- Context name (VACM) ---\n");
 
-    // Some agents use context names for View-based Access Control (VACM)
+    // Some agents use context names for view-based access control (VACM).
     let auth_with_context = async_snmp::UsmConfig::new("snmpuser")
         .auth_priv(
             AuthProtocol::Sha256,

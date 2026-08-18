@@ -90,7 +90,7 @@ impl Oid {
     ///
     /// # Validation
     ///
-    /// This method parses the string format but does **not** validate arc constraints
+    /// Parses the string format but does **not** validate arc constraints
     /// per X.690 Section 8.19.4. Invalid OIDs like `"3.0"` (arc1 must be 0, 1, or 2)
     /// or `"0.40"` (arc2 must be ≤39 when arc1 < 2) will parse successfully.
     ///
@@ -136,13 +136,13 @@ impl Oid {
         Ok(Self { arcs })
     }
 
-    /// Get the arc values.
+    /// Returns the arc values.
     #[must_use]
     pub fn arcs(&self) -> &[u32] {
         &self.arcs
     }
 
-    /// Get the number of arcs.
+    /// Returns the number of arcs.
     #[must_use]
     pub fn len(&self) -> usize {
         self.arcs.len()
@@ -185,7 +185,7 @@ impl Oid {
         self.arcs.len() >= other.arcs.len() && self.arcs[..other.arcs.len()] == other.arcs[..]
     }
 
-    /// Get the parent OID (all arcs except the last).
+    /// Returns the parent OID, which contains all arcs except the last.
     ///
     /// Returns `None` if the OID is empty.
     ///
@@ -280,7 +280,7 @@ impl Oid {
         }
     }
 
-    /// Get the last N arcs as a slice (for multi-level table indexes).
+    /// Returns the last `n` arcs as a slice for use as a multi-level table index.
     ///
     /// Returns `None` if `n` exceeds the OID length.
     ///
@@ -298,7 +298,7 @@ impl Oid {
     /// let index = oid.suffix(5).unwrap();
     /// assert_eq!(index, &[1, 192, 168, 1, 100]);
     ///
-    /// // Get just the last arc
+    /// // Get the last arc
     /// assert_eq!(oid.suffix(1), Some(&[100][..]));
     ///
     /// // suffix(0) returns empty slice

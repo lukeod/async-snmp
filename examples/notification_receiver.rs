@@ -1,27 +1,24 @@
-//! SNMP Notification Receiver Example
+//! Receive SNMP notifications
 //!
-//! This example demonstrates receiving SNMP notifications:
-//! - TrapV1: SNMPv1 format traps
-//! - TrapV2c/TrapV3: SNMPv2c and SNMPv3 traps
-//! - InformRequest: Confirmed notifications (response attempted before delivery)
+//! This example receives SNMPv1, SNMPv2c, and SNMPv3 traps and confirmed
+//! Inform requests. The receiver attempts an Inform response before it delivers
+//! the notification to the application.
 //!
-//! V1/v2c communities and content are cleartext. Without a configured
+//! SNMPv1 and SNMPv2c communities and content use cleartext. Without a configured
 //! community allowlist they are unverified; an allowlist adds no message
-//! integrity. V3 username, context, and content are authenticated only at
+//! integrity. SNMPv3 usernames, contexts, and content are authenticated only at
 //! authNoPriv/authPriv and are spoofable at noAuthNoPriv.
 //!
-//! Run with: cargo run --example notification_receiver
+//! Run `cargo run --example notification_receiver`.
 //!
-//! Test with net-snmp:
-//!   # v2c trap
-//!   snmptrap -v 2c -c public localhost:1162 '' SNMPv2-MIB::coldStart
+//! To send test notifications with net-snmp, run:
 //!
-//!   # v2c inform
-//!   snmpinform -v 2c -c public localhost:1162 '' SNMPv2-MIB::coldStart
-//!
-//!   # v3 trap
-//!   snmptrap -v 3 -u trapuser -l authPriv -a SHA -A authpass123 \
-//!       -x AES -X privpass123 localhost:1163 '' SNMPv2-MIB::warmStart
+//! ```text
+//! snmptrap -v 2c -c public localhost:1162 '' SNMPv2-MIB::coldStart
+//! snmpinform -v 2c -c public localhost:1162 '' SNMPv2-MIB::coldStart
+//! snmptrap -v 3 -u trapuser -l authPriv -a SHA -A authpass123 \
+//!     -x AES -X privpass123 localhost:1163 '' SNMPv2-MIB::warmStart
+//! ```
 
 use async_snmp::notification::{
     Notification, NotificationAcceptance, NotificationEnvelope, NotificationReceiver, oids,
@@ -31,7 +28,7 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+    // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -40,38 +37,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // =========================================================================
-    // Example 1: Simple v2c receiver
+    // Example 1: Simple SNMPv2c receiver
     // =========================================================================
-    println!("--- Simple Notification Receiver ---\n");
+    println!("--- Simple notification receiver ---\n");
 
-    // Bind to port 1162 (unprivileged alternative to 162)
-    // Use port 162 in production (requires root/admin)
+    // Bind to unprivileged port 1162 instead of the standard port 162.
     let receiver = NotificationReceiver::bind("0.0.0.0:1162").await?;
 
     println!("Listening for notifications on {}", receiver.local_addr());
-    println!("This receiver handles v1 and v2c only; v3 notifications are rejected");
+    println!("This receiver handles SNMPv1 and SNMPv2c only; SNMPv3 notifications are rejected");
     println!(
-        "(use NotificationReceiver::builder() with authoritative_engine and usm_user to accept v3)\n"
+        "(use NotificationReceiver::builder() with authoritative_engine and usm_user to accept SNMPv3)\n"
     );
 
     // =========================================================================
-    // Example 2: Receiver with v3 authentication
+    // Example 2: Receiver with SNMPv3 authentication
     // =========================================================================
-    println!("--- V3 Authenticated Receiver ---\n");
+    println!("--- Authenticated SNMPv3 receiver ---\n");
 
-    // A receiver with USM users is authoritative for V3 Inform exchanges and
-    // needs stable engine ID/boots state. This no-op callback is suitable only
-    // for the example; deployed applications must store both fields durably
-    // and call AuthoritativeEngine::restart on later process starts. Storage
-    // errors must implement Error + Send + Sync and remain downcastable through
-    // AuthoritativeEnginePersistenceError.
+    // A receiver with USM users is authoritative for SNMPv3 Inform exchanges
+    // and requires stable engine ID and engine boots state. This example uses a
+    // no-op persistence callback. A deployed application must store both fields
+    // durably and call AuthoritativeEngine::restart after later process starts.
+    // Storage errors must implement Error + Send + Sync and remain downcastable
+    // through AuthoritativeEnginePersistenceError.
     let engine = AuthoritativeEngine::install(b"example-receiver-engine".to_vec(), |_| {
         Ok::<(), std::convert::Infallible>(())
     })?;
     let authenticated_receiver = NotificationReceiver::builder()
         .bind("0.0.0.0:1163")
         .authoritative_engine(engine)
-        // Configure authentication/privacy capabilities. A keyed user also
+        // Configure authentication and privacy capabilities. A keyed user also
         // supports noAuthNoPriv, so the policy below enforces the minimum.
         .usm_user("trapuser", |u| {
             u.auth_priv(
@@ -81,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b"privpass123",
             )
         })?
-        // Can add multiple users
+        // Add a second USM user.
         .usm_user("readonly", |u| {
             u.auth(AuthProtocol::Sha256, b"readonlypass")
         })?
@@ -103,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!(
-        "V3 authenticated receiver on {}",
+        "SNMPv3 authenticated receiver on {}",
         authenticated_receiver.local_addr()
     );
     println!("Configured users: trapuser (authPriv), readonly (authNoPriv)\n");
@@ -111,13 +107,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 3: Receiver with community filtering
     // =========================================================================
-    println!("--- Community-Filtered Receiver ---\n");
+    println!("--- Community-filtered receiver ---\n");
 
-    // Communities are cleartext and provide no message integrity. Filtering is
-    // opt-in. Once one or more communities are
-    // configured, v1/v2c notifications whose community matches none of them
-    // are dropped (a dropped inform is not acknowledged). Comparison is
-    // constant-time. This does not affect v3, which is gated by USM.
+    // Communities use cleartext and provide no message integrity. Filtering is
+    // opt-in. After you configure one or more communities, the receiver drops
+    // SNMPv1 and SNMPv2c notifications that do not match them and does not
+    // acknowledge dropped Inform requests. Comparison is constant-time. The
+    // filter does not affect SNMPv3, which USM controls.
     let filtered_receiver = NotificationReceiver::builder()
         .bind("0.0.0.0:1164")
         .communities(["public", "monitor"])
@@ -132,24 +128,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 4: Main receive loop
     // =========================================================================
-    println!("--- Waiting for Notifications ---\n");
+    println!("--- Waiting for notifications ---\n");
     println!("Send test traps with:");
     println!("  snmptrap -v 2c -c public localhost:1162 '' SNMPv2-MIB::coldStart");
     println!("  snmpinform -v 2c -c public localhost:1162 '' SNMPv2-MIB::warmStart");
     println!("  snmptrap -v 3 -u trapuser -l authPriv -a SHA -A authpass123 \\");
     println!("      -x AES -X privpass123 localhost:1163 '' SNMPv2-MIB::warmStart\n");
 
-    // Each configured receiver has its own socket, so run one receive loop per
-    // port. A production application could instead combine community filters,
-    // authoritative state, and USM users on one receiver.
+    // Each receiver has its own socket, so run one receive loop per port. An
+    // application can instead combine community filters, authoritative state,
+    // and USM users on one receiver.
     let handles = [
-        spawn_receiver("v1/v2c", receiver),
-        spawn_receiver("v3", authenticated_receiver),
+        spawn_receiver("SNMPv1/SNMPv2c", receiver),
+        spawn_receiver("SNMPv3", authenticated_receiver),
         spawn_receiver("filtered", filtered_receiver),
     ];
 
-    // In a real application, you would handle shutdown gracefully
-    // For this demo, we'll wait a bit then exit
+    // Wait 30 seconds, then stop each receive task.
     println!("Receiver running... (waiting 30 seconds for demo)\n");
 
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -182,13 +177,11 @@ fn spawn_receiver(
     })
 }
 
-/// Handle a received notification.
-///
-/// This demonstrates extracting useful information from different notification types.
+/// Prints common and version-specific fields from a received notification.
 fn handle_notification(notification: &Notification, source: SocketAddr) {
     println!("=== Notification from {source} ===");
 
-    // Common fields available on all notification types
+    // Print fields that all notification types provide.
     println!("  Version: {:?}", notification.version());
     println!("  Confirmed: {}", notification.is_confirmed());
     let trap_oid = match notification.trap_oid() {
@@ -202,7 +195,7 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
     println!("  Trap OID: {trap_oid}");
     println!("  Uptime: {} centiseconds", notification.uptime());
 
-    // Identify well-known trap types
+    // Identify selected standard notification types.
     let trap_name = if trap_oid == oids::cold_start() {
         "coldStart"
     } else if trap_oid == oids::warm_start() {
@@ -216,9 +209,9 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
     } else {
         "enterprise-specific"
     };
-    println!("  Trap Type: {trap_name}");
+    println!("  Trap type: {trap_name}");
 
-    // Version-specific handling
+    // Print fields that depend on the SNMP version.
     match notification {
         Notification::TrapV1 {
             community, trap, ..
@@ -229,9 +222,9 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
                 String::from_utf8_lossy(community.as_bytes())
             );
             println!("  Enterprise: {}", trap.enterprise());
-            println!("  Generic Trap: {:?}", trap.generic_trap());
-            println!("  Specific Trap: {}", trap.specific_trap());
-            println!("  Agent Address: {:?}", trap.agent_addr());
+            println!("  Generic trap: {:?}", trap.generic_trap());
+            println!("  Specific trap: {}", trap.specific_trap());
+            println!("  Agent address: {:?}", trap.agent_addr());
         }
 
         Notification::TrapV2c {
@@ -256,10 +249,10 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             ..
         } => {
             println!("  Type: SNMPv3 Trap");
-            println!("  Security Level: {security_level:?}");
+            println!("  Security level: {security_level:?}");
             println!("  Username: {username:?}");
-            println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
-            println!("  Context Name: {}", String::from_utf8_lossy(context_name));
+            println!("  Context engine ID: {:?}", context_engine_id.as_ref());
+            println!("  Context name: {}", String::from_utf8_lossy(context_name));
             println!("  Request ID: {request_id}");
         }
 
@@ -285,18 +278,18 @@ fn handle_notification(notification: &Notification, source: SocketAddr) {
             ..
         } => {
             println!("  Type: SNMPv3 Inform (response attempted before delivery)");
-            println!("  Security Level: {security_level:?}");
+            println!("  Security level: {security_level:?}");
             println!("  Username: {username:?}");
-            println!("  Context Engine ID: {:?}", context_engine_id.as_ref());
-            println!("  Context Name: {}", String::from_utf8_lossy(context_name));
+            println!("  Context engine ID: {:?}", context_engine_id.as_ref());
+            println!("  Context name: {}", String::from_utf8_lossy(context_name));
             println!("  Request ID: {request_id}");
         }
     }
 
-    // Print varbinds
+    // Print the notification's variable bindings.
     let varbinds = notification.varbinds();
     if !varbinds.is_empty() {
-        println!("  Varbinds ({}):", varbinds.len());
+        println!("  Variable bindings ({}):", varbinds.len());
         for vb in varbinds {
             println!("    {}: {:?}", vb.oid, vb.value);
         }

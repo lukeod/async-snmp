@@ -322,7 +322,7 @@ impl UsmSecurityParams {
         })
     }
 
-    /// Get the position of `auth_params` within the encoded message.
+    /// Returns the position of `auth_params` within the encoded message.
     ///
     /// This is needed for HMAC computation: we need to know where to
     /// replace the placeholder zeros with the actual HMAC.

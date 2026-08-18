@@ -17,13 +17,13 @@ pub struct EncodeBuf {
 }
 
 impl EncodeBuf {
-    /// Create a new encode buffer with default capacity.
+    /// Create an encoding buffer with the default capacity.
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(512)
     }
 
-    /// Create a new encode buffer with specified capacity.
+    /// Create an encoding buffer with the specified capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -61,7 +61,7 @@ impl EncodeBuf {
         self.buf.push(tag);
     }
 
-    /// Get the current length of encoded data.
+    /// Returns the current length of the encoded data.
     #[must_use]
     pub fn len(&self) -> usize {
         self.buf.len()

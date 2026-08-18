@@ -17,7 +17,7 @@ pub struct VarBind {
 }
 
 impl VarBind {
-    /// Create a new `VarBind`.
+    /// Create a variable binding from an OID and value.
     pub fn new(oid: Oid, value: Value) -> Self {
         Self { oid, value }
     }

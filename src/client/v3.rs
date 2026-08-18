@@ -1,7 +1,7 @@
-//! SNMPv3-specific client functionality.
+//! SNMPv3 client processing.
 //!
-//! This module contains V3 security configuration, key derivation, engine discovery,
-//! and V3 message building/handling.
+//! Implements engine discovery, message construction, USM processing, protocol
+//! correction, and response validation for SNMPv3 clients.
 
 use crate::ber::EncodeBuf;
 use crate::error::internal::{AuthErrorKind, CryptoErrorKind};
@@ -27,27 +27,21 @@ use std::time::Instant;
 use tracing::{Span, instrument};
 
 use super::{Client, ClientEngine, DecodedResponse, ResponseMetadata};
-use super::{DiscoveryFlight, DiscoveryOutcome};
+use super::{DiscoveredState, DiscoveryCoordinator, DiscoveryFlight, DiscoveryOutcome};
 
-struct DiscoveryLeaderGuard<'a> {
-    slot: &'a std::sync::Mutex<Option<Arc<DiscoveryFlight>>>,
+struct DiscoveryLeaderGuard {
+    coordinator: Arc<DiscoveryCoordinator>,
+    target: SocketAddr,
     flight: Arc<DiscoveryFlight>,
     completed: bool,
 }
 
-impl Drop for DiscoveryLeaderGuard<'_> {
+impl Drop for DiscoveryLeaderGuard {
     fn drop(&mut self) {
         if self.completed {
             return;
         }
-        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
-        if slot
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
-        {
-            *slot = None;
-        }
-        drop(slot);
+        self.coordinator.remove(self.target, &self.flight);
         self.flight.complete.notify_waiters();
     }
 }
@@ -146,28 +140,20 @@ impl<T: Transport> Client<T> {
                 }
             }
 
-            let (flight, leader) = {
-                let mut slot =
-                    self.inner.discovery_flight.lock().map_err(|_| {
-                        Error::Config("discovery flight lock poisoned".into()).boxed()
-                    })?;
-                match slot.as_ref() {
-                    Some(flight) => (Arc::clone(flight), false),
-                    None => {
-                        let flight = Arc::new(DiscoveryFlight {
-                            outcome: std::sync::Mutex::new(None),
-                            complete: tokio::sync::Notify::new(),
-                            retries: AtomicU32::new(0),
-                        });
-                        *slot = Some(Arc::clone(&flight));
-                        (flight, true)
-                    }
-                }
-            };
+            if let Some(cache) = &self.inner.engine_cache
+                && let Some(cached_state) = cache.get(&self.peer_addr())
+            {
+                tracing::debug!(target: "async_snmp::client", "using cached engine state");
+                self.install_discovered_state(cached_state, &ResponseMetadata::default())?;
+                return Ok(ResponseMetadata::default());
+            }
+
+            let (flight, leader) = self.inner.discovery_coordinator.acquire(self.peer_addr());
 
             if leader {
                 let mut guard = DiscoveryLeaderGuard {
-                    slot: &self.inner.discovery_flight,
+                    coordinator: Arc::clone(&self.inner.discovery_coordinator),
+                    target: self.peer_addr(),
                     flight: Arc::clone(&flight),
                     completed: false,
                 };
@@ -187,7 +173,7 @@ impl<T: Transport> Client<T> {
                         () = tokio::time::sleep_until(deadline) => timeout_result(),
                         result = async {
                             let _rediscovery_guard = self.inner.discovery_lock.lock().await;
-                            self.discover_engine_locked(false, &flight.retries).await
+                            self.discover_engine_state_locked(&flight.retries).await
                         } => result,
                     }
                 };
@@ -196,22 +182,18 @@ impl<T: Transport> Client<T> {
                     .outcome
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(outcome);
-                {
-                    let mut slot = self
-                        .inner
-                        .discovery_flight
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if slot
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &flight))
-                    {
-                        *slot = None;
-                    }
-                }
+                let participant_result = match result {
+                    Ok(discovered) => self
+                        .install_discovered_state(discovered.state, &discovered.metadata)
+                        .map(|()| discovered.metadata),
+                    Err(error) => Err(error),
+                };
+                self.inner
+                    .discovery_coordinator
+                    .remove(self.peer_addr(), &flight);
                 guard.completed = true;
                 flight.complete.notify_waiters();
-                return result;
+                return participant_result;
             }
 
             let notified = flight.complete.notified();
@@ -221,13 +203,15 @@ impl<T: Transport> Client<T> {
                 .map_err(|_| Error::Config("discovery outcome lock poisoned".into()).boxed())?
                 .clone()
             {
-                return outcome.into_result();
+                let discovered = outcome.into_result()?;
+                self.install_discovered_state(discovered.state, &discovered.metadata)?;
+                return Ok(discovered.metadata);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(Error::Timeout {
                     target: self.peer_addr(),
                     elapsed: timeout,
-                    retries: flight.retries.load(Ordering::Relaxed),
+                    retries: 0,
                 }
                 .boxed());
             }
@@ -236,7 +220,7 @@ impl<T: Transport> Client<T> {
                 () = tokio::time::sleep_until(deadline) => return Err(Error::Timeout {
                     target: self.peer_addr(),
                     elapsed: timeout,
-                    retries: flight.retries.load(Ordering::Relaxed),
+                    retries: 0,
                 }.boxed()),
                 () = notified => {},
             }
@@ -247,7 +231,9 @@ impl<T: Transport> Client<T> {
                 .map_err(|_| Error::Config("discovery outcome lock poisoned".into()).boxed())?
                 .clone()
             {
-                return outcome.into_result();
+                let discovered = outcome.into_result()?;
+                self.install_discovered_state(discovered.state, &discovered.metadata)?;
+                return Ok(discovered.metadata);
             }
             // A cancelled leader clears the shared slot without publishing an
             // outcome. Re-enter so one surviving waiter takes over under the
@@ -291,6 +277,91 @@ impl<T: Transport> Client<T> {
         } else {
             self.inner.config.retry.retries()
         }
+    }
+
+    /// Resolve the canonical ordinary-discovery state while the client-local
+    /// discovery lock is held. Key derivation and live installation happen for
+    /// each participant after this result has been published to the flight.
+    async fn discover_engine_state_locked(
+        &self,
+        retries_performed: &AtomicU32,
+    ) -> Result<DiscoveredState> {
+        if let Some(state) = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?
+            .as_ref()
+            .map(|engine| engine.state.clone())
+        {
+            return Ok(DiscoveredState {
+                state,
+                metadata: ResponseMetadata::default(),
+            });
+        }
+
+        if let Some(cache) = &self.inner.engine_cache
+            && let Some(state) = cache.get(&self.peer_addr())
+        {
+            return Ok(DiscoveredState {
+                state,
+                metadata: ResponseMetadata::default(),
+            });
+        }
+
+        let discovery = self.discover_engine_response(retries_performed).await?;
+        let state = if let Some(cache) = &self.inner.engine_cache {
+            cache.insert_state(self.peer_addr(), discovery.engine_state)
+        } else {
+            discovery.engine_state
+        };
+        tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(state.engine_id()), snmp.msg_max_size = state.msg_max_size().as_usize() }, "discovered engine identity");
+        Ok(DiscoveredState {
+            state,
+            metadata: discovery.metadata,
+        })
+    }
+
+    fn install_discovered_state(
+        &self,
+        state: EngineState,
+        metadata: &ResponseMetadata,
+    ) -> Result<()> {
+        let mut engine = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())
+            .map_err(|error| error.with_prior_response_metadata(metadata))?;
+
+        // Preserve a generation established while this participant was
+        // waiting on the shared discovery outcome. In particular, explicit
+        // rediscovery wins if it acquired the live-engine lock first. Keep the
+        // live-then-cache lock order used by authenticated publication and
+        // explicit replacement.
+        if engine.is_some() {
+            return Ok(());
+        }
+
+        let install_result: Result<ClientEngine> = (|| {
+            let state = if let Some(cache) = &self.inner.engine_cache {
+                cache.insert_state(self.peer_addr(), state)
+            } else {
+                state
+            };
+            let security = self
+                .inner
+                .config
+                .usm_config()
+                .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+            let derived_keys = security
+                .derive_keys_inner(state.engine_id())
+                .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
+            Ok(ClientEngine::new(state, derived_keys))
+        })();
+        *engine =
+            Some(install_result.map_err(|error| error.with_prior_response_metadata(metadata))?);
+        Ok(())
     }
 
     /// Discover and replace the established authoritative engine.
@@ -344,55 +415,51 @@ impl<T: Transport> Client<T> {
             () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
             result = async {
                 let _guard = self.inner.discovery_lock.lock().await;
-                self.discover_engine_locked(true, &retries).await
+                self.rediscover_engine_locked(&retries).await
             } => result,
         }
     }
 
-    /// Load or discover an engine while `discovery_lock` is held.
-    async fn discover_engine_locked(
+    /// Perform explicit replacement while `discovery_lock` is held.
+    async fn rediscover_engine_locked(
         &self,
-        replace_cached_identity: bool,
         retries_performed: &AtomicU32,
     ) -> Result<ResponseMetadata> {
-        // Re-check after acquiring the lock: a previous waiter may have
-        // completed ordinary discovery while we were blocked. Explicit
-        // rediscovery always reaches the peer even with a live identity.
-        if !replace_cached_identity {
-            let engine = self
+        let discovery = self.discover_engine_response(retries_performed).await?;
+        let engine_state = discovery.engine_state;
+        let metadata = discovery.metadata;
+        tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(engine_state.engine_id()), snmp.msg_max_size = engine_state.msg_max_size().as_usize() }, "discovered engine identity");
+
+        let install_result: Result<()> = (|| {
+            let security = self
+                .inner
+                .config
+                .usm_config()
+                .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
+            let derived_keys = security
+                .derive_keys_inner(engine_state.engine_id())
+                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+            let mut engine = self
                 .inner
                 .engine
-                .read()
+                .write()
                 .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-            if engine.is_some() {
-                return Ok(ResponseMetadata::default());
-            }
-        }
+            let engine_state = if let Some(cache) = &self.inner.engine_cache {
+                cache.replace_target(self.peer_addr(), engine_state)
+            } else {
+                engine_state
+            };
+            *engine = Some(ClientEngine::new(engine_state, derived_keys));
+            Ok(())
+        })();
+        install_result.map_err(|error| error.with_prior_response_metadata(&metadata))?;
+        Ok(metadata)
+    }
 
-        // Explicit rediscovery must reach the peer even if another client
-        // refreshes the previous target mapping while discovery is in progress.
-        if !replace_cached_identity && let Some(cache) = &self.inner.engine_cache {
-            let cached_state = cache.get(&self.peer_addr());
-            if let Some(cached_state) = cached_state {
-                tracing::debug!(target: "async_snmp::client", "using cached engine state");
-                let security =
-                    self.inner.config.usm_config().ok_or_else(|| {
-                        Error::Config("V3 security not configured".into()).boxed()
-                    })?;
-                let derived_keys = security
-                    .derive_keys_inner(cached_state.engine_id())
-                    .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-                let mut engine = self
-                    .inner
-                    .engine
-                    .write()
-                    .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-                *engine = Some(ClientEngine::new(cached_state, derived_keys));
-                return Ok(ResponseMetadata::default());
-            }
-        }
-
-        // Perform discovery with retry (same policy as normal requests)
+    async fn discover_engine_response(
+        &self,
+        retries_performed: &AtomicU32,
+    ) -> Result<DiscoveryResponse> {
         tracing::debug!(target: "async_snmp::client", "performing engine discovery");
         let start = std::time::Instant::now();
         let exchange_deadline = self.start_exchange_deadline()?;
@@ -501,84 +568,14 @@ impl<T: Transport> Client<T> {
             }
         }
 
-        let discovery = discovery_opt.ok_or_else(|| {
+        discovery_opt.ok_or_else(|| {
             Error::Timeout {
                 target: self.peer_addr(),
                 elapsed: start.elapsed(),
                 retries: retries_performed.load(Ordering::Relaxed),
             }
             .boxed()
-        })?;
-        let engine_state = discovery.engine_state;
-        let metadata = discovery.metadata;
-        tracing::debug!(target: "async_snmp::client", { snmp.engine_id = %hex::Bytes(engine_state.engine_id()), snmp.msg_max_size = engine_state.msg_max_size().as_usize() }, "discovered engine identity");
-
-        let install_result: Result<()> = (|| {
-            let security = self
-                .inner
-                .config
-                .usm_config()
-                .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
-
-            // Prepare replacement keys before changing either the live generation
-            // or its cache mapping. Ordinary discovery must first resolve any
-            // canonical state already installed by another client sharing the
-            // cache, then derive keys for that identity.
-            let replacement_keys = if replace_cached_identity {
-                Some(
-                    security
-                        .derive_keys_inner(engine_state.engine_id())
-                        .map_err(|e| Error::Config(e.to_string().into()).boxed())?,
-                )
-            } else {
-                None
-            };
-
-            if let Some(derived_keys) = replacement_keys {
-                // Lock the live generation before publishing its cache mapping.
-                // This matches the live-then-cache lock order used by authenticated
-                // timeliness updates and prevents clones from observing a new
-                // mapping alongside the old identity-localized keys. Reloading the
-                // cache state also adopts authenticated time already shared by another
-                // target for the newly discovered engine ID.
-                let mut engine = self
-                    .inner
-                    .engine
-                    .write()
-                    .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-                let engine_state = if let Some(cache) = &self.inner.engine_cache {
-                    cache.replace_target(self.peer_addr(), engine_state)
-                } else {
-                    engine_state
-                };
-                *engine = Some(ClientEngine::new(engine_state, derived_keys));
-                return Ok(());
-            }
-
-            // A concurrent client sharing this cache may already have installed a
-            // newer identity/time generation. Merge ordinary discovery without
-            // replacing an active target mapping, then derive keys for the
-            // canonical identity.
-            let engine_state = if let Some(cache) = &self.inner.engine_cache {
-                cache.insert_state(self.peer_addr(), engine_state)
-            } else {
-                engine_state
-            };
-            let derived_keys = security
-                .derive_keys_inner(engine_state.engine_id())
-                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-            let mut engine = self
-                .inner
-                .engine
-                .write()
-                .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
-            *engine = Some(ClientEngine::new(engine_state, derived_keys));
-            Ok(())
-        })();
-
-        install_result.map_err(|error| error.with_prior_response_metadata(&metadata))?;
-
-        Ok(metadata)
+        })
     }
 
     fn validate_discovery_response(
@@ -2124,6 +2121,240 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone)]
+    struct GatedDiscoveryTransport {
+        peer: SocketAddr,
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Transport for GatedDiscoveryTransport {
+        async fn send(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn request_with<T, F>(
+            &self,
+            _data: &[u8],
+            registration: RequestRegistration,
+            mut validate: F,
+        ) -> Result<T>
+        where
+            T: Send,
+            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.entered.notify_waiters();
+            self.release
+                .acquire()
+                .await
+                .expect("test release remains open")
+                .forget();
+            let mut response =
+                build_discovery_response(b"shared-engine", registration.request_id()).to_vec();
+            response.push(0xff);
+            match validate(Bytes::from(response), self.peer)? {
+                Candidate::Accept(response) => Ok(response),
+                Candidate::Reject => Err(Error::MalformedResponse { target: self.peer }.boxed()),
+            }
+        }
+
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+
+        fn is_reliable(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn independently_constructed_clients_share_cache_discovery() {
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
+        let cache = Arc::new(EngineCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let transport = GatedDiscoveryTransport {
+            peer: target,
+            calls: Arc::clone(&calls),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let first = Client::with_engine_cache(transport.clone(), config.clone(), cache.clone())
+            .expect("first client");
+        let second =
+            Client::with_engine_cache(transport, config, cache.clone()).expect("second client");
+
+        let leader_entered = entered.notified();
+        let leader = tokio::spawn(async move { first.ensure_engine_discovered().await });
+        leader_entered.await;
+        let follower = tokio::spawn(async move { second.ensure_engine_discovered().await });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        release.add_permits(1);
+
+        let leader_metadata = leader.await.unwrap().unwrap();
+        let follower_metadata = follower.await.unwrap().unwrap();
+        assert_eq!(leader_metadata, follower_metadata);
+        assert_eq!(
+            leader_metadata.decode_anomalies,
+            [crate::DecodeAnomaly::TrailingBytes {
+                original_length: 1,
+                canonical_length: 0,
+            }]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cache.get(&target).unwrap().engine_id().as_ref(),
+            b"shared-engine"
+        );
+        assert_eq!(cache.discovery_coordinator.flight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn waiter_deadline_does_not_cancel_shared_discovery_leader() {
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
+        let cache = Arc::new(EngineCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let transport = GatedDiscoveryTransport {
+            peer: target,
+            calls: Arc::clone(&calls),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let leader_config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("leader")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let waiter_config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("waiter")),
+            exchange_timeout: Some(Duration::from_millis(5)),
+            ..leader_config.clone()
+        };
+        let leader_client =
+            Client::with_engine_cache(transport.clone(), leader_config, cache.clone()).unwrap();
+        let waiter_client =
+            Client::with_engine_cache(transport, waiter_config, cache.clone()).unwrap();
+
+        let leader_entered = entered.notified();
+        let leader = tokio::spawn(async move { leader_client.ensure_engine_discovered().await });
+        leader_entered.await;
+        let waiter_error = waiter_client
+            .ensure_engine_discovered()
+            .await
+            .expect_err("waiter deadline must expire");
+        assert!(matches!(*waiter_error, Error::Timeout { retries: 0, .. }));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        release.add_permits(1);
+        assert!(leader.await.unwrap().is_ok());
+        assert!(cache.get(&target).is_some());
+        assert_eq!(cache.discovery_coordinator.flight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn different_resolved_peers_discover_concurrently() {
+        let first_target = SocketAddr::from(([127, 0, 0, 1], 161));
+        let second_target = SocketAddr::from(([127, 0, 0, 2], 161));
+        let cache = Arc::new(EngineCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let first = Client::with_engine_cache(
+            GatedDiscoveryTransport {
+                peer: first_target,
+                calls: Arc::clone(&calls),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            config.clone(),
+            cache.clone(),
+        )
+        .unwrap();
+        let second = Client::with_engine_cache(
+            GatedDiscoveryTransport {
+                peer: second_target,
+                calls: Arc::clone(&calls),
+                entered,
+                release: Arc::clone(&release),
+            },
+            config,
+            cache.clone(),
+        )
+        .unwrap();
+
+        let first = tokio::spawn(async move { first.ensure_engine_discovered().await });
+        let second = tokio::spawn(async move { second.ensure_engine_discovered().await });
+        while calls.load(Ordering::Relaxed) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cache.discovery_coordinator.flight_count(), 2);
+        release.add_permits(2);
+
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.discovery_coordinator.flight_count(), 0);
+    }
+
+    #[test]
+    fn ordinary_install_preserves_a_concurrently_established_generation() {
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            ..ClientConfig::default()
+        };
+        let client = Client::new(TestTransport::new(), config).unwrap();
+        let replacement = EngineState::from_discovery(
+            Bytes::from_static(b"replacement-engine"),
+            crate::MessageSize::new(65_507).unwrap(),
+        );
+        let replacement_keys = client
+            .inner
+            .config
+            .usm_config()
+            .unwrap()
+            .derive_keys_inner(replacement.engine_id())
+            .unwrap();
+        *client.inner.engine.write().unwrap() =
+            Some(ClientEngine::new(replacement.clone(), replacement_keys));
+
+        let stale_ordinary = EngineState::from_discovery(
+            Bytes::from_static(b"ordinary-engine"),
+            crate::MessageSize::new(65_507).unwrap(),
+        );
+        client
+            .install_discovered_state(stale_ordinary, &ResponseMetadata::default())
+            .unwrap();
+
+        let engine = client.inner.engine.read().unwrap();
+        assert_eq!(
+            engine.as_ref().unwrap().state.engine_id(),
+            replacement.engine_id()
+        );
+    }
+
     #[tokio::test]
     async fn test_discovery_retries_on_timeout() {
         let engine_id = b"test-engine";
@@ -2474,6 +2705,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_cross_client_leader_is_taken_over_on_waiter_transport() {
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 161));
+        let cache = Arc::new(EngineCache::new());
+        let leader_calls = Arc::new(AtomicUsize::new(0));
+        let waiter_calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let leader_transport = SingleFlightFailureTransport {
+            peer: target,
+            calls: Arc::clone(&leader_calls),
+            entered: Arc::clone(&entered),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let waiter_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let waiter_transport = SingleFlightFailureTransport {
+            peer: target,
+            calls: Arc::clone(&waiter_calls),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&waiter_release),
+        };
+        let config = ClientConfig {
+            auth: crate::Auth::Usm(UsmConfig::new("user")),
+            request_timeout: Duration::from_secs(1),
+            retry: crate::client::Retry::none(),
+            ..ClientConfig::default()
+        };
+        let leader_client =
+            Client::with_engine_cache(leader_transport, config.clone(), cache.clone()).unwrap();
+        let waiter_client =
+            Client::with_engine_cache(waiter_transport, config, cache.clone()).unwrap();
+
+        let leader_entered = entered.notified();
+        let leader = tokio::spawn(async move { leader_client.ensure_engine_discovered().await });
+        leader_entered.await;
+        let waiter = tokio::spawn(async move { waiter_client.ensure_engine_discovered().await });
+        tokio::task::yield_now().await;
+        leader.abort();
+
+        while waiter_calls.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        waiter_release.add_permits(1);
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert_eq!(leader_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(waiter_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.discovery_coordinator.flight_count(), 0);
+    }
+
+    #[tokio::test]
     async fn expired_discovery_deadline_does_not_start_transport_io() {
         let calls = Arc::new(AtomicUsize::new(0));
         let transport = SingleFlightFailureTransport {
@@ -2687,6 +2967,7 @@ mod tests {
 
     #[tokio::test]
     async fn structured_discovery_failure_is_preserved_for_waiters() {
+        let cache = Arc::new(EngineCache::new());
         let calls = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2702,18 +2983,14 @@ mod tests {
             retry: crate::client::Retry::none(),
             ..ClientConfig::default()
         };
-        let client = Client::new(transport, config).unwrap();
+        let leader_client =
+            Client::with_engine_cache(transport.clone(), config.clone(), cache.clone()).unwrap();
+        let waiter_client = Client::with_engine_cache(transport, config, cache.clone()).unwrap();
 
         let leader_entered = entered.notified();
-        let leader = tokio::spawn({
-            let client = client.clone();
-            async move { client.ensure_engine_discovered().await }
-        });
+        let leader = tokio::spawn(async move { leader_client.ensure_engine_discovered().await });
         leader_entered.await;
-        let waiter = tokio::spawn({
-            let client = client.clone();
-            async move { client.ensure_engine_discovered().await }
-        });
+        let waiter = tokio::spawn(async move { waiter_client.ensure_engine_discovered().await });
         tokio::task::yield_now().await;
         release.add_permits(1);
 
@@ -2726,6 +3003,7 @@ mod tests {
             assert!(error.response_metadata().is_some());
         }
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.discovery_coordinator.flight_count(), 0);
     }
 }
 

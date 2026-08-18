@@ -1,25 +1,29 @@
-//! Shared Transport for High-Throughput Polling
+//! Share a transport for high-throughput polling
 //!
-//! This example demonstrates using a shared UdpTransport for polling many
-//! targets efficiently. A single UDP socket is shared across all clients
-//! using protocol-aware correlation, reducing file descriptor usage.
+//! One `UdpTransport` polls many targets. All clients share one UDP socket and
+//! use protocol-aware response correlation, which reduces file descriptor use.
 //!
-//! Key concepts:
-//! - UdpTransport: A single UDP socket shared across multiple clients
-//! - `TargetClientBuilder::build_with(&transport)`: Resolves each target and
-//!   derives its `UdpHandle` from the preconstructed shared socket
-//! - Correlation: Community responses use request-id, version, and community;
-//!   V3 uses the outer msgID (the PDU request-id is distinct)
-//! - Source policy: Opt-in strict matching is available through
-//!   `TargetClientBuilder::strict_source()` or `UdpHandle::strict_source()`
-//! - Engine cache: Share V3 target identities and trusted engine time
-//! - Endpoint stats: counters are observable through the transport or clients
+//! The example covers these concepts:
 //!
-//! Run with: cargo run --example shared_transport
+//! - `UdpTransport` shares one UDP socket across clients.
+//! - `TargetClientBuilder::build_with` resolves each target and creates its
+//!   `UdpHandle` from the existing socket.
+//! - SNMPv1 and SNMPv2c responses correlate by request ID, version, and
+//!   community. SNMPv3 responses correlate by the outer message ID; the PDU
+//!   request ID is separate.
+//! - `TargetClientBuilder::strict_source` and `UdpHandle::strict_source` enable
+//!   strict source matching.
+//! - `EngineCache` shares SNMPv3 target identities and trusted engine time.
+//! - The transport and clients expose endpoint counters.
 //!
-//! Uses the async-snmp test container:
-//!   docker build -t async-snmp-test:latest tests/containers/snmpd/
-//!   docker run -d -p 11161:161/udp async-snmp-test:latest
+//! Run `cargo run --example shared_transport`.
+//!
+//! To start the async-snmp test container, run:
+//!
+//! ```text
+//! docker build -t async-snmp-test:latest tests/containers/snmpd/
+//! docker run -d -p 11161:161/udp async-snmp-test:latest
+//! ```
 
 use async_snmp::transport::UdpTransport;
 use async_snmp::{
@@ -32,7 +36,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+    // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -45,14 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 1: Basic shared transport setup
     // =========================================================================
-    println!("--- Basic Shared Transport ---\n");
+    println!("--- Basic shared transport ---\n");
 
     // Create a shared transport bound to an ephemeral port.
     let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
     println!("Shared transport bound to {}", shared.local_addr());
 
-    // Create clients for different targets - all use the same underlying socket.
+    // Create clients for different targets on the same socket.
     // This local agent has a stable response address, so require source matching;
     // exact community matching remains the default.
     let client1 = Client::builder(container_target, Auth::v2c("public"))
@@ -73,9 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 2: Concurrent polling with shared transport
     // =========================================================================
-    println!("--- Concurrent Polling ---\n");
+    println!("--- Concurrent polling ---\n");
 
-    // Poll multiple OIDs concurrently through the same shared transport
+    // Poll multiple OIDs concurrently through the shared transport.
     let shared = UdpTransport::bind("0.0.0.0:0").await?;
 
     let oids = [
@@ -110,7 +114,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some((oid, result)) = futures.next().await {
         match result {
-            Ok(response) => println!("  {oid}: {:?}", response.varbinds[0].value),
+            Ok(response) => println!(
+                "  {oid}: {:?}",
+                response
+                    .single()
+                    .expect("strict response policy returns a singleton")
+                    .value
+            ),
             Err(e) => println!("  {oid}: {e}"),
         }
     }
@@ -118,15 +128,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 3: SNMPv3 with shared engine cache and master keys
     // =========================================================================
-    println!("\n--- SNMPv3 with Shared Engine Cache ---\n");
+    println!("\n--- SNMPv3 with a shared engine cache ---\n");
 
-    // For SNMPv3, target-to-engine identity mappings are cached to avoid
+    // Cache SNMPv3 target-to-engine identity mappings to avoid
     // repeated discovery, while trusted time is shared by authoritative engine
     // ID. TTL expiry affects future cache lookups; a live client retains its
     // established identity until rediscover_engine() is called explicitly.
     let engine_cache = Arc::new(EngineCache::new());
 
-    // Pre-compute master keys once. Password-to-key derivation is substantially
+    // Precompute master keys once. Password-to-key derivation is substantially
     // more expensive than per-engine localization, and these keys can be reused
     // across clients with the same credentials.
     let master_keys = MasterKeys::new(AuthProtocol::Sha256, b"authpass123")?
@@ -137,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shared_v3 = UdpTransport::bind("0.0.0.0:0").await?;
 
-    // Poll multiple OIDs using V3 with shared resources
+    // Poll multiple OIDs over SNMPv3 with shared resources.
     let v3_oids = [
         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), // sysDescr
         oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), // sysUpTime
@@ -157,7 +167,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for oid in &v3_oids {
         match client.get(oid).await {
-            Ok(response) => println!("  {oid}: {:?}", response.varbinds[0].value),
+            Ok(response) => println!(
+                "  {oid}: {:?}",
+                response
+                    .single()
+                    .expect("strict response policy returns a singleton")
+                    .value
+            ),
             Err(e) => println!("  {oid}: {e}"),
         }
     }
@@ -165,9 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 4: Mixed reachable and unreachable targets
     // =========================================================================
-    println!("\n--- Mixed Target Polling ---\n");
+    println!("\n--- Mixed target polling ---\n");
 
-    // Demonstrates behavior when some targets are unreachable.
+    // Include unreachable targets to demonstrate timeout behavior.
     // Uses TEST-NET-1 (192.0.2.0/24) for unreachable addresses.
     let targets: Vec<(&str, u16)> = vec![
         container_target,   // Reachable
@@ -200,7 +216,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(response) => {
                 success += 1;
-                println!("  {}: {:?}", addr, response.varbinds[0].value);
+                println!(
+                    "  {}: {:?}",
+                    addr,
+                    response
+                        .single()
+                        .expect("strict response policy returns a singleton")
+                        .value
+                );
             }
             Err(e) => match *e {
                 async_snmp::Error::Timeout { .. } => {

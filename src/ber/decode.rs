@@ -25,7 +25,7 @@ pub struct Decoder<'a> {
 }
 
 impl Decoder<'static> {
-    /// Create a new decoder from bytes.
+    /// Create a decoder from bytes.
     pub fn new(data: Bytes) -> Self {
         Self {
             data,
@@ -131,7 +131,7 @@ impl<'a> Decoder<'a> {
         self.config
     }
 
-    /// Get the peer address, when decoding at a network boundary.
+    /// Returns the peer address when decoding at a network boundary.
     #[must_use]
     pub fn peer(&self) -> Option<SocketAddr> {
         self.peer
@@ -149,7 +149,7 @@ impl<'a> Decoder<'a> {
         Error::Decode(error).boxed()
     }
 
-    /// Get the current packet-relative offset.
+    /// Returns the current packet-relative offset.
     pub fn offset(&self) -> usize {
         self.base_offset.saturating_add(self.offset)
     }
@@ -158,7 +158,7 @@ impl<'a> Decoder<'a> {
         self.offset
     }
 
-    /// Get remaining bytes.
+    /// Returns the number of remaining bytes.
     pub fn remaining(&self) -> usize {
         self.data.len() - self.offset
     }
@@ -557,12 +557,12 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    /// Get the underlying bytes for the entire buffer.
+    /// Returns the underlying bytes for the entire buffer.
     pub fn as_bytes(&self) -> &Bytes {
         &self.data
     }
 
-    /// Get remaining data as a slice.
+    /// Returns the remaining data as a slice.
     pub fn remaining_slice(&self) -> &[u8] {
         &self.data[self.offset..]
     }

@@ -1,17 +1,17 @@
-//! Transport layer abstraction for SNMP communication.
+//! Transport abstractions for SNMP communication.
 //!
-//! This module provides the [`Transport`] trait and implementations:
+//! The module provides the [`Transport`] trait and these implementations:
 //!
 //! - [`UdpTransport`] + [`UdpHandle`] - UDP socket with per-target handles
 //! - [`TcpTransport`] - TCP stream with BER framing
 //! - [`BuiltinTransport`] - runtime selection between library-maintained transports
 //!
-//! # Choosing a Transport
+//! # Choosing a transport
 //!
 //! | Scenario | Approach |
 //! |----------|---------|
 //! | Single target or few targets | [`Client::builder().connect()`](crate::Client::builder) - each client gets its own socket |
-//! | Many UDP targets from one process | Pass a preconstructed [`UdpTransport`] socket owner to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) - each target gets a handle on one socket and recv loop |
+//! | Many UDP targets from one process | Pass a preconstructed [`UdpTransport`] socket owner to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) - each target gets a handle on one socket and receive loop |
 //! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::TargetClientBuilder::connect_tcp) |
 //! | Preconstruct or implement any client transport | Pass the [`Transport`] implementation to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) without a target |
 //! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) |
@@ -597,7 +597,7 @@ pub trait Transport: Send + Sync {
         UDP_RECEIVE_LIMITS
     }
 
-    /// Maximum exact encoded message size this transport will send.
+    /// Maximum exact encoded message size that this transport sends.
     ///
     /// This is independent of [`receive_limits`](Self::receive_limits), whose
     /// advertised value describes what the local endpoint can receive. The

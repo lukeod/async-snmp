@@ -1,7 +1,6 @@
 //! Retry configuration for SNMP requests.
 //!
-//! This module provides configurable retry strategies including fixed delay
-//! and exponential backoff with jitter.
+//! Provides fixed-delay and exponential-backoff retry strategies.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};

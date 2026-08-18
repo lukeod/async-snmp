@@ -9,7 +9,7 @@
 //! - `EngineState`: Cached identity with optional authenticated time
 //! - Discovery response parsing
 //!
-//! # Discovery Flow
+//! # Discovery flow
 //!
 //! 1. Client sends discovery request (noAuthNoPriv, empty engine ID)
 //! 2. Agent responds with Report PDU containing usmStatsUnknownEngineIDs
@@ -17,7 +17,7 @@
 //! 4. Its first authenticated request uses boots/time zero
 //! 5. An HMAC-verified response or Report establishes trusted boots/time
 //!
-//! # Time Synchronization
+//! # Time synchronization
 //!
 //! Per RFC 3414 Section 2.3, a non-authoritative engine (client) maintains:
 //! - `snmpEngineBoots`: Boot counter from authoritative engine
@@ -591,6 +591,13 @@ pub(crate) enum TimelinessPublicationOutcome {
 /// high-water value. Whole-state inserts merge monotonically and cannot replace
 /// a newer trusted tuple with a stale clone.
 ///
+/// Independently constructed clients that share a cache automatically
+/// coalesce ordinary discovery for the same resolved [`SocketAddr`]. One
+/// client performs the exchange and publishes the canonical state and response
+/// metadata; every participant derives and installs its own credential-local
+/// keys. In-flight discoveries are transient coordination state and do not
+/// count toward [`len`](Self::len), capacity, or identity TTL.
+///
 /// # Entry lifetime
 ///
 /// Each target identity has a refresh timestamp. Every accepted HMAC-verified
@@ -689,6 +696,7 @@ pub(crate) enum TimelinessPublicationOutcome {
 #[derive(Debug)]
 pub struct EngineCache {
     inner: RwLock<EngineCacheInner>,
+    pub(crate) discovery_coordinator: std::sync::Arc<crate::client::DiscoveryCoordinator>,
     recoveries: AtomicU64,
     max_capacity: Option<usize>,
     ttl: Duration,
@@ -703,11 +711,12 @@ impl Default for EngineCache {
 }
 
 impl EngineCache {
-    /// Create a new empty engine cache with default settings.
+    /// Create an empty engine cache with the default settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(EngineCacheInner::default()),
+            discovery_coordinator: std::sync::Arc::new(crate::client::DiscoveryCoordinator::new()),
             recoveries: AtomicU64::new(0),
             max_capacity: None,
             ttl: DEFAULT_ENGINE_CACHE_TTL,
@@ -785,7 +794,7 @@ impl EngineCache {
         self
     }
 
-    /// Get cached engine state for a target.
+    /// Returns the cached engine state for a target.
     ///
     /// Returns `None` if the entry does not exist or has expired.
     /// Expired entries are removed from the cache.
@@ -1221,7 +1230,7 @@ impl EngineCache {
         });
     }
 
-    /// Get the number of cached target identities (including expired entries).
+    /// Returns the number of cached target identities, including expired entries.
     pub fn len(&self) -> usize {
         self.with_inner(|inner| inner.targets.len())
     }
@@ -2697,7 +2706,7 @@ mod tests {
 
     /// Test that boots values near the maximum work correctly.
     ///
-    /// Verify normal operation just before reaching the latch point.
+    /// Verify normal operation immediately before reaching the latch point.
     #[test]
     fn test_engine_boots_near_max_operates_normally() {
         let mut state = EngineState::new(Bytes::from_static(b"engine"), 2_147_483_645, 1000);

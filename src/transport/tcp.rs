@@ -152,7 +152,7 @@ pub struct TcpTransportBuilder {
 }
 
 impl TcpTransportBuilder {
-    /// Create a new builder with default settings.
+    /// Create a builder with the default settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -255,19 +255,19 @@ impl Default for TcpTransportBuilder {
 /// Unlike UDP, TCP is stream-oriented so messages are framed using
 /// BER's self-describing length encoding.
 ///
-/// # Connection Lifecycle
+/// # Connection lifecycle
 ///
 /// The connection is established during construction and remains open
 /// for the lifetime of the transport. If the connection fails, subsequent
 /// operations return errors and a new transport must be created.
 ///
-/// # No Retries
+/// # No retries
 ///
 /// Since TCP guarantees delivery or failure, the client does not retry
 /// on timeout when using TCP transport ([`is_reliable()`](Transport::is_reliable)
 /// returns `true`). A timeout indicates the connection is likely broken.
 ///
-/// # Serialized Operations
+/// # Serialized operations
 ///
 /// Request-response pairs are serialized to ensure correct correlation.
 /// [`request_with()`](Transport::request_with) owns the stream lock for the whole

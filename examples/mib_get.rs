@@ -1,12 +1,11 @@
 //! GET named OIDs with MIB-aware output.
 //!
-//! Resolves named OIDs like "sysDescr.0" and "sysUpTime.0", GETs them,
-//! and shows formatted values with enum labels and display hints.
+//! This example resolves names such as `sysDescr.0` and `sysUpTime.0`, retrieves
+//! their values, and formats the results with enumeration labels and display
+//! hints.
 //!
-//! Requires the `mib` feature:
-//!   cargo run --example mib_get --features mib -- 192.168.1.1
-//!
-//! This example requires an SNMP agent to be running at the specified target.
+//! Run `cargo run --example mib_get --features mib -- 192.168.1.1`. The target
+//! must run an SNMP agent.
 
 use async_snmp::mib_support::{self, Loader};
 use async_snmp::{Auth, Client};
@@ -17,22 +16,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
-    // Load MIBs from system paths
+    // Load MIB modules from the system search paths.
     let mib = tokio::task::spawn_blocking(|| Loader::new().system_paths().load()).await??;
 
-    // Resolve named OIDs
+    // Resolve the object names and instance suffixes.
     let names = ["sysDescr.0", "sysUpTime.0", "sysContact.0", "sysName.0"];
     let oids: Vec<_> = names
         .iter()
         .map(|name| {
             let oid = mib_support::resolve_oid(&mib, name)
-                .unwrap_or_else(|e| panic!("failed to resolve {}: {}", name, e));
-            println!("Resolved {} -> {}", name, oid);
+                .unwrap_or_else(|e| panic!("failed to resolve {name}: {e}"));
+            println!("Resolved {name} -> {oid}");
             oid
         })
         .collect();
 
-    // Connect and GET
+    // Connect to the agent and retrieve the values.
     let client = Client::builder(target, Auth::v2c("public"))
         .connect()
         .await?;
@@ -42,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Response shape anomaly: {anomaly:?}");
     }
 
-    // Format results with MIB metadata
+    // Format each result with its MIB metadata.
     println!();
     for vb in &results.varbinds {
         println!("{}", mib_support::format_varbind(&mib, vb));

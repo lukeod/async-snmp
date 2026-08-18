@@ -4,9 +4,8 @@ use crate::oid::Oid;
 
 /// Helper for implementing GETNEXT with lexicographic OID ordering.
 ///
-/// This struct simplifies implementing the `get_next` method of [`MibHandler`](super::MibHandler)
-/// by maintaining a sorted list of OID-value pairs and providing efficient
-/// lookup for the next OID.
+/// Maintains a sorted list of OID-value pairs and efficiently finds the next
+/// OID for [`MibHandler::get_next`](super::MibHandler::get_next).
 ///
 /// For a static or otherwise already-collected table, prefer [`Iterator::collect`]
 /// or [`FromIterator`] over repeated unsorted [`insert`](Self::insert) calls.
@@ -57,7 +56,7 @@ pub struct OidTable<V> {
 }
 
 impl<V> OidTable<V> {
-    /// Create a new empty OID table.
+    /// Create an empty OID table.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -93,7 +92,7 @@ impl<V> OidTable<V> {
         }
     }
 
-    /// Get the value for an exact OID match.
+    /// Returns the value for an exact OID match.
     #[must_use]
     pub fn get(&self, oid: &Oid) -> Option<&V> {
         match self.entries.binary_search_by(|(o, _)| o.cmp(oid)) {
@@ -102,7 +101,7 @@ impl<V> OidTable<V> {
         }
     }
 
-    /// Get the lexicographically next OID and value after the given OID.
+    /// Returns the lexicographically next OID and value after the given OID.
     ///
     /// Returns `None` if there are no OIDs greater than the given one.
     #[must_use]
@@ -119,13 +118,13 @@ impl<V> OidTable<V> {
         }
     }
 
-    /// Get the number of entries in the table.
+    /// Returns the number of entries in the table.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Check if the table is empty.
+    /// Returns whether the table is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

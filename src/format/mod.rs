@@ -1,9 +1,8 @@
 //! Formatting utilities for SNMP values.
 //!
-//! This module provides formatting functions for converting raw SNMP data
-//! into human-readable strings.
+//! Converts raw SNMP data into human-readable strings.
 //!
-//! ## Display Hints
+//! ## Display hints
 //!
 //! The [`display_hint`] module implements RFC 2579 DISPLAY-HINT formatting
 //! for OCTET STRING values. This is commonly used to format MAC addresses,
@@ -21,7 +20,7 @@
 //! assert_eq!(ip, "192.168.1.1");
 //! ```
 //!
-//! ## Hex Encoding
+//! ## Hex encoding
 //!
 //! The [`hex`] module provides hexadecimal encoding and decoding utilities.
 //!

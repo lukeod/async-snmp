@@ -394,11 +394,11 @@ fn snmp_unknown_contexts_oid() -> crate::Oid {
     crate::oid!(1, 3, 6, 1, 6, 3, 12, 1, 5, 0)
 }
 
-/// Check if a PDU type is a request that should be handled.
+/// Returns whether a PDU type is a request that the agent handles.
 ///
 /// `InformRequest` is a confirmed-class PDU (RFC 3416) that requires a Response.
-/// While Informs are typically handled by notification receivers, agents should
-/// also respond to them per RFC 3413 Section 4.
+/// Notification receivers typically handle Informs, but RFC 3413 Section 4 also
+/// requires agents to respond to them.
 pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {
     matches!(
         pdu_type,

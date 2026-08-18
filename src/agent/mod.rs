@@ -408,11 +408,10 @@ impl AgentAuthorization {
 
 /// Builder for [`Agent`].
 ///
-/// Use this builder to configure and construct an SNMP agent. The builder
-/// pattern allows you to chain configuration methods before calling
-/// [`build()`](AgentBuilder::build) to create the agent.
+/// Configure an SNMP agent, then call [`build()`](AgentBuilder::build) to
+/// create it.
 ///
-/// # Access Control
+/// # Access control
 ///
 /// An agent with an accepted community or USM user must explicitly select
 /// [`vacm()`](AgentBuilder::vacm) or
@@ -420,7 +419,7 @@ impl AgentAuthorization {
 /// and privacy protocols are capabilities and do not establish an inbound
 /// minimum security level.
 ///
-/// # Minimal Example
+/// # Minimal example
 ///
 /// ```rust,no_run
 /// use async_snmp::agent::Agent;
@@ -516,7 +515,7 @@ struct ValidatedAgentBuilder {
 }
 
 impl AgentBuilder {
-    /// Create a new builder with default settings.
+    /// Create a builder with the default settings.
     ///
     /// Defaults:
     /// - Bind address: `0.0.0.0:161` (UDP)
@@ -555,10 +554,10 @@ impl AgentBuilder {
 
     /// Set the UDP bind address.
     ///
-    /// Default is `0.0.0.0:161` (standard SNMP agent port). Note that binding
-    /// to UDP port 161 typically requires root/administrator privileges.
+    /// The default is `0.0.0.0:161`, the standard SNMP agent port. Binding to
+    /// UDP port 161 typically requires root or administrator privileges.
     ///
-    /// # IPv4 Examples
+    /// # IPv4 examples
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
@@ -576,7 +575,7 @@ impl AgentBuilder {
     /// # }
     /// ```
     ///
-    /// # IPv6 / Dual-Stack Examples
+    /// # IPv6 and dual-stack examples
     ///
     /// ```rust,no_run
     /// use async_snmp::agent::Agent;
@@ -661,7 +660,7 @@ impl AgentBuilder {
     /// but it is not a minimum: lower-level packets naming the user remain
     /// valid USM input and are controlled by the Agent authorization policy.
     ///
-    /// # Security Levels
+    /// # Security levels
     ///
     /// - **noAuthNoPriv**: No authentication or encryption
     /// - **authNoPriv**: Authentication only (HMAC verification)
@@ -786,8 +785,8 @@ impl AgentBuilder {
 
     /// Set the maximum message size for responses.
     ///
-    /// Default is 1472 octets (fits Ethernet MTU minus IP/UDP headers).
-    /// GETBULK responses will be truncated to fit within this limit.
+    /// The default is 1472 octets, which fits an Ethernet MTU after IP and UDP
+    /// headers. The agent truncates GETBULK responses to fit this limit.
     /// Values above the UDP receive capacity advertised by this agent (65507
     /// octets) are rejected by [`AgentBuilder::build`].
     ///
@@ -812,10 +811,10 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the maximum number of concurrent requests the agent will process.
+    /// Set the maximum number of requests that the agent processes concurrently.
     ///
-    /// Default is 1000. Requests beyond this limit will queue until a slot
-    /// becomes available. Set to `None` for unbounded concurrency.
+    /// The default is 1000. Requests beyond this limit wait until a slot
+    /// becomes available. Use `None` for unbounded concurrency.
     ///
     /// This controls memory usage under high load while still allowing
     /// parallel request processing.
@@ -830,7 +829,7 @@ impl AgentBuilder {
 
     /// Set the UDP socket receive buffer size.
     ///
-    /// Default is 4MB. The kernel may cap this at `net.core.rmem_max`.
+    /// The default is 4 MiB. The kernel may cap this at `net.core.rmem_max`.
     /// A larger buffer prevents packet loss during request bursts.
     ///
     /// Set to `None` to use the kernel default.
@@ -978,8 +977,8 @@ impl AgentBuilder {
 
     /// Add a trap/inform destination.
     ///
-    /// The agent will send notifications to all configured trap sinks when
-    /// [`Agent::send_trap()`] or [`Agent::send_inform()`] is called.
+    /// [`Agent::send_trap()`] and [`Agent::send_inform()`] send notifications
+    /// to all configured sinks.
     /// For V3 traps, the Agent is authoritative and uses its persisted
     /// [`AuthoritativeEngine`]. For V3 Informs, the receiving sink is
     /// authoritative and the Agent discovers the sink's engine. Configuring
@@ -1074,7 +1073,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Set one total deadline for Agent construction (default: 5 seconds).
+    /// Set one total deadline for agent construction (default: 5 seconds).
     ///
     /// Pure configuration validation runs first. The deadline then spans UDP
     /// binding, every hostname sink lookup in configuration order, and local
@@ -1085,7 +1084,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Bound concurrently admitted trap or Inform sink operations (default: 32).
+    /// Set the maximum number of concurrent trap or Inform sink operations.
     ///
     /// A notification stream admits at most this many sink futures and admits
     /// the next configured sink after a prior outcome completes. Outcomes are
@@ -1132,8 +1131,8 @@ impl AgentBuilder {
     /// Disable a specific built-in MIB handler group.
     ///
     /// By default, the agent registers handlers for snmpEngine, USM stats,
-    /// and MPD stats. Call this to prevent registration of a specific group,
-    /// e.g., if you want to provide your own handler for those OIDs.
+    /// and MPD stats. Disable a group when the application provides its own
+    /// handler for those OIDs.
     #[must_use]
     pub fn without_builtin_handler(mut self, mib: BuiltinMib) -> Self {
         self.disabled_builtins.insert(mib);
@@ -1142,9 +1141,9 @@ impl AgentBuilder {
 
     /// Disable all built-in MIB handlers.
     ///
-    /// The agent will not register any internal handlers for snmpEngine,
-    /// USM stats, or MPD stats. You can still query the counter values
-    /// via accessor methods like [`Agent::usm_unknown_engine_ids()`].
+    /// The agent does not register internal handlers for snmpEngine, USM
+    /// stats, or MPD stats. Counter accessors such as
+    /// [`Agent::usm_unknown_engine_ids()`] remain available.
     #[must_use]
     pub fn without_builtin_handlers(mut self) -> Self {
         self.disabled_builtins.insert(BuiltinMib::SnmpEngine);
@@ -1833,9 +1832,9 @@ pub(crate) struct AgentInner {
     receive_attempts: AtomicU32,
 }
 
-/// SNMP Agent.
+/// An SNMP agent.
 ///
-/// Listens for and responds to SNMP requests (GET, GETNEXT, GETBULK, SET).
+/// Listens for and responds to GET, GETNEXT, GETBULK, and SET requests.
 ///
 /// # Example
 ///
@@ -1865,7 +1864,7 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    /// Get the local address the agent is bound to.
+    /// Returns the local address that the agent is bound to.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr
@@ -1884,7 +1883,7 @@ impl Agent {
         self.inner.trap_sinks.iter().map(|sink| &sink.summary)
     }
 
-    /// Get the local engine ID.
+    /// Returns the local engine ID.
     ///
     /// With an [`AuthoritativeEngine`] this is the stable persisted V3
     /// identity. A community-only Agent instead has a generated process-local
@@ -1929,7 +1928,7 @@ impl Agent {
         self.inner.cancel.cancel();
     }
 
-    /// Get a clone of the cancellation token for this agent.
+    /// Returns a clone of the agent's cancellation token.
     #[must_use]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.inner.cancel.clone()
@@ -1950,7 +1949,7 @@ impl Agent {
         self.inner.run_orphaned.load(Ordering::Acquire) && self.active_request_count() != 0
     }
 
-    /// Get the snmpInASNParseErrs counter value.
+    /// Returns the snmpInASNParseErrs counter value.
     ///
     /// This counter tracks ASN.1 or BER syntax errors encountered while
     /// decoding received SNMP messages. Authentication, authorization,
@@ -1966,7 +1965,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the snmpInvalidMsgs counter value.
+    /// Returns the snmpInvalidMsgs counter value.
     ///
     /// This counter tracks messages with invalid msgFlags, such as
     /// privacy-without-authentication (RFC 3412 Section 7.2 Step 5d).
@@ -1977,7 +1976,7 @@ impl Agent {
         self.inner.state.snmp_invalid_msgs.load(Ordering::Relaxed)
     }
 
-    /// Get the snmpUnknownSecurityModels counter value.
+    /// Returns the snmpUnknownSecurityModels counter value.
     ///
     /// This counter tracks messages with unrecognized security models
     /// (RFC 3412 Section 7.2 Step 2).
@@ -1991,7 +1990,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the snmpSilentDrops counter value.
+    /// Returns the snmpSilentDrops counter value.
     ///
     /// This counter tracks confirmed-class PDUs (`GetRequest`, `GetNextRequest`,
     /// `GetBulkRequest`, `SetRequest`, `InformRequest`) that were silently dropped
@@ -2004,7 +2003,7 @@ impl Agent {
         self.inner.state.snmp_silent_drops.load(Ordering::Relaxed)
     }
 
-    /// Get the snmpUnknownContexts counter value.
+    /// Returns the snmpUnknownContexts counter value.
     ///
     /// This counter tracks requests whose scopedPDU contextEngineID did not
     /// name a context served by this engine (RFC 3413 Section 3.2). Such
@@ -2020,7 +2019,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsUnknownEngineIDs counter value.
+    /// Returns the usmStatsUnknownEngineIDs counter value.
     ///
     /// This counter tracks messages with unknown engine IDs.
     /// Incremented when a non-discovery request arrives with an engine ID that
@@ -2036,7 +2035,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsUnknownUserNames counter value.
+    /// Returns the usmStatsUnknownUserNames counter value.
     ///
     /// This counter tracks messages with unknown user names.
     /// Incremented when a message arrives with a user name not in the local
@@ -2052,7 +2051,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsWrongDigests counter value.
+    /// Returns the usmStatsWrongDigests counter value.
     ///
     /// This counter tracks messages with incorrect authentication digests.
     /// (RFC 3414 Section 3.2 Step 6).
@@ -2067,7 +2066,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsNotInTimeWindows counter value.
+    /// Returns the usmStatsNotInTimeWindows counter value.
     ///
     /// This counter tracks messages requesting an authenticated security
     /// level that fail the time window check (RFC 3414 Section 3.2 Step 7a):
@@ -2085,7 +2084,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsUnsupportedSecLevels counter value.
+    /// Returns the usmStatsUnsupportedSecLevels counter value.
     ///
     /// This counter tracks messages where the user does not support
     /// the requested security level (e.g., auth required but user
@@ -2101,7 +2100,7 @@ impl Agent {
             .load(Ordering::Relaxed)
     }
 
-    /// Get the usmStatsDecryptionErrors counter value.
+    /// Returns the usmStatsDecryptionErrors counter value.
     ///
     /// This counter tracks messages where decryption failed (the user
     /// has a privacy key but the decrypt operation returned an error).

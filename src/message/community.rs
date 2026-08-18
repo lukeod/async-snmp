@@ -107,22 +107,21 @@ fn validate_community_message(version: Version, pdu: &CommunityPdu) -> Result<()
 
 /// Community-based SNMP message (v1/v2c).
 ///
-/// This unified type handles both `SNMPv1` and `SNMPv2c` messages,
-/// which share identical structure but differ in version number.
-/// The `pdu` field is a `CommunityPdu` that can hold either a standard
-/// PDU or a `TrapV1` PDU.
+/// Represents an SNMPv1 or v2c message. These versions share the same message
+/// structure but use different version numbers. The message contains either a
+/// standard PDU or an SNMPv1 Trap PDU.
 #[derive(Debug, Clone)]
 pub struct CommunityMessage {
-    /// SNMP version (V1 or V2c)
+    /// SNMP version (v1 or v2c).
     version: Version,
-    /// Community string for authentication
+    /// Community identifier used for authentication.
     community: Community,
-    /// Protocol data unit
+    /// Protocol data unit.
     pdu: CommunityPdu,
 }
 
 impl CommunityMessage {
-    /// Create a new community message with a standard PDU.
+    /// Create a community message with a standard PDU.
     ///
     /// # Errors
     ///
@@ -142,7 +141,7 @@ impl CommunityMessage {
         Ok(message)
     }
 
-    /// Create a V2c message (convenience constructor).
+    /// Create an SNMPv2c message.
     ///
     /// # Errors
     ///
@@ -151,7 +150,7 @@ impl CommunityMessage {
         Self::new(CommunityVersion::V2c, community, pdu)
     }
 
-    /// Create a V1 message with a standard PDU (convenience constructor).
+    /// Create an SNMPv1 message with a standard PDU.
     ///
     /// # Errors
     ///
@@ -160,7 +159,7 @@ impl CommunityMessage {
         Self::new(CommunityVersion::V1, community, pdu)
     }
 
-    /// Create a V1 message carrying a `TrapV1` PDU.
+    /// Create an SNMPv1 message carrying a `TrapV1` PDU.
     ///
     /// # Errors
     ///

@@ -1,14 +1,15 @@
-//! Using async-snmp from Synchronous Code
+//! Use async-snmp from synchronous code
 //!
-//! async-snmp is async-first, but embedding it in a synchronous application
-//! is straightforward using tokio's Runtime::block_on(). This avoids the need
-//! for a separate sync SNMP library.
+//! async-snmp is asynchronous, but a synchronous application can call it with
+//! Tokio's `Runtime::block_on`.
 //!
-//! This example shows two patterns:
-//! - One-shot: create a runtime, do SNMP work, drop it
-//! - Persistent: keep a runtime alive for repeated SNMP calls
+//! The code uses two patterns:
 //!
-//! Run with: cargo run --example sync_wrapper
+//! - For a one-shot call, create a runtime, complete the SNMP operation, and
+//!   drop the runtime.
+//! - For repeated calls, keep a runtime and client alive.
+//!
+//! Run `cargo run --example sync_wrapper`.
 
 use async_snmp::{
     Auth, Client, Error, FixedCardinalityResponse, ResponseShapePolicy, Retry, Value, VarBind, oid,
@@ -17,10 +18,9 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// One-shot pattern: spin up a runtime, do SNMP work, tear it down.
+/// Creates a runtime for one SNMP operation.
 ///
-/// Good for CLI tools, scripts, or infrequent SNMP calls where you don't
-/// want to keep a runtime alive.
+/// This pattern suits CLI tools, scripts, and infrequent SNMP calls.
 fn oneshot_get(
     target: (&str, u16),
     community: &str,
@@ -45,10 +45,9 @@ fn oneshot_get(
     })
 }
 
-/// Persistent pattern: keep a runtime and client alive for repeated calls.
+/// Keeps a runtime and client alive for repeated calls.
 ///
-/// Wraps the async client in a struct that exposes sync methods. Useful when
-/// SNMP is called from multiple places in a sync codebase.
+/// This wrapper exposes synchronous methods for an asynchronous client.
 struct SyncSnmpClient {
     rt: tokio::runtime::Runtime,
     client: Client,
@@ -109,28 +108,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = ("127.0.0.1", 11161);
 
     // =========================================================================
-    // One-shot: single call, no persistent runtime
+    // Make one call without retaining a runtime.
     // =========================================================================
     println!("--- One-shot GET ---\n");
 
     match oneshot_get(target, "public") {
-        Ok(response) => println!("sysDescr: {:?}", response.varbinds[0].value),
+        Ok(response) => println!(
+            "sysDescr: {:?}",
+            response
+                .single()
+                .expect("strict response policy returns a singleton")
+                .value
+        ),
         Err(e) => println!("Error: {e}"),
     }
 
     // =========================================================================
-    // Persistent: reuse runtime and client across calls
+    // Reuse a runtime and client across calls.
     // =========================================================================
     println!("\n--- Persistent client ---\n");
 
     let client = SyncSnmpClient::connect(target, "public")?;
     println!("UDP client configured for {}", client.peer_addr());
 
-    // GET
+    // Retrieve sysDescr.0.
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))?;
-    println!("sysDescr: {:?}", response.varbinds[0].value);
+    println!(
+        "sysDescr: {:?}",
+        response
+            .single()
+            .expect("strict response policy returns a singleton")
+            .value
+    );
 
-    // GET_MANY
+    // Retrieve sysUpTime.0 and sysName.0 in one request.
     let vbs = client.get_many(&[
         oid!(1, 3, 6, 1, 2, 1, 1, 3, 0), // sysUpTime
         oid!(1, 3, 6, 1, 2, 1, 1, 5, 0), // sysName
@@ -139,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {}: {:?}", vb.oid, vb.value);
     }
 
-    // WALK
+    // Walk the system subtree.
     let results = client.walk(oid!(1, 3, 6, 1, 2, 1, 1))?;
     println!("System subtree: {} OIDs", results.len());
 

@@ -54,13 +54,13 @@ pub struct WalkError {
 /// Protocol operation used for a walk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WalkMethod {
-    /// Auto-select based on version (default).
-    /// V1 uses GETNEXT, V2c/V3 uses GETBULK.
+    /// Select by SNMP version (default).
+    /// SNMPv1 uses GETNEXT; v2c and v3 use GETBULK.
     #[default]
     Auto,
-    /// Always use GETNEXT (slower but more compatible).
+    /// Use GETNEXT, including for peers with broken GETBULK implementations.
     GetNext,
-    /// Always use GETBULK (faster, errors on v1).
+    /// Use GETBULK. SNMPv1 clients return a configuration error.
     GetBulk,
 }
 
@@ -111,7 +111,7 @@ impl WalkOptions {
 /// returning OIDs out of order or even repeating OIDs (which would cause
 /// infinite loops).
 ///
-/// This enum controls how the library handles ordering violations:
+/// Controls how a walk handles ordering violations:
 ///
 /// - [`Strict`](Self::Strict) (default): Terminates immediately with
 ///   [`Error::WalkAborted`](crate::Error::WalkAborted) on any violation.
@@ -609,7 +609,7 @@ pub struct WalkStream<T: Transport> {
 }
 
 impl<T: Transport> WalkStream<T> {
-    /// Create a new walk stream with auto-selection based on version and walk mode.
+    /// Create a walk stream using the configured method and SNMP version.
     pub(crate) fn new(
         client: Client<T>,
         oid: Oid,
@@ -644,7 +644,7 @@ impl<T: Transport> WalkStream<T> {
 }
 
 impl<T: Transport + 'static> WalkStream<T> {
-    /// Get the next varbind, or None when complete.
+    /// Returns the next variable binding, or `None` when the walk is complete.
     pub async fn next(&mut self) -> Option<Result<VarBind>> {
         std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }

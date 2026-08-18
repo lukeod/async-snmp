@@ -1,7 +1,7 @@
 //! `SNMPv3` security module.
 //!
-//! This module implements the User-based Security Model (USM) as defined
-//! in RFC 3414 and RFC 7860, including:
+//! Implements the User-based Security Model (USM) as defined in RFC 3414 and
+//! RFC 7860, including:
 //!
 //! - USM security parameters encoding/decoding
 //! - Key localization (password-to-key derivation)
@@ -196,7 +196,7 @@ impl std::str::FromStr for AuthProtocol {
 }
 
 impl AuthProtocol {
-    /// Get the digest output length in bytes.
+    /// Returns the digest output length in bytes.
     ///
     /// This is also the key length produced by the key localization algorithm,
     /// which is used for privacy key derivation.
@@ -212,7 +212,7 @@ impl AuthProtocol {
         }
     }
 
-    /// Get the truncated MAC length for authentication parameters.
+    /// Returns the truncated MAC length for authentication parameters.
     #[must_use]
     pub fn mac_len(self) -> usize {
         match self {
@@ -300,7 +300,7 @@ impl std::str::FromStr for PrivProtocol {
 }
 
 impl PrivProtocol {
-    /// Get the key length in bytes.
+    /// Returns the key length in bytes.
     #[must_use]
     pub fn key_len(self) -> usize {
         match self {
@@ -312,7 +312,7 @@ impl PrivProtocol {
         }
     }
 
-    /// Get the IV/salt length in bytes.
+    /// Returns the IV or salt length in bytes.
     #[must_use]
     pub fn salt_len(self) -> usize {
         8 // All protocols use 8-byte salt

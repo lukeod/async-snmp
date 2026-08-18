@@ -2,10 +2,10 @@
 //!
 //! Messages encapsulate PDUs with version and authentication information.
 //!
-//! # Message Types
+//! # Message types
 //!
-//! - [`CommunityMessage`] - V1/V2c messages with community string auth
-//! - [`V3Message`] - V3 messages with USM security
+//! - [`CommunityMessage`] - SNMPv1/v2c messages with community authentication
+//! - [`V3Message`] - SNMPv3 messages with USM security
 
 mod community;
 mod v3;
@@ -61,8 +61,8 @@ pub(crate) fn finalize_envelope(
         }));
     }
 
-    // Stable event and field names let callers observe anomalies even when
-    // using the legacy value-only `decode` convenience methods.
+    // Stable event and field names let callers observe anomalies through
+    // tracing even if they discard the returned metadata.
     tracing::warn!(target: "async_snmp::message", anomaly = "trailing_bytes", trailing_bytes, peer = ?root.peer(), "accepted trailing bytes after SNMP message");
     root.record_anomaly(DecodeAnomaly::TrailingBytes {
         original_length: trailing_bytes,
@@ -73,18 +73,17 @@ pub(crate) fn finalize_envelope(
 
 /// Decoded SNMP message (any version).
 ///
-/// This enum provides a unified interface for working with SNMP messages
-/// regardless of version. Use [`Message::decode`] to parse incoming data.
+/// Use [`Message::decode`] to parse an SNMPv1, v2c, or v3 message.
 #[derive(Debug)]
 pub enum Message {
-    /// `SNMPv1` or `SNMPv2c` message with community string
+    /// SNMPv1 or v2c message with community authentication.
     Community(CommunityMessage),
-    /// `SNMPv3` message with USM security
+    /// SNMPv3 message with USM security.
     V3(V3Message),
 }
 
 impl Message {
-    /// Get a reference to the PDU.
+    /// Returns a reference to the PDU.
     ///
     /// Returns `None` for encrypted V3 messages or `SNMPv1` Trap messages.
     pub fn pdu(&self) -> Option<&Pdu> {
@@ -104,7 +103,7 @@ impl Message {
         }
     }
 
-    /// Get the SNMP version.
+    /// Returns the SNMP version.
     pub fn version(&self) -> Version {
         match self {
             Message::Community(m) => m.version(),

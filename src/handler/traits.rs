@@ -123,17 +123,17 @@ pub trait PreparedSet: Send + 'static {
 /// Register handlers with [`AgentBuilder::handler()`](crate::agent::AgentBuilder::handler)
 /// using a prefix OID.
 ///
-/// # Required Methods
+/// # Required methods
 ///
 /// - [`get`](MibHandler::get): Handle GET requests for specific OIDs
 /// - [`get_next`](MibHandler::get_next): Handle GETNEXT/GETBULK requests
 ///
-/// # Optional Methods
+/// # Optional methods
 ///
 /// - [`test_set`](MibHandler::test_set): Validate SET operations (default: read-only)
 /// - [`handles`](MibHandler::handles): Custom OID matching logic
 ///
-/// # GET Implementation
+/// # GET implementation
 ///
 /// The [`get`](MibHandler::get) method should return:
 /// - `Ok(`[`GetResult::Value`]`)` if the OID exists and has a value
@@ -142,7 +142,7 @@ pub trait PreparedSet: Send + 'static {
 /// - `Err(`[`HandlerError`](super::HandlerError)`)` if the handler failed to
 ///   determine an answer (backing store unreachable, hardware fault, ...)
 ///
-/// # GETNEXT and Lexicographic Ordering
+/// # GETNEXT and lexicographic ordering
 ///
 /// The [`get_next`](MibHandler::get_next) method must return the lexicographically
 /// next OID after the requested one. OIDs are compared arc-by-arc as unsigned integers.
@@ -156,7 +156,7 @@ pub trait PreparedSet: Send + 'static {
 ///   multiple registrations of the same handler may therefore overlap
 /// - Use [`OidTable`](super::OidTable) to simplify sorted OID management
 ///
-/// # Error Handling
+/// # Error handling
 ///
 /// Both methods return [`HandlerResult`], so `?` works on any error type
 /// implementing [`std::error::Error`]. Return `Err` only for *processing
@@ -166,7 +166,7 @@ pub trait PreparedSet: Send + 'static {
 /// the failing variable binding (RFC 3416 Section 4.2.1), and logs the
 /// error; the message is never sent to the manager.
 ///
-/// # SET Two-Phase Commit (RFC 3416)
+/// # SET two-phase commit (RFC 3416)
 ///
 /// SET operations use a multi-phase protocol modeled after net-snmp's
 /// RESERVE1/RESERVE2/ACTION/COMMIT/FREE/UNDO phases:
@@ -202,12 +202,12 @@ pub trait PreparedSet: Send + 'static {
 /// hold handlers for its entire lifetime without lifetime annotations.
 /// In practice, most handlers naturally satisfy this bound.
 ///
-/// # Thread Safety
+/// # Thread safety
 ///
 /// Handlers must be `Send + Sync` because the agent may process
 /// requests concurrently from multiple tasks.
 ///
-/// # Example: Read-Only Handler
+/// # Example: read-only handler
 ///
 /// ```rust
 /// use async_snmp::handler::{
@@ -267,7 +267,7 @@ pub trait PreparedSet: Send + 'static {
 /// }
 /// ```
 ///
-/// # Example: Writable Handler
+/// # Example: writable handler
 ///
 /// ```rust
 /// use async_snmp::handler::{

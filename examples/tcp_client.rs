@@ -1,23 +1,24 @@
-//! TCP Transport Example
+//! Use SNMP over TCP
 //!
-//! This example demonstrates using SNMP over TCP instead of UDP.
-//! TCP transport is useful when:
-//! - Large responses exceed UDP's 64KB limit
-//! - Firewalls block UDP but allow TCP
-//! - Reliable delivery is required without timeout retransmissions
+//! TCP transport can support large messages and networks that do not pass UDP.
+//! It also avoids application-level retransmission after a response timeout.
 //!
-//! Key differences from UDP:
-//! - Messages are framed using BER self-describing length
-//! - No timeout retransmissions (TCP guarantees delivery or connection failure)
-//! - SNMPv3 protocol correction remains available independently
-//! - Connection-oriented (one TCP connection per target)
-//! - Requests are serialized per connection
+//! Compared with UDP, TCP transport:
 //!
-//! Run with: cargo run --example tcp_client
+//! - frames messages with their BER-encoded lengths;
+//! - does not retransmit requests after a response timeout;
+//! - can still perform independent SNMPv3 protocol correction;
+//! - uses one connection per target; and
+//! - serializes requests on each connection.
 //!
-//! Uses the async-snmp test container (supports TCP on same port):
-//!   docker build -t async-snmp-test:latest tests/containers/snmpd/
-//!   docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
+//! Run `cargo run --example tcp_client`.
+//!
+//! To start the async-snmp test container with UDP and TCP listeners, run:
+//!
+//! ```text
+//! docker build -t async-snmp-test:latest tests/containers/snmpd/
+//! docker run -d -p 11161:161/udp -p 11161:161/tcp async-snmp-test:latest
+//! ```
 
 use async_snmp::{
     Auth, AuthProtocol, Client, ClientBuilder, PrivProtocol, ResponseShapePolicy, Retry,
@@ -28,7 +29,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+    // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -39,11 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 1: Basic TCP connection
     // =========================================================================
-    println!("--- Basic TCP Client ---\n");
+    println!("--- Basic TCP client ---\n");
 
     let target = ("127.0.0.1", 11161);
 
-    // Use connect_tcp() instead of connect()
+    // Use connect_tcp() to create a TCP client.
     let client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(10))
@@ -55,10 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connected to {} via TCP", client.peer_addr());
 
-    // Perform GET request
+    // Retrieve sysDescr.0.
     match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
         Ok(response) => {
-            println!("sysDescr: {:?}", response.varbinds[0].value);
+            println!(
+                "sysDescr: {:?}",
+                response
+                    .single()
+                    .expect("strict response policy returns a singleton")
+                    .value
+            );
         }
         Err(e) => {
             println!("GET failed: {e}");
@@ -68,9 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 2: Manual TCP transport construction
     // =========================================================================
-    println!("\n--- Manual TCP Transport ---\n");
+    println!("\n--- Manual TCP transport ---\n");
 
-    // Create TCP transport directly for more control
+    // Construct a TCP transport before creating the client.
     let addr: SocketAddr = "127.0.0.1:11161".parse()?;
 
     match TcpTransport::connect(addr).await {
@@ -87,7 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build_with_transport(transport)?;
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 5, 0)).await {
-                Ok(response) => println!("sysName: {:?}", response.varbinds[0].value),
+                Ok(response) => println!(
+                    "sysName: {:?}",
+                    response
+                        .single()
+                        .expect("strict response policy returns a singleton")
+                        .value
+                ),
                 Err(e) => println!("GET failed: {e}"),
             }
         }
@@ -99,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 3: TCP with connection timeout
     // =========================================================================
-    println!("\n--- TCP with Connection Timeout ---\n");
+    println!("\n--- TCP with a connection timeout ---\n");
 
     let connect_timeout = Duration::from_secs(5);
     let addr: SocketAddr = "127.0.0.1:11161".parse()?;
@@ -149,7 +162,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("SNMPv3 TCP client connected");
 
             match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await {
-                Ok(response) => println!("sysDescr: {:?}", response.varbinds[0].value),
+                Ok(response) => println!(
+                    "sysDescr: {:?}",
+                    response
+                        .single()
+                        .expect("strict response policy returns a singleton")
+                        .value
+                ),
                 Err(e) => println!("GET failed: {e}"),
             }
         }
@@ -161,13 +180,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Example 5: Comparing UDP vs TCP behavior
     // =========================================================================
-    println!("\n--- UDP vs TCP Comparison ---\n");
+    println!("\n--- UDP and TCP comparison ---\n");
 
-    // UDP client - retries on timeout
+    // Configure a UDP client to retry after response timeouts.
     let udp_client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(2))
-        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count")) // Will retry up to 3 times on timeout
+        // Retry up to three times after a timeout.
+        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count"))
         .connect()
         .await;
 
@@ -175,11 +195,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Retries: 3 (configured)");
     println!("  Behavior: Retries on timeout\n");
 
-    // TCP client - no timeout retransmissions
+    // Configure the same retry policy on TCP. TCP ignores timeout retries.
     let tcp_client = Client::builder(target, Auth::v2c("public"))
         .response_shape_policy(ResponseShapePolicy::Strict)
         .request_timeout(Duration::from_secs(2))
-        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count")) // Ignored for TCP!
+        .retry(Retry::fixed(3, Duration::ZERO).expect("valid retry count")) // Ignored for TCP.
         .connect_tcp()
         .await;
 
@@ -187,17 +207,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Timeout retries: Ignored (is_reliable = true)");
     println!("  Behavior: Single transmission unless SNMPv3 protocol correction is needed");
 
-    // Demonstrate both clients work the same way
+    // Use the same client operation with each transport.
     if let Ok(client) = udp_client {
         match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-            Ok(response) => println!("\nUDP sysUpTime: {:?}", response.varbinds[0].value),
+            Ok(response) => println!(
+                "\nUDP sysUpTime: {:?}",
+                response
+                    .single()
+                    .expect("strict response policy returns a singleton")
+                    .value
+            ),
             Err(e) => println!("\nUDP error: {e}"),
         }
     }
 
     if let Ok(client) = tcp_client {
         match client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 3, 0)).await {
-            Ok(response) => println!("TCP sysUpTime: {:?}", response.varbinds[0].value),
+            Ok(response) => println!(
+                "TCP sysUpTime: {:?}",
+                response
+                    .single()
+                    .expect("strict response policy returns a singleton")
+                    .value
+            ),
             Err(e) => println!("TCP error: {e}"),
         }
     }

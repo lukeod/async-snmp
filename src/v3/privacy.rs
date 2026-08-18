@@ -8,7 +8,7 @@
 //! - AES-256-CFB privacy with explicit Blumenthal or Reeder key extension
 //!   (draft/vendor extension, not RFC 3826)
 //!
-//! # Salt/IV Construction
+//! # Salt and IV construction
 //!
 //! ## DES-CBC
 //! - Salt (privParameters): engineBoots (4 bytes) || counter (4 bytes) = 8 bytes
@@ -473,7 +473,7 @@ pub struct PrivKey {
 pub struct SaltCounter(AtomicU64);
 
 impl SaltCounter {
-    /// Create a new salt counter initialized from cryptographic randomness.
+    /// Create a salt counter initialized from cryptographic randomness.
     ///
     /// # Errors
     ///
@@ -490,7 +490,7 @@ impl SaltCounter {
         Self(AtomicU64::new(value))
     }
 
-    /// Get the next salt value and increment the counter.
+    /// Returns the next salt value and increments the counter.
     ///
     /// This method never returns a value whose low 32 bits are zero. DES and
     /// 3DES place only those low 32 bits in `privParameters`, so skipping that
@@ -670,7 +670,7 @@ impl PrivKey {
     /// this returns `Err(CryptoError::InvalidKeyLength)` instead. A key longer
     /// than `protocol.key_len()` is accepted (per RFC 3826 Section 3.1.2, the
     /// localized key length is "at least" the required size); the extra
-    /// trailing bytes are simply unused. Length validation precedes the
+    /// trailing bytes remain unused. Length validation precedes the
     /// selected backend's privacy-protocol capability check.
     ///
     /// This constructor treats `key` as finalized and never extends it. The
@@ -705,7 +705,7 @@ impl PrivKey {
         })
     }
 
-    /// Get the privacy protocol.
+    /// Returns the privacy protocol.
     pub fn protocol(&self) -> PrivProtocol {
         self.protocol
     }
@@ -715,7 +715,7 @@ impl PrivKey {
         self.backend
     }
 
-    /// Get the encryption key portion.
+    /// Returns the encryption key portion.
     pub fn encryption_key(&self) -> &[u8] {
         match self.protocol {
             PrivProtocol::Des => &self.key[..8],

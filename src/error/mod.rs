@@ -1,6 +1,6 @@
 //! Error types for async-snmp.
 //!
-//! This module provides:
+//! The module provides:
 //!
 //! - [`Error`] - The main error type covering all failure modes
 //! - [`DecodeError`] - Structured packet-decoding diagnostics
@@ -10,7 +10,7 @@
 //! - [`ErrorStatus`] - SNMP protocol errors returned by agents (RFC 3416)
 //! - [`WalkAbortReason`] - Reasons a walk operation was aborted
 //!
-//! # Error Handling
+//! # Error handling
 //!
 //! Errors are boxed so `Result<T>` stays compact and async state machines that
 //! retain an error across a suspension point do not embed the full [`Error`]
@@ -467,14 +467,13 @@ impl std::fmt::Display for ErrorKind {
 
 /// The main error type for all async-snmp operations.
 ///
-/// This enum covers all possible error conditions including network issues,
-/// protocol errors, authentication failures, and configuration problems.
+/// Covers network, protocol, authentication, and configuration failures.
 ///
 /// Errors are boxed (via [`Result`]) to keep the size small on the stack.
 ///
-/// # Common Patterns
+/// # Common patterns
 ///
-/// ## Checking Error Type
+/// ## Checking error type
 ///
 /// Use pattern matching to handle specific error conditions:
 ///
@@ -803,9 +802,9 @@ impl Error {
 /// The error status is included in the [`Error::Snmp`] variant along with an error
 /// index indicating which varbind caused the error.
 ///
-/// # Error Categories
+/// # Error categories
 ///
-/// ## `SNMPv1` Errors (0-5)
+/// ## SNMPv1 errors (0-5)
 ///
 /// - `NoError` - Operation succeeded
 /// - `TooBig` - Response too large for transport
@@ -814,7 +813,7 @@ impl Error {
 /// - `ReadOnly` - Attempted write to read-only object
 /// - `GenErr` - Unspecified error
 ///
-/// ## SNMPv2c/v3 Errors (6-18)
+/// ## SNMPv2c/v3 errors (6-18)
 ///
 /// These provide more specific error information for SET operations:
 ///
@@ -975,8 +974,8 @@ impl ErrorStatus {
 
     /// Return the canonical SMI name for this status code.
     ///
-    /// For `Unknown` variants, returns `None`; callers should format the
-    /// numeric code directly in that case.
+    /// Returns `None` for `Unknown` variants. Format the numeric code directly
+    /// in that case.
     #[must_use]
     pub fn as_str(&self) -> Option<&'static str> {
         match self {

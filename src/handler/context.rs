@@ -1,8 +1,7 @@
 //! Request context for MIB handlers.
 //!
-//! This module provides [`RequestContext`], which contains information about
-//! incoming SNMP requests for use in handler authorization decisions and
-//! cooperative deadline/shutdown handling.
+//! [`RequestContext`] contains incoming request information for handler
+//! authorization decisions and cooperative deadline and shutdown handling.
 
 use std::net::SocketAddr;
 

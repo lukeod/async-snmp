@@ -251,7 +251,7 @@ pub struct View {
 }
 
 impl View {
-    /// Create a new empty view.
+    /// Create an empty view.
     ///
     /// An empty view contains no OIDs. Add subtrees with [`include()`](View::include)
     /// or [`exclude()`](View::exclude).
@@ -723,7 +723,7 @@ impl fmt::Debug for RedactedSecurityMapping<'_> {
 }
 
 impl VacmConfig {
-    /// Create a new empty VACM configuration.
+    /// Create an empty VACM configuration.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -794,7 +794,7 @@ impl VacmConfig {
         any_match
     }
 
-    /// Get access entry for context.
+    /// Returns the access entry for a context.
     ///
     /// Returns the best matching entry per RFC 3415 Section 4 (vacmAccessTable DESCRIPTION).
     /// Selection uses a 4-tier preference order:
@@ -899,7 +899,7 @@ pub struct VacmBuilder {
 }
 
 impl VacmBuilder {
-    /// Create a new VACM builder.
+    /// Create a VACM builder.
     #[must_use]
     pub fn new() -> Self {
         Self {

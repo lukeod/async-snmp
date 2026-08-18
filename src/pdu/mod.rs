@@ -125,7 +125,7 @@ impl PduType {
         }
     }
 
-    /// Get the tag byte.
+    /// Returns the tag byte.
     #[must_use]
     pub fn tag(self) -> u8 {
         self as u8
@@ -476,7 +476,7 @@ impl Pdu {
         )
     }
 
-    /// Create a new GET request PDU.
+    /// Create a GET request PDU.
     #[must_use]
     pub(crate) fn get_request(request_id: i32, oids: &[Oid]) -> Self {
         Self::standard(
@@ -488,7 +488,7 @@ impl Pdu {
         )
     }
 
-    /// Create a new GETNEXT request PDU.
+    /// Create a GETNEXT request PDU.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn get_next_request(request_id: i32, oids: &[Oid]) -> Self {
@@ -501,7 +501,7 @@ impl Pdu {
         )
     }
 
-    /// Create a new SET request PDU.
+    /// Create a SET request PDU.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn set_request(request_id: i32, varbinds: Vec<VarBind>) -> Self {
@@ -1012,7 +1012,7 @@ impl Pdu {
         self.pdu_type() == PduType::Response && self.error_status() != 0
     }
 
-    /// Get the error status as an enum.
+    /// Returns the error status as an enum.
     #[must_use]
     pub fn error_status_enum(&self) -> ErrorStatus {
         ErrorStatus::from_i32(self.error_status())
@@ -1819,7 +1819,7 @@ impl GenericTrap {
         }
     }
 
-    /// Get the integer value.
+    /// Returns the integer value.
     #[must_use]
     pub fn as_i32(self) -> i32 {
         match self {
@@ -1876,7 +1876,7 @@ impl TrapV1Pdu {
         )
     }
 
-    /// Create a new `SNMPv1` Trap PDU.
+    /// Create an SNMPv1 Trap PDU.
     #[must_use]
     pub(crate) fn new(
         enterprise: Oid,
@@ -2024,7 +2024,8 @@ impl TrapV1Pdu {
     /// (snmpTrapAddress.0, snmpTrapCommunity.0, snmpTrapEnterprise.0) are only
     /// appended when a proxy forwards a received trap.
     ///
-    /// The `request_id` is set to 0; callers should assign their own.
+    /// The `request_id` is set to 0. Assign an application-specific request ID
+    /// before sending the PDU.
     ///
     /// # Errors
     ///

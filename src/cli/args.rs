@@ -1,6 +1,6 @@
 //! Command-line argument structures for async-snmp CLI tools.
 //!
-//! This module provides reusable clap argument structures for the `asnmp-*` CLI tools.
+//! Provides reusable clap argument structures for the `asnmp-*` CLI tools.
 
 use clap::{Parser, ValueEnum};
 use std::time::Duration;
@@ -149,7 +149,7 @@ impl std::fmt::Debug for CommonArgs {
 }
 
 impl CommonArgs {
-    /// Get the timeout as a Duration.
+    /// Returns the timeout as a [`Duration`].
     ///
     /// # Errors
     ///

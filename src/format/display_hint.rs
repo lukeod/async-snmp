@@ -1,8 +1,7 @@
 //! RFC 2579 DISPLAY-HINT formatting for OCTET STRING values.
 //!
-//! This module provides parsing and application of DISPLAY-HINT format strings
-//! to raw bytes, commonly used to format MAC addresses, IP addresses, and other
-//! structured binary data.
+//! Parses and applies DISPLAY-HINT format strings to raw bytes, such as MAC
+//! addresses, IP addresses, and other structured binary data.
 //!
 //! # Examples
 //!
@@ -28,7 +27,7 @@ use crate::format::hex;
 /// Parses the hint string and applies it to the data in a single pass.
 /// On any parse error or empty input, falls back to lowercase hex encoding.
 ///
-/// # Format Specification
+/// # Format specification
 ///
 /// Each format specification has the form: `[*]<length><format>[separator][terminator]`
 ///

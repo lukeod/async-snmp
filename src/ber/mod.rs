@@ -1,6 +1,6 @@
 //! BER (Basic Encoding Rules) codec for SNMP.
 //!
-//! This module provides encoding and decoding of BER-encoded data as used in SNMP.
+//! Encodes and decodes the Basic Encoding Rules (BER) used by SNMP.
 //! The implementation follows X.690 with permissive parsing aligned with net-snmp behavior.
 
 mod decode;

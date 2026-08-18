@@ -98,7 +98,7 @@ impl MasterKey {
     /// Returns [`CryptoError::UnsupportedAlgorithm`](super::CryptoError::UnsupportedAlgorithm) if the active crypto
     /// backend does not support the requested authentication protocol.
     ///
-    /// # Empty and Short Passwords
+    /// # Empty and short passwords
     ///
     /// Passwords shorter than [`MIN_PASSWORD_LENGTH`] (8 octets) are rejected
     /// with [`CryptoError::PasswordTooShort`](super::CryptoError::PasswordTooShort),
@@ -198,7 +198,7 @@ impl MasterKey {
         })
     }
 
-    /// Get the protocol this key is for.
+    /// Returns the protocol for this key.
     #[must_use]
     pub fn protocol(&self) -> AuthProtocol {
         self.protocol
@@ -214,7 +214,7 @@ impl MasterKey {
         self.backend = backend;
     }
 
-    /// Get the raw key bytes.
+    /// Returns the raw key bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.key
@@ -267,7 +267,7 @@ impl LocalizedKey {
     /// engines share credentials, use [`MasterKey`] to retain the intermediate
     /// result and call [`MasterKey::localize`] for each engine.
     ///
-    /// # Empty and Short Passwords
+    /// # Empty and short passwords
     ///
     /// Passwords shorter than [`MIN_PASSWORD_LENGTH`] (8 octets) are rejected
     /// with [`CryptoError::PasswordTooShort`](super::CryptoError::PasswordTooShort),
@@ -354,7 +354,7 @@ impl LocalizedKey {
         })
     }
 
-    /// Get the protocol this key is for.
+    /// Returns the protocol for this key.
     #[must_use]
     pub fn protocol(&self) -> AuthProtocol {
         self.protocol
@@ -366,13 +366,13 @@ impl LocalizedKey {
         self.backend
     }
 
-    /// Get the raw key bytes.
+    /// Returns the raw key bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.key
     }
 
-    /// Get the MAC length for this key's protocol.
+    /// Returns the MAC length for this key's protocol.
     #[must_use]
     pub fn mac_len(&self) -> usize {
         self.protocol.mac_len()
@@ -673,7 +673,7 @@ pub struct MasterKeys {
 }
 
 impl MasterKeys {
-    /// Create master keys with just authentication.
+    /// Create master keys for authentication without privacy.
     ///
     /// # Errors
     ///
@@ -765,13 +765,13 @@ impl MasterKeys {
         Ok(self)
     }
 
-    /// Get the authentication master key.
+    /// Returns the authentication master key.
     #[must_use]
     pub fn auth_master(&self) -> &MasterKey {
         &self.auth_master
     }
 
-    /// Get the privacy master key, if configured.
+    /// Returns the privacy master key, if configured.
     ///
     /// Returns the separate priv master key if set, otherwise returns the
     /// auth master key (for same-password case).
@@ -784,13 +784,13 @@ impl MasterKeys {
         }
     }
 
-    /// Get the configured privacy protocol.
+    /// Returns the configured privacy protocol.
     #[must_use]
     pub fn priv_protocol(&self) -> Option<super::PrivProtocol> {
         self.priv_protocol
     }
 
-    /// Get the authentication protocol.
+    /// Returns the authentication protocol.
     #[must_use]
     pub fn auth_protocol(&self) -> AuthProtocol {
         self.auth_master.protocol()
@@ -926,7 +926,7 @@ pub(crate) fn extend_key_with_backend(
 /// ... and so on
 /// ```
 ///
-/// # Performance Warning
+/// # Performance warning
 ///
 /// This is approximately 1000x slower than [`extend_key`] (Blumenthal) because each
 /// iteration requires the full 1 MB password expansion.

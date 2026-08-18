@@ -182,7 +182,7 @@ pub struct TargetClientBuilder {
 }
 
 impl ClientBuilder {
-    /// Create a new client builder.
+    /// Create a client builder.
     ///
     /// # Arguments
     ///
@@ -422,7 +422,9 @@ impl ClientBuilder {
     ///
     /// Allows multiple clients to share target-to-engine identity mappings and
     /// per-authoritative-engine trusted time, reducing discovery requests and
-    /// keeping clients that reach the same engine coherent. Cache expiry affects
+    /// keeping clients that reach the same engine coherent. Concurrent ordinary
+    /// discovery by independently constructed clients for the same resolved
+    /// address is automatically coalesced through this cache. Cache expiry affects
     /// lookup by newly constructed clients; it does not replace an identity
     /// already established by a live client. Use
     /// [`Client::rediscover_engine`](crate::Client::rediscover_engine) for an
@@ -663,7 +665,8 @@ impl TargetClientBuilder {
         self
     }
 
-    /// Use a shared SNMPv3 engine cache.
+    /// Use a shared SNMPv3 engine cache, including automatic ordinary-discovery
+    /// coalescing for independently constructed clients targeting one address.
     #[must_use]
     pub fn engine_cache(mut self, cache: Arc<EngineCache>) -> Self {
         self.client = self.client.engine_cache(cache);
@@ -761,7 +764,7 @@ impl TargetClientBuilder {
 
     /// Connect via UDP (default).
     ///
-    /// Creates a new UDP socket for this client. Each call allocates a
+    /// Create a UDP socket for this client. Each call allocates a
     /// separate socket and recv loop.
     ///
     /// To share a single socket across multiple clients, use
@@ -866,8 +869,8 @@ impl TargetClientBuilder {
 
     /// Build a per-target client handle on a shared UDP transport.
     ///
-    /// This method specifically accepts a preconstructed [`UdpTransport`]
-    /// socket owner. It resolves the builder's target and creates a
+    /// Accepts a preconstructed [`UdpTransport`] socket owner, resolves the
+    /// builder's target, and creates a
     /// [`UdpHandle`] for the first compatible address. All clients built this
     /// way share one socket and one recv loop. For an arbitrary already-created
     /// type that implements [`Transport`], use
@@ -931,7 +934,7 @@ impl TargetClientBuilder {
     /// - Messages exceed UDP's maximum datagram size
     /// - Reliable delivery is required
     ///
-    /// Note that TCP has higher overhead than UDP due to connection setup
+    /// TCP has higher overhead than UDP because it requires connection setup
     /// and per-message framing.
     ///
     /// When a hostname resolves to multiple addresses, each address is tried

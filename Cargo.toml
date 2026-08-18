@@ -33,7 +33,7 @@ serde_json = { version = "1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # MIB integration (optional)
-mib-rs = { version = "0.8", optional = true, default-features = false }
+mib-rs = { version = "0.10", optional = true, default-features = false }
 
 # V3 crypto dependencies (FIPS backend)
 aws-lc-rs = { version = "1", optional = true, default-features = false, features = ["fips"] }

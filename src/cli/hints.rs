@@ -1,7 +1,7 @@
 //! Well-known OID name hints.
 //!
-//! This module provides a small hardcoded table of common OID names for display purposes.
-//! This is NOT MIB support - just friendly names for common system OIDs.
+//! Provides a small built-in table of common system OID names for display.
+//! These hints do not replace MIB loading or resolution.
 
 use crate::Oid;
 

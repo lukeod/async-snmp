@@ -1,13 +1,11 @@
 //! Walk an SNMP table with MIB-aware output.
 //!
-//! Loads MIBs from system paths, resolves "ifTable" by name, walks it,
-//! and formats results using MIB metadata (symbolic OID names, enum labels,
-//! display hints).
+//! This example loads MIB modules from the system search paths, resolves
+//! `ifTable`, walks the table, and formats each result with a symbolic OID,
+//! enumeration labels, and display hints.
 //!
-//! Requires the `mib` feature:
-//!   cargo run --example mib_walk --features mib -- 192.168.1.1
-//!
-//! This example requires an SNMP agent to be running at the specified target.
+//! Run `cargo run --example mib_walk --features mib -- 192.168.1.1`. The target
+//! must run an SNMP agent.
 
 use async_snmp::mib_support::{self, Loader};
 use async_snmp::{Auth, Client};
@@ -18,10 +16,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
-    // Load MIBs from system paths (net-snmp, libsmi)
+    // Load MIB modules from the system search paths.
     let mib = tokio::task::spawn_blocking(|| Loader::new().system_paths().load()).await??;
 
-    // Resolve "ifTable" by name
+    // Resolve ifTable by name.
     let if_table = mib_support::resolve_oid(&mib, "ifTable")?;
     println!(
         "Walking {} ({})",
@@ -29,18 +27,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if_table
     );
 
-    // Connect and walk
+    // Connect to the agent and walk the table.
     let client = Client::builder(target, Auth::v2c("public"))
         .connect()
         .await?;
 
     let results: Vec<_> = client.walk(if_table)?.collect().await?;
 
-    // Format each result using MIB metadata
+    // Format each result with its MIB metadata.
     for vb in &results {
         println!("{}", mib_support::format_varbind(&mib, vb));
     }
 
-    println!("\n{} varbinds returned", results.len());
+    println!("\n{} variable bindings returned", results.len());
     Ok(())
 }

@@ -1,14 +1,13 @@
-//! MIB integration helpers for async-snmp.
+//! MIB integration for async-snmp.
 //!
-//! This module provides functions that use a loaded [`Mib`] to resolve
-//! OID names, format OIDs symbolically, and render SNMP values using MIB
-//! metadata (enum labels, display hints, type information).
+//! Use a loaded [`Mib`] to resolve OID names, format OIDs symbolically, and
+//! render SNMP values with enum labels, display hints, and type information.
 //!
-//! This is part of the public API, gated on the `mib` feature. All functions
-//! take a `&Mib` reference and are stateless.
+//! This module requires the `mib` Cargo feature. Its functions borrow a
+//! caller-provided `Mib` and do not retain state.
 //!
-//! Key mib-rs types are re-exported here so users can depend on `async-snmp`
-//! alone without adding `mib-rs` as a direct dependency.
+//! The module re-exports the mib-rs types needed for loading MIBs and decoding
+//! table indexes, so applications do not need a direct mib-rs dependency.
 
 use crate::format::hex;
 use crate::{Oid, Value, VarBind};
@@ -16,7 +15,10 @@ use mib_rs::mib::display_hint::HexCase;
 use smallvec::SmallVec;
 
 // Re-export core mib-rs types so users don't need a direct mib-rs dependency.
-pub use mib_rs::{Access, DiagnosticConfig, Kind, Loader, Mib, ResolveOidError, source};
+pub use mib_rs::{
+    Access, DecodeOptions, DiagnosticConfig, IndexSchema, Kind, Loader, Mib, ResolveOidError,
+    source,
+};
 
 /// Resolve a name like "sysDescr.0" or "IF-MIB::ifTable" to an async-snmp OID.
 ///
@@ -35,21 +37,21 @@ pub fn format_oid(mib: &Mib, oid: &Oid) -> String {
     mib.format_oid(&oid.to_mib_oid())
 }
 
-/// Format a VarBind using MIB metadata: OID name + formatted value.
+/// Format a variable binding as a symbolic OID, ` = `, and a formatted value.
 ///
 /// The OID is formatted via [`format_oid`] to produce `MODULE::name.suffix`.
 /// The value is formatted using MIB type information (enum labels, display
-/// hints) when the OID matches an OBJECT-TYPE definition. When no Object
-/// is found, falls back to the value's `Display` impl.
+/// hints) when the OID matches an OBJECT-TYPE definition. When no object is
+/// found, it uses the value's [`std::fmt::Display`] implementation.
 ///
-/// Output like "IF-MIB::ifDescr.1 = eth0"
+/// For example, this function can return `IF-MIB::ifDescr.1 = eth0`.
 pub fn format_varbind(mib: &Mib, vb: &VarBind) -> String {
     let oid_str = format_oid(mib, &vb.oid);
     let value_str = format_value(mib, &vb.oid, &vb.value);
     format!("{} = {}", oid_str, value_str)
 }
 
-/// Richer metadata about a VarBind for programmatic use.
+/// MIB metadata for a variable binding.
 ///
 /// The struct borrows `object_name`, `module_name`, and `units` from the
 /// `Mib`, while `suffix` and `formatted_value` are owned. Callers cannot
@@ -72,7 +74,7 @@ pub struct VarBindInfo<'a> {
     pub formatted_value: String,
 }
 
-/// Get structured metadata about a VarBind using MIB information.
+/// Returns structured MIB metadata for a variable binding.
 ///
 /// Returns `None` if the OID does not match any OBJECT-TYPE definition.
 /// Bare nodes (OID registrations without an OBJECT-TYPE) return `None`.
@@ -99,9 +101,9 @@ pub fn describe_varbind<'a>(mib: &'a Mib, vb: &VarBind) -> Option<VarBindInfo<'a
 
 /// Format a value using MIB metadata for the given OID.
 ///
-/// Looks up the OID in the MIB to find type information (enum labels,
-/// display hints), and uses it to produce a human-readable string.
-/// Falls back to the value's `Display` impl when no OBJECT-TYPE matches.
+/// Looks up enum labels and display hints for the OID. If no OBJECT-TYPE
+/// matches, this function uses the value's [`std::fmt::Display`]
+/// implementation.
 pub fn format_value(mib: &Mib, oid: &Oid, value: &Value) -> String {
     let mib_oid = oid.to_mib_oid();
     let lookup = mib.lookup_instance(&mib_oid);

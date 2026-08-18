@@ -34,7 +34,7 @@ impl From<CommunityVersion> for Version {
 }
 
 impl Version {
-    /// Get the BER-encoded version number.
+    /// Returns the BER-encoded version number.
     ///
     /// # Examples
     ///

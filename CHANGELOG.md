@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The optional `mib` integration now targets mib-rs 0.10 and uses its owned,
+  exact `IndexSchema` codec for table index decoding.
 - Agent construction now has one checked `construction_timeout` spanning UDP
   bind, configuration-order notification-sink DNS, and local setup after pure
   validation. Timeout errors retain the bind address and the active sink's
