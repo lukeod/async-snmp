@@ -1954,12 +1954,8 @@ mod tests {
     async fn request_uses_remaining_budget_after_lock_wait() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (request_read_tx, request_read_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            socket.read_exact(&mut request).await.unwrap();
-            request_read_tx.send(()).unwrap();
+            let (_socket, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
         });
         let transport = TcpTransport::connect(server_addr).await.unwrap();
@@ -1973,8 +1969,10 @@ mod tests {
         assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
         tokio::time::advance(Duration::from_secs(6)).await;
         drop(held_lock);
+        // Polling after lock acquisition arms the transaction and begins I/O.
+        // Do not await real socket readiness while time is paused: an idle
+        // runtime may auto-advance to the request's deadline.
         assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
-        request_read_rx.await.unwrap();
 
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
