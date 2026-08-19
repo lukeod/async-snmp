@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-08-19
+
+### Fixed
+
+- Docs.rs builds no longer enable the AWS-LC FIPS backend, whose native build
+  currently attempts to modify dependency sources in the read-only sandbox.
+
 ## [0.18.0] - 2026-08-19
 
 ### Changed

@@ -21,7 +21,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "async-snmp"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "aes",
  "bytes",

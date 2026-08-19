@@ -1,6 +1,6 @@
 [package]
 name = "async-snmp"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Modern async-first SNMP client library for Rust"
@@ -12,7 +12,7 @@ keywords = ["snmp", "network", "async", "monitoring"]
 categories = ["network-programming", "asynchronous"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["agent", "crypto-rustcrypto", "cli", "mib", "rt-multi-thread"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
