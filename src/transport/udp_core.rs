@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use super::{Candidate, CorrelationWindow, RequestRegistration, ResponseIdentity};
+use super::{
+    Candidate, CorrelationEnvelope, CorrelationWindow, RequestRegistration, ResponseIdentity,
+};
 use crate::error::{Error, Result};
 
 const SHARDS: usize = 64;
@@ -414,7 +416,28 @@ impl UdpCore {
     ///
     /// Returns `true` if the slot existed and the response was stored,
     /// `false` if there was no matching pending request.
+    #[cfg(test)]
     pub fn deliver(&self, request_id: i32, data: Bytes, source: SocketAddr) -> bool {
+        self.deliver_with_envelope(request_id, None, data, source)
+    }
+
+    pub(crate) fn deliver_parsed(
+        &self,
+        request_id: i32,
+        envelope: CorrelationEnvelope,
+        data: Bytes,
+        source: SocketAddr,
+    ) -> bool {
+        self.deliver_with_envelope(request_id, Some(envelope), data, source)
+    }
+
+    fn deliver_with_envelope(
+        &self,
+        request_id: i32,
+        envelope: Option<CorrelationEnvelope>,
+        data: Bytes,
+        source: SocketAddr,
+    ) -> bool {
         let (target_id, owner) = {
             let pending = self.shard(request_id).pending.lock().unwrap();
             match pending.get(&request_id) {
@@ -423,7 +446,14 @@ impl UdpCore {
                 None => (request_id, None),
             }
         };
-        self.deliver_to(target_id, owner.as_ref(), request_id, data, source)
+        self.deliver_to(
+            target_id,
+            owner.as_ref(),
+            request_id,
+            envelope,
+            data,
+            source,
+        )
     }
 
     fn deliver_to(
@@ -431,6 +461,7 @@ impl UdpCore {
         target_id: i32,
         expected_owner: Option<&Arc<RegistrationOwner>>,
         request_id: i32,
+        envelope: Option<CorrelationEnvelope>,
         data: Bytes,
         source: SocketAddr,
     ) -> bool {
@@ -461,10 +492,20 @@ impl UdpCore {
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by strict source correlation");
                 return false;
             }
-            match slot
-                .registration
-                .evaluate_response_identity(&data, source_is_target)
-            {
+            let identity = envelope.map_or_else(
+                || {
+                    slot.registration
+                        .evaluate_response_identity(&data, source_is_target)
+                },
+                |envelope| {
+                    slot.registration.evaluate_parsed_response_identity(
+                        &data,
+                        envelope,
+                        source_is_target,
+                    )
+                },
+            );
+            match identity {
                 ResponseIdentity::Reject => {
                     drop(pending);
                     self.stats

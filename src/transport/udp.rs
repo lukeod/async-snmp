@@ -79,7 +79,7 @@
 use super::udp_core::UdpCore;
 pub use super::udp_core::UdpStats;
 use super::udp_error::{UdpRecvErrorBackoff, UdpRecvErrorClass, classify_udp_recv_error};
-use super::{Candidate, RequestRegistration, Transport, extract_request_id, normalize_udp_target};
+use super::{Candidate, CorrelationEnvelope, RequestRegistration, Transport, normalize_udp_target};
 use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
 use crate::util::bind_udp_socket;
@@ -304,8 +304,10 @@ impl UdpTransport {
                                 }
                                 let data = Bytes::copy_from_slice(&buf[..len]);
 
-                                if let Some(request_id) = extract_request_id(&data) {
-                                    if !core.deliver(request_id, data, source) {
+                                if let Some(envelope) = CorrelationEnvelope::parse(&data)
+                                    && let Some(request_id) = envelope.request_id(&data)
+                                {
+                                    if !core.deliver_parsed(request_id, envelope, data, source) {
                                         tracing::debug!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.source = %source }, "response for unknown request");
                                     }
                                 } else {

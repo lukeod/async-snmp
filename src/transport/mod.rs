@@ -372,17 +372,30 @@ impl RequestRegistration {
             return ResponseIdentity::Match;
         }
 
-        let Some(envelope) = CorrelationEnvelope::parse(data, self.decode_config) else {
+        let Some(envelope) = CorrelationEnvelope::parse(data) else {
             return ResponseIdentity::Reject;
         };
-        let Some(response_id) = envelope.request_id() else {
+
+        self.evaluate_parsed_response_identity(data, envelope, source_is_target)
+    }
+
+    fn evaluate_parsed_response_identity(
+        &self,
+        data: &[u8],
+        envelope: CorrelationEnvelope,
+        source_is_target: bool,
+    ) -> ResponseIdentity {
+        if !self.decode_config.trailing_bytes && envelope.content_end != data.len() {
+            return ResponseIdentity::Reject;
+        }
+        let Some(response_id) = envelope.request_id(data) else {
             return ResponseIdentity::Reject;
         };
         if response_id != self.request_id && !self.aliases.contains(&response_id) {
             return ResponseIdentity::Reject;
         }
 
-        self.correlation.evaluate(envelope, source_is_target)
+        self.correlation.evaluate(data, envelope, source_is_target)
     }
 }
 
@@ -401,7 +414,8 @@ pub enum ResponseIdentity {
 impl ResponseCorrelation {
     fn evaluate(
         &self,
-        envelope: CorrelationEnvelope<'_>,
+        data: &[u8],
+        envelope: CorrelationEnvelope,
         source_is_target: bool,
     ) -> ResponseIdentity {
         #[cfg(test)]
@@ -422,7 +436,7 @@ impl ResponseCorrelation {
             };
         };
 
-        let Some((actual_version, actual_community)) = envelope.community_identity() else {
+        let Some((actual_version, actual_community)) = envelope.community_identity(data) else {
             return ResponseIdentity::Reject;
         };
         if actual_version != *version {
@@ -1078,21 +1092,21 @@ pub(crate) fn normalize_udp_target(
 /// datagram contains a compatible suffix. Nested correlation parsing therefore
 /// cannot inspect or match bytes outside that envelope.
 #[derive(Clone, Copy)]
-struct CorrelationEnvelope<'a> {
-    data: &'a [u8],
+pub(crate) struct CorrelationEnvelope {
+    content_end: usize,
     version: Version,
     after_version: usize,
 }
 
-impl<'a> CorrelationEnvelope<'a> {
-    fn parse(data: &'a [u8], config: DecodeConfig) -> Option<Self> {
+impl CorrelationEnvelope {
+    pub(crate) fn parse(data: &[u8]) -> Option<Self> {
         if data.first().copied()? != 0x30 {
             return None;
         }
         let (outer_len, outer_len_bytes) = parse_ber_length(data.get(1..)?)?;
         let content_start = 1usize.checked_add(outer_len_bytes)?;
         let content_end = content_start.checked_add(outer_len)?;
-        if content_end > data.len() || (!config.trailing_bytes && content_end != data.len()) {
+        if content_end > data.len() {
             return None;
         }
 
@@ -1111,18 +1125,18 @@ impl<'a> CorrelationEnvelope<'a> {
         }
         let version = Version::from_i32(decode_ber_signed_integer(data.get(pos..version_end)?))?;
         Some(Self {
-            data,
+            content_end,
             version,
             after_version: version_end,
         })
     }
 
-    fn community_identity(self) -> Option<(Version, &'a [u8])> {
+    fn community_identity(self, data: &[u8]) -> Option<(Version, &[u8])> {
         if !matches!(self.version, Version::V1 | Version::V2c) {
             return None;
         }
 
-        let data = self.data;
+        let data = data.get(..self.content_end)?;
         let mut pos = self.after_version;
         if *data.get(pos)? != 0x04 {
             return None;
@@ -1134,10 +1148,11 @@ impl<'a> CorrelationEnvelope<'a> {
         Some((self.version, data.get(pos..community_end)?))
     }
 
-    fn request_id(self) -> Option<i32> {
+    pub(crate) fn request_id(self, data: &[u8]) -> Option<i32> {
+        let data = data.get(..self.content_end)?;
         match self.version {
-            Version::V1 | Version::V2c => extract_v1v2c_request_id(self.data, self.after_version),
-            Version::V3 => extract_v3_msg_id(self.data, self.after_version),
+            Version::V1 | Version::V2c => extract_v1v2c_request_id(data, self.after_version),
+            Version::V3 => extract_v3_msg_id(data, self.after_version),
         }
     }
 }
@@ -1149,7 +1164,7 @@ impl<'a> CorrelationEnvelope<'a> {
 /// a datagram suffix.
 #[cfg(test)]
 pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])> {
-    CorrelationEnvelope::parse(data, DecodeConfig::default())?.community_identity()
+    CorrelationEnvelope::parse(data)?.community_identity(data)
 }
 
 // ============================================================================
@@ -1171,8 +1186,9 @@ pub(crate) fn extract_community_identity(data: &[u8]) -> Option<(Version, &[u8])
 /// We navigate only within the first complete declared top-level envelope to
 /// find the appropriate ID. A bounded datagram suffix is ignored here so the
 /// registered strict/compatible policy can decide whether to accept it.
+#[cfg(test)]
 pub(crate) fn extract_request_id(data: &[u8]) -> Option<i32> {
-    CorrelationEnvelope::parse(data, DecodeConfig::default())?.request_id()
+    CorrelationEnvelope::parse(data)?.request_id(data)
 }
 
 /// Extract msgID from V3 message starting at msgGlobalData position.

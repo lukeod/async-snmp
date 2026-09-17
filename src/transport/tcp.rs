@@ -71,7 +71,9 @@
 //! # }
 //! ```
 
-use super::{Candidate, RequestRegistration, ResponseIdentity, Transport, extract_request_id};
+#[cfg(test)]
+use super::extract_request_id;
+use super::{Candidate, CorrelationEnvelope, RequestRegistration, ResponseIdentity, Transport};
 use crate::error::{ConstructionStage, Error, Result};
 use crate::message_size::ReceiveLimits;
 use bytes::{Bytes, BytesMut};
@@ -720,7 +722,11 @@ where
             .await
             .map_err(CorrelatedReadError::Framing)?;
 
-        let Some(frame_id) = extract_request_id(&frame) else {
+        let Some(envelope) = CorrelationEnvelope::parse(&frame) else {
+            tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "complete response frame has no extractable correlation ID");
+            continue;
+        };
+        let Some(frame_id) = envelope.request_id(&frame) else {
             tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "complete response frame has no extractable correlation ID");
             continue;
         };
@@ -729,7 +735,7 @@ where
             continue;
         }
 
-        match registration.evaluate_response_identity(&frame, true) {
+        match registration.evaluate_parsed_response_identity(&frame, envelope, true) {
             ResponseIdentity::Match => {}
             ResponseIdentity::AcceptedCommunityMismatch => {
                 tracing::warn!(target: "async_snmp::transport::tcp", { request_id, %target }, "accepted rewritten response community");
