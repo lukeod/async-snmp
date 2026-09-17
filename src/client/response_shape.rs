@@ -231,7 +231,24 @@ pub(crate) fn classify(
 
     match &request {
         RequestShape::Get(_) | RequestShape::Set(_) => {
-            if unique_non_identity_permutation(&request, &varbinds) {
+            let positionally_ordered = varbinds
+                .iter()
+                .enumerate()
+                .all(|(index, varbind)| varbind.oid == *request.oid(index));
+            if positionally_ordered {
+                if let RequestShape::Set(values) = &request {
+                    for (index, vb) in varbinds.iter().enumerate() {
+                        if vb.value != values[index].1 {
+                            anomalies.push(ResponseShapeAnomaly::SetValueMismatch {
+                                request_index: request_offset + index,
+                                response_index: response_offset + index,
+                                expected: values[index].1.clone(),
+                                actual: vb.value.clone(),
+                            });
+                        }
+                    }
+                }
+            } else if unique_permutation(&request, &varbinds) {
                 anomalies.push(ResponseShapeAnomaly::Reordered {
                     request_range,
                     response_range,
@@ -302,7 +319,7 @@ pub(crate) fn classify(
     }
 }
 
-fn unique_non_identity_permutation(request: &RequestShape<'_>, varbinds: &[VarBind]) -> bool {
+fn unique_permutation(request: &RequestShape<'_>, varbinds: &[VarBind]) -> bool {
     if (0..request.len()).any(|i| (i + 1..request.len()).any(|j| request.oid(i) == request.oid(j)))
         || (0..varbinds.len())
             .any(|i| (i + 1..varbinds.len()).any(|j| varbinds[i].oid == varbinds[j].oid))
@@ -310,17 +327,9 @@ fn unique_non_identity_permutation(request: &RequestShape<'_>, varbinds: &[VarBi
         return false;
     }
 
-    let Some(permutation) = varbinds
+    varbinds
         .iter()
-        .map(|vb| (0..request.len()).find(|&index| request.oid(index) == &vb.oid))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    permutation
-        .iter()
-        .enumerate()
-        .any(|(index, &mapped)| index != mapped)
+        .all(|varbind| (0..request.len()).any(|index| request.oid(index) == &varbind.oid))
 }
 
 #[cfg(test)]
