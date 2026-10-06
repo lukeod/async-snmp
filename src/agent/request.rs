@@ -143,7 +143,10 @@ impl Agent {
         }
 
         let response_pdu = if self.resolve_vacm(&mut ctx) {
-            self.dispatch_request(&ctx, pdu).await?
+            let Some(response) = self.dispatch_request(&ctx, pdu).await? else {
+                return Ok(None);
+            };
+            response
         } else {
             let (status, error_index) = if version == Version::V1 {
                 if pdu.varbinds.is_empty() {
@@ -306,7 +309,10 @@ impl Agent {
         };
 
         let response_pdu = if self.resolve_vacm(&mut ctx) {
-            self.dispatch_request(&ctx, pdu).await?
+            let Some(response) = self.dispatch_request(&ctx, pdu).await? else {
+                return Ok(None);
+            };
+            response
         } else {
             pdu.to_error_response(
                 Version::V3,
