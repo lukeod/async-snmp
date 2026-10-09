@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HandlerError::drop_request` suppresses the entire SNMPv1/v2c retrieval
+  response, even after successful GETBULK repetitions. Ordinary handler errors
+  and SNMPv3 requests retain their existing `genErr` behavior.
+
 ## [0.18.1] - 2026-08-19
 
 ### Fixed

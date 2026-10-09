@@ -7,7 +7,7 @@
 //! - [`GetNextResult`] - Result of a GETNEXT operation
 //! - [`SetTestError`] / [`SetTestResult`] - SET validation failures and prepared state
 //! - [`SetCommitResult`] / [`SetUndoResult`] - Phase-specific apply and rollback results
-//! - [`HandlerError`] / [`HandlerResult`] - Handler processing failures (mapped to `genErr`)
+//! - [`HandlerError`] / [`HandlerResult`] - Handler processing failures or intentional request drops
 
 use std::borrow::Cow;
 
@@ -15,7 +15,7 @@ use crate::error::ErrorStatus;
 use crate::value::Value;
 use crate::varbind::VarBind;
 
-/// A handler processing failure, reported to the manager as a `genErr` Response.
+/// A handler processing failure or a request to suppress the response.
 ///
 /// Returned as the `Err` side of [`HandlerResult`] from
 /// [`MibHandler::get`](super::MibHandler::get) and
@@ -30,11 +30,15 @@ use crate::varbind::VarBind;
 /// | No more OIDs in the subtree | `Ok(GetNextResult::EndOfMibView)` |
 /// | Couldn't find out (backend failure) | `Err(HandlerError)` |
 ///
-/// When a handler returns an error, the agent answers the whole request with
+/// By default, the agent answers the whole request with
 /// error-status `genErr` and error-index set to the failing variable binding
 /// (RFC 3416 Section 4.2.1), for all protocol versions. The message and source
 /// are logged by the agent; they are never sent on the wire — `genErr` carries
 /// no detail.
+///
+/// [`HandlerError::drop_request`] instead suppresses the entire SNMPv1/v2c
+/// GET, GETNEXT, or GETBULK response, including any results already collected.
+/// SNMPv3 retains the default `genErr` behavior.
 ///
 /// # Construction
 ///
@@ -64,6 +68,7 @@ use crate::varbind::VarBind;
 /// of it.
 pub struct HandlerError {
     message: Cow<'static, str>,
+    drop_request: bool,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -73,7 +78,22 @@ impl HandlerError {
         Self {
             message: message.into(),
             source: None,
+            drop_request: false,
         }
+    }
+
+    /// Suppress the entire SNMPv1/v2c retrieval response; log the reason at debug level.
+    pub fn drop_request(message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            drop_request: true,
+            ..Self::new(message)
+        }
+    }
+
+    /// Whether this error requests that the agent suppress the response.
+    #[must_use]
+    pub fn is_drop_request(&self) -> bool {
+        self.drop_request
     }
 
     /// The failure message (used for agent-side logging only; never sent on
@@ -100,6 +120,7 @@ impl std::fmt::Debug for HandlerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HandlerError")
             .field("message", &self.message)
+            .field("drop_request", &self.drop_request)
             .field("source", &self.source)
             .finish()
     }
@@ -110,6 +131,7 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for HandlerError {
         Self {
             message: err.to_string().into(),
             source: Some(Box::new(err)),
+            drop_request: false,
         }
     }
 }
@@ -118,7 +140,7 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for HandlerError {
 /// [`MibHandler::get_next`](super::MibHandler::get_next).
 ///
 /// `Err` means the handler failed to process the request and the agent must
-/// answer `genErr`; see [`HandlerError`] for when to return which.
+/// answer `genErr` or suppress the response; see [`HandlerError`].
 pub type HandlerResult<T> = Result<T, HandlerError>;
 
 /// Result of preparing one SET varbind.

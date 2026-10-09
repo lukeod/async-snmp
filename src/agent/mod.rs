@@ -2484,26 +2484,27 @@ impl Agent {
     }
 
     /// Dispatch a request to the appropriate handler.
-    async fn dispatch_request(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn dispatch_request(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         match pdu.pdu_type() {
             PduType::GetRequest => self.handle_get(ctx, pdu).await,
             PduType::GetNextRequest => self.handle_get_next(ctx, pdu).await,
             PduType::GetBulkRequest => {
                 // SNMPv1 does not support GETBULK
                 if ctx.version() == Version::V1 {
-                    return pdu.to_error_response(
+                    return Ok(Some(pdu.to_error_response(
                         ctx.version(),
                         ErrorStatus::GenErr,
                         usize::from(!pdu.varbinds.is_empty()),
-                    );
+                    )?));
                 }
                 self.handle_get_bulk(ctx, pdu).await
             }
-            PduType::SetRequest => self.handle_set(ctx, pdu).await,
-            PduType::InformRequest => self.handle_inform(ctx, pdu),
+            PduType::SetRequest => self.handle_set(ctx, pdu).await.map(Some),
+            PduType::InformRequest => self.handle_inform(ctx, pdu).map(Some),
             _ => {
                 // Should not happen - filtered earlier
                 pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, 0)
+                    .map(Some)
             }
         }
     }
@@ -2569,7 +2570,7 @@ impl Agent {
     }
 
     /// Handle GET request.
-    async fn handle_get(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn handle_get(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         let mut response_varbinds = Vec::with_capacity(pdu.varbinds.len());
 
         for (index, vb) in pdu.varbinds.iter().enumerate() {
@@ -2579,11 +2580,11 @@ impl Agent {
             {
                 // v1: noSuchName, v2c/v3: noAccess or NoSuchObject
                 if ctx.version() == Version::V1 {
-                    return pdu.to_error_response(
+                    return Ok(Some(pdu.to_error_response(
                         ctx.version(),
                         ErrorStatus::NoSuchName,
                         index + 1,
-                    );
+                    )?));
                 }
                 // For GET, return NoSuchObject for inaccessible OIDs per RFC 3415
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::NoSuchObject));
@@ -2593,6 +2594,10 @@ impl Agent {
             let result = if let Some(handler) = self.find_handler(&vb.oid) {
                 match handler.handler.get(ctx, &vb.oid).await {
                     Ok(result) => result,
+                    Err(err) if err.is_drop_request() && ctx.version() != Version::V3 => {
+                        tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                        return Ok(None);
+                    }
                     Err(err) => {
                         // RFC 3416 Section 4.2.1: a varbind whose processing
                         // fails yields a genErr Response naming its index.
@@ -2602,11 +2607,11 @@ impl Agent {
                             error = %err,
                             "handler GET failed; responding genErr"
                         );
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::GenErr,
                             index + 1,
-                        );
+                        )?));
                     }
                 }
             } else {
@@ -2616,33 +2621,33 @@ impl Agent {
             let response_value = match result {
                 GetResult::Value(v) => {
                     if v1_rejects_counter64(ctx.version(), &v) {
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
-                        );
+                        )?));
                     }
                     v
                 }
                 GetResult::NoSuchObject => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchObject exception
                     if ctx.version() == Version::V1 {
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
-                        );
+                        )?));
                     }
                     Value::NoSuchObject
                 }
                 GetResult::NoSuchInstance => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchInstance exception
                     if ctx.version() == Version::V1 {
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
-                        );
+                        )?));
                     }
                     Value::NoSuchInstance
                 }
@@ -2651,11 +2656,13 @@ impl Agent {
             response_varbinds.push(VarBind::new(vb.oid.clone(), response_value));
         }
 
-        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
+        Ok(Some(
+            ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw(),
+        ))
     }
 
     /// Handle GETNEXT request.
-    async fn handle_get_next(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn handle_get_next(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         let mut response_varbinds = Vec::with_capacity(pdu.varbinds.len());
 
         for (index, vb) in pdu.varbinds.iter().enumerate() {
@@ -2664,6 +2671,10 @@ impl Agent {
             // continuing the walk until an accessible OID is found.
             let next = match self.get_next_accessible_oid(ctx, &vb.oid).await {
                 Ok(next) => next,
+                Err(err) if err.is_drop_request() && ctx.version() != Version::V3 => {
+                    tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                    return Ok(None);
+                }
                 Err(err) => {
                     tracing::warn!(
                         target: "async_snmp::agent",
@@ -2671,7 +2682,11 @@ impl Agent {
                         error = %err,
                         "handler GETNEXT failed; responding genErr"
                     );
-                    return pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, index + 1);
+                    return Ok(Some(pdu.to_error_response(
+                        ctx.version(),
+                        ErrorStatus::GenErr,
+                        index + 1,
+                    )?));
                 }
             };
 
@@ -2680,24 +2695,26 @@ impl Agent {
             } else {
                 // v1 returns noSuchName, v2c/v3 returns endOfMibView
                 if ctx.version() == Version::V1 {
-                    return pdu.to_error_response(
+                    return Ok(Some(pdu.to_error_response(
                         ctx.version(),
                         ErrorStatus::NoSuchName,
                         index + 1,
-                    );
+                    )?));
                 }
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
             }
         }
 
-        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
+        Ok(Some(
+            ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw(),
+        ))
     }
 
     /// Handle GETBULK request.
     ///
     /// Per RFC 3416 Section 4.2.3, if the response would exceed the message
     /// size limit, we return fewer variable bindings rather than all of them.
-    async fn handle_get_bulk(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn handle_get_bulk(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         let PduBody::GetBulk {
             non_repeaters,
             max_repetitions,
@@ -2721,6 +2738,10 @@ impl Agent {
         for (index, vb) in pdu.varbinds.iter().take(non_repeaters).enumerate() {
             let next = match self.get_next_accessible_oid(ctx, &vb.oid).await {
                 Ok(next) => next,
+                Err(err) if err.is_drop_request() && ctx.version() != Version::V3 => {
+                    tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                    return Ok(None);
+                }
                 Err(err) => {
                     // RFC 3416 Section 4.2.3: error-index names the varbind in
                     // the received request.
@@ -2730,7 +2751,11 @@ impl Agent {
                         error = %err,
                         "handler GETBULK failed; responding genErr"
                     );
-                    return pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, index + 1);
+                    return Ok(Some(pdu.to_error_response(
+                        ctx.version(),
+                        ErrorStatus::GenErr,
+                        index + 1,
+                    )?));
                 }
             };
 
@@ -2754,10 +2779,10 @@ impl Agent {
                 // non-repeater prefix collected so far without running the
                 // repeater loop (falling through would emit repeater varbinds
                 // into the dropped non-repeater's slot).
-                return Ok(
+                return Ok(Some(
                     ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?
                         .into_raw(),
-                );
+                ));
             }
 
             current_size += next_vb.encoded_size();
@@ -2778,6 +2803,10 @@ impl Agent {
                     } else {
                         let next = match self.get_next_accessible_oid(ctx, oid).await {
                             Ok(next) => next,
+                            Err(err) if err.is_drop_request() && ctx.version() != Version::V3 => {
+                                tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                                return Ok(None);
+                            }
                             Err(err) => {
                                 // error-index refers to the repeater's position
                                 // in the received request, whatever the
@@ -2789,11 +2818,11 @@ impl Agent {
                                     error = %err,
                                     "handler GETBULK failed; responding genErr"
                                 );
-                                return pdu.to_error_response(
+                                return Ok(Some(pdu.to_error_response(
                                     ctx.version(),
                                     ErrorStatus::GenErr,
                                     non_repeaters + i + 1,
-                                );
+                                )?));
                             }
                         };
 
@@ -2828,7 +2857,9 @@ impl Agent {
             }
         }
 
-        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
+        Ok(Some(
+            ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw(),
+        ))
     }
 
     /// Find the handler for a given OID.
@@ -4261,7 +4292,11 @@ mod tests {
                 0,
                 vec![VarBind::new(cursor, Value::Null)],
             );
-            let response = agent.dispatch_request(&ctx, &request).await.unwrap();
+            let response = agent
+                .dispatch_request(&ctx, &request)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
             assert_eq!(response.error_index(), 1);
             assert_eq!(response.varbinds, request.varbinds);
@@ -4293,7 +4328,11 @@ mod tests {
         let request =
             Pdu::get_bulk(11, 0, 2, vec![VarBind::new(root.child(1), Value::Null)]).unwrap();
 
-        let response = agent.dispatch_request(&ctx, &request).await.unwrap();
+        let response = agent
+            .dispatch_request(&ctx, &request)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             response
                 .varbinds
@@ -4599,7 +4638,7 @@ mod tests {
         let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
         let pdu = Pdu::get_bulk(10, 0, 3, vec![VarBind::new(prefix.clone(), Value::Null)]).unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(
             response
                 .varbinds
@@ -4677,7 +4716,7 @@ mod tests {
             ],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 2);
         assert_eq!(response.varbinds.len(), 2);
@@ -4703,7 +4742,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
     }
@@ -4724,7 +4763,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
     }
@@ -4748,9 +4787,106 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 2);
+    }
+
+    struct DropBackendHandler;
+
+    impl MibHandler for DropBackendHandler {
+        fn get<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async move {
+                FailingBackendHandler
+                    .get(ctx, oid)
+                    .await
+                    .map_err(|err| HandlerError::drop_request(err.message().to_owned()))
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async move {
+                FailingBackendHandler
+                    .get_next(ctx, oid)
+                    .await
+                    .map_err(|err| HandlerError::drop_request(err.message().to_owned()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_drop_discards_the_entire_community_request() {
+        use crate::message::CommunityMessage;
+        let root = oid!(1, 3, 6, 1, 4, 1, 99999);
+        let first = root.child(1).child(0);
+        let oids = [first.clone(), first.child(1)];
+        let binding = |oid: Oid| vec![VarBind::new(oid, Value::Null)];
+        let requests = [
+            (Pdu::get_request(1, &oids), 2),
+            (Pdu::get_next_request(2, &oids), 1),
+            (Pdu::get_bulk(3, 1, 2, binding(first.clone())).unwrap(), 1),
+            (Pdu::get_bulk(4, 0, 2, binding(first)).unwrap(), 1),
+            // The first repetition succeeds; the second must discard its result.
+            (Pdu::get_bulk(5, 0, 2, binding(root.clone())).unwrap(), 1),
+        ];
+        for drop in [false, true] {
+            let handler: Arc<dyn MibHandler> = if drop {
+                Arc::new(DropBackendHandler)
+            } else {
+                Arc::new(FailingBackendHandler)
+            };
+            let agent = AgentBuilder::new()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .allow_all_access()
+                .handler(root.clone(), handler)
+                .build()
+                .await
+                .unwrap();
+            for version in [Version::V1, Version::V2c] {
+                for (pdu, index) in &requests {
+                    if version == Version::V1 && pdu.pdu_type() == PduType::GetBulkRequest {
+                        continue;
+                    }
+                    let message = match version {
+                        Version::V1 => CommunityMessage::v1("public", pdu.clone()),
+                        _ => CommunityMessage::v2c("public", pdu.clone()),
+                    }
+                    .unwrap()
+                    .encode()
+                    .unwrap();
+                    let response = agent
+                        .handle_request(message, "127.0.0.1:9999".parse().unwrap())
+                        .await
+                        .unwrap();
+                    if drop {
+                        assert!(
+                            response.is_none(),
+                            "{version:?}: request {}",
+                            pdu.request_id
+                        );
+                    } else {
+                        let decoded = CommunityMessage::decode(
+                            response.unwrap(),
+                            crate::DecodeConfig::default(),
+                        )
+                        .unwrap()
+                        .value;
+                        let response = decoded.pdu().standard().unwrap();
+                        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+                        assert_eq!(response.error_index(), *index);
+                    }
+                }
+            }
+        }
     }
 
     // FiveOidHandler has OIDs at .99999.{1,2,3,4,5}.0 with integer values 1-5.
@@ -4839,7 +4975,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // Collect the OIDs returned (excluding EndOfMibView sentinels)
         let returned_oids: Vec<&Oid> = response
@@ -4898,7 +5034,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // First non-repeater skips denied .99999.1.0 and returns accessible .99999.2.0
         assert_eq!(
@@ -4986,7 +5122,7 @@ mod tests {
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
@@ -5059,7 +5195,7 @@ mod tests {
         );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), MAX_GETNEXT_SKIP_ITERATIONS);
@@ -5074,7 +5210,7 @@ mod tests {
         );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::NoSuchName.as_i32());
         assert_eq!(response.error_index(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -5176,7 +5312,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].oid,
@@ -5210,7 +5346,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].value,
@@ -5241,7 +5377,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // Both OIDs should appear
         assert!(
@@ -5283,7 +5419,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(
             ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::GenErr,
@@ -5367,7 +5503,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(
             ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::NoSuchName,
@@ -5393,7 +5529,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0);
         assert!(matches!(response.varbinds[0].value, Value::Counter64(_)));
     }
@@ -5433,7 +5569,11 @@ mod tests {
         )
         .unwrap();
 
-        let full_response = agent.dispatch_request(&ctx_unlimited, &pdu).await.unwrap();
+        let full_response = agent
+            .dispatch_request(&ctx_unlimited, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         let full_count = full_response
             .varbinds
             .iter()
@@ -5458,7 +5598,11 @@ mod tests {
             150,
         );
 
-        let limited_response = agent.dispatch_request(&ctx_limited, &pdu).await.unwrap();
+        let limited_response = agent
+            .dispatch_request(&ctx_limited, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         let limited_count = limited_response
             .varbinds
             .iter()
@@ -5590,6 +5734,7 @@ mod tests {
             .dispatch_request(&v2c, &pdu)
             .await
             .unwrap()
+            .unwrap()
             .varbinds
             .iter()
             .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
@@ -5607,6 +5752,7 @@ mod tests {
         let authpriv_count = agent
             .dispatch_request(&authpriv, &pdu)
             .await
+            .unwrap()
             .unwrap()
             .varbinds
             .iter()
@@ -5724,7 +5870,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // Only the first non-repeater fit; the response is exactly that prefix.
         assert_eq!(
@@ -5789,7 +5935,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
@@ -5838,7 +5984,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
@@ -5869,7 +6015,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         let data_count = response
             .varbinds
             .iter()
@@ -5901,7 +6047,7 @@ mod tests {
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0, "should succeed");
         assert_eq!(
             response.varbinds[0].oid,
@@ -7268,7 +7414,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert!(matches!(response.varbinds[0].value, Value::Integer(1)));
@@ -7338,7 +7484,7 @@ mod tests {
         .unwrap()
         .into_raw();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.pdu_type(), PduType::Response);
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.request_id, 7);
@@ -7362,7 +7508,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
