@@ -988,6 +988,8 @@ impl super::Agent {
     }
 
     /// Generate a notification request/message ID.
+    // Atomic::try_update requires Rust 1.95; the MSRV is 1.88.
+    #[allow(deprecated)]
     fn next_notification_id(&self) -> i32 {
         use std::sync::atomic::Ordering;
         self.inner

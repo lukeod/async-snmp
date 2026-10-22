@@ -357,6 +357,8 @@ impl DesSaltState {
     /// The reservation is burned even if later message encoding or encryption
     /// fails. It cannot be constructed or reused with a different epoch.
     pub fn reserve(&self) -> PrivacyResult<DesSaltReservation> {
+        // Atomic::try_update requires Rust 1.95; the MSRV is 1.88.
+        #[allow(deprecated)]
         let salt = self
             .inner
             .last_salt

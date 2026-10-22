@@ -726,6 +726,8 @@ impl EngineCache {
     }
 
     fn record_recovery(&self) {
+        // Atomic::try_update requires Rust 1.95; the MSRV is 1.88.
+        #[allow(deprecated)]
         let _ = self
             .recoveries
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
