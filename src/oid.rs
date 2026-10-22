@@ -517,7 +517,11 @@ impl Oid {
         let mut arcs = SmallVec::new();
 
         // Decode the combined first subidentifier with its wider valid range.
-        let (first_subid, consumed) = decode_first_subidentifier(data)?;
+        let (first_subid, consumed) = if data[0] & 0x80 == 0 {
+            (u64::from(data[0]), 1)
+        } else {
+            decode_first_subidentifier(data)?
+        };
 
         // Split the combined value back into u32 arcs.
         let (arc1, arc2) = if first_subid < 40 {
@@ -536,14 +540,17 @@ impl Oid {
         // Decode remaining arcs
         let mut i = consumed;
         while i < data.len() {
-            let (arc, bytes_consumed) =
+            let (arc, bytes_consumed) = if data[i] & 0x80 == 0 {
+                (u32::from(data[i]), 1)
+            } else {
                 decode_subidentifier(&data[i..]).map_err(|error| match *error {
                     Error::Decode(mut error) => {
                         error.offset = i.saturating_add(error.offset);
                         Error::Decode(error).boxed()
                     }
                     other => Box::new(other),
-                })?;
+                })?
+            };
             arcs.push(arc);
             i += bytes_consumed;
 

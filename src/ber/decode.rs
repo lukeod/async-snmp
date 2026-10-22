@@ -245,6 +245,19 @@ impl<'a> Decoder<'a> {
         Ok(bytes)
     }
 
+    fn read_slice(&mut self, len: usize) -> Result<&[u8]> {
+        if self.offset.saturating_add(len) > self.data.len() {
+            tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::InsufficientData { needed: len, available: self.remaining() } }, "insufficient data");
+            return Err(self.malformed(DecodeErrorKind::InsufficientData {
+                needed: len,
+                available: self.remaining(),
+            }));
+        }
+        let start = self.offset;
+        self.offset += len;
+        Ok(&self.data[start..self.offset])
+    }
+
     /// Read and expect a specific tag, returning the content length.
     pub fn expect_tag(&mut self, expected: u8) -> Result<usize> {
         let tag = self.read_tag()?;
@@ -325,14 +338,14 @@ impl<'a> Decoder<'a> {
             return Err(self.malformed(DecodeErrorKind::IntegerTooLong { length: len }));
         }
 
-        let bytes = self.read_bytes(len)?;
+        let bytes = self.read_slice(len)?;
 
         // Sign-extend into i64. The generic caller truncates this to i32 to
         // match net-snmp's CHECK_OVERFLOW_S compatibility behavior.
         let is_negative = bytes[0] & 0x80 != 0;
         let mut value: i64 = if is_negative { -1 } else { 0 };
 
-        for &byte in &bytes {
+        for &byte in bytes {
             value = (value << 8) | i64::from(byte);
         }
 
@@ -364,7 +377,7 @@ impl<'a> Decoder<'a> {
             return Err(self.malformed(DecodeErrorKind::Integer64TooLong { length: len }));
         }
 
-        let bytes = self.read_bytes(len)?;
+        let bytes = self.read_slice(len)?;
 
         if len == 9 && bytes[0] != 0x00 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Integer64MissingLeadingZero }, "9-octet integer64 missing leading zero");
@@ -373,7 +386,7 @@ impl<'a> Decoder<'a> {
 
         let mut value: u64 = 0;
 
-        for &byte in &bytes {
+        for &byte in bytes {
             value = (value << 8) | u64::from(byte);
         }
 
@@ -433,7 +446,7 @@ impl<'a> Decoder<'a> {
             return Err(self.malformed(DecodeErrorKind::Unsigned32TooLong { length: len }));
         }
 
-        let bytes = self.read_bytes(len)?;
+        let bytes = self.read_slice(len)?;
 
         if len == 9 && bytes[0] != 0x00 {
             tracing::debug!(target: "async_snmp::ber", { snmp.offset = %self.offset, kind = %DecodeErrorKind::Unsigned32MissingLeadingZero }, "9-octet unsigned32 missing leading zero");
@@ -441,7 +454,7 @@ impl<'a> Decoder<'a> {
         }
 
         let mut value: u64 = 0;
-        for &byte in &bytes {
+        for &byte in bytes {
             value = (value << 8) | u64::from(byte);
         }
         Ok(value)
