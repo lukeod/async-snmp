@@ -159,12 +159,21 @@ pub trait PreparedSet: Send + 'static {
 /// # Error handling
 ///
 /// Both methods return [`HandlerResult`], so `?` works on any error type
-/// implementing [`std::error::Error`]. Return `Err` only for *processing
+/// implementing [`std::error::Error`]. Return ordinary errors only for *processing
 /// failures* — "I could not find out" — never for "the object does not
-/// exist", which is expressed by the `Ok` variants above. On `Err`, the
+/// exist", which is expressed by the `Ok` variants above. On an ordinary error, the
 /// agent responds to the whole request with `genErr` and the error-index of
 /// the failing variable binding (RFC 3416 Section 4.2.1), and logs the
 /// error; the message is never sent to the manager.
+///
+/// Simulators and test agents may return
+/// [`HandlerError::drop_request`](super::HandlerError::drop_request) to suppress
+/// the entire GET, GETNEXT, or GETBULK response for any SNMP version, including
+/// results collected before the marker. GETNEXT/GETBULK probe all registered
+/// handlers before filtering candidate OIDs for access, so even a handler
+/// outside the selected or accessible subtree can suppress the whole request.
+/// Earlier errors, access checks, or walk truncation may prevent later handler
+/// calls; returning the marker does not guarantee that other handlers run.
 ///
 /// # SET two-phase commit (RFC 3416)
 ///
@@ -382,10 +391,12 @@ pub trait MibHandler: Send + Sync + 'static {
     /// or `Ok(`[`GetResult::NoSuchInstance`]`)` if the object type exists but
     /// this specific instance doesn't.
     ///
-    /// Return `Err(`[`HandlerError`](super::HandlerError)`)` only when the
+    /// Return an ordinary `Err(`[`HandlerError`](super::HandlerError)`)` when the
     /// handler failed to determine an answer (e.g. its backing store is
     /// unreachable); the agent then responds to the whole request with
     /// `genErr` per RFC 3416 Section 4.2.1.
+    /// For simulator silence, return
+    /// [`HandlerError::drop_request`](super::HandlerError::drop_request) instead.
     ///
     /// See [`GetResult`] documentation for details on when to use each variant.
     fn get<'a>(
@@ -403,10 +414,13 @@ pub trait MibHandler: Send + Sync + 'static {
     /// must return `true` for it. The agent rejects either contract violation
     /// and responds to the request with `genErr`.
     ///
-    /// Return `Err(`[`HandlerError`](super::HandlerError)`)` only when the
+    /// Return an ordinary `Err(`[`HandlerError`](super::HandlerError)`)` when the
     /// handler failed to determine an answer; the agent then responds to the
     /// whole request (including GETBULK) with `genErr` per RFC 3416
     /// Section 4.2.1.
+    /// For simulator silence, return
+    /// [`HandlerError::drop_request`](super::HandlerError::drop_request) instead;
+    /// this suppresses the whole request even if another handler offers a value.
     fn get_next<'a>(
         &'a self,
         ctx: &'a RequestContext,

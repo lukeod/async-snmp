@@ -20,15 +20,17 @@ use crate::varbind::VarBind;
 /// Returned as the `Err` side of [`HandlerResult`] from
 /// [`MibHandler::get`](super::MibHandler::get) and
 /// [`MibHandler::get_next`](super::MibHandler::get_next) when the handler
-/// *failed to process* the request — the backing store was unreachable, a lock
-/// was poisoned, a hardware read timed out. It is distinct from the RFC 3416
-/// exception values, which are successful answers about the MIB:
+/// failed to process the request (for example, a backing store was unreachable)
+/// or explicitly requests silence via [`HandlerError::drop_request`].
+/// It is distinct from the RFC 3416 exception values, which are successful
+/// answers about the MIB:
 ///
 /// | Situation | Return |
 /// |-----------|--------|
 /// | Object/instance doesn't exist | `Ok(GetResult::NoSuchObject / NoSuchInstance)` |
 /// | No more OIDs in the subtree | `Ok(GetNextResult::EndOfMibView)` |
 /// | Couldn't find out (backend failure) | `Err(HandlerError)` |
+/// | Simulate an unresponsive device | `Err(HandlerError::drop_request("simulated loss"))` |
 ///
 /// By default, the agent answers the whole request with
 /// error-status `genErr` and error-index set to the failing variable binding
@@ -36,9 +38,8 @@ use crate::varbind::VarBind;
 /// are logged by the agent; they are never sent on the wire — `genErr` carries
 /// no detail.
 ///
-/// [`HandlerError::drop_request`] instead suppresses the entire SNMPv1/v2c
+/// [`HandlerError::drop_request`] instead suppresses the entire SNMPv1/v2c/v3
 /// GET, GETNEXT, or GETBULK response, including any results already collected.
-/// SNMPv3 retains the default `genErr` behavior.
 ///
 /// # Construction
 ///
@@ -82,7 +83,31 @@ impl HandlerError {
         }
     }
 
-    /// Suppress the entire SNMPv1/v2c retrieval response; log the reason at debug level.
+    /// Suppress the entire retrieval response for any SNMP version.
+    ///
+    /// Intended for simulators and test agents modeling an unresponsive device.
+    /// Return this from [`MibHandler::get`](super::MibHandler::get) or
+    /// [`MibHandler::get_next`](super::MibHandler::get_next). All results already
+    /// collected for the GET, GETNEXT, or GETBULK request are discarded, including
+    /// earlier GETBULK repetitions. The reason is logged at debug level.
+    ///
+    /// GETNEXT/GETBULK probe all registered handlers, so the marker can suppress
+    /// a response even when another handler offers an accessible value.
+    /// SET and INFORM processing are unaffected. SNMPv3 discovery and security
+    /// processing occur before handler dispatch and may still generate Reports.
+    ///
+    /// ```rust
+    /// use async_snmp::handler::{GetResult, HandlerError, HandlerResult};
+    ///
+    /// fn simulated_read(respond: bool) -> HandlerResult<GetResult> {
+    ///     if !respond {
+    ///         return Err(HandlerError::drop_request("simulated packet loss"));
+    ///     }
+    ///     Ok(GetResult::Value(async_snmp::Value::Integer(42)))
+    /// }
+    ///
+    /// assert!(simulated_read(false).unwrap_err().is_drop_request());
+    /// ```
     pub fn drop_request(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             drop_request: true,
@@ -96,8 +121,8 @@ impl HandlerError {
         self.drop_request
     }
 
-    /// The failure message (used for agent-side logging only; never sent on
-    /// the wire).
+    /// The failure or suppression reason (used for agent-side logging only;
+    /// never sent on the wire).
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -139,8 +164,8 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for HandlerError {
 /// Result type returned by [`MibHandler::get`](super::MibHandler::get) and
 /// [`MibHandler::get_next`](super::MibHandler::get_next).
 ///
-/// `Err` means the handler failed to process the request and the agent must
-/// answer `genErr` or suppress the response; see [`HandlerError`].
+/// Ordinary errors produce `genErr`; [`HandlerError::drop_request`] explicitly
+/// suppresses the entire retrieval response for any SNMP version.
 pub type HandlerResult<T> = Result<T, HandlerError>;
 
 /// Result of preparing one SET varbind.
@@ -532,6 +557,7 @@ mod tests {
     #[test]
     fn test_handler_error_message_only() {
         let err = HandlerError::new("backend down");
+        assert!(!err.is_drop_request());
         assert_eq!(err.message(), "backend down");
         assert!(err.source().is_none());
         assert_eq!(err.to_string(), "backend down");
@@ -541,6 +567,7 @@ mod tests {
     fn test_handler_error_from_std_error() {
         let io_err = std::io::Error::other("bus timeout");
         let err: HandlerError = io_err.into();
+        assert!(!err.is_drop_request());
         assert_eq!(err.message(), "bus timeout");
         assert!(err.source().is_some());
         assert_eq!(err.to_string(), "bus timeout");
@@ -553,6 +580,16 @@ mod tests {
             unreachable!()
         }
         let err = inner().unwrap_err();
+        assert!(!err.is_drop_request());
         assert_eq!(err.message(), "no route");
+    }
+
+    #[test]
+    fn test_handler_error_drop_request() {
+        let err = HandlerError::drop_request("simulated packet loss");
+        assert!(err.is_drop_request());
+        assert_eq!(err.message(), "simulated packet loss");
+        assert_eq!(err.to_string(), "simulated packet loss");
+        assert!(err.source().is_none());
     }
 }
