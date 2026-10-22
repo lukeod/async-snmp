@@ -7,21 +7,24 @@
 //! - [`PreparedSet`], [`SetTestResult`] - Request-owned SET transaction state
 //! - [`GetResult`], [`GetNextResult`] - Read operation results
 //! - [`SetTestResult`], [`SetCommitResult`], [`SetUndoResult`] - SET phase results
-//! - [`HandlerError`], [`HandlerResult`] - Processing failures, reported as `genErr`
+//! - [`HandlerError`], [`HandlerResult`] - Processing failures or intentional response suppression
 //! - [`OidTable`] - Helper for implementing GETNEXT with sorted OID storage
 //!
 //! # Overview
 //!
 //! Handlers are registered with an [`Agent`](crate::agent::Agent) using a prefix OID.
-//! When the agent receives a request, it dispatches to the handler with the longest
-//! matching prefix. Each handler implements the [`MibHandler`] trait to respond to
-//! GET, GETNEXT, and optionally SET operations.
+//! GET and SET use the handler with the longest matching prefix. GETNEXT and
+//! GETBULK probe registered handlers to find the lexicographic successor.
+//! Each handler implements the [`MibHandler`] trait to respond to GET, GETNEXT,
+//! and optionally SET operations.
 //!
 //! GET and GETNEXT return [`HandlerResult`], so `?` works on any
 //! [`std::error::Error`] inside a handler. `Ok` carries the protocol answer —
 //! including the "doesn't exist" exception values — while `Err` means the
 //! handler failed to produce one (e.g. its backing store was unreachable) and
-//! makes the agent answer the request with `genErr` (RFC 3416 Section 4.2.1).
+//! normally makes the agent answer with `genErr` (RFC 3416 Section 4.2.1).
+//! For simulators and test agents, [`HandlerError::drop_request`] instead
+//! suppresses the entire retrieval response for every SNMP version.
 //!
 //! # Basic handler example
 //!

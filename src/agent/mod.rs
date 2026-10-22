@@ -2484,26 +2484,27 @@ impl Agent {
     }
 
     /// Dispatch a request to the appropriate handler.
-    async fn dispatch_request(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn dispatch_request(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         match pdu.pdu_type() {
             PduType::GetRequest => self.handle_get(ctx, pdu).await,
             PduType::GetNextRequest => self.handle_get_next(ctx, pdu).await,
             PduType::GetBulkRequest => {
                 // SNMPv1 does not support GETBULK
                 if ctx.version() == Version::V1 {
-                    return pdu.to_error_response(
+                    return Ok(Some(pdu.to_error_response(
                         ctx.version(),
                         ErrorStatus::GenErr,
                         usize::from(!pdu.varbinds.is_empty()),
-                    );
+                    )?));
                 }
                 self.handle_get_bulk(ctx, pdu).await
             }
-            PduType::SetRequest => self.handle_set(ctx, pdu).await,
-            PduType::InformRequest => self.handle_inform(ctx, pdu),
+            PduType::SetRequest => self.handle_set(ctx, pdu).await.map(Some),
+            PduType::InformRequest => self.handle_inform(ctx, pdu).map(Some),
             _ => {
                 // Should not happen - filtered earlier
                 pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, 0)
+                    .map(Some)
             }
         }
     }
@@ -2569,7 +2570,7 @@ impl Agent {
     }
 
     /// Handle GET request.
-    async fn handle_get(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn handle_get(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         let mut response_varbinds = Vec::with_capacity(pdu.varbinds.len());
 
         for (index, vb) in pdu.varbinds.iter().enumerate() {
@@ -2579,11 +2580,11 @@ impl Agent {
             {
                 // v1: noSuchName, v2c/v3: noAccess or NoSuchObject
                 if ctx.version() == Version::V1 {
-                    return pdu.to_error_response(
+                    return Ok(Some(pdu.to_error_response(
                         ctx.version(),
                         ErrorStatus::NoSuchName,
                         index + 1,
-                    );
+                    )?));
                 }
                 // For GET, return NoSuchObject for inaccessible OIDs per RFC 3415
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::NoSuchObject));
@@ -2593,6 +2594,10 @@ impl Agent {
             let result = if let Some(handler) = self.find_handler(&vb.oid) {
                 match handler.handler.get(ctx, &vb.oid).await {
                     Ok(result) => result,
+                    Err(err) if err.is_drop_request() => {
+                        tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                        return Ok(None);
+                    }
                     Err(err) => {
                         // RFC 3416 Section 4.2.1: a varbind whose processing
                         // fails yields a genErr Response naming its index.
@@ -2602,11 +2607,11 @@ impl Agent {
                             error = %err,
                             "handler GET failed; responding genErr"
                         );
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::GenErr,
                             index + 1,
-                        );
+                        )?));
                     }
                 }
             } else {
@@ -2616,33 +2621,33 @@ impl Agent {
             let response_value = match result {
                 GetResult::Value(v) => {
                     if v1_rejects_counter64(ctx.version(), &v) {
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
-                        );
+                        )?));
                     }
                     v
                 }
                 GetResult::NoSuchObject => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchObject exception
                     if ctx.version() == Version::V1 {
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
-                        );
+                        )?));
                     }
                     Value::NoSuchObject
                 }
                 GetResult::NoSuchInstance => {
                     // v1 returns noSuchName error, v2c/v3 returns NoSuchInstance exception
                     if ctx.version() == Version::V1 {
-                        return pdu.to_error_response(
+                        return Ok(Some(pdu.to_error_response(
                             ctx.version(),
                             ErrorStatus::NoSuchName,
                             index + 1,
-                        );
+                        )?));
                     }
                     Value::NoSuchInstance
                 }
@@ -2651,11 +2656,13 @@ impl Agent {
             response_varbinds.push(VarBind::new(vb.oid.clone(), response_value));
         }
 
-        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
+        Ok(Some(
+            ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw(),
+        ))
     }
 
     /// Handle GETNEXT request.
-    async fn handle_get_next(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn handle_get_next(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         let mut response_varbinds = Vec::with_capacity(pdu.varbinds.len());
 
         for (index, vb) in pdu.varbinds.iter().enumerate() {
@@ -2664,6 +2671,10 @@ impl Agent {
             // continuing the walk until an accessible OID is found.
             let next = match self.get_next_accessible_oid(ctx, &vb.oid).await {
                 Ok(next) => next,
+                Err(err) if err.is_drop_request() => {
+                    tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                    return Ok(None);
+                }
                 Err(err) => {
                     tracing::warn!(
                         target: "async_snmp::agent",
@@ -2671,7 +2682,11 @@ impl Agent {
                         error = %err,
                         "handler GETNEXT failed; responding genErr"
                     );
-                    return pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, index + 1);
+                    return Ok(Some(pdu.to_error_response(
+                        ctx.version(),
+                        ErrorStatus::GenErr,
+                        index + 1,
+                    )?));
                 }
             };
 
@@ -2680,24 +2695,26 @@ impl Agent {
             } else {
                 // v1 returns noSuchName, v2c/v3 returns endOfMibView
                 if ctx.version() == Version::V1 {
-                    return pdu.to_error_response(
+                    return Ok(Some(pdu.to_error_response(
                         ctx.version(),
                         ErrorStatus::NoSuchName,
                         index + 1,
-                    );
+                    )?));
                 }
                 response_varbinds.push(VarBind::new(vb.oid.clone(), Value::EndOfMibView));
             }
         }
 
-        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
+        Ok(Some(
+            ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw(),
+        ))
     }
 
     /// Handle GETBULK request.
     ///
     /// Per RFC 3416 Section 4.2.3, if the response would exceed the message
     /// size limit, we return fewer variable bindings rather than all of them.
-    async fn handle_get_bulk(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
+    async fn handle_get_bulk(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         let PduBody::GetBulk {
             non_repeaters,
             max_repetitions,
@@ -2721,6 +2738,10 @@ impl Agent {
         for (index, vb) in pdu.varbinds.iter().take(non_repeaters).enumerate() {
             let next = match self.get_next_accessible_oid(ctx, &vb.oid).await {
                 Ok(next) => next,
+                Err(err) if err.is_drop_request() => {
+                    tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                    return Ok(None);
+                }
                 Err(err) => {
                     // RFC 3416 Section 4.2.3: error-index names the varbind in
                     // the received request.
@@ -2730,7 +2751,11 @@ impl Agent {
                         error = %err,
                         "handler GETBULK failed; responding genErr"
                     );
-                    return pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, index + 1);
+                    return Ok(Some(pdu.to_error_response(
+                        ctx.version(),
+                        ErrorStatus::GenErr,
+                        index + 1,
+                    )?));
                 }
             };
 
@@ -2754,10 +2779,10 @@ impl Agent {
                 // non-repeater prefix collected so far without running the
                 // repeater loop (falling through would emit repeater varbinds
                 // into the dropped non-repeater's slot).
-                return Ok(
+                return Ok(Some(
                     ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?
                         .into_raw(),
-                );
+                ));
             }
 
             current_size += next_vb.encoded_size();
@@ -2778,6 +2803,10 @@ impl Agent {
                     } else {
                         let next = match self.get_next_accessible_oid(ctx, oid).await {
                             Ok(next) => next,
+                            Err(err) if err.is_drop_request() => {
+                                tracing::debug!(target: "async_snmp::agent", error = %err, "handler requested dropping response");
+                                return Ok(None);
+                            }
                             Err(err) => {
                                 // error-index refers to the repeater's position
                                 // in the received request, whatever the
@@ -2789,11 +2818,11 @@ impl Agent {
                                     error = %err,
                                     "handler GETBULK failed; responding genErr"
                                 );
-                                return pdu.to_error_response(
+                                return Ok(Some(pdu.to_error_response(
                                     ctx.version(),
                                     ErrorStatus::GenErr,
                                     non_repeaters + i + 1,
-                                );
+                                )?));
                             }
                         };
 
@@ -2828,7 +2857,9 @@ impl Agent {
             }
         }
 
-        Ok(ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw())
+        Ok(Some(
+            ResponsePdu::success(ctx.version(), pdu.request_id, response_varbinds)?.into_raw(),
+        ))
     }
 
     /// Find the handler for a given OID.
@@ -2844,7 +2875,7 @@ impl Agent {
     /// Find the next OID accessible under VACM, skipping denied OIDs by
     /// continuing the walk. Returns None when end-of-MIB is reached or all
     /// remaining candidates are denied. A handler processing failure
-    /// propagates as Err (mapped to genErr by the caller).
+    /// propagates as Err; the caller sends genErr or honors an explicit drop marker.
     async fn get_next_accessible_oid(
         &self,
         ctx: &RequestContext,
@@ -4261,7 +4292,11 @@ mod tests {
                 0,
                 vec![VarBind::new(cursor, Value::Null)],
             );
-            let response = agent.dispatch_request(&ctx, &request).await.unwrap();
+            let response = agent
+                .dispatch_request(&ctx, &request)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
             assert_eq!(response.error_index(), 1);
             assert_eq!(response.varbinds, request.varbinds);
@@ -4293,7 +4328,11 @@ mod tests {
         let request =
             Pdu::get_bulk(11, 0, 2, vec![VarBind::new(root.child(1), Value::Null)]).unwrap();
 
-        let response = agent.dispatch_request(&ctx, &request).await.unwrap();
+        let response = agent
+            .dispatch_request(&ctx, &request)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             response
                 .varbinds
@@ -4599,7 +4638,7 @@ mod tests {
         let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
         let pdu = Pdu::get_bulk(10, 0, 3, vec![VarBind::new(prefix.clone(), Value::Null)]).unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(
             response
                 .varbinds
@@ -4677,7 +4716,7 @@ mod tests {
             ],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 2);
         assert_eq!(response.varbinds.len(), 2);
@@ -4703,7 +4742,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
     }
@@ -4724,7 +4763,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
     }
@@ -4748,9 +4787,517 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 2);
+    }
+
+    struct DropBackendHandler;
+
+    impl MibHandler for DropBackendHandler {
+        fn get<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            Box::pin(async move {
+                FailingBackendHandler
+                    .get(ctx, oid)
+                    .await
+                    .map_err(|err| HandlerError::drop_request(err.message().to_owned()))
+            })
+        }
+
+        fn get_next<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            Box::pin(async move {
+                FailingBackendHandler
+                    .get_next(ctx, oid)
+                    .await
+                    .map_err(|err| HandlerError::drop_request(err.message().to_owned()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_drop_discards_the_entire_request() {
+        use crate::message::{CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
+        use crate::v3::UsmSecurityParams;
+        let root = oid!(1, 3, 6, 1, 4, 1, 99999);
+        let first = root.child(1).child(0);
+        let oids = [first.clone(), first.child(1)];
+        let binding = |oid: Oid| vec![VarBind::new(oid, Value::Null)];
+        let requests = [
+            (Pdu::get_request(1, &oids), 2),
+            (Pdu::get_next_request(2, &oids), 1),
+            (Pdu::get_bulk(3, 1, 2, binding(first.clone())).unwrap(), 1),
+            (Pdu::get_bulk(4, 0, 2, binding(first)).unwrap(), 1),
+            // The first repetition succeeds; the second must discard its result.
+            (Pdu::get_bulk(5, 0, 2, binding(root.clone())).unwrap(), 1),
+        ];
+        for drop in [false, true] {
+            let handler: Arc<dyn MibHandler> = if drop {
+                Arc::new(DropBackendHandler)
+            } else {
+                Arc::new(FailingBackendHandler)
+            };
+            let agent = AgentBuilder::new()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .authoritative_engine(AuthoritativeEngine::for_test(
+                    b"handler-drop-engine".to_vec(),
+                    1,
+                ))
+                .usm_user("user", Ok)
+                .unwrap()
+                .without_builtin_handlers()
+                .allow_all_access()
+                .handler(root.clone(), handler)
+                .build()
+                .await
+                .unwrap();
+            for version in [Version::V1, Version::V2c, Version::V3] {
+                for (pdu, index) in &requests {
+                    if version == Version::V1 && pdu.pdu_type() == PduType::GetBulkRequest {
+                        continue;
+                    }
+                    let message = match version {
+                        Version::V1 => CommunityMessage::v1("public", pdu.clone())
+                            .unwrap()
+                            .encode()
+                            .unwrap(),
+                        Version::V2c => CommunityMessage::v2c("public", pdu.clone())
+                            .unwrap()
+                            .encode()
+                            .unwrap(),
+                        Version::V3 => {
+                            let global = MsgGlobalData::new(
+                                pdu.request_id,
+                                crate::UDP_RECEIVE_LIMITS.advertised(),
+                                MsgFlags::new(SecurityLevel::NoAuthNoPriv, true),
+                            )
+                            .unwrap();
+                            let usm = UsmSecurityParams::new(
+                                Bytes::copy_from_slice(agent.engine_id()),
+                                1,
+                                0,
+                                Bytes::from_static(b"user"),
+                            )
+                            .unwrap();
+                            let scoped = ScopedPdu::new(
+                                Bytes::copy_from_slice(agent.engine_id()),
+                                Bytes::new(),
+                                pdu.clone(),
+                            );
+                            V3Message::new(global, usm.encode().unwrap(), scoped)
+                                .unwrap()
+                                .encode()
+                                .unwrap()
+                        }
+                    };
+                    let response = agent
+                        .handle_request(message, "127.0.0.1:9999".parse().unwrap())
+                        .await
+                        .unwrap();
+                    if drop {
+                        assert!(
+                            response.is_none(),
+                            "{version:?}: request {}",
+                            pdu.request_id
+                        );
+                    } else {
+                        let response = match version {
+                            Version::V1 | Version::V2c => CommunityMessage::decode(
+                                response.unwrap(),
+                                crate::DecodeConfig::default(),
+                            )
+                            .unwrap()
+                            .value
+                            .pdu()
+                            .standard()
+                            .unwrap()
+                            .clone(),
+                            Version::V3 => {
+                                V3Message::decode(response.unwrap(), crate::DecodeConfig::default())
+                                    .unwrap()
+                                    .value
+                                    .pdu()
+                                    .unwrap()
+                                    .clone()
+                            }
+                        };
+                        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+                        assert_eq!(response.error_index(), *index);
+                        assert_eq!(response.varbinds, pdu.varbinds);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_drop_udp_silence_cleanup_and_recovery() {
+        use crate::message::CommunityMessage;
+        use std::time::Duration;
+        let root = oid!(1, 3, 6, 1, 4, 1, 99999);
+        let first = root.child(1).child(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .allow_all_access()
+            .max_concurrent_requests(Some(1))
+            .without_builtin_handlers()
+            .handler(root.clone(), Arc::new(CountingDropHandler(calls.clone())))
+            .build()
+            .await
+            .unwrap();
+        let task_agent = agent.clone();
+        let task = tokio::spawn(async move { task_agent.run().await });
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 4096];
+        for version in [Version::V1, Version::V2c] {
+            let requests = [
+                (Pdu::get_request(1, &[first.clone(), first.child(1)]), 2),
+                (Pdu::get_next_request(2, std::slice::from_ref(&first)), 1),
+                (
+                    Pdu::get_bulk(3, 0, 2, vec![VarBind::new(root.clone(), Value::Null)]).unwrap(),
+                    2,
+                ),
+            ];
+            for (request, expected_calls) in requests {
+                if version == Version::V1 && request.pdu_type() == PduType::GetBulkRequest {
+                    continue;
+                }
+                calls.store(0, Ordering::Relaxed);
+                let msg = match version {
+                    Version::V1 => CommunityMessage::v1("public", request),
+                    _ => CommunityMessage::v2c("public", request),
+                }
+                .unwrap()
+                .encode()
+                .unwrap();
+                socket.send_to(&msg, agent.local_addr()).await.unwrap();
+                // Observe dispatch and task completion before checking for silence.
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while calls.load(Ordering::Relaxed) < expected_calls
+                        || agent.active_request_count() != 0
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("suppressed request must finish");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf))
+                        .await
+                        .is_err()
+                );
+                assert_eq!(agent.active_request_count(), 0);
+                assert_eq!(agent.snmp_silent_drops(), 0);
+            }
+        }
+        let good = CommunityMessage::v2c("public", Pdu::get_request(9, &[first]))
+            .unwrap()
+            .encode()
+            .unwrap();
+        socket.send_to(&good, agent.local_addr()).await.unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = CommunityMessage::decode(
+            Bytes::copy_from_slice(&buf[..len]),
+            crate::DecodeConfig::default(),
+        )
+        .unwrap()
+        .value;
+        assert_eq!(decoded.pdu().standard().unwrap().request_id, 9);
+        assert_eq!(
+            decoded.pdu().standard().unwrap().varbinds[0].value,
+            Value::Integer(1)
+        );
+        agent.cancellation_token().cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.active_request_count(), 0);
+    }
+
+    struct CountingDropHandler(Arc<AtomicUsize>);
+
+    impl MibHandler for CountingDropHandler {
+        fn get<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetResult>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            DropBackendHandler.get(ctx, oid)
+        }
+        fn get_next<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            oid: &'a Oid,
+        ) -> BoxFuture<'a, HandlerResult<GetNextResult>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            DropBackendHandler.get_next(ctx, oid)
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_drop_respects_get_access_checks_and_propagates_during_walk_skip() {
+        use crate::message::CommunityMessage;
+        let root = oid!(1, 3, 6, 1, 4, 1, 99999);
+        let first = root.child(1).child(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .community(b"public")
+            .without_builtin_handlers()
+            .handler(root.clone(), Arc::new(CountingDropHandler(calls.clone())))
+            .vacm(|v| {
+                v.group("public", SecurityModel::V2c, "readers")
+                    .access(
+                        "readers",
+                        SecurityModel::V2c,
+                        SecurityLevel::NoAuthNoPriv,
+                        |a| a.read_view("restricted"),
+                    )
+                    .view("restricted", |v| v.include(root.child(2)))
+            })
+            .build()
+            .await
+            .unwrap();
+        let requests = [
+            Pdu::get_request(1, &[first]),
+            Pdu::get_next_request(2, std::slice::from_ref(&root)),
+            Pdu::get_bulk(3, 1, 2, vec![VarBind::new(root.clone(), Value::Null)]).unwrap(),
+            Pdu::get_bulk(4, 0, 2, vec![VarBind::new(root, Value::Null)]).unwrap(),
+        ];
+        for (i, pdu) in requests.into_iter().enumerate() {
+            calls.store(0, Ordering::Relaxed);
+            let msg = CommunityMessage::v2c("public", pdu)
+                .unwrap()
+                .encode()
+                .unwrap();
+            let response = agent
+                .handle_request(msg, "127.0.0.1:9999".parse().unwrap())
+                .await
+                .unwrap();
+            if i == 0 {
+                let decoded =
+                    CommunityMessage::decode(response.unwrap(), crate::DecodeConfig::default())
+                        .unwrap()
+                        .value;
+                assert_eq!(
+                    decoded.pdu().standard().unwrap().varbinds[0].value,
+                    Value::NoSuchObject
+                );
+                assert_eq!(calls.load(Ordering::Relaxed), 0);
+            } else {
+                assert!(response.is_none());
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    2,
+                    "denied candidate then marker"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_drop_from_unrelated_registration_suppresses_walk() {
+        let root = oid!(1, 3, 6, 1, 4, 1, 99999);
+        let cursor = root.child(1).child(0);
+        for drop_first in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            // Prefix length controls registration processing order.
+            let drop_prefix = if drop_first {
+                oid!(1, 3, 6, 1, 4, 1, 100000, 1)
+            } else {
+                oid!(1, 3, 6, 1, 4, 100000)
+            };
+            let agent = Agent::builder()
+                .bind("127.0.0.1:0")
+                .community(b"public")
+                .without_builtin_handlers()
+                .allow_all_access()
+                .handler(root.clone(), Arc::new(FiveOidHandler))
+                .handler(drop_prefix, Arc::new(CountingDropHandler(calls.clone())))
+                .build()
+                .await
+                .unwrap();
+            for version in [Version::V1, Version::V2c, Version::V3] {
+                calls.store(0, Ordering::Relaxed);
+                let ctx =
+                    crate::test_support::request_context_for_version(version, PduType::GetRequest);
+                // GET only uses the matching handler and succeeds.
+                assert!(
+                    agent
+                        .dispatch_request(&ctx, &Pdu::get_request(1, std::slice::from_ref(&cursor)))
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    0,
+                    "GET must use only its matching handler"
+                );
+                let ctx = crate::test_support::request_context_for_version(
+                    version,
+                    PduType::GetNextRequest,
+                );
+                assert!(
+                    agent
+                        .dispatch_request(
+                            &ctx,
+                            &Pdu::get_next_request(2, std::slice::from_ref(&cursor))
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                if version != Version::V1 {
+                    calls.store(0, Ordering::Relaxed);
+                    let ctx = crate::test_support::request_context_for_version(
+                        version,
+                        PduType::GetBulkRequest,
+                    );
+                    let request =
+                        Pdu::get_bulk(3, 0, 2, vec![VarBind::new(cursor.clone(), Value::Null)])
+                            .unwrap();
+                    assert!(
+                        agent
+                            .dispatch_request(&ctx, &request)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(calls.load(Ordering::Relaxed), 1);
+                }
+            }
+        }
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[tokio::test]
+    async fn handler_drop_v3_udp_all_security_levels() {
+        use std::time::Duration;
+        let root = oid!(1, 3, 6, 1, 4, 1, 99999);
+        let first = root.child(1).child(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .without_builtin_handlers()
+            .allow_all_access()
+            .max_concurrent_requests(Some(1))
+            .authoritative_engine(AuthoritativeEngine::for_test(
+                b"handler-drop-engine".to_vec(),
+                1,
+            ))
+            .usm_user("user", |u| {
+                u.auth_priv(
+                    crate::AuthProtocol::Sha256,
+                    b"authentication-password",
+                    crate::PrivProtocol::Aes128,
+                    b"privacy-password",
+                )
+            })
+            .unwrap()
+            .handler(root.clone(), Arc::new(CountingDropHandler(calls.clone())))
+            .build()
+            .await
+            .unwrap();
+        let runner = agent.clone();
+        let task = tokio::spawn(async move { runner.run().await });
+        for level in [
+            SecurityLevel::NoAuthNoPriv,
+            SecurityLevel::AuthNoPriv,
+            SecurityLevel::AuthPriv,
+        ] {
+            let config = crate::UsmConfig::new("user");
+            let auth: crate::Auth = match level {
+                SecurityLevel::NoAuthNoPriv => config.into(),
+                SecurityLevel::AuthNoPriv => config
+                    .auth(crate::AuthProtocol::Sha256, "authentication-password")
+                    .unwrap()
+                    .into(),
+                SecurityLevel::AuthPriv => config
+                    .auth_priv(
+                        crate::AuthProtocol::Sha256,
+                        "authentication-password",
+                        crate::PrivProtocol::Aes128,
+                        "privacy-password",
+                    )
+                    .unwrap()
+                    .into(),
+            };
+            let client = crate::Client::builder(agent.local_addr().to_string(), auth)
+                .request_timeout(Duration::from_millis(250))
+                .retry(crate::Retry::none())
+                .connect()
+                .await
+                .unwrap();
+            calls.store(0, Ordering::Relaxed);
+            // Establish discovery, time synchronization, and a working good path first.
+            assert_eq!(
+                client.get(&first).await.unwrap().varbinds[0].value,
+                Value::Integer(1)
+            );
+            let results = [
+                client
+                    .get_many(&[first.clone(), first.child(1)])
+                    .await
+                    .map(|_| ()),
+                client.get_next(&first).await.map(|_| ()),
+                client
+                    .get_bulk(std::slice::from_ref(&first), 1, 2)
+                    .await
+                    .map(|_| ()),
+                client
+                    .get_bulk(std::slice::from_ref(&first), 0, 2)
+                    .await
+                    .map(|_| ()),
+                client
+                    .get_bulk(std::slice::from_ref(&root), 0, 2)
+                    .await
+                    .map(|_| ()),
+            ];
+            for result in results {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    crate::ErrorKind::Timeout,
+                    "{level:?}: {error:?}"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                8,
+                "{level:?}: all drop cases dispatched"
+            );
+            assert_eq!(
+                client.get(&first).await.unwrap().varbinds[0].value,
+                Value::Integer(1)
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 9);
+        }
+        agent.cancellation_token().cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.active_request_count(), 0);
+        assert_eq!(agent.snmp_silent_drops(), 0);
     }
 
     // FiveOidHandler has OIDs at .99999.{1,2,3,4,5}.0 with integer values 1-5.
@@ -4839,7 +5386,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // Collect the OIDs returned (excluding EndOfMibView sentinels)
         let returned_oids: Vec<&Oid> = response
@@ -4898,7 +5445,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // First non-repeater skips denied .99999.1.0 and returns accessible .99999.2.0
         assert_eq!(
@@ -4986,7 +5533,7 @@ mod tests {
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
@@ -5059,7 +5606,7 @@ mod tests {
         );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), MAX_GETNEXT_SKIP_ITERATIONS);
@@ -5074,7 +5621,7 @@ mod tests {
         );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::NoSuchName.as_i32());
         assert_eq!(response.error_index(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -5176,7 +5723,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].oid,
@@ -5210,7 +5757,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].value,
@@ -5241,7 +5788,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // Both OIDs should appear
         assert!(
@@ -5283,7 +5830,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(
             ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::GenErr,
@@ -5367,7 +5914,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(
             ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::NoSuchName,
@@ -5393,7 +5940,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0);
         assert!(matches!(response.varbinds[0].value, Value::Counter64(_)));
     }
@@ -5433,7 +5980,11 @@ mod tests {
         )
         .unwrap();
 
-        let full_response = agent.dispatch_request(&ctx_unlimited, &pdu).await.unwrap();
+        let full_response = agent
+            .dispatch_request(&ctx_unlimited, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         let full_count = full_response
             .varbinds
             .iter()
@@ -5458,7 +6009,11 @@ mod tests {
             150,
         );
 
-        let limited_response = agent.dispatch_request(&ctx_limited, &pdu).await.unwrap();
+        let limited_response = agent
+            .dispatch_request(&ctx_limited, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         let limited_count = limited_response
             .varbinds
             .iter()
@@ -5590,6 +6145,7 @@ mod tests {
             .dispatch_request(&v2c, &pdu)
             .await
             .unwrap()
+            .unwrap()
             .varbinds
             .iter()
             .filter(|vb| !matches!(vb.value, Value::EndOfMibView))
@@ -5607,6 +6163,7 @@ mod tests {
         let authpriv_count = agent
             .dispatch_request(&authpriv, &pdu)
             .await
+            .unwrap()
             .unwrap()
             .varbinds
             .iter()
@@ -5724,7 +6281,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // Only the first non-repeater fit; the response is exactly that prefix.
         assert_eq!(
@@ -5789,7 +6346,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
@@ -5838,7 +6395,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
@@ -5869,7 +6426,7 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         let data_count = response
             .varbinds
             .iter()
@@ -5901,7 +6458,7 @@ mod tests {
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0, "should succeed");
         assert_eq!(
             response.varbinds[0].oid,
@@ -7268,7 +7825,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert!(matches!(response.varbinds[0].value, Value::Integer(1)));
@@ -7338,7 +7895,7 @@ mod tests {
         .unwrap()
         .into_raw();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.pdu_type(), PduType::Response);
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.request_id, 7);
@@ -7362,7 +7919,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(

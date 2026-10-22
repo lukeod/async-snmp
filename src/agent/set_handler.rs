@@ -474,7 +474,7 @@ mod tests {
         for version in [Version::V1, Version::V2c, Version::V3] {
             let ctx =
                 crate::test_support::request_context_for_version(version, PduType::SetRequest);
-            let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+            let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
             assert_eq!(
                 response.error_status(),
                 ErrorStatus::GenErr.as_i32(),
@@ -515,7 +515,7 @@ mod tests {
             ],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         // Should have error on varbind 2
         assert_eq!(response.error_index(), 2);
@@ -553,7 +553,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
@@ -713,7 +713,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(commit_count.load(Ordering::Relaxed), 1);
     }
@@ -749,7 +749,7 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
 
         assert_eq!(response.error_index(), 1);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
@@ -950,7 +950,7 @@ mod tests {
             three_set_varbinds(),
         );
         let ctx = crate::test_support::request_context_for_version(version, PduType::SetRequest);
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         let calls = calls.lock().unwrap().clone();
         let values = values.lock().unwrap().clone();
         (response, calls, values)
@@ -1135,7 +1135,11 @@ mod tests {
             three_set_varbinds(),
         );
 
-        let response = agent.dispatch_request(&test_ctx(), &pdu).await.unwrap();
+        let response = agent
+            .dispatch_request(&test_ctx(), &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         let calls = calls.lock().unwrap().clone();
         assert_eq!(response.error_status(), ErrorStatus::WrongValue.as_i32());
         assert_eq!(response.error_index(), 2);
@@ -1262,7 +1266,7 @@ mod tests {
             PduType::SetRequest,
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap();
+        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
         assert_eq!(response.error_status(), ErrorStatus::NoError.as_i32());
         assert_eq!(
             *events.lock().unwrap(),
@@ -1487,6 +1491,7 @@ mod tests {
         )
         .await
         .expect("retrieval must not wait for SET coordination")
+        .unwrap()
         .unwrap();
         assert_eq!(get_response.varbinds[0].value, Value::Integer(10));
 
@@ -1502,7 +1507,7 @@ mod tests {
         );
 
         release_undo.add_permits(1);
-        let first_response = first.await.unwrap().unwrap();
+        let first_response = first.await.unwrap().unwrap().unwrap();
         assert_eq!(
             first_response.error_status(),
             ErrorStatus::CommitFailed.as_i32()
@@ -1512,7 +1517,7 @@ mod tests {
             .await
             .expect("second-test signal remains open")
             .forget();
-        let second_response = second.await.unwrap().unwrap();
+        let second_response = second.await.unwrap().unwrap().unwrap();
         assert_eq!(
             second_response.error_status(),
             ErrorStatus::NoError.as_i32()
@@ -1679,7 +1684,12 @@ mod tests {
         );
         let ctx = test_ctx();
         let task_ctx = ctx.clone();
-        let task = tokio::spawn(async move { agent.dispatch_request(&task_ctx, &pdu).await });
+        let task = tokio::spawn(async move {
+            agent
+                .dispatch_request(&task_ctx, &pdu)
+                .await
+                .map(Option::unwrap)
+        });
         (task, ctx, callback_started, release_callback, calls)
     }
 
@@ -1967,7 +1977,12 @@ mod tests {
                 .map(|index| VarBind::new(set_oid(index), Value::Integer(index as i32)))
                 .collect(),
         );
-        let task = tokio::spawn(async move { agent.dispatch_request(&test_ctx(), &pdu).await });
+        let task = tokio::spawn(async move {
+            agent
+                .dispatch_request(&test_ctx(), &pdu)
+                .await
+                .map(Option::unwrap)
+        });
         (task, active, drops, drop_order, callback_started)
     }
 
