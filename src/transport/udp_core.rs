@@ -94,7 +94,7 @@ struct ResponseCandidate {
     info: crate::ReceivedMessageInfo,
     // Retained through validation; accepted public values are caller-owned and
     // no longer count against transport buffering.
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _permit: Option<super::framing::BufferPermits>,
 }
 
 struct ResponseSlot {
@@ -479,7 +479,7 @@ impl UdpCore {
         envelope: CorrelationEnvelope,
         data: Bytes,
         info: crate::ReceivedMessageInfo,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: super::framing::BufferPermits,
     ) -> bool {
         self.deliver_with_envelope(
             request_id,

@@ -588,10 +588,10 @@ pub mod mib_support;
 // Re-exports for convenience
 #[cfg(feature = "agent")]
 pub use agent::{
-    Agent, AgentBuilder, AgentShutdownPolicy, BuiltinMib, DuplicateVacmAccessEntry,
-    NotificationOutcome, NotificationSendStream, NotificationSinkId, NotificationSinkIdError,
-    NotificationSinkSummary, SinkOutcome, SinkSkipReason, SinkStatus, VacmAccessIndex, VacmBuilder,
-    VacmConfig, VacmSecurityModel, View,
+    Agent, AgentBuilder, AgentControl, AgentRunner, AgentShutdownPolicy, AgentStatus, BuiltinMib,
+    DuplicateVacmAccessEntry, NotificationOutcome, NotificationSendStream, NotificationSinkId,
+    NotificationSinkIdError, NotificationSinkSummary, PreparedAgent, RunningAgent, SinkOutcome,
+    SinkSkipReason, SinkStatus, VacmAccessIndex, VacmBuilder, VacmConfig, VacmSecurityModel, View,
 };
 pub use client::{
     Auth, BulkResponse, Client, ClientBuilder, ClientConfig, CommunityVersion,
@@ -636,11 +636,12 @@ pub use pdu::{
     PduBody, PduType, RequestPdu, ResponsePdu, StandardPduType, TrapV1Notification, TrapV1Pdu,
 };
 pub use transport::{
-    BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId, PreparedTcpSession,
-    PreparedUdpEndpoint, ReceivedMessageInfo, RequestRegistration, RequestTransport,
-    ResponseIdentity, RunningTcpSession, RunningUdpEndpoint, SessionId, TcpControl, TcpOptions,
-    TcpRunner, TcpStatus, TcpTransport, TcpTransportBuilder, TransportKind, UdpControl,
-    UdpEndpoint, UdpEndpointBuilder, UdpHandle, UdpRunner, UdpStats, UdpStatus,
+    BoundListener, BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId,
+    ListenerSource, PreparedTcpSession, PreparedUdpEndpoint, ReceivedMessageInfo,
+    RequestRegistration, RequestTransport, ResponseIdentity, RunningTcpSession, RunningUdpEndpoint,
+    SessionId, TcpControl, TcpListenerSource, TcpOptions, TcpRunner, TcpStatus, TcpTransport,
+    TcpTransportBuilder, TransportKind, UdpControl, UdpEndpoint, UdpEndpointBuilder, UdpHandle,
+    UdpRunner, UdpStats, UdpStatus,
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, AuthoritativeEnginePersistenceError,

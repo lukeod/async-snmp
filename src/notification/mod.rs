@@ -1924,7 +1924,7 @@ impl NotificationProcessor {
                 if let Some(gate) = &response_send_gate {
                     gate.acquire().await.expect("test send gate remains open").forget();
                 }
-                route.send(data).await
+                route.send_before(data, deadline).await
             } => result,
         }
     }

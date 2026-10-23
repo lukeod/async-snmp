@@ -147,6 +147,7 @@ struct UdpEndpointInner {
     admission: Arc<Mutex<bool>>,
     status: Arc<Mutex<UdpStatus>>,
     ipv6_only: bool,
+    ingress: Option<super::ingress::ApplicationIngress>,
     #[cfg(test)]
     receive_errors: Arc<std::sync::Mutex<std::collections::VecDeque<std::io::Error>>>,
     #[cfg(test)]
@@ -203,6 +204,22 @@ impl Drop for UdpRecvTaskCleanup {
 }
 
 impl UdpEndpoint {
+    /// Process-local identity of this bound endpoint.
+    pub fn endpoint_id(&self) -> crate::EndpointId {
+        self.inner.endpoint_id
+    }
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) fn limits(&self) -> super::EndpointLimits {
+        super::EndpointLimits {
+            receive: self.inner.receive_limits,
+            send: self.inner.config.send_capacity,
+        }
+    }
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) fn socket(&self) -> &UdpSocket {
+        &self.inner.socket
+    }
+
     /// Bind and explicitly start a receiver with default configuration.
     ///
     /// Use `0.0.0.0:0` for IPv4 targets or `[::]:0` for IPv6 targets.
@@ -326,12 +343,26 @@ pub struct UdpRunner {
     local_addr: SocketAddr,
     receive_limits: ReceiveLimits,
     cleanup: UdpRecvTaskCleanup,
+    ingress: Option<super::ingress::ApplicationIngress>,
+    send_capacity: usize,
+    #[cfg(test)]
+    receive_attempts: Option<Arc<std::sync::atomic::AtomicU32>>,
     #[cfg(test)]
     receive_errors: Arc<Mutex<std::collections::VecDeque<std::io::Error>>>,
     #[cfg(test)]
     receive_error_ready: Arc<tokio::sync::Notify>,
 }
 impl UdpRunner {
+    #[cfg(test)]
+    pub(crate) fn test_receive_state(
+        &mut self,
+        errors: Arc<Mutex<std::collections::VecDeque<std::io::Error>>>,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        self.receive_errors = errors;
+        self.receive_attempts = Some(attempts);
+    }
+
     fn new(inner: &UdpEndpointInner) -> Self {
         Self {
             socket: inner.socket.clone(),
@@ -339,6 +370,10 @@ impl UdpRunner {
             endpoint_id: inner.endpoint_id,
             local_addr: inner.local_addr,
             receive_limits: inner.receive_limits,
+            ingress: inner.ingress.clone(),
+            send_capacity: inner.config.send_capacity,
+            #[cfg(test)]
+            receive_attempts: None,
             cleanup: UdpRecvTaskCleanup {
                 core: inner.core.clone(),
                 shutdown_complete: inner.shutdown_complete.clone(),
@@ -384,6 +419,10 @@ impl UdpRunner {
         let mut recv_error_backoff = UdpRecvErrorBackoff::default();
 
         loop {
+            #[cfg(test)]
+            if let Some(attempts) = &self.receive_attempts {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             tokio::select! {
                 biased;
 
@@ -414,6 +453,10 @@ impl UdpRunner {
                             }
                             let data = Bytes::copy_from_slice(&buf[..len]);
 
+                            if let Some(ingress) = &self.ingress {
+                                ingress.deliver_udp(super::ReceivedMessage::udp(data, endpoint_id, self.socket.clone(), self.responder.clone(), received, info.received_at(), super::EndpointLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone()));
+                                continue;
+                            }
                             if let Some(envelope) = CorrelationEnvelope::parse(&data)
                                 && let Some(request_id) = envelope.request_id(&data)
                             {
@@ -524,9 +567,16 @@ pub struct UdpEndpointBuilder {
     config: UdpEndpointConfig,
     recv_buffer_size: Option<usize>,
     send_buffer_size: Option<usize>,
+    ingress: Option<super::ingress::ApplicationIngress>,
 }
 
 impl UdpEndpointBuilder {
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) fn ingress(mut self, ingress: super::ingress::ApplicationIngress) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+
     /// Create a builder with the default settings.
     ///
     /// Default bind address is `0.0.0.0:0` (IPv4).
@@ -538,6 +588,7 @@ impl UdpEndpointBuilder {
             config: UdpEndpointConfig::default(),
             recv_buffer_size: None,
             send_buffer_size: None,
+            ingress: None,
         }
     }
 
@@ -712,6 +763,7 @@ impl UdpEndpointBuilder {
             admission: Arc::new(Mutex::new(true)),
             status: Arc::new(Mutex::new(UdpStatus::Prepared)),
             ipv6_only,
+            ingress: self.ingress,
             #[cfg(test)]
             receive_errors: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             #[cfg(test)]

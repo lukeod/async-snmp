@@ -8,14 +8,15 @@ use crate::v3::encode::encode_v3_response;
 use crate::v3::{MAX_ENGINE_TIME, UsmSecurityParams};
 use bytes::Bytes;
 
-use super::Agent;
+use super::AgentProcessor;
 
-impl Agent {
+impl AgentProcessor {
     /// Build a V3 response message with appropriate security.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_v3_response(
         &self,
         limits: crate::transport::EndpointLimits,
+        source: std::net::SocketAddr,
         incoming: &MsgGlobalData,
         incoming_usm: &UsmSecurityParams,
         request_pdu: &Pdu,
@@ -65,7 +66,7 @@ impl Agent {
                     derived_keys,
                     self.inner.salt_counter.as_ref(),
                     self.inner.des_salt_state.as_ref(),
-                    self.inner.local_addr,
+                    source,
                 )
             },
         )
@@ -90,6 +91,7 @@ impl Agent {
         );
         self.finalize_v3_response(
             crate::transport::EndpointLimits::UDP,
+            "127.0.0.1:161".parse().unwrap(),
             incoming,
             incoming_usm,
             &request,
@@ -178,6 +180,7 @@ mod tests {
         let response = Pdu::response(1, 0, 1, vec![crate::VarBind::null(oid!(1, 3, 6, 1))]);
 
         let error = agent
+            .processor()
             .build_v3_response(
                 &dummy_v3_msg(SecurityLevel::NoAuthNoPriv),
                 &dummy_usm(),
@@ -219,6 +222,7 @@ mod tests {
         let keys = user.derive_keys(b"agent-engine").unwrap();
 
         let error = agent
+            .processor()
             .build_v3_response(
                 &dummy_v3_msg(SecurityLevel::AuthPriv),
                 &dummy_usm(),
@@ -247,6 +251,7 @@ mod tests {
         let usm = dummy_usm();
 
         let result = agent
+            .processor()
             .build_v3_response(
                 &msg,
                 &usm,
@@ -276,6 +281,7 @@ mod tests {
         let usm = dummy_usm();
 
         let result = agent
+            .processor()
             .build_v3_response(
                 &msg,
                 &usm,
@@ -300,6 +306,7 @@ mod tests {
         let usm = dummy_usm();
 
         let result = agent
+            .processor()
             .build_v3_response(
                 &msg,
                 &usm,
@@ -325,6 +332,7 @@ mod tests {
 
         // NoAuthNoPriv should work regardless
         let result = agent
+            .processor()
             .build_v3_response(
                 &msg,
                 &usm,
@@ -348,6 +356,7 @@ mod tests {
 
         let earliest = agent.inner.state.authoritative_boots_time().unwrap();
         let encoded = agent
+            .processor()
             .build_v3_response(
                 &dummy_v3_msg(SecurityLevel::NoAuthNoPriv),
                 &dummy_usm(),
@@ -396,6 +405,7 @@ mod tests {
         let usm = dummy_usm();
 
         let result = agent
+            .processor()
             .build_v3_response(
                 &msg,
                 &usm,
@@ -421,8 +431,10 @@ mod tests {
             send: 1024,
         };
         let result = agent
+            .processor()
             .finalize_v3_response(
                 limits,
+                "127.0.0.1:161".parse().unwrap(),
                 &msg,
                 &usm,
                 &request,
@@ -442,8 +454,10 @@ mod tests {
 
         let limits = crate::transport::EndpointLimits { send: 1, ..limits };
         let result = agent
+            .processor()
             .finalize_v3_response(
                 limits,
+                "127.0.0.1:161".parse().unwrap(),
                 &msg,
                 &usm,
                 &request,

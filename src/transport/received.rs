@@ -159,24 +159,64 @@ impl EndpointLimits {
 }
 
 /// A response capability bound to the exact receiving endpoint and destination.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ReplyRoute {
-    socket: std::sync::Arc<tokio::net::UdpSocket>,
-    responder: std::sync::Arc<crate::udp_responder::UdpResponder>,
-    received: crate::udp_responder::ReceivedDatagram,
+    kind: ReplyKind,
     pub(crate) limits: EndpointLimits,
 }
+
+#[derive(Clone)]
+enum ReplyKind {
+    Udp {
+        socket: std::sync::Arc<tokio::net::UdpSocket>,
+        responder: std::sync::Arc<crate::udp_responder::UdpResponder>,
+        received: crate::udp_responder::ReceivedDatagram,
+        admission: Option<(
+            std::sync::Arc<std::sync::Mutex<bool>>,
+            tokio_util::sync::CancellationToken,
+        )>,
+    },
+    Tcp(super::TcpTransport),
+}
 impl ReplyRoute {
-    pub(crate) async fn send(&self, data: &[u8]) -> std::io::Result<()> {
+    pub(crate) async fn send_before(&self, data: &[u8], deadline: Instant) -> std::io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "reply deadline expired",
+            ));
+        }
         if data.len() > self.limits.send {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "response exceeds endpoint send capacity",
             ));
         }
-        self.responder
-            .reply(&self.socket, data, &self.received)
-            .await
+        match &self.kind {
+            ReplyKind::Udp {
+                socket,
+                responder,
+                received,
+                admission,
+            } => {
+                let send = responder.send_to_admitted(
+                    socket,
+                    data,
+                    received.source,
+                    received.destination,
+                    admission.as_ref().map(|(gate, _)| gate.as_ref()),
+                );
+                tokio::select! { biased;
+                    () = tokio::time::sleep_until(deadline) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "reply deadline expired")),
+                    () = async { match admission { Some((_, cancel)) => cancel.cancelled().await, None => std::future::pending().await } } => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "UDP endpoint closed")),
+                    result = send => result,
+                }
+            }
+            ReplyKind::Tcp(transport) => transport
+                .write_before(data, deadline)
+                .await
+                .map_err(std::io::Error::other),
+        }
     }
 }
 
@@ -187,6 +227,37 @@ pub(crate) struct ReceivedMessage {
     pub(crate) reply: ReplyRoute,
 }
 impl ReceivedMessage {
+    pub(crate) fn with_udp_admission(
+        mut self,
+        gate: std::sync::Arc<std::sync::Mutex<bool>>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        if let ReplyKind::Udp { admission, .. } = &mut self.reply.kind {
+            *admission = Some((gate, cancel));
+        }
+        self
+    }
+
+    pub(crate) fn tcp(
+        bytes: bytes::Bytes,
+        info: ReceivedMessageInfo,
+        transport: super::TcpTransport,
+    ) -> Self {
+        use super::RequestTransport;
+        let limits = EndpointLimits {
+            receive: transport.receive_limits(),
+            send: transport.send_capacity(),
+        };
+        Self {
+            bytes,
+            info,
+            reply: ReplyRoute {
+                kind: ReplyKind::Tcp(transport),
+                limits,
+            },
+        }
+    }
+
     pub(crate) fn udp(
         bytes: bytes::Bytes,
         endpoint_id: EndpointId,
@@ -210,9 +281,12 @@ impl ReceivedMessage {
             bytes,
             info,
             reply: ReplyRoute {
-                socket,
-                responder,
-                received,
+                kind: ReplyKind::Udp {
+                    socket,
+                    responder,
+                    received,
+                    admission: None,
+                },
                 limits,
             },
         }

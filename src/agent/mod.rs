@@ -13,6 +13,17 @@
 //! - Read-only handlers for the snmpEngine, usmStats, and mpdStats groups; see
 //!   [`BuiltinMib`]
 //!
+//! Preparation binds all listeners without spawning tasks. Split the prepared
+//! agent with `into_parts()` to run its owned runner in an application supervisor,
+//! or use `spawn()` / `spawn_on()` and retain the returned owner. Each listener has
+//! an identified entry in `bound_addresses()`. UDP and TCP listeners share one
+//! engine, USM state, VACM configuration, handler tree and SET coordinator.
+//!
+//! Command listeners ignore notifications by default. Applications intentionally
+//! discarding and acknowledging Informs must opt in with `discard_notifications()`.
+//! Forced runner termination closes network endpoints while admitted SET cleanup
+//! stays retained; use `AgentControl::drain_mutations` to observe completion.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -63,13 +74,16 @@
 //!         .community(b"public")
 //!         .handler(oid!(1, 3, 6, 1, 2, 1, 1), Arc::new(SystemMibHandler))
 //!         .allow_all_access()
-//!         .build()
+//!         .spawn()
 //!         .await?;
 //!
-//!     agent.run().await
+//!     agent.join().await
 //! }
 //! ```
 
+mod lifecycle;
+pub use lifecycle::{AgentControl, AgentRunner, AgentStatus, PreparedAgent, RunningAgent};
+use lifecycle::{AgentLease, AgentNetwork};
 mod builtins;
 mod notification;
 mod request;
@@ -100,24 +114,22 @@ use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::instrument;
 
 use crate::error::{ConstructionStage, Error, ErrorStatus, Result};
 use crate::handler::{
     GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, RequestLifecycle,
     RequestTaskPhase,
 };
-use crate::message_size::{MessageSize, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS};
+use crate::message_size::{MessageSize, UDP_RECEIVE_LIMITS};
 use crate::oid;
 use crate::oid::Oid;
 #[cfg(test)]
 use crate::pdu::NotificationPdu;
 use crate::pdu::{Pdu, PduBody, PduType, ResponsePdu};
 use crate::transport::normalize_udp_target;
-use crate::transport::udp_error::{
-    UdpRecvErrorBackoff, UdpRecvErrorClass, classify_udp_recv_error,
-};
-use crate::udp_responder::{ReceivedDatagram, UdpResponder};
+use crate::transport::udp_error::UdpRecvErrorBackoff;
+#[cfg(test)]
+use crate::transport::udp_error::{UdpRecvErrorClass, classify_udp_recv_error};
 use crate::util::{
     EmptyCommunityPolicy, PreparedAuthoritativeUsm, ValidatedAuthoritativeUsm, bind_udp_socket,
     community_matches, validate_authoritative_usm_deferred,
@@ -137,7 +149,7 @@ const DEFAULT_MAX_MESSAGE_SIZE: usize = 1472;
 /// headers, request-id / error-status / error-index integers, and, for v3, the
 /// msgGlobalData, USM, and scopedPDU framing). The variable-length community
 /// string (v1/v2c), variable-length v3 fields, and the auth/priv material are
-/// added on top in [`Agent::response_overhead`].
+/// added on top in [`AgentProcessor::response_overhead`].
 const RESPONSE_OVERHEAD: usize = 100;
 
 /// Additional v3 overhead when the message is authenticated:
@@ -176,32 +188,6 @@ fn transient_recv_errno(_code: i32) -> bool {
     false
 }
 
-/// Clears the shared active-run flag after orderly exit, or after the last
-/// retained request exits when [`Agent::run`] is dropped.
-struct RunGuard<'a> {
-    inner: &'a AgentInner,
-    completed: bool,
-}
-
-impl RunGuard<'_> {
-    fn complete(&mut self) {
-        self.completed = true;
-        self.inner.run_active.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for RunGuard<'_> {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        self.inner.run_orphaned.store(true, Ordering::Release);
-        if self.inner.active_request_tasks.load(Ordering::Acquire) == 0 {
-            self.inner.run_active.store(false, Ordering::Release);
-        }
-    }
-}
-
 struct ActiveRequestGuard {
     inner: Arc<AgentInner>,
     task_id: u64,
@@ -209,11 +195,22 @@ struct ActiveRequestGuard {
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        self.inner
+        let removed = self
+            .inner
             .live_request_tasks
             .lock()
             .unwrap()
             .remove(&self.task_id);
+        if std::thread::panicking()
+            && removed.is_some_and(|task| {
+                let phase = task.phase.load(Ordering::Acquire);
+                phase == RequestTaskPhase::SetPreCommit as u8
+                    || phase == RequestTaskPhase::SetProtected as u8
+            })
+        {
+            self.inner.mutation_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.task_changed.notify_waiters();
         if self
             .inner
             .active_request_tasks
@@ -231,7 +228,7 @@ struct RequestTaskControl {
     abort: AbortHandle,
 }
 
-/// Request tasks owned by one [`Agent::run`] invocation.
+/// Request tasks owned by one [`AgentRunner::run`] invocation.
 ///
 /// Each task also has an entry in the Agent-owned registry. If `run` is
 /// dropped, detaching the local join handles does not lose ownership or
@@ -408,8 +405,9 @@ impl AgentAuthorization {
 
 /// Builder for [`Agent`].
 ///
-/// Configure an SNMP agent, then call [`build()`](AgentBuilder::build) to
-/// create it.
+/// Configure an SNMP agent, then call [`prepare()`](AgentBuilder::prepare)
+/// for an unstarted handle/runner pair or [`spawn()`](AgentBuilder::spawn)
+/// for an explicitly started service owner.
 ///
 /// # Access control
 ///
@@ -443,12 +441,19 @@ impl AgentAuthorization {
 ///     .community(b"public")
 ///     .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(MyHandler))
 ///     .allow_all_access()
-///     .build()
+///     .spawn()
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct AgentBuilder {
+    listeners: Vec<crate::transport::ListenerSource>,
+    bind_explicit: bool,
+    recv_buffer_explicit: bool,
+    max_connections: usize,
+    buffered_bytes: usize,
+    overload_timeout: Duration,
+    discard_notifications: bool,
     bind_addr: String,
     communities: Vec<crate::Community>,
     usm_users: HashMap<Bytes, UsmUser>,
@@ -457,7 +462,7 @@ pub struct AgentBuilder {
     des_salt_state: Option<DesSaltState>,
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
-    max_concurrent_requests: Option<usize>,
+    max_concurrent_requests: usize,
     recv_buffer_size: Option<usize>,
     authorization: AgentAuthorization,
     cancel: Option<CancellationToken>,
@@ -489,6 +494,11 @@ struct ValidatedTrapSink {
 }
 
 struct ValidatedAgentBuilder {
+    listeners: Vec<crate::transport::ListenerSource>,
+    max_connections: usize,
+    buffered_bytes: usize,
+    overload_timeout: Duration,
+    discard_notifications: bool,
     bind_addr: SocketAddr,
     communities: Vec<crate::Community>,
     usm: ValidatedAuthoritativeUsm,
@@ -496,7 +506,7 @@ struct ValidatedAgentBuilder {
     max_message_size: usize,
     engine_receive_capacity: MessageSize,
     decode_config: crate::DecodeConfig,
-    concurrency_limit: Option<Arc<Semaphore>>,
+    concurrency_limit: Arc<Semaphore>,
     recv_buffer_size: Option<usize>,
     authorization: AgentAuthorization,
     cancel: CancellationToken,
@@ -515,6 +525,47 @@ struct ValidatedAgentBuilder {
 }
 
 impl AgentBuilder {
+    /// Add an explicit UDP or TCP listener. When present, replaces the default
+    /// UDP bind; an explicit `bind` or `recv_buffer_size` configuration conflicts.
+    #[must_use]
+    pub fn listener(mut self, source: crate::transport::ListenerSource) -> Self {
+        self.listeners.push(source);
+        self
+    }
+    /// Bound simultaneous TCP connections across all listeners (default 128).
+    #[must_use]
+    pub fn max_connections(mut self, count: usize) -> Self {
+        self.max_connections = count;
+        self
+    }
+    /// Bound transport-retained message bytes across listeners (default 64 MiB).
+    #[must_use]
+    pub fn buffered_bytes(mut self, bytes: usize) -> Self {
+        self.buffered_bytes = bytes;
+        self
+    }
+    /// Bound intentional TCP admission pauses (default 5 seconds).
+    #[must_use]
+    pub fn overload_timeout(mut self, duration: Duration) -> Self {
+        self.overload_timeout = duration;
+        self
+    }
+    /// Explicitly acknowledge and discard valid Informs on command listeners.
+    /// Disabled by default; consuming notifications requires a notification role.
+    #[must_use]
+    pub fn discard_notifications(mut self) -> Self {
+        self.discard_notifications = true;
+        self
+    }
+    /// Prepare and start the owned runner on the current runtime.
+    pub async fn spawn(self) -> Result<RunningAgent> {
+        Ok(self.prepare().await?.spawn())
+    }
+    /// Start without moving existing Tokio I/O registrations between runtimes.
+    pub async fn spawn_on(self, runtime: &tokio::runtime::Handle) -> Result<RunningAgent> {
+        Ok(self.prepare().await?.spawn_on(runtime))
+    }
+
     /// Create a builder with the default settings.
     ///
     /// Defaults:
@@ -527,6 +578,13 @@ impl AgentBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            listeners: Vec::new(),
+            bind_explicit: false,
+            recv_buffer_explicit: false,
+            max_connections: 128,
+            buffered_bytes: 64 * 1024 * 1024,
+            overload_timeout: Duration::from_secs(5),
+            discard_notifications: false,
             bind_addr: "0.0.0.0:161".to_string(),
             communities: Vec::new(),
             usm_users: HashMap::new(),
@@ -535,7 +593,7 @@ impl AgentBuilder {
             des_salt_state: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             decode_config: crate::DecodeConfig::default(),
-            max_concurrent_requests: Some(1000),
+            max_concurrent_requests: 1000,
             recv_buffer_size: Some(4 * 1024 * 1024), // 4MB
             authorization: AgentAuthorization::Unset,
             cancel: None,
@@ -564,13 +622,13 @@ impl AgentBuilder {
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to all IPv4 interfaces on standard port (requires privileges)
-    /// let agent = Agent::builder().bind("0.0.0.0:161").community(b"public").allow_all_access().build().await?;
+    /// let agent = Agent::builder().bind("0.0.0.0:161").community(b"public").allow_all_access().spawn().await?;
     ///
     /// // Bind to localhost only on non-privileged port
-    /// let agent = Agent::builder().bind("127.0.0.1:1161").community(b"public").allow_all_access().build().await?;
+    /// let agent = Agent::builder().bind("127.0.0.1:1161").community(b"public").allow_all_access().spawn().await?;
     ///
     /// // Bind to specific interface
-    /// let agent = Agent::builder().bind("192.168.1.100:161").community(b"public").allow_all_access().build().await?;
+    /// let agent = Agent::builder().bind("192.168.1.100:161").community(b"public").allow_all_access().spawn().await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -582,15 +640,16 @@ impl AgentBuilder {
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to all interfaces (IPv6, with dual-stack on Linux)
-    /// let agent = Agent::builder().bind("[::]:161").community(b"public").allow_all_access().build().await?;
+    /// let agent = Agent::builder().bind("[::]:161").community(b"public").allow_all_access().spawn().await?;
     ///
     /// // Bind to IPv6 localhost only
-    /// let agent = Agent::builder().bind("[::1]:1161").community(b"public").allow_all_access().build().await?;
+    /// let agent = Agent::builder().bind("[::1]:1161").community(b"public").allow_all_access().spawn().await?;
     /// # Ok(())
     /// # }
     /// ```
     #[must_use]
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
+        self.bind_explicit = true;
         self.bind_addr = addr.into();
         self
     }
@@ -611,7 +670,7 @@ impl AgentBuilder {
     ///     .community(b"public")
     ///     .community(b"private")
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -635,7 +694,7 @@ impl AgentBuilder {
     ///     .bind("0.0.0.0:1161")
     ///     .communities(communities)
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -695,7 +754,7 @@ impl AgentBuilder {
     ///         )
     ///     }).unwrap()
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -739,7 +798,7 @@ impl AgentBuilder {
     ///     .authoritative_engine(engine)
     ///     .community(b"public")
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -787,8 +846,8 @@ impl AgentBuilder {
     ///
     /// The default is 1472 octets, which fits an Ethernet MTU after IP and UDP
     /// headers. The agent truncates GETBULK responses to fit this limit.
-    /// Values above the UDP receive capacity advertised by this agent (65507
-    /// octets) are rejected by [`AgentBuilder::build`].
+    /// Each response also respects its concrete route send capacity. TCP
+    /// response limits may exceed UDP capacity, up to the SNMP size range.
     ///
     /// For `SNMPv3` requests, the agent uses the minimum of this value
     /// and the msgMaxSize from the request. This outbound response limit is
@@ -813,16 +872,15 @@ impl AgentBuilder {
 
     /// Set the maximum number of requests that the agent processes concurrently.
     ///
-    /// The default is 1000. Requests beyond this limit wait until a slot
-    /// becomes available. Use `None` for unbounded concurrency.
+    /// The default is 1000. UDP drops are counted when admission is full.
+    /// Inbound TCP sessions wait up to the configured overload deadline.
     ///
     /// This controls memory usage under high load while still allowing
     /// parallel request processing.
     ///
-    /// A limit of `Some(0)` is invalid (it would permit no requests and wedge
-    /// the agent) and is rejected by [`AgentBuilder::build`].
+    /// Zero and unrepresentable semaphore limits are rejected during preparation.
     #[must_use]
-    pub fn max_concurrent_requests(mut self, limit: Option<usize>) -> Self {
+    pub fn max_concurrent_requests(mut self, limit: usize) -> Self {
         self.max_concurrent_requests = limit;
         self
     }
@@ -835,6 +893,7 @@ impl AgentBuilder {
     /// Set to `None` to use the kernel default.
     #[must_use]
     pub fn recv_buffer_size(mut self, size: Option<usize>) -> Self {
+        self.recv_buffer_explicit = true;
         self.recv_buffer_size = size;
         self
     }
@@ -875,7 +934,7 @@ impl AgentBuilder {
     ///     // Register handler for system MIB subtree
     ///     .handler(oid!(1, 3, 6, 1, 2, 1, 1), Arc::new(SystemHandler))
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -921,7 +980,7 @@ impl AgentBuilder {
     ///             .include(oid!(1, 3, 6, 1)))
     ///         .view("write_view", |v| v
     ///             .include(oid!(1, 3, 6, 1, 2, 1, 1))))
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -1024,7 +1083,7 @@ impl AgentBuilder {
     ///         )
     ///         .unwrap())
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -1075,8 +1134,8 @@ impl AgentBuilder {
 
     /// Set one total deadline for agent construction (default: 5 seconds).
     ///
-    /// Pure configuration validation runs first. The deadline then spans UDP
-    /// binding, every hostname sink lookup in configuration order, and local
+    /// Pure configuration validation runs first. The deadline then spans listener
+    /// preparation, every hostname sink lookup in configuration order, and local
     /// protocol-state setup. [`Duration::ZERO`] is an immediate deadline.
     #[must_use]
     pub fn construction_timeout(mut self, timeout: Duration) -> Self {
@@ -1152,7 +1211,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Build the agent.
+    /// Prepare every listener and application state without spawning tasks.
     ///
     /// Returns a configuration error when inbound identities do not have an
     /// explicit access policy, VACM and unrestricted access are both selected,
@@ -1160,16 +1219,15 @@ impl AgentBuilder {
     /// invalid or cannot be resolved;
     /// USM credentials are invalid; USM users or V3 trap sinks are configured
     /// without a persisted [`AuthoritativeEngine`]; a timeout cannot be
-    /// represented; or the response-size limit exceeds the fixed UDP receive
-    /// capacity. Returns [`Error::RandomSource`] when a generated engine ID or
+    /// represented; or response or listener limits are outside their valid range. Returns [`Error::RandomSource`] when a generated engine ID or
     /// required privacy salt cannot be initialized.
     ///
     /// Pure deterministic validation and normalization precedes socket I/O,
     /// DNS, entropy, and authoritative engine clock or persistence access.
     /// Checking whether configured durations can form deadlines observes the
     /// process monotonic clock during that validation phase.
-    pub async fn build(self) -> Result<Agent> {
-        self.build_with_dependencies(
+    pub async fn prepare(self) -> Result<PreparedAgent> {
+        self.prepare_with_dependencies(
             |addr, recv_buffer_size| bind_udp_socket(addr, recv_buffer_size, None, false),
             |host, port| async move {
                 tokio::net::lookup_host((host.as_str(), port))
@@ -1188,13 +1246,13 @@ impl AgentBuilder {
         .await
     }
 
-    async fn build_with_dependencies<B, BFut, R, RFut, G, S>(
+    async fn prepare_with_dependencies<B, BFut, R, RFut, G, S>(
         self,
         bind_socket: B,
         mut resolve_host: R,
         generate_engine_id: G,
         create_salt_counter: S,
-    ) -> Result<Agent>
+    ) -> Result<PreparedAgent>
     where
         B: FnOnce(SocketAddr, Option<usize>) -> BFut,
         BFut: Future<Output = std::io::Result<UdpSocket>>,
@@ -1214,23 +1272,60 @@ impl AgentBuilder {
         let construction =
             AgentConstructionDeadline::new(config.bind_addr, config.construction_timeout)?;
 
-        let socket = construction
-            .run(ConstructionStage::Bind, None, None, async {
-                bind_socket(config.bind_addr, config.recv_buffer_size)
-                    .await
-                    .map_err(|source| {
-                        Error::Network {
-                            target: config.bind_addr,
-                            source,
-                        }
-                        .boxed()
-                    })
-            })
-            .await?;
-        let local_addr = socket.local_addr().map_err(|source| Error::Network {
-            target: config.bind_addr,
-            source,
-        })?;
+        let capacity = config.concurrency_limit.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity.available_permits());
+        let ingress = crate::transport::ingress::ApplicationIngress {
+            sender,
+            capacity,
+            budget: Arc::new(Semaphore::new(config.buffered_bytes)),
+            overload_timeout: config.overload_timeout,
+            drops: Arc::new(AtomicU64::new(0)),
+            session: None,
+        };
+        let mut listeners = Vec::new();
+        if config.listeners.is_empty() {
+            let socket = construction
+                .run(ConstructionStage::Bind, None, None, async {
+                    bind_socket(config.bind_addr, config.recv_buffer_size)
+                        .await
+                        .map_err(|source| {
+                            Error::Network {
+                                target: config.bind_addr,
+                                source,
+                            }
+                            .boxed()
+                        })
+                })
+                .await?;
+            listeners.push(
+                crate::transport::ListenerSource::udp_socket(socket)
+                    .prepare(ingress.clone())
+                    .await?,
+            );
+        } else {
+            for source in config.listeners.drain(..) {
+                listeners.push(
+                    construction
+                        .run(
+                            ConstructionStage::Bind,
+                            None,
+                            None,
+                            source.prepare(ingress.clone()),
+                        )
+                        .await?,
+                );
+            }
+        }
+        config.engine_receive_capacity = listeners
+            .iter()
+            .map(|listener| listener.limits().receive.advertised())
+            .min()
+            .expect("at least one listener");
+        let network = Arc::new(AgentNetwork::new(
+            &listeners,
+            config.max_connections,
+            ingress.drops.clone(),
+        ));
 
         let mut trap_sinks = Vec::with_capacity(config.trap_sinks.len());
         for (index, sink) in config.trap_sinks.into_iter().enumerate() {
@@ -1291,7 +1386,6 @@ impl AgentBuilder {
             .then(create_salt_counter)
             .transpose()?;
         construction.check(ConstructionStage::Prepare, None, None)?;
-        let udp_responder = UdpResponder::new(&socket);
 
         let state = Arc::new(AgentState {
             authoritative_engine,
@@ -1343,50 +1437,54 @@ impl AgentBuilder {
             .handlers
             .sort_by_key(|h| std::cmp::Reverse(h.prefix.len()));
 
-        let agent = Agent {
-            inner: Arc::new(AgentInner {
-                socket: Arc::new(socket),
-                udp_responder: Arc::new(udp_responder),
-                endpoint_id: crate::EndpointId::new(),
-                local_addr,
-                communities: config.communities,
-                usm_users,
-                handlers: config.handlers,
-                state,
-                salt_counter,
-                des_salt_state: config.des_salt_state,
-                set_coordinator: tokio::sync::Mutex::new(()),
-                concurrency_limit: config.concurrency_limit,
-                authorization: config.authorization,
-                cancel: config.cancel,
-                trap_sinks,
-                inform_transports: notification::InformTransportPool::new(),
-                notification_id: std::sync::atomic::AtomicI32::new(1),
-                run_active: AtomicBool::new(false),
-                run_orphaned: AtomicBool::new(false),
-                active_request_tasks: AtomicUsize::new(0),
-                next_request_task_id: AtomicU64::new(1),
-                live_request_tasks: std::sync::Mutex::new(HashMap::new()),
-                response_send_timeout: config.response_send_timeout,
-                request_deadline: config.request_deadline,
-                shutdown_policy: config.shutdown_policy,
-                notification_fanout_limit: config.notification_fanout_limit,
-                #[cfg(test)]
-                response_send_gate: std::sync::Mutex::new(None),
-                #[cfg(test)]
-                response_sends_started: AtomicU32::new(0),
-                #[cfg(test)]
-                received_datagrams: AtomicU32::new(0),
-                #[cfg(test)]
-                pre_permit_gate: std::sync::Mutex::new(None),
-                #[cfg(test)]
-                receive_errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                #[cfg(test)]
-                receive_attempts: AtomicU32::new(0),
-            }),
-        };
+        let inner = Arc::new(AgentInner {
+            discard_notifications: config.discard_notifications,
+            task_changed: tokio::sync::Notify::new(),
+            mutation_failures: AtomicU64::new(0),
+            communities: config.communities,
+            usm_users,
+            handlers: config.handlers,
+            state,
+            salt_counter,
+            des_salt_state: config.des_salt_state,
+            set_coordinator: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            concurrency_limit: config.concurrency_limit,
+            authorization: config.authorization,
+            cancel: config.cancel,
+            trap_sinks,
+            inform_transports: notification::InformTransportPool::new(),
+            notification_id: std::sync::atomic::AtomicI32::new(1),
+            run_active: AtomicBool::new(false),
+            run_orphaned: AtomicBool::new(false),
+            active_request_tasks: AtomicUsize::new(0),
+            next_request_task_id: AtomicU64::new(1),
+            live_request_tasks: std::sync::Mutex::new(HashMap::new()),
+            response_send_timeout: config.response_send_timeout,
+            request_deadline: config.request_deadline,
+            shutdown_policy: config.shutdown_policy,
+            notification_fanout_limit: config.notification_fanout_limit,
+            #[cfg(test)]
+            response_send_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            response_sends_started: AtomicU32::new(0),
+            #[cfg(test)]
+            received_datagrams: AtomicU32::new(0),
+            #[cfg(test)]
+            receive_errors: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            #[cfg(test)]
+            receive_attempts: Arc::new(AtomicU32::new(0)),
+        });
         construction.check(ConstructionStage::Prepare, None, None)?;
-        Ok(agent)
+        let agent = Agent {
+            inner: inner.clone(),
+            network: network.clone(),
+            lease: Arc::new(AgentLease::new(inner.cancel.clone())),
+            #[cfg(test)]
+            test_runner: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let runner = AgentRunner::new(inner, network, listeners, receiver);
+        Ok(PreparedAgent { agent, runner })
     }
 
     fn validate_and_normalize(mut self) -> Result<ValidatedAgentBuilder> {
@@ -1436,15 +1534,40 @@ impl AgentBuilder {
             }
         }
 
-        let engine_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
-        if self.max_message_size > engine_receive_capacity.as_usize() {
+        if !self.listeners.is_empty() && (self.bind_explicit || self.recv_buffer_explicit) {
             return Err(Error::Config(
-                format!("max_message_size must not exceed UDP capacity {engine_receive_capacity}")
+                "explicit listeners conflict with bind or receive-buffer configuration".into(),
+            )
+            .boxed());
+        }
+        if self.listeners.len() > 32
+            || self.max_connections == 0
+            || self.max_connections > 65536
+            || self.buffered_bytes < crate::UDP_RECEIVE_BUFFER_SIZE
+            || self.buffered_bytes > u32::MAX as usize
+            || self.buffered_bytes > Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "invalid listener, connection or aggregate buffer limit".into(),
+            )
+            .boxed());
+        }
+        if self.overload_timeout.is_zero() {
+            return Err(Error::Config("overload timeout must be nonzero".into()).boxed());
+        }
+        crate::transport::checked_deadline(self.overload_timeout, "listener overload timeout")?;
+        let engine_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
+        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
+            return Err(Error::Config(
+                "max_message_size exceeds the SNMP size range"
+                    .to_string()
                     .into(),
             )
             .boxed());
         }
-        if self.max_concurrent_requests == Some(0) {
+        if self.max_concurrent_requests == 0
+            || self.max_concurrent_requests > Semaphore::MAX_PERMITS
+        {
             return Err(
                 Error::Config("max_concurrent_requests must be greater than 0".into()).boxed(),
             );
@@ -1525,11 +1648,14 @@ impl AgentBuilder {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let concurrency_limit = self
-            .max_concurrent_requests
-            .map(|limit| Arc::new(Semaphore::new(limit)));
+        let concurrency_limit = Arc::new(Semaphore::new(self.max_concurrent_requests));
 
         Ok(ValidatedAgentBuilder {
+            listeners: self.listeners,
+            max_connections: self.max_connections,
+            buffered_bytes: self.buffered_bytes,
+            overload_timeout: self.overload_timeout,
+            discard_notifications: self.discard_notifications,
             bind_addr,
             communities: self.communities,
             usm,
@@ -1785,10 +1911,9 @@ impl AgentState {
 
 /// Inner state shared across agent clones.
 pub(crate) struct AgentInner {
-    pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) udp_responder: Arc<UdpResponder>,
-    pub(crate) endpoint_id: crate::EndpointId,
-    pub(crate) local_addr: SocketAddr,
+    discard_notifications: bool,
+    task_changed: tokio::sync::Notify,
+    mutation_failures: AtomicU64,
     pub(crate) communities: Vec<crate::Community>,
     pub(crate) usm_users: HashMap<Bytes, UsmUser>,
     pub(crate) handlers: Vec<RegisteredHandler>,
@@ -1797,7 +1922,8 @@ pub(crate) struct AgentInner {
     pub(crate) des_salt_state: Option<DesSaltState>,
     /// Serializes complete SET transactions without restricting retrieval.
     pub(crate) set_coordinator: tokio::sync::Mutex<()>,
-    pub(crate) concurrency_limit: Option<Arc<Semaphore>>,
+    #[cfg(test)]
+    pub(crate) concurrency_limit: Arc<Semaphore>,
     pub(crate) authorization: AgentAuthorization,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
@@ -1827,11 +1953,9 @@ pub(crate) struct AgentInner {
     #[cfg(test)]
     received_datagrams: AtomicU32,
     #[cfg(test)]
-    pre_permit_gate: std::sync::Mutex<Option<Arc<Semaphore>>>,
+    receive_errors: Arc<std::sync::Mutex<std::collections::VecDeque<std::io::Error>>>,
     #[cfg(test)]
-    receive_errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
-    #[cfg(test)]
-    receive_attempts: AtomicU32,
+    receive_attempts: Arc<AtomicU32>,
 }
 
 /// An SNMP agent.
@@ -1849,13 +1973,21 @@ pub(crate) struct AgentInner {
 ///     .bind("0.0.0.0:161")
 ///     .community(b"public")
 ///     .allow_all_access()
-///     .build()
+///     .spawn()
 ///     .await?;
 ///
-/// agent.run().await
+/// agent.join().await
 /// # }
 /// ```
 pub struct Agent {
+    pub(crate) inner: Arc<AgentInner>,
+    pub(crate) network: Arc<AgentNetwork>,
+    lease: Arc<AgentLease>,
+    #[cfg(test)]
+    test_runner: Arc<std::sync::Mutex<Option<AgentRunner>>>,
+}
+#[derive(Clone)]
+pub(crate) struct AgentProcessor {
     pub(crate) inner: Arc<AgentInner>,
 }
 
@@ -1866,10 +1998,37 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    /// Returns the local address that the agent is bound to.
-    #[must_use]
+    /// Identified addresses of every prepared UDP endpoint and TCP listener.
+    pub fn bound_addresses(&self) -> &[crate::transport::BoundListener] {
+        &self.network.bound
+    }
+    /// Clone a selected UDP endpoint without creating a reader.
+    pub fn udp_endpoint(&self, id: crate::EndpointId) -> Option<crate::UdpEndpoint> {
+        self.network
+            .udp
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id() == id)
+            .cloned()
+    }
+    /// Snapshot handles selecting the currently accepted TCP sessions.
+    pub fn tcp_sessions(&self) -> Vec<crate::TcpTransport> {
+        self.network
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+    #[cfg(test)]
+    pub(crate) fn processor(&self) -> AgentProcessor {
+        AgentProcessor {
+            inner: self.inner.clone(),
+        }
+    }
+    #[cfg(test)]
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr
+        self.bound_addresses()[0].local_addr
     }
 
     /// Return the configured request decode configuration.
@@ -1939,7 +2098,7 @@ impl Agent {
     /// Return the number of dispatched request tasks still owned by the agent.
     ///
     /// This includes protected SET work retained after a `run` future is
-    /// dropped. A second `run` remains rejected until such orphaned work exits.
+    /// dropped. The runner is single use; mutation work remains independently retained.
     #[must_use]
     pub fn active_request_count(&self) -> usize {
         self.inner.active_request_tasks.load(Ordering::Acquire)
@@ -2129,266 +2288,15 @@ impl Agent {
         centisecs.min(u128::from(u32::MAX)) as u32
     }
 
-    /// Run the agent, processing requests concurrently.
-    ///
-    /// Requests are processed in parallel up to the configured
-    /// `max_concurrent_requests` limit (default: 1000). This method runs
-    /// until the cancellation token is triggered.
-    ///
-    /// Cancellation stops receiving datagrams and waiting for concurrency
-    /// permits, signals every dispatched request context, and by default drains
-    /// handler work and response attempts without a forced timeout. A received
-    /// request still waiting for admission may be dropped. Configure
-    /// [`AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter`] only when
-    /// every retrieval handler satisfies its cancellation-safety contract;
-    /// SET and unclassified work always drain.
-    ///
-    /// Dropping or aborting `run` signals its request contexts but cannot await
-    /// them. Live tasks remain in the Agent-owned registry and are observable
-    /// through [`active_request_count`](Self::active_request_count); a second
-    /// `run` is rejected until retained work finishes. For orderly shutdown,
-    /// cancel the configured token and await this method.
-    ///
-    /// Only one active call to `run` is supported for an agent. Cloned handles
-    /// may still be used for other agent operations while that call is active.
-    /// Datagram-local receive metadata errors are discarded. Known transient
-    /// socket errors are retried with bounded backoff; invalid or unknown
-    /// socket-state errors terminate the service and are returned.
-    #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
-    pub async fn run(&self) -> Result<()> {
-        self.inner
-            .run_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::AgentAlreadyRunning.boxed())?;
-        self.inner.run_orphaned.store(false, Ordering::Release);
-        let mut run_guard = RunGuard {
-            inner: &self.inner,
-            completed: false,
-        };
-
-        let mut buf = vec![0u8; UDP_RECEIVE_BUFFER_SIZE];
-        let mut request_tasks =
-            RequestTasks::new(self.inner.cancel.child_token(), Arc::clone(&self.inner));
-        let mut recv_error_backoff = UdpRecvErrorBackoff::default();
-
-        let log_task_result = |result: std::result::Result<(), JoinError>| {
-            if let Err(error) = result {
-                if error.is_cancelled() {
-                    tracing::debug!(target: "async_snmp::agent", "cancellation-safe retrieval task aborted by shutdown policy");
-                } else {
-                    tracing::error!(target: "async_snmp::agent", %error, "request task failed");
-                }
-            }
-        };
-
-        let run_result = 'service: loop {
-            let recv_meta = loop {
-                tokio::select! {
-                    biased;
-                    () = self.inner.cancel.cancelled() => {
-                        tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
-                        break 'service Ok(());
-                    }
-                    result = request_tasks.join_next(), if !request_tasks.is_empty() => {
-                        if let Some(result) = result {
-                            log_task_result(result);
-                        }
-                    }
-                    result = self.recv_packet(&mut buf) => {
-                        match result {
-                            Ok(recv_meta) => {
-                                recv_error_backoff.reset();
-                                break recv_meta;
-                            }
-                            Err(error) => match classify_udp_recv_error(&error) {
-                                UdpRecvErrorClass::DatagramLocal => {
-                                    recv_error_backoff.reset();
-                                    tracing::warn!(target: "async_snmp::agent", %error, "discarding datagram with invalid receive metadata");
-                                }
-                                UdpRecvErrorClass::Transient => {
-                                    let delay = recv_error_backoff.advance();
-                                    tracing::warn!(target: "async_snmp::agent", %error, backoff = ?delay, "transient UDP receive error");
-                                    tokio::select! {
-                                        biased;
-                                        () = self.inner.cancel.cancelled() => {
-                                            tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
-                                            break 'service Ok(());
-                                        }
-                                        () = tokio::time::sleep(delay) => {}
-                                    }
-                                }
-                                UdpRecvErrorClass::Fatal => {
-                                    break 'service Err(Error::Network {
-                                        target: self.inner.local_addr,
-                                        source: error,
-                                    }
-                                    .boxed());
-                                }
-                            },
-                        }
-                    }
-                }
-            };
-
-            // Capture receipt before copying the datagram or waiting for an
-            // execution permit so queueing consumes the request budget.
-            let received_at = tokio::time::Instant::now();
-            let deadline = self.inner.request_deadline.map(|duration| {
-                received_at
-                    .checked_add(duration)
-                    .expect("agent request deadline validated by builder")
-            });
-            #[cfg(test)]
-            self.inner
-                .received_datagrams
-                .fetch_add(1, Ordering::Relaxed);
-            #[cfg(test)]
-            let pre_permit_gate = self.inner.pre_permit_gate.lock().unwrap().clone();
-            #[cfg(test)]
-            if let Some(gate) = pre_permit_gate {
-                gate.acquire()
-                    .await
-                    .expect("test pre-permit gate remains open")
-                    .forget();
-            }
-
-            let data = Bytes::copy_from_slice(&buf[..recv_meta.len]);
-            if data.len() > UDP_RECEIVE_LIMITS.advertised().as_usize() {
-                tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, received_size = data.len(), advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
-            }
-            let message = crate::transport::ReceivedMessage::udp(
-                data,
-                self.inner.endpoint_id,
-                self.inner.socket.clone(),
-                self.inner.udp_responder.clone(),
-                recv_meta,
-                received_at,
-                crate::transport::EndpointLimits::UDP,
-            );
-            let agent = self.clone();
-
-            let permit = if let Some(ref sem) = self.inner.concurrency_limit {
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = self.inner.cancel.cancelled() => {
-                            tracing::info!(target: "async_snmp::agent", "agent shutdown requested");
-                            break 'service Ok(());
-                        }
-                        result = request_tasks.join_next(), if !request_tasks.is_empty() => {
-                            if let Some(result) = result {
-                                log_task_result(result);
-                            }
-                        }
-                        result = sem.clone().acquire_owned() => {
-                            break Some(result.expect("semaphore closed"));
-                        }
-                    }
-                }
-            } else {
-                None
-            };
-
-            let task_cancel = request_tasks.cancellation_token();
-            let request_cancel = task_cancel.child_token();
-            let phase = Arc::new(AtomicU8::new(RequestTaskPhase::Unclassified as u8));
-            let lifecycle = RequestLifecycle::new(
-                received_at,
-                tokio::time::Instant::now(),
-                deadline,
-                request_cancel.clone(),
-                phase.clone(),
-            )
-            .with_message(message.info, message.reply.limits);
-            request_tasks.spawn(phase, async move {
-                let _permit = permit;
-
-                let request = async {
-                    match agent
-                        .handle_request_with_lifecycle(message.bytes, message.info.peer_addr(), lifecycle)
-                        .await
-                    {
-                        Ok(Some(response_bytes)) => {
-                            if let Err(e) = agent.send_response(&response_bytes, &message.reply).await {
-                                tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "failed to send response");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "error handling request");
-                        }
-                    }
-                };
-                tokio::pin!(request);
-                if let Some(deadline) = deadline {
-                    if tokio::time::Instant::now() >= deadline {
-                        tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source }, "request deadline expired before admission");
-                        request_cancel.cancel();
-                        request.await;
-                    } else {
-                        tokio::select! {
-                            () = tokio::time::sleep_until(deadline) => {
-                                tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source }, "request deadline expired");
-                                request_cancel.cancel();
-                                request.await;
-                            }
-                            () = &mut request => {}
-                        }
-                    }
-                } else {
-                    request.await;
-                }
-            });
-        };
-
-        request_tasks.cancel();
-        match self.inner.shutdown_policy {
-            AgentShutdownPolicy::Drain => {
-                while let Some(result) = request_tasks.join_next().await {
-                    log_task_result(result);
-                }
-            }
-            AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(grace) => {
-                let deadline = tokio::time::Instant::now()
-                    .checked_add(grace)
-                    .expect("agent shutdown grace validated by builder");
-                loop {
-                    if request_tasks.is_empty() {
-                        break;
-                    }
-                    tokio::select! {
-                        result = request_tasks.join_next() => {
-                            if let Some(result) = result {
-                                log_task_result(result);
-                            }
-                        }
-                        () = tokio::time::sleep_until(deadline) => {
-                            request_tasks.abort_retrievals();
-                            break;
-                        }
-                    }
-                }
-                while let Some(result) = request_tasks.join_next().await {
-                    log_task_result(result);
-                }
-            }
+    /// Acquire lifecycle and independent mutation-drain observation.
+    pub fn control(&self) -> AgentControl {
+        AgentControl {
+            agent: self.clone(),
         }
-
-        run_guard.complete();
-        run_result
     }
+}
 
-    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<ReceivedDatagram> {
-        #[cfg(test)]
-        {
-            self.inner.receive_attempts.fetch_add(1, Ordering::Relaxed);
-            if let Some(error) = self.inner.receive_errors.lock().unwrap().pop_front() {
-                return Err(error);
-            }
-        }
-        self.inner.udp_responder.recv(&self.inner.socket, buf).await
-    }
-
+impl AgentProcessor {
     async fn send_response(
         &self,
         data: &[u8],
@@ -2414,7 +2322,7 @@ impl Agent {
                 if let Some(gate) = &response_send_gate {
                     gate.acquire().await.expect("test send gate remains open").forget();
                 }
-                route.send(data).await
+                route.send_before(data, deadline).await
             } => result,
         }
     }
@@ -2512,7 +2420,10 @@ impl Agent {
                 self.handle_get_bulk(ctx, pdu).await
             }
             PduType::SetRequest => self.handle_set(ctx, pdu).await.map(Some),
-            PduType::InformRequest => self.handle_inform(ctx, pdu).map(Some),
+            PduType::InformRequest if self.inner.discard_notifications => {
+                self.handle_inform(ctx, pdu).map(Some)
+            }
+            PduType::InformRequest => Ok(None),
             _ => {
                 // Should not happen - filtered earlier
                 pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, 0)
@@ -2999,6 +2910,10 @@ impl Clone for Agent {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            network: self.network.clone(),
+            lease: self.lease.clone(),
+            #[cfg(test)]
+            test_runner: self.test_runner.clone(),
         }
     }
 }
@@ -3363,7 +3278,7 @@ mod tests {
         wait_for_run_state(&agent, true).await;
 
         let error = agent.clone().run().await.unwrap_err();
-        assert!(matches!(*error, Error::AgentAlreadyRunning));
+        assert!(matches!(*error, Error::Config(_)));
         assert!(!first.is_finished());
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3395,10 +3310,7 @@ mod tests {
         agent.cancel();
         first.await.unwrap().unwrap();
         wait_for_run_state(&agent, false).await;
-        assert!(
-            agent.run().await.is_ok(),
-            "a later call must acquire the guard"
-        );
+        assert!(agent.run().await.is_err(), "the owned runner is single use");
     }
 
     #[test]
@@ -3516,7 +3428,7 @@ mod tests {
             .push_back(std::io::Error::from(std::io::ErrorKind::InvalidInput));
 
         let error = agent.run().await.unwrap_err();
-        let Error::Network { source, .. } = &*error else {
+        let Error::Network { source, .. } = error.exchange_source() else {
             panic!("fatal receive error lost its network classification");
         };
         assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
@@ -3555,7 +3467,7 @@ mod tests {
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(TestHandler))
             .without_builtin_handlers()
-            .max_concurrent_requests(Some(1))
+            .max_concurrent_requests(1)
             .response_send_timeout(Duration::from_millis(20))
             .allow_all_access()
             .build()
@@ -3628,7 +3540,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn request_deadline_includes_concurrency_permit_queueing() {
+    async fn udp_overload_drops_before_admission_and_preserves_admitted_deadline() {
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3644,14 +3556,12 @@ mod tests {
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(handler))
             .without_builtin_handlers()
-            .max_concurrent_requests(Some(1))
+            .max_concurrent_requests(1)
             .request_deadline(Some(budget))
             .allow_all_access()
             .build()
             .await
             .unwrap();
-        let pre_permit_gate = Arc::new(Semaphore::new(1));
-        *agent.inner.pre_permit_gate.lock().unwrap() = Some(pre_permit_gate.clone());
         let run_agent = agent.clone();
         let run = tokio::spawn(async move { run_agent.run().await });
         wait_for_run_state(&agent, true).await;
@@ -3665,15 +3575,14 @@ mod tests {
             .send_to(&encoded_get(2), agent.local_addr())
             .await
             .unwrap();
-        while agent.inner.received_datagrams.load(Ordering::Relaxed) < 2 {
+        while agent.control().overload_drops() == 0 {
             tokio::task::yield_now().await;
         }
         assert_eq!(agent.active_request_count(), 1);
         tokio::time::advance(budget + Duration::from_millis(1)).await;
-        pre_permit_gate.add_permits(1);
-        release.add_permits(2);
+        release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while observations.lock().unwrap().len() != 2 {
+            while observations.lock().unwrap().len() != 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3682,10 +3591,10 @@ mod tests {
 
         let queued = {
             let observations = observations.lock().unwrap();
-            observations[1]
+            observations[0]
         };
         assert_eq!(queued.2, queued.0.checked_add(budget));
-        assert!(queued.1.duration_since(queued.0) >= budget);
+        assert!(queued.1 >= queued.0);
         assert!(queued.3);
         agent.cancel();
         run.await.unwrap().unwrap();
@@ -3744,7 +3653,7 @@ mod tests {
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(handler))
             .without_builtin_handlers()
-            .max_concurrent_requests(Some(1))
+            .max_concurrent_requests(1)
             .shutdown_policy(AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(
                 Duration::from_millis(10),
             ))
@@ -3768,15 +3677,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(agent.active_request_count(), 0);
-        assert_eq!(
-            agent
-                .inner
-                .concurrency_limit
-                .as_ref()
-                .unwrap()
-                .available_permits(),
-            1
-        );
+        assert_eq!(agent.inner.concurrency_limit.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -3841,10 +3742,7 @@ mod tests {
         assert!(run.await.unwrap_err().is_cancelled());
         assert_eq!(agent.active_request_count(), 1);
         assert!(agent.has_orphaned_requests());
-        assert!(matches!(
-            &*agent.run().await.unwrap_err(),
-            Error::AgentAlreadyRunning
-        ));
+        assert!(matches!(&*agent.run().await.unwrap_err(), Error::Config(_)));
 
         release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3947,7 +3845,7 @@ mod tests {
         wait_for_run_state(&agent, false).await;
 
         agent.cancel();
-        assert!(agent.run().await.is_ok());
+        assert!(agent.run().await.is_err());
     }
 
     #[tokio::test]
@@ -3967,7 +3865,7 @@ mod tests {
         wait_for_run_state(&agent, false).await;
 
         agent.cancel();
-        assert!(agent.run().await.is_ok());
+        assert!(agent.run().await.is_err());
     }
 
     #[test]
@@ -4230,6 +4128,7 @@ mod tests {
             let agent = builder.allow_all_access().build().await.unwrap();
 
             let result = agent
+                .processor()
                 .get_next_oid(&test_ctx(), &cursor)
                 .await
                 .unwrap()
@@ -4261,6 +4160,7 @@ mod tests {
         }
         let agent = builder.allow_all_access().build().await.unwrap();
         let result = agent
+            .processor()
             .get_next_oid(&test_ctx(), &cursor)
             .await
             .unwrap()
@@ -4298,7 +4198,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let error = agent.get_next_oid(&ctx, &cursor).await.unwrap_err();
+            let error = agent
+                .processor()
+                .get_next_oid(&ctx, &cursor)
+                .await
+                .unwrap_err();
             assert!(error.message().contains(expected_error));
 
             let request = Pdu::standard(
@@ -4309,6 +4213,7 @@ mod tests {
                 vec![VarBind::new(cursor, Value::Null)],
             );
             let response = agent
+                .processor()
                 .dispatch_request(&ctx, &request)
                 .await
                 .unwrap()
@@ -4345,6 +4250,7 @@ mod tests {
             Pdu::get_bulk(11, 0, 2, vec![VarBind::new(root.child(1), Value::Null)]).unwrap();
 
         let response = agent
+            .processor()
             .dispatch_request(&ctx, &request)
             .await
             .unwrap()
@@ -4393,7 +4299,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+        let task =
+            tokio::spawn(async move { agent.processor().get_next_oid(&test_ctx(), &prefix).await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while first_calls.load(Ordering::SeqCst) == 0 || later_calls.load(Ordering::SeqCst) == 0
@@ -4444,7 +4351,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+        let task =
+            tokio::spawn(async move { agent.processor().get_next_oid(&test_ctx(), &prefix).await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while first_calls.load(Ordering::SeqCst) == 0 || later_calls.load(Ordering::SeqCst) == 0
@@ -4502,7 +4410,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(20),
-                agent.dispatch_request(&ctx, &pdu)
+                agent.processor().dispatch_request(&ctx, &pdu)
             )
             .await
             .is_err()
@@ -4536,7 +4444,8 @@ mod tests {
             );
         }
         let agent = builder.allow_all_access().build().await.unwrap();
-        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+        let task =
+            tokio::spawn(async move { agent.processor().get_next_oid(&test_ctx(), &prefix).await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while calls.load(Ordering::SeqCst) < MAX_CONCURRENT_GETNEXT_PROBES {
@@ -4602,7 +4511,8 @@ mod tests {
             }),
         );
         let agent = builder.allow_all_access().build().await.unwrap();
-        let task = tokio::spawn(async move { agent.get_next_oid(&test_ctx(), &prefix).await });
+        let task =
+            tokio::spawn(async move { agent.processor().get_next_oid(&test_ctx(), &prefix).await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while calls.load(Ordering::SeqCst) <= MAX_CONCURRENT_GETNEXT_PROBES {
@@ -4654,7 +4564,12 @@ mod tests {
         let ctx = crate::test_support::request_context(PduType::GetBulkRequest);
         let pdu = Pdu::get_bulk(10, 0, 3, vec![VarBind::new(prefix.clone(), Value::Null)]).unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             response
                 .varbinds
@@ -4732,7 +4647,12 @@ mod tests {
             ],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 2);
         assert_eq!(response.varbinds.len(), 2);
@@ -4758,7 +4678,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
     }
@@ -4779,7 +4704,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
     }
@@ -4803,7 +4733,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 2);
     }
@@ -4915,6 +4850,7 @@ mod tests {
                         }
                     };
                     let response = agent
+                        .processor()
                         .handle_request(message, "127.0.0.1:9999".parse().unwrap())
                         .await
                         .unwrap();
@@ -4965,7 +4901,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .allow_all_access()
-            .max_concurrent_requests(Some(1))
+            .max_concurrent_requests(1)
             .without_builtin_handlers()
             .handler(root.clone(), Arc::new(CountingDropHandler(calls.clone())))
             .build()
@@ -5103,6 +5039,7 @@ mod tests {
                 .encode()
                 .unwrap();
             let response = agent
+                .processor()
                 .handle_request(msg, "127.0.0.1:9999".parse().unwrap())
                 .await
                 .unwrap();
@@ -5156,6 +5093,7 @@ mod tests {
                 // GET only uses the matching handler and succeeds.
                 assert!(
                     agent
+                        .processor()
                         .dispatch_request(&ctx, &Pdu::get_request(1, std::slice::from_ref(&cursor)))
                         .await
                         .unwrap()
@@ -5172,6 +5110,7 @@ mod tests {
                 );
                 assert!(
                     agent
+                        .processor()
                         .dispatch_request(
                             &ctx,
                             &Pdu::get_next_request(2, std::slice::from_ref(&cursor))
@@ -5192,6 +5131,7 @@ mod tests {
                             .unwrap();
                     assert!(
                         agent
+                            .processor()
                             .dispatch_request(&ctx, &request)
                             .await
                             .unwrap()
@@ -5214,7 +5154,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .without_builtin_handlers()
             .allow_all_access()
-            .max_concurrent_requests(Some(1))
+            .max_concurrent_requests(1)
             .authoritative_engine(AuthoritativeEngine::for_test(
                 b"handler-drop-engine".to_vec(),
                 1,
@@ -5402,7 +5342,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Collect the OIDs returned (excluding EndOfMibView sentinels)
         let returned_oids: Vec<&Oid> = response
@@ -5461,7 +5406,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         // First non-repeater skips denied .99999.1.0 and returns accessible .99999.2.0
         assert_eq!(
@@ -5549,7 +5499,12 @@ mod tests {
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
@@ -5622,7 +5577,12 @@ mod tests {
         );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
         assert_eq!(response.error_index(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), MAX_GETNEXT_SKIP_ITERATIONS);
@@ -5637,7 +5597,12 @@ mod tests {
         );
         let pdu = Pdu::get_next_request(1, &[oid!(1, 3, 6, 1, 4, 1, 99999)]);
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), ErrorStatus::NoSuchName.as_i32());
         assert_eq!(response.error_index(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -5739,7 +5704,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].oid,
@@ -5773,7 +5743,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].value,
@@ -5804,7 +5779,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Both OIDs should appear
         assert!(
@@ -5846,7 +5826,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::GenErr,
@@ -5930,7 +5915,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ErrorStatus::from_i32(response.error_status()),
             ErrorStatus::NoSuchName,
@@ -5956,7 +5946,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), 0);
         assert!(matches!(response.varbinds[0].value, Value::Counter64(_)));
     }
@@ -5997,6 +5992,7 @@ mod tests {
         .unwrap();
 
         let full_response = agent
+            .processor()
             .dispatch_request(&ctx_unlimited, &pdu)
             .await
             .unwrap()
@@ -6026,6 +6022,7 @@ mod tests {
         );
 
         let limited_response = agent
+            .processor()
             .dispatch_request(&ctx_limited, &pdu)
             .await
             .unwrap()
@@ -6063,7 +6060,7 @@ mod tests {
         // the security level field.
         let v2c = test_ctx();
         assert_eq!(
-            agent.response_overhead(&v2c),
+            agent.processor().response_overhead(&v2c),
             RESPONSE_OVERHEAD + v2c.security_name().len()
         );
 
@@ -6075,7 +6072,7 @@ mod tests {
             PduType::GetRequest,
         );
         assert_eq!(
-            agent.response_overhead(&noauth),
+            agent.processor().response_overhead(&noauth),
             RESPONSE_OVERHEAD + variable
         );
 
@@ -6084,21 +6081,30 @@ mod tests {
             PduType::GetRequest,
         );
         assert_eq!(
-            agent.response_overhead(&authnopriv),
+            agent.processor().response_overhead(&authnopriv),
             RESPONSE_OVERHEAD + variable + V3_AUTH_OVERHEAD
         );
 
         let authpriv =
             crate::test_support::usm_request_context(SecurityLevel::AuthPriv, PduType::GetRequest);
         assert_eq!(
-            agent.response_overhead(&authpriv),
+            agent.processor().response_overhead(&authpriv),
             RESPONSE_OVERHEAD + variable + V3_AUTH_OVERHEAD + V3_PRIV_OVERHEAD
         );
 
         // Overhead is monotonic in the wrapper cost.
-        assert!(agent.response_overhead(&v2c) < agent.response_overhead(&noauth));
-        assert!(agent.response_overhead(&noauth) < agent.response_overhead(&authnopriv));
-        assert!(agent.response_overhead(&authnopriv) < agent.response_overhead(&authpriv));
+        assert!(
+            agent.processor().response_overhead(&v2c)
+                < agent.processor().response_overhead(&noauth)
+        );
+        assert!(
+            agent.processor().response_overhead(&noauth)
+                < agent.processor().response_overhead(&authnopriv)
+        );
+        assert!(
+            agent.processor().response_overhead(&authnopriv)
+                < agent.processor().response_overhead(&authpriv)
+        );
     }
 
     #[tokio::test]
@@ -6123,7 +6129,8 @@ mod tests {
         );
 
         assert_eq!(
-            agent.response_overhead(&long) - agent.response_overhead(&short),
+            agent.processor().response_overhead(&long)
+                - agent.processor().response_overhead(&short),
             long.security_name().len() - short.security_name().len()
         );
     }
@@ -6158,6 +6165,7 @@ mod tests {
         // than authPriv because authPriv's overhead is larger.
         let v2c = crate::test_support::request_context(PduType::GetBulkRequest);
         let v2c_count = agent
+            .processor()
             .dispatch_request(&v2c, &pdu)
             .await
             .unwrap()
@@ -6177,6 +6185,7 @@ mod tests {
             limit,
         );
         let authpriv_count = agent
+            .processor()
             .dispatch_request(&authpriv, &pdu)
             .await
             .unwrap()
@@ -6297,7 +6306,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Only the first non-repeater fit; the response is exactly that prefix.
         assert_eq!(
@@ -6362,7 +6376,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
@@ -6411,7 +6430,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
@@ -6442,7 +6466,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         let data_count = response
             .varbinds
             .iter()
@@ -6474,7 +6503,12 @@ mod tests {
             vec![VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999), Value::Null)],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), 0, "should succeed");
         assert_eq!(
             response.varbinds[0].oid,
@@ -6672,6 +6706,7 @@ mod tests {
         let source = "127.0.0.1:9999".parse().unwrap();
         assert_eq!(
             agent
+                .processor()
                 .handle_request(discovery.clone(), source)
                 .await
                 .unwrap_err()
@@ -6695,6 +6730,7 @@ mod tests {
             .unwrap();
             assert!(
                 agent
+                    .processor()
                     .handle_request(request, source)
                     .await
                     .unwrap()
@@ -6705,6 +6741,7 @@ mod tests {
 
         assert_eq!(
             agent
+                .processor()
                 .handle_request(discovery, source)
                 .await
                 .unwrap_err()
@@ -6913,8 +6950,8 @@ mod tests {
     #[tokio::test]
     async fn test_agent_community_matching_preserves_deny_empty_policy() {
         let empty = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
-        assert!(!empty.validate_community(b"public"));
-        assert!(!empty.validate_community(b""));
+        assert!(!empty.processor().validate_community(b"public"));
+        assert!(!empty.processor().validate_community(b""));
         assert!(empty.inner.salt_counter.is_none());
 
         let configured = Agent::builder()
@@ -6924,11 +6961,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        assert!(configured.validate_community(b"public"));
-        assert!(configured.validate_community(b"monitor"));
+        assert!(configured.processor().validate_community(b"public"));
+        assert!(configured.processor().validate_community(b"monitor"));
         assert!(configured.inner.salt_counter.is_none());
         for community in [b"private".as_slice(), b"pub", b"publicx", b""] {
-            assert!(!configured.validate_community(community));
+            assert!(!configured.processor().validate_community(community));
         }
     }
 
@@ -6966,11 +7003,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_message_size_above_udp_capacity_rejected_before_bind() {
-        let max_udp_message_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize();
+    async fn test_max_message_size_above_snmp_range_rejected_before_bind() {
+        let max_snmp_message_size = i32::MAX as usize;
         let result = Agent::builder()
             .bind("not a socket address")
-            .max_message_size(max_udp_message_size + 1)
+            .max_message_size(max_snmp_message_size + 1)
             .build()
             .await;
 
@@ -6988,7 +7025,7 @@ mod tests {
         let result = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .max_concurrent_requests(Some(0))
+            .max_concurrent_requests(0)
             .allow_all_access()
             .build()
             .await;
@@ -7103,7 +7140,7 @@ mod tests {
     async fn deterministic_validation_precedes_invalid_bind_and_dependencies() {
         let error = Agent::builder()
             .bind("not a socket address")
-            .max_concurrent_requests(Some(0))
+            .max_concurrent_requests(0)
             .trap_sink(
                 NotificationSinkId::new("resolver-must-not-run").unwrap(),
                 "unresolvable.invalid:162",
@@ -7626,7 +7663,8 @@ mod tests {
         let ctx = test_ctx();
 
         // snmpEngineMaxMessageSize.0 should be queryable
-        let handler = agent
+        let processor = agent.processor();
+        let handler = processor
             .find_handler(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
             .expect("snmpEngine handler should be registered");
         let get_result = handler
@@ -7637,7 +7675,8 @@ mod tests {
         assert!(matches!(get_result, GetResult::Value(Value::Integer(_))));
 
         // usmStatsWrongDigests.0 should be queryable
-        let handler = agent
+        let processor = agent.processor();
+        let handler = processor
             .find_handler(&oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0))
             .expect("USM stats handler should be registered");
         let get_result = handler
@@ -7648,7 +7687,8 @@ mod tests {
         assert!(matches!(get_result, GetResult::Value(Value::Counter32(0))));
 
         // snmpUnknownSecurityModels.0 should be queryable
-        let handler = agent
+        let processor = agent.processor();
+        let handler = processor
             .find_handler(&oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
             .expect("MPD stats handler should be registered");
         let get_result = handler
@@ -7672,16 +7712,19 @@ mod tests {
 
         assert!(
             agent
+                .processor()
                 .find_handler(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0))
                 .is_none()
         );
         assert!(
             agent
+                .processor()
                 .find_handler(&oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 1, 0))
                 .is_none()
         );
         assert!(
             agent
+                .processor()
                 .find_handler(&oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
                 .is_none()
         );
@@ -7700,16 +7743,19 @@ mod tests {
 
         assert!(
             agent
+                .processor()
                 .find_handler(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0))
                 .is_some()
         );
         assert!(
             agent
+                .processor()
                 .find_handler(&oid!(1, 3, 6, 1, 6, 3, 15, 1, 1, 1, 0))
                 .is_none()
         );
         assert!(
             agent
+                .processor()
                 .find_handler(&oid!(1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0))
                 .is_some()
         );
@@ -7750,11 +7796,13 @@ mod tests {
         let bytes = match version {
             Version::V1 => {
                 agent
+                    .processor()
                     .handle_v1(request, "127.0.0.1:161".parse().unwrap())
                     .await
             }
             Version::V2c => {
                 agent
+                    .processor()
                     .handle_v2c(request, "127.0.0.1:161".parse().unwrap())
                     .await
             }
@@ -7841,7 +7889,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert!(matches!(response.varbinds[0].value, Value::Integer(1)));
@@ -7911,7 +7964,12 @@ mod tests {
         .unwrap()
         .into_raw();
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.pdu_type(), PduType::Response);
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.request_id, 7);
@@ -7935,7 +7993,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(

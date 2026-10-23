@@ -706,7 +706,7 @@ impl super::Agent {
     ///     .community(b"public")
     ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     ///
     /// let outcome = agent
@@ -802,7 +802,7 @@ impl super::Agent {
     ///     .community(b"public")
     ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
     ///     .allow_all_access()
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     ///
     /// let outcome = agent
@@ -905,7 +905,16 @@ impl super::Agent {
             Version::V1 => {
                 // Convert the v2 PDU to a v1 TrapV1Pdu (RFC 3584 Section 3.2).
                 // Use the agent's bound address as agent_addr if available.
-                let local_ip = match self.inner.socket.local_addr() {
+                let local_ip = match self
+                    .network
+                    .udp
+                    .first()
+                    .ok_or_else(|| {
+                        Error::Config("trap sink requires a UDP endpoint".into()).boxed()
+                    })?
+                    .socket()
+                    .local_addr()
+                {
                     Ok(addr) => match addr.ip() {
                         std::net::IpAddr::V4(v4) => v4.octets(),
                         std::net::IpAddr::V6(_) => [0, 0, 0, 0],
@@ -956,13 +965,14 @@ impl super::Agent {
         }?;
 
         tracing::debug!(target: "async_snmp::agent", { snmp.sink_id = %sink.summary.id, snmp.dest = %sink.summary.dest, snmp.bytes = data.len() }, "sending trap");
-        send_datagram_with_timeout(
-            &self.inner.socket,
-            &data,
-            sink.summary.dest,
-            sink.trap_send_timeout,
-        )
-        .await?;
+        use crate::RequestTransport;
+        self.network
+            .udp
+            .first()
+            .ok_or_else(|| Error::Config("trap sink requires a UDP endpoint".into()).boxed())?
+            .handle(sink.summary.dest)?
+            .send_with_timeout(&data, sink.trap_send_timeout)
+            .await?;
 
         Ok(())
     }
@@ -999,41 +1009,6 @@ impl super::Agent {
             })
             .unwrap_or(1)
     }
-}
-
-async fn send_datagram_with_timeout(
-    socket: &tokio::net::UdpSocket,
-    data: &[u8],
-    target: SocketAddr,
-    timeout: Duration,
-) -> Result<()> {
-    crate::transport::checked_deadline(timeout, "trap send timeout")?;
-    let deadline = tokio::time::Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| {
-            Error::Config("trap send timeout exceeds the representable deadline".into()).boxed()
-        })?;
-    if tokio::time::Instant::now() >= deadline {
-        return Err(Error::Timeout {
-            target,
-            elapsed: timeout,
-            retries: 0,
-        }
-        .boxed());
-    }
-
-    tokio::time::timeout_at(deadline, socket.send_to(data, target))
-        .await
-        .map_err(|_| {
-            Error::Timeout {
-                target,
-                elapsed: timeout,
-                retries: 0,
-            }
-            .boxed()
-        })?
-        .map_err(|source| Error::Network { target, source }.boxed())?;
-    Ok(())
 }
 
 #[cfg(test)]

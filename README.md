@@ -21,8 +21,8 @@ For version-specific API documentation, see
 - GET, GETNEXT, GETBULK, SET, WALK, and BULKWALK
 - Trap and inform sending and receiving
 - UDP, shared UDP, and TCP transports
-- An optional SNMP agent with asynchronous handlers, two-phase SET processing,
-  and View-based Access Control Model (VACM) support
+- An optional SNMP agent with UDP/TCP listener sets, explicit runners, asynchronous
+  handlers, two-phase SET processing, and View-based Access Control Model (VACM) support
 - Optional MIB parsing, OID resolution, and value formatting through
   [mib-rs](https://github.com/lukeod/mib-rs)
 - Automatic `tooBig` recovery for GET and GETNEXT batches

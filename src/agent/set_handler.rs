@@ -16,7 +16,7 @@ use crate::pdu::Pdu;
 use crate::value::Value;
 use crate::version::Version;
 
-use super::Agent;
+use super::AgentProcessor;
 
 struct PendingSet<'a> {
     prepared: Option<Box<dyn PreparedSet>>,
@@ -40,7 +40,7 @@ impl Drop for SetTransaction<'_> {
     }
 }
 
-impl Agent {
+impl AgentProcessor {
     /// Handle SET request with multi-phase commit protocol.
     ///
     /// On normal completion, the RFC 3416 SET phases provide atomic rollback:
@@ -474,7 +474,12 @@ mod tests {
         for version in [Version::V1, Version::V2c, Version::V3] {
             let ctx =
                 crate::test_support::request_context_for_version(version, PduType::SetRequest);
-            let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+            let response = agent
+                .processor()
+                .dispatch_request(&ctx, &pdu)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 response.error_status(),
                 ErrorStatus::GenErr.as_i32(),
@@ -515,7 +520,12 @@ mod tests {
             ],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Should have error on varbind 2
         assert_eq!(response.error_index(), 2);
@@ -553,7 +563,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(response.error_status(), 0);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
@@ -665,6 +680,7 @@ mod tests {
             .encode()
             .unwrap();
         let response = agent
+            .processor()
             .handle_v2c(request, "127.0.0.1:161".parse().unwrap())
             .await
             .unwrap()
@@ -713,7 +729,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), 0);
         assert_eq!(commit_count.load(Ordering::Relaxed), 1);
     }
@@ -749,7 +770,12 @@ mod tests {
             )],
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(response.error_index(), 1);
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
@@ -950,7 +976,12 @@ mod tests {
             three_set_varbinds(),
         );
         let ctx = crate::test_support::request_context_for_version(version, PduType::SetRequest);
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         let calls = calls.lock().unwrap().clone();
         let values = values.lock().unwrap().clone();
         (response, calls, values)
@@ -1136,6 +1167,7 @@ mod tests {
         );
 
         let response = agent
+            .processor()
             .dispatch_request(&test_ctx(), &pdu)
             .await
             .unwrap()
@@ -1266,7 +1298,12 @@ mod tests {
             PduType::SetRequest,
         );
 
-        let response = agent.dispatch_request(&ctx, &pdu).await.unwrap().unwrap();
+        let response = agent
+            .processor()
+            .dispatch_request(&ctx, &pdu)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.error_status(), ErrorStatus::NoError.as_i32());
         assert_eq!(
             *events.lock().unwrap(),
@@ -1441,8 +1478,12 @@ mod tests {
             PduType::SetRequest,
         );
         let first_agent = agent.clone();
-        let first =
-            tokio::spawn(async move { first_agent.dispatch_request(&first_ctx, &first_pdu).await });
+        let first = tokio::spawn(async move {
+            first_agent
+                .processor()
+                .dispatch_request(&first_ctx, &first_pdu)
+                .await
+        });
         first_commit_finished
             .acquire()
             .await
@@ -1468,6 +1509,7 @@ mod tests {
         let second = tokio::spawn(async move {
             second_dispatch_signal.add_permits(1);
             second_agent
+                .processor()
                 .dispatch_request(&second_ctx, &second_pdu)
                 .await
         });
@@ -1487,7 +1529,7 @@ mod tests {
         let get_ctx = crate::test_support::request_context(PduType::GetRequest);
         let get_response = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            agent.dispatch_request(&get_ctx, &get_pdu),
+            agent.processor().dispatch_request(&get_ctx, &get_pdu),
         )
         .await
         .expect("retrieval must not wait for SET coordination")
@@ -1686,6 +1728,7 @@ mod tests {
         let task_ctx = ctx.clone();
         let task = tokio::spawn(async move {
             agent
+                .processor()
                 .dispatch_request(&task_ctx, &pdu)
                 .await
                 .map(Option::unwrap)
@@ -1979,6 +2022,7 @@ mod tests {
         );
         let task = tokio::spawn(async move {
             agent
+                .processor()
                 .dispatch_request(&test_ctx(), &pdu)
                 .await
                 .map(Option::unwrap)

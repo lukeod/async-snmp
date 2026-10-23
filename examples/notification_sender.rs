@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Auth::v2c("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await?;
 
     // Send an SNMPv2c trap to all configured sinks.

@@ -11,10 +11,24 @@ use tokio::time::Instant;
 
 use crate::{DecodeError, DecodeErrorKind, Error, Result};
 
+#[derive(Debug)]
+pub(crate) struct BufferPermits {
+    pub(crate) _local: OwnedSemaphorePermit,
+    pub(crate) _shared: Option<OwnedSemaphorePermit>,
+}
+impl From<OwnedSemaphorePermit> for BufferPermits {
+    fn from(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _local: permit,
+            _shared: None,
+        }
+    }
+}
+
 /// Outbound owned storage retains byte admission until write completion.
 pub(super) struct BufferedFrame {
     pub(super) bytes: Vec<u8>,
-    pub(super) _permit: OwnedSemaphorePermit,
+    pub(super) _permit: BufferPermits,
 }
 impl AsRef<[u8]> for BufferedFrame {
     fn as_ref(&self) -> &[u8] {
@@ -28,7 +42,7 @@ impl AsRef<[u8]> for BufferedFrame {
 #[derive(Debug)]
 pub(super) struct ReceivedFrame {
     pub(super) bytes: Bytes,
-    pub(super) permit: OwnedSemaphorePermit,
+    pub(super) permit: BufferPermits,
 }
 
 pub(super) struct BerFramer {
@@ -36,6 +50,7 @@ pub(super) struct BerFramer {
     header_timeout: Duration,
     body_timeout: Duration,
     budget: Arc<Semaphore>,
+    shared: Option<(Arc<Semaphore>, Duration)>,
 }
 
 impl BerFramer {
@@ -50,9 +65,14 @@ impl BerFramer {
             header_timeout,
             body_timeout,
             budget,
+            shared: None,
         }
     }
 
+    pub(super) fn with_shared_budget(mut self, budget: Arc<Semaphore>, overload: Duration) -> Self {
+        self.shared = Some((budget, overload));
+        self
+    }
     /// Read exactly one frame without consuming bytes from the following frame.
     /// Idle connections have no read deadline. Once the first byte arrives the
     /// header must complete within `header_timeout`, and then the body within
@@ -127,18 +147,64 @@ impl BerFramer {
                 },
             ));
         }
-        // Client-capable sessions must not pause their reader behind application
-        // or candidate buffering. Budget exhaustion closes this session.
-        let permit = self
-            .budget
-            .clone()
-            .try_acquire_many_owned(total as u32)
+        // Inbound-only sessions may pause at a validated frame boundary. This
+        // bounded admission wait is separate from the body progress deadline.
+        let admission_deadline = self
+            .shared
+            .as_ref()
+            .map(|(_, overload)| Instant::now() + *overload);
+        let permit = if let Some(deadline) = admission_deadline {
+            tokio::time::timeout_at(
+                deadline,
+                self.budget.clone().acquire_many_owned(total as u32),
+            )
+            .await
             .map_err(|_| {
                 network(
                     peer,
-                    std::io::Error::other("TCP buffered-byte limit exhausted"),
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "TCP session buffer overload",
+                    ),
                 )
-            })?;
+            })?
+            .map_err(|_| network(peer, std::io::Error::other("TCP session buffer closed")))?
+        } else {
+            self.budget
+                .clone()
+                .try_acquire_many_owned(total as u32)
+                .map_err(|_| {
+                    network(
+                        peer,
+                        std::io::Error::other("TCP buffered-byte limit exhausted"),
+                    )
+                })?
+        };
+        let shared = if let Some((budget, _)) = &self.shared {
+            Some(
+                tokio::time::timeout_at(
+                    admission_deadline.expect("shared budget deadline"),
+                    budget.clone().acquire_many_owned(total as u32),
+                )
+                .await
+                .map_err(|_| {
+                    network(
+                        peer,
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "TCP aggregate buffer overload",
+                        ),
+                    )
+                })?
+                .map_err(|_| network(peer, std::io::Error::other("TCP aggregate buffer closed")))?,
+            )
+        } else {
+            None
+        };
+        let permit = BufferPermits {
+            _local: permit,
+            _shared: shared,
+        };
         let mut bytes = vec![0; total];
         bytes[..header_len].copy_from_slice(&header[..header_len]);
         let body_deadline = Instant::now() + self.body_timeout;
@@ -188,4 +254,57 @@ fn network(target: SocketAddr, source: std::io::Error) -> Box<Error> {
 }
 fn decode(peer: SocketAddr, offset: usize, kind: DecodeErrorKind) -> Box<Error> {
     Error::Decode(DecodeError::new(offset, kind).with_peer(peer)).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_budget_pause_does_not_consume_body_progress_deadline() {
+        let local = Arc::new(Semaphore::new(4));
+        let busy = local.clone().acquire_many_owned(4).await.unwrap();
+        let shared = Arc::new(Semaphore::new(4));
+        let (mut reader, mut writer) = tokio::io::duplex(16);
+        let task = tokio::spawn(async move {
+            BerFramer::new(4, Duration::from_secs(1), Duration::from_secs(1), local)
+                .with_shared_budget(shared, Duration::from_secs(5))
+                .next(&mut reader, "127.0.0.1:161".parse().unwrap())
+                .await
+        });
+        writer.write_all(&[0x30, 2, 5, 0]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!task.is_finished());
+        drop(busy);
+        assert_eq!(
+            task.await.unwrap().unwrap().unwrap().bytes.as_ref(),
+            &[0x30, 2, 5, 0]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_and_aggregate_admission_share_one_overload_deadline() {
+        let local = Arc::new(Semaphore::new(4));
+        let local_busy = local.clone().acquire_many_owned(4).await.unwrap();
+        let shared = Arc::new(Semaphore::new(4));
+        let _shared_busy = shared.clone().acquire_many_owned(4).await.unwrap();
+        let (mut reader, mut writer) = tokio::io::duplex(16);
+        let task = tokio::spawn(async move {
+            BerFramer::new(4, Duration::from_secs(1), Duration::from_secs(1), local)
+                .with_shared_budget(shared, Duration::from_secs(5))
+                .next(&mut reader, "127.0.0.1:161".parse().unwrap())
+                .await
+        });
+        writer.write_all(&[0x30, 2, 5, 0]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        drop(local_busy);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        assert!(task.await.unwrap().is_err());
+    }
 }

@@ -67,15 +67,18 @@ fn bench_io_backed_handlers(c: &mut Criterion) {
                     }),
                 );
             }
-            let agent = builder.allow_all_access().build().await.unwrap();
-            let client = Client::builder(agent.local_addr().to_string(), Auth::v2c("public"))
-                .request_timeout(Duration::from_secs(1))
-                .connect()
-                .await
-                .unwrap();
-            let run_agent = agent.clone();
-            let run = tokio::spawn(async move { run_agent.run().await });
-            (agent, client, run)
+            let agent = builder.allow_all_access().spawn().await.unwrap();
+            let client = Client::builder(
+                agent.bound_addresses()[0].local_addr.to_string(),
+                Auth::v2c("public"),
+            )
+            .request_timeout(Duration::from_secs(1))
+            .connect()
+            .await
+            .unwrap();
+            let handle = agent.agent();
+            let run = tokio::spawn(async move { agent.join().await });
+            (handle, client, run)
         });
 
         c.bench_with_input(

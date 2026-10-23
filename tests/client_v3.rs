@@ -24,7 +24,7 @@ const PRIV_PASS: &str = "privpassword123";
 async fn v3_no_auth_no_priv() {
     let agent = TestAgentBuilder::new()
         .usm_user(V3User::no_auth(b"noauthuser".to_vec()))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(agent.addr().to_string(), Auth::usm("noauthuser"))
@@ -47,7 +47,7 @@ async fn v3_auth_sha256() {
             AuthProtocol::Sha256,
             AUTH_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(
@@ -74,7 +74,7 @@ async fn auth_only_roundtrip(protocol: AuthProtocol) {
             protocol,
             AUTH_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(
@@ -125,7 +125,7 @@ async fn v3_shared_cache_rejects_stale_boots_overwrite() {
             AuthProtocol::Sha256,
             AUTH_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let cache = Arc::new(EngineCache::new());
@@ -205,7 +205,7 @@ async fn v3_auth_priv_shared_cache_rejects_stale_boots_overwrite() {
             PrivProtocol::Aes128,
             PRIV_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let cache = Arc::new(EngineCache::new());
@@ -283,7 +283,7 @@ async fn v3_auth_priv_sha256_aes128() {
             PrivProtocol::Aes128,
             PRIV_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(
@@ -317,7 +317,7 @@ async fn v3_auth_md5() {
             AuthProtocol::Md5,
             AUTH_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(
@@ -350,7 +350,7 @@ async fn v3_auth_priv_sha1_des() {
             PrivProtocol::Des,
             PRIV_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(
@@ -379,7 +379,7 @@ async fn v3_wrong_password_fails() {
             AuthProtocol::Sha256,
             AUTH_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(
@@ -397,7 +397,7 @@ async fn v3_wrong_password_fails() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     assert!(
-        matches!(result, Err(ref e) if matches!(**e, Error::Timeout { .. })),
+        matches!(result, Err(ref e) if matches!(e.exchange_source(), Error::Timeout { .. })),
         "expected timeout after candidate rejection, got {result:?}"
     );
 }
@@ -413,7 +413,7 @@ async fn v3_unknown_user_auth_fails() {
             AuthProtocol::Sha256,
             AUTH_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     // Try to use unknown user with authentication - should fail
@@ -432,7 +432,7 @@ async fn v3_unknown_user_auth_fails() {
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
 
     assert!(
-        matches!(result, Err(ref e) if matches!(**e, Error::Timeout { .. })),
+        matches!(result, Err(ref e) if matches!(e.exchange_source(), Error::Timeout { .. })),
         "expected timeout after candidate rejection, got {result:?}"
     );
 }
@@ -446,7 +446,7 @@ async fn v3_unknown_user_auth_fails() {
 async fn v3_unknown_user_no_auth_fails() {
     let agent = TestAgentBuilder::new()
         .usm_user(V3User::no_auth(b"knownuser".to_vec()))
-        .build()
+        .spawn()
         .await;
 
     // Try to use unknown user with noAuthNoPriv - must fail per RFC 3414
@@ -482,7 +482,7 @@ async fn v3_engine_discovery() {
             AuthProtocol::Sha256,
             AUTH_PASS.as_bytes().to_vec(),
         ))
-        .build()
+        .spawn()
         .await;
 
     let client = Client::builder(
@@ -557,7 +557,7 @@ async fn send_raw_udp(addr: std::net::SocketAddr, data: Bytes) -> Bytes {
 async fn report_pdu_counter_matches_agent_counter_discovery() {
     let agent = TestAgentBuilder::new()
         .usm_user(V3User::no_auth(b"testuser".to_vec()))
-        .build()
+        .spawn()
         .await;
 
     let addr = agent.addr();
@@ -629,7 +629,7 @@ async fn report_pdu_counter_matches_agent_counter_discovery() {
 async fn report_pdu_counter_matches_agent_counter_unknown_user() {
     let agent = TestAgentBuilder::new()
         .usm_user(V3User::no_auth(b"knownuser".to_vec()))
-        .build()
+        .spawn()
         .await;
 
     let addr = agent.addr();

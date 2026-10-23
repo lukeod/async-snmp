@@ -55,6 +55,8 @@ pub struct TcpOptions {
     /// Concurrent locally initiated exchanges; default 64. Waiting consumes the
     /// exchange's ordinary absolute deadline.
     pub max_in_flight: usize,
+    /// Inbound application tasks per accepted/configured session; default 16.
+    pub max_application_in_flight: usize,
     /// Complete writes waiting for the writer; default 32.
     pub write_queue_capacity: usize,
     /// Aggregate buffered inbound/outbound bytes, including parked and validating
@@ -75,6 +77,7 @@ impl Default for TcpOptions {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             send_capacity: DEFAULT_MAX_MESSAGE_SIZE,
             max_in_flight: 64,
+            max_application_in_flight: 16,
             write_queue_capacity: 32,
             max_buffered_bytes: 32 * 1024 * 1024,
             header_timeout: Duration::from_secs(5),
@@ -84,10 +87,12 @@ impl Default for TcpOptions {
     }
 }
 impl TcpOptions {
-    fn validate(&self) -> Result<ReceiveLimits> {
+    pub(crate) fn validate(&self) -> Result<ReceiveLimits> {
         let limits = ReceiveLimits::tcp(self.max_message_size)
             .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
-        if self.max_in_flight == 0
+        if self.max_application_in_flight == 0
+            || self.max_application_in_flight > Semaphore::MAX_PERMITS
+            || self.max_in_flight == 0
             || self.max_in_flight > Semaphore::MAX_PERMITS
             || self.write_queue_capacity == 0
             || self.write_queue_capacity > Semaphore::MAX_PERMITS
@@ -130,8 +135,21 @@ pub struct TcpTransportBuilder {
     socket: Option<TcpSocket>,
     connect_timeout: Option<Duration>,
     options: TcpOptions,
+    ingress: Option<super::ingress::ApplicationIngress>,
+    endpoint_id: Option<crate::EndpointId>,
 }
 impl TcpTransportBuilder {
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) fn ingress(
+        mut self,
+        ingress: super::ingress::ApplicationIngress,
+        endpoint_id: crate::EndpointId,
+    ) -> Self {
+        self.ingress = Some(ingress);
+        self.endpoint_id = Some(endpoint_id);
+        self
+    }
+
     /// Create default configuration.
     pub fn new() -> Self {
         Self::default()
@@ -267,7 +285,7 @@ impl TcpTransportBuilder {
             .map_err(|source| Error::Network { target, source }.boxed())?;
         let (writes, receiver) = mpsc::channel(self.options.write_queue_capacity);
         let state = Arc::new(SessionState {
-            endpoint_id: crate::EndpointId::new(),
+            endpoint_id: self.endpoint_id.unwrap_or_default(),
             session_id: crate::SessionId::new(),
             target,
             local_addr,
@@ -281,6 +299,12 @@ impl TcpTransportBuilder {
             terminal_error: Mutex::new(None),
             in_flight: Arc::new(Semaphore::new(self.options.max_in_flight)),
             budget: Arc::new(Semaphore::new(self.options.max_buffered_bytes)),
+            ingress: self.ingress.map(|mut ingress| {
+                ingress.session = Some(Arc::new(Semaphore::new(
+                    self.options.max_application_in_flight,
+                )));
+                ingress
+            }),
         });
         let transport = TcpTransport {
             inner: Arc::new(TcpTransportInner {
@@ -290,12 +314,14 @@ impl TcpTransportBuilder {
                 task: tokio::sync::Mutex::new(None),
             }),
         };
+        let weak_transport = Arc::downgrade(&transport.inner);
         Ok(PreparedTcpSession {
             transport,
             runner: TcpRunner {
                 stream,
                 writes: receiver,
                 cleanup: SessionCleanup(state),
+                transport: weak_transport,
             },
         })
     }
@@ -341,6 +367,7 @@ struct SessionState {
     terminal_error: Mutex<Option<Arc<Error>>>,
     in_flight: Arc<Semaphore>,
     budget: Arc<Semaphore>,
+    ingress: Option<super::ingress::ApplicationIngress>,
 }
 impl SessionState {
     fn close(&self) {
@@ -430,6 +457,7 @@ pub struct TcpRunner {
     stream: TcpStream,
     writes: mpsc::Receiver<WriteCommand>,
     cleanup: SessionCleanup,
+    transport: std::sync::Weak<TcpTransportInner>,
 }
 impl TcpRunner {
     /// Drive complete-message reads and serialized writes until terminal shutdown.
@@ -439,6 +467,7 @@ impl TcpRunner {
             stream,
             writes,
             cleanup,
+            transport,
         } = self;
         let state = &cleanup.0;
         *state.status.lock().unwrap() = TcpStatus::Running;
@@ -446,7 +475,7 @@ impl TcpRunner {
         let result = tokio::select! {
             biased;
             () = state.shutdown.cancelled() => Ok(()),
-            result = read_loop(read, state) => result,
+            result = read_loop(read, state, transport) => result,
             result = write_loop(write, writes, state) => result,
         };
         result.map_err(|error| state.fail(error))
@@ -618,7 +647,7 @@ impl TcpTransport {
         }
     }
 
-    async fn write_before(&self, data: &[u8], deadline: Instant) -> Result<()> {
+    pub(crate) async fn write_before(&self, data: &[u8], deadline: Instant) -> Result<()> {
         let state = &self.inner.state;
         let started = Instant::now();
         crate::message_size::enforce_outbound_size(data.len(), state.options.send_capacity)?;
@@ -639,9 +668,24 @@ impl TcpTransport {
                 .acquire_many_owned(data.len() as u32)
                 .await
                 .map_err(|_| state.closed_error())?;
+            let shared = if let Some(ingress) = &state.ingress {
+                Some(
+                    ingress
+                        .budget
+                        .clone()
+                        .acquire_many_owned(data.len() as u32)
+                        .await
+                        .map_err(|_| state.closed_error())?,
+                )
+            } else {
+                None
+            };
             let bytes = Bytes::from_owner(BufferedFrame {
                 bytes: data.to_vec(),
-                _permit: budget,
+                _permit: super::framing::BufferPermits {
+                    _local: budget,
+                    _shared: shared,
+                },
             });
             let (complete, result) = oneshot::channel();
             {
@@ -763,13 +807,20 @@ struct WriteCommand {
     complete: oneshot::Sender<Result<()>>,
 }
 
-async fn read_loop(mut read: tokio::net::tcp::OwnedReadHalf, state: &SessionState) -> Result<()> {
+async fn read_loop(
+    mut read: tokio::net::tcp::OwnedReadHalf,
+    state: &SessionState,
+    transport: std::sync::Weak<TcpTransportInner>,
+) -> Result<()> {
     let mut framer = BerFramer::new(
         state.receive_limits.accepted(),
         state.options.header_timeout,
         state.options.body_timeout,
         state.budget.clone(),
     );
+    if let Some(ingress) = &state.ingress {
+        framer = framer.with_shared_budget(ingress.budget.clone(), ingress.overload_timeout);
+    }
     while let Some(frame) = framer.next(&mut read, state.target).await? {
         let super::framing::ReceivedFrame {
             bytes: frame,
@@ -783,7 +834,13 @@ async fn read_loop(mut read: tokio::net::tcp::OwnedReadHalf, state: &SessionStat
             Instant::now(),
             frame.len(),
         );
-        if let Some(envelope) = CorrelationEnvelope::parse(&frame)
+        if let Some(ingress) = &state.ingress {
+            let Some(inner) = transport.upgrade() else {
+                return Ok(());
+            };
+            let message = super::ReceivedMessage::tcp(frame, info, TcpTransport { inner });
+            ingress.deliver_tcp(message, permit).await?;
+        } else if let Some(envelope) = CorrelationEnvelope::parse(&frame)
             && let Some(id) = envelope.request_id(&frame)
         {
             state

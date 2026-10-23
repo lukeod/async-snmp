@@ -40,7 +40,7 @@ fn no_op_authoritative_engine(engine_id: &[u8]) -> AuthoritativeEngine {
 }
 
 fn expect_agent_build_error(
-    result: async_snmp::Result<Agent>,
+    result: async_snmp::Result<async_snmp::RunningAgent>,
     message: &str,
 ) -> Box<async_snmp::Error> {
     match result {
@@ -773,7 +773,7 @@ async fn agent_v2c_trap_to_sink() {
             Auth::v2c("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -817,7 +817,7 @@ async fn agent_trap_send_timeout_is_bounded_and_reported() {
         )
         .trap_send_timeout(Duration::ZERO)
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -851,7 +851,7 @@ async fn agent_rejects_unrepresentable_trap_send_timeout() {
         Agent::builder()
             .bind("127.0.0.1:0")
             .trap_send_timeout(Duration::MAX)
-            .build()
+            .spawn()
             .await,
         "unrepresentable trap send timeout was accepted",
     );
@@ -871,7 +871,7 @@ async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
             Auth::v2c("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -914,7 +914,7 @@ async fn agent_v2c_inform_to_sink() {
             Auth::v2c("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -964,7 +964,7 @@ async fn agent_inform_sinks_share_source_endpoint() {
             Auth::v2c("private"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
     let first = tokio::spawn(async move { first_receiver.recv().await.unwrap() });
@@ -977,7 +977,10 @@ async fn agent_inform_sinks_share_source_endpoint() {
     let first_source = first.await.unwrap().receive_info.peer_addr();
     let second_source = second.await.unwrap().receive_info.peer_addr();
     assert_eq!(first_source, second_source);
-    assert_ne!(first_source.port(), agent.local_addr().port());
+    assert_ne!(
+        first_source.port(),
+        agent.bound_addresses()[0].local_addr.port()
+    );
 }
 
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
@@ -1016,7 +1019,7 @@ async fn agent_v3_trap_to_sink() {
                 .unwrap(),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1067,7 +1070,7 @@ async fn agent_multiple_sinks() {
             Auth::v2c("trap-community"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1122,7 +1125,7 @@ async fn agent_v1_trap_to_sink() {
             Auth::v1("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1172,7 +1175,7 @@ async fn agent_mixed_v1_v2c_sinks() {
             Auth::v2c("v2comm"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1227,7 +1230,7 @@ async fn agent_no_sinks_is_noop() {
         .community(b"public")
         // No trap sinks configured
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1266,7 +1269,7 @@ async fn agent_rejects_duplicate_sink_ids_before_bind_configuration() {
             "127.0.0.1:10",
             Auth::v2c("second"),
         )
-        .build()
+        .spawn()
         .await;
 
     let error = match result {
@@ -1286,7 +1289,7 @@ async fn agent_preserves_non_utf8_sink_id_octets() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .trap_sink(id.clone(), "127.0.0.1:9", Auth::v1("public"))
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1313,7 +1316,7 @@ async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
             dest.to_string(),
             async_snmp::UsmConfig::new(USER_SECRET).context_name(CONTEXT_SECRET),
         )
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1366,7 +1369,7 @@ async fn agent_inform_reports_failing_sink() {
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1445,7 +1448,7 @@ async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1531,7 +1534,7 @@ async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::none())
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1584,7 +1587,7 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
         .inform_timeout(Duration::from_secs(2))
         .inform_retry(Retry::none())
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1627,7 +1630,7 @@ async fn dropping_inform_stream_cancels_retries() {
         .inform_timeout(Duration::from_millis(50))
         .inform_retry(Retry::fixed(2, Duration::ZERO).unwrap())
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1677,7 +1680,7 @@ async fn agent_inform_aggregate_restores_configuration_order() {
         .inform_timeout(Duration::from_millis(100))
         .inform_retry(Retry::none())
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1707,7 +1710,7 @@ async fn agent_trap_reports_total_conversion_failure() {
             Auth::v1("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1753,7 +1756,7 @@ async fn agent_trap_reports_ordered_partial_success() {
             Auth::v2c("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1798,7 +1801,7 @@ async fn agent_v1_inform_is_explicitly_skipped() {
             Auth::v1("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1828,7 +1831,7 @@ async fn agent_inform_stream_yields_skipped_sink() {
             Auth::v1("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 
@@ -1856,7 +1859,7 @@ async fn agent_best_effort_helpers_complete_after_failure_and_skip() {
             Auth::v1("public"),
         )
         .allow_all_access()
-        .build()
+        .spawn()
         .await
         .unwrap();
 

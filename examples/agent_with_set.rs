@@ -22,7 +22,7 @@ use async_snmp::handler::{
 };
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
-use async_snmp::{Oid, oid};
+use async_snmp::{ListenerSource, Oid, oid};
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -260,22 +260,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler = Arc::new(ConfigHandler::new());
 
     let agent = Agent::builder()
-        .bind("0.0.0.0:10161")
+        .listener(ListenerSource::udp("0.0.0.0:10161"))
+        .listener(ListenerSource::tcp("0.0.0.0:10161"))
         .community(b"private")
         .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
         .allow_all_access()
-        .build()
+        .spawn()
         .await?;
 
-    println!("Agent listening on {}", agent.local_addr());
+    for listener in agent.bound_addresses() {
+        println!(
+            "Agent listening on {:?} {}",
+            listener.transport, listener.local_addr
+        );
+    }
     println!();
     println!("Try these commands:");
     println!("  snmpget -v2c -c private localhost:10161 1.3.6.1.4.1.99999.1.0");
     println!("  snmpset -v2c -c private localhost:10161 1.3.6.1.4.1.99999.1.0 s 'new name'");
     println!("  snmpset -v2c -c private localhost:10161 1.3.6.1.4.1.99999.2.0 i 120");
     println!("  snmpget -v2c -c private localhost:10161 1.3.6.1.4.1.99999.3.0");
+    println!("  snmpget -v2c -c private tcp:localhost:10161 1.3.6.1.4.1.99999.1.0");
     println!("  snmpwalk -v2c -c private localhost:10161 1.3.6.1.4.1.99999");
 
-    agent.run().await?;
+    agent.join().await?;
     Ok(())
 }

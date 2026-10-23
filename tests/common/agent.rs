@@ -72,15 +72,16 @@ impl TestAgent {
             .handler(oid!(1, 3, 6), handler.clone())
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .discard_notifications()
+            .spawn()
             .await
             .expect("failed to build test agent");
 
-        let addr = agent.local_addr();
+        let addr = agent.bound_addresses()[0].local_addr;
         let agent_handle = agent.clone();
 
         let task = tokio::spawn(async move {
-            if let Err(e) = agent.run().await {
+            if let Err(e) = agent.join().await {
                 // Only log if not cancelled
                 if !e.to_string().contains("cancelled") {
                     eprintln!("TestAgent error: {e}");
@@ -245,7 +246,7 @@ impl TestAgentBuilder {
     }
 
     /// Build the agent.
-    pub async fn build(self) -> TestAgent {
+    pub async fn spawn(self) -> TestAgent {
         let uses_des = self.usm_users.iter().any(|user| {
             user.priv_
                 .as_ref()
@@ -298,14 +299,15 @@ impl TestAgentBuilder {
 
         let agent = builder
             .allow_all_access()
-            .build()
+            .discard_notifications()
+            .spawn()
             .await
             .expect("failed to build test agent");
-        let addr = agent.local_addr();
+        let addr = agent.bound_addresses()[0].local_addr;
         let agent_handle = agent.clone();
 
         let task = tokio::spawn(async move {
-            let _ = agent.run().await;
+            let _ = agent.join().await;
         });
 
         TestAgent {

@@ -405,19 +405,7 @@ impl UdpResponder {
         }
     }
 
-    /// Reply using the received destination as the source when packet info was
-    /// available, or ordinary kernel source selection otherwise.
-    #[cfg(feature = "agent")]
-    pub(crate) async fn reply(
-        &self,
-        socket: &UdpSocket,
-        data: &[u8],
-        received: &ReceivedDatagram,
-    ) -> io::Result<()> {
-        self.send_to(socket, data, received.source, received.destination)
-            .await
-    }
-
+    #[cfg(test)]
     pub(crate) async fn send_to(
         &self,
         socket: &UdpSocket,
@@ -425,13 +413,24 @@ impl UdpResponder {
         destination: SocketAddr,
         source: Option<DestinationMetadata>,
     ) -> io::Result<()> {
+        self.send_to_admitted(socket, data, destination, source, None)
+            .await
+    }
+
+    pub(crate) async fn send_to_admitted(
+        &self,
+        socket: &UdpSocket,
+        data: &[u8],
+        destination: SocketAddr,
+        source: Option<DestinationMetadata>,
+        admission: Option<&std::sync::Mutex<bool>>,
+    ) -> io::Result<()> {
         let Some(source) = source.filter(|_| self.packet_info) else {
-            socket.send_to(data, destination).await?;
-            return Ok(());
+            return send_plain_admitted(socket, data, destination, admission).await;
         };
 
         let exact_result = self
-            .send_with_metadata(socket, data, destination, source, false)
+            .send_with_metadata(socket, data, destination, source, false, admission)
             .await;
         let exact_error = match exact_result {
             Ok(()) => return Ok(()),
@@ -463,7 +462,7 @@ impl UdpResponder {
                 "UDP exact-source reply failed; retrying on the received interface"
             );
             match self
-                .send_with_metadata(socket, data, destination, source, true)
+                .send_with_metadata(socket, data, destination, source, true, admission)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -492,8 +491,7 @@ impl UdpResponder {
             );
         }
 
-        socket.send_to(data, destination).await?;
-        Ok(())
+        send_plain_admitted(socket, data, destination, admission).await
     }
 
     async fn classify_destination(&self, source: DestinationMetadata) -> DestinationClassification {
@@ -605,9 +603,11 @@ impl UdpResponder {
         destination: SocketAddr,
         source: DestinationMetadata,
         unspecified_source: bool,
+        admission: Option<&std::sync::Mutex<bool>>,
     ) -> io::Result<()> {
         loop {
             socket.writable().await?;
+            let _admission = check_send_admission(admission)?;
             match socket.try_io(tokio::io::Interest::WRITABLE, || {
                 platform::send_with_source(socket, data, destination, source, unspecified_source)
             }) {
@@ -615,6 +615,35 @@ impl UdpResponder {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
             }
+        }
+    }
+}
+
+fn check_send_admission(
+    admission: Option<&std::sync::Mutex<bool>>,
+) -> io::Result<Option<std::sync::MutexGuard<'_, bool>>> {
+    let guard = admission.map(|gate| gate.lock().unwrap());
+    if guard.as_ref().is_some_and(|open| !**open) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "UDP endpoint is closed",
+        ));
+    }
+    Ok(guard)
+}
+async fn send_plain_admitted(
+    socket: &UdpSocket,
+    data: &[u8],
+    destination: SocketAddr,
+    admission: Option<&std::sync::Mutex<bool>>,
+) -> io::Result<()> {
+    loop {
+        socket.writable().await?;
+        let _admission = check_send_admission(admission)?;
+        match socket.try_send_to(data, destination) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
         }
     }
 }

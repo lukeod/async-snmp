@@ -66,15 +66,15 @@ impl LossyAgent {
             .cancellation_token(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
             .allow_all_access()
-            .build()
+            .spawn()
             .await
             .expect("failed to build lossy agent");
 
-        let addr = agent.local_addr();
+        let addr = agent.bound_addresses()[0].local_addr;
         let count_clone = request_count.clone();
 
         let task = tokio::spawn(async move {
-            let _ = agent.run().await;
+            let _ = agent.join().await;
         });
 
         // Yield to let the agent task start its receive loop
@@ -136,14 +136,14 @@ impl SlowAgent {
             .cancellation_token(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
             .allow_all_access()
-            .build()
+            .spawn()
             .await
             .expect("failed to build slow agent");
 
-        let addr = agent.local_addr();
+        let addr = agent.bound_addresses()[0].local_addr;
 
         let task = tokio::spawn(async move {
-            let _ = agent.run().await;
+            let _ = agent.join().await;
         });
 
         // Yield to let the agent task start its receive loop
@@ -208,14 +208,14 @@ impl PausableAgent {
             .cancellation_token(cancel.clone())
             .handler(oid!(1, 3, 6), handler.clone())
             .allow_all_access()
-            .build()
+            .spawn()
             .await
             .expect("failed to build pausable agent");
 
-        let addr = agent.local_addr();
+        let addr = agent.bound_addresses()[0].local_addr;
 
         let task = tokio::spawn(async move {
-            let _ = agent.run().await;
+            let _ = agent.join().await;
         });
 
         // Yield to let the agent task start its receive loop

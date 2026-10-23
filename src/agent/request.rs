@@ -14,11 +14,11 @@ use crate::version::{CommunityVersion, Version};
 
 use std::sync::atomic::Ordering;
 
-use super::Agent;
+use super::AgentProcessor;
 #[cfg(test)]
 use super::RESPONSE_OVERHEAD;
 
-impl Agent {
+impl AgentProcessor {
     /// Handle `SNMPv1` request.
     #[cfg(test)]
     pub(super) async fn handle_v1(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
@@ -263,6 +263,7 @@ impl Agent {
             return self
                 .finalize_v3_response(
                     limits,
+                    source,
                     global_data,
                     usm_params,
                     pdu,
@@ -295,6 +296,7 @@ impl Agent {
             let success_pdu = pdu.to_response(Version::V3)?;
             match self.finalize_v3_response(
                 limits,
+                source,
                 global_data,
                 usm_params,
                 pdu,
@@ -333,6 +335,7 @@ impl Agent {
         // Build and exactly finalize non-SET responses and SET error responses.
         self.finalize_v3_response(
             limits,
+            source,
             global_data,
             usm_params,
             pdu,
@@ -424,6 +427,7 @@ pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Agent;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet,
         RequestContext, SecurityModel, SetCommitResult, SetTestResult, SetUndoResult,
@@ -622,8 +626,18 @@ mod tests {
                 community_request(version, PduType::GetRequest, b"public", Value::Null).to_vec();
             request.extend_from_slice(&[0x05, 0]);
             let result = match version {
-                Version::V1 => strict.handle_v1(Bytes::from(request), source).await,
-                Version::V2c => strict.handle_v2c(Bytes::from(request), source).await,
+                Version::V1 => {
+                    strict
+                        .processor()
+                        .handle_v1(Bytes::from(request), source)
+                        .await
+                }
+                Version::V2c => {
+                    strict
+                        .processor()
+                        .handle_v2c(Bytes::from(request), source)
+                        .await
+                }
                 Version::V3 => unreachable!(),
             };
             assert!(result.is_err(), "strict {version:?} accepted a suffix");
@@ -646,8 +660,8 @@ mod tests {
                 .unwrap();
             let request = community_set_with_integer_content(version, &[1, 0, 0, 0, 9]);
             let result = match version {
-                Version::V1 => strict.handle_v1(request, source).await,
-                Version::V2c => strict.handle_v2c(request, source).await,
+                Version::V1 => strict.processor().handle_v1(request, source).await,
+                Version::V2c => strict.processor().handle_v2c(request, source).await,
                 Version::V3 => unreachable!(),
             };
             assert!(result.is_err());
@@ -667,8 +681,8 @@ mod tests {
                 .unwrap();
             let request = community_set_with_integer_content(version, &[1, 0, 0, 0, 9]);
             let response = match version {
-                Version::V1 => agent.handle_v1(request, source).await,
-                Version::V2c => agent.handle_v2c(request, source).await,
+                Version::V1 => agent.processor().handle_v1(request, source).await,
+                Version::V2c => agent.processor().handle_v2c(request, source).await,
                 Version::V3 => unreachable!(),
             }
             .unwrap();
@@ -729,6 +743,7 @@ mod tests {
             let request =
                 community_request(Version::V2c, PduType::GetRequest, b"public", Value::Null);
             let response = agent
+                .processor()
                 .handle_v2c(request, source)
                 .await
                 .unwrap()
@@ -757,6 +772,7 @@ mod tests {
             Value::Integer(9),
         );
         let response = agent
+            .processor()
             .handle_v2c(request, "127.0.0.1:9999".parse().unwrap())
             .await
             .unwrap()
@@ -810,7 +826,14 @@ mod tests {
                 b"public",
                 Value::Counter64(1_u64 << 40),
             );
-            assert!(agent.handle_v1(request, source).await.unwrap().is_none());
+            assert!(
+                agent
+                    .processor()
+                    .handle_v1(request, source)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
             assert_no_callbacks(&callbacks);
         }
@@ -831,6 +854,7 @@ mod tests {
         );
         assert!(
             agent
+                .processor()
                 .handle_v1(multiple_counter64s, source)
                 .await
                 .unwrap()
@@ -851,12 +875,24 @@ mod tests {
             Bytes::from_static(&[0x30, 0x03, 0x02, 0x01, 0x01]),
             Bytes::from_static(&[0x30, 0x03, 0x02, 0x01, 0x03]),
         ] {
-            assert!(agent.handle_request(malformed, source).await.is_err());
+            assert!(
+                agent
+                    .processor()
+                    .handle_request(malformed, source)
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(agent.snmp_in_asn_parse_errs(), 3);
 
         let unknown_version = Bytes::from_static(&[0x30, 0x03, 0x02, 0x01, 0x09]);
-        assert!(agent.handle_request(unknown_version, source).await.is_err());
+        assert!(
+            agent
+                .processor()
+                .handle_request(unknown_version, source)
+                .await
+                .is_err()
+        );
         assert_eq!(agent.snmp_in_asn_parse_errs(), 3);
     }
 
@@ -886,13 +922,25 @@ mod tests {
         let request = build_noauth_msg(&engine_id, b"noauthuser", &engine_id);
 
         let invalid_flags = patch_first(&request, &[0x04, 0x01, 0x04], 2, 0x02);
-        assert!(agent.handle_request(invalid_flags, source).await.is_err());
+        assert!(
+            agent
+                .processor()
+                .handle_request(invalid_flags, source)
+                .await
+                .is_err()
+        );
         assert_eq!(agent.snmp_invalid_msgs(), 1);
         assert_eq!(agent.snmp_unknown_security_models(), 0);
         assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
 
         let unknown_model = patch_first(&request, &[0x04, 0x01, 0x04, 0x02, 0x01, 0x03], 5, 99);
-        assert!(agent.handle_request(unknown_model, source).await.is_err());
+        assert!(
+            agent
+                .processor()
+                .handle_request(unknown_model, source)
+                .await
+                .is_err()
+        );
         assert_eq!(agent.snmp_invalid_msgs(), 1);
         assert_eq!(agent.snmp_unknown_security_models(), 1);
         assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
@@ -900,6 +948,7 @@ mod tests {
         let invalid_flags_length = patch_first(&request, &[0x04, 0x01, 0x04], 1, 0);
         assert!(
             agent
+                .processor()
                 .handle_request(invalid_flags_length, source)
                 .await
                 .is_err()
@@ -917,6 +966,7 @@ mod tests {
         let request = community_request(Version::V1, PduType::GetRequest, b"public", Value::Null);
 
         let response = agent
+            .processor()
             .handle_v1(request, source)
             .await
             .unwrap()
@@ -976,6 +1026,7 @@ mod tests {
             let callbacks = Arc::new(CallbackCounts::default());
             let agent = getbulk_call_path_agent(callbacks, exact).await;
             let response = agent
+                .processor()
                 .handle_v2c(request.clone(), source)
                 .await
                 .unwrap()
@@ -986,6 +1037,7 @@ mod tests {
             let callbacks = Arc::new(CallbackCounts::default());
             let agent = getbulk_call_path_agent(callbacks, exact - 1).await;
             let response = agent
+                .processor()
                 .handle_v2c(request.clone(), source)
                 .await
                 .unwrap()
@@ -1003,7 +1055,14 @@ mod tests {
 
             let callbacks = Arc::new(CallbackCounts::default());
             let agent = getbulk_call_path_agent(callbacks, 1).await;
-            assert!(agent.handle_v2c(request, source).await.unwrap().is_none());
+            assert!(
+                agent
+                    .processor()
+                    .handle_v2c(request, source)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(agent.snmp_silent_drops(), 1);
         }
     }
@@ -1021,6 +1080,7 @@ mod tests {
         );
 
         let response = agent
+            .processor()
             .handle_v2c(request, source)
             .await
             .unwrap()
@@ -1046,7 +1106,14 @@ mod tests {
             Value::Counter64(1_u64 << 40),
         );
 
-        assert!(agent.handle_v1(request, source).await.unwrap().is_none());
+        assert!(
+            agent
+                .processor()
+                .handle_v1(request, source)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(agent.snmp_in_asn_parse_errs(), 0);
         assert_no_callbacks(&callbacks);
     }
@@ -1185,6 +1252,7 @@ mod tests {
         request.extend_from_slice(&[0x05, 0]);
         assert!(
             agent
+                .processor()
                 .handle_v3(Bytes::from(request), "127.0.0.1:9999".parse().unwrap())
                 .await
                 .is_err()
@@ -1211,6 +1279,7 @@ mod tests {
         request.extend_from_slice(&[0x05, 0]);
 
         let response = agent
+            .processor()
             .handle_v3(Bytes::from(request), "127.0.0.1:9999".parse().unwrap())
             .await
             .unwrap();
@@ -1246,6 +1315,7 @@ mod tests {
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let report = agent
+            .processor()
             .handle_v3(msg, source)
             .await
             .unwrap()
@@ -1283,6 +1353,7 @@ mod tests {
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let response = agent
+            .processor()
             .handle_v3(msg, source)
             .await
             .unwrap()
@@ -1317,6 +1388,7 @@ mod tests {
         let pdu = Pdu::get_request(77, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]);
         let request = build_noauth_pdu(&engine_id, b"keyed-user", &engine_id, 0, 0, pdu, 65507);
         let response = agent
+            .processor()
             .handle_v3(request, "127.0.0.1:9999".parse().unwrap())
             .await
             .unwrap()
@@ -1371,6 +1443,7 @@ mod tests {
             65507,
         );
         let response = agent
+            .processor()
             .handle_v3(request, "127.0.0.1:9999".parse().unwrap())
             .await
             .unwrap()
@@ -1408,6 +1481,7 @@ mod tests {
             .encode()
             .unwrap();
         let response = agent
+            .processor()
             .handle_v3(request, "127.0.0.1:9999".parse().unwrap())
             .await
             .unwrap()
@@ -1559,6 +1633,7 @@ mod tests {
             i32::try_from(exact_limit).unwrap(),
         );
         let response = agent
+            .processor()
             .handle_v3(request, "127.0.0.1:9999".parse().unwrap())
             .await
             .unwrap()
@@ -1598,6 +1673,7 @@ mod tests {
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let response = agent
+            .processor()
             .handle_v3(msg, source)
             .await
             .unwrap()
@@ -1637,6 +1713,7 @@ mod tests {
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let report = agent
+            .processor()
             .handle_v3(msg, source)
             .await
             .unwrap()
@@ -1676,7 +1753,7 @@ mod tests {
         let msg = build_authpriv_bad_hmac(&engine_id, b"trapuser", b"wrong-password-1234");
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let result = agent.handle_v3(msg, source).await.unwrap();
+        let result = agent.processor().handle_v3(msg, source).await.unwrap();
         let report = result.expect("a reportable authPriv request must produce a Report");
         assert_eq!(agent.usm_unsupported_sec_levels(), 1);
         assert_eq!(agent.usm_wrong_digests(), 0);
@@ -1730,6 +1807,7 @@ mod tests {
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let report = agent
+            .processor()
             .handle_v3(msg, source)
             .await
             .unwrap()

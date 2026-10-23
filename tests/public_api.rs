@@ -185,10 +185,6 @@ fn stable_value_and_error_kinds_are_public() {
         ErrorKind::AuthoritativeEnginePersistence.as_str(),
         "authoritative_engine_persistence"
     );
-
-    // The kind remains nameable when the feature-gated parent error does not.
-    let agent_kind = ErrorKind::AgentAlreadyRunning;
-    assert_eq!(agent_kind.to_string(), "agent_already_running");
 }
 
 #[test]

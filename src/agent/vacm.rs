@@ -150,7 +150,7 @@
 //!         .access("readwrite", SecurityModel::V2c, SecurityLevel::NoAuthNoPriv,
 //!             |a| a.read_view("all").write_view("all"))
 //!         .view("all", |v| v.include(oid!(1, 3, 6, 1))))
-//!     .build()
+//!     .spawn()
 //!     .await?;
 //! # Ok(())
 //! # }

@@ -153,11 +153,11 @@ async fn agent_captures_complete_v1_and_v2c_contexts() {
                 .view(WRITE_VIEW, |view| view.include(oid!(1, 3, 6)))
         })
         .cancellation_token(cancel.clone())
-        .build()
+        .spawn()
         .await
         .unwrap();
-    let address = agent.local_addr();
-    let task = tokio::spawn(async move { agent.run().await });
+    let address = agent.bound_addresses()[0].local_addr;
+    let task = tokio::spawn(async move { agent.join().await });
     let agent = RunningAgent {
         address,
         capture,
@@ -255,11 +255,11 @@ async fn agent_captures_complete_v3_contexts_at_every_security_level() {
                 .view(WRITE_VIEW, |view| view.include(oid!(1, 3, 6)))
         })
         .cancellation_token(cancel.clone())
-        .build()
+        .spawn()
         .await
         .unwrap();
-    let address = agent.local_addr();
-    let task = tokio::spawn(async move { agent.run().await });
+    let address = agent.bound_addresses()[0].local_addr;
+    let task = tokio::spawn(async move { agent.join().await });
     let agent = RunningAgent {
         address,
         capture,

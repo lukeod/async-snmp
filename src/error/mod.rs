@@ -422,8 +422,6 @@ pub enum ErrorKind {
     Privacy,
     /// Operating-system random source failure.
     RandomSource,
-    /// Available even when the `agent` feature is disabled.
-    AgentAlreadyRunning,
     /// Invalid outbound SNMP message.
     InvalidMessage,
     /// Invalid OID.
@@ -452,7 +450,6 @@ impl ErrorKind {
             Self::AuthoritativeEnginePersistence => "authoritative_engine_persistence",
             Self::Privacy => "privacy",
             Self::RandomSource => "random_source",
-            Self::AgentAlreadyRunning => "agent_already_running",
             Self::InvalidMessage => "invalid_message",
             Self::InvalidOid => "invalid_oid",
         }
@@ -497,6 +494,15 @@ impl std::fmt::Display for ErrorKind {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Fatal failure of an identified service listener.
+    #[error("{transport:?} listener {endpoint_id:?} at {local_addr} failed: {source}")]
+    Listener {
+        endpoint_id: crate::EndpointId,
+        transport: crate::TransportKind,
+        local_addr: SocketAddr,
+        source: Box<Error>,
+    },
+
     /// A failure shared by concurrent participants in one internal operation.
     #[error("{source}")]
     SharedOperation {
@@ -666,11 +672,6 @@ pub enum Error {
         source: getrandom::Error,
     },
 
-    /// Another [`Agent::run`](crate::agent::Agent::run) call is already active.
-    #[cfg(feature = "agent")]
-    #[error("agent is already running")]
-    AgentAlreadyRunning,
-
     /// Message cannot be represented by the selected SNMP version.
     #[error("invalid SNMP message: {0}")]
     InvalidMessage(Box<str>),
@@ -685,6 +686,7 @@ impl Error {
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
         match self {
+            Self::Listener { source, .. } => source.kind(),
             Self::SharedOperation { source } => source.kind(),
             Self::Exchange { source, .. } => source.kind(),
             Self::Network { .. } => ErrorKind::Network,
@@ -706,8 +708,6 @@ impl Error {
             Self::AuthoritativeEnginePersistence(_) => ErrorKind::AuthoritativeEnginePersistence,
             Self::Privacy(_) => ErrorKind::Privacy,
             Self::RandomSource { .. } => ErrorKind::RandomSource,
-            #[cfg(feature = "agent")]
-            Self::AgentAlreadyRunning => ErrorKind::AgentAlreadyRunning,
             Self::InvalidMessage(_) => ErrorKind::InvalidMessage,
             Self::InvalidOid(_) => ErrorKind::InvalidOid,
         }
@@ -722,6 +722,7 @@ impl Error {
     pub fn response_metadata(&self) -> Option<&crate::client::ResponseMetadata> {
         match self {
             Self::SharedOperation { source } => source.response_metadata(),
+            Self::Listener { source, .. } => source.response_metadata(),
             Self::Exchange { metadata, .. }
             | Self::Snmp { metadata, .. }
             | Self::Report { metadata, .. } => Some(metadata.as_ref()),
@@ -739,6 +740,7 @@ impl Error {
     #[must_use]
     pub fn exchange_source(&self) -> &Error {
         match self {
+            Self::Listener { source, .. } => source.exchange_source(),
             Self::SharedOperation { source } => source.exchange_source(),
             Self::Exchange { source, .. } => source.exchange_source(),
             _ => self,
@@ -1173,7 +1175,6 @@ mod tests {
                 "authoritative_engine_persistence",
             ),
             (ErrorKind::RandomSource, "random_source"),
-            (ErrorKind::AgentAlreadyRunning, "agent_already_running"),
             (ErrorKind::InvalidMessage, "invalid_message"),
             (ErrorKind::InvalidOid, "invalid_oid"),
         ];
@@ -1188,19 +1189,6 @@ mod tests {
     fn error_kind_names_are_const() {
         const NAME: &str = ErrorKind::ConstructionTimeout.as_str();
         assert_eq!(NAME, "construction_timeout");
-    }
-
-    #[cfg(feature = "agent")]
-    #[test]
-    fn agent_error_maps_to_always_nameable_kind() {
-        assert_eq!(
-            Error::AgentAlreadyRunning.kind(),
-            ErrorKind::AgentAlreadyRunning
-        );
-        assert_eq!(
-            ErrorKind::AgentAlreadyRunning.as_str(),
-            "agent_already_running"
-        );
     }
 
     #[test]
