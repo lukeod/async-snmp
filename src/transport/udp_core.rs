@@ -25,6 +25,7 @@ const MAX_PARKED_CANDIDATES: usize = 16;
 /// Each pending request has its own [`Notify`], so delivering a
 /// response wakes only the task waiting for that specific request.
 pub struct UdpCore {
+    observation: super::observation::Observation,
     shards: Box<[Shard; SHARDS]>,
     stats: CoreStats,
     /// Set when the owning transport shuts down; waiters fail immediately.
@@ -173,6 +174,10 @@ impl Drop for UdpRegistration {
 }
 
 impl UdpCore {
+    pub(crate) fn with_observation(mut self, observation: super::observation::Observation) -> Self {
+        self.observation = observation;
+        self
+    }
     /// Create a new `UdpCore` with empty shards.
     pub fn new() -> Self {
         Self::with_duplicate_filter(true)
@@ -190,6 +195,7 @@ impl UdpCore {
             .collect();
 
         Self {
+            observation: Default::default(),
             shards: shards
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("Vec has exactly SHARDS elements")),
@@ -506,7 +512,13 @@ impl UdpCore {
                 None => (request_id, None),
             }
         };
-        self.deliver_to(target_id, owner.as_ref(), request_id, envelope, candidate)
+        let info = candidate.info;
+        let delivered = self.deliver_to(target_id, owner.as_ref(), request_id, envelope, candidate);
+        if !delivered {
+            self.observation
+                .disposition(info, super::MessageDisposition::Unmatched);
+        }
+        delivered
     }
 
     fn deliver_to(
@@ -599,6 +611,8 @@ impl UdpCore {
                 _permit,
             });
             let notify = slot.owner.notify.clone();
+            self.observation
+                .disposition(info, super::MessageDisposition::CandidateQueued);
             drop(pending);
             notify.notify_one();
             self.stats
@@ -718,7 +732,16 @@ impl UdpCore {
             }) = response
             {
                 let source = info.peer_addr();
-                match validate(data, info)? {
+                let validation = validate(data, info);
+                self.observation.disposition(
+                    info,
+                    if matches!(validation, Ok(Candidate::Accept(_))) {
+                        super::MessageDisposition::CandidateValidated
+                    } else {
+                        super::MessageDisposition::CandidateRejected
+                    },
+                );
+                match validation? {
                     Candidate::Accept(value) => {
                         self.remove_owned(request_id, &registration.owner);
                         return Ok(value);

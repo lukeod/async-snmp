@@ -646,11 +646,13 @@ pub use pdu::{
     PduBody, PduType, RequestPdu, ResponsePdu, StandardPduType, TrapV1Notification, TrapV1Pdu,
 };
 pub use transport::{
-    BoundListener, BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId,
-    ListenerSource, PreparedTcpSession, PreparedUdpEndpoint, ReceivedMessageInfo, ReceptionId,
-    RequestRegistration, RequestTransport, ResponseIdentity, RunningTcpSession, RunningUdpEndpoint,
-    SessionId, TcpControl, TcpListenerSource, TcpOptions, TcpRunner, TcpStatus, TcpTransport,
-    TcpTransportBuilder, TransportKind, UdpControl, UdpEndpoint, UdpEndpointBuilder, UdpHandle,
+    BoundListener, BuiltinTransport, Candidate, CommunityResponsePolicy,
+    DEFAULT_OBSERVATION_CAPACITY, EndpointId, ListenerSource, MessageDisposition, ObservationEvent,
+    ObservationReceiver, ObservationStats, PreparedTcpSession, PreparedUdpEndpoint,
+    ReceivedMessageInfo, ReceptionId, RequestRegistration, RequestTransport, ResponseIdentity,
+    RunningTcpSession, RunningUdpEndpoint, SentMessageInfo, SessionId, TcpControl,
+    TcpListenerSource, TcpOptions, TcpRunner, TcpStatus, TcpTransport, TcpTransportBuilder,
+    TransportKind, TransportObserver, UdpControl, UdpEndpoint, UdpEndpointBuilder, UdpHandle,
     UdpRunner, UdpStats, UdpStatus,
 };
 pub use v3::{

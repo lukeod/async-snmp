@@ -132,6 +132,7 @@ pub struct UdpEndpoint {
 }
 
 struct UdpEndpointInner {
+    observation: super::observation::Observation,
     endpoint_id: crate::EndpointId,
     responder: Arc<crate::udp_responder::UdpResponder>,
     socket: Arc<UdpSocket>,
@@ -358,6 +359,7 @@ pub enum UdpStatus {
 /// when `run()` has never been polled. Timers are created only when it runs.
 #[must_use = "the runner must be driven or dropped"]
 pub struct UdpRunner {
+    observation: super::observation::Observation,
     socket: Arc<UdpSocket>,
     responder: Arc<crate::udp_responder::UdpResponder>,
     endpoint_id: crate::EndpointId,
@@ -396,6 +398,7 @@ impl UdpRunner {
 
     fn new(inner: &UdpEndpointInner) -> Self {
         Self {
+            observation: inner.observation.clone(),
             socket: inner.socket.clone(),
             responder: inner.responder.clone(),
             endpoint_id: inner.endpoint_id,
@@ -484,6 +487,7 @@ impl UdpRunner {
                             let len = received.len;
                             let source = received.source;
                             let info = crate::ReceivedMessageInfo::udp(endpoint_id, local_addr, source, received.destination.map(|d| d.ip), tokio::time::Instant::now(), len);
+                            self.observation.received(info);
                             recv_error_backoff.reset();
                             if len > receive_limits.advertised().as_usize() {
                                 tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, received_size = len, advertised_size = receive_limits.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
@@ -506,6 +510,7 @@ impl UdpRunner {
                                     tracing::debug!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.source = %source }, "response for unknown request");
                                 }
                             } else {
+                                self.observation.disposition(info, super::MessageDisposition::Malformed);
                                 core.note_malformed();
                                 tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, snmp.bytes = len }, "malformed response (no request_id)");
                             }
@@ -604,6 +609,7 @@ impl RunningUdpEndpoint {
 
 /// Builder for [`UdpEndpoint`].
 pub struct UdpEndpointBuilder {
+    observation: super::observation::Observation,
     bind_addr: Option<String>,
     socket: Option<UdpSocket>,
     config: UdpEndpointConfig,
@@ -613,6 +619,12 @@ pub struct UdpEndpointBuilder {
 }
 
 impl UdpEndpointBuilder {
+    /// Observe this socket with bounded metadata events and aggregate I/O counters.
+    #[must_use]
+    pub fn observer(mut self, observer: super::TransportObserver) -> Self {
+        self.observation = super::observation::Observation(Some(observer));
+        self
+    }
     #[cfg_attr(not(feature = "agent"), allow(dead_code))]
     pub(crate) fn ingress(mut self, ingress: super::ingress::ApplicationIngress) -> Self {
         self.ingress = Some(ingress);
@@ -625,6 +637,7 @@ impl UdpEndpointBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            observation: Default::default(),
             bind_addr: None,
             socket: None,
             config: UdpEndpointConfig::default(),
@@ -807,11 +820,15 @@ impl UdpEndpointBuilder {
         let shutdown = CancellationToken::new();
         let shutdown_complete = CancellationToken::new();
         let inner = Arc::new(UdpEndpointInner {
+            observation: self.observation.clone(),
             endpoint_id: crate::EndpointId::new(),
-            responder: Arc::new(crate::udp_responder::UdpResponder::new(&socket)),
+            responder: Arc::new(
+                crate::udp_responder::UdpResponder::new(&socket)
+                    .with_observation(self.observation.clone()),
+            ),
             socket: Arc::new(socket),
             local_addr,
-            core: Arc::new(UdpCore::new()),
+            core: Arc::new(UdpCore::new().with_observation(self.observation)),
             request_admission: Arc::new(tokio::sync::Semaphore::new(
                 self.config.max_inflight_requests,
             )),
@@ -1139,7 +1156,29 @@ impl UdpHandle {
                 .boxed());
             }
             match self.inner.socket.try_send_to(data, self.target) {
-                Ok(_) => break,
+                Ok(written) => {
+                    self.inner.observation.written(written);
+                    if written != data.len() {
+                        return Err(Error::Network {
+                            target: self.target,
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "UDP send wrote a partial datagram",
+                            ),
+                        }
+                        .boxed());
+                    }
+                    self.inner.observation.sent(super::SentMessageInfo {
+                        endpoint_id: self.inner.endpoint_id,
+                        session_id: None,
+                        transport: super::TransportKind::Udp,
+                        local_addr: self.inner.local_addr,
+                        peer_addr: self.target,
+                        sent_at: tokio::time::Instant::now(),
+                        sent_len: written,
+                    });
+                    break;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(source) => {
                     return Err(Error::Network {

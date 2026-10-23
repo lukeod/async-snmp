@@ -122,6 +122,7 @@ impl DispatchRoles {
             &self.application_bytes
         };
         let Ok(slot) = slots.clone().try_acquire_owned() else {
+            message.observe(super::MessageDisposition::Overloaded);
             self.note_drop();
             return;
         };
@@ -129,15 +130,18 @@ impl DispatchRoles {
             .clone()
             .try_acquire_many_owned(message.bytes.len() as u32)
         else {
+            message.observe(super::MessageDisposition::Overloaded);
             self.note_drop();
             return;
         };
         let peer_buffer = if candidate {
             let Some(budget) = self.peer_response_budget(message.info.peer_addr()) else {
+                message.observe(super::MessageDisposition::Overloaded);
                 self.note_drop();
                 return;
             };
             let Ok(permit) = budget.try_acquire_many_owned(message.bytes.len() as u32) else {
+                message.observe(super::MessageDisposition::Overloaded);
                 self.note_drop();
                 return;
             };
@@ -170,6 +174,8 @@ impl DispatchRoles {
                             _shared: peer_buffer,
                         },
                     );
+                } else {
+                    message.observe(super::MessageDisposition::Unmatched);
                 }
                 return;
             }
@@ -177,6 +183,7 @@ impl DispatchRoles {
             // must obtain its own admission before releasing that allowance.
             let (_slot, _buffer) = if candidate {
                 let Ok(app_slot) = roles.application.clone().try_acquire_owned() else {
+                    message.observe(super::MessageDisposition::Overloaded);
                     roles.note_drop();
                     return;
                 };
@@ -185,6 +192,7 @@ impl DispatchRoles {
                     .clone()
                     .try_acquire_many_owned(message.bytes.len() as u32)
                 else {
+                    message.observe(super::MessageDisposition::Overloaded);
                     roles.note_drop();
                     return;
                 };
@@ -205,6 +213,8 @@ impl DispatchRoles {
                         processor.process(message).await;
                     } else if let Some(commands) = commands {
                         commands.deliver_udp(message);
+                    } else {
+                        message.observe(super::MessageDisposition::Disabled);
                     }
                 }
                 Ok(Some(_)) => {
@@ -212,6 +222,8 @@ impl DispatchRoles {
                         commands.deliver_udp(message);
                     } else if let Some(processor) = &roles.notifications {
                         processor.process(message).await;
+                    } else {
+                        message.observe(super::MessageDisposition::Disabled);
                     }
                 }
                 // Unresolved application security needs the combined local /
@@ -226,6 +238,8 @@ impl DispatchRoles {
                         processor.process(message).await;
                     } else if let Some(commands) = commands {
                         commands.deliver_udp(message);
+                    } else {
+                        message.observe(super::MessageDisposition::Disabled);
                     }
                 }
             }
@@ -267,6 +281,8 @@ impl DispatchRoles {
                 && let Some(id) = envelope.request_id(&message.bytes)
             {
                 core.deliver_parsed_buffered(id, envelope, message.bytes, message.info, buffers);
+            } else {
+                message.observe(super::MessageDisposition::Unmatched);
             }
             return Ok(());
         }
@@ -285,11 +301,14 @@ impl DispatchRoles {
             Ok(Some(_)) => self.notifications.as_ref(),
             Err(_) | Ok(None) => self.notifications.as_ref().filter(|role| role.is_enabled()),
         };
+        let observation = message.reply.observation().clone();
+        let info = message.info;
         let target = message.info.peer_addr();
         let session = message.info.session_id();
         let admit = async {
             if let Some(processor) = notification {
                 if !processor.is_enabled() {
+                    message.observe(super::MessageDisposition::Disabled);
                     return Ok::<(), Box<Error>>(());
                 }
                 let admission = async {
@@ -302,6 +321,7 @@ impl DispatchRoles {
                     let admission = if needs_delivery {
                         let Some(admission) = processor.reserve_tcp(self.client_exchanges).await?
                         else {
+                            message.observe(super::MessageDisposition::Disabled);
                             return Ok::<(), Box<Error>>(());
                         };
                         admission
@@ -316,17 +336,19 @@ impl DispatchRoles {
                     Ok::<(), Box<Error>>(())
                 };
                 tokio::select! { biased;
-                    () = processor.admission_closed() => {},
+                    () = processor.admission_closed() => { observation.disposition(info, super::MessageDisposition::Disabled); },
                     result = admission => result?,
                 }
             } else if commands.is_some() {
                 ingress
                     .deliver_tcp(message, buffers, self.client_exchanges)
                     .await?;
+            } else {
+                message.observe(super::MessageDisposition::Disabled);
             }
             Ok(())
         };
-        match tokio::time::timeout(ingress.overload_timeout, admit).await {
+        let result = match tokio::time::timeout(ingress.overload_timeout, admit).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(Error::Network {
                 target,
@@ -343,7 +365,11 @@ impl DispatchRoles {
                 ),
             }
             .boxed()),
+        };
+        if result.is_err() && notification.is_some() {
+            observation.disposition(info, super::MessageDisposition::Overloaded);
         }
+        result
     }
     fn classify(
         &self,

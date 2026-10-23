@@ -131,6 +131,7 @@ async fn run_tcp_listener(
         options,
         ingress,
         roles,
+        observation,
     } = source
     else {
         unreachable!("TCP acceptor source")
@@ -148,7 +149,7 @@ async fn run_tcp_listener(
                 Ok((stream, _)) => {
                     backoff.reset();
                     let Ok(permit) = network.connections.clone().try_acquire_owned() else { drop(stream); continue; };
-                    let prepared = match TcpTransport::builder().from_stream(stream).options(options.clone()).ingress(ingress.clone(), bound.endpoint_id).prepare().await {
+                    let prepared = match TcpTransport::builder().from_stream(stream).observation(observation.clone()).options(options.clone()).ingress(ingress.clone(), bound.endpoint_id).prepare().await {
                         Ok(prepared) => prepared,
                         Err(error) => { tracing::debug!(%error, "accepted TCP session preparation failed"); continue; }
                     };

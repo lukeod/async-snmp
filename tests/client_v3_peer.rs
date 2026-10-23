@@ -268,11 +268,17 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, config: DecodeConfig) {
     )
     .await;
 
+    let (observer, mut events) = async_snmp::TransportObserver::channel(32).unwrap();
+    let endpoint = async_snmp::UdpEndpoint::builder()
+        .observer(observer.clone())
+        .spawn()
+        .await
+        .unwrap();
     let client = Client::builder(peer.addr(), auth_for(level))
         .decode_config(config)
         .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
-        .connect()
+        .build_with(&endpoint)
         .await
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
@@ -324,6 +330,25 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, config: DecodeConfig) {
     } else {
         assert!(result.metadata.decode_anomalies().next().is_none());
     }
+    let stats = observer.stats();
+    assert_eq!(
+        stats.received_messages,
+        if config.trailing_bytes { 2 } else { 3 }
+    );
+    assert_eq!(stats.received_message_bytes, stats.socket_read_bytes);
+    let mut inputs = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let async_snmp::ObservationEvent::Received(info) = event {
+            inputs.push(info);
+        }
+    }
+    for record in records {
+        assert_eq!(
+            inputs.iter().filter(|&&info| info == record.info).count(),
+            1
+        );
+    }
+    endpoint.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2943,10 +2968,16 @@ async fn v3_auth_client_rejects_unauthenticated_response() {
     )
     .await;
 
+    let (observer, mut events) = async_snmp::TransportObserver::channel(32).unwrap();
+    let endpoint = async_snmp::UdpEndpoint::builder()
+        .observer(observer.clone())
+        .spawn()
+        .await
+        .unwrap();
     let client = Client::builder(peer.addr(), auth_for(level))
         .request_timeout(LOOPBACK_TIMEOUT)
         .retry(Retry::none())
-        .connect()
+        .build_with(&endpoint)
         .await
         .unwrap();
     let err = client
@@ -2958,6 +2989,22 @@ async fn v3_auth_client_rejects_unauthenticated_response() {
         "expected timeout after candidate rejection, got: {err}"
     );
     peer.finish().await.unwrap();
+    assert_eq!(observer.stats().received_messages, 2);
+    assert_eq!(err.response_metadata().unwrap().received_messages.len(), 1);
+    let mut rejected = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event,
+            async_snmp::ObservationEvent::Disposition {
+                disposition: async_snmp::MessageDisposition::CandidateRejected,
+                ..
+            }
+        ) {
+            rejected += 1;
+        }
+    }
+    assert_eq!(rejected, 1);
+    endpoint.shutdown().await.unwrap();
 }
 
 /// An ordinary Response at a lower security level must not use the

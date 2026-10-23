@@ -567,6 +567,7 @@ impl NotificationProcessor {
         message: crate::transport::ReceivedMessage,
     ) -> NotificationDisposition {
         if !self.is_enabled() {
+            message.observe(crate::MessageDisposition::Disabled);
             return NotificationDisposition::Disabled;
         }
         self.process_admitted(message, NotificationAdmission::default())
@@ -590,7 +591,9 @@ impl NotificationProcessor {
         async move {
             let _active = active;
             let source = message.info.peer_addr();
-            match processor.parse_and_respond(message, &mut admission).await {
+            let info = message.info;
+            let observation = message.reply.observation().clone();
+            let disposition = match processor.parse_and_respond(message, &mut admission).await {
                 Ok(Some(notification)) => {
                     admission.publish(notification);
                     NotificationDisposition::Delivered
@@ -610,7 +613,19 @@ impl NotificationProcessor {
                     tracing::debug!(target: "async_snmp::notification", %source, %error, "notification rejected before admission");
                     NotificationDisposition::Rejected
                 }
-            }
+            };
+            observation.disposition(
+                info,
+                match disposition {
+                    NotificationDisposition::Delivered => {
+                        crate::MessageDisposition::NotificationDelivered
+                    }
+                    NotificationDisposition::Disabled => crate::MessageDisposition::Disabled,
+                    NotificationDisposition::Overloaded => crate::MessageDisposition::Overloaded,
+                    NotificationDisposition::Rejected => crate::MessageDisposition::Rejected,
+                },
+            );
+            disposition
         }
     }
 }

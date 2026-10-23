@@ -192,6 +192,7 @@ fn intrinsically_non_unicast(ip: IpAddr) -> bool {
 /// Per-socket capability for destination-aware datagram receives and replies.
 #[derive(Debug)]
 pub(crate) struct UdpResponder {
+    observation: crate::transport::observation::Observation,
     packet_info: bool,
     #[cfg(any(
         test,
@@ -321,6 +322,17 @@ impl InterfaceSnapshotCache {
 }
 
 impl UdpResponder {
+    pub(crate) fn with_observation(
+        mut self,
+        observation: crate::transport::observation::Observation,
+    ) -> Self {
+        self.observation = observation;
+        self
+    }
+    pub(crate) fn observation(&self) -> &crate::transport::observation::Observation {
+        &self.observation
+    }
+
     pub(crate) fn new(socket: &UdpSocket) -> Self {
         Self::from_setup_result(socket, platform::enable_packet_info(socket))
     }
@@ -328,6 +340,7 @@ impl UdpResponder {
     fn from_setup_result(socket: &UdpSocket, result: io::Result<()>) -> Self {
         match result {
             Ok(()) => Self {
+                observation: Default::default(),
                 packet_info: true,
                 #[cfg(any(
                     test,
@@ -347,6 +360,7 @@ impl UdpResponder {
                     "UDP destination metadata unavailable; replies will use kernel source selection"
                 );
                 Self {
+                    observation: Default::default(),
                     packet_info: false,
                     #[cfg(any(
                         test,
@@ -365,6 +379,7 @@ impl UdpResponder {
     #[cfg(test)]
     fn without_packet_info() -> Self {
         Self {
+            observation: Default::default(),
             packet_info: false,
             #[cfg(any(
                 test,
@@ -386,6 +401,7 @@ impl UdpResponder {
     ) -> io::Result<ReceivedDatagram> {
         if !self.packet_info {
             let (len, source) = socket.recv_from(buf).await?;
+            self.observation.read(len);
             return Ok(ReceivedDatagram {
                 len,
                 source,
@@ -396,7 +412,7 @@ impl UdpResponder {
         loop {
             socket.readable().await?;
             match socket.try_io(tokio::io::Interest::READABLE, || {
-                platform::recv_with_packet_info(socket, buf)
+                platform::recv_with_packet_info(socket, buf, &self.observation)
             }) {
                 Ok(received) => return Ok(received),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -426,7 +442,8 @@ impl UdpResponder {
         admission: Option<&std::sync::Mutex<bool>>,
     ) -> io::Result<()> {
         let Some(source) = source.filter(|_| self.packet_info) else {
-            return send_plain_admitted(socket, data, destination, admission).await;
+            return send_plain_admitted(socket, data, destination, admission, &self.observation)
+                .await;
         };
 
         let exact_result = self
@@ -491,7 +508,7 @@ impl UdpResponder {
             );
         }
 
-        send_plain_admitted(socket, data, destination, admission).await
+        send_plain_admitted(socket, data, destination, admission, &self.observation).await
     }
 
     async fn classify_destination(&self, source: DestinationMetadata) -> DestinationClassification {
@@ -609,7 +626,14 @@ impl UdpResponder {
             socket.writable().await?;
             let _admission = check_send_admission(admission)?;
             match socket.try_io(tokio::io::Interest::WRITABLE, || {
-                platform::send_with_source(socket, data, destination, source, unspecified_source)
+                platform::send_with_source(
+                    socket,
+                    data,
+                    destination,
+                    source,
+                    unspecified_source,
+                    &self.observation,
+                )
             }) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -636,12 +660,22 @@ async fn send_plain_admitted(
     data: &[u8],
     destination: SocketAddr,
     admission: Option<&std::sync::Mutex<bool>>,
+    observation: &crate::transport::observation::Observation,
 ) -> io::Result<()> {
     loop {
         socket.writable().await?;
         let _admission = check_send_admission(admission)?;
         match socket.try_send_to(data, destination) {
-            Ok(_) => return Ok(()),
+            Ok(written) => {
+                observation.written(written);
+                if written != data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "UDP send wrote a partial datagram",
+                    ));
+                }
+                return Ok(());
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
@@ -732,6 +766,7 @@ mod platform {
     pub(super) fn recv_with_packet_info(
         socket: &UdpSocket,
         buf: &mut [u8],
+        observation: &crate::transport::observation::Observation,
     ) -> io::Result<ReceivedDatagram> {
         let mut iov = [IoSliceMut::new(buf)];
         // Space for packet-info representations and, on FreeBSD, the separate
@@ -747,6 +782,7 @@ mod platform {
             MsgFlags::empty(),
         )
         .map_err(io::Error::from)?;
+        observation.read(message.bytes);
         if message
             .flags
             .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
@@ -883,6 +919,7 @@ mod platform {
         destination: SocketAddr,
         source: DestinationMetadata,
         unspecified_source: bool,
+        observation: &crate::transport::observation::Observation,
     ) -> io::Result<()> {
         let destination = SockaddrStorage::from(destination);
         let iov = [IoSlice::new(data)];
@@ -916,6 +953,7 @@ mod platform {
             }
         }
         .map_err(io::Error::from)?;
+        observation.written(sent);
         if sent != data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -1050,6 +1088,7 @@ mod platform {
     pub(super) fn recv_with_packet_info(
         socket: &UdpSocket,
         buf: &mut [u8],
+        observation: &crate::transport::observation::Observation,
     ) -> io::Result<ReceivedDatagram> {
         // SAFETY: `sockaddr_storage` is a plain C storage type for which the
         // all-zero bit pattern is valid initialization.
@@ -1075,6 +1114,7 @@ mod platform {
         if len < 0 {
             return Err(io::Error::last_os_error());
         }
+        observation.read(len as usize);
         if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1115,6 +1155,7 @@ mod platform {
         destination: SocketAddr,
         source: DestinationMetadata,
         unspecified_source: bool,
+        observation: &crate::transport::observation::Observation,
     ) -> io::Result<()> {
         let destination = socket2::SockAddr::from(destination);
         let mut control = Aligned([0_u8; CONTROL_LEN]);
@@ -1185,6 +1226,7 @@ mod platform {
         if sent < 0 {
             return Err(io::Error::last_os_error());
         }
+        observation.written(sent as usize);
         if sent as usize != data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -1474,6 +1516,7 @@ mod platform {
     pub(super) fn recv_with_packet_info(
         socket: &UdpSocket,
         buf: &mut [u8],
+        observation: &crate::transport::observation::Observation,
     ) -> io::Result<ReceivedDatagram> {
         let recv_msg = RECV_MSG
             .as_ref()
@@ -1523,6 +1566,7 @@ mod platform {
             // GetLastError/last_os_error uses a different thread-local slot.
             return Err(winsock_error(unsafe { WinSock::WSAGetLastError() }));
         }
+        observation.read(len as usize);
         if message.dwFlags & (WinSock::MSG_TRUNC | WinSock::MSG_CTRUNC) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1562,6 +1606,7 @@ mod platform {
         destination: SocketAddr,
         source: DestinationMetadata,
         unspecified_source: bool,
+        observation: &crate::transport::observation::Observation,
     ) -> io::Result<()> {
         let destination = socket2::SockAddr::from(destination);
         let mut control = Aligned([0_u8; CONTROL_LEN]);
@@ -1643,6 +1688,7 @@ mod platform {
             // SAFETY: this is the immediate error query for WSASendMsg above.
             return Err(winsock_error(unsafe { WinSock::WSAGetLastError() }));
         }
+        observation.written(sent as usize);
         if sent as usize != data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -2022,6 +2068,7 @@ mod platform {
     pub(super) fn recv_with_packet_info(
         _socket: &UdpSocket,
         _buf: &mut [u8],
+        _observation: &crate::transport::observation::Observation,
     ) -> io::Result<ReceivedDatagram> {
         unreachable!("packet info cannot be enabled on this platform")
     }
@@ -2032,6 +2079,7 @@ mod platform {
         _destination: SocketAddr,
         _source: DestinationMetadata,
         _unspecified_source: bool,
+        _observation: &crate::transport::observation::Observation,
     ) -> io::Result<()> {
         unreachable!("packet info cannot be enabled on this platform")
     }
@@ -2099,7 +2147,10 @@ mod tests {
     async fn ordinary_udp_fallback_receives_and_sends() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let responder = UdpResponder::without_packet_info();
+        let (observer, _events) = crate::TransportObserver::channel(8).unwrap();
+        let responder = UdpResponder::without_packet_info().with_observation(
+            crate::transport::observation::Observation(Some(observer.clone())),
+        );
         client
             .send_to(b"request", server.local_addr().unwrap())
             .await
@@ -2118,6 +2169,30 @@ mod tests {
         let (len, source) = client.recv_from(&mut response).await.unwrap();
         assert_eq!(&response[..len], b"response");
         assert_eq!(source, server.local_addr().unwrap());
+        assert_eq!(observer.stats().socket_read_bytes, 7);
+        assert_eq!(observer.stats().socket_written_bytes, 8);
+        assert_eq!(observer.stats().sent_messages, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn truncated_datagram_counts_reported_bytes_before_metadata_rejection() {
+        let (observer, _events) = crate::TransportObserver::channel(8).unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let responder = UdpResponder::new(&server).with_observation(
+            crate::transport::observation::Observation(Some(observer.clone())),
+        );
+        assert!(responder.packet_info);
+        client
+            .send_to(b"too long", server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let error = responder.recv(&server, &mut [0; 2]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // recvmsg without MSG_TRUNC input flags reports copied bytes on Linux.
+        assert_eq!(observer.stats().socket_read_bytes, 2);
+        assert_eq!(observer.stats().received_messages, 0);
     }
 
     #[tokio::test]
@@ -2501,7 +2576,10 @@ mod tests {
     #[tokio::test]
     async fn broadcast_reply_uses_received_interface_without_duplicates() {
         let server = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let responder = UdpResponder::new(&server);
+        let (observer, _events) = crate::TransportObserver::channel(8).unwrap();
+        let responder = UdpResponder::new(&server).with_observation(
+            crate::transport::observation::Observation(Some(observer.clone())),
+        );
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.set_broadcast(true).unwrap();
         let destination =
@@ -2543,6 +2621,8 @@ mod tests {
             .is_err(),
             "broadcast fallback emitted a duplicate reply"
         );
+        assert_eq!(observer.stats().socket_read_bytes, 7);
+        assert_eq!(observer.stats().socket_written_bytes, 8);
     }
 
     #[cfg(target_os = "linux")]

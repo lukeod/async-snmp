@@ -28,6 +28,11 @@ pub(crate) mod network;
 #[cfg(all(test, feature = "agent"))]
 mod shared_tcp_tests;
 pub use listener::{BoundListener, ListenerSource, TcpListenerSource};
+pub(crate) mod observation;
+pub use observation::{
+    DEFAULT_OBSERVATION_CAPACITY, MessageDisposition, ObservationEvent, ObservationReceiver,
+    ObservationStats, SentMessageInfo, TransportObserver,
+};
 mod received;
 pub use received::*;
 mod tcp;

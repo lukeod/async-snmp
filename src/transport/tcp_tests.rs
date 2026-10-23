@@ -1252,12 +1252,14 @@ async fn frame_larger_than_udp_capacity_is_received_with_exact_length() {
 
 #[tokio::test]
 async fn cancelling_started_write_finishes_frame_before_next_message() {
+    let (observer, _events) = crate::TransportObserver::channel(8).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let socket = TcpSocket::new_v4().unwrap();
     socket.set_send_buffer_size(4096).unwrap();
     let (prepared, accepted) = tokio::join!(
         TcpTransport::builder()
+            .observer(observer.clone())
             .from_socket(socket)
             .target(address)
             .prepare(),
@@ -1287,18 +1289,29 @@ async fn cancelling_started_write_finishes_frame_before_next_message() {
     );
     assert_eq!(&remainder[remainder.len() - 3..], b"END");
     next.await.unwrap().unwrap();
+    assert_eq!(observer.stats().sent_messages, 2);
+    assert_eq!(
+        observer.stats().socket_written_bytes,
+        (1024 * 1024 + 3) as u64
+    );
+    assert_eq!(
+        observer.stats().sent_message_bytes,
+        observer.stats().socket_written_bytes
+    );
     assert!(!running.control().is_shutdown());
     running.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn partial_write_uses_original_exchange_deadline_and_closes_session() {
+    let (observer, mut events) = crate::TransportObserver::channel(8).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let socket = TcpSocket::new_v4().unwrap();
     socket.set_send_buffer_size(4096).unwrap();
     let (prepared, accepted) = tokio::join!(
         TcpTransport::builder()
+            .observer(observer.clone())
             .from_socket(socket)
             .target(address)
             .prepare(),
@@ -1325,6 +1338,10 @@ async fn partial_write_uses_original_exchange_deadline_and_closes_session() {
     peer.read_to_end(&mut written).await.unwrap();
     assert!(!written.is_empty());
     assert!(written.len() < payload.len());
+    assert_eq!(observer.stats().socket_written_bytes, written.len() as u64);
+    assert_eq!(observer.stats().sent_messages, 0);
+    assert_eq!(observer.stats().sent_message_bytes, 0);
+    assert!(events.try_recv().is_err());
     assert!(running.join().await.is_err());
 }
 

@@ -130,6 +130,7 @@ impl TcpOptions {
 /// with target, connect timeout and pre-connect socket configuration.
 #[derive(Debug, Default)]
 pub struct TcpTransportBuilder {
+    observation: super::observation::Observation,
     target: Option<SocketAddr>,
     stream: Option<TcpStream>,
     socket: Option<TcpSocket>,
@@ -139,6 +140,17 @@ pub struct TcpTransportBuilder {
     endpoint_id: Option<crate::EndpointId>,
 }
 impl TcpTransportBuilder {
+    /// Observe this session with bounded metadata events and aggregate I/O counters.
+    #[must_use]
+    pub fn observer(mut self, observer: super::TransportObserver) -> Self {
+        self.observation = super::observation::Observation(Some(observer));
+        self
+    }
+    pub(crate) fn observation(mut self, observation: super::observation::Observation) -> Self {
+        self.observation = observation;
+        self
+    }
+
     #[cfg_attr(not(feature = "agent"), allow(dead_code))]
     pub(crate) fn ingress(
         mut self,
@@ -293,13 +305,14 @@ impl TcpTransportBuilder {
             .map_err(|source| Error::Network { target, source }.boxed())?;
         let (writes, receiver) = mpsc::channel(self.options.write_queue_capacity);
         let state = Arc::new(SessionState {
+            observation: self.observation.clone(),
             endpoint_id: self.endpoint_id.unwrap_or_default(),
             session_id: crate::SessionId::new(),
             target,
             local_addr,
             receive_limits: limits,
             options: self.options.clone(),
-            core: Arc::new(UdpCore::for_stream()),
+            core: Arc::new(UdpCore::for_stream().with_observation(self.observation)),
             shutdown: CancellationToken::new(),
             complete: CancellationToken::new(),
             admission: Mutex::new(true),
@@ -364,6 +377,7 @@ struct TcpTransportInner {
     _lease: DropGuard,
 }
 struct SessionState {
+    observation: super::observation::Observation,
     dispatch: Mutex<Option<Arc<super::dispatch::DispatchRoles>>>,
     endpoint_id: crate::EndpointId,
     session_id: crate::SessionId,
@@ -604,6 +618,9 @@ impl TcpControl {
 }
 
 impl TcpTransport {
+    pub(crate) fn observation(&self) -> &super::observation::Observation {
+        &self.inner.state.observation
+    }
     pub(crate) fn with_service_lease(mut self, lease: Arc<dyn Send + Sync>) -> Self {
         self.service_lease = Some(lease);
         self
@@ -848,10 +865,14 @@ struct WriteCommand {
 }
 
 async fn read_loop(
-    mut read: tokio::net::tcp::OwnedReadHalf,
+    read: tokio::net::tcp::OwnedReadHalf,
     state: &SessionState,
     transport: std::sync::Weak<TcpTransportInner>,
 ) -> Result<()> {
+    let mut read = super::observation::ObservedRead {
+        inner: read,
+        observation: state.observation.clone(),
+    };
     let mut framer = BerFramer::new(
         state.receive_limits.accepted(),
         state.options.header_timeout,
@@ -912,6 +933,7 @@ async fn read_loop(
             Instant::now(),
             frame.len(),
         );
+        state.observation.received(info);
         if let Some(dispatch) = &dispatch {
             let Some(inner) = transport.upgrade() else {
                 return Ok(());
@@ -935,6 +957,9 @@ async fn read_loop(
                 .core
                 .deliver_parsed_buffered(id, envelope, frame, info, permit);
         } else {
+            state
+                .observation
+                .disposition(info, super::MessageDisposition::Malformed);
             state.core.note_malformed();
         }
     }
@@ -1025,7 +1050,10 @@ async fn write_loop(
                     }
                     .boxed());
                 }
-                Ok(written) => offset += written,
+                Ok(written) => {
+                    state.observation.written(written);
+                    offset += written;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(source) => {
                     return Err(Error::Network {
@@ -1037,6 +1065,15 @@ async fn write_loop(
             }
         }
         if offset == command.bytes.len() {
+            state.observation.sent(super::SentMessageInfo {
+                endpoint_id: state.endpoint_id,
+                session_id: Some(state.session_id),
+                transport: super::TransportKind::Tcp,
+                local_addr: state.local_addr,
+                peer_addr: state.target,
+                sent_at: Instant::now(),
+                sent_len: offset,
+            });
             let _ = command.complete.send(Ok(()));
         }
     }

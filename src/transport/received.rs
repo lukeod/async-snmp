@@ -190,6 +190,8 @@ enum ReplyKind {
         socket: std::sync::Arc<tokio::net::UdpSocket>,
         responder: std::sync::Arc<crate::udp_responder::UdpResponder>,
         received: crate::udp_responder::ReceivedDatagram,
+        endpoint_id: EndpointId,
+        local_addr: SocketAddr,
         admission: Option<(
             std::sync::Arc<std::sync::Mutex<bool>>,
             tokio_util::sync::CancellationToken,
@@ -198,6 +200,13 @@ enum ReplyKind {
     Tcp(super::TcpTransport),
 }
 impl ReplyRoute {
+    pub(crate) fn observation(&self) -> &super::observation::Observation {
+        match &self.kind {
+            ReplyKind::Udp { responder, .. } => responder.observation(),
+            ReplyKind::Tcp(transport) => transport.observation(),
+        }
+    }
+
     pub(crate) async fn send_before(&self, data: &[u8], deadline: Instant) -> std::io::Result<()> {
         if Instant::now() >= deadline {
             return Err(std::io::Error::new(
@@ -216,6 +225,8 @@ impl ReplyRoute {
                 socket,
                 responder,
                 received,
+                endpoint_id,
+                local_addr,
                 admission,
             } => {
                 let send = responder.send_to_admitted(
@@ -225,11 +236,23 @@ impl ReplyRoute {
                     received.destination,
                     admission.as_ref().map(|(gate, _)| gate.as_ref()),
                 );
-                tokio::select! { biased;
+                let result = tokio::select! { biased;
                     () = tokio::time::sleep_until(deadline) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "reply deadline expired")),
                     () = async { match admission { Some((_, cancel)) => cancel.cancelled().await, None => std::future::pending().await } } => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "UDP endpoint closed")),
                     result = send => result,
+                };
+                if result.is_ok() {
+                    responder.observation().sent(super::SentMessageInfo {
+                        endpoint_id: *endpoint_id,
+                        session_id: None,
+                        transport: TransportKind::Udp,
+                        local_addr: *local_addr,
+                        peer_addr: received.source,
+                        sent_at: Instant::now(),
+                        sent_len: data.len(),
+                    });
                 }
+                result
             }
             ReplyKind::Tcp(transport) => transport
                 .write_before(data, deadline)
@@ -246,6 +269,10 @@ pub(crate) struct ReceivedMessage {
     pub(crate) reply: ReplyRoute,
 }
 impl ReceivedMessage {
+    pub(crate) fn observe(&self, disposition: super::MessageDisposition) {
+        self.reply.observation().disposition(self.info, disposition);
+    }
+
     pub(crate) fn with_udp_admission(
         mut self,
         gate: std::sync::Arc<std::sync::Mutex<bool>>,
@@ -295,6 +322,8 @@ impl ReceivedMessage {
                     socket,
                     responder,
                     received,
+                    endpoint_id: info.endpoint_id(),
+                    local_addr: info.local_addr(),
                     admission: None,
                 },
                 limits,

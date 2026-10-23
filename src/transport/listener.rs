@@ -132,6 +132,7 @@ impl ListenerSource {
                     bound,
                     listener,
                     options: source.options,
+                    observation: source.observation,
                     ingress,
                     roles: None,
                 })
@@ -142,13 +143,22 @@ impl ListenerSource {
 
 /// TCP acceptor source and limits applied independently to each accepted session.
 pub struct TcpListenerSource {
+    observation: super::observation::Observation,
     address: Option<String>,
     listener: Option<TcpListener>,
     options: TcpOptions,
 }
 impl TcpListenerSource {
+    /// Observe every accepted session; events retain listener and session identities.
+    #[must_use]
+    pub fn observer(mut self, observer: super::TransportObserver) -> Self {
+        self.observation = super::observation::Observation(Some(observer));
+        self
+    }
+
     pub fn bind(address: impl AsRef<str>) -> Self {
         Self {
+            observation: Default::default(),
             address: Some(address.as_ref().into()),
             listener: None,
             options: TcpOptions::default(),
@@ -156,6 +166,7 @@ impl TcpListenerSource {
     }
     pub fn from_listener(listener: TcpListener) -> Self {
         Self {
+            observation: Default::default(),
             address: None,
             listener: Some(listener),
             options: TcpOptions::default(),
@@ -180,6 +191,7 @@ pub(crate) enum PreparedListener {
         runner: UdpRunner,
     },
     Tcp {
+        observation: super::observation::Observation,
         bound: BoundListener,
         listener: TcpListener,
         options: TcpOptions,

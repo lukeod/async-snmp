@@ -506,9 +506,14 @@ async fn shared_v3_notifications_keep_trap_and_inform_authority_separate() {
 
 #[tokio::test]
 async fn selected_udp_retransmissions_keep_port_and_stream_cancellation_stops_retries() {
+    let (observer, _events) = async_snmp::TransportObserver::channel(16).unwrap();
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let agent = Agent::builder()
-        .bind("127.0.0.1:0")
+        .listener(ListenerSource::Udp(
+            UdpEndpoint::builder()
+                .bind("127.0.0.1:0")
+                .observer(observer.clone()),
+        ))
         .notification_sink(
             id("retry"),
             NotificationTarget::shared_udp(0, socket.local_addr().unwrap().to_string()),
@@ -535,6 +540,12 @@ async fn selected_udp_retransmissions_keep_port_and_stream_cancellation_stops_re
         tokio::time::timeout(Duration::from_millis(180), socket.recv_from(&mut buffer))
             .await
             .is_err()
+    );
+    assert_eq!(observer.stats().sent_messages, 2);
+    assert_eq!(observer.stats().received_messages, 0);
+    assert_eq!(
+        observer.stats().socket_written_bytes,
+        observer.stats().sent_message_bytes
     );
     agent.shutdown().await.unwrap();
 }

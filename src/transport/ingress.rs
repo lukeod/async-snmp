@@ -34,9 +34,11 @@ impl ApplicationIngress {
     }
     pub(crate) fn deliver_udp(&self, message: ReceivedMessage) {
         if !self.is_enabled() {
+            message.observe(super::MessageDisposition::Disabled);
             return;
         }
         let Ok(admission) = self.capacity.clone().try_acquire_owned() else {
+            message.observe(super::MessageDisposition::Overloaded);
             self.drops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -46,16 +48,27 @@ impl ApplicationIngress {
             .clone()
             .try_acquire_many_owned(message.bytes.len() as u32)
         else {
+            message.observe(super::MessageDisposition::Overloaded);
             self.drops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         };
-        let _ = self.sender.try_send(InboundWork {
+        let observation = message.reply.observation().clone();
+        let info = message.info;
+        let result = self.sender.try_send(InboundWork {
             message,
             _admission: admission,
             _session: None,
             _buffers: Some(buffer.into()),
         });
+        observation.disposition(
+            info,
+            match result {
+                Ok(()) => super::MessageDisposition::ApplicationQueued,
+                Err(mpsc::error::TrySendError::Closed(_)) => super::MessageDisposition::Disabled,
+                Err(_) => super::MessageDisposition::Overloaded,
+            },
+        );
     }
     pub(crate) async fn deliver_tcp(
         &self,
@@ -63,10 +76,34 @@ impl ApplicationIngress {
         buffers: BufferPermits,
         fail_fast: bool,
     ) -> Result<()> {
+        let observation = message.reply.observation().clone();
+        let info = message.info;
+        let result = self.deliver_tcp_inner(message, buffers, fail_fast).await;
+        if result.is_err() {
+            observation.disposition(
+                info,
+                if self.is_enabled() {
+                    super::MessageDisposition::Overloaded
+                } else {
+                    super::MessageDisposition::Disabled
+                },
+            );
+        }
+        result
+    }
+    async fn deliver_tcp_inner(
+        &self,
+        message: ReceivedMessage,
+        buffers: BufferPermits,
+        fail_fast: bool,
+    ) -> Result<()> {
         if !self.is_enabled() {
+            message.observe(super::MessageDisposition::Disabled);
             return Ok(());
         }
         let target = message.info.peer_addr();
+        let info = message.info;
+        let observation = message.reply.observation().clone();
         if fail_fast {
             let overload = || {
                 Error::Network {
@@ -95,30 +132,37 @@ impl ApplicationIngress {
                 _session: session,
                 _buffers: Some(buffers),
             };
-            return self.sender.try_send(work).map_err(|error| {
-                Error::Network {
-                    target,
-                    source: std::io::Error::other(format!(
-                        "TCP application admission overload: {error}"
-                    )),
-                }
-                .boxed()
-            });
+            return self
+                .sender
+                .try_send(work)
+                .map(|()| {
+                    observation.disposition(info, super::MessageDisposition::ApplicationQueued)
+                })
+                .map_err(|error| {
+                    Error::Network {
+                        target,
+                        source: std::io::Error::other(format!(
+                            "TCP application admission overload: {error}"
+                        )),
+                    }
+                    .boxed()
+                });
         }
         tokio::select! { biased;
-        () = self.disabled.cancelled() => Ok(()),
+        () = self.disabled.cancelled() => { observation.disposition(info, super::MessageDisposition::Disabled); Ok(()) },
         result = tokio::time::timeout(self.overload_timeout, async {
             let session = if let Some(limit) = &self.session {
                 Some(tokio::select! { biased;
-                    () = self.sender.closed() => return Ok(()),
+                    () = self.sender.closed() => { observation.disposition(info, super::MessageDisposition::Disabled); return Ok(()); },
                     permit = limit.clone().acquire_owned() => permit.map_err(|_| Error::Closed { target }.boxed())?,
                 })
             } else { None };
             let admission = tokio::select! { biased;
-                () = self.sender.closed() => return Ok(()),
+                () = self.sender.closed() => { observation.disposition(info, super::MessageDisposition::Disabled); return Ok(()); },
                 permit = self.capacity.clone().acquire_owned() => permit.map_err(|_| Error::Closed { target }.boxed())?,
             };
-            let _ = self.sender.send(InboundWork { message, _admission: admission, _session: session, _buffers: Some(buffers) }).await; Ok(())
+            let result = self.sender.send(InboundWork { message, _admission: admission, _session: session, _buffers: Some(buffers) }).await;
+            observation.disposition(info, if result.is_ok() { super::MessageDisposition::ApplicationQueued } else { super::MessageDisposition::Disabled }); Ok(())
         }) => result.map_err(|_| Error::Network { target, source: std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP application admission overload") }.boxed())?,
         }
     }

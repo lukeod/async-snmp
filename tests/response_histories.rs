@@ -56,11 +56,17 @@ async fn udp_batch_error_and_inform_histories_keep_each_input_length() {
         }
         lengths
     });
+    let (observer, mut events) = async_snmp::TransportObserver::channel(64).unwrap();
+    let endpoint = async_snmp::UdpEndpoint::builder()
+        .observer(observer.clone())
+        .spawn()
+        .await
+        .unwrap();
     let client = Client::builder(address, Auth::v2c("public"))
         .max_oids_per_request(1)
         .request_timeout(Duration::from_millis(200))
         .retry(Retry::none())
-        .connect()
+        .build_with(&endpoint)
         .await
         .unwrap();
     let oids = [
@@ -118,6 +124,28 @@ async fn udp_batch_error_and_inform_histories_keep_each_input_length() {
         "short input must not inherit prior buffer suffix"
     );
     assert!(records[0].info.received_len() > records[1].info.received_len() + 600);
+    let stats = observer.stats();
+    assert_eq!(stats.received_messages, 10);
+    assert_eq!(stats.sent_messages, 6);
+    assert_eq!(
+        stats.socket_read_bytes,
+        lengths.iter().sum::<usize>() as u64 + 5 * 9
+    );
+    assert_eq!(stats.received_message_bytes, stats.socket_read_bytes);
+    assert_eq!(stats.sent_message_bytes, stats.socket_written_bytes);
+    let mut receipts = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let async_snmp::ObservationEvent::Received(info) = event {
+            receipts.push(info);
+        }
+    }
+    for record in records {
+        assert_eq!(
+            receipts.iter().filter(|&&info| info == record.info).count(),
+            1
+        );
+    }
+    endpoint.shutdown().await.unwrap();
 }
 
 async fn read_frame(stream: &mut TcpStream) -> Bytes {
@@ -169,17 +197,22 @@ async fn tcp_history_counts_one_frame_despite_segmentation_and_adjacent_rejectio
         // Keep the connection until the client finishes validation.
         let mut byte = [0];
         let _ = stream.read(&mut byte).await;
-        reply.len()
+        (reply.len(), combined.len())
     });
-    let client = Client::builder(address, Auth::v2c("public"))
+    let (observer, mut events) = async_snmp::TransportObserver::channel(32).unwrap();
+    let transport = async_snmp::TcpTransport::builder()
+        .observer(observer.clone())
+        .connect(address)
+        .await
+        .unwrap();
+    let client = async_snmp::ClientBuilder::new(Auth::v2c("public"))
         .request_timeout(Duration::from_secs(2))
         .retry(Retry::none())
-        .connect_tcp()
-        .await
+        .build_with_transport(transport)
         .unwrap();
     let result = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     drop(client);
-    let length = server.await.unwrap();
+    let (length, input_bytes) = server.await.unwrap();
     let [record] = result.metadata.received_messages.as_slice() else {
         panic!("one accepted frame")
     };
@@ -188,4 +221,18 @@ async fn tcp_history_counts_one_frame_despite_segmentation_and_adjacent_rejectio
     assert!(record.info.session_id().is_some());
     assert_eq!(record.pdu_type, PduType::Response);
     assert!(record.decode_anomalies.is_empty());
+    let stats = observer.stats();
+    assert_eq!(stats.received_messages, 3);
+    assert_eq!(stats.socket_read_bytes, input_bytes as u64);
+    assert_eq!(stats.received_message_bytes, input_bytes as u64);
+    assert_eq!(stats.sent_messages, 1);
+    let mut matched = 0;
+    while let Ok(event) = events.try_recv() {
+        if let async_snmp::ObservationEvent::Received(info) = event
+            && info == record.info
+        {
+            matched += 1;
+        }
+    }
+    assert_eq!(matched, 1);
 }
