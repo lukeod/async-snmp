@@ -271,10 +271,10 @@ async fn community_client_applies_only_targeted_bounded_string_clamping() {
 async fn notification_receiver_applies_only_targeted_empty_oid_normalization() {
     let mut targeted = DecodeConfig::STRICT;
     targeted.empty_object_identifier = true;
-    let receiver = NotificationReceiver::builder()
+    let mut receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .decode_config(targeted)
-        .build()
+        .spawn()
         .await
         .unwrap();
     let receiver_addr = receiver.local_addr();

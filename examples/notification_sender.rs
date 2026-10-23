@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // concrete Error + Send + Sync callback failures.
     let engine =
         AuthoritativeEngine::install(engine_id, |_| Ok::<(), std::convert::Infallible>(()))?;
-    let receiver = NotificationReceiver::builder()
+    let mut receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .authoritative_engine(engine.clone())
         .usm_user("v3user", |u| {
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(level) if level >= SecurityLevel::AuthNoPriv => NotificationAcceptance::Accept,
             Some(_) => NotificationAcceptance::Reject,
         })
-        .build()
+        .spawn()
         .await?;
     let recv_addr = receiver.local_addr();
     println!("Receiver listening on {recv_addr}\n");
@@ -66,13 +66,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recv_handle = tokio::spawn(async move {
         for _ in 0..5 {
             match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
-                Ok(Ok(received)) => {
+                Ok(Some(received)) => {
                     print_notification(&received.notification, received.receive_info.peer_addr());
                     if let Some(outcome) = received.inform_ack {
                         println!("  Inform acknowledgement: {outcome:?}");
                     }
                 }
-                Ok(Err(e)) => eprintln!("Receive error: {e}"),
+                Ok(None) => {
+                    eprintln!("Receiver ended: {:?}", receiver.control().status());
+                    break;
+                }
                 Err(_) => eprintln!("Timeout waiting for notification"),
             }
         }

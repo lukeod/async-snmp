@@ -3,7 +3,6 @@
 //! This module contains the internal handlers for processing `SNMPv1`, v2c, and v3
 //! notification messages.
 
-#[cfg(test)]
 use std::net::SocketAddr;
 
 use bytes::Bytes;
@@ -25,21 +24,25 @@ use super::{
 };
 use crate::v3::DerivedKeys;
 
-impl super::NotificationReceiver {
+impl super::NotificationProcessor {
     #[cfg(test)]
     pub(super) async fn handle_v1(
         &self,
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<ReceivedNotification>> {
-        self.handle_v1_message(self.test_message(data, source, None))
-            .await
+        self.handle_v1_message(
+            self.test_message(data, source, None),
+            &mut super::NotificationAdmission::default(),
+        )
+        .await
     }
 
     /// Handle `SNMPv1` message.
     pub(super) async fn handle_v1_message(
         &self,
         message: crate::transport::ReceivedMessage,
+        admission: &mut super::NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
         let crate::transport::ReceivedMessage {
             bytes: data,
@@ -69,7 +72,7 @@ impl super::NotificationReceiver {
                     trap,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(info, &notification) {
+                if !self.inner.accepts(info, &notification, admission) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v1 trap");
                     return Ok(None);
                 }
@@ -104,13 +107,17 @@ impl super::NotificationReceiver {
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
-        self.handle_v2c_message(self.test_message(data, source, response_source))
-            .await
+        self.handle_v2c_message(
+            self.test_message(data, source, response_source),
+            &mut super::NotificationAdmission::default(),
+        )
+        .await
     }
 
     pub(super) async fn handle_v2c_message(
         &self,
         message: crate::transport::ReceivedMessage,
+        admission: &mut super::NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
         let crate::transport::ReceivedMessage {
             bytes: data,
@@ -149,7 +156,7 @@ impl super::NotificationReceiver {
                     request_id: pdu.request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(info, &notification) {
+                if !self.inner.accepts(info, &notification, admission) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c trap");
                     return Ok(None);
                 }
@@ -175,7 +182,7 @@ impl super::NotificationReceiver {
                     request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(info, &notification) {
+                if !self.inner.accepts(info, &notification, admission) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c Inform");
                     return Ok(None);
                 }
@@ -270,13 +277,17 @@ impl super::NotificationReceiver {
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
-        self.handle_v3_message(self.test_message(data, source, response_source))
-            .await
+        self.handle_v3_message(
+            self.test_message(data, source, response_source),
+            &mut super::NotificationAdmission::default(),
+        )
+        .await
     }
 
     pub(super) async fn handle_v3_message(
         &self,
         message: crate::transport::ReceivedMessage,
+        admission: &mut super::NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
         let crate::transport::ReceivedMessage {
             bytes: data,
@@ -385,7 +396,7 @@ impl super::NotificationReceiver {
                     request_id: pdu.request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(info, &notification) {
+                if !self.inner.accepts(info, &notification, admission) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
                     return Ok(None);
                 }
@@ -410,7 +421,7 @@ impl super::NotificationReceiver {
                     request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(info, &notification) {
+                if !self.inner.accepts(info, &notification, admission) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
                     return Ok(None);
                 }
@@ -438,6 +449,7 @@ impl super::NotificationReceiver {
                             |response_pdu| {
                                 build_v3_response(
                                     &self.inner,
+                                    source,
                                     route.limits.receive,
                                     global_data,
                                     usm_params,
@@ -495,6 +507,7 @@ impl super::NotificationReceiver {
 #[allow(clippy::too_many_arguments)]
 fn build_v3_response(
     inner: &ReceiverInner,
+    source: SocketAddr,
     receive_limits: crate::ReceiveLimits,
     incoming: &MsgGlobalData,
     incoming_usm: &UsmSecurityParams,
@@ -527,6 +540,6 @@ fn build_v3_response(
         derived_keys,
         inner.salt_counter.as_ref(),
         inner.des_salt_state.as_ref(),
-        inner.local_addr,
+        source,
     )
 }

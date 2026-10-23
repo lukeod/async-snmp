@@ -623,10 +623,12 @@ pub use message_size::{
 };
 pub use notification::{
     InformAckOutcome, Notification, NotificationAcceptance, NotificationAcceptanceError,
-    NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationEnvelope,
-    NotificationPduClass, NotificationReceiver, NotificationReceiverBuilder,
-    NotificationVarbindValidation, NotificationWireIdentity, ReceivedNotification,
-    V3NotificationWireIdentity, validate_notification_varbinds,
+    NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationControl,
+    NotificationEnvelope, NotificationHealth, NotificationPduClass, NotificationReceiver,
+    NotificationReceiverBuilder, NotificationRunner, NotificationStatus,
+    NotificationVarbindValidation, NotificationWireIdentity, PreparedNotificationReceiver,
+    ReceivedNotification, RunningNotificationReceiver, V3NotificationWireIdentity,
+    validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{

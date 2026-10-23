@@ -1166,7 +1166,7 @@ mod tests {
             |_| Ok::<(), std::convert::Infallible>(()),
         )
         .unwrap();
-        let receiver = crate::NotificationReceiver::builder()
+        let mut receiver = crate::NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .authoritative_engine(receiver_engine)
             .des_salt_state(receiver_des_state)
@@ -1180,7 +1180,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
         let receiver_addr = receiver.local_addr();

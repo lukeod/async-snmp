@@ -5,9 +5,42 @@
 //! - `TrapV2`/`SNMPv2-Trap` (SNMP v2c/v3 format)
 //! - `InformRequest` (confirmed notification, requires response)
 //!
+//! # Execution and delivery
+//!
+//! Preparation returns a single consumer and an owned runner. Drive the runner
+//! independently to receive and acknowledge notifications even while the consumer
+//! is unpolled:
+//!
+//! ```rust,no_run
+//! use async_snmp::NotificationReceiver;
+//! # async fn example() -> async_snmp::Result<()> {
+//! let (mut receiver, runner) = NotificationReceiver::builder()
+//!     .bind("127.0.0.1:1162").queue_capacity(256).prepare().await?.into_parts();
+//! let control = receiver.control();
+//! let task = tokio::spawn(runner.run());
+//! if let Some(notification) = receiver.recv().await {
+//!     println!("{} bytes", notification.receive_info.received_len());
+//! }
+//! control.request_shutdown();
+//! task.await.expect("notification task panicked")?;
+//! while receiver.recv().await.is_some() {}
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! `spawn()` and `spawn_on()` provide an owner retaining both the consumer and
+//! task. Their owner requests shutdown on drop. Delivery is bounded (256 events
+//! by default), with at most 64 concurrent protocol/response tasks and bounded
+//! UDP input. A full queue drops an Inform before acceptance and acknowledgement.
+//! `close()` stops notification admission and drains already admitted events;
+//! cancelling `recv()` leaves the event queue intact. Dropping the consumer or
+//! aborting the runner can lose volatile events, including acknowledged events.
+//! Acknowledgement is not a durability guarantee. Queue EOF does not report the
+//! runner's terminal result; join the runner or inspect its control status.
+//!
 //! # SNMPv1 and SNMPv2c
 //!
-//! Receive v1/v2c notifications. A receiver constructed with `bind` has no
+//! Receive v1/v2c notifications. A receiver constructed with `spawn` has no
 //! USM user table, so v3 notifications are rejected; see below for v3.
 //! V1/v2c community strings are carried in cleartext and provide no message
 //! integrity. With no configured community allowlist, the reported community
@@ -21,17 +54,15 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<async_snmp::Error>> {
-//!     let receiver = NotificationReceiver::bind("0.0.0.0:1162").await?;
+//!     let mut receiver = NotificationReceiver::spawn("0.0.0.0:1162").await?;
 //!
 //!     loop {
 //!         match receiver.recv().await {
-//!             Ok(received) => {
+//!             Some(received) => {
 //!                 println!("Received notification from {}: {:?}", received.receive_info.peer_addr(), received.notification);
 //!                 println!("Inform acknowledgement: {:?}", received.inform_ack);
 //!             }
-//!             Err(e) => {
-//!                 eprintln!("Error receiving notification: {}", e);
-//!             }
+//!             None => return receiver.join().await,
 //!         }
 //!     }
 //! }
@@ -42,7 +73,7 @@
 //! To receive V3 traps and `InformRequests`, configure USM credentials via
 //! the builder. Configured mechanisms are capabilities, so a keyed user also
 //! supports lower levels including `noAuthNoPriv`. Select an explicit
-//! acceptance policy before building. Only `authNoPriv` and `authPriv`
+//! acceptance policy before preparation. Only `authNoPriv` and `authPriv`
 //! authenticate the USM username, scoped context, and notification content;
 //! every such field in a `noAuthNoPriv` message is an unverified, spoofable
 //! claim.
@@ -57,7 +88,7 @@
 //! let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
 //!     Ok::<(), Infallible>(())
 //! })?;
-//! let receiver = NotificationReceiver::builder()
+//! let mut receiver = NotificationReceiver::builder()
 //!     .bind("0.0.0.0:1162")
 //!     .authoritative_engine(engine)
 //!     .usm_user("informuser", |u| {
@@ -75,7 +106,7 @@
 //!             NotificationAcceptance::Reject
 //!         }
 //!     })
-//!     .build()
+//!     .spawn()
 //!     .await?;
 //! # Ok(())
 //! # }
@@ -98,7 +129,7 @@
 //! let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
 //!     Ok::<(), Infallible>(())
 //! })?;
-//! let receiver = NotificationReceiver::builder()
+//! let mut receiver = NotificationReceiver::builder()
 //!     .bind("0.0.0.0:1162")
 //!     .authoritative_engine(engine)
 //!     .communities(["public", "monitor"]) // gates v1/v2c
@@ -118,7 +149,7 @@
 //!         }
 //!         Some(_) => NotificationAcceptance::Reject,
 //!     })
-//!     .build()
+//!     .spawn()
 //!     .await?;
 //! # Ok(())
 //! # }
@@ -187,7 +218,15 @@
 //! required.
 
 mod handlers;
+mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
 mod varbind;
+use lifecycle::{Delivery, NotificationAdmission, NotificationLease, RunnerCleanup};
+pub use lifecycle::{
+    NotificationControl, NotificationHealth, NotificationRunner, NotificationStatus,
+    PreparedNotificationReceiver, RunningNotificationReceiver,
+};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -198,14 +237,12 @@ use std::time::{Duration, Instant};
 use crate::Community;
 use bytes::Bytes;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex as AsyncMutex;
-use tracing::instrument;
+use tokio::sync::{mpsc, watch};
 
 use crate::error::{Error, Result};
 use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
-use crate::transport::udp_error::{UdpRecvErrorClass, classify_udp_recv_error};
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
 use crate::v3::process::RemoteEngineTable;
@@ -680,6 +717,10 @@ pub mod oids {
 /// [module docs](crate::notification#mixed-versions-on-one-port).
 pub struct NotificationReceiverBuilder {
     bind_addr: String,
+    bind_explicit: bool,
+    socket: Option<UdpSocket>,
+    queue_capacity: usize,
+    max_processing: usize,
     usm_users: HashMap<Bytes, UsmUser>,
     communities: Vec<Community>,
     authoritative_engine: Option<AuthoritativeEngine>,
@@ -704,6 +745,10 @@ impl NotificationReceiverBuilder {
     pub fn new() -> Self {
         Self {
             bind_addr: "0.0.0.0:162".to_string(),
+            bind_explicit: false,
+            socket: None,
+            queue_capacity: 256,
+            max_processing: 64,
             usm_users: HashMap::new(),
             communities: Vec::new(),
             authoritative_engine: None,
@@ -722,6 +767,28 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
+        self.bind_explicit = true;
+        self
+    }
+
+    /// Supply an owned bound, unconnected socket, retaining its options and runtime registration.
+    /// An explicit bind address conflicts with this source.
+    pub fn from_socket(mut self, socket: UdpSocket) -> Self {
+        self.socket = Some(socket);
+        self
+    }
+
+    /// Bound queued and admitted notifications. Default: 256 events. A full UDP
+    /// queue drops notifications before acceptance and Inform acknowledgement.
+    pub fn queue_capacity(mut self, capacity: usize) -> Self {
+        self.queue_capacity = capacity;
+        self
+    }
+
+    /// Bound concurrent protocol/response work. Default: 64 tasks. Inputs above
+    /// this bound are counted and dropped without blocking the UDP reader.
+    pub fn max_processing(mut self, limit: usize) -> Self {
+        self.max_processing = limit;
         self
     }
 
@@ -759,8 +826,8 @@ impl NotificationReceiverBuilder {
 
     /// Set the deadline for each Inform acknowledgement or SNMPv3 Report send.
     ///
-    /// The default is five seconds. Expiry releases the receiver's FIFO turn,
-    /// allowing the next cloned receiver to continue.
+    /// The default is five seconds. Expiry completes the admitted Inform with
+    /// a failed acknowledgement outcome while other processing can continue.
     #[must_use]
     pub fn response_send_timeout(mut self, timeout: Duration) -> Self {
         self.response_send_timeout = timeout;
@@ -830,7 +897,7 @@ impl NotificationReceiverBuilder {
     /// explicit [`acceptance_policy`](Self::acceptance_policy),
     /// [`try_acceptance_policy`](Self::try_acceptance_policy), or
     /// [`accept_all_notifications`](Self::accept_all_notifications) before
-    /// [`build`](Self::build), because this receiver is authoritative for V3
+    /// [`prepare`](Self::prepare), because this receiver is authoritative for V3
     /// Inform exchanges.
     ///
     /// # Example
@@ -845,7 +912,7 @@ impl NotificationReceiverBuilder {
     /// let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
     ///     Ok::<(), Infallible>(())
     /// })?;
-    /// let receiver = NotificationReceiver::builder()
+    /// let mut receiver = NotificationReceiver::builder()
     ///     .bind("0.0.0.0:162")
     ///     .authoritative_engine(engine)
     ///     .usm_user("trapuser", |u| {
@@ -863,7 +930,7 @@ impl NotificationReceiverBuilder {
     ///             NotificationAcceptance::Reject
     ///         }
     ///     })
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -904,10 +971,10 @@ impl NotificationReceiverBuilder {
     /// use async_snmp::notification::NotificationReceiver;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// let receiver = NotificationReceiver::builder()
+    /// let mut receiver = NotificationReceiver::builder()
     ///     .bind("0.0.0.0:162")
     ///     .community(b"public")
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -929,10 +996,10 @@ impl NotificationReceiverBuilder {
     /// use async_snmp::notification::NotificationReceiver;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// let receiver = NotificationReceiver::builder()
+    /// let mut receiver = NotificationReceiver::builder()
     ///     .bind("0.0.0.0:162")
     ///     .communities(["public", "monitor"])
-    ///     .build()
+    ///     .spawn()
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -993,22 +1060,38 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Build the notification receiver.
+    /// Prepare the notification receiver and its unstarted runner.
     ///
     /// Returns a configuration error when USM credentials are invalid, USM
     /// users do not have an explicit acceptance policy, or a USM user is
     /// configured without a persisted [`AuthoritativeEngine`]. Returns
     /// [`Error::RandomSource`] when a generated engine ID or required privacy
     /// salt cannot be initialized.
-    pub async fn build(self) -> Result<NotificationReceiver> {
-        self.build_with_engine_id_generator(crate::v3::generate_engine_id)
+    pub async fn prepare(self) -> Result<PreparedNotificationReceiver> {
+        self.prepare_with_engine_id_generator(crate::v3::generate_engine_id)
             .await
     }
 
-    async fn build_with_engine_id_generator(
+    async fn prepare_with_engine_id_generator(
         self,
         generate_engine_id: impl FnOnce() -> Result<Bytes>,
-    ) -> Result<NotificationReceiver> {
+    ) -> Result<PreparedNotificationReceiver> {
+        if self.queue_capacity == 0
+            || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || self.max_processing == 0
+            || self.max_processing > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "notification queue and processing limits must be nonzero and representable".into(),
+            )
+            .boxed());
+        }
+        if self.socket.is_some() && self.bind_explicit {
+            return Err(Error::Config(
+                "supplied notification socket conflicts with bind address".into(),
+            )
+            .boxed());
+        }
         if !self.usm_users.is_empty() && self.acceptance_policy.is_none() {
             return Err(Error::Config(
                 "a notification receiver with USM users requires an acceptance policy".into(),
@@ -1068,17 +1151,29 @@ impl NotificationReceiverBuilder {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
-        let socket = bind_udp_socket(bind_addr, None, None, false)
-            .await
-            .map_err(|e| Error::Network {
-                target: bind_addr,
-                source: e,
-            })?;
-
-        let local_addr = socket.local_addr().map_err(|e| Error::Network {
+        let socket = match self.socket {
+            Some(socket) => {
+                if socket.peer_addr().is_ok() {
+                    return Err(
+                        Error::Config("notification socket must be unconnected".into()).boxed(),
+                    );
+                }
+                socket
+            }
+            None => bind_udp_socket(bind_addr, None, None, false)
+                .await
+                .map_err(|source| Error::Network {
+                    target: bind_addr,
+                    source,
+                })?,
+        };
+        let local_addr = socket.local_addr().map_err(|source| Error::Network {
             target: bind_addr,
-            source: e,
+            source,
         })?;
+        if local_addr.port() == 0 {
+            return Err(Error::Config("notification socket must already be bound".into()).boxed());
+        }
 
         let PreparedAuthoritativeUsm {
             users: usm_users,
@@ -1087,44 +1182,82 @@ impl NotificationReceiverBuilder {
             engine_boots,
         } = validated_usm.prepare(generate_engine_id)?;
         let salt_counter = uses_aes.then(SaltCounter::new).transpose()?;
-        let udp_responder = UdpResponder::new(&socket);
+        let udp_responder = Arc::new(UdpResponder::new(&socket));
+        let socket = Arc::new(socket);
+        let endpoint_id = crate::EndpointId::new();
+        let (sender, events) = mpsc::channel(self.queue_capacity);
+        let delivery = Arc::new(Delivery::new(sender));
+        let (health, _) = watch::channel(NotificationHealth::Healthy);
+        let inner = Arc::new(ReceiverInner {
+            authoritative_engine,
+            #[cfg(test)]
+            socket: socket.clone(),
+            #[cfg(test)]
+            udp_responder: udp_responder.clone(),
+            #[cfg(test)]
+            endpoint_id,
+            delivery: delivery.clone(),
+            health,
+            usm_users,
+            communities: self.communities,
+            varbind_validation: self.varbind_validation,
+            engine_id,
+            salt_counter,
+            des_salt_state: self.des_salt_state,
+            authoritative_snapshot: AtomicU64::new(pack_boots_time((engine_boots, 0))),
+            engine_boots_base: engine_boots,
+            engine_start: Instant::now(),
+            usm_stats: UsmStats::default(),
+            remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
+            max_message_size: self.max_message_size,
+            decode_config: self.decode_config,
+            snmp_silent_drops: AtomicU32::new(0),
+            acceptance_policy: self.acceptance_policy,
+            response_send_timeout: self.response_send_timeout,
+            #[cfg(test)]
+            response_send_gate: Mutex::new(None),
+            #[cfg(test)]
+            response_sends_started: AtomicU32::new(0),
+            #[cfg(test)]
+            response_send_errors: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            response_construction_errors: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            receive_errors: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            receive_error_ready: tokio::sync::Notify::new(),
+        });
+        let state = Arc::new(lifecycle::ServiceState::new());
+        let lease = Arc::new(NotificationLease::new(state.shutdown.clone()));
+        let receiver = NotificationReceiver {
+            local_addr,
+            inner: inner.clone(),
+            events,
+            state: state.clone(),
+            lease,
+        };
+        let runner = NotificationRunner::new(
+            socket,
+            udp_responder,
+            endpoint_id,
+            local_addr,
+            NotificationProcessor { inner },
+            self.max_processing,
+            RunnerCleanup { delivery, state },
+        );
+        Ok(PreparedNotificationReceiver { receiver, runner })
+    }
+    /// Prepare and spawn the same runner on the current runtime.
+    pub async fn spawn(self) -> Result<RunningNotificationReceiver> {
+        Ok(self.prepare().await?.spawn())
+    }
 
-        Ok(NotificationReceiver {
-            inner: Arc::new(ReceiverInner {
-                authoritative_engine,
-                socket: Arc::new(socket),
-                udp_responder: Arc::new(udp_responder),
-                endpoint_id: crate::EndpointId::new(),
-                local_addr,
-                usm_users,
-                communities: self.communities,
-                varbind_validation: self.varbind_validation,
-                engine_id,
-                salt_counter,
-                des_salt_state: self.des_salt_state,
-                authoritative_snapshot: AtomicU64::new(pack_boots_time((engine_boots, 0))),
-                engine_boots_base: engine_boots,
-                engine_start: Instant::now(),
-                usm_stats: UsmStats::default(),
-                remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
-                max_message_size: self.max_message_size,
-                decode_config: self.decode_config,
-                snmp_silent_drops: AtomicU32::new(0),
-                acceptance_policy: self.acceptance_policy,
-                response_send_timeout: self.response_send_timeout,
-                #[cfg(test)]
-                response_send_gate: Mutex::new(None),
-                #[cfg(test)]
-                response_sends_started: AtomicU32::new(0),
-                #[cfg(test)]
-                response_send_errors: Mutex::new(std::collections::VecDeque::new()),
-                #[cfg(test)]
-                response_construction_errors: Mutex::new(std::collections::VecDeque::new()),
-                #[cfg(test)]
-                receive_errors: Mutex::new(std::collections::VecDeque::new()),
-                recv_gate: AsyncMutex::new(vec![0; crate::UDP_RECEIVE_BUFFER_SIZE]),
-            }),
-        })
+    /// Prepare and spawn without moving a supplied socket's I/O registration.
+    pub async fn spawn_on(
+        self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<RunningNotificationReceiver> {
+        Ok(self.prepare().await?.spawn_on(runtime))
     }
 }
 
@@ -1372,7 +1505,7 @@ impl Notification {
 /// let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
 ///     Ok::<(), Infallible>(())
 /// })?;
-/// let receiver = NotificationReceiver::builder()
+/// let mut receiver = NotificationReceiver::builder()
 ///     .bind("0.0.0.0:162")
 ///     .authoritative_engine(engine)
 ///     .usm_user("trapuser", |u| {
@@ -1385,21 +1518,35 @@ impl Notification {
 ///             NotificationAcceptance::Reject
 ///         }
 ///     })
-///     .build()
+///     .spawn()
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct NotificationReceiver {
+    local_addr: SocketAddr,
+    inner: Arc<ReceiverInner>,
+    events: mpsc::Receiver<ReceivedNotification>,
+    state: Arc<lifecycle::ServiceState>,
+    lease: Arc<NotificationLease>,
+}
+
+/// Application protocol state, independent of socket and public lifetime ownership.
+#[derive(Clone)]
+pub(crate) struct NotificationProcessor {
     inner: Arc<ReceiverInner>,
 }
 
 struct ReceiverInner {
     authoritative_engine: Option<AuthoritativeEngine>,
+    #[cfg(test)]
     socket: Arc<UdpSocket>,
+    #[cfg(test)]
     udp_responder: Arc<UdpResponder>,
+    #[cfg(test)]
     endpoint_id: crate::EndpointId,
-    local_addr: SocketAddr,
+    delivery: Arc<Delivery>,
+    health: watch::Sender<NotificationHealth>,
     /// Configured USM users for V3 authentication
     usm_users: HashMap<Bytes, UsmUser>,
     /// Accepted v1/v2c community strings. Empty means accept any community
@@ -1446,8 +1593,8 @@ struct ReceiverInner {
     response_construction_errors: Mutex<std::collections::VecDeque<Box<Error>>>,
     #[cfg(test)]
     receive_errors: Mutex<std::collections::VecDeque<std::io::Error>>,
-    /// Fairly serializes cloned `recv` calls and retains their shared UDP buffer.
-    recv_gate: AsyncMutex<Vec<u8>>,
+    #[cfg(test)]
+    receive_error_ready: tokio::sync::Notify,
 }
 
 impl ReceiverInner {
@@ -1455,7 +1602,11 @@ impl ReceiverInner {
         &self,
         receive_info: crate::ReceivedMessageInfo,
         notification: &Notification,
+        admission: &mut NotificationAdmission,
     ) -> bool {
+        if !admission.reserve(&self.delivery) {
+            return false;
+        }
         let Some(policy) = &self.acceptance_policy else {
             return true;
         };
@@ -1487,8 +1638,40 @@ impl ReceiverInner {
                     total_secs,
                 ))
             }
-        }?;
-        Ok(self.publish_authoritative_boots_time(pair))
+        };
+        match pair {
+            Ok(pair) => {
+                self.health.send_if_modified(|health| {
+                    if *health == NotificationHealth::Healthy {
+                        false
+                    } else {
+                        *health = NotificationHealth::Healthy;
+                        true
+                    }
+                });
+                Ok(self.publish_authoritative_boots_time(pair))
+            }
+            Err(error) => {
+                if let Some(persistence) = error.authoritative_engine_persistence() {
+                    self.health.send_modify(|health| {
+                        let consecutive_failures = match *health {
+                            NotificationHealth::AuthoritativePersistenceDegraded {
+                                consecutive_failures,
+                                ..
+                            } => consecutive_failures.saturating_add(1),
+                            NotificationHealth::Healthy => 1,
+                        };
+                        *health = NotificationHealth::AuthoritativePersistenceDegraded {
+                            consecutive_failures,
+                            operation: persistence.operation(),
+                            previous_engine_boots: persistence.previous_engine_boots(),
+                            attempted_engine_boots: persistence.attempted_engine_boots(),
+                        };
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     fn publish_authoritative_boots_time(&self, pair: (u32, u32)) -> (u32, u32) {
@@ -1555,10 +1738,10 @@ impl NotificationReceiver {
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
     /// // Bind to the standard trap port (requires root/admin on most systems)
-    /// let receiver = NotificationReceiver::bind("0.0.0.0:162").await?;
+    /// let mut receiver = NotificationReceiver::spawn("0.0.0.0:162").await?;
     ///
     /// // Or use an unprivileged port for testing
-    /// let receiver = NotificationReceiver::bind("0.0.0.0:1162").await?;
+    /// let mut receiver = NotificationReceiver::spawn("0.0.0.0:1162").await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1568,25 +1751,25 @@ impl NotificationReceiver {
     /// Returns an error when the address is invalid, the socket cannot be
     /// created, or the operating system cannot provide randomness for the
     /// receiver's engine ID.
-    pub async fn bind(addr: impl AsRef<str>) -> Result<Self> {
-        Self::builder().bind(addr.as_ref()).build().await
+    pub async fn spawn(addr: impl AsRef<str>) -> Result<RunningNotificationReceiver> {
+        Self::builder().bind(addr.as_ref()).spawn().await
     }
 
     #[cfg(test)]
     async fn bind_with_engine_id_generator(
         addr: impl AsRef<str>,
         generate_engine_id: impl FnOnce() -> Result<Bytes>,
-    ) -> Result<Self> {
+    ) -> Result<PreparedNotificationReceiver> {
         Self::builder()
             .bind(addr.as_ref())
-            .build_with_engine_id_generator(generate_engine_id)
+            .prepare_with_engine_id_generator(generate_engine_id)
             .await
     }
 
     /// Returns the local address that this receiver is bound to.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr
+        self.local_addr
     }
 
     /// Return the configured notification decode configuration.
@@ -1667,127 +1850,21 @@ impl NotificationReceiver {
             .decryption_errors
             .load(Ordering::Relaxed)
     }
+}
 
-    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<ReceivedDatagram> {
-        #[cfg(test)]
-        if let Some(error) = self.inner.receive_errors.lock().unwrap().pop_front() {
-            return Err(error);
-        }
-        self.inner.udp_responder.recv(&self.inner.socket, buf).await
-    }
-
-    /// Receive a notification.
-    ///
-    /// Waits until a notification passes protocol processing,
-    /// prefix validation, and the application acceptance policy. Policy
-    /// rejection, error, or panic drops the notification and withholds an
-    /// Inform response while this method continues waiting.
-    ///
-    /// For an accepted `InformRequest`, the receiver finalizes and attempts a
-    /// Response-PDU before returning. The local result is reported through
-    /// [`ReceivedNotification::inform_ack`]; even [`InformAckOutcome::Sent`]
-    /// does not prove that the originator received the response. Response
-    /// construction, persistence, crypto, send timeout, and other send errors
-    /// after acceptance are delivered as [`InformAckOutcome::Failed`].
-    /// Persistence failure before application acceptance is returned directly
-    /// from this method as [`Error::AuthoritativeEnginePersistence`].
-    ///
-    /// V1/v2c community and content are cleartext and unverified unless a
-    /// community allowlist was configured. Even an allowlist match provides no
-    /// cryptographic integrity. V3 username, context, and content are
-    /// authenticated only at [`SecurityLevel::AuthNoPriv`] or
-    /// [`SecurityLevel::AuthPriv`] and remain spoofable at
-    /// [`SecurityLevel::NoAuthNoPriv`].
-    ///
-    /// Clones share the socket and one fixed receive buffer; cloning does not
-    /// allocate another UDP-sized buffer. Concurrent calls are queued in FIFO
-    /// order. The active call retains its queue position while it skips
-    /// malformed, rejected, or non-notification datagrams. Cancelling a queued
-    /// or active call releases its position and leaves the shared buffer ready
-    /// for the next waiter. Dropping this future before it returns does not
-    /// guarantee delivery of a datagram whose processing had begun; acceptance
-    /// callbacks must therefore remain side-effect-free. The receiver does not
-    /// retain an internal delivery queue across this cancellation boundary.
-    ///
-    /// Returns the owning notification, source/wire identity, and Inform
-    /// acknowledgement outcome.
-    #[instrument(skip(self), err, fields(snmp.local_addr = %self.local_addr()))]
-    pub async fn recv(&self) -> Result<ReceivedNotification> {
-        // Tokio's mutex queues callers in FIFO order. Keeping the guard while
-        // malformed/non-notification datagrams are skipped prevents a later
-        // cloned receiver from overtaking the earlier call.
-        let mut buf = self.inner.recv_gate.lock().await;
-
-        loop {
-            let received = match self.recv_packet(buf.as_mut_slice()).await {
-                Ok(received) => received,
-                Err(error) => match classify_udp_recv_error(&error) {
-                    UdpRecvErrorClass::DatagramLocal => {
-                        tracing::warn!(target: "async_snmp::notification", %error, "discarding datagram with invalid receive metadata");
-                        continue;
-                    }
-                    UdpRecvErrorClass::Transient => {
-                        tracing::warn!(target: "async_snmp::notification", %error, "returning transient UDP receive error to caller");
-                        return Err(Error::Network {
-                            target: self.inner.local_addr,
-                            source: error,
-                        }
-                        .boxed());
-                    }
-                    UdpRecvErrorClass::Fatal => {
-                        tracing::error!(target: "async_snmp::notification", %error, "returning fatal UDP receive error to caller");
-                        return Err(Error::Network {
-                            target: self.inner.local_addr,
-                            source: error,
-                        }
-                        .boxed());
-                    }
-                },
-            };
-            let received_at = tokio::time::Instant::now();
-            let source = received.source;
-            if received.len > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
-                tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, received_size = received.len, advertised_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
-            }
-            let data = Bytes::copy_from_slice(&buf[..received.len]);
-
-            let message = crate::transport::ReceivedMessage::udp(
-                data,
-                self.inner.endpoint_id,
-                self.inner.socket.clone(),
-                self.inner.udp_responder.clone(),
-                received,
-                received_at,
-                crate::transport::EndpointLimits::UDP,
-            );
-            match self.parse_and_respond(message).await {
-                Ok(Some(notification)) => return Ok(notification),
-                Ok(None) => {} // Not a notification PDU, ignore
-                Err(e) if e.kind() == crate::ErrorKind::AuthoritativeEnginePersistence => {
-                    // Shared local authoritative state prevented this datagram
-                    // from reaching application acceptance. Return the typed
-                    // failure instead of hiding it in the receive loop.
-                    return Err(e);
-                }
-                Err(e) => {
-                    // Log parsing error but continue receiving
-                    tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to parse notification");
-                }
-            }
-        }
-    }
-
+impl NotificationProcessor {
     /// Parse received data and send response if needed.
     ///
     /// Returns `None` if the message is not a notification PDU.
     async fn parse_and_respond(
         &self,
         message: crate::transport::ReceivedMessage,
+        admission: &mut NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
         match crate::message::peek_version(message.bytes.clone(), message.info.peer_addr())? {
-            Version::V1 => self.handle_v1_message(message).await,
-            Version::V2c => self.handle_v2c_message(message).await,
-            Version::V3 => self.handle_v3_message(message).await,
+            Version::V1 => self.handle_v1_message(message, admission).await,
+            Version::V2c => self.handle_v2c_message(message, admission).await,
+            Version::V3 => self.handle_v3_message(message, admission).await,
         }
     }
 
@@ -1853,14 +1930,6 @@ impl NotificationReceiver {
     }
 }
 
-impl Clone for NotificationReceiver {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
@@ -1872,7 +1941,7 @@ mod tests {
         let error = NotificationReceiver::builder()
             .bind("not a socket address")
             .response_send_timeout(Duration::MAX)
-            .build()
+            .spawn()
             .await
             .err()
             .expect("invalid timeout must fail");
@@ -1884,7 +1953,7 @@ mod tests {
 
     #[tokio::test]
     async fn decoding_policy_defaults_strict_preset_and_targeted_override() {
-        let default = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let default = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
         assert_eq!(default.decode_config(), crate::DecodeConfig::DEFAULT);
 
         let mut targeted = crate::DecodeConfig::STRICT;
@@ -1892,7 +1961,7 @@ mod tests {
         let configured = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .decode_config(targeted)
-            .build()
+            .spawn()
             .await
             .unwrap();
         assert_eq!(configured.decode_config(), targeted);
@@ -1998,10 +2067,10 @@ mod tests {
     async fn convenience_bind_matches_default_builder_configuration() {
         let built = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
-            .build()
+            .spawn()
             .await
             .unwrap();
-        let bound = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let bound = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
 
         for receiver in [&bound, &built] {
             assert!(receiver.inner.authoritative_engine.is_none());
@@ -2026,10 +2095,6 @@ mod tests {
                 receiver.inner.socket.local_addr().unwrap(),
                 receiver.local_addr()
             );
-
-            let receive_buffer = receiver.inner.recv_gate.lock().await;
-            assert_eq!(receive_buffer.len(), crate::UDP_RECEIVE_BUFFER_SIZE);
-            assert!(receive_buffer.capacity() >= crate::UDP_RECEIVE_BUFFER_SIZE);
         }
 
         assert_ne!(bound.engine_id(), built.engine_id());
@@ -2067,7 +2132,7 @@ mod tests {
         .expect("invalid convenience bind must fail");
         let built_error = NotificationReceiver::builder()
             .bind("not a socket address")
-            .build_with_engine_id_generator(unavailable_engine_id)
+            .prepare_with_engine_id_generator(unavailable_engine_id)
             .await
             .err()
             .expect("invalid builder bind must fail");
@@ -2089,7 +2154,7 @@ mod tests {
         .expect("occupied convenience bind must fail");
         let built_error = NotificationReceiver::builder()
             .bind(occupied_addr.to_string())
-            .build_with_engine_id_generator(unavailable_engine_id)
+            .prepare_with_engine_id_generator(unavailable_engine_id)
             .await
             .err()
             .expect("occupied builder bind must fail");
@@ -2111,7 +2176,7 @@ mod tests {
 
         let built_error = NotificationReceiver::builder()
             .bind(addr.to_string())
-            .build_with_engine_id_generator(unavailable_engine_id)
+            .prepare_with_engine_id_generator(unavailable_engine_id)
             .await
             .err()
             .expect("builder entropy failure must fail");
@@ -2136,11 +2201,11 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(configured_engine_id.to_vec())
-            .build_with_engine_id_generator(|| panic!("engine ID generator must not be called"))
+            .prepare_with_engine_id_generator(|| panic!("engine ID generator must not be called"))
             .await
             .unwrap();
 
-        assert_eq!(receiver.engine_id(), configured_engine_id);
+        assert_eq!(receiver.receiver.engine_id(), configured_engine_id);
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
@@ -2168,7 +2233,7 @@ mod tests {
             .usm_user("user", Ok)
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await;
 
         let err = result.err().expect("expected build to fail");
@@ -2185,7 +2250,7 @@ mod tests {
             .bind("not a socket address")
             .usm_user("user", Ok)
             .unwrap()
-            .build()
+            .spawn()
             .await;
         let error = result.err().expect("missing receiver policy must fail");
         assert!(matches!(
@@ -2201,7 +2266,7 @@ mod tests {
             .usm_user("", Ok)
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await;
 
         let err = result.err().expect("expected build to fail");
@@ -2219,7 +2284,7 @@ mod tests {
         let result = NotificationReceiver::builder()
             .bind("not a socket address")
             .authoritative_engine(engine)
-            .build()
+            .spawn()
             .await;
 
         let err = result.err().expect("expected build to fail");
@@ -2255,16 +2320,16 @@ mod tests {
             }
         })
         .unwrap();
-        let mut receiver = NotificationReceiver::builder()
+        let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .authoritative_engine(engine)
-            .build()
+            .spawn()
             .await
             .unwrap();
-        Arc::get_mut(&mut receiver.inner)
-            .unwrap()
+        receiver
+            .inner
             .authoritative_engine
-            .as_mut()
+            .as_ref()
             .unwrap()
             .set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
 
@@ -2288,7 +2353,7 @@ mod tests {
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
-    async fn recv_returns_pre_acceptance_persistence_failure() {
+    async fn runner_reports_pre_acceptance_persistence_degradation() {
         let engine_id = Bytes::from_static(b"local-persist-engine");
         let calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = Arc::clone(&calls);
@@ -2300,7 +2365,7 @@ mod tests {
             }
         })
         .unwrap();
-        let receiver = NotificationReceiver::builder()
+        let mut receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .authoritative_engine(engine.clone())
             .usm_user("informuser", |user| {
@@ -2308,7 +2373,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
@@ -2328,11 +2393,24 @@ mod tests {
             .await
             .unwrap();
 
-        let error = receiver.recv().await.unwrap_err();
-        assert_eq!(
-            error.kind(),
-            crate::ErrorKind::AuthoritativeEnginePersistence
+        let mut health = receiver.control().subscribe_health();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *health.borrow_and_update() == NotificationHealth::Healthy {
+                health.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            receiver.control().health(),
+            NotificationHealth::AuthoritativePersistenceDegraded { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
         );
+        assert_eq!(receiver.control().status(), NotificationStatus::Running);
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
@@ -2359,7 +2437,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
@@ -2411,7 +2489,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .authoritative_engine(engine)
-            .build()
+            .spawn()
             .await
             .unwrap();
         let cycle = u64::from(crate::v3::MAX_ENGINE_TIME) + 1;
@@ -2759,7 +2837,7 @@ mod tests {
     /// Build an authenticated V3 `InformRequest` message with the given
     /// `engine_boots` and `engine_time` in the USM parameters.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn build_authed_v3_inform(
+    pub(super) fn build_authed_v3_inform(
         engine_id: &[u8],
         engine_boots: u32,
         engine_time: u32,
@@ -2780,7 +2858,11 @@ mod tests {
     /// Build an authenticated V3 `SNMPv2-Trap` message with the given
     /// `engine_boots` and `engine_time` in the USM parameters.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn build_authed_v3_trap(engine_id: &[u8], engine_boots: u32, engine_time: u32) -> Bytes {
+    pub(super) fn build_authed_v3_trap(
+        engine_id: &[u8],
+        engine_boots: u32,
+        engine_time: u32,
+    ) -> Bytes {
         build_v3_notification(
             crate::pdu::PduType::TrapV2,
             engine_id,
@@ -2800,7 +2882,7 @@ mod tests {
     /// Build a receiver with its own engine ID and a `trapuser` configured,
     /// for tests exercising traps sent under a remote sender's engine ID.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    async fn remote_trap_receiver() -> NotificationReceiver {
+    async fn remote_trap_receiver() -> RunningNotificationReceiver {
         NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"my-receiver-engine".to_vec())
@@ -2810,7 +2892,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap()
     }
@@ -2896,7 +2978,7 @@ mod tests {
                     NotificationAcceptance::Reject
                 }
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let message = build_noauth_v3_trap(b"remote-sender-engine", b"trapuser");
@@ -2929,7 +3011,7 @@ mod tests {
                     NotificationAcceptance::Reject
                 }
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3136,7 +3218,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3172,7 +3254,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3208,7 +3290,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3314,7 +3396,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"test-discovery-engine".to_vec())
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3375,13 +3457,11 @@ mod tests {
         use crate::message::V3Message;
         use crate::v3::UsmSecurityParams;
 
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
         let destination = receiver.local_addr();
         let engine_id = Bytes::copy_from_slice(receiver.engine_id());
         crate::v3::validate_engine_id(&engine_id).unwrap();
 
-        let receive_receiver = receiver.clone();
-        let receive_task = tokio::spawn(async move { receive_receiver.recv().await });
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         client.send_to(&[0x30, 0], destination).await.unwrap();
@@ -3458,8 +3538,7 @@ mod tests {
         );
         assert_eq!(receiver.usm_unknown_usernames(), 1);
 
-        receive_task.abort();
-        let _ = receive_task.await;
+        receiver.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3467,7 +3546,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"test-discovery-engine".to_vec())
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3501,7 +3580,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3539,7 +3618,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3582,7 +3661,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3658,7 +3737,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3806,7 +3885,7 @@ mod tests {
                     NotificationAcceptance::Accept
                 })
                 .max_message_size(candidate_len - 1)
-                .build()
+                .spawn()
                 .await
                 .unwrap();
             let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3861,7 +3940,7 @@ mod tests {
                 .unwrap()
                 .accept_all_notifications()
                 .max_message_size(1)
-                .build()
+                .spawn()
                 .await
                 .unwrap();
             let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3911,7 +3990,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -3979,8 +4058,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_generates_engine_id() {
-        let first = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
-        let second = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let first = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
+        let second = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
 
         crate::v3::validate_engine_id(first.engine_id()).unwrap();
         crate::v3::validate_engine_id(second.engine_id()).unwrap();
@@ -3992,7 +4071,7 @@ mod tests {
     async fn test_builder_generates_engine_id() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
-            .build()
+            .spawn()
             .await
             .unwrap();
         assert_eq!(receiver.engine_id().len(), 17);
@@ -4004,7 +4083,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"custom-engine".to_vec())
-            .build()
+            .spawn()
             .await
             .unwrap();
         assert_eq!(receiver.engine_id(), b"custom-engine");
@@ -4041,7 +4120,7 @@ mod tests {
                 policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
                 NotificationAcceptance::Accept
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -4093,7 +4172,7 @@ mod tests {
             .usm_user("plainuser", Ok)
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -4126,7 +4205,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -4283,7 +4362,7 @@ mod tests {
                 policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
                 NotificationAcceptance::Accept
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -4337,7 +4416,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -4419,7 +4498,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -4486,7 +4565,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -4600,11 +4679,11 @@ mod tests {
         }
     }
 
-    fn build_v2c_trap(community: &[u8]) -> Bytes {
+    pub(super) fn build_v2c_trap(community: &[u8]) -> Bytes {
         build_v2c_trap_with_request_id(community, 1)
     }
 
-    fn build_v2c_trap_with_request_id(community: &[u8], request_id: i32) -> Bytes {
+    pub(super) fn build_v2c_trap_with_request_id(community: &[u8], request_id: i32) -> Bytes {
         use crate::message::CommunityMessage;
         use crate::pdu::Pdu;
         let pdu = Pdu::trap_v2(request_id, 100, &oids::cold_start(), vec![]);
@@ -4614,12 +4693,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn receive_buffer_identity(receiver: &NotificationReceiver) -> (usize, usize, usize) {
-        let buffer = receiver.inner.recv_gate.lock().await;
-        (buffer.as_ptr() as usize, buffer.len(), buffer.capacity())
-    }
-
-    fn build_v2c_inform(community: &[u8]) -> Bytes {
+    pub(super) fn build_v2c_inform(community: &[u8]) -> Bytes {
         use crate::message::CommunityMessage;
         use crate::pdu::Pdu;
         let pdu = Pdu::inform_request(1, 100, &oids::cold_start(), vec![]);
@@ -4718,7 +4792,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -4740,13 +4814,13 @@ mod tests {
     async fn received_metadata_preserves_complete_datagrams_and_policy_identity() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let policy_observed = observed.clone();
-        let receiver = NotificationReceiver::builder()
+        let mut receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .acceptance_policy(move |envelope: &NotificationEnvelope<'_>| {
                 policy_observed.lock().unwrap().push(envelope.receive_info);
                 NotificationAcceptance::Accept
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -4790,7 +4864,7 @@ mod tests {
                 *policy_observed.lock().unwrap() = notification.decode_anomalies.to_vec();
                 NotificationAcceptance::Accept
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -4821,7 +4895,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .decode_config(crate::DecodeConfig::STRICT)
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source = "127.0.0.1:9999".parse().unwrap();
@@ -4846,7 +4920,7 @@ mod tests {
             let strict = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .decode_config(crate::DecodeConfig::STRICT)
-                .build()
+                .spawn()
                 .await
                 .unwrap();
             let packet = build_notification_with_malformed_integer(version);
@@ -4862,7 +4936,7 @@ mod tests {
             let receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .decode_config(targeted)
-                .build()
+                .spawn()
                 .await
                 .unwrap();
             let packet = build_notification_with_malformed_integer(version);
@@ -4901,13 +4975,13 @@ mod tests {
                 crate::UDP_RECEIVE_LIMITS.advertised(),
             );
             let config = inform_user(level, &username);
-            let receiver = NotificationReceiver::builder()
+            let mut receiver = NotificationReceiver::builder()
                 .bind("127.0.0.1:0")
                 .authoritative_engine(AuthoritativeEngine::for_test(engine_id.clone(), 1))
                 .usm_user(username.clone(), move |_| Ok(config))
                 .unwrap()
                 .accept_all_notifications()
-                .build()
+                .spawn()
                 .await
                 .unwrap();
             let source_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -4961,7 +5035,7 @@ mod tests {
                 .unwrap()
                 .accept_all_notifications()
                 .decode_config(crate::DecodeConfig::STRICT)
-                .build()
+                .spawn()
                 .await
                 .unwrap();
             let mut message = message.to_vec();
@@ -4978,7 +5052,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -4992,7 +5066,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_v2c_trap_no_allowlist_accepts_any_community() {
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         let result = receiver
@@ -5013,7 +5087,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .build()
+            .spawn()
             .await
             .unwrap();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -5065,7 +5139,7 @@ mod tests {
                 ));
                 NotificationAcceptance::Accept
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -5094,7 +5168,7 @@ mod tests {
                 policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
                 NotificationAcceptance::Accept
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -5148,7 +5222,7 @@ mod tests {
                     NotificationAcceptance::Accept
                 }
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -5178,7 +5252,7 @@ mod tests {
                     "policy backend unavailable",
                 ))
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -5204,7 +5278,7 @@ mod tests {
     async fn acceptance_policy_panic_rejects_inform_and_recv_continues_to_next_datagram() {
         let calls = Arc::new(AtomicU32::new(0));
         let calls_for_receiver = Arc::clone(&calls);
-        let receiver = NotificationReceiver::builder()
+        let mut receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .acceptance_policy(move |_: &NotificationEnvelope<'_>| {
                 if calls_for_receiver.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -5212,7 +5286,7 @@ mod tests {
                 }
                 NotificationAcceptance::Accept
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let receiver_addr = receiver.local_addr();
@@ -5261,7 +5335,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .build()
+            .spawn()
             .await
             .unwrap();
 
@@ -5305,7 +5379,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_accepted_inform_datagram_is_returned_exactly_once() {
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let message = build_v2c_inform(b"public");
 
@@ -5343,70 +5417,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_timeout_releases_fifo_turn_for_cloned_receiver() {
-        let receiver = NotificationReceiver::builder()
-            .bind("127.0.0.1:0")
-            .response_send_timeout(Duration::from_millis(20))
-            .build()
-            .await
-            .unwrap();
-        *receiver.inner.response_send_gate.lock().unwrap() =
-            Some(Arc::new(tokio::sync::Semaphore::new(0)));
-        let first_receiver = receiver.clone();
-        let second_receiver = receiver.clone();
-        let first = tokio::spawn(async move { first_receiver.recv().await });
-        let second = tokio::spawn(async move { second_receiver.recv().await });
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        sender
-            .send_to(&build_v2c_inform(b"public"), receiver.local_addr())
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while receiver
-                .inner
-                .response_sends_started
-                .load(Ordering::Relaxed)
-                == 0
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        sender
-            .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
-            .await
-            .unwrap();
-
-        let first_received = tokio::time::timeout(Duration::from_secs(1), first)
-            .await
-            .expect("first receiver did not release its FIFO turn")
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            first_received.inform_ack,
-            Some(InformAckOutcome::Failed(error))
-                if matches!(&*error, Error::Network { source, .. }
-                    if source.kind() == std::io::ErrorKind::TimedOut)
-        ));
-        let received = tokio::time::timeout(Duration::from_secs(1), second)
-            .await
-            .expect("second receiver remained blocked after response timeout")
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            received.notification,
-            Notification::TrapV2c { .. }
-        ));
-    }
-
-    #[tokio::test]
     async fn zero_response_timeout_emits_no_inform_acknowledgement() {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .response_send_timeout(Duration::ZERO)
-            .build()
+            .spawn()
             .await
             .unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -5433,7 +5448,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_v2c_inform_reports_construction_and_non_timeout_send_failures() {
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
         receiver
             .inner
             .response_construction_errors
@@ -5485,7 +5500,7 @@ mod tests {
                 } else {
                     Duration::from_secs(1)
                 })
-                .build()
+                .spawn()
                 .await
                 .unwrap();
             if failure == "construction" {
@@ -5537,7 +5552,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .max_message_size(80)
-            .build()
+            .spawn()
             .await
             .unwrap();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -5575,7 +5590,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .max_message_size(1)
-            .build()
+            .spawn()
             .await
             .unwrap();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -5608,48 +5623,10 @@ mod tests {
         assert_eq!(receiver.snmp_silent_drops(), 1);
     }
 
-    #[tokio::test]
-    async fn notification_receive_error_policy_discards_datagram_local_and_returns_socket_errors() {
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
-        receiver
-            .inner
-            .receive_errors
-            .lock()
-            .unwrap()
-            .push_back(std::io::Error::from(std::io::ErrorKind::InvalidData));
-        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client
-            .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
-            .await
-            .unwrap();
-        let received = receiver.recv().await.unwrap();
-        assert!(matches!(
-            received.notification,
-            Notification::TrapV2c { .. }
-        ));
-
-        for kind in [
-            std::io::ErrorKind::ConnectionRefused,
-            std::io::ErrorKind::InvalidInput,
-        ] {
-            receiver
-                .inner
-                .receive_errors
-                .lock()
-                .unwrap()
-                .push_back(std::io::Error::from(kind));
-            let error = receiver.recv().await.unwrap_err();
-            assert!(matches!(
-                &*error,
-                Error::Network { source, .. } if source.kind() == kind
-            ));
-        }
-    }
-
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn wildcard_ipv4_inform_reply_uses_received_destination_as_source() {
-        let receiver = NotificationReceiver::bind("0.0.0.0:0").await.unwrap();
+        let mut receiver = NotificationReceiver::spawn("0.0.0.0:0").await.unwrap();
         let destination = SocketAddr::from(([127, 0, 0, 2], receiver.local_addr().port()));
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -5693,12 +5670,9 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn receive_buffer_reuses_capacity_at_udp_boundaries() {
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
+        let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
         let destination = receiver.local_addr();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let initial = receive_buffer_identity(&receiver).await;
-        assert_eq!(initial.1, crate::UDP_RECEIVE_BUFFER_SIZE);
-        assert!(initial.2 >= crate::UDP_RECEIVE_BUFFER_SIZE);
 
         let mut maximum_datagram = build_v2c_trap_with_request_id(b"public", 70).to_vec();
         let message_len = maximum_datagram.len();
@@ -5733,7 +5707,6 @@ mod tests {
             }],
             "the maximum legal IPv4 UDP payload must not be truncated"
         );
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
 
         client
             .send_to(&build_v2c_trap_with_request_id(b"public", 71), destination)
@@ -5744,7 +5717,6 @@ mod tests {
             received.notification,
             Notification::TrapV2c { request_id: 71, .. }
         ));
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5752,12 +5724,9 @@ mod tests {
     async fn receive_buffer_accepts_maximum_native_ipv6_udp_payload() {
         const IPV6_MAX_UDP_PAYLOAD: usize = 65_527;
 
-        let receiver = NotificationReceiver::bind("[::1]:0").await.unwrap();
+        let mut receiver = NotificationReceiver::spawn("[::1]:0").await.unwrap();
         let destination = receiver.local_addr();
         let client = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
-        let initial = receive_buffer_identity(&receiver).await;
-        assert_eq!(initial.1, crate::UDP_RECEIVE_BUFFER_SIZE);
-        assert!(initial.2 >= crate::UDP_RECEIVE_BUFFER_SIZE);
 
         let mut maximum_datagram = build_v2c_trap_with_request_id(b"public", 72).to_vec();
         let message_len = maximum_datagram.len();
@@ -5791,12 +5760,11 @@ mod tests {
             }],
             "the maximum legal native IPv6 UDP payload must not be truncated"
         );
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
     }
 
     #[tokio::test]
     async fn receive_buffer_survives_skipped_datagrams_policy_errors_and_panics() {
-        let receiver = NotificationReceiver::builder()
+        let mut receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .try_acceptance_policy(|notification: &NotificationEnvelope<'_>| {
                 match notification.request_id {
@@ -5806,12 +5774,11 @@ mod tests {
                     _ => Ok(NotificationAcceptance::Accept),
                 }
             })
-            .build()
+            .spawn()
             .await
             .unwrap();
         let destination = receiver.local_addr();
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let initial = receive_buffer_identity(&receiver).await;
 
         for datagram in [
             Bytes::from_static(&[0x30, 0x01, 0xff]),
@@ -5831,89 +5798,6 @@ mod tests {
             received.notification,
             Notification::TrapV2c { request_id: 4, .. }
         ));
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
-    }
-
-    #[tokio::test]
-    async fn cancelled_cloned_recv_returns_shared_buffer_to_next_waiter() {
-        use std::task::Poll;
-
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
-        let cloned = receiver.clone();
-        assert!(Arc::ptr_eq(&receiver.inner, &cloned.inner));
-        let initial = receive_buffer_identity(&receiver).await;
-
-        let mut cancelled = Box::pin(cloned.recv());
-        assert!(matches!(futures::poll!(&mut cancelled), Poll::Pending));
-        drop(cancelled);
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
-
-        let gate = receiver.inner.recv_gate.lock().await;
-        let queued_clone = receiver.clone();
-        let mut queued = Box::pin(queued_clone.recv());
-        assert!(matches!(futures::poll!(&mut queued), Poll::Pending));
-        drop(queued);
-        drop(gate);
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
-
-        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client
-            .send_to(&build_v2c_trap(b"public"), receiver.local_addr())
-            .await
-            .unwrap();
-        let received = receiver.recv().await.unwrap();
-        assert!(matches!(
-            received.notification,
-            Notification::TrapV2c { .. }
-        ));
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
-    }
-
-    #[tokio::test]
-    async fn concurrent_cloned_recv_waiters_preserve_fifo_without_stalling() {
-        use std::task::Poll;
-
-        let receiver = NotificationReceiver::bind("127.0.0.1:0").await.unwrap();
-        let destination = receiver.local_addr();
-        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let initial = receive_buffer_identity(&receiver).await;
-
-        // Hold the gate while each future is polled once. This deterministically
-        // establishes the FIFO waiter order before the datagram burst arrives.
-        let gate = receiver.inner.recv_gate.lock().await;
-        let first_receiver = receiver.clone();
-        let second_receiver = receiver.clone();
-        let third_receiver = receiver.clone();
-        let mut first = Box::pin(first_receiver.recv());
-        let mut second = Box::pin(second_receiver.recv());
-        let mut third = Box::pin(third_receiver.recv());
-        assert!(matches!(futures::poll!(&mut first), Poll::Pending));
-        assert!(matches!(futures::poll!(&mut second), Poll::Pending));
-        assert!(matches!(futures::poll!(&mut third), Poll::Pending));
-
-        for request_id in [11, 12, 13] {
-            client
-                .send_to(
-                    &build_v2c_trap_with_request_id(b"public", request_id),
-                    destination,
-                )
-                .await
-                .unwrap();
-        }
-        drop(gate);
-
-        let results = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            futures::join!(first, second, third)
-        })
-        .await
-        .expect("concurrent recv waiters stalled");
-        let request_ids =
-            [results.0, results.1, results.2].map(|result| match result.unwrap().notification {
-                Notification::TrapV2c { request_id, .. } => request_id,
-                other => panic!("unexpected notification: {other:?}"),
-            });
-        assert_eq!(request_ids, [11, 12, 13]);
-        assert_eq!(receive_buffer_identity(&receiver).await, initial);
     }
 
     /// A dual-stack IPv6 wildcard socket receives this IPv4 datagram through
@@ -5922,7 +5806,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn wildcard_ipv6_dual_stack_inform_reply_preserves_mapped_destination() {
-        let receiver = NotificationReceiver::bind("[::]:0").await.unwrap();
+        let mut receiver = NotificationReceiver::spawn("[::]:0").await.unwrap();
         let destination = SocketAddr::from(([127, 0, 0, 2], receiver.local_addr().port()));
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -5966,10 +5850,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn wildcard_ipv6_report_uses_received_destination_as_source() {
-        let receiver = NotificationReceiver::builder()
+        let mut receiver = NotificationReceiver::builder()
             .bind("[::]:0")
             .engine_id(b"test-report-source".to_vec())
-            .build()
+            .spawn()
             .await
             .unwrap();
         let destination = SocketAddr::new(
@@ -6004,7 +5888,7 @@ mod tests {
     ))]
     #[tokio::test]
     async fn wildcard_ipv4_v3_inform_reply_uses_received_destination_as_source() {
-        let receiver = NotificationReceiver::builder()
+        let mut receiver = NotificationReceiver::builder()
             .bind("0.0.0.0:0")
             .engine_id(b"wildcard-inform-engine".to_vec())
             .engine_boots(1)
@@ -6013,7 +5897,7 @@ mod tests {
             })
             .unwrap()
             .accept_all_notifications()
-            .build()
+            .spawn()
             .await
             .unwrap();
         let destination = SocketAddr::from(([127, 0, 0, 2], receiver.local_addr().port()));

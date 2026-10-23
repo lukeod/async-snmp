@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** notification receivers use `prepare()` or explicit `spawn()` /
+  `spawn_on()` and an independently driven runner. `recv(&mut self)` is a
+  cancellation-safe single-consumer queue returning `Option`; receivers are no
+  longer cloneable. Controls expose shutdown, terminal status and coalesced
+  authoritative persistence health. Queue capacity is reserved before acceptance
+  and Inform acknowledgement; closure drains admitted events.
+
 - TCP sessions now own one reader and serialized writer, with bounded concurrent
   exchanges and aggregate message buffering. Cancelling a request leaves framing
   intact; started writes finish within their original deadline or close the session.

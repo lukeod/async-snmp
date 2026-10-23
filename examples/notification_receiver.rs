@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Simple notification receiver ---\n");
 
     // Bind to unprivileged port 1162 instead of the standard port 162.
-    let receiver = NotificationReceiver::bind("0.0.0.0:1162").await?;
+    let receiver = NotificationReceiver::spawn("0.0.0.0:1162").await?;
 
     println!("Listening for notifications on {}", receiver.local_addr());
     println!("This receiver handles SNMPv1 and SNMPv2c only; SNMPv3 notifications are rejected");
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 NotificationAcceptance::Reject
             }
         })
-        .build()
+        .spawn()
         .await?;
 
     println!(
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filtered_receiver = NotificationReceiver::builder()
         .bind("0.0.0.0:1164")
         .communities(["public", "monitor"])
-        .build()
+        .spawn()
         .await?;
 
     println!(
@@ -159,19 +159,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn spawn_receiver(
     label: &'static str,
-    receiver: NotificationReceiver,
+    mut receiver: async_snmp::RunningNotificationReceiver,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match receiver.recv().await {
-                Ok(received) => {
+                Some(received) => {
                     println!("[{label} receiver]");
                     handle_notification(&received.notification, received.receive_info.peer_addr());
                     if let Some(outcome) = received.inform_ack {
                         println!("  Inform acknowledgement: {outcome:?}");
                     }
                 }
-                Err(e) => eprintln!("{label} receive error: {e}"),
+                None => {
+                    if let Err(error) = receiver.join().await {
+                        eprintln!("{label} runner failed: {error}");
+                    }
+                    break;
+                }
             }
         }
     })
