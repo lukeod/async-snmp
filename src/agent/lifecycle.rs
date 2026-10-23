@@ -80,13 +80,17 @@ pub struct AgentControl {
     pub(super) agent: Agent,
 }
 impl AgentControl {
+    /// Disable only the command role, leaving notifications and exchanges active.
+    pub fn close_commands(&self) {
+        self.agent.close_commands();
+    }
     pub fn request_shutdown(&self) {
         self.agent.inner.cancel.cancel();
     }
     pub fn status(&self) -> AgentStatus {
         self.agent.network.status.lock().unwrap().clone()
     }
-    /// UDP inputs dropped before application admission because work or memory was full.
+    /// UDP inputs dropped during dispatch or application admission because work or memory was full.
     pub fn overload_drops(&self) -> u64 {
         self.agent.network.drops.load(Ordering::Relaxed)
     }
@@ -170,8 +174,13 @@ impl AgentControl {
 pub struct PreparedAgent {
     pub(super) agent: Agent,
     pub(super) runner: AgentRunner,
+    pub(super) notifications: Option<crate::NotificationReceiver>,
 }
 impl PreparedAgent {
+    /// Take the unique attached consumer before splitting or spawning the runner.
+    pub fn take_notifications(&mut self) -> Option<crate::NotificationReceiver> {
+        self.notifications.take()
+    }
     pub fn into_parts(self) -> (Agent, AgentRunner) {
         (self.agent, self.runner)
     }
@@ -180,9 +189,14 @@ impl PreparedAgent {
     }
     /// Existing listener/socket registrations remain on their original runtime.
     pub fn spawn_on(self, runtime: &tokio::runtime::Handle) -> RunningAgent {
-        let (agent, runner) = self.into_parts();
+        let Self {
+            agent,
+            runner,
+            notifications,
+        } = self;
         RunningAgent {
             agent,
+            notifications,
             task: Some(runtime.spawn(runner.run())),
         }
     }
@@ -197,6 +211,7 @@ impl PreparedAgent {
 #[must_use = "dropping the running owner requests shutdown"]
 pub struct RunningAgent {
     agent: Agent,
+    notifications: Option<crate::NotificationReceiver>,
     task: Option<JoinHandle<Result<()>>>,
 }
 impl std::ops::Deref for RunningAgent {
@@ -213,6 +228,10 @@ impl Drop for RunningAgent {
     }
 }
 impl RunningAgent {
+    /// Take the one attached notification consumer.
+    pub fn take_notifications(&mut self) -> Option<crate::NotificationReceiver> {
+        self.notifications.take()
+    }
     pub fn agent(&self) -> Agent {
         self.agent.clone()
     }
@@ -263,6 +282,10 @@ pub struct AgentRunner {
     listeners: Vec<PreparedListener>,
     incoming: mpsc::Receiver<InboundWork>,
     cleanup: AgentRunCleanup,
+    pub(super) notification_role: Option<(
+        crate::notification::NotificationProcessor,
+        crate::notification::RunnerCleanup,
+    )>,
 }
 impl AgentRunner {
     pub(super) fn new(
@@ -272,6 +295,7 @@ impl AgentRunner {
         incoming: mpsc::Receiver<InboundWork>,
     ) -> Self {
         Self {
+            notification_role: None,
             processor: AgentProcessor {
                 inner: inner.clone(),
             },
@@ -290,6 +314,9 @@ impl AgentRunner {
             .run_active
             .store(true, Ordering::Release);
         *self.cleanup.network.status.lock().unwrap() = AgentStatus::Running;
+        if let Some((_, role)) = &self.notification_role {
+            role.started();
+        }
         let mut children: JoinSet<Result<()>> = JoinSet::new();
         let (failures, mut failure_rx) = mpsc::channel(self.listeners.len());
         let mut requests = RequestTasks::new(
@@ -352,6 +379,9 @@ impl AgentRunner {
                 }
             }
         };
+        if let Some((_, role)) = &self.notification_role {
+            role.stop_admission();
+        }
         self.incoming.close();
         self.processor.inner.cancel.cancel();
         requests.cancel();
@@ -371,6 +401,10 @@ impl AgentRunner {
         while let Some(joined) = requests.join_next().await {
             log_request_result(Some(joined));
         }
+        if let Some((processor, role)) = &self.notification_role {
+            processor.drain().await;
+            role.finished(&result);
+        }
         self.cleanup.network.close_endpoints();
         children.abort_all();
         while children.join_next().await.is_some() {}
@@ -386,6 +420,9 @@ impl AgentRunner {
         result
     }
     fn dispatch(&self, requests: &mut RequestTasks, work: InboundWork) {
+        if !self.processor.inner.commands_open.load(Ordering::Acquire) {
+            return;
+        }
         let received_at = work.message.info.received_at();
         let deadline = self
             .processor

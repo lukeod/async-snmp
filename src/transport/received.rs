@@ -152,6 +152,7 @@ pub(crate) struct EndpointLimits {
     pub(crate) send: usize,
 }
 impl EndpointLimits {
+    #[cfg(any(feature = "agent", test))]
     pub(crate) const UDP: Self = Self {
         receive: crate::UDP_RECEIVE_LIMITS,
         send: crate::MAX_UDP_PAYLOAD,

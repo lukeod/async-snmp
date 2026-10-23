@@ -103,6 +103,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 struct UdpEndpointConfig {
     /// Local receive capacity advertised in SNMPv3 messages.
     local_receive_capacity: usize,
+    max_inflight_requests: usize,
     /// Maximum exact encoded datagram size sent by this transport.
     send_capacity: usize,
     /// Log warning when response source differs from target (default: true)
@@ -113,6 +114,7 @@ impl Default for UdpEndpointConfig {
     fn default() -> Self {
         Self {
             local_receive_capacity: 1472,
+            max_inflight_requests: 1024,
             send_capacity: 1472,
             warn_on_source_mismatch: true,
         }
@@ -125,6 +127,7 @@ impl Default for UdpEndpointConfig {
 /// Create [`UdpHandle`]s for each target via [`handle()`](Self::handle).
 #[derive(Clone)]
 pub struct UdpEndpoint {
+    _service_lease: Option<Arc<dyn Send + Sync>>,
     inner: Arc<UdpEndpointInner>,
 }
 
@@ -139,6 +142,7 @@ struct UdpEndpointInner {
     shutdown: CancellationToken,
     shutdown_complete: CancellationToken,
     operations: tokio::sync::RwLock<()>,
+    request_admission: Arc<tokio::sync::Semaphore>,
     // Cancels the recv task when the last transport/handle reference drops.
     // The task itself must hold no strong reference to this struct, or the
     // guard would never fire.
@@ -148,6 +152,7 @@ struct UdpEndpointInner {
     status: Arc<Mutex<UdpStatus>>,
     ipv6_only: bool,
     ingress: Option<super::ingress::ApplicationIngress>,
+    dispatch: Arc<std::sync::OnceLock<Arc<super::dispatch::DispatchRoles>>>,
     #[cfg(test)]
     receive_errors: Arc<std::sync::Mutex<std::collections::VecDeque<std::io::Error>>>,
     #[cfg(test)]
@@ -209,6 +214,24 @@ impl UdpEndpoint {
         self.inner.endpoint_id
     }
     #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) fn with_service_lease(mut self, lease: Arc<dyn Send + Sync>) -> Self {
+        self._service_lease = Some(lease);
+        self
+    }
+    pub(crate) fn configure_dispatch(&self, roles: Arc<super::dispatch::DispatchRoles>) {
+        assert!(
+            self.inner.dispatch.set(roles).is_ok(),
+            "endpoint roles configured once during preparation"
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn test_socket(&self) -> Arc<UdpSocket> {
+        self.inner.socket.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_responder(&self) -> Arc<crate::udp_responder::UdpResponder> {
+        self.inner.responder.clone()
+    }
     pub(crate) fn limits(&self) -> super::EndpointLimits {
         super::EndpointLimits {
             receive: self.inner.receive_limits,
@@ -254,6 +277,7 @@ impl UdpEndpoint {
             );
         }
         Ok(UdpHandle {
+            _service_lease: self._service_lease.clone(),
             inner: self.inner.clone(),
             target,
             strict_source: false,
@@ -285,6 +309,7 @@ impl UdpEndpoint {
     #[must_use]
     pub fn control(&self) -> UdpControl {
         UdpControl {
+            _service_lease: self._service_lease.clone(),
             inner: Arc::clone(&self.inner),
         }
     }
@@ -344,6 +369,7 @@ pub struct UdpRunner {
     receive_limits: ReceiveLimits,
     cleanup: UdpRecvTaskCleanup,
     ingress: Option<super::ingress::ApplicationIngress>,
+    dispatch: Arc<std::sync::OnceLock<Arc<super::dispatch::DispatchRoles>>>,
     send_capacity: usize,
     #[cfg(test)]
     receive_attempts: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -353,6 +379,15 @@ pub struct UdpRunner {
     receive_error_ready: Arc<tokio::sync::Notify>,
 }
 impl UdpRunner {
+    #[cfg(test)]
+    pub(crate) fn test_receive_faults(
+        &mut self,
+        errors: Arc<Mutex<std::collections::VecDeque<std::io::Error>>>,
+        ready: Arc<tokio::sync::Notify>,
+    ) {
+        self.receive_errors = errors;
+        self.receive_error_ready = ready;
+    }
     #[cfg(test)]
     pub(crate) fn test_receive_state(
         &mut self,
@@ -371,6 +406,7 @@ impl UdpRunner {
             local_addr: inner.local_addr,
             receive_limits: inner.receive_limits,
             ingress: inner.ingress.clone(),
+            dispatch: inner.dispatch.clone(),
             send_capacity: inner.config.send_capacity,
             #[cfg(test)]
             receive_attempts: None,
@@ -417,6 +453,7 @@ impl UdpRunner {
         // of ICMP port-unreachable errors). Reset on any successful recv so
         // the normal success path is never delayed.
         let mut recv_error_backoff = UdpRecvErrorBackoff::default();
+        let mut dispatch_tasks = tokio::task::JoinSet::new();
 
         loop {
             #[cfg(test)]
@@ -430,6 +467,10 @@ impl UdpRunner {
                     tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %local_addr }, "UDP transport shutdown");
                     break;
                 }
+
+                joined = dispatch_tasks.join_next(), if !dispatch_tasks.is_empty() => {
+                    if let Some(Err(error)) = joined { return Err(Error::Config(format!("UDP processing task failed: {error}").into()).boxed()); }
+                },
 
                 _ = cleanup_interval.tick() => {
                     core.cleanup_expired();
@@ -453,6 +494,11 @@ impl UdpRunner {
                             }
                             let data = Bytes::copy_from_slice(&buf[..len]);
 
+                            if let Some(roles) = self.dispatch.get() {
+                                let message = super::ReceivedMessage::udp(data, endpoint_id, self.socket.clone(), self.responder.clone(), received, info.received_at(), super::EndpointLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone());
+                                roles.dispatch(message, core.clone(), &mut dispatch_tasks);
+                                continue;
+                            }
                             if let Some(ingress) = &self.ingress {
                                 ingress.deliver_udp(super::ReceivedMessage::udp(data, endpoint_id, self.socket.clone(), self.responder.clone(), received, info.received_at(), super::EndpointLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone()));
                                 continue;
@@ -592,6 +638,15 @@ impl UdpEndpointBuilder {
         }
     }
 
+    /// Bound concurrently registered exchanges (default 1024). Admission waits
+    /// within the request's absolute deadline. Retries retain one permit until
+    /// their correlation window ends, including between transmission attempts.
+    #[must_use]
+    pub fn max_inflight_requests(mut self, limit: usize) -> Self {
+        self.config.max_inflight_requests = limit;
+        self
+    }
+
     /// Set the local bind address.
     #[must_use]
     pub fn bind(mut self, addr: impl AsRef<str>) -> Self {
@@ -675,6 +730,14 @@ impl UdpEndpointBuilder {
     /// can be packaged without an entered runtime. Binding a new socket requires
     /// an entered Tokio runtime and preserves that runtime's I/O registration.
     pub async fn prepare(self) -> Result<PreparedUdpEndpoint> {
+        if self.config.max_inflight_requests == 0
+            || self.config.max_inflight_requests > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "UDP max_inflight_requests must be nonzero and representable".into(),
+            )
+            .boxed());
+        }
         // Validate before parsing or binding so invalid size configuration has
         // deterministic precedence and can never be narrowed on advertisement.
         let receive_limits = ReceiveLimits::udp(self.config.local_receive_capacity)
@@ -753,6 +816,9 @@ impl UdpEndpointBuilder {
             socket: Arc::new(socket),
             local_addr,
             core: Arc::new(UdpCore::new()),
+            request_admission: Arc::new(tokio::sync::Semaphore::new(
+                self.config.max_inflight_requests,
+            )),
             config: self.config,
             receive_limits,
             _shutdown_guard: shutdown.clone().drop_guard(),
@@ -764,6 +830,7 @@ impl UdpEndpointBuilder {
             status: Arc::new(Mutex::new(UdpStatus::Prepared)),
             ipv6_only,
             ingress: self.ingress,
+            dispatch: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             receive_errors: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             #[cfg(test)]
@@ -772,7 +839,10 @@ impl UdpEndpointBuilder {
 
         let runner = UdpRunner::new(&inner);
         Ok(PreparedUdpEndpoint {
-            endpoint: UdpEndpoint { inner },
+            endpoint: UdpEndpoint {
+                inner,
+                _service_lease: None,
+            },
             runner,
         })
     }
@@ -793,6 +863,7 @@ impl UdpEndpointBuilder {
 /// that share the endpoint, including clients for other targets.
 #[derive(Clone)]
 pub struct UdpControl {
+    _service_lease: Option<Arc<dyn Send + Sync>>,
     inner: Arc<UdpEndpointInner>,
 }
 
@@ -893,6 +964,7 @@ impl Default for UdpEndpointBuilder {
 /// ```
 #[derive(Clone)]
 pub struct UdpHandle {
+    _service_lease: Option<Arc<dyn Send + Sync>>,
     inner: Arc<UdpEndpointInner>,
     target: SocketAddr,
     strict_source: bool,
@@ -936,7 +1008,7 @@ impl RequestTransport for UdpHandle {
     async fn request_with<T, F>(
         &self,
         data: &[u8],
-        registration: RequestRegistration,
+        mut registration: RequestRegistration,
         validate: F,
     ) -> Result<T>
     where
@@ -947,9 +1019,51 @@ impl RequestTransport for UdpHandle {
         let _operation = self.inner.operations.read().await;
         self.ensure_open()?;
 
-        // Registration is the first protocol work performed when this future
-        // is polled. The guard owns primary and alias cleanup across both
-        // awaits, including cancellation and send failure.
+        if let Some(roles) = self.inner.dispatch.get() {
+            roles.validate_registration(&registration)?;
+        } else if self.inner.ingress.is_some() {
+            return Err(Error::Config(
+                "client exchanges were not enabled during endpoint preparation".into(),
+            )
+            .boxed());
+        }
+
+        // Admission is owned by the registration/window, not this attempt's
+        // future, so retry retention cannot grow the pending map beyond its bound.
+        let admitted_at = tokio::time::Instant::now();
+        let acquire = async {
+            if let Some(window) = registration.correlation_window() {
+                let mut admission = window.udp_admission.lock().await;
+                if let Some(permit) = admission.get(&self.inner.endpoint_id) {
+                    return permit.clone();
+                }
+                let permit = Arc::new(
+                    self.inner
+                        .request_admission
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("request admission is never closed"),
+                );
+                admission.insert(self.inner.endpoint_id, permit.clone());
+                permit
+            } else {
+                Arc::new(
+                    self.inner
+                        .request_admission
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("request admission is never closed"),
+                )
+            }
+        };
+        registration.udp_admission = Some(tokio::select! {
+            biased;
+            () = self.inner.shutdown.cancelled() => return Err(Error::Closed { target: self.target }.boxed()),
+            () = tokio::time::sleep_until(registration.deadline()) => return Err(Error::Timeout { target: self.target, elapsed: admitted_at.elapsed(), retries: 0 }.boxed()),
+            permit = acquire => permit,
+        });
         let registration =
             self.inner
                 .core
@@ -1084,6 +1198,56 @@ impl UdpHandle {
 mod tests {
     use super::*;
     use crate::{Auth, Client, Retry, oid};
+
+    #[tokio::test]
+    async fn bounded_registration_admission_retains_retry_window_and_honors_deadline() {
+        let service = UdpEndpoint::builder()
+            .bind("127.0.0.1:0")
+            .max_inflight_requests(1)
+            .spawn()
+            .await
+            .unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let handle = service.handle(peer.local_addr().unwrap()).unwrap();
+        let window = super::super::CorrelationWindow::new();
+        let first = RequestRegistration::v3(1, deadline_after(Duration::from_secs(3)))
+            .with_correlation_window(window.clone());
+        let mut pending =
+            Box::pin(handle.request_with(b"first", first, |_, _| Ok(Candidate::Accept(()))));
+        let mut buffer = [0; 64];
+        tokio::select! {
+            result = &mut pending => panic!("request completed before peer received it: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut buffer)) => { result.unwrap().unwrap(); }
+        }
+        drop(pending);
+        assert_eq!(service.inner.request_admission.available_permits(), 0);
+        let error = handle
+            .request_with(
+                b"blocked",
+                RequestRegistration::v3(2, deadline_after(Duration::from_millis(20))),
+                |_, _| Ok(Candidate::Accept(())),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(*error, Error::Timeout { .. }));
+        assert_eq!(service.inner.core.pending_counts(), (1, 0));
+        let retry = RequestRegistration::v3(3, deadline_after(Duration::from_secs(3)))
+            .with_correlation_window(window.clone())
+            .with_aliases([1])
+            .unwrap();
+        let mut retrying =
+            Box::pin(handle.request_with(b"retry", retry, |_, _| Ok(Candidate::Accept(()))));
+        let n = tokio::select! {
+            result = &mut retrying => panic!("retry completed before peer received it: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut buffer)) => result.unwrap().unwrap(),
+        };
+        assert_eq!(&buffer[..n], b"retry");
+        drop(retrying);
+        drop(window);
+        assert_eq!(service.inner.request_admission.available_permits(), 1);
+        assert_eq!(service.inner.core.pending_counts(), (0, 0));
+        service.shutdown().await.unwrap();
+    }
 
     fn deadline_after(timeout: Duration) -> tokio::time::Instant {
         tokio::time::Instant::now() + timeout

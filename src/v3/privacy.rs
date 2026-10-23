@@ -728,6 +728,10 @@ impl PrivKey {
         }
     }
 
+    pub(crate) fn key_material(&self) -> &[u8] {
+        &self.key
+    }
+
     /// Encrypt with already selected protocol-specific sender inputs.
     pub(crate) fn encrypt_with_context(
         &self,

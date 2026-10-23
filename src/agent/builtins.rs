@@ -304,10 +304,10 @@ mod tests {
             max_message_size: 1472,
             engine_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             decode_config: crate::DecodeConfig::default(),
-            snmp_in_asn_parse_errs: AtomicU32::new(0),
-            snmp_invalid_msgs: AtomicU32::new(10),
-            snmp_unknown_security_models: AtomicU32::new(20),
-            snmp_silent_drops: AtomicU32::new(30),
+            snmp_in_asn_parse_errs: Arc::new(AtomicU32::new(0)),
+            snmp_invalid_msgs: Arc::new(AtomicU32::new(10)),
+            snmp_unknown_security_models: Arc::new(AtomicU32::new(20)),
+            snmp_silent_drops: Arc::new(AtomicU32::new(30)),
             snmp_unknown_contexts: AtomicU32::new(0),
             usm_stats: {
                 let stats = crate::v3::process::UsmStats::default();
@@ -317,7 +317,7 @@ mod tests {
                 stats.not_in_time_windows.store(70, Ordering::Relaxed);
                 stats.unsupported_sec_levels.store(80, Ordering::Relaxed);
                 stats.decryption_errors.store(90, Ordering::Relaxed);
-                stats
+                Arc::new(stats)
             },
             health: tokio::sync::watch::channel(crate::agent::AgentHealth::Healthy).0,
         })

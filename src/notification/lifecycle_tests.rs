@@ -521,3 +521,102 @@ async fn persistence_degradation_withholds_local_acceptance_and_recovers_without
     ));
     assert_eq!(control.health(), NotificationHealth::Healthy);
 }
+
+#[tokio::test]
+async fn colliding_informs_blocked_in_ack_leave_response_allowance_available() {
+    use crate::transport::{
+        Candidate, CommunityResponsePolicy, RequestRegistration, RequestTransport,
+    };
+    let mut receiver = NotificationReceiver::builder()
+        .bind("127.0.0.1:0")
+        .client_exchanges(true)
+        .queue_capacity(64)
+        .max_processing(64)
+        .response_send_timeout(Duration::from_secs(10))
+        .spawn()
+        .await
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *receiver.inner.response_send_gate.lock().unwrap() = Some(gate.clone());
+    let endpoint = receiver
+        .udp_endpoint(receiver.bound_addresses()[0].endpoint_id)
+        .unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let handle = endpoint.handle(peer.local_addr().unwrap()).unwrap();
+    let pending = tokio::spawn(async move {
+        let request =
+            crate::message::CommunityMessage::v2c("public", crate::Pdu::get_request(1, &[]))
+                .unwrap()
+                .encode()
+                .unwrap();
+        handle
+            .request_with(
+                &request,
+                RequestRegistration::community(
+                    1,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    crate::CommunityVersion::V2c,
+                    "public",
+                    CommunityResponsePolicy::Exact,
+                ),
+                |data, _| {
+                    assert_eq!(
+                        crate::message::CommunityMessage::decode(
+                            data,
+                            crate::DecodeConfig::DEFAULT
+                        )?
+                        .value
+                        .pdu()
+                        .pdu_type(),
+                        crate::PduType::Response
+                    );
+                    Ok(Candidate::Accept(()))
+                },
+            )
+            .await
+    });
+    await_ack(&peer).await; // Outgoing request establishes the pending ID.
+    for _ in 0..64 {
+        peer.send_to(&build_v2c_inform(b"public"), receiver.local_addr())
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while receiver
+            .inner
+            .response_sends_started
+            .load(Ordering::Relaxed)
+            < 64
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let response =
+        crate::message::CommunityMessage::v2c("public", crate::Pdu::response(1, 0, 0, vec![]))
+            .unwrap()
+            .encode()
+            .unwrap();
+    peer.send_to(&response, receiver.local_addr())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receiver
+            .inner
+            .response_sends_started
+            .load(Ordering::Relaxed),
+        64
+    );
+    gate.add_permits(64);
+    receiver.shutdown().await.unwrap();
+    for _ in 0..64 {
+        assert!(receiver.recv().await.is_some());
+    }
+    assert!(receiver.recv().await.is_none());
+}

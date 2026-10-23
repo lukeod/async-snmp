@@ -144,6 +144,37 @@ impl UsmUser {
         self.config.security_level()
     }
 
+    pub(crate) fn supports_outbound_credentials(&self, config: &UsmConfig) -> crate::Result<bool> {
+        use subtle::ConstantTimeEq;
+        let inbound = self
+            .derive_keys(b"shared-usm-identity-check")
+            .map_err(|e| crate::Error::Config(e.to_string().into()).boxed())?;
+        let outbound = config
+            .derive_keys_inner(b"shared-usm-identity-check")
+            .map_err(|e| crate::Error::Config(e.to_string().into()).boxed())?;
+        if let Some(key) = &outbound.auth_key {
+            let Some(other) = &inbound.auth_key else {
+                return Ok(false);
+            };
+            if key.protocol() != other.protocol()
+                || !bool::from(key.as_bytes().ct_eq(other.as_bytes()))
+            {
+                return Ok(false);
+            }
+        }
+        if let Some(key) = &outbound.priv_key {
+            let Some(other) = &inbound.priv_key else {
+                return Ok(false);
+            };
+            if key.protocol() != other.protocol()
+                || !bool::from(key.key_material().ct_eq(other.key_material()))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn validate_and_precompute(&mut self) -> CryptoResult<()> {
         self.config.validate_and_precompute()
     }

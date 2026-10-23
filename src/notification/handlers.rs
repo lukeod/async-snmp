@@ -312,7 +312,10 @@ impl super::NotificationProcessor {
             outbound_limit: self.inner.max_message_size.min(route.limits.send),
             usm_users: &self.inner.usm_users,
             stats: &self.inner.usm_stats,
-            mpd: None,
+            mpd: Some(crate::v3::process::MpdCounters {
+                invalid_msgs: &self.inner.snmp_invalid_msgs,
+                unknown_security_models: &self.inner.snmp_unknown_security_models,
+            }),
             source,
         };
         let role = V3Role::Receiver {
@@ -538,7 +541,7 @@ fn build_v3_response(
         context_engine_id,
         context_name,
         derived_keys,
-        inner.salt_counter.as_ref(),
+        inner.salt_counter.as_deref(),
         inner.des_salt_state.as_ref(),
         source,
     )

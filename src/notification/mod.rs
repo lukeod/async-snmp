@@ -112,6 +112,27 @@
 //! # }
 //! ```
 //!
+//! # Shared UDP client exchanges
+//!
+//! Set [`NotificationReceiverBuilder::client_exchanges`] before preparation to
+//! enable follow-up polling or Informs through `receiver.udp_endpoint(id)` and
+//! its per-target handles. The receiver's existing runner owns all reception;
+//! a full event queue does not consume the response-processing allowance.
+//! The dispatcher reserves 64 response classifiers and 4 MiB of response input
+//! buffers (at most 1 MiB per peer, 1,024 tracked peers) independently of
+//! notification `max_processing` (default 64) and its
+//! input budget (at most 4 MiB). Delivery retains at most `queue_capacity` decoded
+//! events (default 256). Each pending exchange parks at most 16 candidates.
+//! UDP admits at most 1,024 exchanges including retry retention; waiting for
+//! admission uses the exchange deadline and is cancelled by endpoint shutdown.
+//!
+//! With the agent feature, `AgentBuilder::notifications` attaches this consumer
+//! to the agent's UDP endpoints. Configure engine/users/client capability on the
+//! agent; attached notification configuration must omit those independent fields.
+//! Attached control shutdown closes only notifications; standalone control
+//! shutdown stops its endpoint service. Consumer closure never enables itself
+//! again through a retained control or client handle.
+//!
 //! # Mixed versions on one port
 //!
 //! A single receiver on one UDP port handles v1, v2c, and v3 concurrently;
@@ -222,7 +243,8 @@ mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
 mod varbind;
-use lifecycle::{Delivery, NotificationAdmission, NotificationLease, RunnerCleanup};
+pub(crate) use lifecycle::RunnerCleanup;
+use lifecycle::{Delivery, NotificationAdmission, NotificationLease};
 pub use lifecycle::{
     NotificationControl, NotificationHealth, NotificationRunner, NotificationStatus,
     PreparedNotificationReceiver, RunningNotificationReceiver,
@@ -243,6 +265,7 @@ use crate::error::{Error, Result};
 use crate::message::SecurityLevel;
 use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
+#[cfg(test)]
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
 use crate::v3::process::RemoteEngineTable;
@@ -716,6 +739,7 @@ pub mod oids {
 /// acceptance policy. See the
 /// [module docs](crate::notification#mixed-versions-on-one-port).
 pub struct NotificationReceiverBuilder {
+    client_exchanges: bool,
     bind_addr: String,
     bind_explicit: bool,
     socket: Option<UdpSocket>,
@@ -744,6 +768,7 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            client_exchanges: false,
             bind_addr: "0.0.0.0:162".to_string(),
             bind_explicit: false,
             socket: None,
@@ -759,6 +784,14 @@ impl NotificationReceiverBuilder {
             acceptance_policy: None,
             response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
         }
+    }
+
+    /// Enable locally initiated exchanges on the same UDP endpoint. Responses
+    /// have an independent bounded dispatch allowance from notification delivery.
+    #[must_use]
+    pub fn client_exchanges(mut self, enabled: bool) -> Self {
+        self.client_exchanges = enabled;
+        self
     }
 
     /// Set the UDP bind address.
@@ -1073,7 +1106,7 @@ impl NotificationReceiverBuilder {
     }
 
     async fn prepare_with_engine_id_generator(
-        self,
+        mut self,
         generate_engine_id: impl FnOnce() -> Result<Bytes>,
     ) -> Result<PreparedNotificationReceiver> {
         if self.queue_capacity == 0
@@ -1140,8 +1173,8 @@ impl NotificationReceiverBuilder {
         }
         let requires_authoritative_engine = !self.usm_users.is_empty();
         let validated_usm = validate_authoritative_usm(
-            self.usm_users,
-            self.authoritative_engine,
+            std::mem::take(&mut self.usm_users),
+            self.authoritative_engine.take(),
             requires_authoritative_engine,
             "invalid USM user configuration",
             "authoritative engine state is required for SNMPv3 notification receiving",
@@ -1151,7 +1184,7 @@ impl NotificationReceiverBuilder {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
         })?;
 
-        let socket = match self.socket {
+        let socket = match self.socket.take() {
             Some(socket) => {
                 if socket.peer_addr().is_ok() {
                     return Err(
@@ -1181,37 +1214,105 @@ impl NotificationReceiverBuilder {
             engine_id,
             engine_boots,
         } = validated_usm.prepare(generate_engine_id)?;
-        let salt_counter = uses_aes.then(SaltCounter::new).transpose()?;
-        let udp_responder = Arc::new(UdpResponder::new(&socket));
-        let socket = Arc::new(socket);
-        let endpoint_id = crate::EndpointId::new();
+        let salt_counter = uses_aes.then(SaltCounter::new).transpose()?.map(Arc::new);
+        let (endpoint, udp_runner) = crate::UdpEndpoint::builder()
+            .from_socket(socket)
+            .max_message_size(crate::MAX_UDP_PAYLOAD)
+            .prepare()
+            .await?
+            .into_parts();
+        let enabled = self.client_exchanges;
+        let engine = NotificationEngine {
+            authoritative_engine,
+            engine_id,
+            engine_boots,
+            usm_users,
+            salt_counter,
+            des_salt_state: self.des_salt_state.take(),
+            stats: Arc::new(UsmStats::default()),
+            snmp_in_asn_parse_errs: Arc::new(AtomicU32::new(0)),
+            snmp_invalid_msgs: Arc::new(AtomicU32::new(0)),
+            snmp_unknown_security_models: Arc::new(AtomicU32::new(0)),
+            snmp_silent_drops: Arc::new(AtomicU32::new(0)),
+
+            time_source: None,
+        };
+        let (mut receiver, processor, cleanup) = self.prepare_role(engine, &endpoint)?;
+        endpoint.configure_dispatch(Arc::new(crate::transport::dispatch::DispatchRoles::new(
+            None,
+            Some(processor.clone()),
+            processor.inner.usm_users.clone(),
+            enabled,
+            processor.processing_limit(),
+        )));
+        receiver.endpoints.push(endpoint.clone());
+        receiver.bound.push(crate::transport::BoundListener {
+            endpoint_id: endpoint.endpoint_id(),
+            transport: crate::TransportKind::Udp,
+            local_addr,
+        });
+        let runner = NotificationRunner::from_endpoint(endpoint, udp_runner, processor, cleanup);
+        Ok(PreparedNotificationReceiver { receiver, runner })
+    }
+    fn prepare_role(
+        self,
+        engine: NotificationEngine,
+        endpoint: &crate::UdpEndpoint,
+    ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
+        if self.queue_capacity == 0
+            || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || self.max_processing == 0
+            || self.max_processing > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "notification queue and processing limits must be nonzero and representable".into(),
+            )
+            .boxed());
+        }
+        crate::transport::checked_deadline(
+            self.response_send_timeout,
+            "notification response send timeout",
+        )?;
+        if !engine.usm_users.is_empty() && self.acceptance_policy.is_none() {
+            return Err(Error::Config(
+                "shared USM notification role requires an explicit acceptance policy".into(),
+            )
+            .boxed());
+        }
         let (sender, events) = mpsc::channel(self.queue_capacity);
         let delivery = Arc::new(Delivery::new(sender));
         let (health, _) = watch::channel(NotificationHealth::Healthy);
         let inner = Arc::new(ReceiverInner {
-            authoritative_engine,
+            authoritative_engine: engine.authoritative_engine,
             #[cfg(test)]
-            socket: socket.clone(),
+            socket: endpoint.test_socket(),
             #[cfg(test)]
-            udp_responder: udp_responder.clone(),
+            udp_responder: endpoint.test_responder(),
             #[cfg(test)]
-            endpoint_id,
+            endpoint_id: endpoint.endpoint_id(),
             delivery: delivery.clone(),
             health,
-            usm_users,
+            usm_users: engine.usm_users,
             communities: self.communities,
             varbind_validation: self.varbind_validation,
-            engine_id,
-            salt_counter,
-            des_salt_state: self.des_salt_state,
-            authoritative_snapshot: AtomicU64::new(pack_boots_time((engine_boots, 0))),
-            engine_boots_base: engine_boots,
+            engine_id: engine.engine_id,
+            salt_counter: engine.salt_counter,
+            des_salt_state: engine.des_salt_state,
+            authoritative_snapshot: AtomicU64::new(pack_boots_time((engine.engine_boots, 0))),
+            engine_boots_base: engine.engine_boots,
             engine_start: Instant::now(),
-            usm_stats: UsmStats::default(),
+            usm_stats: engine.stats,
+            time_source: engine.time_source,
+            max_processing: self.max_processing,
+            active: std::sync::atomic::AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
             remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
             max_message_size: self.max_message_size,
             decode_config: self.decode_config,
-            snmp_silent_drops: AtomicU32::new(0),
+            snmp_in_asn_parse_errs: engine.snmp_in_asn_parse_errs,
+            snmp_invalid_msgs: engine.snmp_invalid_msgs,
+            snmp_unknown_security_models: engine.snmp_unknown_security_models,
+            snmp_silent_drops: engine.snmp_silent_drops,
             acceptance_policy: self.acceptance_policy,
             response_send_timeout: self.response_send_timeout,
             #[cfg(test)]
@@ -1223,30 +1324,93 @@ impl NotificationReceiverBuilder {
             #[cfg(test)]
             response_construction_errors: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
-            receive_errors: Mutex::new(std::collections::VecDeque::new()),
+            receive_errors: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             #[cfg(test)]
-            receive_error_ready: tokio::sync::Notify::new(),
+            receive_error_ready: Arc::new(tokio::sync::Notify::new()),
         });
         let state = Arc::new(lifecycle::ServiceState::new());
         let lease = Arc::new(NotificationLease::new(state.shutdown.clone()));
         let receiver = NotificationReceiver {
-            local_addr,
+            local_addr: endpoint.local_addr(),
+            endpoints: Vec::new(),
+            bound: Vec::new(),
             inner: inner.clone(),
             events,
             state: state.clone(),
             lease,
         };
-        let runner = NotificationRunner::new(
-            socket,
-            udp_responder,
-            endpoint_id,
-            local_addr,
+        Ok((
+            receiver,
             NotificationProcessor { inner },
-            self.max_processing,
             RunnerCleanup { delivery, state },
-        );
-        Ok(PreparedNotificationReceiver { receiver, runner })
+        ))
     }
+
+    #[cfg(feature = "agent")]
+    pub(crate) fn validate_attached(&self, has_users: bool) -> Result<()> {
+        if self.socket.is_some()
+            || self.bind_explicit
+            || self.authoritative_engine.is_some()
+            || !self.usm_users.is_empty()
+            || self.des_salt_state.is_some()
+            || self.client_exchanges
+        {
+            return Err(Error::Config("attached notifications inherit the agent endpoint, client capability and prepared USM engine; independent socket, engine, users or client capability conflict".into()).boxed());
+        }
+        if self.queue_capacity == 0
+            || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || self.max_processing == 0
+            || self.max_processing > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "notification queue and processing limits must be nonzero and representable".into(),
+            )
+            .boxed());
+        }
+        if self.max_message_size > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
+            return Err(
+                Error::Config("notification max_message_size exceeds UDP capacity".into()).boxed(),
+            );
+        }
+        crate::transport::checked_deadline(
+            self.response_send_timeout,
+            "notification response send timeout",
+        )?;
+        if has_users && self.acceptance_policy.is_none() {
+            return Err(Error::Config(
+                "shared USM notification role requires an explicit acceptance policy".into(),
+            )
+            .boxed());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "agent")]
+    pub(crate) fn prepare_attached(
+        self,
+        agent: &crate::agent::AgentProcessor,
+        endpoint: &crate::UdpEndpoint,
+    ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
+        self.validate_attached(!agent.inner.usm_users.is_empty())?;
+        let state = agent.inner.state.clone();
+        let engine = NotificationEngine {
+            authoritative_engine: state.authoritative_engine.clone(),
+            engine_id: state.engine_id.clone(),
+            engine_boots: state.engine_boots_base,
+            usm_users: agent.inner.usm_users.clone(),
+            salt_counter: agent.inner.salt_counter.clone(),
+            des_salt_state: agent.inner.des_salt_state.clone(),
+            stats: state.usm_stats.clone(),
+            snmp_in_asn_parse_errs: state.snmp_in_asn_parse_errs.clone(),
+            snmp_invalid_msgs: state.snmp_invalid_msgs.clone(),
+            snmp_unknown_security_models: state.snmp_unknown_security_models.clone(),
+            snmp_silent_drops: state.snmp_silent_drops.clone(),
+
+            time_source: Some(Arc::new(move || state.authoritative_boots_time())),
+        };
+        self.prepare_role(engine, endpoint)
+    }
+
     /// Prepare and spawn the same runner on the current runtime.
     pub async fn spawn(self) -> Result<RunningNotificationReceiver> {
         Ok(self.prepare().await?.spawn())
@@ -1524,11 +1688,13 @@ impl Notification {
 /// # }
 /// ```
 pub struct NotificationReceiver {
+    pub(crate) endpoints: Vec<crate::UdpEndpoint>,
+    pub(crate) bound: Vec<crate::transport::BoundListener>,
     local_addr: SocketAddr,
     inner: Arc<ReceiverInner>,
     events: mpsc::Receiver<ReceivedNotification>,
     state: Arc<lifecycle::ServiceState>,
-    lease: Arc<NotificationLease>,
+    pub(crate) lease: Arc<NotificationLease>,
 }
 
 /// Application protocol state, independent of socket and public lifetime ownership.
@@ -1537,7 +1703,27 @@ pub(crate) struct NotificationProcessor {
     inner: Arc<ReceiverInner>,
 }
 
+struct NotificationEngine {
+    authoritative_engine: Option<AuthoritativeEngine>,
+    engine_id: Bytes,
+    engine_boots: u32,
+    usm_users: HashMap<Bytes, UsmUser>,
+    salt_counter: Option<Arc<SaltCounter>>,
+    des_salt_state: Option<DesSaltState>,
+    stats: Arc<UsmStats>,
+    snmp_in_asn_parse_errs: Arc<AtomicU32>,
+    snmp_invalid_msgs: Arc<AtomicU32>,
+    snmp_unknown_security_models: Arc<AtomicU32>,
+    snmp_silent_drops: Arc<AtomicU32>,
+
+    time_source: Option<crate::client::LocalAuthoritativeTimeSource>,
+}
+
 struct ReceiverInner {
+    time_source: Option<crate::client::LocalAuthoritativeTimeSource>,
+    max_processing: usize,
+    active: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
     authoritative_engine: Option<AuthoritativeEngine>,
     #[cfg(test)]
     socket: Arc<UdpSocket>,
@@ -1558,7 +1744,7 @@ struct ReceiverInner {
     /// Engine ID for V3 discovery responses
     engine_id: Bytes,
     /// Salt counter for privacy operations
-    salt_counter: Option<SaltCounter>,
+    salt_counter: Option<Arc<SaltCounter>>,
     des_salt_state: Option<DesSaltState>,
     /// Most recently sampled authoritative boots/time tuple.
     authoritative_snapshot: AtomicU64,
@@ -1567,7 +1753,7 @@ struct ReceiverInner {
     /// Time when the receiver was started, used to compute engine time.
     engine_start: Instant,
     /// RFC 3414 usmStats counters
-    usm_stats: UsmStats,
+    usm_stats: Arc<UsmStats>,
     /// Timeliness state for remote authoritative engines (trap senders),
     /// keyed by engine ID (RFC 3414 Section 2.3). Seeded from the first
     /// authenticated message from each engine, so only holders of configured
@@ -1580,7 +1766,10 @@ struct ReceiverInner {
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
     /// Confirmed notifications dropped because even the alternate Response did not fit.
-    snmp_silent_drops: AtomicU32,
+    snmp_in_asn_parse_errs: Arc<AtomicU32>,
+    snmp_invalid_msgs: Arc<AtomicU32>,
+    snmp_unknown_security_models: Arc<AtomicU32>,
+    snmp_silent_drops: Arc<AtomicU32>,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
     response_send_timeout: Duration,
     #[cfg(test)]
@@ -1592,9 +1781,9 @@ struct ReceiverInner {
     #[cfg(test)]
     response_construction_errors: Mutex<std::collections::VecDeque<Box<Error>>>,
     #[cfg(test)]
-    receive_errors: Mutex<std::collections::VecDeque<std::io::Error>>,
+    receive_errors: Arc<Mutex<std::collections::VecDeque<std::io::Error>>>,
     #[cfg(test)]
-    receive_error_ready: tokio::sync::Notify,
+    receive_error_ready: Arc<tokio::sync::Notify>,
 }
 
 impl ReceiverInner {
@@ -1629,14 +1818,18 @@ impl ReceiverInner {
 
     /// Return one coherent authoritative boots/time pair for the current instant.
     fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
-        let pair = match &self.authoritative_engine {
-            Some(engine) => engine.current_boots_time(),
-            None => {
-                let total_secs = self.engine_start.elapsed().as_secs();
-                Ok(crate::v3::compute_engine_boots_time(
-                    self.engine_boots_base,
-                    total_secs,
-                ))
+        let pair = if let Some(source) = &self.time_source {
+            source()
+        } else {
+            match &self.authoritative_engine {
+                Some(engine) => engine.current_boots_time(),
+                None => {
+                    let total_secs = self.engine_start.elapsed().as_secs();
+                    Ok(crate::v3::compute_engine_boots_time(
+                        self.engine_boots_base,
+                        total_secs,
+                    ))
+                }
             }
         };
         match pair {

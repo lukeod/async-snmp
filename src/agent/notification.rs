@@ -954,7 +954,7 @@ impl super::Agent {
                     engine_time,
                     security,
                     derived.as_ref(),
-                    self.inner.salt_counter.as_ref(),
+                    self.inner.salt_counter.as_deref(),
                     self.inner.des_salt_state.as_ref(),
                     Some(engine_boots),
                     false, // reportable=false for traps

@@ -17,6 +17,9 @@
 //! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) |
 
 mod builtin;
+pub(crate) mod dispatch;
+#[cfg(all(test, feature = "agent"))]
+mod dispatch_tests;
 mod framing;
 pub(crate) mod ingress;
 #[cfg_attr(not(feature = "agent"), allow(dead_code))]
@@ -62,6 +65,9 @@ static CORRELATION_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct CorrelationWindow {
     id: u64,
     udp_cores: Mutex<Vec<Weak<udp_core::UdpCore>>>,
+    udp_admission: tokio::sync::Mutex<
+        std::collections::HashMap<EndpointId, Arc<tokio::sync::OwnedSemaphorePermit>>,
+    >,
 }
 
 impl CorrelationWindow {
@@ -69,6 +75,7 @@ impl CorrelationWindow {
         Arc::new(Self {
             id: CORRELATION_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
             udp_cores: Mutex::new(Vec::new()),
+            udp_admission: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -218,6 +225,8 @@ pub(crate) enum ResponseCorrelation {
 /// ```
 #[derive(Debug, Clone)]
 pub struct RequestRegistration {
+    udp_admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    pub(crate) classification_security: Option<Arc<ResponseSecurityContext>>,
     /// Request ID (v1/v2c) or msgID (v3).
     request_id: i32,
     /// Absolute deadline for registration, write, candidate rejection, and response.
@@ -230,6 +239,14 @@ pub struct RequestRegistration {
     aliases: BTreeSet<i32>,
     /// Internal lifetime shared by registrations in one V3 retry window.
     correlation_window: Option<Arc<CorrelationWindow>>,
+}
+
+/// Built-in client context used only for shared-endpoint classification. The
+/// exchange validator remains responsible for complete response acceptance.
+#[derive(Debug)]
+pub(crate) struct ResponseSecurityContext {
+    pub(crate) usm: crate::v3::UsmConfig,
+    pub(crate) engine_id: Option<Bytes>,
 }
 
 impl RequestRegistration {
@@ -253,6 +270,8 @@ impl RequestRegistration {
             decode_config: DecodeConfig::DEFAULT,
             aliases: BTreeSet::new(),
             correlation_window: None,
+            udp_admission: None,
+            classification_security: None,
         }
     }
 
@@ -266,6 +285,8 @@ impl RequestRegistration {
             decode_config: DecodeConfig::DEFAULT,
             aliases: BTreeSet::new(),
             correlation_window: None,
+            udp_admission: None,
+            classification_security: None,
         }
     }
 
@@ -281,7 +302,21 @@ impl RequestRegistration {
             decode_config: DecodeConfig::DEFAULT,
             aliases: BTreeSet::new(),
             correlation_window: None,
+            udp_admission: None,
+            classification_security: None,
         }
+    }
+
+    pub(crate) fn with_classification_usm(
+        mut self,
+        config: crate::v3::UsmConfig,
+        engine_id: Option<Bytes>,
+    ) -> Self {
+        self.classification_security = Some(Arc::new(ResponseSecurityContext {
+            usm: config,
+            engine_id,
+        }));
+        self
     }
 
     /// Attach prior transmission IDs to this registration.

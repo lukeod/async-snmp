@@ -15,6 +15,7 @@ pub(crate) struct InboundWork {
 #[derive(Clone)]
 pub(crate) struct ApplicationIngress {
     pub(crate) sender: mpsc::Sender<InboundWork>,
+    pub(crate) enabled: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) capacity: Arc<Semaphore>,
     pub(crate) budget: Arc<Semaphore>,
     pub(crate) overload_timeout: Duration,
@@ -27,8 +28,11 @@ impl std::fmt::Debug for ApplicationIngress {
     }
 }
 impl ApplicationIngress {
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Acquire) && !self.sender.is_closed()
+    }
     pub(crate) fn deliver_udp(&self, message: ReceivedMessage) {
-        if self.sender.is_closed() {
+        if !self.is_enabled() {
             return;
         }
         let Ok(admission) = self.capacity.clone().try_acquire_owned() else {

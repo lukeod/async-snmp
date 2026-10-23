@@ -612,6 +612,42 @@ impl UdpCore {
         false
     }
 
+    pub(crate) fn candidate_registration(
+        &self,
+        id: i32,
+        data: &[u8],
+        envelope: CorrelationEnvelope,
+        source: SocketAddr,
+    ) -> Option<RequestRegistration> {
+        let primary = {
+            let pending = self.shard(id).pending.lock().unwrap();
+            match pending.get(&id)? {
+                PendingEntry::Slot(_) => id,
+                PendingEntry::Alias { primary, .. } => *primary,
+            }
+        };
+        let pending = self.shard(primary).pending.lock().unwrap();
+        let PendingEntry::Slot(slot) = pending.get(&primary)? else {
+            return None;
+        };
+        if slot.owner.deadline <= Instant::now()
+            || (slot.strict_source && slot.target_source != source)
+        {
+            return None;
+        }
+        if matches!(
+            slot.registration.evaluate_parsed_response_identity(
+                data,
+                envelope,
+                slot.target_source == source
+            ),
+            ResponseIdentity::Reject
+        ) {
+            return None;
+        }
+        Some(slot.registration.clone())
+    }
+
     /// Record a datagram from which no request ID could be extracted.
     pub(crate) fn note_malformed(&self) {
         self.stats

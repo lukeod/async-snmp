@@ -176,3 +176,7 @@ required-features = ["mib"]
 [[example]]
 name = "mib_table"
 required-features = ["mib"]
+
+[[example]]
+name = "shared_udp_roles"
+required-features = ["agent"]

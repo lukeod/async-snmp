@@ -24,6 +24,44 @@
 //! Forced runner termination closes network endpoints while admitted SET cleanup
 //! stays retained; use `AgentControl::drain_mutations` to observe completion.
 //!
+//! # Shared UDP roles
+//!
+//! Enable `client_exchanges(true)` before preparation, then select a listener
+//! with `udp_endpoint(id)` and derive its target handles. Attach a
+//! [`NotificationReceiverBuilder`](crate::notification::NotificationReceiverBuilder)
+//! with `notifications(...)`; take its unique consumer using
+//! [`PreparedAgent::take_notifications`] or [`RunningAgent::take_notifications`].
+//! Take the consumer before `into_parts()`, which otherwise drops it and closes
+//! notification admission. The notification role inherits the prepared engine,
+//! USM users, privacy sender state and message/security counters; configure
+//! engine identity and users only on the agent.
+//! The role keeps its own community, acceptance, decoding and delivery policies.
+//!
+//! Closing the notification consumer or its attached control disables that role.
+//! [`Agent::close_commands`] disables commands while notifications and exchanges
+//! continue. Agent/endpoint control owns network shutdown. Public endpoint, peer
+//! and control handles retain the service after ordinary Agent handles are
+//! dropped; dropping a running owner still explicitly requests root shutdown.
+//!
+//! Shared UDP dispatch uses 64 response-classification slots and a separate
+//! 4 MiB response-input budget, retained through candidate validation. Each peer
+//! is limited to 1 MiB; at most 1,024 peer budgets are tracked. Each UDP endpoint
+//! admits at most 1,024 registered exchanges, including retained retry windows;
+//! admission waits within the exchange deadline. Application
+//! classification/notification processing uses 64 slots by default (the attached
+//! notification `max_processing` overrides this), and at most 4 MiB of input
+//! buffers. These bounds are shared across the agent's UDP endpoints. Existing
+//! command admission/buffering limits and notification delivery capacity remain
+//! additional bounds. Overload drops before application acceptance or Inform ACK;
+//! classification of a colliding request transfers off the response allowance.
+//!
+//! Encrypted classification does not publish Reports or security state. The
+//! selected application or exchange performs its own final checks. A shared USM
+//! username must use compatible credentials; conflicting client credentials are
+//! rejected before sending. Use distinct identities or separate endpoints for
+//! distinct credential contexts. Structural classification does not replace each
+//! role's configured decode policy. These attached roles currently select UDP endpoints.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -454,6 +492,8 @@ pub struct AgentBuilder {
     buffered_bytes: usize,
     overload_timeout: Duration,
     discard_notifications: bool,
+    client_exchanges: bool,
+    notifications: Option<crate::notification::NotificationReceiverBuilder>,
     bind_addr: String,
     communities: Vec<crate::Community>,
     usm_users: HashMap<Bytes, UsmUser>,
@@ -499,6 +539,8 @@ struct ValidatedAgentBuilder {
     buffered_bytes: usize,
     overload_timeout: Duration,
     discard_notifications: bool,
+    client_exchanges: bool,
+    notifications: Option<crate::notification::NotificationReceiverBuilder>,
     bind_addr: SocketAddr,
     communities: Vec<crate::Community>,
     usm: ValidatedAuthoritativeUsm,
@@ -525,6 +567,22 @@ struct ValidatedAgentBuilder {
 }
 
 impl AgentBuilder {
+    /// Enable client exchanges on the prepared UDP endpoints (default false).
+    /// The existing endpoint runner remains the sole socket reader.
+    #[must_use]
+    pub fn client_exchanges(mut self, enabled: bool) -> Self {
+        self.client_exchanges = enabled;
+        self
+    }
+    /// Attach one notification consumer to every UDP endpoint. Its engine, USM
+    /// users and privacy sender state are inherited from this agent. Take the
+    /// consumer from the prepared or running agent before receiving events.
+    #[must_use]
+    pub fn notifications(mut self, role: crate::notification::NotificationReceiverBuilder) -> Self {
+        self.notifications = Some(role);
+        self
+    }
+
     /// Add an explicit UDP or TCP listener. When present, replaces the default
     /// UDP bind; an explicit `bind` or `recv_buffer_size` configuration conflicts.
     #[must_use]
@@ -585,6 +643,8 @@ impl AgentBuilder {
             buffered_bytes: 64 * 1024 * 1024,
             overload_timeout: Duration::from_secs(5),
             discard_notifications: false,
+            client_exchanges: false,
+            notifications: None,
             bind_addr: "0.0.0.0:161".to_string(),
             communities: Vec::new(),
             usm_users: HashMap::new(),
@@ -1276,6 +1336,7 @@ impl AgentBuilder {
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity.available_permits());
         let ingress = crate::transport::ingress::ApplicationIngress {
             sender,
+            enabled: Arc::new(AtomicBool::new(true)),
             capacity,
             budget: Arc::new(Semaphore::new(config.buffered_bytes)),
             overload_timeout: config.overload_timeout,
@@ -1384,7 +1445,8 @@ impl AgentBuilder {
         let salt_counter = config
             .requires_privacy
             .then(create_salt_counter)
-            .transpose()?;
+            .transpose()?
+            .map(Arc::new);
         construction.check(ConstructionStage::Prepare, None, None)?;
 
         let state = Arc::new(AgentState {
@@ -1397,12 +1459,12 @@ impl AgentBuilder {
             max_message_size: config.max_message_size,
             engine_receive_capacity: config.engine_receive_capacity,
             decode_config: config.decode_config,
-            snmp_in_asn_parse_errs: AtomicU32::new(0),
-            snmp_invalid_msgs: AtomicU32::new(0),
-            snmp_unknown_security_models: AtomicU32::new(0),
-            snmp_silent_drops: AtomicU32::new(0),
+            snmp_in_asn_parse_errs: Arc::new(AtomicU32::new(0)),
+            snmp_invalid_msgs: Arc::new(AtomicU32::new(0)),
+            snmp_unknown_security_models: Arc::new(AtomicU32::new(0)),
+            snmp_silent_drops: Arc::new(AtomicU32::new(0)),
             snmp_unknown_contexts: AtomicU32::new(0),
-            usm_stats: UsmStats::default(),
+            usm_stats: Arc::new(UsmStats::default()),
             health: tokio::sync::watch::channel(AgentHealth::Healthy).0,
         });
 
@@ -1439,6 +1501,7 @@ impl AgentBuilder {
 
         let inner = Arc::new(AgentInner {
             discard_notifications: config.discard_notifications,
+            commands_open: ingress.enabled.clone(),
             task_changed: tokio::sync::Notify::new(),
             mutation_failures: AtomicU64::new(0),
             communities: config.communities,
@@ -1483,11 +1546,56 @@ impl AgentBuilder {
             #[cfg(test)]
             test_runner: Arc::new(std::sync::Mutex::new(None)),
         };
-        let runner = AgentRunner::new(inner, network, listeners, receiver);
-        Ok(PreparedAgent { agent, runner })
+        let processor = AgentProcessor {
+            inner: inner.clone(),
+        };
+        let (notifications, notification_role) = if let Some(role) = config.notifications {
+            let endpoint = network.udp.first().ok_or_else(|| {
+                Error::Config("attached notifications currently require a UDP listener".into())
+                    .boxed()
+            })?;
+            let (mut consumer, processor, cleanup) = role.prepare_attached(&processor, endpoint)?;
+            consumer.attach_lifetime(agent.lease.clone());
+            consumer.endpoints = network.udp.clone();
+            consumer.bound = network
+                .bound
+                .iter()
+                .filter(|bound| bound.transport == crate::TransportKind::Udp)
+                .copied()
+                .collect();
+            (Some(consumer), Some((processor, cleanup)))
+        } else {
+            (None, None)
+        };
+        if config.client_exchanges || notification_role.is_some() {
+            let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
+                Some(ingress),
+                notification_role
+                    .as_ref()
+                    .map(|(processor, _)| processor.clone()),
+                inner.usm_users.clone(),
+                config.client_exchanges,
+                notification_role
+                    .as_ref()
+                    .map_or(64, |(processor, _)| processor.processing_limit()),
+            ));
+            for endpoint in &network.udp {
+                endpoint.configure_dispatch(roles.clone());
+            }
+        }
+        let mut runner = AgentRunner::new(inner, network, listeners, receiver);
+        runner.notification_role = notification_role;
+        Ok(PreparedAgent {
+            agent,
+            runner,
+            notifications,
+        })
     }
 
     fn validate_and_normalize(mut self) -> Result<ValidatedAgentBuilder> {
+        if let Some(role) = &self.notifications {
+            role.validate_attached(!self.usm_users.is_empty())?;
+        }
         // Stable validation precedence: deadline representability (which reads
         // the monotonic clock), authorization, sink IDs, sizes/concurrency,
         // security configuration, then address syntax and family.
@@ -1656,6 +1764,8 @@ impl AgentBuilder {
             buffered_bytes: self.buffered_bytes,
             overload_timeout: self.overload_timeout,
             discard_notifications: self.discard_notifications,
+            client_exchanges: self.client_exchanges,
+            notifications: self.notifications,
             bind_addr,
             communities: self.communities,
             usm,
@@ -1813,22 +1923,22 @@ pub(crate) struct AgentState {
     pub(crate) decode_config: crate::DecodeConfig,
     /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
     /// their ASN.1 representation is invalid for the received SNMP version
-    pub(crate) snmp_in_asn_parse_errs: AtomicU32,
+    pub(crate) snmp_in_asn_parse_errs: Arc<AtomicU32>,
     // RFC 3412 statistics counters
     /// snmpInvalidMsgs (1.3.6.1.6.3.11.2.1.2) - messages with invalid msgFlags
     /// (e.g., privacy without authentication)
-    pub(crate) snmp_invalid_msgs: AtomicU32,
+    pub(crate) snmp_invalid_msgs: Arc<AtomicU32>,
     /// snmpUnknownSecurityModels (1.3.6.1.6.3.11.2.1.1) - messages with
     /// unrecognized security model
-    pub(crate) snmp_unknown_security_models: AtomicU32,
+    pub(crate) snmp_unknown_security_models: Arc<AtomicU32>,
     /// snmpSilentDrops (1.3.6.1.6.3.11.2.1.3) - confirmed-class PDUs silently
     /// dropped because even an empty response would exceed max message size
-    pub(crate) snmp_silent_drops: AtomicU32,
+    pub(crate) snmp_silent_drops: Arc<AtomicU32>,
     /// snmpUnknownContexts (1.3.6.1.6.3.12.1.5) - requests whose scopedPDU
     /// contextEngineID did not name a context served by this engine
     pub(crate) snmp_unknown_contexts: AtomicU32,
     /// RFC 3414 usmStats counters
-    pub(crate) usm_stats: UsmStats,
+    pub(crate) usm_stats: Arc<UsmStats>,
     /// Bounded/coalescing current-health publication.
     health: tokio::sync::watch::Sender<AgentHealth>,
 }
@@ -1912,13 +2022,14 @@ impl AgentState {
 /// Inner state shared across agent clones.
 pub(crate) struct AgentInner {
     discard_notifications: bool,
+    commands_open: Arc<AtomicBool>,
     task_changed: tokio::sync::Notify,
     mutation_failures: AtomicU64,
     pub(crate) communities: Vec<crate::Community>,
     pub(crate) usm_users: HashMap<Bytes, UsmUser>,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
-    pub(crate) salt_counter: Option<SaltCounter>,
+    pub(crate) salt_counter: Option<Arc<SaltCounter>>,
     pub(crate) des_salt_state: Option<DesSaltState>,
     /// Serializes complete SET transactions without restricting retrieval.
     pub(crate) set_coordinator: tokio::sync::Mutex<()>,
@@ -2002,6 +2113,11 @@ impl Agent {
     pub fn bound_addresses(&self) -> &[crate::transport::BoundListener] {
         &self.network.bound
     }
+    /// Disable new command processing while shared notifications and exchanges continue.
+    pub fn close_commands(&self) {
+        self.inner.commands_open.store(false, Ordering::Release);
+    }
+
     /// Clone a selected UDP endpoint without creating a reader.
     pub fn udp_endpoint(&self, id: crate::EndpointId) -> Option<crate::UdpEndpoint> {
         self.network
@@ -2009,6 +2125,7 @@ impl Agent {
             .iter()
             .find(|endpoint| endpoint.endpoint_id() == id)
             .cloned()
+            .map(|endpoint| endpoint.with_service_lease(self.lease.clone()))
     }
     /// Snapshot handles selecting the currently accepted TCP sessions.
     pub fn tcp_sessions(&self) -> Vec<crate::TcpTransport> {

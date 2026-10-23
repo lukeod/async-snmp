@@ -48,6 +48,7 @@ impl Drop for DiscoveryLeaderGuard {
 
 struct EncodedV3Request {
     data: Vec<u8>,
+    authoritative_engine_id: Bytes,
     context_engine_id: Bytes,
     context_name: Bytes,
 }
@@ -499,6 +500,13 @@ impl<T: RequestTransport> Client<T> {
                 None => attempt_deadline,
             };
             let registration = RequestRegistration::v3(msg_id, registration_deadline)
+                .with_classification_usm(
+                    match &self.inner.config.auth {
+                        crate::Auth::Usm(config) => config.clone(),
+                        _ => unreachable!(),
+                    },
+                    None,
+                )
                 .with_decode_config(self.inner.config.decode_config)
                 .with_correlation_window(Arc::clone(&correlation_window))
                 .with_aliases(msg_id_window.iter().copied())?;
@@ -769,6 +777,7 @@ impl<T: RequestTransport> Client<T> {
         self.enforce_outbound_size(data.len(), Some(engine.state.msg_max_size()))?;
 
         Ok(EncodedV3Request {
+            authoritative_engine_id: engine.state.engine_id().clone(),
             data,
             context_engine_id,
             context_name,
@@ -1166,6 +1175,13 @@ impl<T: RequestTransport> Client<T> {
                 None => attempt_deadline,
             };
             let registration = RequestRegistration::v3(msg_id, registration_deadline)
+                .with_classification_usm(
+                    match &self.inner.config.auth {
+                        crate::Auth::Usm(config) => config.clone(),
+                        _ => unreachable!(),
+                    },
+                    Some(request.authoritative_engine_id.clone()),
+                )
                 .with_decode_config(self.inner.config.decode_config)
                 .with_correlation_window(Arc::clone(&correlation_window))
                 .with_aliases(msg_id_window.iter().copied())
