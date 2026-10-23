@@ -93,6 +93,44 @@ The repository contains these examples:
   [walks](examples/mib_walk.rs), and
   [table index decoding](examples/mib_table.rs)
 
+## Transport and service lifecycle
+
+Built-in services use `prepare().await?` followed by `into_parts()` to obtain
+public handles and an owned runner. Preparation binds/connects and validates
+configuration without starting tasks. Drive `runner.run()` or use the explicit
+`spawn()`/`spawn_on()` conveniences; retain the running owner to observe shutdown
+and failures. Supplied Tokio sockets keep their original runtime registration.
+Dropping the last public handle requests shutdown; controls also retain lifetime.
+Dropping an unpolled runner closes its endpoints. Sends and exchanges use their
+ordinary deadlines before startup and fail after termination.
+
+| API migration | Current API |
+| --- | --- |
+| Custom client transport contract | `RequestTransport` |
+| Shared UDP transport | `UdpEndpoint`, target-specific `UdpHandle` |
+| Agent/receiver startup | `prepare` plus runner, or explicit `spawn` |
+| Single service local address | Identified `bound_addresses()` |
+| Notification consumer | Non-Clone receiver; `recv(&mut self)` and separate control |
+| Agent notification destinations | `notification_sink(id, NotificationTarget, auth)` |
+
+Notification targets explicitly select `shared_udp(listener_index, destination)`,
+`udp(endpoint_builder, destination)`, `tcp(session_builder)`, or `peer(existing)`.
+The shared index follows configured listener order; index zero selects the default
+UDP bind. Shared traps and Informs use the same source endpoint as commands.
+Separate UDP/TCP resources prepare with the Agent and run under its supervisor.
+TCP targets connect during preparation; selected existing sessions never reconnect,
+replay, or fall back to UDP. Use `Agent::notification_peer` for accepted sessions
+obtained after startup, enabling client exchanges on the selected service first.
+Sink outcomes include endpoint/session identity, transport and limits without credentials.
+
+See [shared UDP roles](examples/shared_udp_roles.rs) and
+[shared TCP roles](examples/shared_tcp_roles.rs) for command handling alongside
+Agent notification sends. SNMPv3 traps use the originating Agent's persisted engine;
+Informs discover the receiver's authoritative engine. Runtime v3 originators require
+prepared authoritative state, an AES role for AES privacy, or durable DES sender
+state for DES/3DES. Closing a notification consumer disables that role while other
+roles continue; root shutdown terminates all owned endpoints and pending exchanges.
+
 ## Command-line tools
 
 The `cli` feature provides the `asnmp-get`, `asnmp-walk`, and `asnmp-set`

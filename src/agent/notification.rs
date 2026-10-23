@@ -1,6 +1,6 @@
 //! Agent notification sending (trap/inform).
 //!
-//! Provides trap sink configuration and methods for sending notifications
+//! Provides notification sink configuration and methods for sending notifications
 //! from an agent to configured destinations.
 
 use std::fmt;
@@ -18,6 +18,7 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::Community;
+use crate::RequestTransport;
 use crate::client::{
     Auth, Client, ClientConfig, CommunityVersion, LocalAuthoritativeTimeSource, Retry,
 };
@@ -26,10 +27,64 @@ use crate::handler::SecurityModel;
 use crate::message::{CommunityMessage, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::NotificationPdu;
-use crate::transport::{UdpEndpoint, UdpHandle};
+use crate::transport::BuiltinTransport;
 use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
 use crate::version::Version;
+
+/// Explicit transport selection for a configured notification destination.
+/// Preparation binds/connects owned resources without starting their drivers.
+pub enum NotificationTarget {
+    /// Reuse the UDP listener at this zero-based position in configured listener order.
+    /// With the default `bind` configuration its index is zero.
+    SharedUdp {
+        listener: usize,
+        destination: String,
+    },
+    /// Prepare a separate UDP endpoint, supervised by the Agent runner.
+    Udp {
+        endpoint: crate::UdpEndpointBuilder,
+        destination: String,
+    },
+    /// Prepare an originator-initiated or supplied connected TCP session.
+    Tcp(crate::TcpTransportBuilder),
+    /// Select this exact existing peer. Its service remains independently owned.
+    Peer(BuiltinTransport),
+}
+impl NotificationTarget {
+    /// Select a UDP listener by its position in the Agent listener configuration.
+    /// Index zero selects the default `bind` endpoint. Non-UDP or missing indices
+    /// fail preparation. Hostnames are resolved against the selected socket's
+    /// address family; both traps and Informs use its bound source port.
+    pub fn shared_udp(listener: usize, destination: impl Into<String>) -> Self {
+        Self::SharedUdp {
+            listener,
+            destination: destination.into(),
+        }
+    }
+    /// Prepare a separate UDP endpoint from bind configuration or an owned socket.
+    /// `destination` includes a port and may contain a hostname. Its driver belongs
+    /// to the Agent runner; this endpoint has only the client exchange role.
+    pub fn udp(endpoint: crate::UdpEndpointBuilder, destination: impl Into<String>) -> Self {
+        Self::Udp {
+            endpoint,
+            destination: destination.into(),
+        }
+    }
+    /// Prepare one TCP session using the supplied target, socket or connected stream.
+    /// Target configuration connects during preparation. The Agent runner supervises
+    /// the session driver. A terminated session is never replaced or replayed.
+    pub fn tcp(session: crate::TcpTransportBuilder) -> Self {
+        Self::Tcp(session)
+    }
+    /// Select an existing UDP peer or exact TCP session without opening a connection.
+    /// The peer retains its own service lifetime and requires its runner to be driven.
+    /// Shared application services must have client exchanges enabled for Informs.
+    /// Closed peers fail delivery without reconnection or transport fallback.
+    pub fn peer(peer: impl Into<BuiltinTransport>) -> Self {
+        Self::Peer(peer.into())
+    }
+}
 
 const MAX_NOTIFICATION_SINK_ID_LEN: usize = 32;
 
@@ -169,6 +224,12 @@ pub struct NotificationSinkSummary {
     index: usize,
     id: NotificationSinkId,
     dest: SocketAddr,
+    transport: crate::TransportKind,
+    endpoint_id: crate::EndpointId,
+    session_id: Option<crate::SessionId>,
+    local_addr: SocketAddr,
+    receive_limits: crate::ReceiveLimits,
+    send_capacity: usize,
     version: Version,
     security_level: Option<SecurityLevel>,
 }
@@ -192,6 +253,31 @@ impl NotificationSinkSummary {
         self.dest
     }
 
+    /// Selected transport protocol.
+    pub fn transport(&self) -> crate::TransportKind {
+        self.transport
+    }
+    /// Identity of the selected endpoint.
+    pub fn endpoint_id(&self) -> crate::EndpointId {
+        self.endpoint_id
+    }
+    /// Exact selected TCP session, absent for UDP.
+    pub fn session_id(&self) -> Option<crate::SessionId> {
+        self.session_id
+    }
+    /// Bound UDP address or connected TCP local address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+    /// Advertised and accepted receive capacities for Inform exchanges.
+    pub fn receive_limits(&self) -> crate::ReceiveLimits {
+        self.receive_limits
+    }
+    /// Maximum encoded outgoing SNMP message length.
+    pub fn send_capacity(&self) -> usize {
+        self.send_capacity
+    }
+
     /// SNMP version used for this sink.
     #[must_use]
     pub fn version(&self) -> Version {
@@ -210,6 +296,7 @@ impl NotificationSinkSummary {
 /// Stores resolved credentials and cached keys for sending traps and informs
 /// to a specific target.
 pub(crate) struct TrapSink {
+    peer: BuiltinTransport,
     pub(crate) summary: NotificationSinkSummary,
     auth: Auth,
     pub(crate) community: Community,
@@ -217,44 +304,13 @@ pub(crate) struct TrapSink {
     /// Keys derived against the agent's `engine_id` for V3 trap sending.
     /// Lazily populated on first use.
     pub(crate) derived_keys: RwLock<Option<DerivedKeys>>,
-    /// Timeout for each unconfirmed trap datagram send.
+    /// Timeout for each unconfirmed trap message send.
     trap_send_timeout: Duration,
     /// Inform request timeout and retry policy.
     inform_timeout: Duration,
     inform_retry: Retry,
     /// Cached client for inform sending. Lazily created on first inform.
-    inform_client: AsyncMutex<Option<Client<UdpHandle>>>,
-}
-
-/// Agent-owned Inform endpoints, shared by every sink in an address family.
-pub(crate) struct InformTransportPool {
-    ipv4: AsyncMutex<Option<crate::transport::RunningUdpEndpoint>>,
-    ipv6: AsyncMutex<Option<crate::transport::RunningUdpEndpoint>>,
-}
-
-impl InformTransportPool {
-    pub(crate) fn new() -> Self {
-        Self {
-            ipv4: AsyncMutex::new(None),
-            ipv6: AsyncMutex::new(None),
-        }
-    }
-
-    async fn handle(&self, target: SocketAddr) -> Result<UdpHandle> {
-        let (slot, bind_addr) = if target.is_ipv6() {
-            (&self.ipv6, "[::]:0")
-        } else {
-            (&self.ipv4, "0.0.0.0:0")
-        };
-        let mut transport = slot.lock().await;
-        if transport.is_none() {
-            *transport = Some(UdpEndpoint::spawn(bind_addr).await?);
-        }
-        transport
-            .as_ref()
-            .expect("Inform transport was initialized")
-            .handle(target)
-    }
+    inform_client: AsyncMutex<Option<Client<BuiltinTransport>>>,
 }
 
 impl TrapSink {
@@ -262,7 +318,7 @@ impl TrapSink {
     pub(crate) fn new(
         index: usize,
         id: NotificationSinkId,
-        dest: SocketAddr,
+        peer: BuiltinTransport,
         auth: Auth,
         trap_send_timeout: Duration,
         inform_timeout: Duration,
@@ -272,7 +328,13 @@ impl TrapSink {
         let summary = NotificationSinkSummary {
             index,
             id,
-            dest,
+            dest: peer.peer_addr(),
+            transport: peer.transport_kind(),
+            endpoint_id: peer.endpoint_id(),
+            session_id: peer.session_id(),
+            local_addr: peer.local_addr(),
+            receive_limits: peer.receive_limits(),
+            send_capacity: peer.send_capacity(),
             version: auth.version(),
             security_level: match &auth {
                 Auth::Community { .. } => None,
@@ -282,6 +344,7 @@ impl TrapSink {
         match auth {
             Auth::Community { community, .. } => TrapSink {
                 summary,
+                peer,
                 auth: sink_auth,
                 community: community.clone(),
                 v3_security: None,
@@ -293,6 +356,7 @@ impl TrapSink {
             },
             Auth::Usm(security) => TrapSink {
                 summary,
+                peer,
                 auth: sink_auth,
                 community: Community::default(),
                 v3_security: Some(security),
@@ -336,10 +400,9 @@ impl TrapSink {
     /// Get or create the cached inform client for this sink.
     async fn get_or_create_inform_client(
         &self,
-        transports: &InformTransportPool,
         des_salt_state: Option<&crate::v3::DesSaltState>,
         agent_state: Option<&Arc<super::AgentState>>,
-    ) -> Result<Client<UdpHandle>> {
+    ) -> Result<Client<BuiltinTransport>> {
         let mut guard = self.inform_client.lock().await;
         if let Some(ref client) = *guard {
             return Ok(client.clone());
@@ -364,8 +427,7 @@ impl TrapSink {
             ..ClientConfig::default()
         };
 
-        let handle = transports.handle(self.summary.dest).await?;
-        let client = Client::new(handle, config)?;
+        let client = Client::new(self.peer.clone(), config)?;
         *guard = Some(client.clone());
         Ok(client)
     }
@@ -462,7 +524,7 @@ impl NotificationSendStream<'_> {
     ///
     /// Outcomes already yielded by [`next`](Self::next) are not included.
     pub async fn into_outcome(mut self) -> NotificationOutcome {
-        let mut sinks = Vec::with_capacity(self.agent.inner.trap_sinks.len());
+        let mut sinks = Vec::with_capacity(self.agent.sinks.len());
         while let Some(outcome) = self.next().await {
             sinks.push(outcome);
         }
@@ -473,10 +535,8 @@ impl NotificationSendStream<'_> {
 
 impl<'a> NotificationSendStream<'a> {
     fn admit(&mut self) {
-        while self.pending.len() < self.admission_limit
-            && self.next_sink < self.agent.inner.trap_sinks.len()
-        {
-            let sink = &self.agent.inner.trap_sinks[self.next_sink];
+        while self.pending.len() < self.admission_limit && self.next_sink < self.agent.sinks.len() {
+            let sink = &self.agent.sinks[self.next_sink];
             let agent = self.agent;
             self.next_sink += 1;
             let future: PendingSinkOutcome<'a> = match &self.operation {
@@ -526,7 +586,7 @@ impl Stream for NotificationSendStream<'_> {
 
 impl FusedStream for NotificationSendStream<'_> {
     fn is_terminated(&self) -> bool {
-        self.next_sink == self.agent.inner.trap_sinks.len() && self.pending.is_empty()
+        self.next_sink == self.agent.sinks.len() && self.pending.is_empty()
     }
 }
 
@@ -704,7 +764,7 @@ impl super::Agent {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
-    ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
+    ///     .notification_sink(NotificationSinkId::new("primary").unwrap(), async_snmp::NotificationTarget::shared_udp(0, "192.168.1.100:162"), Auth::v2c("public"))
     ///     .allow_all_access()
     ///     .spawn()
     ///     .await?;
@@ -776,15 +836,15 @@ impl super::Agent {
         }
     }
 
-    /// Send an inform to all configured trap sinks, reporting every outcome.
+    /// Send an inform to all configured notification sinks, reporting every outcome.
     ///
     /// Constructs an `InformRequest` PDU and sends it to each destination,
     /// waiting for acknowledgement from each. Sink exchanges run concurrently,
     /// and outcomes remain in sink configuration order. Reuses a cached client
-    /// per sink and one Inform UDP endpoint per destination address family for
-    /// request/response exchanges.
+    /// per sink over the same selected peer used for traps. Owned transport
+    /// drivers run only while the Agent runner is driven.
     ///
-    /// V1 trap sinks are explicitly reported as skipped because v1 does not
+    /// V1 notification sinks are explicitly reported as skipped because v1 does not
     /// support informs. For a V3 sink, the receiver is authoritative; the
     /// cached client discovers and uses the sink's engine identity and trusted
     /// time rather than the Agent's local authoritative state. Each
@@ -800,7 +860,7 @@ impl super::Agent {
     /// let agent = Agent::builder()
     ///     .bind("0.0.0.0:1161")
     ///     .community(b"public")
-    ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
+    ///     .notification_sink(NotificationSinkId::new("primary").unwrap(), async_snmp::NotificationTarget::shared_udp(0, "192.168.1.100:162"), Auth::v2c("public"))
     ///     .allow_all_access()
     ///     .spawn()
     ///     .await?;
@@ -901,25 +961,14 @@ impl super::Agent {
 
     /// Send a trap PDU to a single sink.
     async fn send_trap_to_sink(&self, sink: &TrapSink, pdu: &NotificationPdu) -> Result<()> {
+        self.ensure_notification_active()?;
         let data = match sink.summary.version {
             Version::V1 => {
                 // Convert the v2 PDU to a v1 TrapV1Pdu (RFC 3584 Section 3.2).
                 // Use the agent's bound address as agent_addr if available.
-                let local_ip = match self
-                    .network
-                    .udp
-                    .first()
-                    .ok_or_else(|| {
-                        Error::Config("trap sink requires a UDP endpoint".into()).boxed()
-                    })?
-                    .socket()
-                    .local_addr()
-                {
-                    Ok(addr) => match addr.ip() {
-                        std::net::IpAddr::V4(v4) => v4.octets(),
-                        std::net::IpAddr::V6(_) => [0, 0, 0, 0],
-                    },
-                    Err(_) => [0, 0, 0, 0],
+                let local_ip = match sink.peer.local_addr().ip() {
+                    std::net::IpAddr::V4(v4) => v4.octets(),
+                    std::net::IpAddr::V6(_) => [0; 4],
                 };
                 let trap = pdu.to_v1_trap(local_ip)?;
                 let msg = CommunityMessage::v1_trap(sink.community.clone(), trap.into_raw())?;
@@ -958,21 +1007,18 @@ impl super::Agent {
                     self.inner.des_salt_state.as_ref(),
                     Some(engine_boots),
                     false, // reportable=false for traps
-                    crate::transport::EndpointLimits::UDP.receive.advertised(),
+                    sink.peer.receive_limits().advertised(),
                 )?;
                 Ok(Bytes::from(encoded))
             }
         }?;
 
         tracing::debug!(target: "async_snmp::agent", { snmp.sink_id = %sink.summary.id, snmp.dest = %sink.summary.dest, snmp.bytes = data.len() }, "sending trap");
-        use crate::RequestTransport;
-        self.network
-            .udp
-            .first()
-            .ok_or_else(|| Error::Config("trap sink requires a UDP endpoint".into()).boxed())?
-            .handle(sink.summary.dest)?
-            .send_with_timeout(&data, sink.trap_send_timeout)
-            .await?;
+        tokio::select! {
+            biased;
+            () = self.inner.cancel.cancelled() => return Err(Error::Config("agent notification originator stopped".into()).boxed()),
+            result = sink.peer.send_with_timeout(&data, sink.trap_send_timeout) => result?,
+        }
 
         Ok(())
     }
@@ -985,16 +1031,87 @@ impl super::Agent {
         uptime: u32,
         varbinds: &[VarBind],
     ) -> Result<crate::client::ResponseMetadata> {
+        self.ensure_notification_active()?;
         let client = sink
             .get_or_create_inform_client(
-                &self.inner.inform_transports,
                 self.inner.des_salt_state.as_ref(),
                 Some(&self.inner.state),
             )
             .await?;
-        client
-            .send_inform_with_metadata(trap_oid, uptime, varbinds.to_vec())
-            .await
+        tokio::select! {
+            biased;
+            () = self.inner.cancel.cancelled() => Err(Error::Config("agent notification originator stopped".into()).boxed()),
+            result = client.send_inform_with_metadata(trap_oid, uptime, varbinds.to_vec()) => result,
+        }
+    }
+
+    fn ensure_notification_active(&self) -> Result<()> {
+        if self.inner.cancel.is_cancelled() {
+            return Err(Error::Config("agent notification originator stopped".into()).boxed());
+        }
+        Ok(())
+    }
+
+    /// Select an existing peer for runtime notifications, including accepted TCP sessions.
+    /// No connection is opened or replaced. The returned handle retains this Agent and
+    /// the selected peer's service lifetime. Its sink index is zero.
+    ///
+    /// Enable `client_exchanges(true)` when preparing a shared service used for
+    /// Inform acknowledgements. SNMPv3 requires this Agent's prepared authoritative
+    /// engine. AES privacy additionally requires an AES user or configured sink
+    /// during preparation, and DES/3DES requires durable `des_salt_state`.
+    /// Credentials are validated here; no transport I/O or background task starts.
+    pub fn notification_peer(
+        &self,
+        id: NotificationSinkId,
+        peer: impl Into<BuiltinTransport>,
+        auth: impl Into<Auth>,
+    ) -> Result<NotificationPeer> {
+        self.ensure_notification_active()?;
+        let mut auth = auth.into();
+        if let Auth::Usm(security) = &mut auth {
+            security
+                .validate_and_precompute()
+                .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+            if self.inner.state.authoritative_engine.is_none() {
+                return Err(Error::Config(
+                    "authoritative engine state is required for SNMPv3 notification originators"
+                        .into(),
+                )
+                .boxed());
+            }
+            if security
+                .priv_protocol()
+                .is_some_and(crate::PrivProtocol::is_des_family)
+                && self.inner.des_salt_state.is_none()
+            {
+                return Err(Error::Config(
+                    "durable DES sender state is required for DES/3DES notifications".into(),
+                )
+                .boxed());
+            }
+            if security.priv_protocol().is_some_and(|p| !p.is_des_family())
+                && self.inner.salt_counter.is_none()
+            {
+                return Err(Error::Config(
+                    "configure an AES USM role before preparing an AES notification originator"
+                        .into(),
+                )
+                .boxed());
+            }
+        }
+        Ok(NotificationPeer {
+            agent: self.clone(),
+            sink: TrapSink::new(
+                0,
+                id,
+                peer.into(),
+                auth,
+                self.inner.trap_send_timeout,
+                self.inner.inform_timeout,
+                self.inner.inform_retry.clone(),
+            ),
+        })
     }
 
     /// Generate a notification request/message ID.
@@ -1008,6 +1125,34 @@ impl super::Agent {
                 Some(if v == i32::MAX { 1 } else { v + 1 })
             })
             .unwrap_or(1)
+    }
+}
+
+/// Runtime notification originator selecting one exact peer and Agent security context.
+pub struct NotificationPeer {
+    agent: super::Agent,
+    sink: TrapSink,
+}
+impl NotificationPeer {
+    /// Credential-free identity and limits of this selected peer.
+    pub fn summary(&self) -> &NotificationSinkSummary {
+        &self.sink.summary
+    }
+    /// Send an unconfirmed notification using the Agent's local authoritative state.
+    /// The outcome includes VACM skips and encoding/write failures. Cancellation
+    /// preserves TCP framing; a closed session fails without replacement.
+    pub async fn send_trap(&self, oid: &Oid, uptime: u32, varbinds: Vec<VarBind>) -> SinkOutcome {
+        self.agent
+            .trap_sink_outcome(&self.sink, oid, uptime, &varbinds)
+            .await
+    }
+    /// Exchange an Inform using the receiver's authoritative engine and the Agent's
+    /// configured timeout/retry policy. The outcome retains accepted response metadata;
+    /// v1 is skipped. Dropping this future cancels the exchange and further retries.
+    pub async fn send_inform(&self, oid: &Oid, uptime: u32, varbinds: Vec<VarBind>) -> SinkOutcome {
+        self.agent
+            .inform_sink_outcome(&self.sink, oid, uptime, &varbinds)
+            .await
     }
 }
 
@@ -1025,63 +1170,25 @@ mod tests {
     use futures_util::stream::FuturesUnordered;
     use std::sync::Arc;
 
-    fn test_sink(auth: impl Into<Auth>) -> TrapSink {
+    async fn test_sink(auth: impl Into<Auth>) -> TrapSink {
         TrapSink::new(
             0,
             NotificationSinkId::new("test-sink").unwrap(),
-            "127.0.0.1:9".parse().unwrap(),
+            crate::UdpEndpoint::builder()
+                .bind("127.0.0.1:0")
+                .prepare()
+                .await
+                .unwrap()
+                .into_parts()
+                .0
+                .handle("127.0.0.1:9".parse().unwrap())
+                .unwrap()
+                .into(),
             auth.into(),
             crate::client::DEFAULT_SEND_TIMEOUT,
             std::time::Duration::from_millis(10),
             crate::client::Retry::default(),
         )
-    }
-
-    #[tokio::test]
-    async fn inform_clients_share_one_lazy_endpoint_per_family() {
-        let first_receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let second_receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let first_target = first_receiver.local_addr().unwrap();
-        let second_target = second_receiver.local_addr().unwrap();
-        let agent = Agent::builder()
-            .bind("127.0.0.1:0")
-            .trap_sink(
-                NotificationSinkId::new("first").unwrap(),
-                first_target.to_string(),
-                Auth::v2c("public"),
-            )
-            .trap_sink(
-                NotificationSinkId::new("second").unwrap(),
-                second_target.to_string(),
-                Auth::v2c("private"),
-            )
-            .allow_all_access()
-            .build()
-            .await
-            .unwrap();
-
-        assert!(agent.inner.inform_transports.ipv4.lock().await.is_none());
-        let (first, second) = tokio::join!(
-            agent.inner.trap_sinks[0].get_or_create_inform_client(
-                &agent.inner.inform_transports,
-                None,
-                None
-            ),
-            agent.inner.trap_sinks[1].get_or_create_inform_client(
-                &agent.inner.inform_transports,
-                None,
-                None
-            ),
-        );
-        let first = first.unwrap();
-        let second = second.unwrap();
-        assert_eq!(first.peer_addr(), first_target);
-        assert_eq!(second.peer_addr(), second_target);
-
-        let transport = agent.inner.inform_transports.ipv4.lock().await;
-        let endpoint = transport.as_ref().expect("IPv4 endpoint was not cached");
-        assert_ne!(endpoint.local_addr().port(), agent.local_addr().port());
-        assert!(agent.inner.inform_transports.ipv6.lock().await.is_none());
     }
 
     #[cfg(feature = "crypto-rustcrypto")]
@@ -1103,9 +1210,9 @@ mod tests {
             .bind("127.0.0.1:0")
             .authoritative_engine(engine)
             .des_salt_state(des_state.clone())
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("des-sink").unwrap(),
-                "127.0.0.1:9",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 auth,
             )
             .allow_all_access()
@@ -1185,15 +1292,15 @@ mod tests {
             .bind("127.0.0.1:0")
             .authoritative_engine(engine.clone())
             .des_salt_state(des_state)
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("des-inform").unwrap(),
-                receiver_addr.to_string(),
+                crate::NotificationTarget::shared_udp(0, receiver_addr.to_string()),
                 sink_auth,
             )
             .inform_timeout(std::time::Duration::from_secs(1))
             .inform_retry(crate::Retry::none())
             .allow_all_access()
-            .build()
+            .spawn()
             .await
             .unwrap();
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
@@ -1286,15 +1393,23 @@ mod tests {
             .unwrap();
         let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
 
-        assert!(agent.notification_allowed(&test_sink(Auth::v1("v1-community")), &trap_oid, &[]));
-        assert!(agent.notification_allowed(&test_sink(Auth::v2c("v2-community")), &trap_oid, &[]));
         assert!(agent.notification_allowed(
-            &test_sink(crate::UsmConfig::new("context-user").context_name("tenant/blue"),),
+            &test_sink(Auth::v1("v1-community")).await,
+            &trap_oid,
+            &[]
+        ));
+        assert!(agent.notification_allowed(
+            &test_sink(Auth::v2c("v2-community")).await,
+            &trap_oid,
+            &[]
+        ));
+        assert!(agent.notification_allowed(
+            &test_sink(crate::UsmConfig::new("context-user").context_name("tenant/blue"),).await,
             &trap_oid,
             &[]
         ));
         assert!(!agent.notification_allowed(
-            &test_sink(crate::UsmConfig::new("context-user").context_name("tenant/red"),),
+            &test_sink(crate::UsmConfig::new("context-user").context_name("tenant/red"),).await,
             &trap_oid,
             &[]
         ));
@@ -1305,7 +1420,8 @@ mod tests {
                         .auth(AuthProtocol::Sha256, "auth-password")
                         .unwrap()
                         .context_name("secure")
-                ),
+                )
+                .await,
                 &trap_oid,
                 &[]
             )
@@ -1322,7 +1438,8 @@ mod tests {
                         )
                         .unwrap()
                         .context_name("secure")
-                ),
+                )
+                .await,
                 &trap_oid,
                 &[]
             )
@@ -1379,23 +1496,35 @@ mod tests {
         let extra = VarBind::new(denied_extra, Value::Integer(1));
 
         assert!(!agent.notification_allowed(
-            &test_sink(Auth::v2c("trap-denied")),
+            &test_sink(Auth::v2c("trap-denied")).await,
             &denied_trap,
             &[]
         ));
         assert!(!agent.notification_allowed(
-            &test_sink(Auth::v2c("extra-denied")),
+            &test_sink(Auth::v2c("extra-denied")).await,
             &allowed_trap,
             &[extra]
         ));
-        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("missing")), &allowed_trap, &[]));
-        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("empty")), &allowed_trap, &[]));
         assert!(!agent.notification_allowed(
-            &test_sink(Auth::v2c("no-access")),
+            &test_sink(Auth::v2c("missing")).await,
             &allowed_trap,
             &[]
         ));
-        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("no-group")), &allowed_trap, &[]));
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::v2c("empty")).await,
+            &allowed_trap,
+            &[]
+        ));
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::v2c("no-access")).await,
+            &allowed_trap,
+            &[]
+        ));
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::v2c("no-group")).await,
+            &allowed_trap,
+            &[]
+        ));
     }
 
     #[tokio::test]
@@ -1423,11 +1552,15 @@ mod tests {
         let extra = VarBind::new(extra_oid, Value::Integer(1));
 
         assert!(agent.notification_allowed(
-            &test_sink(Auth::v1("v1")),
+            &test_sink(Auth::v1("v1")).await,
             &trap_oid,
             std::slice::from_ref(&extra)
         ));
-        assert!(!agent.notification_allowed(&test_sink(Auth::v2c("v2")), &trap_oid, &[extra]));
+        assert!(!agent.notification_allowed(
+            &test_sink(Auth::v2c("v2")).await,
+            &trap_oid,
+            &[extra]
+        ));
     }
 
     #[tokio::test]
@@ -1435,21 +1568,21 @@ mod tests {
         let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
         let permissive = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
         assert!(permissive.notification_allowed(
-            &test_sink(Auth::v2c("unmapped")),
+            &test_sink(Auth::v2c("unmapped")).await,
             &trap_oid,
             &[VarBind::new(oid!(9, 9), Value::Integer(1))]
         ));
 
         let mixed = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("allowed").unwrap(),
-                "127.0.0.1:9",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 Auth::v2c("allowed"),
             )
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("denied").unwrap(),
-                "127.0.0.1:9",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 Auth::v2c("denied"),
             )
             .vacm(|v| {
@@ -1482,9 +1615,9 @@ mod tests {
 
         let denied_inform = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("denied").unwrap(),
-                "127.0.0.1:9",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 Auth::v2c("denied"),
             )
             .vacm(|v| {
@@ -1509,9 +1642,9 @@ mod tests {
 
         let denied_v1_inform = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("denied-v1").unwrap(),
-                "127.0.0.1:9",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 Auth::v1("denied"),
             )
             .vacm(|v| v)
@@ -1531,9 +1664,9 @@ mod tests {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("public").unwrap(),
-                "127.0.0.1:9",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 Auth::v2c("public"),
             )
             .allow_all_access()
@@ -1564,9 +1697,9 @@ mod tests {
     async fn unpolled_trap_stream_does_not_allocate_request_id() {
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("lazy").unwrap(),
-                "127.0.0.1:9",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 Auth::v1("public"),
             )
             .build()
@@ -1591,9 +1724,9 @@ mod tests {
             .bind("127.0.0.1:0")
             .notification_fanout_limit(2);
         for index in 0..5 {
-            builder = builder.trap_sink(
+            builder = builder.notification_sink(
                 NotificationSinkId::new(format!("sink-{index}")).unwrap(),
-                format!("127.0.0.1:{}", 20_000 + index),
+                crate::NotificationTarget::shared_udp(0, format!("127.0.0.1:{}", 20_000 + index)),
                 Auth::v2c("public"),
             );
         }
@@ -1623,7 +1756,7 @@ mod tests {
         let agent = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
         let pending = FuturesUnordered::new();
         for (index, delay) in [(0, 20), (1, 1)] {
-            let mut sink = test_sink(Auth::v2c("public")).summary;
+            let mut sink = test_sink(Auth::v2c("public")).await.summary;
             sink.index = index;
             pending.push(Box::pin(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;

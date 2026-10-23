@@ -102,9 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap()
         // Configure a sink. The agent sends each notification to all sinks.
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("local-receiver").unwrap(),
-            recv_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, recv_addr.to_string()),
             Auth::v2c("public"),
         )
         .allow_all_access()

@@ -1,7 +1,8 @@
 //! Bidirectional commands and notifications on one explicitly shared connection.
 //! Run: cargo run --example shared_tcp_roles --features agent
 use async_snmp::{
-    Agent, Auth, ClientBuilder, ListenerSource, NotificationReceiver, TcpTransport, oid,
+    Agent, Auth, ClientBuilder, ListenerSource, NotificationReceiver, NotificationSinkId,
+    SinkStatus, TcpTransport, oid,
 };
 
 #[tokio::main]
@@ -22,11 +23,18 @@ async fn main() -> async_snmp::Result<()> {
         .spawn()
         .await?;
     let mut notifications = collector.take_notifications().unwrap();
-    let originator = ClientBuilder::new(Auth::v2c("public"))
-        .build_with_transport(device.tcp_sessions()[0].clone())?;
-    originator
+    let originator = device.notification_peer(
+        NotificationSinkId::new("collector").unwrap(),
+        device.tcp_sessions()[0].clone(),
+        Auth::v2c("public"),
+    )?;
+    let outcome = originator
         .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
-        .await?;
+        .await;
+    assert!(
+        matches!(outcome.status, SinkStatus::Succeeded),
+        "{outcome:?}"
+    );
     let event = notifications.recv().await.unwrap();
     let session = collector
         .tcp_sessions()

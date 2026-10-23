@@ -1,0 +1,665 @@
+#![cfg(feature = "agent")]
+use async_snmp::{
+    Agent, Auth, ClientBuilder, ListenerSource, NotificationReceiver, NotificationSinkId,
+    NotificationTarget, RequestTransport, Retry, SinkStatus, TcpTransport, TransportKind,
+    UdpEndpoint, oid,
+};
+use std::time::Duration;
+use tokio::net::{TcpListener, UdpSocket};
+const WAIT: Duration = Duration::from_secs(3);
+fn id(value: &str) -> NotificationSinkId {
+    NotificationSinkId::new(value).unwrap()
+}
+fn cold() -> async_snmp::Oid {
+    oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1)
+}
+fn engine_oid() -> async_snmp::Oid {
+    oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0)
+}
+
+#[tokio::test]
+async fn shared_wildcard_udp_commands_and_notifications_use_one_port() {
+    let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
+    let target = receiver.bound_addresses()[0].local_addr;
+    let agent = Agent::builder()
+        .bind("0.0.0.0:0")
+        .community("public")
+        .allow_all_access()
+        .notification_sink(
+            id("shared"),
+            NotificationTarget::shared_udp(0, target.to_string()),
+            Auth::v2c("public"),
+        )
+        .inform_retry(Retry::none())
+        .inform_timeout(WAIT)
+        .spawn()
+        .await
+        .unwrap();
+    let port = agent.bound_addresses()[0].local_addr.port();
+    let manager_endpoint = UdpEndpoint::builder()
+        .bind("127.0.0.1:0")
+        .spawn()
+        .await
+        .unwrap();
+    let peer = manager_endpoint
+        .handle(format!("127.0.0.2:{port}").parse().unwrap())
+        .unwrap()
+        .strict_source(true);
+    let manager = ClientBuilder::new(Auth::v2c("public"))
+        .retry(Retry::none())
+        .request_timeout(WAIT)
+        .build_with_transport(peer)
+        .unwrap();
+    let query = engine_oid();
+    let trap = cold();
+    let (get, inform, sent) = tokio::join!(
+        manager.get(&query),
+        agent.send_inform(&trap, 1, vec![]),
+        agent.send_trap(&trap, 2, vec![])
+    );
+    get.unwrap();
+    assert!(inform.all_succeeded(), "{inform:?}");
+    assert!(sent.all_succeeded());
+    for _ in 0..2 {
+        let event = tokio::time::timeout(WAIT, receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.receive_info.peer_addr().port(), port);
+    }
+    let summary = agent.notification_sinks().next().unwrap();
+    assert_eq!(
+        summary.endpoint_id(),
+        agent.bound_addresses()[0].endpoint_id
+    );
+    assert_eq!(summary.transport(), TransportKind::Udp);
+    assert_eq!(summary.session_id(), None);
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dedicated_udp_and_tcp_are_prepared_and_mixed_fanout_preserves_order() {
+    let mut udp = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
+    let mut tcp = NotificationReceiver::builder()
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let prepared = Agent::builder()
+        .bind("127.0.0.1:0")
+        .notification_sink(
+            id("tcp"),
+            NotificationTarget::tcp(
+                TcpTransport::builder()
+                    .target(tcp.bound_addresses()[0].local_addr)
+                    .max_message_size(256 * 1024),
+            ),
+            Auth::v2c("public"),
+        )
+        .notification_sink(
+            id("udp"),
+            NotificationTarget::udp(
+                UdpEndpoint::builder()
+                    .bind("127.0.0.1:0")
+                    .max_message_size(4096),
+                udp.bound_addresses()[0].local_addr.to_string(),
+            ),
+            Auth::v2c("public"),
+        )
+        .inform_timeout(WAIT)
+        .inform_retry(Retry::none())
+        .prepare()
+        .await
+        .unwrap();
+    let (handle, runner) = prepared.into_parts();
+    let summaries: Vec<_> = handle.notification_sinks().collect();
+    assert_eq!(summaries[0].transport(), TransportKind::Tcp);
+    assert!(summaries[0].session_id().is_some());
+    assert_eq!(
+        summaries[0].receive_limits().advertised().as_usize(),
+        256 * 1024
+    );
+    assert_eq!(summaries[1].receive_limits().advertised().as_usize(), 4096);
+    assert_ne!(
+        summaries[1].local_addr(),
+        handle.bound_addresses()[0].local_addr
+    );
+    let task = tokio::spawn(runner.run());
+    for inform in [false, true] {
+        let outcome = if inform {
+            handle.send_inform(&cold(), 1, vec![]).await
+        } else {
+            handle.send_trap(&cold(), 1, vec![]).await
+        };
+        assert!(outcome.all_succeeded(), "{outcome:?}");
+        assert_eq!(outcome.sinks()[0].sink.id(), &id("tcp"));
+        assert_eq!(outcome.sinks()[1].sink.id(), &id("udp"));
+        let a = tokio::time::timeout(WAIT, tcp.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let b = tokio::time::timeout(WAIT, udp.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.receive_info.peer_addr(), summaries[0].local_addr());
+        assert_eq!(b.receive_info.peer_addr(), summaries[1].local_addr());
+    }
+    handle.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn accepted_and_connected_sessions_send_both_directions_and_never_reconnect() {
+    let mut server = Agent::builder()
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .client_exchanges(true)
+        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .spawn()
+        .await
+        .unwrap();
+    let mut client = Agent::builder()
+        .session(TcpTransport::builder().target(server.bound_addresses()[0].local_addr))
+        .client_exchanges(true)
+        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .spawn()
+        .await
+        .unwrap();
+    let mut server_events = server.take_notifications().unwrap();
+    let mut client_events = client.take_notifications().unwrap();
+    let connected = client.tcp_sessions()[0].clone();
+    let outbound = client
+        .notification_peer(id("connected"), connected.clone(), Auth::v2c("public"))
+        .unwrap();
+    assert!(matches!(
+        outbound.send_inform(&cold(), 1, vec![]).await.status,
+        SinkStatus::Succeeded
+    ));
+    let event = tokio::time::timeout(WAIT, server_events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let accepted = server
+        .tcp_sessions()
+        .into_iter()
+        .find(|p| Some(p.session_id()) == event.receive_info.session_id())
+        .unwrap();
+    let reverse = server
+        .notification_peer(id("accepted"), accepted.clone(), Auth::v2c("public"))
+        .unwrap();
+    assert_eq!(reverse.summary().session_id(), Some(accepted.session_id()));
+    for inform in [false, true] {
+        let result = if inform {
+            reverse.send_inform(&cold(), 1, vec![]).await
+        } else {
+            reverse.send_trap(&cold(), 1, vec![]).await
+        };
+        assert!(matches!(result.status, SinkStatus::Succeeded), "{result:?}");
+        let event = tokio::time::timeout(WAIT, client_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event.receive_info.session_id(),
+            Some(connected.session_id())
+        );
+    }
+    assert!(matches!(
+        outbound.send_trap(&cold(), 1, vec![]).await.status,
+        SinkStatus::Succeeded
+    ));
+    tokio::time::timeout(WAIT, server_events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    accepted.control().shutdown().await;
+    for inform in [false, true] {
+        let result = if inform {
+            reverse.send_inform(&cold(), 1, vec![]).await
+        } else {
+            reverse.send_trap(&cold(), 1, vec![]).await
+        };
+        assert!(matches!(result.status, SinkStatus::Failed(_)));
+        assert_eq!(result.sink.session_id(), Some(accepted.session_id()));
+    }
+    assert_eq!(client.bound_addresses().len(), 1);
+    server.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_final_handle_stops_shared_sink_root_and_owned_child_drivers() {
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let prepared = Agent::builder()
+        .bind("127.0.0.1:0")
+        .notification_sink(
+            id("shared"),
+            NotificationTarget::shared_udp(0, sink.local_addr().unwrap().to_string()),
+            Auth::v2c("public"),
+        )
+        .notification_sink(
+            id("dedicated"),
+            NotificationTarget::udp(
+                UdpEndpoint::builder().bind("127.0.0.1:0"),
+                sink.local_addr().unwrap().to_string(),
+            ),
+            Auth::v2c("public"),
+        )
+        .inform_timeout(Duration::from_millis(20))
+        .inform_retry(Retry::none())
+        .prepare()
+        .await
+        .unwrap();
+    let (agent, runner) = prepared.into_parts();
+    let bound = agent.bound_addresses().to_vec();
+    let task = tokio::spawn(runner.run());
+    assert!(!agent.send_inform(&cold(), 0, vec![]).await.all_succeeded());
+    drop(agent);
+    tokio::time::timeout(WAIT, task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    for endpoint in bound {
+        UdpSocket::bind(endpoint.local_addr).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unpolled_drop_closes_prepared_children_and_disables_notifications() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let prepared = Agent::builder()
+        .bind("127.0.0.1:0")
+        .notification_sink(
+            id("tcp"),
+            NotificationTarget::tcp(TcpTransport::builder().target(listener.local_addr().unwrap())),
+            Auth::v2c("public"),
+        )
+        .notification_sink(
+            id("udp"),
+            NotificationTarget::udp(UdpEndpoint::builder().bind("127.0.0.1:0"), "127.0.0.1:9"),
+            Auth::v2c("public"),
+        )
+        .prepare()
+        .await
+        .unwrap();
+    let (agent, runner) = prepared.into_parts();
+    let (mut stream, _) = listener.accept().await.unwrap();
+    drop(runner);
+    use tokio::io::AsyncReadExt;
+    assert_eq!(
+        tokio::time::timeout(WAIT, stream.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(!agent.send_trap(&cold(), 0, vec![]).await.all_succeeded());
+    assert!(!agent.send_inform(&cold(), 0, vec![]).await.all_succeeded());
+    let bound = agent.bound_addresses().to_vec();
+    drop(agent);
+    for endpoint in bound
+        .into_iter()
+        .filter(|b| b.transport == TransportKind::Udp)
+    {
+        UdpSocket::bind(endpoint.local_addr).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_sink_preparation_releases_prior_tcp_and_udp_resources() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let failed = Agent::builder()
+        .listener(ListenerSource::udp_socket(socket))
+        .notification_sink(
+            id("tcp"),
+            NotificationTarget::tcp(TcpTransport::builder().target(listener.local_addr().unwrap())),
+            Auth::v2c("public"),
+        )
+        .notification_sink(
+            id("invalid"),
+            NotificationTarget::shared_udp(99, "127.0.0.1:9"),
+            Auth::v2c("public"),
+        )
+        .prepare()
+        .await;
+    assert!(failed.is_err());
+    UdpSocket::bind(addr).await.unwrap();
+    let (mut stream, _) = listener.accept().await.unwrap();
+    use tokio::io::AsyncReadExt;
+    assert_eq!(
+        tokio::time::timeout(WAIT, stream.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn runner_abort_wakes_pending_informs_and_blocks_external_peer_traps() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let external = UdpEndpoint::builder()
+        .bind("127.0.0.1:0")
+        .spawn()
+        .await
+        .unwrap();
+    let prepared = Agent::builder()
+        .bind("127.0.0.1:0")
+        .notification_sink(
+            id("external"),
+            NotificationTarget::peer(external.handle(target.local_addr().unwrap()).unwrap()),
+            Auth::v2c("public"),
+        )
+        .inform_timeout(Duration::from_secs(60))
+        .inform_retry(Retry::none())
+        .prepare()
+        .await
+        .unwrap();
+    let (agent, runner) = prepared.into_parts();
+    let task = tokio::spawn(runner.run());
+    let cloned = agent.clone();
+    let pending = tokio::spawn(async move { cloned.send_inform(&cold(), 0, vec![]).await });
+    tokio::time::timeout(WAIT, target.recv_from(&mut [0; 2048]))
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let result = tokio::time::timeout(WAIT, pending).await.unwrap().unwrap();
+    assert!(!result.all_succeeded());
+    assert!(!agent.send_trap(&cold(), 0, vec![]).await.all_succeeded());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), target.recv_from(&mut [0; 2048]))
+            .await
+            .is_err()
+    );
+    // The externally owned endpoint remains usable after the Agent terminates.
+    external
+        .handle(target.local_addr().unwrap())
+        .unwrap()
+        .send(b"external")
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, target.recv_from(&mut [0; 32]))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn shared_v3_notifications_keep_trap_and_inform_authority_separate() {
+    use async_snmp::{AuthProtocol, AuthoritativeEngine, Notification, PrivProtocol, UsmConfig};
+    let make_engine = |name: &[u8]| {
+        AuthoritativeEngine::install(name.to_vec(), |_| Ok::<_, std::convert::Infallible>(()))
+            .unwrap()
+    };
+    let sink_engine = make_engine(b"sink-authority");
+    let local_engine = make_engine(b"originator-authority");
+    let mut receiver = NotificationReceiver::builder()
+        .bind("127.0.0.1:0")
+        .authoritative_engine(sink_engine.clone())
+        .accept_all_notifications()
+        .usm_user("user", |u| {
+            u.auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            )
+        })
+        .unwrap()
+        .spawn()
+        .await
+        .unwrap();
+    let security = UsmConfig::new("user")
+        .auth_priv(
+            AuthProtocol::Sha256,
+            b"auth-password",
+            PrivProtocol::Aes128,
+            b"priv-password",
+        )
+        .unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .authoritative_engine(local_engine.clone())
+        .usm_user("user", |u| {
+            u.auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            )
+        })
+        .unwrap()
+        .allow_all_access()
+        .notification_sink(
+            id("private"),
+            NotificationTarget::shared_udp(0, receiver.bound_addresses()[0].local_addr.to_string()),
+            security.clone(),
+        )
+        .inform_retry(Retry::none())
+        .inform_timeout(WAIT)
+        .spawn()
+        .await
+        .unwrap();
+    let endpoint = UdpEndpoint::builder()
+        .bind("127.0.0.1:0")
+        .spawn()
+        .await
+        .unwrap();
+    let client = ClientBuilder::new(security)
+        .retry(Retry::none())
+        .request_timeout(WAIT)
+        .build_with_transport(
+            endpoint
+                .handle(agent.bound_addresses()[0].local_addr)
+                .unwrap(),
+        )
+        .unwrap();
+    let trap = cold();
+    let query = engine_oid();
+    let (command, informed, trapped) = tokio::join!(
+        client.get(&query),
+        agent.send_inform(&trap, 5, vec![]),
+        agent.send_trap(&trap, 6, vec![])
+    );
+    assert!(informed.all_succeeded(), "{informed:?}");
+    assert!(trapped.all_succeeded(), "{trapped:?}");
+    assert_eq!(
+        command.unwrap().varbinds[0].value,
+        async_snmp::Value::OctetString(agent.engine_id().to_vec().into())
+    );
+    let mut saw_trap = false;
+    let mut saw_inform = false;
+    for _ in 0..2 {
+        let event = tokio::time::timeout(WAIT, receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event.receive_info.peer_addr(),
+            agent.bound_addresses()[0].local_addr
+        );
+        let wire = event.wire_identity.v3.as_ref().unwrap();
+        match event.notification {
+            Notification::TrapV3 { .. } => {
+                saw_trap = true;
+                assert_eq!(wire.authoritative_engine_id.as_ref(), agent.engine_id());
+            }
+            Notification::InformV3 { .. } => {
+                saw_inform = true;
+                assert_eq!(
+                    wire.authoritative_engine_id.as_ref(),
+                    sink_engine.engine_id()
+                );
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+    assert!(saw_trap && saw_inform);
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_udp_retransmissions_keep_port_and_stream_cancellation_stops_retries() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .notification_sink(
+            id("retry"),
+            NotificationTarget::shared_udp(0, socket.local_addr().unwrap().to_string()),
+            Auth::v2c("public"),
+        )
+        .inform_timeout(Duration::from_millis(100))
+        .inform_retry(Retry::fixed(10, Duration::from_millis(10)).unwrap())
+        .spawn()
+        .await
+        .unwrap();
+    let trap = cold();
+    let mut stream = agent.send_inform_stream(&trap, 0, vec![]);
+    let mut buffer = [0; 2048];
+    for _ in 0..2 {
+        tokio::select! {
+            result = stream.next() => panic!("retry completed early: {result:?}"),
+            received = tokio::time::timeout(WAIT, socket.recv_from(&mut buffer)) => {
+                assert_eq!(received.unwrap().unwrap().1, agent.bound_addresses()[0].local_addr);
+            }
+        }
+    }
+    drop(stream);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(180), socket.recv_from(&mut buffer))
+            .await
+            .is_err()
+    );
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_peer_send_capacity_is_applied_to_traps() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .notification_sink(
+            id("limited"),
+            NotificationTarget::udp(
+                UdpEndpoint::builder().bind("127.0.0.1:0").send_capacity(16),
+                target.local_addr().unwrap().to_string(),
+            ),
+            Auth::v2c("public"),
+        )
+        .spawn()
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.notification_sinks().next().unwrap().send_capacity(),
+        16
+    );
+    assert!(!agent.send_trap(&cold(), 0, vec![]).await.all_succeeded());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), target.recv_from(&mut [0; 2048]))
+            .await
+            .is_err()
+    );
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_sink_resolves_using_selected_listener_family_and_rejects_tcp_indices() {
+    let mut receiver = NotificationReceiver::spawn("[::]:0").await.unwrap();
+    let agent = Agent::builder()
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::udp("[::]:0"))
+        .notification_sink(
+            id("ipv6"),
+            NotificationTarget::shared_udp(
+                1,
+                format!(
+                    "localhost:{}",
+                    receiver.bound_addresses()[0].local_addr.port()
+                ),
+            ),
+            Auth::v2c("public"),
+        )
+        .inform_timeout(WAIT)
+        .inform_retry(Retry::none())
+        .spawn()
+        .await
+        .unwrap();
+    let summary = agent.notification_sinks().next().unwrap();
+    assert!(summary.dest().is_ipv6());
+    assert_eq!(
+        summary.endpoint_id(),
+        agent.bound_addresses()[1].endpoint_id
+    );
+    assert!(agent.send_inform(&cold(), 0, vec![]).await.all_succeeded());
+    let event = tokio::time::timeout(WAIT, receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        event.receive_info.peer_addr().port(),
+        summary.local_addr().port()
+    );
+    agent.shutdown().await.unwrap();
+    assert!(
+        Agent::builder()
+            .listener(ListenerSource::tcp("127.0.0.1:0"))
+            .notification_sink(
+                id("wrong-kind"),
+                NotificationTarget::shared_udp(0, "127.0.0.1:9"),
+                Auth::v2c("public")
+            )
+            .prepare()
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn tcp_traps_and_informs_exceed_udp_capacity() {
+    let mut receiver = NotificationReceiver::builder()
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .max_message_size(256 * 1024)
+        .spawn()
+        .await
+        .unwrap();
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .notification_sink(
+            id("large"),
+            NotificationTarget::tcp(
+                TcpTransport::builder()
+                    .target(receiver.bound_addresses()[0].local_addr)
+                    .max_message_size(256 * 1024),
+            ),
+            Auth::v2c("public"),
+        )
+        .inform_timeout(WAIT)
+        .inform_retry(Retry::none())
+        .spawn()
+        .await
+        .unwrap();
+    let payload = async_snmp::VarBind::new(
+        oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0),
+        async_snmp::Value::OctetString(vec![42; 80_000].into()),
+    );
+    for inform in [false, true] {
+        let result = if inform {
+            agent.send_inform(&cold(), 0, vec![payload.clone()]).await
+        } else {
+            agent.send_trap(&cold(), 0, vec![payload.clone()]).await
+        };
+        assert!(result.all_succeeded(), "{result:?}");
+        let event = tokio::time::timeout(WAIT, receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(event.receive_info.received_len() > async_snmp::MAX_UDP_PAYLOAD);
+    }
+    agent.shutdown().await.unwrap();
+}

@@ -238,10 +238,6 @@ impl UdpEndpoint {
             send: self.inner.config.send_capacity,
         }
     }
-    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
-    pub(crate) fn socket(&self) -> &UdpSocket {
-        &self.inner.socket
-    }
 
     /// Bind and explicitly start a receiver with default configuration.
     ///
@@ -973,6 +969,10 @@ pub struct UdpHandle {
 }
 
 impl UdpHandle {
+    /// Identity of the owning UDP endpoint.
+    pub fn endpoint_id(&self) -> crate::EndpointId {
+        self.inner.endpoint_id
+    }
     /// Snapshot cumulative statistics for this handle's UDP endpoint.
     ///
     /// The counters are shared by all handles and clients using the socket and

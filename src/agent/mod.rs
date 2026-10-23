@@ -147,8 +147,9 @@ pub mod vacm;
 
 pub use crate::handler::SecurityModel;
 pub use notification::{
-    NotificationOutcome, NotificationSendStream, NotificationSinkId, NotificationSinkIdError,
-    NotificationSinkSummary, SinkOutcome, SinkSkipReason, SinkStatus,
+    NotificationOutcome, NotificationPeer, NotificationSendStream, NotificationSinkId,
+    NotificationSinkIdError, NotificationSinkSummary, NotificationTarget, SinkOutcome,
+    SinkSkipReason, SinkStatus,
 };
 pub use vacm::{
     DuplicateVacmAccessEntry, VacmAccessIndex, VacmBuilder, VacmConfig, VacmSecurityModel, View,
@@ -523,7 +524,7 @@ pub struct AgentBuilder {
     recv_buffer_size: Option<usize>,
     authorization: AgentAuthorization,
     cancel: Option<CancellationToken>,
-    trap_sinks: Vec<(NotificationSinkId, String, crate::client::Auth)>,
+    trap_sinks: Vec<(NotificationSinkId, NotificationTarget, crate::client::Auth)>,
     trap_send_timeout: Duration,
     inform_timeout: Duration,
     inform_retry: crate::client::Retry,
@@ -546,7 +547,8 @@ enum TrapSinkTarget {
 
 struct ValidatedTrapSink {
     id: NotificationSinkId,
-    target: TrapSinkTarget,
+    target: Option<TrapSinkTarget>,
+    transport: NotificationTarget,
     auth: crate::client::Auth,
 }
 
@@ -1130,13 +1132,16 @@ impl AgentBuilder {
     /// `id` must be unique within the agent. Its 1-to-32-octet length was
     /// validated when the [`NotificationSinkId`] was constructed.
     /// It is included in delivery outcomes and should remain stable across
-    /// restarts when the application retains sink status. `dest` must include
+    /// restarts when the application retains sink status. UDP destinations include
     /// a port and may be an IPv4 address, bracketed IPv6 address, or hostname.
     /// IPv4 binds accept IPv4 and mapped-IPv6 destinations, normalizing the
     /// latter to IPv4, and reject native IPv6 destinations. IPv6 binds retain
     /// IPv6 destinations and map IPv4 destinations into the dual-stack address
     /// space. Hostname candidates are considered in resolver order under the
-    /// same rules.
+    /// same rules against the selected endpoint. Shared UDP selection enables
+    /// exchanges on the shared service; both traps and Informs use that endpoint.
+    /// Separate UDP/TCP resources are prepared atomically with listeners and run
+    /// under the Agent runner. Existing peers keep their independent service owner.
     ///
     /// # Example
     ///
@@ -1156,8 +1161,8 @@ impl AgentBuilder {
     ///     .bind("0.0.0.0:1161")
     ///     .authoritative_engine(engine)
     ///     .community(b"public")
-    ///     .trap_sink(NotificationSinkId::new("primary").unwrap(), "192.168.1.100:162", Auth::v2c("public"))
-    ///     .trap_sink(NotificationSinkId::new("secure").unwrap(), "10.0.0.1:162", async_snmp::UsmConfig::new("trapuser")
+    ///     .notification_sink(NotificationSinkId::new("primary").unwrap(), async_snmp::NotificationTarget::shared_udp(0, "192.168.1.100:162"), Auth::v2c("public"))
+    ///     .notification_sink(NotificationSinkId::new("secure").unwrap(), async_snmp::NotificationTarget::shared_udp(0, "10.0.0.1:162"), async_snmp::UsmConfig::new("trapuser")
     ///         .auth_priv(
     ///             AuthProtocol::Sha256,
     ///             "authpass",
@@ -1172,13 +1177,13 @@ impl AgentBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn trap_sink(
+    pub fn notification_sink(
         mut self,
         id: NotificationSinkId,
-        dest: impl Into<String>,
+        target: NotificationTarget,
         auth: impl Into<crate::client::Auth>,
     ) -> Self {
-        self.trap_sinks.push((id, dest.into(), auth.into()));
+        self.trap_sinks.push((id, target, auth.into()));
         self
     }
 
@@ -1401,61 +1406,115 @@ impl AgentBuilder {
                 );
             }
         }
-        config.engine_receive_capacity = listeners
-            .iter()
-            .map(|listener| listener.limits().receive.advertised())
-            .min()
-            .expect("at least one listener");
-        let network = Arc::new(AgentNetwork::new(
-            &listeners,
-            config.max_connections,
-            ingress.drops.clone(),
-        )?);
-
+        let shared_listener_count = listeners.len();
+        let mut shared_sink_exchanges = false;
         let mut trap_sinks = Vec::with_capacity(config.trap_sinks.len());
         for (index, sink) in config.trap_sinks.into_iter().enumerate() {
-            let dest = match sink.target {
-                TrapSinkTarget::Address(address) => address,
-                TrapSinkTarget::HostPort {
-                    original,
-                    host,
-                    port,
-                } => {
-                    let addresses = construction
-                        .run(
-                            ConstructionStage::Resolve,
-                            Some(index),
-                            Some(original.clone()),
-                            resolve_host(host, port),
+            let peer = match sink.transport {
+                NotificationTarget::SharedUdp { listener, .. } => {
+                    shared_sink_exchanges = true;
+                    let Some(crate::transport::listener::PreparedListener::Udp {
+                        endpoint, ..
+                    }) = listeners
+                        .get(listener)
+                        .filter(|_| listener < shared_listener_count)
+                    else {
+                        return Err(Error::Config(
+                            "notification sink must select an existing UDP listener index".into(),
                         )
-                        .await?;
-                    addresses
-                        .into_iter()
-                        .find_map(|address| {
-                            normalize_udp_target(config.bind_addr, address).ok()
-                        })
-                        .ok_or_else(|| {
-                        Error::Config(
-                            format!(
-                                "no address resolved for trap sink '{original}' is compatible with Agent bind {}",
-                                config.bind_addr
-                            )
-                            .into(),
-                        )
-                        .boxed()
-                    })?
+                        .boxed());
+                    };
+                    let dest = resolve_notification_destination(
+                        sink.target.expect("validated UDP target"),
+                        endpoint.local_addr(),
+                        &construction,
+                        index,
+                        &mut resolve_host,
+                    )
+                    .await?;
+                    crate::BuiltinTransport::from(endpoint.handle(dest)?)
                 }
+                NotificationTarget::Udp {
+                    endpoint: builder, ..
+                } => {
+                    let (endpoint, runner) = construction
+                        .run(
+                            ConstructionStage::Bind,
+                            Some(index),
+                            None,
+                            builder.prepare(),
+                        )
+                        .await?
+                        .into_parts();
+                    let dest = resolve_notification_destination(
+                        sink.target.expect("validated UDP target"),
+                        endpoint.local_addr(),
+                        &construction,
+                        index,
+                        &mut resolve_host,
+                    )
+                    .await?;
+                    let peer = endpoint.handle(dest)?;
+                    listeners.push(crate::transport::listener::PreparedListener::Udp {
+                        bound: crate::BoundListener {
+                            endpoint_id: endpoint.endpoint_id(),
+                            transport: crate::TransportKind::Udp,
+                            local_addr: endpoint.local_addr(),
+                        },
+                        endpoint,
+                        runner,
+                    });
+                    crate::BuiltinTransport::from(peer)
+                }
+                NotificationTarget::Tcp(builder) => {
+                    let (transport, runner) = construction
+                        .run(
+                            ConstructionStage::Bind,
+                            Some(index),
+                            None,
+                            builder.prepare(),
+                        )
+                        .await?
+                        .into_parts();
+                    let peer = transport.clone();
+                    listeners.push(crate::transport::listener::PreparedListener::Session {
+                        bound: crate::BoundListener {
+                            endpoint_id: transport.endpoint_id(),
+                            transport: crate::TransportKind::Tcp,
+                            local_addr: crate::RequestTransport::local_addr(&transport),
+                        },
+                        transport,
+                        runner,
+                    });
+                    crate::BuiltinTransport::from(peer)
+                }
+                NotificationTarget::Peer(peer) => peer,
             };
             trap_sinks.push(notification::TrapSink::new(
                 index,
                 sink.id,
-                dest,
+                peer,
                 sink.auth,
                 config.trap_send_timeout,
                 config.inform_timeout,
                 config.inform_retry.clone(),
             ));
         }
+        config.engine_receive_capacity = listeners
+            .iter()
+            .map(|listener| listener.limits().receive.advertised())
+            .chain(
+                trap_sinks
+                    .iter()
+                    .map(|sink| sink.summary.receive_limits().advertised()),
+            )
+            .min()
+            .expect("at least one endpoint");
+        let network = Arc::new(AgentNetwork::new(
+            &listeners,
+            config.max_connections,
+            ingress.drops.clone(),
+        )?);
 
         let PreparedAuthoritativeUsm {
             users: usm_users,
@@ -1539,8 +1598,9 @@ impl AgentBuilder {
             concurrency_limit: config.concurrency_limit,
             authorization: config.authorization,
             cancel: config.cancel,
-            trap_sinks,
-            inform_transports: notification::InformTransportPool::new(),
+            trap_send_timeout: config.trap_send_timeout,
+            inform_timeout: config.inform_timeout,
+            inform_retry: config.inform_retry,
             notification_id: std::sync::atomic::AtomicI32::new(1),
             run_active: AtomicBool::new(false),
             run_orphaned: AtomicBool::new(false),
@@ -1564,6 +1624,7 @@ impl AgentBuilder {
         });
         construction.check(ConstructionStage::Prepare, None, None)?;
         let agent = Agent {
+            sinks: Arc::new(trap_sinks),
             inner: inner.clone(),
             network: network.clone(),
             lease: Arc::new(AgentLease::new(inner.cancel.clone())),
@@ -1588,12 +1649,12 @@ impl AgentBuilder {
                     .as_ref()
                     .map(|(processor, _)| processor.clone()),
                 inner.usm_users.clone(),
-                config.client_exchanges,
+                config.client_exchanges || shared_sink_exchanges,
                 notification_role
                     .as_ref()
                     .map_or(64, |(processor, _)| processor.processing_limit()),
             ));
-            for listener in &mut listeners {
+            for listener in listeners.iter_mut().take(shared_listener_count) {
                 listener.configure_dispatch(roles.clone());
             }
         }
@@ -1765,14 +1826,20 @@ impl AgentBuilder {
         let trap_sinks = self
             .trap_sinks
             .into_iter()
-            .map(|(id, destination, auth)| {
-                let target = match parse_trap_sink_target(destination)? {
-                    TrapSinkTarget::Address(address) => {
-                        TrapSinkTarget::Address(normalize_udp_target(bind_addr, address)?)
+            .map(|(id, transport, auth)| {
+                let target = match &transport {
+                    NotificationTarget::SharedUdp { destination, .. }
+                    | NotificationTarget::Udp { destination, .. } => {
+                        Some(parse_trap_sink_target(destination.clone())?)
                     }
-                    target @ TrapSinkTarget::HostPort { .. } => target,
+                    _ => None,
                 };
-                Ok(ValidatedTrapSink { id, target, auth })
+                Ok(ValidatedTrapSink {
+                    id,
+                    target,
+                    transport,
+                    auth,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -1875,6 +1942,37 @@ impl AgentConstructionDeadline {
             elapsed: self.started.elapsed(),
         }
         .boxed()
+    }
+}
+
+async fn resolve_notification_destination<R, F>(
+    target: TrapSinkTarget,
+    local: SocketAddr,
+    construction: &AgentConstructionDeadline,
+    index: usize,
+    resolve: &mut R,
+) -> Result<SocketAddr>
+where
+    R: FnMut(String, u16) -> F,
+    F: Future<Output = Result<Vec<SocketAddr>>>,
+{
+    match target {
+        TrapSinkTarget::Address(address) => normalize_udp_target(local, address),
+        TrapSinkTarget::HostPort {
+            original,
+            host,
+            port,
+        } => {
+            let addresses = construction
+                .run(
+                    ConstructionStage::Resolve,
+                    Some(index),
+                    Some(original.clone()),
+                    resolve(host, port),
+                )
+                .await?;
+            addresses.into_iter().find_map(|address| normalize_udp_target(local, address).ok()).ok_or_else(|| Error::Config(format!("no address resolved for notification sink '{original}' is compatible with selected endpoint {local}").into()).boxed())
+        }
     }
 }
 
@@ -2058,10 +2156,9 @@ pub(crate) struct AgentInner {
     pub(crate) authorization: AgentAuthorization,
     /// Cancellation token for graceful shutdown.
     pub(crate) cancel: CancellationToken,
-    /// Configured trap/inform destinations.
-    pub(crate) trap_sinks: Vec<notification::TrapSink>,
-    /// Inform endpoints shared by all sinks of each destination family.
-    pub(crate) inform_transports: notification::InformTransportPool,
+    pub(crate) trap_send_timeout: Duration,
+    pub(crate) inform_timeout: Duration,
+    pub(crate) inform_retry: crate::Retry,
     /// Per-agent monotonic counter for trap request-ids and v3 notification msgIDs.
     pub(crate) notification_id: std::sync::atomic::AtomicI32,
     /// Maximum sink futures admitted by one notification stream.
@@ -2111,6 +2208,7 @@ pub(crate) struct AgentInner {
 /// # }
 /// ```
 pub struct Agent {
+    pub(crate) sinks: Arc<Vec<notification::TrapSink>>,
     pub(crate) inner: Arc<AgentInner>,
     pub(crate) network: Arc<AgentNetwork>,
     lease: Arc<AgentLease>,
@@ -2179,7 +2277,7 @@ impl Agent {
     pub fn notification_sinks(
         &self,
     ) -> impl ExactSizeIterator<Item = &NotificationSinkSummary> + DoubleEndedIterator {
-        self.inner.trap_sinks.iter().map(|sink| &sink.summary)
+        self.sinks.iter().map(|sink| &sink.summary)
     }
 
     /// Returns the local engine ID.
@@ -3047,6 +3145,7 @@ impl AgentProcessor {
 impl Clone for Agent {
     fn clone(&self) -> Self {
         Self {
+            sinks: self.sinks.clone(),
             inner: Arc::clone(&self.inner),
             network: self.network.clone(),
             lease: self.lease.clone(),
@@ -7006,9 +7105,9 @@ mod tests {
     async fn test_v3_trap_sink_requires_authoritative_engine_before_bind() {
         let result = Agent::builder()
             .bind("not a socket address")
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("v3-sink").unwrap(),
-                "127.0.0.1:162",
+                crate::NotificationTarget::shared_udp(0, "127.0.0.1:162"),
                 crate::Auth::usm("trapuser"),
             )
             .build()
@@ -7192,9 +7291,9 @@ mod tests {
         let error = Agent::builder()
             .bind("not a socket address")
             .construction_timeout(Duration::MAX)
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("never-resolved").unwrap(),
-                "sink.example:162",
+                crate::NotificationTarget::shared_udp(0, "sink.example:162"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(
@@ -7220,14 +7319,14 @@ mod tests {
         let error = Agent::builder()
             .bind("127.0.0.1:0")
             .construction_timeout(Duration::from_millis(100))
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("first").unwrap(),
-                "first.example:162",
+                crate::NotificationTarget::shared_udp(0, "first.example:162"),
                 crate::Auth::v2c("public"),
             )
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("second").unwrap(),
-                "second.example:162",
+                crate::NotificationTarget::shared_udp(0, "second.example:162"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(
@@ -7279,9 +7378,9 @@ mod tests {
         let error = Agent::builder()
             .bind("not a socket address")
             .max_concurrent_requests(0)
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("resolver-must-not-run").unwrap(),
-                "unresolvable.invalid:162",
+                crate::NotificationTarget::shared_udp(0, "unresolvable.invalid:162"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(
@@ -7329,9 +7428,9 @@ mod tests {
 
         let error = Agent::builder()
             .bind(occupied_addr.to_string())
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("invalid").unwrap(),
-                "missing-port",
+                crate::NotificationTarget::shared_udp(0, "missing-port"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(
@@ -7380,9 +7479,9 @@ mod tests {
 
         let error = Agent::builder()
             .bind(occupied_addr.to_string())
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("unresolved").unwrap(),
-                "unresolvable.invalid:162",
+                crate::NotificationTarget::shared_udp(0, "unresolvable.invalid:162"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(
@@ -7410,9 +7509,9 @@ mod tests {
 
         let error = Agent::builder()
             .bind(bind_addr.to_string())
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("unresolved").unwrap(),
-                "unresolvable.invalid:162",
+                crate::NotificationTarget::shared_udp(0, "unresolvable.invalid:162"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(
@@ -7493,17 +7592,17 @@ mod tests {
     fn validated_numeric_trap_sink(bind: &str, destination: SocketAddr) -> Result<SocketAddr> {
         let config = Agent::builder()
             .bind(bind)
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("numeric").unwrap(),
-                destination.to_string(),
+                crate::NotificationTarget::shared_udp(0, destination.to_string()),
                 crate::Auth::v2c("public"),
             )
             .validate_and_normalize()?;
         let target = &config.trap_sinks[0].target;
-        let TrapSinkTarget::Address(address) = target else {
+        let Some(TrapSinkTarget::Address(address)) = target else {
             panic!("numeric destination must remain an address");
         };
-        Ok(*address)
+        normalize_udp_target(bind.parse().unwrap(), *address)
     }
 
     #[test]
@@ -7550,9 +7649,9 @@ mod tests {
     ) -> Result<Agent> {
         Agent::builder()
             .bind(bind)
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("hostname").unwrap(),
-                "sink.example:162",
+                crate::NotificationTarget::shared_udp(0, "sink.example:162"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(
@@ -7585,13 +7684,13 @@ mod tests {
         let agent = agent_with_resolved_trap_sink("127.0.0.1:0", vec![ipv4])
             .await
             .unwrap();
-        assert_eq!(agent.inner.trap_sinks[0].summary.dest(), ipv4);
+        assert_eq!(agent.sinks[0].summary.dest(), ipv4);
 
         let agent = agent_with_resolved_trap_sink("127.0.0.1:0", vec![mapped])
             .await
             .unwrap();
         assert_eq!(
-            agent.inner.trap_sinks[0].summary.dest(),
+            agent.sinks[0].summary.dest(),
             "192.0.2.2:1162".parse().unwrap()
         );
 
@@ -7605,20 +7704,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            agent.inner.trap_sinks[0].summary.dest(),
+            agent.sinks[0].summary.dest(),
             "[::ffff:192.0.2.1]:1161".parse().unwrap()
         );
 
         let agent = agent_with_resolved_trap_sink("[::]:0", vec![mapped])
             .await
             .unwrap();
-        assert_eq!(agent.inner.trap_sinks[0].summary.dest(), mapped);
+        assert_eq!(agent.sinks[0].summary.dest(), mapped);
 
         let agent = agent_with_resolved_trap_sink("[::]:0", vec![native_v6])
             .await
             .unwrap();
         assert_eq!(
-            agent.inner.trap_sinks[0].summary.dest(),
+            agent.sinks[0].summary.dest(),
             native_v6,
             "native IPv6 flow information and scope must be preserved"
         );
@@ -7637,7 +7736,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            agent.inner.trap_sinks[0].summary.dest(),
+            agent.sinks[0].summary.dest(),
             "192.0.2.2:1162".parse().unwrap()
         );
 
@@ -7645,7 +7744,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            agent.inner.trap_sinks[0].summary.dest(),
+            agent.sinks[0].summary.dest(),
             "[::ffff:192.0.2.3]:1163".parse().unwrap(),
             "IPv6 binds must retain resolver order even when a later native IPv6 candidate exists"
         );
@@ -7657,24 +7756,24 @@ mod tests {
         let resolver_calls_for_builder = Arc::clone(&resolver_calls);
         let agent = Agent::builder()
             .bind("127.0.0.1:0")
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("numeric-mapped").unwrap(),
-                "[::ffff:192.0.2.10]:1162",
+                crate::NotificationTarget::shared_udp(0, "[::ffff:192.0.2.10]:1162"),
                 crate::Auth::v2c("public"),
             )
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("resolved").unwrap(),
-                "first.example:162",
+                crate::NotificationTarget::shared_udp(0, "first.example:162"),
                 crate::Auth::v2c("public"),
             )
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("numeric-v4").unwrap(),
-                "192.0.2.30:1162",
+                crate::NotificationTarget::shared_udp(0, "192.0.2.30:1162"),
                 crate::Auth::v2c("public"),
             )
-            .trap_sink(
+            .notification_sink(
                 NotificationSinkId::new("mapped").unwrap(),
-                "second.example:162",
+                crate::NotificationTarget::shared_udp(0, "second.example:162"),
                 crate::Auth::v2c("public"),
             )
             .build_with_dependencies(

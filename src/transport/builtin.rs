@@ -29,12 +29,37 @@ use std::time::Duration;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum BuiltinTransport {
     /// A target handle on a shared or dedicated UDP endpoint.
     Udp(UdpHandle),
     /// A TCP connection to one target.
     Tcp(TcpTransport),
+}
+
+impl BuiltinTransport {
+    /// Selected transport protocol.
+    pub fn transport_kind(&self) -> super::TransportKind {
+        match self {
+            Self::Udp(_) => super::TransportKind::Udp,
+            Self::Tcp(_) => super::TransportKind::Tcp,
+        }
+    }
+    /// Identity of the selected endpoint.
+    pub fn endpoint_id(&self) -> crate::EndpointId {
+        match self {
+            Self::Udp(peer) => peer.endpoint_id(),
+            Self::Tcp(peer) => peer.endpoint_id(),
+        }
+    }
+    /// Identity of the exact TCP session, absent for UDP.
+    pub fn session_id(&self) -> Option<crate::SessionId> {
+        match self {
+            Self::Udp(_) => None,
+            Self::Tcp(peer) => Some(peer.session_id()),
+        }
+    }
 }
 
 impl From<UdpHandle> for BuiltinTransport {

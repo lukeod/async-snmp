@@ -783,8 +783,11 @@ fn notification_sink_identity_types_are_public() {
     let ordered = BTreeMap::from([(non_utf8.clone(), 2), (one.clone(), 1)]);
     assert_eq!(ordered.keys().next(), Some(&non_utf8));
 
-    let builder: AgentBuilder =
-        Agent::builder().trap_sink(from_str, "127.0.0.1:162", async_snmp::Auth::v2c("public"));
+    let builder: AgentBuilder = Agent::builder().notification_sink(
+        from_str,
+        async_snmp::NotificationTarget::shared_udp(0, "127.0.0.1:162"),
+        async_snmp::Auth::v2c("public"),
+    );
     drop(builder);
     let _: Option<NotificationSinkSummary> = None;
     let _: Option<NotificationSendStream<'static>> = None;

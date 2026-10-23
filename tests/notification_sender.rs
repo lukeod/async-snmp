@@ -767,9 +767,9 @@ async fn agent_v2c_trap_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v2c").unwrap(),
-            recv_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, recv_addr.to_string()),
             Auth::v2c("public"),
         )
         .allow_all_access()
@@ -810,9 +810,9 @@ async fn agent_trap_send_timeout_is_bounded_and_reported() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("timed").unwrap(),
-            recv_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, recv_addr.to_string()),
             Auth::v2c("public"),
         )
         .trap_send_timeout(Duration::ZERO)
@@ -865,9 +865,9 @@ async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("lazy").unwrap(),
-            recv_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, recv_addr.to_string()),
             Auth::v2c("public"),
         )
         .allow_all_access()
@@ -908,9 +908,9 @@ async fn agent_v2c_inform_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v2c").unwrap(),
-            recv_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, recv_addr.to_string()),
             Auth::v2c("public"),
         )
         .allow_all_access()
@@ -953,14 +953,14 @@ async fn agent_inform_sinks_share_source_endpoint() {
     let second_addr = second_receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("first").unwrap(),
-            first_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, first_addr.to_string()),
             Auth::v2c("public"),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("second").unwrap(),
-            second_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, second_addr.to_string()),
             Auth::v2c("private"),
         )
         .allow_all_access()
@@ -977,7 +977,7 @@ async fn agent_inform_sinks_share_source_endpoint() {
     let first_source = first.await.unwrap().receive_info.peer_addr();
     let second_source = second.await.unwrap().receive_info.peer_addr();
     assert_eq!(first_source, second_source);
-    assert_ne!(
+    assert_eq!(
         first_source.port(),
         agent.bound_addresses()[0].local_addr.port()
     );
@@ -1011,9 +1011,9 @@ async fn agent_v3_trap_to_sink() {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
         .unwrap()
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v3").unwrap(),
-            recv_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, recv_addr.to_string()),
             async_snmp::UsmConfig::new("trapuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
                 .unwrap(),
@@ -1059,14 +1059,14 @@ async fn agent_multiple_sinks() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("first").unwrap(),
-            addr1.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, addr1.to_string()),
             Auth::v2c("public"),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("second").unwrap(),
-            addr2.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, addr2.to_string()),
             Auth::v2c("trap-community"),
         )
         .allow_all_access()
@@ -1119,9 +1119,9 @@ async fn agent_v1_trap_to_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v1").unwrap(),
-            recv_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, recv_addr.to_string()),
             Auth::v1("public"),
         )
         .allow_all_access()
@@ -1164,14 +1164,14 @@ async fn agent_mixed_v1_v2c_sinks() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v1").unwrap(),
-            addr_v1.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, addr_v1.to_string()),
             Auth::v1("v1comm"),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v2c").unwrap(),
-            addr_v2.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, addr_v2.to_string()),
             Auth::v2c("v2comm"),
         )
         .allow_all_access()
@@ -1259,14 +1259,14 @@ async fn agent_no_sinks_is_noop() {
 async fn agent_rejects_duplicate_sink_ids_before_bind_configuration() {
     let result = Agent::builder()
         .bind("not-a-socket-address")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("duplicate").unwrap(),
-            "127.0.0.1:9",
+            async_snmp::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
             Auth::v1("first"),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("duplicate").unwrap(),
-            "127.0.0.1:10",
+            async_snmp::NotificationTarget::shared_udp(0, "127.0.0.1:10"),
             Auth::v2c("second"),
         )
         .spawn()
@@ -1288,7 +1288,11 @@ async fn agent_preserves_non_utf8_sink_id_octets() {
     let id = NotificationSinkId::try_from(&b"binary\x00\xff"[..]).unwrap();
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
-        .trap_sink(id.clone(), "127.0.0.1:9", Auth::v1("public"))
+        .notification_sink(
+            id.clone(),
+            async_snmp::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
+            Auth::v1("public"),
+        )
         .spawn()
         .await
         .unwrap();
@@ -1306,14 +1310,14 @@ async fn agent_sink_summaries_and_outcomes_preserve_distinct_ids_and_order() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .authoritative_engine(no_op_authoritative_engine(b"sink-summary-engine"))
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("community").unwrap(),
-            dest.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, dest.to_string()),
             Auth::v2c(COMMUNITY_SECRET),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("usm").unwrap(),
-            dest.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, dest.to_string()),
             async_snmp::UsmConfig::new(USER_SECRET).context_name(CONTEXT_SECRET),
         )
         .spawn()
@@ -1361,9 +1365,9 @@ async fn agent_inform_reports_failing_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("dead").unwrap(),
-            dead_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, dead_addr.to_string()),
             Auth::v2c("public"),
         )
         .inform_timeout(Duration::from_millis(50))
@@ -1438,9 +1442,9 @@ async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .authoritative_engine(no_op_authoritative_engine(b"agent-inform-metadata"))
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("metadata").unwrap(),
-            peer.addr().to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, peer.addr().to_string()),
             async_snmp::UsmConfig::new("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
                 .unwrap(),
@@ -1524,9 +1528,9 @@ async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
         .bind("127.0.0.1:0")
         .community(b"public")
         .authoritative_engine(no_op_authoritative_engine(b"agent-malformed-inform"))
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("malformed").unwrap(),
-            peer.addr().to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, peer.addr().to_string()),
             async_snmp::UsmConfig::new("informuser")
                 .auth(AuthProtocol::Sha256, "authpass12345678")
                 .unwrap(),
@@ -1574,14 +1578,14 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("dead").unwrap(),
-            dead_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, dead_addr.to_string()),
             Auth::v2c("public"),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("live").unwrap(),
-            live_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, live_addr.to_string()),
             Auth::v2c("public"),
         )
         .inform_timeout(Duration::from_secs(2))
@@ -1622,9 +1626,9 @@ async fn dropping_inform_stream_cancels_retries() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("cancelled").unwrap(),
-            target_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, target_addr.to_string()),
             Auth::v2c("public"),
         )
         .inform_timeout(Duration::from_millis(50))
@@ -1667,14 +1671,14 @@ async fn agent_inform_aggregate_restores_configuration_order() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("dead").unwrap(),
-            dead_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, dead_addr.to_string()),
             Auth::v2c("public"),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("live").unwrap(),
-            live_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, live_addr.to_string()),
             Auth::v2c("public"),
         )
         .inform_timeout(Duration::from_millis(100))
@@ -1704,9 +1708,9 @@ async fn agent_trap_reports_total_conversion_failure() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v1").unwrap(),
-            sink_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, sink_addr.to_string()),
             Auth::v1("public"),
         )
         .allow_all_access()
@@ -1745,14 +1749,14 @@ async fn agent_trap_reports_ordered_partial_success() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v1").unwrap(),
-            v1_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, v1_addr.to_string()),
             Auth::v1("public"),
         )
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v2c").unwrap(),
-            v2_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, v2_addr.to_string()),
             Auth::v2c("public"),
         )
         .allow_all_access()
@@ -1795,9 +1799,9 @@ async fn agent_v1_inform_is_explicitly_skipped() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v1").unwrap(),
-            sink_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(0, sink_addr.to_string()),
             Auth::v1("public"),
         )
         .allow_all_access()
@@ -1825,9 +1829,9 @@ async fn agent_inform_stream_yields_skipped_sink() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v1-skip").unwrap(),
-            "127.0.0.1:9",
+            async_snmp::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
             Auth::v1("public"),
         )
         .allow_all_access()
@@ -1853,9 +1857,12 @@ async fn agent_best_effort_helpers_complete_after_failure_and_skip() {
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
-        .trap_sink(
+        .notification_sink(
             NotificationSinkId::new("v1").unwrap(),
-            receiver.bound_addresses()[0].local_addr.to_string(),
+            async_snmp::NotificationTarget::shared_udp(
+                0,
+                receiver.bound_addresses()[0].local_addr.to_string(),
+            ),
             Auth::v1("public"),
         )
         .allow_all_access()
