@@ -37,6 +37,15 @@ impl Default for SessionId {
     }
 }
 
+/// Process-local identity of one complete received SNMP input.
+///
+/// Each [`ReceivedMessageInfo`] constructor allocates a new identity. Copies
+/// retain it, including a discovery result reused by several logical operations.
+/// A retransmission received separately has a different identity, even when its
+/// bytes match. This value is not an on-wire transaction or authenticated identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReceptionId(u64);
+
 /// Transport mapping that delivered a complete SNMP input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -57,6 +66,7 @@ pub enum TransportKind {
 /// values are asserted by the transport implementation, not independently verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceivedMessageInfo {
+    reception_id: ReceptionId,
     endpoint_id: EndpointId,
     transport: TransportKind,
     local_addr: SocketAddr,
@@ -68,7 +78,8 @@ pub struct ReceivedMessageInfo {
 }
 
 impl ReceivedMessageInfo {
-    /// Construct UDP metadata. Supply a destination only when receive metadata
+    /// Construct UDP metadata with a new reception identity. Call once per input.
+    /// Supply a destination only when receive metadata
     /// identifies it; a wildcard bind address does not identify a destination.
     pub fn udp(
         endpoint_id: EndpointId,
@@ -79,6 +90,7 @@ impl ReceivedMessageInfo {
         received_len: usize,
     ) -> Self {
         Self {
+            reception_id: ReceptionId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             endpoint_id,
             transport: TransportKind::Udp,
             local_addr,
@@ -90,7 +102,8 @@ impl ReceivedMessageInfo {
         }
     }
 
-    /// Construct TCP metadata for one complete BER frame on a known session.
+    /// Construct metadata with a new reception identity for one complete TCP BER
+    /// frame on a known session. Call once per frame, then preserve this value.
     pub fn tcp(
         endpoint_id: EndpointId,
         session_id: SessionId,
@@ -100,6 +113,7 @@ impl ReceivedMessageInfo {
         received_len: usize,
     ) -> Self {
         Self {
+            reception_id: ReceptionId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             endpoint_id,
             transport: TransportKind::Tcp,
             local_addr,
@@ -109,6 +123,10 @@ impl ReceivedMessageInfo {
             received_at,
             received_len,
         }
+    }
+    /// Identity allocated once at complete-input receipt, preserved by copying.
+    pub const fn reception_id(self) -> ReceptionId {
+        self.reception_id
     }
     /// Endpoint which received the input.
     pub const fn endpoint_id(self) -> EndpointId {
@@ -261,23 +279,14 @@ impl ReceivedMessage {
 
     pub(crate) fn udp(
         bytes: bytes::Bytes,
-        endpoint_id: EndpointId,
+        info: ReceivedMessageInfo,
         socket: std::sync::Arc<tokio::net::UdpSocket>,
         responder: std::sync::Arc<crate::udp_responder::UdpResponder>,
         received: crate::udp_responder::ReceivedDatagram,
-        received_at: Instant,
         limits: EndpointLimits,
     ) -> Self {
-        let info = ReceivedMessageInfo::udp(
-            endpoint_id,
-            socket
-                .local_addr()
-                .expect("bound UDP endpoint has local address"),
-            received.source,
-            received.destination.map(|d| d.ip),
-            received_at,
-            bytes.len(),
-        );
+        debug_assert_eq!(info.received_len(), bytes.len());
+        debug_assert_eq!(info.peer_addr(), received.source);
         Self {
             bytes,
             info,
@@ -290,6 +299,46 @@ impl ReceivedMessage {
                 },
                 limits,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn udp_reply_route_preserves_the_complete_input_identity() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let responder = Arc::new(crate::udp_responder::UdpResponder::new(&socket));
+        let endpoint = EndpointId::new();
+        let mut buffer = [0; 32];
+        let mut previous = None;
+        for _ in 0..2 {
+            peer.send_to(b"same bytes", local).await.unwrap();
+            let received = responder.recv(&socket, &mut buffer).await.unwrap();
+            let info = ReceivedMessageInfo::udp(
+                endpoint,
+                local,
+                received.source,
+                received.destination.map(|destination| destination.ip),
+                Instant::now(),
+                received.len,
+            );
+            let message = ReceivedMessage::udp(
+                bytes::Bytes::copy_from_slice(&buffer[..received.len]),
+                info,
+                socket.clone(),
+                responder.clone(),
+                received,
+                EndpointLimits::UDP,
+            );
+            assert_eq!(message.info, info);
+            assert_ne!(Some(info.reception_id()), previous);
+            previous = Some(info.reception_id());
         }
     }
 }

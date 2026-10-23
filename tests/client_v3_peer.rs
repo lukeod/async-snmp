@@ -107,8 +107,7 @@ fn trailing_lengths(error: &async_snmp::Error) -> Vec<usize> {
     error
         .response_metadata()
         .expect("accepted response metadata")
-        .decode_anomalies
-        .iter()
+        .decode_anomalies()
         .map(|anomaly| match anomaly {
             async_snmp::DecodeAnomaly::TrailingBytes {
                 original_length, ..
@@ -211,10 +210,24 @@ async fn v3_scripted_udp_success_at_all_security_levels() {
 async fn v3_udp_suffix_policy(level: SecurityLevel, config: DecodeConfig) {
     let engine = engine_for(level);
     let response_engine = engine.clone();
+    let lengths = Arc::new(Mutex::new(Vec::new()));
+    let discovery_lengths = lengths.clone();
+    let response_lengths = lengths.clone();
+    let discovery_engine = engine.clone();
     let peer = ScriptedV3Peer::udp(
         engine.clone(),
         vec![
-            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                let response = V3ReplyBuilder::report_to(
+                    request,
+                    &discovery_engine,
+                    report_oids::unknown_engine_ids(),
+                    1,
+                )
+                .build()?;
+                discovery_lengths.lock().unwrap().push(response.len());
+                Ok(response)
+            }),
             ScriptStep::replies(move |request| {
                 let oid = request.scoped_pdu.as_ref().unwrap().pdu.varbinds()[0]
                     .oid
@@ -236,6 +249,14 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, config: DecodeConfig) {
                     )])
                     .build()?;
                 suffixed.extend_from_slice(&plausible);
+                response_lengths
+                    .lock()
+                    .unwrap()
+                    .push(if config.trailing_bytes {
+                        suffixed.len()
+                    } else {
+                        response.len()
+                    });
                 let replies = if !config.trailing_bytes {
                     vec![Bytes::from(suffixed), response]
                 } else {
@@ -259,20 +280,49 @@ async fn v3_udp_suffix_policy(level: SecurityLevel, config: DecodeConfig) {
     assert!(peer_result.is_ok(), "peer failed: {peer_result:?}");
     let result = result.unwrap();
     assert_eq!(result.varbinds[0].value.as_str(), Some("v3 suffix policy"));
+    let records = &result.metadata.received_messages;
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.info.received_len())
+            .collect::<Vec<_>>(),
+        *lengths.lock().unwrap()
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.pdu_type)
+            .collect::<Vec<_>>(),
+        [async_snmp::PduType::Report, async_snmp::PduType::Response]
+    );
+    assert_ne!(
+        records[0].info.reception_id(),
+        records[1].info.reception_id()
+    );
+    assert_eq!(records[0].info.endpoint_id(), records[1].info.endpoint_id());
     if config.trailing_bytes {
         assert!(
             matches!(
-                result.metadata.decode_anomalies.as_slice(),
+                result
+                    .metadata
+                    .decode_anomalies()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .as_slice(),
                 [async_snmp::DecodeAnomaly::TrailingBytes {
                     original_length: 1..,
                     canonical_length: 0,
                 }]
             ),
             "level {level:?}: {:?}",
-            result.metadata.decode_anomalies
+            result
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>()
         );
     } else {
-        assert!(result.metadata.decode_anomalies.is_empty());
+        assert!(result.metadata.decode_anomalies().next().is_none());
     }
 }
 
@@ -286,6 +336,101 @@ async fn v3_udp_client_suffix_policy_is_coherent() {
         v3_udp_suffix_policy(level, DecodeConfig::default()).await;
         v3_udp_suffix_policy(level, DecodeConfig::STRICT).await;
     }
+}
+
+#[cfg(feature = "crypto-rustcrypto")]
+#[tokio::test]
+async fn v3_des_history_counts_ciphertext_padding_and_udp_suffix() {
+    let security = UsmConfig::new(USERNAME)
+        .with_master_keys(
+            MasterKeys::new(AuthProtocol::Sha256, AUTH_PASSWORD.as_bytes())
+                .unwrap()
+                .with_privacy(PrivProtocol::Des, PRIV_PASSWORD.as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+    let engine = TestV3Engine::new(Bytes::from_static(ENGINE_ID))
+        .boots_time(7, 100)
+        .user(security.clone());
+    let reply_engine = engine.clone();
+    let sent_length = Arc::new(Mutex::new(0));
+    let recorded_length = sent_length.clone();
+    let peer = ScriptedV3Peer::udp(
+        engine.clone(),
+        vec![
+            discovery_step(engine),
+            ScriptStep::reply(move |request| {
+                let mut scoped = request.scoped_pdu.clone().unwrap();
+                let oid = scoped.pdu.varbinds()[0].oid.clone();
+                let mut bindings = vec![VarBind::new(
+                    oid,
+                    Value::OctetString(Bytes::from_static(b"padded")),
+                )];
+                scoped.pdu = async_snmp::ResponsePdu::success(
+                    async_snmp::Version::V3,
+                    scoped.pdu.request_id(),
+                    bindings.clone(),
+                )
+                .unwrap()
+                .into_raw();
+                if scoped.encode_to_bytes().unwrap().len() % 8 == 0 {
+                    bindings[0].value = Value::OctetString(Bytes::from_static(b"padded!"));
+                    scoped.pdu = async_snmp::ResponsePdu::success(
+                        async_snmp::Version::V3,
+                        scoped.pdu.request_id(),
+                        bindings.clone(),
+                    )
+                    .unwrap()
+                    .into_raw();
+                }
+                let plaintext_len = scoped.encode_to_bytes().unwrap().len();
+                let reply = V3ReplyBuilder::response_to(request, &reply_engine)
+                    .varbinds(bindings)
+                    .build()?;
+                let decoded = V3Message::decode(reply.clone(), DecodeConfig::default())
+                    .unwrap()
+                    .value;
+                let V3MessageData::Encrypted(ciphertext) = decoded.data() else {
+                    panic!("encrypted response")
+                };
+                assert_eq!(ciphertext.len() % 8, 0);
+                assert!(
+                    ciphertext.len() > plaintext_len,
+                    "exercise nonempty DES padding"
+                );
+                let mut reply = reply.to_vec();
+                reply.extend_from_slice(&[0xee; 3]);
+                *recorded_length.lock().unwrap() = reply.len();
+                Ok(Bytes::from(reply))
+            }),
+        ],
+    )
+    .await;
+    let client = Client::builder(peer.addr(), security)
+        .des_salt_state(
+            async_snmp::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap(),
+        )
+        .request_timeout(LOOPBACK_TIMEOUT)
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await;
+    peer.finish().await.unwrap();
+    let response = response.unwrap();
+    let [discovery, received] = response.metadata.received_messages.as_slice() else {
+        panic!("discovery and response")
+    };
+    assert_eq!(discovery.pdu_type, async_snmp::PduType::Report);
+    assert_eq!(received.pdu_type, async_snmp::PduType::Response);
+    assert_eq!(received.info.received_len(), *sent_length.lock().unwrap());
+    assert_eq!(
+        received.decode_anomalies,
+        [async_snmp::DecodeAnomaly::TrailingBytes {
+            original_length: 3,
+            canonical_length: 0
+        }]
+    );
 }
 
 #[tokio::test]
@@ -317,7 +462,12 @@ async fn v3_plaintext_and_authpriv_inner_anomaly_precedes_top_level_suffix() {
         let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
         assert!(
             matches!(
-                response.metadata.decode_anomalies.as_slice(),
+                response
+                    .metadata
+                    .decode_anomalies()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .as_slice(),
                 [
                     async_snmp::DecodeAnomaly::SignedIntegerTruncation {
                         encoded_length: 5,
@@ -330,7 +480,11 @@ async fn v3_plaintext_and_authpriv_inner_anomaly_precedes_top_level_suffix() {
                 ]
             ),
             "level {level:?}: {:?}",
-            response.metadata.decode_anomalies
+            response
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -377,14 +531,19 @@ async fn v3_value_policy_is_applied_to_plaintext_and_decrypted_scoped_pdus(
     peer.finish().await.unwrap();
     if accept_malformed {
         assert!(matches!(
-            response.metadata.decode_anomalies.as_slice(),
+            response
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice(),
             [async_snmp::DecodeAnomaly::SignedIntegerTruncation {
                 encoded_length: 5,
                 ..
             }]
         ));
     } else {
-        assert!(response.metadata.decode_anomalies.is_empty());
+        assert!(response.metadata.decode_anomalies().next().is_none());
     }
 }
 
@@ -1262,7 +1421,24 @@ async fn v3_exchange_metadata_aggregates_discovery_correction_and_final_response
     let client = custom_client(transport, level, None);
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
     assert_eq!(
-        response.metadata.decode_anomalies,
+        response
+            .metadata
+            .received_messages
+            .iter()
+            .map(|record| record.pdu_type)
+            .collect::<Vec<_>>(),
+        [
+            async_snmp::PduType::Report,
+            async_snmp::PduType::Report,
+            async_snmp::PduType::Response
+        ]
+    );
+    assert_eq!(
+        response
+            .metadata
+            .decode_anomalies()
+            .cloned()
+            .collect::<Vec<_>>(),
         [1, 2, 3]
             .into_iter()
             .map(|original_length| async_snmp::DecodeAnomaly::TrailingBytes {
@@ -1324,6 +1500,13 @@ async fn v3_exchange_errors_retain_discovery_and_correction_metadata() {
         timeout_error.exchange_source(),
         async_snmp::Error::Timeout { .. }
     ));
+    let history = &timeout_error.response_metadata().unwrap().received_messages;
+    assert_eq!(history.len(), 2);
+    assert!(
+        history
+            .iter()
+            .all(|record| record.pdu_type == async_snmp::PduType::Report)
+    );
     assert_eq!(trailing_lengths(&timeout_error), [1, 2]);
 
     let transport_engine = engine_for(level);
@@ -1359,6 +1542,16 @@ async fn v3_exchange_errors_retain_discovery_and_correction_metadata() {
         transport_error.exchange_source(),
         async_snmp::Error::Closed { .. }
     ));
+    let history = &transport_error
+        .response_metadata()
+        .unwrap()
+        .received_messages;
+    assert_eq!(history.len(), 1);
+    assert!(
+        history
+            .iter()
+            .all(|record| record.pdu_type == async_snmp::PduType::Report)
+    );
     assert_eq!(trailing_lengths(&transport_error), [1]);
 
     let local_engine = engine_for(level);
@@ -1396,6 +1589,13 @@ async fn v3_exchange_errors_retain_discovery_and_correction_metadata() {
         local_error.exchange_source(),
         async_snmp::Error::OutboundMessageTooLarge { .. }
     ));
+    let history = &local_error.response_metadata().unwrap().received_messages;
+    assert_eq!(history.len(), 1);
+    assert!(
+        history
+            .iter()
+            .all(|record| record.pdu_type == async_snmp::PduType::Report)
+    );
     assert_eq!(trailing_lengths(&local_error), [1]);
 }
 
@@ -1443,6 +1643,10 @@ async fn v3_exchange_error_excludes_rejected_candidate_metadata() {
         .unwrap_err();
 
     assert_eq!(error.kind(), async_snmp::ErrorKind::Closed);
+    assert_eq!(
+        error.response_metadata().unwrap().received_messages.len(),
+        1
+    );
     assert_eq!(trailing_lengths(&error), [1]);
 }
 
@@ -1829,7 +2033,7 @@ async fn v3_repeated_unauthenticated_time_report_is_typed_and_bounded() {
         &*err,
         async_snmp::Error::Report { status, metadata, .. }
             if matches!(status.as_ref(), ReportStatus::NotInTimeWindow { counter: 5 })
-                && metadata.decode_anomalies == vec![
+                && metadata.decode_anomalies().cloned().collect::<Vec<_>>() == vec![
                     async_snmp::DecodeAnomaly::TrailingBytes {
                         original_length: 1,
                         canonical_length: 0,

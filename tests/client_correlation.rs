@@ -252,6 +252,11 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, config: Decode
         if !config.trailing_bytes {
             socket.send_to(&response, source).await.unwrap();
         }
+        if config.trailing_bytes {
+            suffixed.len()
+        } else {
+            response.len()
+        }
     });
 
     let auth = match version {
@@ -274,16 +279,27 @@ async fn udp_suffix_policy(version: async_snmp::CommunityVersion, config: Decode
     );
     if config.trailing_bytes {
         assert!(matches!(
-            result.metadata.decode_anomalies.as_slice(),
+            result
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice(),
             [async_snmp::DecodeAnomaly::TrailingBytes {
                 original_length: 1..,
                 canonical_length: 0,
             }]
         ));
     } else {
-        assert!(result.metadata.decode_anomalies.is_empty());
+        assert!(result.metadata.decode_anomalies().next().is_none());
     }
-    server.await.unwrap();
+    let accepted_len = server.await.unwrap();
+    let [record] = result.metadata.received_messages.as_slice() else {
+        panic!("one accepted Response")
+    };
+    assert_eq!(record.info.received_len(), accepted_len);
+    assert_eq!(record.pdu_type, async_snmp::PduType::Response);
+    assert_eq!(record.info.peer_addr(), peer);
 }
 
 #[tokio::test]

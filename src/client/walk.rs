@@ -1642,10 +1642,19 @@ mod tests {
         let mut walk = client.walk_getnext_with_metadata(walk_base()).unwrap();
         let item = walk.next().await.unwrap().unwrap();
         assert_eq!(item.varbind, walk_binding(1));
-        assert_eq!(item.metadata.decode_anomalies, vec![trailing(1)]);
+        assert_eq!(
+            item.metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![trailing(1)]
+        );
         assert!(walk.next().await.is_none());
         assert_eq!(
-            walk.metadata().decode_anomalies,
+            walk.metadata()
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![trailing(1), trailing(2)]
         );
     }
@@ -1663,11 +1672,32 @@ mod tests {
         let mut walk = client.bulk_walk_with_metadata(walk_base(), 8).unwrap();
         let first = walk.next().await.unwrap().unwrap();
         let second = walk.next().await.unwrap().unwrap();
-        assert_eq!(first.metadata.decode_anomalies, vec![trailing(1)]);
-        assert!(second.metadata.decode_anomalies.is_empty());
-        assert!(walk.next().await.is_none());
         assert_eq!(
-            walk.metadata().decode_anomalies,
+            first
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![trailing(1)]
+        );
+        assert!(second.metadata.decode_anomalies().next().is_none());
+        assert_eq!(first.metadata.received_messages.len(), 1);
+        assert!(second.metadata.received_messages.is_empty());
+        assert!(walk.next().await.is_none());
+        assert_eq!(walk.metadata().received_messages.len(), 2);
+        assert_eq!(
+            first.metadata.received_messages[0].info.reception_id(),
+            walk.metadata().received_messages[0].info.reception_id()
+        );
+        assert_ne!(
+            walk.metadata().received_messages[0].info.reception_id(),
+            walk.metadata().received_messages[1].info.reception_id()
+        );
+        assert_eq!(
+            walk.metadata()
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![trailing(1), trailing(2)]
         );
     }
@@ -1689,9 +1719,16 @@ mod tests {
         assert!(matches!(
             &*error.source,
             Error::Snmp { metadata, .. }
-                if metadata.decode_anomalies == vec![trailing(3)]
+                if metadata.decode_anomalies().cloned().collect::<Vec<_>>() == vec![trailing(3)]
         ));
-        assert_eq!(error.metadata.decode_anomalies, vec![trailing(3)]);
+        assert_eq!(
+            error
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![trailing(3)]
+        );
     }
 
     #[tokio::test]

@@ -1241,7 +1241,6 @@ impl<T: RequestTransport> Client<T> {
                         scoped_pdu.pdu.pdu_type(),
                         validated.decode_anomalies,
                     );
-                    exchange_metadata.append(message_metadata);
 
                     // Publish candidate timeliness state only after every deep
                     // validation check has accepted the response.
@@ -1322,6 +1321,8 @@ impl<T: RequestTransport> Client<T> {
                             .boxed()
                             .with_prior_response_metadata(&exchange_metadata)
                         })?;
+
+                        exchange_metadata.append(message_metadata);
 
                         if matches!(status, ReportStatus::NotInTimeWindow { .. })
                             && received_level.requires_auth()
@@ -1471,6 +1472,8 @@ impl<T: RequestTransport> Client<T> {
                     }
 
                     tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type(), snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status(), snmp.error_index = response_pdu.error_index() }, "received V3 {} response", response_pdu.pdu_type());
+
+                    exchange_metadata.append(message_metadata);
 
                     // Check for SNMP error
                     if let Some(err) = super::pdu_to_snmp_error(
@@ -2247,8 +2250,22 @@ mod tests {
         let leader_metadata = leader.await.unwrap().unwrap();
         let follower_metadata = follower.await.unwrap().unwrap();
         assert_eq!(leader_metadata, follower_metadata);
+        let [leader_record] = leader_metadata.received_messages.as_slice() else {
+            panic!("one discovery input")
+        };
+        let [follower_record] = follower_metadata.received_messages.as_slice() else {
+            panic!("one reused discovery input")
+        };
         assert_eq!(
-            leader_metadata.decode_anomalies,
+            leader_record.info.reception_id(),
+            follower_record.info.reception_id()
+        );
+        assert_eq!(leader_record.pdu_type, PduType::Report);
+        assert_eq!(
+            leader_metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
             [crate::DecodeAnomaly::TrailingBytes {
                 original_length: 1,
                 canonical_length: 0,
@@ -3592,6 +3609,15 @@ mod response_validation_tests {
 
         let err = stale_request.await.unwrap().unwrap_err();
         assert!(matches!(err.exchange_source(), Error::Auth { .. }));
+        let [prior] = err
+            .response_metadata()
+            .unwrap()
+            .received_messages
+            .as_slice()
+        else {
+            panic!("retain the correction Report, excluding the concurrently stale Response")
+        };
+        assert_eq!(prior.pdu_type, PduType::Report);
         let engine = client.inner.engine.read().unwrap();
         let trusted = engine.as_ref().unwrap().state.authenticated_time().unwrap();
         assert_eq!(trusted.latest_received_time(), 1400);
@@ -3699,6 +3725,10 @@ mod response_validation_tests {
             err.exchange_source(),
             Error::MalformedResponse { .. }
         ));
+        assert!(
+            err.response_metadata().is_none(),
+            "identity-conflicted response is not accepted"
+        );
         let engine = client.inner.engine.read().unwrap();
         let state = &engine.as_ref().unwrap().state;
         assert_eq!(state.engine_id(), REPLACEMENT_ENGINE_ID);

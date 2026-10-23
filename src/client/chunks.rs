@@ -548,8 +548,7 @@ mod tests {
 
     fn trailing_lengths(metadata: &crate::client::ResponseMetadata) -> Vec<usize> {
         metadata
-            .decode_anomalies
-            .iter()
+            .decode_anomalies()
             .map(|anomaly| match anomaly {
                 crate::DecodeAnomaly::TrailingBytes {
                     original_length, ..
@@ -949,7 +948,10 @@ mod tests {
             assert_eq!(a.operation, b.operation);
             assert_eq!(a.varbinds, b.varbinds);
             assert_eq!(a.anomalies, b.anomalies);
-            assert_eq!(a.metadata.decode_anomalies, b.metadata.decode_anomalies);
+            assert_eq!(
+                a.metadata.decode_anomalies().cloned().collect::<Vec<_>>(),
+                b.metadata.decode_anomalies().cloned().collect::<Vec<_>>()
+            );
             assert_eq!(a.metadata.received_messages.len(), 2);
             assert_eq!(b.metadata.received_messages.len(), 2);
             for (a, b) in a

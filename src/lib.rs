@@ -465,13 +465,21 @@
 //! correlation decisions, and protocol corrections are observed through their
 //! tracing events or returned diagnostics as documented.
 //!
-//! Network clients retain decode anomalies in [`ResponseMetadata`], ordered by
-//! accepted message within an exchange (v3 discovery, correction Reports, then
-//! the final response). Within a v3 message the deterministic logical order is
+//! Network clients retain individual [`ReceivedResponse`] records in
+//! [`ResponseMetadata::received_messages`], ordered by accepted message within
+//! an exchange (v3 discovery, correction Reports, then the final response).
+//! Each record retains its actual PDU kind, original receive metadata and decode
+//! anomalies. [`ResponseMetadata::decode_anomalies`] borrows a flattened iterator
+//! over those records. Within a v3 message the deterministic logical order is
 //! outer header/security fields, plaintext or decrypted scoped-PDU fields, and
 //! finally a top-level datagram suffix. Response-derived [`Error::Snmp`] and
 //! [`Error::Report`] carry the same metadata; local transport, configuration,
 //! and construction errors do not synthesize response metadata.
+//! A later local failure can still retain earlier accepted messages. Lengths
+//! describe complete transport inputs before USM decryption, including ciphertext,
+//! padding and accepted UDP suffixes; TCP lengths describe individual BER frames.
+//! Shared discovery can appear in several logical histories with the same
+//! [`ReceptionId`]. Histories describe operation provenance, not unique traffic.
 //!
 //! Fixed GET/GETNEXT/SET responses expose metadata through
 //! [`FixedCardinalityResponse::metadata`]; GETBULK and Inform callers use
@@ -599,9 +607,10 @@ pub use client::{
     DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
     DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
     FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
-    FixedCardinalityResponse, MAX_RETRIES, OidOrdering, ResponseMetadata, ResponseShapeAnomaly,
-    ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder,
-    WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod, WalkOptions, WalkStream,
+    FixedCardinalityResponse, MAX_RETRIES, OidOrdering, ReceivedResponse, ResponseMetadata,
+    ResponseShapeAnomaly, ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target,
+    TargetClientBuilder, WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod,
+    WalkOptions, WalkStream,
 };
 pub use community::Community;
 pub use compatibility::{
@@ -638,7 +647,7 @@ pub use pdu::{
 };
 pub use transport::{
     BoundListener, BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId,
-    ListenerSource, PreparedTcpSession, PreparedUdpEndpoint, ReceivedMessageInfo,
+    ListenerSource, PreparedTcpSession, PreparedUdpEndpoint, ReceivedMessageInfo, ReceptionId,
     RequestRegistration, RequestTransport, ResponseIdentity, RunningTcpSession, RunningUdpEndpoint,
     SessionId, TcpControl, TcpListenerSource, TcpOptions, TcpRunner, TcpStatus, TcpTransport,
     TcpTransportBuilder, TransportKind, UdpControl, UdpEndpoint, UdpEndpointBuilder, UdpHandle,

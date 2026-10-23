@@ -616,7 +616,9 @@ pub trait RequestTransport: Send + Sync {
     /// state on every completion or cancellation path. Identity-correlated
     /// candidates must pass through `validate` with their original receive metadata;
     /// `received_len()` must equal the delivered bytes length. Capture the timestamp
-    /// at complete-message receipt, before correlation or validation. Custom
+    /// at complete-message receipt, before correlation or validation. Construct
+    /// receive metadata once per input and preserve its reception identity when
+    /// passing the same candidate through different processing stages. Custom
     /// transports construct [`ReceivedMessageInfo`] without internal reply capabilities.
     /// Rejection continues under the
     /// same deadline. Reliable transports must retain independent framing

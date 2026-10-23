@@ -2149,13 +2149,21 @@ impl NotificationProcessor {
             source,
             destination,
         };
+        let socket = self.inner.socket.clone().expect("UDP test fixture");
+        let info = crate::ReceivedMessageInfo::udp(
+            self.inner.endpoint_id,
+            socket.local_addr().unwrap(),
+            source,
+            destination.map(|destination| destination.ip),
+            tokio::time::Instant::now(),
+            data.len(),
+        );
         crate::transport::ReceivedMessage::udp(
             data,
-            self.inner.endpoint_id,
-            self.inner.socket.clone().expect("UDP test fixture"),
+            info,
+            socket,
             self.inner.udp_responder.clone().expect("UDP test fixture"),
             received,
-            tokio::time::Instant::now(),
             crate::transport::EndpointLimits::UDP,
         )
     }

@@ -112,6 +112,8 @@ ordinary deadlines before startup and fail after termination.
 | Single service local address | Identified `bound_addresses()` |
 | Notification consumer | Non-Clone receiver; `recv(&mut self)` and separate control |
 | Agent notification destinations | `notification_sink(id, NotificationTarget, auth)` |
+| Client response history | `ResponseMetadata::received_messages` |
+| Aggregate decode anomalies | `ResponseMetadata::decode_anomalies()` iterator |
 
 Notification targets explicitly select `shared_udp(listener_index, destination)`,
 `udp(endpoint_builder, destination)`, `tcp(session_builder)`, or `peer(existing)`.
@@ -130,6 +132,14 @@ Informs discover the receiver's authoritative engine. Runtime v3 originators req
 prepared authoritative state, an AES role for AES privacy, or durable DES sender
 state for DES/3DES. Closing a notification consumer disables that role while other
 roles continue; root shutdown terminates all owned endpoints and pending exchanges.
+
+Response histories contain each accepted message's PDU kind, decode anomalies and
+`ReceivedMessageInfo`, including discovery/correction Reports and error Responses.
+`received_len()` counts the original UDP payload or TCP BER frame before USM
+decryption, including ciphertext, padding and accepted UDP suffixes. Batched
+operations retain individual records. Shared discovery retains the same
+`reception_id()` in every operation using it; histories describe provenance rather
+than unique endpoint traffic. Rejected candidates do not create history records.
 
 ## Command-line tools
 

@@ -12,8 +12,8 @@ pub use auth::{Auth, CommunityVersion};
 pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target, TargetClientBuilder};
 pub use chunks::{FixedCardinalityChunk, FixedCardinalityChunkError, FixedCardinalityChunkStream};
 pub use response_shape::{
-    BulkResponse, FixedCardinalityOperation, FixedCardinalityResponse, ResponseMetadata,
-    ResponseShapeAnomaly, ResponseShapePolicy,
+    BulkResponse, FixedCardinalityOperation, FixedCardinalityResponse, ReceivedResponse,
+    ResponseMetadata, ResponseShapeAnomaly, ResponseShapePolicy,
 };
 pub use retry::{MAX_RETRIES, Retry, RetryBuilder, RetryConfigError};
 
@@ -3230,8 +3230,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let [ack] = metadata.received_messages.as_slice() else {
+            panic!("one Inform acknowledgement")
+        };
+        assert_eq!(ack.pdu_type, PduType::Response);
+        assert!(ack.info.received_len() > 2);
         assert_eq!(
-            metadata.decode_anomalies,
+            metadata.decode_anomalies().cloned().collect::<Vec<_>>(),
             vec![crate::DecodeAnomaly::TrailingBytes {
                 original_length: 2,
                 canonical_length: 0,
@@ -3264,7 +3269,12 @@ mod tests {
 
         assert_eq!(error.kind(), crate::ErrorKind::MalformedResponse);
         assert_eq!(
-            error.response_metadata().unwrap().decode_anomalies,
+            error
+                .response_metadata()
+                .unwrap()
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![crate::DecodeAnomaly::TrailingBytes {
                 original_length: 2,
                 canonical_length: 0,

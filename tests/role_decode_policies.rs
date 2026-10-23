@@ -190,7 +190,12 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
             .unwrap();
         let response = default.get(&oid).await.unwrap();
         assert!(matches!(
-            response.metadata.decode_anomalies.as_slice(),
+            response
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice(),
             [async_snmp::DecodeAnomaly::SignedIntegerTruncation {
                 encoded_length: 5,
                 ..
@@ -208,8 +213,9 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
                 .await
                 .unwrap()
                 .metadata
-                .decode_anomalies
-                .is_empty()
+                .decode_anomalies()
+                .next()
+                .is_none()
         );
 
         let mut targeted = DecodeConfig::STRICT;
@@ -225,7 +231,9 @@ async fn community_clients_apply_default_strict_and_targeted_value_policies() {
                 .await
                 .unwrap()
                 .metadata
-                .decode_anomalies
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>()
                 .as_slice(),
             [async_snmp::DecodeAnomaly::SignedIntegerTruncation { .. }]
         ));
@@ -258,7 +266,11 @@ async fn community_client_applies_only_targeted_bounded_string_clamping() {
         Value::OctetString(Bytes::from_static(b"ab"))
     );
     assert_eq!(
-        response.metadata.decode_anomalies,
+        response
+            .metadata
+            .decode_anomalies()
+            .cloned()
+            .collect::<Vec<_>>(),
         [DecodeAnomaly::BoundedStringClamp {
             kind: BoundedStringKind::OctetString,
             declared_length: 3,

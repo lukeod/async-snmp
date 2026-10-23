@@ -21,22 +21,46 @@ pub enum FixedCardinalityOperation {
     Set,
 }
 
-/// Metadata retained from decoding one or more network responses.
+/// Accepted received messages contributing to a logical operation, in exchange order.
+///
+/// Records include discovery and correction Reports, successful and SNMP-error
+/// Responses, and Inform acknowledgements. Rejected candidates and local failures
+/// do not create records. Batched operations concatenate their exchange histories.
+/// Shared discovery can contribute the same reception to several operations;
+/// these histories describe provenance, not unique endpoint traffic. Compare
+/// [`ReceivedMessageInfo::reception_id`](crate::ReceivedMessageInfo::reception_id)
+/// when identifying that reuse.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResponseMetadata {
-    pub(crate) received_messages: Vec<ReceivedResponse>,
-    /// Accepted BER/value deviations in response and decode order.
+    /// Individual messages accepted while carrying out this operation.
+    pub received_messages: Vec<ReceivedResponse>,
+}
+
+/// One accepted message in a client operation's response history.
+///
+/// A Report is recorded with its actual PDU kind. No raw packet is retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedResponse {
+    /// Original complete-input metadata, before SNMP decoding or USM decryption.
+    pub info: crate::ReceivedMessageInfo,
+    /// Actual received PDU kind, including Reports and error Responses.
+    pub pdu_type: crate::PduType,
+    /// Accepted BER/value deviations for this message, in decode order.
     pub decode_anomalies: Vec<crate::DecodeAnomaly>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReceivedResponse {
-    pub(crate) info: crate::ReceivedMessageInfo,
-    pub(crate) pdu_type: crate::PduType,
-    pub(crate) decode_anomalies: Vec<crate::DecodeAnomaly>,
-}
-
 impl ResponseMetadata {
+    /// Iterate over accepted deviations in message order, then decode order.
+    ///
+    /// This borrows each record's anomalies without retaining a second copy.
+    /// V3 decode order is outer header/security fields, scoped-PDU fields, then
+    /// any accepted top-level UDP suffix.
+    pub fn decode_anomalies(&self) -> impl Iterator<Item = &crate::DecodeAnomaly> {
+        self.received_messages
+            .iter()
+            .flat_map(|message| &message.decode_anomalies)
+    }
+
     pub(crate) fn from_received(
         info: crate::ReceivedMessageInfo,
         pdu_type: crate::PduType,
@@ -46,23 +70,13 @@ impl ResponseMetadata {
             received_messages: vec![ReceivedResponse {
                 info,
                 pdu_type,
-                decode_anomalies: decode_anomalies.clone(),
+                decode_anomalies,
             }],
-            decode_anomalies,
         }
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
-        self.decode_anomalies.append(&mut other.decode_anomalies);
         self.received_messages.append(&mut other.received_messages);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_decode_anomalies(decode_anomalies: Vec<crate::DecodeAnomaly>) -> Self {
-        Self {
-            decode_anomalies,
-            received_messages: Vec::new(),
-        }
     }
 }
 

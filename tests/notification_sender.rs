@@ -1467,8 +1467,7 @@ async fn agent_failed_v3_inform_exposes_accepted_exchange_metadata() {
     assert_eq!(sink.metadata, *error.response_metadata().unwrap());
     assert_eq!(
         sink.metadata
-            .decode_anomalies
-            .iter()
+            .decode_anomalies()
             .map(|anomaly| match anomaly {
                 async_snmp::DecodeAnomaly::TrailingBytes {
                     original_length, ..
@@ -1553,8 +1552,7 @@ async fn agent_malformed_v3_inform_acknowledgement_retains_metadata_once() {
     assert_eq!(sink.metadata, *error.response_metadata().unwrap());
     assert_eq!(
         sink.metadata
-            .decode_anomalies
-            .iter()
+            .decode_anomalies()
             .map(|anomaly| match anomaly {
                 async_snmp::DecodeAnomaly::TrailingBytes {
                     original_length, ..

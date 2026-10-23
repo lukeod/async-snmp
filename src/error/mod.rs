@@ -779,7 +779,7 @@ impl Error {
         mut self: Box<Self>,
         prior: &crate::client::ResponseMetadata,
     ) -> Box<Self> {
-        if prior.decode_anomalies.is_empty() && prior.received_messages.is_empty() {
+        if prior.received_messages.is_empty() {
             return self;
         }
 
@@ -1035,15 +1035,12 @@ mod tests {
     #[test]
     fn exchange_metadata_wrapper_preserves_kind_source_and_metadata() {
         let target = "127.0.0.1:161".parse().unwrap();
-        let metadata = crate::client::ResponseMetadata::from_decode_anomalies(vec![
-            crate::DecodeAnomaly::TrailingBytes {
-                original_length: 3,
-                canonical_length: 0,
-            },
-        ]);
-        let error = Error::Closed { target }
-            .boxed()
-            .with_prior_response_metadata(&metadata);
+        let metadata = crate::client::ResponseMetadata::default();
+        let error = Error::Exchange {
+            source: Error::Closed { target }.boxed(),
+            metadata: Box::new(metadata.clone()),
+        }
+        .boxed();
 
         assert_eq!(error.kind(), ErrorKind::Closed);
         assert!(matches!(error.exchange_source(), Error::Closed { .. }));

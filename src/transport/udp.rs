@@ -491,12 +491,12 @@ impl UdpRunner {
                             let data = Bytes::copy_from_slice(&buf[..len]);
 
                             if let Some(roles) = self.dispatch.get() {
-                                let message = super::ReceivedMessage::udp(data, endpoint_id, self.socket.clone(), self.responder.clone(), received, info.received_at(), super::EndpointLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone());
+                                let message = super::ReceivedMessage::udp(data, info, self.socket.clone(), self.responder.clone(), received, super::EndpointLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone());
                                 roles.dispatch(message, core.clone(), &mut dispatch_tasks);
                                 continue;
                             }
                             if let Some(ingress) = &self.ingress {
-                                ingress.deliver_udp(super::ReceivedMessage::udp(data, endpoint_id, self.socket.clone(), self.responder.clone(), received, info.received_at(), super::EndpointLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone()));
+                                ingress.deliver_udp(super::ReceivedMessage::udp(data, info, self.socket.clone(), self.responder.clone(), received, super::EndpointLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone()));
                                 continue;
                             }
                             if let Some(envelope) = CorrelationEnvelope::parse(&data)
