@@ -354,7 +354,7 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
 
     #[derive(Clone)]
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_in_flight_tcp_chunk_poisons_the_connection() {
+    async fn dropping_in_flight_tcp_chunk_preserves_connection_and_discards_late_response() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
         let transport = crate::TcpTransport::connect(target).await.unwrap();
@@ -1051,10 +1051,33 @@ mod tests {
         let (request_seen, seen) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut first_byte = [0];
-            socket.read_exact(&mut first_byte).await.unwrap();
+            async fn response_for_next(socket: &mut tokio::net::TcpStream) -> Bytes {
+                let mut header = [0; 2];
+                socket.read_exact(&mut header).await.unwrap();
+                assert!(header[1] < 128);
+                let mut frame = header.to_vec();
+                frame.resize(2 + usize::from(header[1]), 0);
+                socket.read_exact(&mut frame[2..]).await.unwrap();
+                let request =
+                    CommunityMessage::decode(Bytes::from(frame), crate::DecodeConfig::DEFAULT)
+                        .unwrap()
+                        .value;
+                let request = request.pdu().standard().unwrap();
+                let values = request
+                    .varbinds
+                    .iter()
+                    .map(|vb| VarBind::new(vb.oid.clone(), Value::Integer(42)))
+                    .collect();
+                CommunityMessage::v2c("public", Pdu::response(request.request_id, 0, 0, values))
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+            }
+            let late = response_for_next(&mut socket).await;
             request_seen.send(()).unwrap();
-            std::future::pending::<()>().await;
+            let response = response_for_next(&mut socket).await;
+            socket.write_all(&late).await.unwrap();
+            socket.write_all(&response).await.unwrap();
         });
 
         let oid = test_oids(1).remove(0);
@@ -1067,11 +1090,11 @@ mod tests {
         drop(next);
         drop(stream);
 
-        let error = timeout(Duration::from_secs(2), client.get(&oid))
+        let response = timeout(Duration::from_secs(2), client.get(&oid))
             .await
             .unwrap()
-            .unwrap_err();
-        assert!(matches!(error.exchange_source(), Error::Closed { .. }));
-        server.abort();
+            .unwrap();
+        assert_eq!(response.varbinds[0].value, Value::Integer(42));
+        server.await.unwrap();
     }
 }

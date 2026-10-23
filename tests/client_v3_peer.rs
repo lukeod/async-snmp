@@ -746,7 +746,7 @@ async fn v3_discovery_rejects_noncanonical_security_and_report_shapes() {
             .await
             .unwrap_err();
         assert!(
-            matches!(*error, async_snmp::Error::Timeout { .. }),
+            matches!(error.exchange_source(), async_snmp::Error::Timeout { .. }),
             "{case} should be rejected until timeout, got {error}"
         );
         assert_eq!(transport.log().len(), 1, "{case} must not continue");
@@ -792,7 +792,10 @@ async fn v3_discovery_rejects_trailing_usm_security_parameter_data() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
+    assert!(matches!(
+        error.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
 }
 
 #[tokio::test]
@@ -881,7 +884,10 @@ async fn v3_udp_discovery_source_policy_is_builder_configurable() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
+    assert!(matches!(
+        error.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
     assert_eq!(log.len(), 1, "off-source discovery must not be adopted");
     peer.finish().await.unwrap();
 }
@@ -922,7 +928,10 @@ async fn v3_established_identity_ignores_ordinary_discovery_traffic() {
         Some("before")
     );
     let error = client.get(&oid).await.unwrap_err();
-    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
+    assert!(matches!(
+        error.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
     assert_eq!(
         client.get(&oid).await.unwrap().varbinds[0].value.as_str(),
         Some("after")
@@ -1061,7 +1070,10 @@ async fn v3_failed_rediscovery_preserves_live_identity_and_cache_mapping() {
     );
 
     let error = client.rediscover_engine().await.unwrap_err();
-    assert!(matches!(*error, async_snmp::Error::Timeout { .. }));
+    assert!(matches!(
+        error.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
     assert_eq!(
         cache.get(&client.peer_addr()).unwrap().engine_id().as_ref(),
         ENGINE_ID
@@ -1464,7 +1476,7 @@ async fn v3_unauthenticated_time_report_compatibility_is_explicit() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "the compatibility path must remain disabled by default: {err}"
     );
     assert_eq!(log.len(), 2, "a disabled path must not send a correction");
@@ -1587,7 +1599,10 @@ async fn v3_udp_compatibility_respects_strict_source_policy() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(*err, async_snmp::Error::Timeout { .. }));
+    assert!(matches!(
+        err.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
     assert_eq!(log.len(), 2, "an off-source Report must not add a send");
     peer.finish().await.unwrap();
 }
@@ -1741,7 +1756,7 @@ async fn v3_failed_packet_local_correction_preserves_authenticated_time() {
         .await
         .unwrap_err();
     assert!(matches!(
-        *err,
+        err.exchange_source(),
         async_snmp::Error::Timeout { retries: 0, .. }
     ));
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await.unwrap();
@@ -2249,7 +2264,7 @@ async fn v3_malformed_reports_are_rejected_until_timeout_without_correction() {
             .await
             .unwrap_err();
         assert!(
-            matches!(*err, async_snmp::Error::Timeout { .. }),
+            matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
             "{case} should be rejected until timeout, got {err}"
         );
         assert_eq!(log.len(), 2, "{case} must not trigger correction");
@@ -2349,7 +2364,7 @@ async fn v3_failed_correction_preserves_authenticated_report_time() {
         .await
         .unwrap_err();
     assert!(matches!(
-        *err,
+        err.exchange_source(),
         async_snmp::Error::Timeout { retries: 0, .. }
     ));
 
@@ -2402,7 +2417,7 @@ async fn v3_noauth_client_rejects_authenticated_report() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "expected timeout after candidate rejection, got: {err}"
     );
 
@@ -2457,7 +2472,7 @@ async fn v3_authenticated_wrong_username_does_not_mutate_time_or_retry() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "wrong security name must be rejected until timeout, got: {err}"
     );
 
@@ -2514,7 +2529,7 @@ async fn v3_authenticated_wrong_engine_id_does_not_trigger_report_retry() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "wrong authoritative engine must be rejected until timeout, got: {err}"
     );
 
@@ -2562,7 +2577,7 @@ async fn v3_auth_no_priv_client_rejects_auth_priv_without_time_mutation() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "unsupported authPriv must be rejected until timeout, got: {err}"
     );
 
@@ -2625,7 +2640,7 @@ async fn v3_failed_hmac_precedes_plaintext_parse_and_time_update() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "failed HMAC candidate must be rejected until timeout, got: {err}"
     );
 
@@ -2679,7 +2694,7 @@ async fn v3_auth_priv_timeliness_precedes_decryption() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "stale ciphertext must be rejected until timeout, got: {err}"
     );
 
@@ -2735,7 +2750,7 @@ async fn v3_auth_client_rejects_unauthenticated_response() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "expected timeout after candidate rejection, got: {err}"
     );
     peer.finish().await.unwrap();
@@ -2774,7 +2789,7 @@ async fn v3_auth_priv_client_rejects_auth_no_priv_response() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "lower-security ordinary Response must not be accepted: {err}"
     );
     peer.finish().await.unwrap();
@@ -2975,7 +2990,7 @@ async fn v3_tcp_skips_wrong_response_msg_id_until_timeout() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "wrong TCP msgID must be skipped under the request deadline, got: {err}"
     );
     peer.finish().await.unwrap();
@@ -3010,7 +3025,10 @@ async fn v3_tcp_skips_wrong_discovery_msg_id_until_timeout() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(*err, async_snmp::Error::Timeout { .. }));
+    assert!(matches!(
+        err.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
     peer.finish().await.unwrap();
 }
 
@@ -3040,7 +3058,7 @@ async fn v3_custom_transport_rejects_prior_attempt_msg_id() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "matching PDU request-id must not rescue a prior msgID: {err}"
     );
     let requests = log.snapshot();
@@ -3077,7 +3095,10 @@ async fn v3_custom_transport_rejects_future_discovery_msg_id() {
         .get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0))
         .await
         .unwrap_err();
-    assert!(matches!(*err, async_snmp::Error::Timeout { .. }));
+    assert!(matches!(
+        err.exchange_source(),
+        async_snmp::Error::Timeout { .. }
+    ));
 }
 
 /// RFC 3412 Section 7.2 processes the Security Model before parsing the
@@ -3159,7 +3180,7 @@ async fn v3_wrong_report_msg_id_does_not_trigger_correction() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "wrong-ID Report with request-id zero must not be acted on: {err}"
     );
     assert_eq!(
@@ -3222,7 +3243,7 @@ async fn v3_rejects_wrong_scoped_context_at_every_security_level() {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(*err, async_snmp::Error::Timeout { .. }),
+                matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
                 "{level:?}, wrong_context_name={wrong_context_name}: {err}"
             );
         }
@@ -3589,7 +3610,7 @@ async fn v3_pre_correction_msg_id_rejected_after_correction() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "correction resets the window; pre-correction msgID must not correlate: {err}"
     );
     assert_eq!(log.snapshot().len(), 3);
@@ -3797,7 +3818,7 @@ async fn v3_repeated_report_with_pre_correction_msg_id_is_not_acted_on() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "a Report stamped with the pre-correction msgID must not trigger a second correction: {err}"
     );
     assert_eq!(
@@ -3863,7 +3884,7 @@ async fn v3_completed_operation_msg_id_not_accepted_for_next_operation() {
         .await
         .unwrap_err();
     assert!(
-        matches!(*err, async_snmp::Error::Timeout { .. }),
+        matches!(err.exchange_source(), async_snmp::Error::Timeout { .. }),
         "a completed operation's msgID must not correlate to the next operation: {err}"
     );
     assert_eq!(log.snapshot().len(), 3);

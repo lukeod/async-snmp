@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- TCP sessions now own one reader and serialized writer, with bounded concurrent
+  exchanges and aggregate message buffering. Cancelling a request leaves framing
+  intact; started writes finish within their original deadline or close the session.
+  `TcpTransportBuilder::prepare()` returns a session/runner pair, accepts owned
+  connected streams or configured pre-connect sockets, and creates no task.
+  Explicit `spawn()`/`spawn_on()` return a `RunningTcpSession`; `TcpControl`
+  exposes shutdown, status and managed-driver joining. Session handles never reconnect.
+
 - **Breaking:** `UdpTransport` is now `UdpEndpoint`. Its builder uses `prepare()`
   for an unstarted endpoint/runner pair, or explicit `spawn()`/`spawn_on()` for a
   `RunningUdpEndpoint` that retains the task result and requests shutdown on drop.

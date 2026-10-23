@@ -17,6 +17,7 @@
 //! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) |
 
 mod builtin;
+mod framing;
 mod received;
 pub use received::*;
 mod tcp;
@@ -576,9 +577,9 @@ pub trait RequestTransport: Send + Sync {
     /// at complete-message receipt, before correlation or validation. Custom
     /// transports construct [`ReceivedMessageInfo`] without internal reply capabilities.
     /// Rejection continues under the
-    /// same deadline. Reliable transports must retain exclusive framing
-    /// ownership across the complete operation and make an unsafe partially
-    /// completed connection unusable.
+    /// same deadline. Reliable transports must retain independent framing
+    /// ownership when a caller is cancelled. A started write must finish its
+    /// frame under its existing deadline or make the connection unusable.
     fn request_with<T, F>(
         &self,
         data: &[u8],

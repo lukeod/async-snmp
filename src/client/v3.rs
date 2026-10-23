@@ -1172,8 +1172,8 @@ impl<T: RequestTransport> Client<T> {
                 .map_err(|error| error.with_prior_response_metadata(&exchange_metadata))?;
             msg_id_window.insert(msg_id);
 
-            // Send request and wait for response as a single unit so reliable
-            // transports own their stream lock for the whole exchange.
+            // Register, write and validate under one absolute exchange deadline;
+            // reliable transports keep framing independent of this future.
             let exchange_result = {
                 let request_exchange =
                     self.inner

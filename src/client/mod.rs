@@ -839,10 +839,9 @@ impl<T: RequestTransport> Client<T> {
             )
             .with_decode_config(self.inner.config.decode_config);
 
-            // Send request and wait for response as a single unit. Combining the
-            // two lets reliable transports (TCP) own their stream lock for the
-            // whole exchange, so a cancelled request cannot leak the lock and
-            // wedge later requests.
+            // The transport registers before writing and preserves one deadline
+            // through response rejection. TCP framing belongs to its session
+            // driver and survives cancellation of this exchange.
             tracing::trace!(target: "async_snmp::client", { snmp.bytes = data.len() }, "sending request");
             match self
                 .inner

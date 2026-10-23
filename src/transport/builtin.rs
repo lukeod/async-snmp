@@ -130,7 +130,6 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
-    use tokio::time::timeout;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -247,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_request_with_keeps_concurrent_exchanges_serialized_across_rejection() {
+    async fn tcp_request_with_preserves_frame_boundaries_and_concurrent_rejection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
@@ -273,21 +272,16 @@ mod tests {
                 .await
         });
 
+        // Both complete writes must arrive before either response. Large
+        // frames exercise writer serialization without serializing exchanges.
+        let mut markers = Vec::new();
         for _ in 0..2 {
             let request = read_frame(&mut server).await;
             let marker = *request.last().unwrap();
-
-            // The TCP implementation owns the connection lock from write
-            // through every rejected candidate. Delegating to the trait's
-            // send-then-recv default would allow the queued request to begin.
-            let mut next = [0_u8; 1];
-            assert!(
-                timeout(Duration::from_millis(50), server.read_exact(&mut next))
-                    .await
-                    .is_err(),
-                "a concurrent request was written before the active exchange completed"
-            );
-
+            assert!(request[5..request.len() - 1].iter().all(|byte| *byte == 0));
+            markers.push(marker);
+        }
+        for marker in markers.into_iter().rev() {
             server
                 .write_all(&response(i32::from(marker)))
                 .await

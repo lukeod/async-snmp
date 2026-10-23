@@ -9,7 +9,7 @@
 //! - does not retransmit requests after a response timeout;
 //! - can still perform independent SNMPv3 protocol correction;
 //! - uses one connection per target; and
-//! - serializes requests on each connection.
+//! - permits bounded concurrent exchanges with serialized complete-message writes.
 //!
 //! Run `cargo run --example tcp_client`.
 //!
@@ -80,8 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Construct a TCP transport before creating the client.
     let addr: SocketAddr = "127.0.0.1:11161".parse()?;
 
-    match TcpTransport::connect(addr).await {
-        Ok(transport) => {
+    match TcpTransport::builder().target(addr).spawn().await {
+        Ok(running) => {
+            let transport = running.transport();
             println!("TCP transport connected");
             println!("  Local:  {}", transport.local_addr());
             println!("  Remote: {}", transport.peer_addr());
@@ -103,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 Err(e) => println!("GET failed: {e}"),
             }
+            running.shutdown().await?;
         }
         Err(e) => {
             println!("TCP connection failed: {e}");

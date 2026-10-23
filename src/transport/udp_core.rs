@@ -29,6 +29,7 @@ pub struct UdpCore {
     stats: CoreStats,
     /// Set when the owning transport shuts down; waiters fail immediately.
     closed: AtomicBool,
+    deduplicate_candidates: bool,
 }
 
 /// Counters for transport health monitoring.
@@ -88,8 +89,16 @@ impl RegistrationOwner {
     }
 }
 
+struct ResponseCandidate {
+    data: Bytes,
+    info: crate::ReceivedMessageInfo,
+    // Retained through validation; accepted public values are caller-owned and
+    // no longer count against transport buffering.
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 struct ResponseSlot {
-    responses: VecDeque<(Bytes, crate::ReceivedMessageInfo)>,
+    responses: VecDeque<ResponseCandidate>,
     owner: Arc<RegistrationOwner>,
     /// Configured target, used by conditional community rewrite policy.
     target_source: SocketAddr,
@@ -166,6 +175,14 @@ impl Drop for UdpRegistration {
 impl UdpCore {
     /// Create a new `UdpCore` with empty shards.
     pub fn new() -> Self {
+        Self::with_duplicate_filter(true)
+    }
+
+    pub(crate) fn for_stream() -> Self {
+        Self::with_duplicate_filter(false)
+    }
+
+    fn with_duplicate_filter(deduplicate_candidates: bool) -> Self {
         let shards: Vec<Shard> = (0..SHARDS)
             .map(|_| Shard {
                 pending: Mutex::new(HashMap::new()),
@@ -183,6 +200,7 @@ impl UdpCore {
                 malformed_datagrams: AtomicU64::new(0),
             },
             closed: AtomicBool::new(false),
+            deduplicate_candidates,
         }
     }
 
@@ -426,7 +444,15 @@ impl UdpCore {
             Instant::now(),
             data.len(),
         );
-        self.deliver_with_envelope(request_id, None, data, info)
+        self.deliver_with_envelope(
+            request_id,
+            None,
+            ResponseCandidate {
+                data,
+                info,
+                _permit: None,
+            },
+        )
     }
 
     pub(crate) fn deliver_parsed(
@@ -436,15 +462,41 @@ impl UdpCore {
         data: Bytes,
         info: crate::ReceivedMessageInfo,
     ) -> bool {
-        self.deliver_with_envelope(request_id, Some(envelope), data, info)
+        self.deliver_with_envelope(
+            request_id,
+            Some(envelope),
+            ResponseCandidate {
+                data,
+                info,
+                _permit: None,
+            },
+        )
+    }
+
+    pub(crate) fn deliver_parsed_buffered(
+        &self,
+        request_id: i32,
+        envelope: CorrelationEnvelope,
+        data: Bytes,
+        info: crate::ReceivedMessageInfo,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> bool {
+        self.deliver_with_envelope(
+            request_id,
+            Some(envelope),
+            ResponseCandidate {
+                data,
+                info,
+                _permit: Some(permit),
+            },
+        )
     }
 
     fn deliver_with_envelope(
         &self,
         request_id: i32,
         envelope: Option<CorrelationEnvelope>,
-        data: Bytes,
-        info: crate::ReceivedMessageInfo,
+        candidate: ResponseCandidate,
     ) -> bool {
         let (target_id, owner) = {
             let pending = self.shard(request_id).pending.lock().unwrap();
@@ -454,7 +506,7 @@ impl UdpCore {
                 None => (request_id, None),
             }
         };
-        self.deliver_to(target_id, owner.as_ref(), request_id, envelope, data, info)
+        self.deliver_to(target_id, owner.as_ref(), request_id, envelope, candidate)
     }
 
     fn deliver_to(
@@ -463,9 +515,13 @@ impl UdpCore {
         expected_owner: Option<&Arc<RegistrationOwner>>,
         request_id: i32,
         envelope: Option<CorrelationEnvelope>,
-        data: Bytes,
-        info: crate::ReceivedMessageInfo,
+        candidate: ResponseCandidate,
     ) -> bool {
+        let ResponseCandidate {
+            data,
+            info,
+            _permit,
+        } = candidate;
         let source = info.peer_addr();
         let shard = self.shard(target_id);
         let mut pending = shard.pending.lock().unwrap();
@@ -521,9 +577,12 @@ impl UdpCore {
                 }
                 ResponseIdentity::Match => {}
             }
-            if slot.responses.iter().any(|(parked, parked_source)| {
-                parked_source.peer_addr() == source && *parked == data
-            }) || slot.responses.len() >= MAX_PARKED_CANDIDATES
+            if (self.deduplicate_candidates
+                && slot
+                    .responses
+                    .iter()
+                    .any(|parked| parked.info.peer_addr() == source && parked.data == data))
+                || slot.responses.len() >= MAX_PARKED_CANDIDATES
             {
                 // Ignore exact duplicates and bound per-exchange memory if
                 // candidates arrive faster than
@@ -534,7 +593,11 @@ impl UdpCore {
                     .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
-            slot.responses.push_back((data, info));
+            slot.responses.push_back(ResponseCandidate {
+                data,
+                info,
+                _permit,
+            });
             let notify = slot.owner.notify.clone();
             drop(pending);
             notify.notify_one();
@@ -612,7 +675,12 @@ impl UdpCore {
                 }
             };
 
-            if let Some((data, info)) = response {
+            if let Some(ResponseCandidate {
+                data,
+                info,
+                _permit,
+            }) = response
+            {
                 let source = info.peer_addr();
                 match validate(data, info)? {
                     Candidate::Accept(value) => {

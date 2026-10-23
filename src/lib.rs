@@ -634,10 +634,11 @@ pub use pdu::{
     PduBody, PduType, RequestPdu, ResponsePdu, StandardPduType, TrapV1Notification, TrapV1Pdu,
 };
 pub use transport::{
-    BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId, PreparedUdpEndpoint,
-    ReceivedMessageInfo, RequestRegistration, RequestTransport, ResponseIdentity,
-    RunningUdpEndpoint, SessionId, TcpTransport, TransportKind, UdpControl, UdpEndpoint,
-    UdpEndpointBuilder, UdpHandle, UdpRunner, UdpStats, UdpStatus,
+    BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId, PreparedTcpSession,
+    PreparedUdpEndpoint, ReceivedMessageInfo, RequestRegistration, RequestTransport,
+    ResponseIdentity, RunningTcpSession, RunningUdpEndpoint, SessionId, TcpControl, TcpOptions,
+    TcpRunner, TcpStatus, TcpTransport, TcpTransportBuilder, TransportKind, UdpControl,
+    UdpEndpoint, UdpEndpointBuilder, UdpHandle, UdpRunner, UdpStats, UdpStatus,
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, AuthoritativeEnginePersistenceError,

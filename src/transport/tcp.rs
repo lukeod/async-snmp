@@ -1,524 +1,686 @@
-//! TCP transport implementation for SNMP clients.
+//! Session-owned TCP framing, correlation and serialized complete-message writes.
 //!
-//! [`TcpTransport`] carries BER-encoded SNMP messages over a connected TCP
-//! stream. The peer must support SNMP over TCP.
+//! A session has one reader and one writer, driven by its owned [`TcpRunner`].
+//! Requests register before entering the bounded write queue and validate
+//! responses in their own futures. Cancellation removes a registration without
+//! dropping the reader. Started writes finish under their original deadline or
+//! close the session; messages never interleave. There is no reconnect or replay.
 //!
-//! # Message framing
-//!
-//! Unlike UDP where each datagram is a complete message, TCP is a byte stream.
-//! SNMP over TCP uses BER's self-describing length for framing:
-//!
-//! ```text
-//! +------+--------+------------+
-//! | 0x30 | Length |  Content   |
-//! +------+--------+------------+
-//!   Tag   1-5 bytes  N bytes
-//! ```
-//!
-//! The receiver reads:
-//! 1. Tag byte (0x30 for SEQUENCE)
-//! 2. Length field (1-5 bytes, definite form only)
-//! 3. Content bytes (length determined by step 2)
-//!
-//! This uses the message's BER envelope without an additional framing header.
-//!
-//! # RequestTransport differences
-//!
-//! UDP preserves message boundaries and does not require connection state. TCP
-//! presents a byte stream, provides ordered delivery while the connection is
-//! usable, and is not constrained by a UDP datagram boundary. Message-size
-//! limits still apply at the SNMP and library configuration layers.
-//!
-//! # Request retries
-//!
-//! The client does not apply its UDP retry policy to TCP requests. A request
-//! timeout is returned to the caller; reconnecting or retrying on another
-//! connection is an application decision.
-//!
-//! # Example
+//! [`TcpTransportBuilder::prepare`] performs setup without spawning. Supplied
+//! streams retain their original Tokio registration and socket options. Explicit
+//! spawn conveniences return a [`RunningTcpSession`] owner. `connect` conveniences
+//! retain their task with the public session lifetime and expose [`TcpControl`].
 //!
 //! ```rust,no_run
-//! use async_snmp::{Auth, Client};
-//! use std::time::Duration;
-//!
+//! use async_snmp::{Auth, ClientBuilder, TcpTransport};
 //! # async fn example() -> async_snmp::Result<()> {
-//! // Create a TCP client via the builder
-//! let client = Client::builder("192.168.1.1:161", Auth::v2c("public"))
-//!     .request_timeout(Duration::from_secs(10))
-//!     .connect_tcp()
-//!     .await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! For advanced TCP configuration (connection timeout, keepalive, buffer sizes),
-//! construct the transport directly:
-//!
-//! ```rust,no_run
-//! use async_snmp::transport::TcpTransport;
-//! use async_snmp::{Auth, ClientBuilder};
-//! use std::time::Duration;
-//!
-//! # async fn example() -> async_snmp::Result<()> {
-//! let transport = TcpTransport::connect_timeout(
-//!     "192.168.1.1:161".parse().unwrap(),
-//!     Duration::from_secs(5)
-//! ).await?;
-//!
-//! let client = ClientBuilder::new(Auth::v2c("public"))
-//!     .build_with_transport(transport)?;
+//! let prepared = TcpTransport::builder()
+//!     .target("192.0.2.1:161".parse().unwrap()).prepare().await?;
+//! let (session, runner) = prepared.into_parts();
+//! let client = ClientBuilder::new(Auth::v2c("public")).build_with_transport(session)?;
+//! let driver = tokio::spawn(runner.run());
+//! # let _ = (client, driver);
 //! # Ok(())
 //! # }
 //! ```
 
-#[cfg(test)]
-use super::extract_request_id;
-use super::{
-    Candidate, CorrelationEnvelope, RequestRegistration, RequestTransport, ResponseIdentity,
-};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bytes::Bytes;
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::sync::{CancellationToken, DropGuard};
+
+use super::framing::{BerFramer, BufferedFrame};
+use super::udp_core::UdpCore;
+use super::{Candidate, CorrelationEnvelope, RequestRegistration, RequestTransport};
 use crate::error::{ConstructionStage, Error, Result};
 use crate::message_size::ReceiveLimits;
-use bytes::{Bytes, BytesMut};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::{Mutex, OwnedMutexGuard};
-#[cfg(test)]
-use tokio::time::timeout;
 
-/// Default total-message limit for incoming TCP messages.
-///
-/// While the protocol allows messages up to 2GB, we impose a practical limit
-/// to prevent denial-of-service attacks where a malicious sender claims an
-/// enormous message size. This limit is checked before allocating any buffers.
-///
-/// 10MB is generous for SNMP - even large table walks rarely exceed a few MB.
-/// Real-world SNMP messages typically range from a few hundred bytes to a few KB.
-const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
-/// Configuration options for [`TcpTransport`].
-///
-/// For advanced TCP socket configuration (`TCP_NODELAY`, keepalive, buffer sizes,
-/// etc.), use [`TcpTransport::from_socket()`] with a pre-configured `TcpSocket`.
+/// TCP frame, queue and execution limits. Limits are per session; listener
+/// supervisors additionally bound the number and aggregate capacity of sessions.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TcpOptions {
-    /// Maximum size of incoming messages to accept.
-    ///
-    /// Messages claiming to be larger than this are rejected before allocating
-    /// any buffers, preventing denial-of-service attacks.
-    ///
-    /// Default: 10MB. Real SNMP messages rarely exceed a few KB.
+    /// Maximum complete incoming frame and advertised receive size; default 10 MiB.
     pub max_message_size: usize,
-    /// Maximum exact encoded message size to send.
-    ///
-    /// Default: 10MB. This is independent of the incoming framing and
-    /// SNMPv3 advertisement limit above.
+    /// Maximum exact outgoing message size; default 10 MiB.
     pub send_capacity: usize,
+    /// Concurrent locally initiated exchanges; default 64. Waiting consumes the
+    /// exchange's ordinary absolute deadline.
+    pub max_in_flight: usize,
+    /// Complete writes waiting for the writer; default 32.
+    pub write_queue_capacity: usize,
+    /// Aggregate buffered inbound/outbound bytes, including parked and validating
+    /// candidates; default 32 MiB. Accepted caller-owned results are excluded.
+    /// Must accommodate each configured message limit.
+    pub max_buffered_bytes: usize,
+    /// Complete a started BER header within this duration; default 5 seconds.
+    pub header_timeout: Duration,
+    /// Complete a declared BER body within this duration; default 30 seconds.
+    pub body_timeout: Duration,
+    /// Total queue/write budget for send-only operations, and upper bound for
+    /// individual writes; default 5 seconds. Exchange deadlines may be shorter.
+    pub write_timeout: Duration,
 }
-
 impl Default for TcpOptions {
     fn default() -> Self {
         Self {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             send_capacity: DEFAULT_MAX_MESSAGE_SIZE,
+            max_in_flight: 64,
+            write_queue_capacity: 32,
+            max_buffered_bytes: 32 * 1024 * 1024,
+            header_timeout: Duration::from_secs(5),
+            body_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(5),
         }
     }
 }
+impl TcpOptions {
+    fn validate(&self) -> Result<ReceiveLimits> {
+        let limits = ReceiveLimits::tcp(self.max_message_size)
+            .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
+        if self.max_in_flight == 0
+            || self.max_in_flight > Semaphore::MAX_PERMITS
+            || self.write_queue_capacity == 0
+            || self.write_queue_capacity > Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "TCP concurrency and queue capacities must be nonzero and representable".into(),
+            )
+            .boxed());
+        }
+        if self.max_buffered_bytes > u32::MAX as usize
+            || self.max_buffered_bytes > Semaphore::MAX_PERMITS
+            || self.max_buffered_bytes < self.max_message_size.max(self.send_capacity)
+        {
+            return Err(Error::Config(
+                "TCP buffered-byte capacity must fit semaphore accounting and every message limit"
+                    .into(),
+            )
+            .boxed());
+        }
+        for (duration, name) in [
+            (self.header_timeout, "TCP header timeout"),
+            (self.body_timeout, "TCP body timeout"),
+            (self.write_timeout, "TCP write timeout"),
+        ] {
+            if duration.is_zero() {
+                return Err(Error::Config(format!("{name} must be nonzero").into()).boxed());
+            }
+            tcp_deadline(duration, name)?;
+        }
+        Ok(limits)
+    }
+}
 
-/// Builder for [`TcpTransport`].
-///
-/// For advanced TCP socket configuration (`TCP_NODELAY`, keepalive, buffer sizes,
-/// etc.), use [`TcpTransport::from_socket()`] with a pre-configured `TcpSocket`.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use async_snmp::transport::TcpTransport;
-/// use std::time::Duration;
-///
-/// # async fn example() -> async_snmp::Result<()> {
-/// let transport = TcpTransport::builder()
-///     .connect_timeout(Duration::from_secs(10))
-///     .max_message_size(1_000_000)  // 1MB limit
-///     .connect("192.168.1.1:161".parse().unwrap())
-///     .await?;
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Debug)]
+/// Prepare a connected or accepted TCP session. A supplied stream conflicts
+/// with target, connect timeout and pre-connect socket configuration.
+#[derive(Debug, Default)]
 pub struct TcpTransportBuilder {
+    target: Option<SocketAddr>,
+    stream: Option<TcpStream>,
+    socket: Option<TcpSocket>,
     connect_timeout: Option<Duration>,
     options: TcpOptions,
 }
-
 impl TcpTransportBuilder {
-    /// Create a builder with the default settings.
-    #[must_use]
+    /// Create default configuration.
     pub fn new() -> Self {
-        Self {
-            connect_timeout: None,
-            options: TcpOptions::default(),
-        }
+        Self::default()
     }
-
-    /// Set connection timeout.
+    /// Configure an outbound connection target.
+    #[must_use]
+    pub fn target(mut self, target: SocketAddr) -> Self {
+        self.target = Some(target);
+        self
+    }
+    /// Supply an owned connected or accepted stream without modifying its options.
+    #[must_use]
+    pub fn from_stream(mut self, stream: TcpStream) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+    /// Supply a configured pre-connect socket. Also configure a target.
+    #[must_use]
+    pub fn from_socket(mut self, socket: TcpSocket) -> Self {
+        self.socket = Some(socket);
+        self
+    }
+    /// Configure all session limits.
+    #[must_use]
+    pub fn options(mut self, options: TcpOptions) -> Self {
+        self.options = options;
+        self
+    }
+    /// Bound initial connection establishment.
     #[must_use]
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
     }
-
-    /// Set the maximum total encoded size for incoming messages.
-    ///
-    /// Messages claiming to be larger than this are rejected before allocating
-    /// any buffers, preventing denial-of-service attacks.
-    ///
-    /// Default: 10MB.
+    /// Set complete incoming frame size and SNMPv3 receive advertisement.
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.options.max_message_size = size;
         self
     }
-
-    /// Set the maximum exact encoded size for outgoing messages.
+    /// Set exact outgoing message capacity.
     #[must_use]
     pub fn send_capacity(mut self, size: usize) -> Self {
         self.options.send_capacity = size;
         self
     }
+    /// Bound concurrent exchanges.
+    #[must_use]
+    pub fn max_in_flight(mut self, count: usize) -> Self {
+        self.options.max_in_flight = count;
+        self
+    }
+    /// Bound the writer queue.
+    #[must_use]
+    pub fn write_queue_capacity(mut self, count: usize) -> Self {
+        self.options.write_queue_capacity = count;
+        self
+    }
+    /// Bound owned message bytes across reads, candidates and writes.
+    #[must_use]
+    pub fn max_buffered_bytes(mut self, bytes: usize) -> Self {
+        self.options.max_buffered_bytes = bytes;
+        self
+    }
+    /// Bound completion of a started BER header.
+    #[must_use]
+    pub fn header_timeout(mut self, timeout: Duration) -> Self {
+        self.options.header_timeout = timeout;
+        self
+    }
+    /// Bound completion of a declared BER body.
+    #[must_use]
+    pub fn body_timeout(mut self, timeout: Duration) -> Self {
+        self.options.body_timeout = timeout;
+        self
+    }
+    /// Bound individual writes and default send-only operations.
+    #[must_use]
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.options.write_timeout = timeout;
+        self
+    }
 
-    /// Connect to the target address.
-    pub async fn connect(self, target: SocketAddr) -> Result<TcpTransport> {
-        // Validate the deadline before normalizing limits or starting connect
-        // I/O so an unrepresentable duration has deterministic precedence.
-        let started = tokio::time::Instant::now();
+    /// Validate and establish initial resources, without creating background tasks.
+    /// Packaging a registered supplied stream requires no entered Tokio runtime.
+    pub async fn prepare(self) -> Result<PreparedTcpSession> {
+        let started = Instant::now();
         let connect_deadline = self
             .connect_timeout
-            .map(|timeout| tcp_deadline(timeout, "TCP connect timeout"))
+            .map(|duration| tcp_deadline(duration, "TCP connect timeout"))
             .transpose()?;
-        let receive_limits = ReceiveLimits::tcp(self.options.max_message_size)
-            .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
-        let stream = match (self.connect_timeout, connect_deadline) {
-            (Some(_), Some(deadline)) if tokio::time::Instant::now() >= deadline => {
-                return Err(Error::ConstructionTimeout {
-                    target: target.into(),
-                    stage: ConstructionStage::Connect,
-                    elapsed: started.elapsed(),
-                }
+        let limits = self.options.validate()?;
+        let stream = if let Some(stream) = self.stream {
+            if self.target.is_some() || self.socket.is_some() || self.connect_timeout.is_some() {
+                return Err(Error::Config(
+                    "supplied TCP stream conflicts with target, socket or connect timeout".into(),
+                )
                 .boxed());
             }
-            (Some(_), Some(deadline)) => {
-                tokio::time::timeout_at(deadline, TcpStream::connect(target))
+            stream
+        } else {
+            let target = self.target.ok_or_else(|| {
+                Error::Config("TCP target or connected stream is required".into()).boxed()
+            })?;
+            let connect = async {
+                match self.socket {
+                    Some(socket) => socket.connect(target).await,
+                    None => TcpStream::connect(target).await,
+                }
+                .map_err(|source| Error::Network { target, source }.boxed())
+            };
+            if let Some(deadline) = connect_deadline {
+                if Instant::now() >= deadline {
+                    return Err(construction_timeout(target, started));
+                }
+                tokio::time::timeout_at(deadline, connect)
                     .await
-                    .map_err(|_| {
-                        Error::ConstructionTimeout {
-                            target: target.into(),
-                            stage: ConstructionStage::Connect,
-                            elapsed: started.elapsed(),
-                        }
-                        .boxed()
-                    })?
-                    .map_err(|e| Error::Network { target, source: e }.boxed())?
+                    .map_err(|_| construction_timeout(target, started))??
+            } else {
+                connect.await?
             }
-            (None, None) => TcpStream::connect(target)
-                .await
-                .map_err(|e| Error::Network { target, source: e }.boxed())?,
-            _ => unreachable!("deadline presence follows timeout presence"),
         };
-
+        let unknown = "0.0.0.0:0".parse().unwrap();
+        let target = stream.peer_addr().map_err(|source| {
+            Error::Network {
+                target: unknown,
+                source,
+            }
+            .boxed()
+        })?;
         let local_addr = stream
             .local_addr()
-            .map_err(|e| Error::Network { target, source: e }.boxed())?;
-
-        Ok(TcpTransport {
+            .map_err(|source| Error::Network { target, source }.boxed())?;
+        let (writes, receiver) = mpsc::channel(self.options.write_queue_capacity);
+        let state = Arc::new(SessionState {
+            endpoint_id: crate::EndpointId::new(),
+            session_id: crate::SessionId::new(),
+            target,
+            local_addr,
+            receive_limits: limits,
+            options: self.options.clone(),
+            core: Arc::new(UdpCore::for_stream()),
+            shutdown: CancellationToken::new(),
+            complete: CancellationToken::new(),
+            admission: Mutex::new(true),
+            status: Mutex::new(TcpStatus::Prepared),
+            terminal_error: Mutex::new(None),
+            in_flight: Arc::new(Semaphore::new(self.options.max_in_flight)),
+            budget: Arc::new(Semaphore::new(self.options.max_buffered_bytes)),
+        });
+        let transport = TcpTransport {
             inner: Arc::new(TcpTransportInner {
-                endpoint_id: crate::EndpointId::new(),
-                session_id: crate::SessionId::new(),
-                stream: Arc::new(Mutex::new(stream)),
-                target,
-                local_addr,
-                receive_limits,
-                send_capacity: self.options.send_capacity,
-                poisoned: AtomicBool::new(false),
+                _lease: state.shutdown.clone().drop_guard(),
+                state: state.clone(),
+                writes,
+                task: tokio::sync::Mutex::new(None),
             }),
+        };
+        Ok(PreparedTcpSession {
+            transport,
+            runner: TcpRunner {
+                stream,
+                writes: receiver,
+                cleanup: SessionCleanup(state),
+            },
         })
     }
-}
-
-impl Default for TcpTransportBuilder {
-    fn default() -> Self {
-        Self::new()
+    /// Prepare and explicitly spawn the session on the current runtime.
+    pub async fn spawn(self) -> Result<RunningTcpSession> {
+        Ok(self.prepare().await?.spawn())
+    }
+    /// Prepare and spawn without migrating existing I/O registration.
+    pub async fn spawn_on(self, runtime: &tokio::runtime::Handle) -> Result<RunningTcpSession> {
+        Ok(self.prepare().await?.spawn_on(runtime))
+    }
+    /// Connect and retain the driver with the public session lifetime. Its result
+    /// is observable through the returned handle's control.
+    pub async fn connect(self, target: SocketAddr) -> Result<TcpTransport> {
+        Ok(self.target(target).spawn().await?.into_managed())
     }
 }
 
-/// TCP transport for a single target.
-///
-/// Each `TcpTransport` owns a TCP connection to a specific target.
-/// Unlike UDP, TCP is stream-oriented so messages are framed using
-/// BER's self-describing length encoding.
-///
-/// # Connection lifecycle
-///
-/// The connection is established during construction and remains open
-/// for the lifetime of the transport. If the connection fails, subsequent
-/// operations return errors and a new transport must be created.
-///
-/// # No retries
-///
-/// Since TCP guarantees delivery or failure, the client does not retry
-/// on timeout when using TCP transport ([`is_reliable()`](RequestTransport::is_reliable)
-/// returns `true`). A timeout indicates the connection is likely broken.
-///
-/// # Serialized operations
-///
-/// Request-response pairs are serialized to ensure correct correlation.
-/// [`request_with()`](RequestTransport::request_with) owns the stream lock for the whole
-/// write-then-read exchange, preventing interleaving of concurrent requests.
-/// Because the lock is held by a single future (not stashed across independent
-/// await points), a dropped or cancelled request releases it instead of leaking
-/// it. Cancellation after the lock is acquired also poisons the connection, so
-/// later operations fail with [`Error::Closed`] rather than consuming ambiguous
-/// stream state.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use async_snmp::transport::TcpTransport;
-/// use async_snmp::{Auth, ClientBuilder};
-/// use std::time::Duration;
-///
-/// # async fn example() -> async_snmp::Result<()> {
-/// let transport = TcpTransport::connect_timeout(
-///     "192.168.1.1:161".parse().unwrap(),
-///     Duration::from_secs(5)
-/// ).await?;
-///
-/// let client = ClientBuilder::new(Auth::v2c("public"))
-///     .build_with_transport(transport)?;
-/// # Ok(())
-/// # }
-/// ```
+/// Cloneable handle to exactly one TCP session, whether accepted or connected.
+/// A closed handle never connects again or selects another session by address.
 #[derive(Clone)]
 pub struct TcpTransport {
     inner: Arc<TcpTransportInner>,
 }
-
 struct TcpTransportInner {
+    state: Arc<SessionState>,
+    writes: mpsc::Sender<WriteCommand>,
+    task: tokio::sync::Mutex<Option<JoinHandle<Result<()>>>>,
+    _lease: DropGuard,
+}
+struct SessionState {
     endpoint_id: crate::EndpointId,
     session_id: crate::SessionId,
-    /// The TCP stream, wrapped in Arc for owned guard pattern
-    stream: Arc<Mutex<TcpStream>>,
     target: SocketAddr,
     local_addr: SocketAddr,
-    /// One total-message bound shared by framing, decoding, and advertisement.
     receive_limits: ReceiveLimits,
-    /// Exact encoded outbound-message limit.
-    send_capacity: usize,
-    /// Set once framing or transaction state may be ambiguous.
-    ///
-    /// TCP is a byte stream framed by BER length prefixes. Partial I/O,
-    /// cancellation, timeout, or malformed framing can leave an unknown number
-    /// of bytes in flight or buffered. A subsequent exchange could then consume
-    /// an abandoned request's response or parse leftover bytes as a fresh
-    /// message. Once this flag is set every later operation fails fast with
-    /// [`Error::Closed`]; recovery requires constructing a new transport.
-    poisoned: AtomicBool,
+    options: TcpOptions,
+    core: Arc<UdpCore>,
+    shutdown: CancellationToken,
+    complete: CancellationToken,
+    admission: Mutex<bool>,
+    status: Mutex<TcpStatus>,
+    terminal_error: Mutex<Option<Arc<Error>>>,
+    in_flight: Arc<Semaphore>,
+    budget: Arc<Semaphore>,
 }
-
-impl TcpTransportInner {
-    /// Report whether the stream framing has been marked lost.
-    fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Acquire)
+impl SessionState {
+    fn close(&self) {
+        *self.admission.lock().unwrap() = false;
+        self.shutdown.cancel();
+        self.core.close();
     }
-}
-
-/// Marks a locked stream unusable unless its transaction completes cleanly.
-///
-/// The synchronous `Drop` implementation is essential: cancellation drops the
-/// future at an arbitrary await point, where an asynchronous cleanup path
-/// cannot be relied upon to run before another caller acquires the stream lock.
-struct TcpTransactionGuard<'a> {
-    poisoned: &'a AtomicBool,
-    armed: bool,
-}
-
-impl<'a> TcpTransactionGuard<'a> {
-    fn new(inner: &'a TcpTransportInner) -> Self {
-        Self {
-            poisoned: &inner.poisoned,
-            armed: true,
-        }
+    fn closed_error(&self) -> Box<Error> {
+        self.terminal_error.lock().unwrap().as_ref().map_or_else(
+            || {
+                Error::Closed {
+                    target: self.target,
+                }
+                .boxed()
+            },
+            |source| {
+                Error::SharedOperation {
+                    source: source.clone(),
+                }
+                .boxed()
+            },
+        )
     }
-
-    fn unarmed(inner: &'a TcpTransportInner) -> Self {
-        Self {
-            poisoned: &inner.poisoned,
-            armed: false,
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(poisoned: &'a AtomicBool) -> Self {
-        Self {
-            poisoned,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    fn arm(&mut self) {
-        self.armed = true;
+    fn fail(&self, error: Box<Error>) -> Box<Error> {
+        let error: Arc<Error> = error.into();
+        *self.status.lock().unwrap() = TcpStatus::Failed(Arc::from(error.to_string()));
+        *self.terminal_error.lock().unwrap() = Some(error.clone());
+        self.close();
+        Error::SharedOperation { source: error }.boxed()
     }
 }
-
-impl Drop for TcpTransactionGuard<'_> {
+struct SessionCleanup(Arc<SessionState>);
+impl Drop for SessionCleanup {
     fn drop(&mut self) {
-        if self.armed {
-            self.poisoned.store(true, Ordering::Release);
+        self.0.close();
+        let mut status = self.0.status.lock().unwrap();
+        if !matches!(*status, TcpStatus::Failed(_)) {
+            *status = TcpStatus::Stopped;
+        }
+        self.0.complete.cancel();
+    }
+}
+
+/// Coalesced session status, independent of response consumption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TcpStatus {
+    /// Prepared, with an unpolled runner.
+    Prepared,
+    /// Reader and writer are being driven.
+    Running,
+    /// Terminal, including runner drop or clean peer EOF.
+    Stopped,
+    /// Terminal framing or socket failure.
+    Failed(Arc<str>),
+}
+
+/// Prepared session and its unstarted, single-use runner.
+#[must_use = "drive or drop the runner"]
+pub struct PreparedTcpSession {
+    transport: TcpTransport,
+    runner: TcpRunner,
+}
+impl PreparedTcpSession {
+    /// Separate public lifetime ownership from driver ownership.
+    pub fn into_parts(self) -> (TcpTransport, TcpRunner) {
+        (self.transport, self.runner)
+    }
+    /// Spawn and retain a running owner.
+    pub fn spawn(self) -> RunningTcpSession {
+        self.spawn_on(&tokio::runtime::Handle::current())
+    }
+    /// Spawn without migrating the supplied stream's Tokio registration.
+    pub fn spawn_on(self, runtime: &tokio::runtime::Handle) -> RunningTcpSession {
+        let (transport, runner) = self.into_parts();
+        RunningTcpSession {
+            transport,
+            task: Some(runtime.spawn(runner.run())),
+        }
+    }
+}
+
+/// Owned session driver. Its reader and writer are polled concurrently by one
+/// supervisor future; there are no detached child tasks. Cleanup is owned before
+/// `run` is polled, so abort or unpolled drop wakes pending exchanges.
+#[must_use = "drive or drop the runner"]
+pub struct TcpRunner {
+    stream: TcpStream,
+    writes: mpsc::Receiver<WriteCommand>,
+    cleanup: SessionCleanup,
+}
+impl TcpRunner {
+    /// Drive complete-message reads and serialized writes until terminal shutdown.
+    /// The runtime owning the socket registration must remain alive and driven.
+    pub async fn run(self) -> Result<()> {
+        let Self {
+            stream,
+            writes,
+            cleanup,
+        } = self;
+        let state = &cleanup.0;
+        *state.status.lock().unwrap() = TcpStatus::Running;
+        let (read, write) = stream.into_split();
+        let result = tokio::select! {
+            biased;
+            () = state.shutdown.cancelled() => Ok(()),
+            result = read_loop(read, state) => result,
+            result = write_loop(write, writes, state) => result,
+        };
+        result.map_err(|error| state.fail(error))
+    }
+}
+
+/// Running session owner. Drop requests shutdown; join observes its result.
+#[must_use = "dropping the running owner requests shutdown"]
+pub struct RunningTcpSession {
+    transport: TcpTransport,
+    task: Option<JoinHandle<Result<()>>>,
+}
+impl std::ops::Deref for RunningTcpSession {
+    type Target = TcpTransport;
+    fn deref(&self) -> &TcpTransport {
+        &self.transport
+    }
+}
+impl Drop for RunningTcpSession {
+    fn drop(&mut self) {
+        if self.task.is_some() {
+            self.transport.control().request_shutdown();
+        }
+    }
+}
+impl RunningTcpSession {
+    /// Clone a handle selecting this exact session.
+    pub fn transport(&self) -> TcpTransport {
+        self.transport.clone()
+    }
+    /// Access retained task status or abort it.
+    pub fn task(&self) -> &JoinHandle<Result<()>> {
+        self.task.as_ref().expect("running task retained")
+    }
+    /// Join without initiating shutdown.
+    pub async fn join(mut self) -> Result<()> {
+        let result = self.task.as_mut().expect("running task retained").await;
+        self.task.take();
+        join_result(result, self.peer_addr())
+    }
+    /// Request shutdown and join the driver.
+    pub async fn shutdown(self) -> Result<()> {
+        self.control().request_shutdown();
+        self.join().await
+    }
+    fn into_managed(mut self) -> TcpTransport {
+        *self
+            .transport
+            .inner
+            .task
+            .try_lock()
+            .expect("new session task slot") = self.task.take();
+        self.transport.clone()
+    }
+}
+
+/// Cloneable lifecycle authority for one session.
+#[derive(Clone)]
+pub struct TcpControl {
+    transport: TcpTransport,
+}
+impl TcpControl {
+    /// Request terminal shutdown without waiting for an unpolled runner.
+    pub fn request_shutdown(&self) {
+        self.transport.inner.state.close();
+    }
+    /// Whether shutdown has been requested or the driver terminated.
+    pub fn is_shutdown(&self) -> bool {
+        self.transport.inner.state.shutdown.is_cancelled()
+    }
+    /// Observe current driver state.
+    pub fn status(&self) -> TcpStatus {
+        self.transport.inner.state.status.lock().unwrap().clone()
+    }
+    /// Wait for driver completion. An unstarted runner must be driven or dropped.
+    pub async fn wait_closed(&self) {
+        self.transport.inner.state.complete.cancelled().await;
+    }
+    /// Request shutdown and wait for completion.
+    pub async fn shutdown(&self) {
+        self.request_shutdown();
+        self.wait_closed().await;
+    }
+    /// Join a driver retained by a connect convenience; explicit owners expose
+    /// their own `join`. Errors remain visible in status after a previous join.
+    pub async fn join(&self) -> Result<()> {
+        let mut task = self.transport.inner.task.lock().await;
+        if let Some(join) = task.as_mut() {
+            let result = join.await;
+            task.take();
+            join_result(result, self.transport.peer_addr())
+        } else {
+            drop(task);
+            self.wait_closed().await;
+            let state = &self.transport.inner.state;
+            if state.terminal_error.lock().unwrap().is_some() {
+                Err(state.closed_error())
+            } else {
+                Ok(())
+            }
         }
     }
 }
 
 impl TcpTransport {
-    /// Connect to a target address with default options.
-    ///
-    /// For custom configuration, use [`builder()`](Self::builder) or
-    /// [`from_socket()`](Self::from_socket).
-    pub async fn connect(target: SocketAddr) -> Result<Self> {
-        Self::builder().connect(target).await
-    }
-
-    /// Connect with a timeout.
-    ///
-    /// For additional configuration, use [`builder()`](Self::builder).
-    pub async fn connect_timeout(target: SocketAddr, connect_timeout: Duration) -> Result<Self> {
-        Self::builder()
-            .connect_timeout(connect_timeout)
-            .connect(target)
-            .await
-    }
-
-    /// Create a builder for custom configuration.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use async_snmp::transport::TcpTransport;
-    /// use std::time::Duration;
-    ///
-    /// # async fn example() -> async_snmp::Result<()> {
-    /// let transport = TcpTransport::builder()
-    ///     .connect_timeout(Duration::from_secs(10))
-    ///     .max_message_size(1_000_000)
-    ///     .connect("192.168.1.1:161".parse().unwrap())
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use]
+    /// Configure a session from an outbound target or an owned stream.
     pub fn builder() -> TcpTransportBuilder {
         TcpTransportBuilder::new()
     }
-
-    /// Create a transport from a pre-configured TCP socket.
-    ///
-    /// Use this when you need fine-grained control over TCP socket options
-    /// like `TCP_NODELAY`, keepalive, buffer sizes, etc.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use async_snmp::transport::{TcpTransport, TcpOptions};
-    /// use tokio::net::TcpSocket;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let socket = TcpSocket::new_v4()?;
-    /// socket.set_nodelay(true)?;
-    /// // Configure other options as needed...
-    ///
-    /// let target = "192.168.1.1:161".parse()?;
-    /// let transport = TcpTransport::from_socket(socket, target, TcpOptions::default()).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Connect with a driver retained for the public session lifetime.
+    pub async fn connect(target: SocketAddr) -> Result<Self> {
+        Self::builder().connect(target).await
+    }
+    /// Connect under a construction deadline.
+    pub async fn connect_timeout(target: SocketAddr, timeout: Duration) -> Result<Self> {
+        Self::builder()
+            .connect_timeout(timeout)
+            .connect(target)
+            .await
+    }
+    /// Connect a configured socket and retain its driver. To drive it yourself,
+    /// use `builder().from_socket(socket).target(target).prepare()`.
     pub async fn from_socket(
-        socket: tokio::net::TcpSocket,
+        socket: TcpSocket,
         target: SocketAddr,
         options: TcpOptions,
     ) -> Result<Self> {
-        let receive_limits = ReceiveLimits::tcp(options.max_message_size)
-            .map_err(|error| Error::Config(error.to_string().into()).boxed())?;
-        let stream = socket
-            .connect(target)
+        Self::builder()
+            .from_socket(socket)
+            .target(target)
+            .options(options)
+            .spawn()
             .await
-            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+            .map(RunningTcpSession::into_managed)
+    }
+    /// Identity of this connection; reconnects always have a different identity.
+    pub fn session_id(&self) -> crate::SessionId {
+        self.inner.state.session_id
+    }
+    /// Identity of the owning transport endpoint.
+    pub fn endpoint_id(&self) -> crate::EndpointId {
+        self.inner.state.endpoint_id
+    }
+    /// Acquire session-wide shutdown and result observation authority.
+    pub fn control(&self) -> TcpControl {
+        TcpControl {
+            transport: self.clone(),
+        }
+    }
 
-        let local_addr = stream
-            .local_addr()
-            .map_err(|e| Error::Network { target, source: e }.boxed())?;
+    async fn before<T>(
+        &self,
+        deadline: Instant,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let state = &self.inner.state;
+        let started = Instant::now();
+        if state.shutdown.is_cancelled() {
+            return Err(state.closed_error());
+        }
+        if Instant::now() >= deadline {
+            return Err(timeout_error(state.target, started.elapsed()));
+        }
+        tokio::select! {
+            biased;
+            result = future => result,
+            () = state.shutdown.cancelled() => Err(state.closed_error()),
+            () = tokio::time::sleep_until(deadline) => Err(timeout_error(state.target, started.elapsed())),
+        }
+    }
 
-        Ok(Self {
-            inner: Arc::new(TcpTransportInner {
-                endpoint_id: crate::EndpointId::new(),
-                session_id: crate::SessionId::new(),
-                stream: Arc::new(Mutex::new(stream)),
-                target,
-                local_addr,
-                receive_limits,
-                send_capacity: options.send_capacity,
-                poisoned: AtomicBool::new(false),
-            }),
+    async fn write_before(&self, data: &[u8], deadline: Instant) -> Result<()> {
+        let state = &self.inner.state;
+        let started = Instant::now();
+        crate::message_size::enforce_outbound_size(data.len(), state.options.send_capacity)?;
+        let cancelled = CancellationToken::new();
+        let _cancel_on_drop = cancelled.clone().drop_guard();
+        self.before(deadline, async {
+            // Reserve a queue slot and byte budget before copying caller data.
+            let slot = self
+                .inner
+                .writes
+                .clone()
+                .reserve_owned()
+                .await
+                .map_err(|_| state.closed_error())?;
+            let budget = state
+                .budget
+                .clone()
+                .acquire_many_owned(data.len() as u32)
+                .await
+                .map_err(|_| state.closed_error())?;
+            let bytes = Bytes::from_owner(BufferedFrame {
+                bytes: data.to_vec(),
+                _permit: budget,
+            });
+            let (complete, result) = oneshot::channel();
+            {
+                let admission = state.admission.lock().unwrap();
+                if !*admission || state.shutdown.is_cancelled() {
+                    return Err(state.closed_error());
+                }
+                if Instant::now() >= deadline {
+                    return Err(timeout_error(state.target, started.elapsed()));
+                }
+                slot.send(WriteCommand {
+                    bytes,
+                    started,
+                    deadline,
+                    cancelled,
+                    complete,
+                });
+            }
+            match result.await {
+                Ok(result) => result,
+                Err(_) => {
+                    state.shutdown.cancelled().await;
+                    Err(state.closed_error())
+                }
+            }
         })
+        .await
     }
 }
 
 impl RequestTransport for TcpTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
-        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
-        // Do not arm the transaction until the lock is acquired: cancellation
-        // while queued has not touched stream state and must leave it reusable.
-        let mut stream = self.inner.stream.clone().lock_owned().await;
-        let target = self.inner.target;
-        if self.inner.is_poisoned() {
-            return Err(Error::Closed { target }.boxed());
-        }
-
-        let mut transaction = TcpTransactionGuard::new(&self.inner);
-        write_message(&mut *stream, target, data).await?;
-        transaction.disarm();
-        Ok(())
+        self.send_with_timeout(data, self.inner.state.options.write_timeout)
+            .await
     }
-
-    async fn send_with_timeout(&self, data: &[u8], timeout: Duration) -> Result<()> {
-        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
-        let target = self.inner.target;
-        let deadline = transaction_deadline(timeout)?;
-        let mut stream = lock_stream_before(&self.inner, deadline, timeout).await?;
-
-        if self.inner.is_poisoned() {
-            return Err(Error::Closed { target }.boxed());
-        }
-
-        // `lock_stream_before` rejects an exhausted budget. Once the guarded
-        // write is polled, cancellation or expiry may leave partial stream I/O.
-        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
-        tokio::time::timeout_at(
-            deadline,
-            arm_when_polled(&mut transaction, write_message(&mut *stream, target, data)),
-        )
-        .await
-        .map_err(|_| timeout_error(target, timeout))??;
-        transaction.disarm();
-        Ok(())
+    async fn send_with_timeout(&self, data: &[u8], duration: Duration) -> Result<()> {
+        let deadline = tcp_deadline(duration, "TCP send timeout")?;
+        self.write_before(data, deadline).await
     }
-
     async fn request_with<T, F>(
         &self,
         data: &[u8],
@@ -529,158 +691,205 @@ impl RequestTransport for TcpTransport {
         T: Send,
         F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
     {
-        crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
-        let request_id = registration.request_id();
-        let started = tokio::time::Instant::now();
-        let deadline = registration.deadline();
-        let recv_timeout = deadline.saturating_duration_since(started);
-        let target = self.inner.target;
-        let mut stream = lock_stream_before(&self.inner, deadline, recv_timeout).await?;
-
-        if self.inner.is_poisoned() {
-            return Err(Error::Closed { target }.boxed());
+        let started = Instant::now();
+        let result = async {
+            let state = &self.inner.state;
+            crate::message_size::enforce_outbound_size(data.len(), state.options.send_capacity)?;
+            let deadline = registration.deadline();
+            let _permit = self
+                .before(deadline, async {
+                    state
+                        .in_flight
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| state.closed_error())
+                })
+                .await?;
+            let registration = {
+                let admission = state.admission.lock().unwrap();
+                if !*admission || state.shutdown.is_cancelled() {
+                    return Err(state.closed_error());
+                }
+                state.core.register(registration, state.target, true)?
+            };
+            self.write_before(data, deadline).await?;
+            // The core offers queued complete responses before closure, permitting a
+            // final response followed immediately by peer EOF to complete normally.
+            let result = state
+                .core
+                .wait_for_response_with(&registration, state.target, validate)
+                .await;
+            result.map_err(|error| {
+                if matches!(*error, Error::Closed { .. }) {
+                    state.closed_error()
+                } else {
+                    error
+                }
+            })
         }
-        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
-
-        tokio::time::timeout_at(
-            deadline,
-            arm_when_polled(&mut transaction, write_message(&mut *stream, target, data)),
-        )
-        .await
-        .map_err(|_| timeout_error(target, recv_timeout))??;
-
-        let result = tokio::time::timeout_at(
-            deadline,
-            arm_when_polled(
-                &mut transaction,
-                read_validated_message(
-                    &mut stream,
-                    &self.inner,
-                    target,
-                    self.inner.receive_limits.accepted(),
-                    &registration,
-                    validate,
-                ),
-            ),
-        )
-        .await
-        .map_err(|_| CorrelatedReadError::Timeout)
-        .and_then(std::convert::identity);
-        let value = finish_correlated_read(result, target, request_id, recv_timeout)?;
-        transaction.disarm();
-        Ok(value)
+        .await;
+        result.map_err(|error| {
+            if error.kind() == crate::ErrorKind::Timeout {
+                timeout_error(self.peer_addr(), started.elapsed())
+            } else {
+                error
+            }
+        })
     }
 
     fn peer_addr(&self) -> SocketAddr {
-        self.inner.target
+        self.inner.state.target
     }
-
     fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr
+        self.inner.state.local_addr
     }
-
     fn is_reliable(&self) -> bool {
         true
     }
-
     fn receive_limits(&self) -> ReceiveLimits {
-        self.inner.receive_limits
+        self.inner.state.receive_limits
     }
-
     fn send_capacity(&self) -> usize {
-        self.inner.send_capacity
+        self.inner.state.options.send_capacity
     }
 }
 
-#[cfg(test)]
-impl TcpTransport {
-    async fn recv(&self, registration: RequestRegistration) -> Result<(Bytes, SocketAddr)> {
-        let request_id = registration.request_id();
-        let started = tokio::time::Instant::now();
-        let deadline = registration.deadline();
-        let elapsed = deadline.saturating_duration_since(started);
-        let target = self.inner.target;
-        let mut stream = lock_stream_before(&self.inner, deadline, elapsed).await?;
+struct WriteCommand {
+    bytes: Bytes,
+    started: Instant,
+    deadline: Instant,
+    cancelled: CancellationToken,
+    complete: oneshot::Sender<Result<()>>,
+}
 
-        if self.inner.is_poisoned() {
-            return Err(Error::Closed { target }.boxed());
+async fn read_loop(mut read: tokio::net::tcp::OwnedReadHalf, state: &SessionState) -> Result<()> {
+    let mut framer = BerFramer::new(
+        state.receive_limits.accepted(),
+        state.options.header_timeout,
+        state.options.body_timeout,
+        state.budget.clone(),
+    );
+    while let Some(frame) = framer.next(&mut read, state.target).await? {
+        let super::framing::ReceivedFrame {
+            bytes: frame,
+            permit,
+        } = frame;
+        let info = crate::ReceivedMessageInfo::tcp(
+            state.endpoint_id,
+            state.session_id,
+            state.local_addr,
+            state.target,
+            Instant::now(),
+            frame.len(),
+        );
+        if let Some(envelope) = CorrelationEnvelope::parse(&frame)
+            && let Some(id) = envelope.request_id(&frame)
+        {
+            state
+                .core
+                .deliver_parsed_buffered(id, envelope, frame, info, permit);
+        } else {
+            state.core.note_malformed();
         }
-        let mut transaction = TcpTransactionGuard::unarmed(&self.inner);
-        let result = tokio::time::timeout_at(
-            deadline,
-            arm_when_polled(
-                &mut transaction,
-                read_validated_message(
-                    &mut stream,
-                    &self.inner,
-                    target,
-                    self.inner.receive_limits.accepted(),
-                    &registration,
-                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
-                ),
-            ),
-        )
-        .await
-        .map_err(|_| CorrelatedReadError::Timeout)
-        .and_then(std::convert::identity);
-        let value = finish_correlated_read(result, target, request_id, elapsed)?;
-        transaction.disarm();
-        Ok(value)
     }
+    Ok(())
+}
 
-    async fn request(
-        &self,
-        data: &[u8],
-        registration: RequestRegistration,
-    ) -> Result<(Bytes, SocketAddr)> {
-        self.request_with(data, registration, |response, source| {
-            Ok(Candidate::Accept((response, source.peer_addr())))
-        })
-        .await
+async fn write_loop(
+    write: tokio::net::tcp::OwnedWriteHalf,
+    mut receiver: mpsc::Receiver<WriteCommand>,
+    state: &SessionState,
+) -> Result<()> {
+    'commands: while let Some(command) = receiver.recv().await {
+        if command.cancelled.is_cancelled() {
+            continue;
+        }
+        let deadline = command
+            .deadline
+            .min(Instant::now() + state.options.write_timeout);
+        if Instant::now() >= deadline {
+            let _ = command
+                .complete
+                .send(Err(timeout_error(state.target, command.started.elapsed())));
+            continue;
+        }
+        let mut offset = 0;
+        while offset < command.bytes.len() {
+            let ready = tokio::select! {
+                biased;
+                () = command.cancelled.cancelled(), if offset == 0 => continue 'commands,
+                result = tokio::time::timeout_at(deadline, write.writable()) => result,
+            };
+            match ready {
+                Ok(Ok(())) => {}
+                Ok(Err(source)) => {
+                    return Err(Error::Network {
+                        target: state.target,
+                        source,
+                    }
+                    .boxed());
+                }
+                Err(_) if offset == 0 => {
+                    let _ = command.complete.send(Err(timeout_error(
+                        state.target,
+                        state.options.write_timeout,
+                    )));
+                    continue 'commands;
+                }
+                Err(_) => return Err(timeout_error(state.target, command.started.elapsed())),
+            }
+            let admission = state.admission.lock().unwrap();
+            if !*admission || state.shutdown.is_cancelled() {
+                return Ok(());
+            }
+            if offset == 0 && command.cancelled.is_cancelled() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                if offset == 0 {
+                    let _ = command.complete.send(Err(timeout_error(
+                        state.target,
+                        state.options.write_timeout,
+                    )));
+                    continue 'commands;
+                }
+                return Err(timeout_error(state.target, command.started.elapsed()));
+            }
+            match write.try_write(&command.bytes[offset..]) {
+                Ok(0) => {
+                    return Err(Error::Network {
+                        target: state.target,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "TCP frame write returned zero",
+                        ),
+                    }
+                    .boxed());
+                }
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(source) => {
+                    return Err(Error::Network {
+                        target: state.target,
+                        source,
+                    }
+                    .boxed());
+                }
+            }
+        }
+        if offset == command.bytes.len() {
+            let _ = command.complete.send(Ok(()));
+        }
     }
+    Ok(())
 }
 
-enum CorrelatedReadError {
-    Framing(Box<Error>),
-    Validation(Box<Error>),
-    Timeout,
+fn tcp_deadline(duration: Duration, description: &str) -> Result<Instant> {
+    Instant::now().checked_add(duration).ok_or_else(|| {
+        Error::Config(format!("{description} exceeds the representable deadline").into()).boxed()
+    })
 }
-
-fn tcp_deadline(timeout: Duration, description: &str) -> Result<tokio::time::Instant> {
-    tokio::time::Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| {
-            Error::Config(format!("{description} exceeds the representable deadline").into())
-                .boxed()
-        })
-}
-
-fn transaction_deadline(timeout: Duration) -> Result<tokio::time::Instant> {
-    tcp_deadline(timeout, "TCP timeout")
-}
-
-async fn lock_stream_before(
-    inner: &TcpTransportInner,
-    deadline: tokio::time::Instant,
-    timeout: Duration,
-) -> Result<OwnedMutexGuard<TcpStream>> {
-    let target = inner.target;
-    if tokio::time::Instant::now() >= deadline {
-        return Err(timeout_error(target, timeout));
-    }
-
-    let stream = tokio::time::timeout_at(deadline, inner.stream.clone().lock_owned())
-        .await
-        .map_err(|_| timeout_error(target, timeout))?;
-
-    // A ready lock can win the timeout race at the boundary. Do not start I/O
-    // once the total budget is exhausted, and do not poison an untouched stream.
-    if tokio::time::Instant::now() >= deadline {
-        return Err(timeout_error(target, timeout));
-    }
-    Ok(stream)
-}
-
 fn timeout_error(target: SocketAddr, elapsed: Duration) -> Box<Error> {
     Error::Timeout {
         target,
@@ -689,1750 +898,27 @@ fn timeout_error(target: SocketAddr, elapsed: Duration) -> Box<Error> {
     }
     .boxed()
 }
-
-async fn arm_when_polled<F>(transaction: &mut TcpTransactionGuard<'_>, future: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    tokio::pin!(future);
-    std::future::poll_fn(|context| {
-        transaction.arm();
-        future.as_mut().poll(context)
-    })
-    .await
+fn construction_timeout(target: SocketAddr, started: Instant) -> Box<Error> {
+    Error::ConstructionTimeout {
+        target: target.into(),
+        stage: ConstructionStage::Connect,
+        elapsed: started.elapsed(),
+    }
+    .boxed()
 }
-
-async fn write_message<W>(stream: &mut W, target: SocketAddr, data: &[u8]) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    stream
-        .write_all(data)
-        .await
-        .map_err(|source| Error::Network { target, source }.boxed())?;
-    stream
-        .flush()
-        .await
-        .map_err(|source| Error::Network { target, source }.boxed())
-}
-
-async fn read_validated_message<T, F>(
-    stream: &mut TcpStream,
-    inner: &TcpTransportInner,
+fn join_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
     target: SocketAddr,
-    max_message_size: usize,
-    registration: &RequestRegistration,
-    mut validate: F,
-) -> std::result::Result<T, CorrelatedReadError>
-where
-    F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>>,
-{
-    let request_id = registration.request_id();
-    loop {
-        let frame = read_ber_message(stream, target, max_message_size)
-            .await
-            .map_err(CorrelatedReadError::Framing)?;
-
-        let info = crate::ReceivedMessageInfo::tcp(
-            inner.endpoint_id,
-            inner.session_id,
-            inner.local_addr,
+) -> Result<()> {
+    result.map_err(|source| {
+        Error::Network {
             target,
-            tokio::time::Instant::now(),
-            frame.len(),
-        );
-        let Some(envelope) = CorrelationEnvelope::parse(&frame) else {
-            tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "complete response frame has no extractable correlation ID");
-            continue;
-        };
-        let Some(frame_id) = envelope.request_id(&frame) else {
-            tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "complete response frame has no extractable correlation ID");
-            continue;
-        };
-        if frame_id != request_id && !registration.aliases().contains(&frame_id) {
-            tracing::debug!(target: "async_snmp::transport::tcp", { request_id, frame_id, %target }, "stale response frame skipped");
-            continue;
+            source: std::io::Error::other(source),
         }
-
-        match registration.evaluate_parsed_response_identity(&frame, envelope, true) {
-            ResponseIdentity::Match => {}
-            ResponseIdentity::AcceptedCommunityMismatch => {
-                tracing::warn!(target: "async_snmp::transport::tcp", { request_id, %target }, "accepted rewritten response community");
-            }
-            ResponseIdentity::Reject => {
-                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "response rejected by registered identity correlation");
-                continue;
-            }
-        }
-        match validate(frame, info).map_err(CorrelatedReadError::Validation)? {
-            Candidate::Accept(value) => return Ok(value),
-            Candidate::Reject => {
-                tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "response rejected by client validation");
-            }
-        }
-    }
-}
-
-fn finish_correlated_read<T>(
-    result: std::result::Result<T, CorrelatedReadError>,
-    target: SocketAddr,
-    request_id: i32,
-    recv_timeout: Duration,
-) -> Result<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(CorrelatedReadError::Framing(error)) | Err(CorrelatedReadError::Validation(error)) => {
-            Err(error)
-        }
-        Err(CorrelatedReadError::Timeout) => {
-            tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target, elapsed = ?recv_timeout }, "transport timeout");
-            Err(timeout_error(target, recv_timeout))
-        }
-    }
-}
-
-/// Read a complete BER-encoded SNMP message from a TCP stream.
-///
-/// SNMP messages are SEQUENCE types (tag 0x30). We read:
-/// 1. Tag byte (must be 0x30)
-/// 2. Length field (definite form only)
-/// 3. Content bytes
-async fn read_ber_message(
-    stream: &mut TcpStream,
-    target: SocketAddr,
-    max_message_size: usize,
-) -> Result<Bytes> {
-    // Read tag byte
-    let mut tag_buf = [0u8; 1];
-    stream
-        .read_exact(&mut tag_buf)
-        .await
-        .map_err(|e| Error::Network { target, source: e }.boxed())?;
-
-    let tag = tag_buf[0];
-    if tag & 0x1f == 0x1f {
-        tracing::debug!(target: "async_snmp::transport::tcp", { actual_tag = tag, %target }, "multi-byte tag not supported");
-        return Err(Error::Decode(
-            crate::DecodeError::new(
-                0,
-                crate::DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: tag },
-            )
-            .with_peer(target),
-        )
-        .boxed());
-    }
-    if tag != 0x30 {
-        tracing::debug!(target: "async_snmp::transport::tcp", { expected_tag = 0x30, actual_tag = tag, %target }, "invalid SNMP message tag");
-        return Err(Error::Decode(
-            crate::DecodeError::new(
-                0,
-                crate::DecodeErrorKind::UnexpectedTag {
-                    expected: 0x30,
-                    actual: tag,
-                },
-            )
-            .with_peer(target),
-        )
-        .boxed());
-    }
-
-    // Read length
-    let mut first_len_byte = [0u8; 1];
-    stream
-        .read_exact(&mut first_len_byte)
-        .await
-        .map_err(|e| Error::Network { target, source: e }.boxed())?;
-
-    let (content_len, len_bytes) = match first_len_byte[0].cmp(&0x80) {
-        std::cmp::Ordering::Less => {
-            // Short form: length is directly in this byte
-            (first_len_byte[0] as usize, vec![first_len_byte[0]])
-        }
-        std::cmp::Ordering::Equal => {
-            // Indefinite length - not supported
-            tracing::debug!(target: "async_snmp::transport::tcp", { %target }, "indefinite length encoding not supported");
-            return Err(Error::Decode(
-                crate::DecodeError::new(1, crate::DecodeErrorKind::IndefiniteLength)
-                    .with_peer(target),
-            )
-            .boxed());
-        }
-        std::cmp::Ordering::Greater => {
-            // Long form: first byte indicates number of following length bytes
-            let num_len_bytes = (first_len_byte[0] & 0x7F) as usize;
-            if num_len_bytes > 4 {
-                tracing::debug!(target: "async_snmp::transport::tcp", { octets = num_len_bytes, %target }, "length encoding too long");
-                return Err(Error::Decode(
-                    crate::DecodeError::new(
-                        1,
-                        crate::DecodeErrorKind::LengthTooLong {
-                            octets: num_len_bytes,
-                        },
-                    )
-                    .with_peer(target),
-                )
-                .boxed());
-            }
-
-            let mut len_bytes_buf = vec![0u8; num_len_bytes];
-            stream
-                .read_exact(&mut len_bytes_buf)
-                .await
-                .map_err(|e| Error::Network { target, source: e }.boxed())?;
-
-            let mut length: usize = 0;
-            for &b in &len_bytes_buf {
-                length = (length << 8) | (b as usize);
-            }
-
-            // Build the complete length encoding for reconstruction
-            let mut all_len_bytes = vec![first_len_byte[0]];
-            all_len_bytes.extend_from_slice(&len_bytes_buf);
-
-            (length, all_len_bytes)
-        }
-    };
-
-    // The configured quantity is total encoded message size, matching the V3
-    // advertisement. Check it before allocating attacker-declared content.
-    let total_len = 1usize
-        .checked_add(len_bytes.len())
-        .and_then(|header_len| header_len.checked_add(content_len))
-        .ok_or_else(|| {
-            Error::Decode(
-                crate::DecodeError::new(1, crate::DecodeErrorKind::IntegerOverflow)
-                    .with_peer(target),
-            )
-            .boxed()
-        })?;
-    if total_len > max_message_size {
-        tracing::warn!(target: "async_snmp::transport::tcp", { size = total_len, max = max_message_size, %target }, "message size exceeds limit");
-        return Err(Error::Decode(
-            crate::DecodeError::new(
-                0,
-                crate::DecodeErrorKind::MessageTooLarge {
-                    size: total_len,
-                    maximum: max_message_size,
-                },
-            )
-            .with_peer(target),
-        )
-        .boxed());
-    }
-
-    // Read content
-    let mut content = vec![0u8; content_len];
-    stream
-        .read_exact(&mut content)
-        .await
-        .map_err(|e| Error::Network { target, source: e }.boxed())?;
-
-    // Reconstruct complete message: tag + length + content
-    let mut message = BytesMut::with_capacity(total_len);
-    message.extend_from_slice(&[tag]);
-    message.extend_from_slice(&len_bytes);
-    message.extend_from_slice(&content);
-
-    Ok(message.freeze())
+        .boxed()
+    })?
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tokio::io::{AsyncWrite, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    fn deadline_after(timeout: Duration) -> tokio::time::Instant {
-        tokio::time::Instant::now() + timeout
-    }
-
-    enum WriteFailure {
-        Write,
-        Flush,
-    }
-
-    struct FailingWriter(WriteFailure);
-
-    impl AsyncWrite for FailingWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            match self.0 {
-                WriteFailure::Write => Poll::Ready(Err(io::Error::other("write failed"))),
-                WriteFailure::Flush => Poll::Ready(Ok(buf.len())),
-            }
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            match self.0 {
-                WriteFailure::Write => Poll::Ready(Ok(())),
-                WriteFailure::Flush => Poll::Ready(Err(io::Error::other("flush failed"))),
-            }
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn guarded_write_and_flush_failures_poison() {
-        let target = "127.0.0.1:161".parse().unwrap();
-        for failure in [WriteFailure::Write, WriteFailure::Flush] {
-            let poisoned = AtomicBool::new(false);
-            let mut writer = FailingWriter(failure);
-            {
-                let _transaction = TcpTransactionGuard::for_test(&poisoned);
-                let error = write_message(&mut writer, target, b"message")
-                    .await
-                    .unwrap_err();
-                assert!(matches!(*error, Error::Network { .. }));
-            }
-            assert!(poisoned.load(Ordering::Acquire));
-        }
-    }
-
-    #[tokio::test]
-    async fn unrepresentable_connect_deadline_starts_no_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let error = TcpTransport::connect_timeout(server_addr, Duration::MAX)
-            .await
-            .err()
-            .expect("unrepresentable connect deadline must fail");
-        assert!(matches!(*error, Error::Config(_)));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err(),
-            "invalid connect deadline started stream I/O"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_tcp_send_recv() {
-        // Start a mock server
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        // Server task
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            // Read incoming message using BER framing
-            let mut buf = vec![0u8; 1024];
-            let n = socket.read(&mut buf).await.unwrap();
-
-            // Echo back a mock SNMP response
-            // SEQUENCE { version=1, community="public", Response PDU { request_id=1, ... } }
-            let response = [
-                0x30, 0x1c, // SEQUENCE length 28
-                0x02, 0x01, 0x01, // INTEGER 1 (v2c)
-                0x04, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, // "public"
-                0xa2, 0x0f, // Response PDU
-                0x02, 0x01, 0x01, // request_id = 1
-                0x02, 0x01, 0x00, // error-status = 0
-                0x02, 0x01, 0x00, // error-index = 0
-                0x30, 0x04, 0x30, 0x02, 0x05, 0x00, // varbinds
-            ];
-            socket.write_all(&response).await.unwrap();
-            n
-        });
-
-        // Client
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-
-        // Send a mock request
-        let request = [
-            0x30, 0x1a, // SEQUENCE
-            0x02, 0x01, 0x01, // version
-            0x04, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, // community
-            0xa0, 0x0d, // GET PDU
-            0x02, 0x01, 0x01, // request_id = 1
-            0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x02, 0x30, 0x00,
-        ];
-        transport.send(&request).await.unwrap();
-
-        // Receive response
-        let registration = RequestRegistration::test_unchecked(1, Duration::from_secs(5));
-        let (response, source) = transport.recv(registration).await.unwrap();
-
-        assert_eq!(source, server_addr);
-        assert_eq!(response[0], 0x30); // SEQUENCE tag
-        assert!(response.len() > 10);
-
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_tcp_long_length_form() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            socket.read_exact(&mut request).await.unwrap();
-
-            // Encode the otherwise ordinary 29-byte response content using the
-            // BER long form so correlation still sees a complete SNMP frame.
-            let response = build_response_with_id(1);
-            let mut long_form = vec![0x30, 0x81, response[1]];
-            long_form.extend_from_slice(&response[2..]);
-            socket.write_all(&long_form).await.unwrap();
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let registration = RequestRegistration::test_unchecked(1, Duration::from_secs(5));
-        let (response, _) = transport
-            .request(&build_request_with_id(1), registration)
-            .await
-            .unwrap();
-
-        assert_eq!(response.len(), 32);
-        assert_eq!(&response[..3], &[0x30, 0x81, 0x1d]);
-        server.await.unwrap();
-    }
-
-    /// Regression test: the advertised msgMaxSize must equal the transport's
-    /// actual acceptance limit (`max_message_size`), not the protocol
-    /// ceiling. Advertising more than the reader accepts would let a v3 peer
-    /// honor the advertisement with a response the reader then rejects.
-    #[tokio::test]
-    async fn test_tcp_advertised_max_matches_accepted_limit() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut conns = Vec::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                conns.push(socket);
-            }
-        });
-
-        // Default limit.
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        assert_eq!(
-            transport.receive_limits().advertised().as_usize(),
-            transport.inner.receive_limits.accepted(),
-            "advertised msgMaxSize must equal the accepted total-message limit"
-        );
-        assert_eq!(
-            transport.receive_limits().advertised().as_usize(),
-            DEFAULT_MAX_MESSAGE_SIZE
-        );
-
-        // Custom limit via the builder.
-        let custom = 512 * 1024;
-        let transport = TcpTransport::builder()
-            .max_message_size(custom)
-            .connect(server_addr)
-            .await
-            .unwrap();
-        assert_eq!(transport.receive_limits().advertised().as_usize(), custom);
-        assert_eq!(
-            transport.receive_limits().advertised().as_usize(),
-            transport.inner.receive_limits.accepted()
-        );
-    }
-
-    #[tokio::test]
-    async fn receive_advertisement_and_send_capacity_are_independent() {
-        let request = build_request_with_id(1);
-        let exact_limit = request.len();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let (inspect_tx, inspect_rx) = tokio::sync::oneshot::channel();
-        let (inspected_tx, inspected_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            inspect_rx.await.unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), socket.read_u8())
-                    .await
-                    .is_err(),
-                "oversized rejection must leave the TCP stream empty"
-            );
-            inspected_tx.send(()).unwrap();
-            let mut received = vec![0; exact_limit];
-            socket.read_exact(&mut received).await.unwrap();
-            received
-        });
-
-        let transport = TcpTransport::builder()
-            .max_message_size(4096)
-            .send_capacity(exact_limit)
-            .connect(server_addr)
-            .await
-            .unwrap();
-        assert_eq!(transport.receive_limits().advertised().as_usize(), 4096);
-        assert_eq!(transport.send_capacity(), exact_limit);
-
-        let mut oversized = request.clone();
-        oversized.push(0);
-        let error = transport.send(&oversized).await.unwrap_err();
-        assert!(matches!(
-            *error,
-            Error::OutboundMessageTooLarge { size, limit }
-                if size == exact_limit + 1 && limit == exact_limit
-        ));
-        inspect_tx.send(()).unwrap();
-        inspected_rx.await.unwrap();
-
-        transport.send(&request).await.unwrap();
-        assert_eq!(server.await.unwrap(), request);
-    }
-
-    #[tokio::test]
-    async fn test_tcp_is_reliable() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        // Accept connection in background
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        assert!(transport.is_reliable());
-    }
-
-    /// Test concurrent requests through a single `TcpTransport`.
-    ///
-    /// TCP serializes request-response pairs via locking. Multiple concurrent
-    /// callers queue up and execute one at a time. All should succeed.
-    #[tokio::test]
-    async fn test_tcp_concurrent_requests() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        // Server that handles multiple sequential requests
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            // Handle 5 requests sequentially (TCP serializes them)
-            for _ in 0..5 {
-                // Read request using BER framing
-                let mut tag = [0u8; 1];
-                if socket.read_exact(&mut tag).await.is_err() {
-                    break;
-                }
-
-                let mut len_byte = [0u8; 1];
-                socket.read_exact(&mut len_byte).await.unwrap();
-                let content_len = len_byte[0] as usize;
-
-                let mut content = vec![0u8; content_len];
-                socket.read_exact(&mut content).await.unwrap();
-
-                let mut request = Vec::with_capacity(content_len + 2);
-                request.extend_from_slice(&tag);
-                request.extend_from_slice(&len_byte);
-                request.extend_from_slice(&content);
-                let request_id = extract_request_id(&request).unwrap();
-                let response = build_response_with_id(request_id);
-                socket.write_all(&response).await.unwrap();
-            }
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-
-        // Spawn 5 concurrent tasks that all try to use the transport
-        let mut handles = vec![];
-        for i in 0..5 {
-            let transport = transport.clone();
-            let handle = tokio::spawn(async move {
-                let request_id = i + 1;
-                let request = build_request_with_id(request_id);
-
-                let registration =
-                    RequestRegistration::test_unchecked(request_id, Duration::from_secs(5));
-                let (response, _) = transport.request(&request, registration).await?;
-
-                // Verify we got a valid response
-                assert_eq!(response[0], 0x30, "Response should be SEQUENCE");
-                Ok::<_, Box<Error>>(i)
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all tasks to complete
-        let results: Vec<_> = futures::future::join_all(handles).await;
-
-        let success_count = results
-            .iter()
-            .filter(|r| r.as_ref().is_ok_and(std::result::Result::is_ok))
-            .count();
-
-        assert_eq!(
-            success_count, 5,
-            "All 5 concurrent requests should succeed (serialized)"
-        );
-
-        server.await.unwrap();
-    }
-
-    /// Build a minimal SNMP v2c request with a specific `request_id`.
-    fn build_request_with_id(request_id: i32) -> Vec<u8> {
-        let id_bytes = request_id.to_be_bytes();
-        vec![
-            0x30,
-            0x1d, // SEQUENCE length 29
-            0x02,
-            0x01,
-            0x01, // version = 1 (v2c)
-            0x04,
-            0x06,
-            0x70,
-            0x75,
-            0x62,
-            0x6c,
-            0x69,
-            0x63, // "public"
-            0xa0,
-            0x10, // GET PDU length 16
-            0x02,
-            0x04,
-            id_bytes[0],
-            id_bytes[1],
-            id_bytes[2],
-            id_bytes[3], // request_id
-            0x02,
-            0x01,
-            0x00, // error-status = 0
-            0x02,
-            0x01,
-            0x00, // error-index = 0
-            0x30,
-            0x02,
-            0x30,
-            0x00, // varbinds
-        ]
-    }
-
-    /// Build a minimal SNMP v2c response with a specific `request_id`.
-    fn build_response_with_id(request_id: i32) -> Vec<u8> {
-        let id_bytes = request_id.to_be_bytes();
-        vec![
-            0x30,
-            0x1d, // SEQUENCE length 29
-            0x02,
-            0x01,
-            0x01, // version = 1 (v2c)
-            0x04,
-            0x06,
-            0x70,
-            0x75,
-            0x62,
-            0x6c,
-            0x69,
-            0x63, // "public"
-            0xa2,
-            0x10, // Response PDU length 16
-            0x02,
-            0x04,
-            id_bytes[0],
-            id_bytes[1],
-            id_bytes[2],
-            id_bytes[3], // request_id
-            0x02,
-            0x01,
-            0x00, // error-status = 0
-            0x02,
-            0x01,
-            0x00, // error-index = 0
-            0x30,
-            0x02,
-            0x30,
-            0x00, // varbinds
-        ]
-    }
-
-    #[tokio::test]
-    async fn tcp_skips_mismatched_community_frame_under_original_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            stream.read_exact(&mut request).await.unwrap();
-            let mut wrong = build_response_with_id(77);
-            wrong[7..13].copy_from_slice(b"other!");
-            stream.write_all(&wrong).await.unwrap();
-            stream.write_all(&build_response_with_id(77)).await.unwrap();
-        });
-
-        let transport = TcpTransport::connect(addr).await.unwrap();
-        let registration = RequestRegistration::community(
-            77,
-            deadline_after(Duration::from_secs(2)),
-            crate::CommunityVersion::V2c,
-            Bytes::from_static(b"public"),
-            super::super::CommunityResponsePolicy::Exact,
-        );
-        let (response, _) = transport
-            .request(&build_request_with_id(77), registration)
-            .await
-            .unwrap();
-        assert_eq!(response.as_ref(), build_response_with_id(77));
-        assert!(!transport.inner.is_poisoned());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn tcp_strict_envelope_policy_applies_to_each_framed_message() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            stream.read_exact(&mut request).await.unwrap();
-            // Back-to-back top-level TLVs are two TCP frames, not one message
-            // with a suffix. Strict policy accepts the first framed response.
-            stream.write_all(&build_response_with_id(77)).await.unwrap();
-            stream.write_all(&build_response_with_id(78)).await.unwrap();
-        });
-
-        let transport = TcpTransport::connect(addr).await.unwrap();
-        let registration = RequestRegistration::community(
-            77,
-            deadline_after(Duration::from_secs(2)),
-            crate::CommunityVersion::V2c,
-            Bytes::from_static(b"public"),
-            super::super::CommunityResponsePolicy::Exact,
-        )
-        .with_decode_config(crate::DecodeConfig::STRICT);
-        let (response, _) = transport
-            .request(&build_request_with_id(77), registration)
-            .await
-            .unwrap();
-        assert_eq!(response.as_ref(), build_response_with_id(77));
-        assert!(!transport.inner.is_poisoned());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn tcp_skips_stale_id_then_accepts_primary_id() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            stream.read_exact(&mut request).await.unwrap();
-            stream.write_all(&build_response_with_id(90)).await.unwrap();
-            stream.write_all(&build_response_with_id(91)).await.unwrap();
-        });
-
-        let transport = TcpTransport::connect(addr).await.unwrap();
-        let (response, _) = transport
-            .request(
-                &build_request_with_id(91),
-                RequestRegistration::test_unchecked(91, Duration::from_secs(2)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(extract_request_id(&response), Some(91));
-        assert!(!transport.inner.is_poisoned());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn tcp_accepts_each_registered_alias_id() {
-        for accepted_alias in [101, 102] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0u8; 31];
-                stream.read_exact(&mut request).await.unwrap();
-                stream
-                    .write_all(&build_response_with_id(accepted_alias))
-                    .await
-                    .unwrap();
-            });
-
-            let transport = TcpTransport::connect(addr).await.unwrap();
-            let registration = RequestRegistration::test_unchecked(100, Duration::from_secs(2))
-                .with_aliases([101, 102])
-                .unwrap();
-            let (response, _) = transport
-                .request(&build_request_with_id(100), registration)
-                .await
-                .unwrap();
-            assert_eq!(extract_request_id(&response), Some(accepted_alias));
-            assert!(!transport.inner.is_poisoned());
-            server.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn stale_frames_do_not_extend_deadline_and_timeout_poisons() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            stream.read_exact(&mut request).await.unwrap();
-            for stale_id in 200..230 {
-                if stream
-                    .write_all(&build_response_with_id(stale_id))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-
-        let transport = TcpTransport::connect(addr).await.unwrap();
-        let start = tokio::time::Instant::now();
-        let error = transport
-            .request(
-                &build_request_with_id(300),
-                RequestRegistration::v3(300, deadline_after(Duration::from_millis(100))),
-            )
-            .await
-            .unwrap_err();
-        let elapsed = start.elapsed();
-        assert!(matches!(*error, Error::Timeout { .. }));
-        assert!(elapsed < Duration::from_millis(250), "elapsed {elapsed:?}");
-        assert!(transport.inner.is_poisoned());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn tcp_validator_rejection_keeps_exchange_for_later_frame() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            stream.read_exact(&mut request).await.unwrap();
-            stream.write_all(&build_response_with_id(78)).await.unwrap();
-            stream.write_all(&build_response_with_id(78)).await.unwrap();
-        });
-
-        let transport = TcpTransport::connect(addr).await.unwrap();
-        let registration = RequestRegistration::community(
-            78,
-            deadline_after(Duration::from_secs(2)),
-            crate::CommunityVersion::V2c,
-            Bytes::from_static(b"public"),
-            super::super::CommunityResponsePolicy::Exact,
-        );
-        let mut candidates = 0;
-        let response = transport
-            .request_with(&build_request_with_id(78), registration, |data, _| {
-                candidates += 1;
-                if candidates == 1 {
-                    Ok(Candidate::Reject)
-                } else {
-                    Ok(Candidate::Accept(data))
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(response.as_ref(), build_response_with_id(78));
-        assert_eq!(candidates, 2);
-        assert!(!transport.inner.is_poisoned());
-        server.await.unwrap();
-    }
-
-    /// Test that excessively large claimed message sizes are rejected early.
-    ///
-    /// A malicious client could send a BER length field claiming the message is
-    /// very large (e.g., 100MB) without actually sending that much data. Without
-    /// proper limits, the receiver would allocate the full claimed size before
-    /// reading any content, enabling a denial-of-service attack.
-    #[tokio::test]
-    async fn test_tcp_rejects_excessive_claimed_size() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        // Server that sends a message claiming to be 100MB
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            // Wait for any data (client sends something)
-            let mut buf = [0u8; 64];
-            let _ = socket.read(&mut buf).await;
-
-            // Send a response claiming to be 100MB (0x06400000 = 104857600)
-            // Format: tag (0x30) + long-form length (0x84 = 4 bytes follow)
-            let malicious_response = [
-                0x30, // SEQUENCE tag
-                0x84, // Long form: 4 length bytes follow
-                0x06, 0x40, 0x00,
-                0x00, // Length = 104857600 (100MB)
-                      // No actual content sent - attacker doesn't need to send anything
-            ];
-            let _ = socket.write_all(&malicious_response).await;
-
-            // Keep connection open briefly
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-
-        // Send a request to trigger the malicious response
-        let request = build_request_with_id(1);
-        transport.send(&request).await.unwrap();
-
-        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
-        let result = transport.recv(registration).await;
-
-        // Should reject the message without allocating 100MB
-        assert!(result.is_err(), "Should reject excessive claimed size");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(*err, Error::Decode(_)),
-            "Expected Decode error, got: {err:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    /// Test that `read_ber_message` rejects a non-SEQUENCE tag byte.
-    #[tokio::test]
-    async fn test_read_ber_message_rejects_bad_tag() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            socket.write_all(&[0x31, 0x00]).await.unwrap();
-        });
-
-        let mut client = TcpStream::connect(server_addr).await.unwrap();
-        let result = timeout(
-            Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect("read_ber_message should not hang");
-
-        assert!(result.is_err(), "Should reject non-0x30 tag byte");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(&*err, Error::Decode(error)
-                if error.offset == 0
-                    && error.kind == crate::DecodeErrorKind::UnexpectedTag { expected: 0x30, actual: 0x31 }
-                    && error.peer == Some(server_addr)),
-            "Expected Decode error, got: {err:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn tcp_receive_reports_high_tag_number_form_at_network_boundary() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            socket.write_all(&[0xbf]).await.unwrap();
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let error = transport
-            .recv(RequestRegistration::v3(
-                1,
-                deadline_after(Duration::from_secs(5)),
-            ))
-            .await
-            .expect_err("high-tag-number form must be rejected");
-
-        assert!(
-            matches!(&*error, Error::Decode(error)
-                if error.kind == crate::DecodeErrorKind::UnsupportedMultiOctetTag { first_octet: 0xbf }
-                    && error.origin == crate::DecodeErrorOrigin::Packet
-                    && error.offset == 0
-                    && error.peer == Some(server_addr)),
-            "unexpected error: {error:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    /// Test that `read_ber_message` rejects the BER indefinite-length form (0x80).
-    #[tokio::test]
-    async fn test_read_ber_message_rejects_indefinite_length() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            socket.write_all(&[0x30, 0x80]).await.unwrap();
-        });
-
-        let mut client = TcpStream::connect(server_addr).await.unwrap();
-        let result = timeout(
-            Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect("read_ber_message should not hang");
-
-        assert!(result.is_err(), "Should reject indefinite length encoding");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(*err, Error::Decode(_)),
-            "Expected Decode error, got: {err:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    /// Test that `read_ber_message` rejects a long-form length with more than
-    /// the 4-octet cap of trailing length bytes.
-    #[tokio::test]
-    async fn test_read_ber_message_rejects_length_encoding_too_long() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            // 0x85 = long form, 5 trailing length octets (> 4-octet cap).
-            socket
-                .write_all(&[0x30, 0x85, 0x00, 0x00, 0x00, 0x00, 0x00])
-                .await
-                .unwrap();
-        });
-
-        let mut client = TcpStream::connect(server_addr).await.unwrap();
-        let result = timeout(
-            Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect("read_ber_message should not hang");
-
-        assert!(
-            result.is_err(),
-            "Should reject length encoding over 4 octets"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            matches!(*err, Error::Decode(_)),
-            "Expected Decode error, got: {err:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    /// Test that `read_ber_message` reassembles content delivered across
-    /// multiple separate TCP writes (segmented delivery), proving `read_exact`
-    /// correctly spans multiple reads rather than assuming one full message
-    /// arrives in a single `read`.
-    #[tokio::test]
-    async fn test_read_ber_message_reassembles_segmented_content() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            // Tag + length in the first segment.
-            socket.write_all(&[0x30, 0x04]).await.unwrap();
-            socket.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-
-            // First half of content.
-            socket.write_all(&[0x01, 0x02]).await.unwrap();
-            socket.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-
-            // Second half of content.
-            socket.write_all(&[0x03, 0x04]).await.unwrap();
-            socket.flush().await.unwrap();
-
-            // Keep the connection open until the client has read everything.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-
-        let mut client = TcpStream::connect(server_addr).await.unwrap();
-        let result = timeout(
-            Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect("read_ber_message should not hang");
-
-        let bytes = result.expect("segmented message should reassemble successfully");
-        assert_eq!(bytes.as_ref(), &[0x30, 0x04, 0x01, 0x02, 0x03, 0x04]);
-
-        server.await.unwrap();
-    }
-
-    /// Test that a truncated stream (content promised but connection closed
-    /// before it fully arrives) surfaces as a `Network` error from the
-    /// content `read_exact` hitting `UnexpectedEof`.
-    #[tokio::test]
-    async fn test_read_ber_message_truncated_stream_is_network_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            // Claims 5 content octets but only ever sends 2, then drops the
-            // connection.
-            socket.write_all(&[0x30, 0x05]).await.unwrap();
-            socket.write_all(&[0x01, 0x02]).await.unwrap();
-            socket.flush().await.unwrap();
-            drop(socket);
-        });
-
-        let mut client = TcpStream::connect(server_addr).await.unwrap();
-        let result = timeout(
-            Duration::from_secs(5),
-            read_ber_message(&mut client, server_addr, DEFAULT_MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect("read_ber_message should not hang");
-
-        assert!(result.is_err(), "Should error on truncated content stream");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(*err, Error::Network { .. }),
-            "Expected Network error, got: {err:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_tcp_message_sizes_are_rejected_before_connect() {
-        let target = "127.0.0.1:9".parse().unwrap();
-        for size in [0usize, 483, i32::MAX as usize + 1, usize::MAX] {
-            let error = TcpTransport::builder()
-                .max_message_size(size)
-                .connect(target)
-                .await
-                .err()
-                .expect("invalid size must fail before connect");
-            assert!(
-                matches!(*error, Error::Config(_)),
-                "unexpected error: {error}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn tcp_frame_limit_counts_total_encoded_size() {
-        const CONTENT_LEN: usize = 481;
-        // 0x82 + two length octets gives a four-byte tag/length header.
-        const TOTAL_LEN: usize = 1 + 3 + CONTENT_LEN;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut frame = vec![0x30, 0x82, 0x01, 0xe1];
-            frame.resize(TOTAL_LEN, 0);
-            socket.write_all(&frame).await.unwrap();
-        });
-        let mut client = TcpStream::connect(server_addr).await.unwrap();
-        let frame = read_ber_message(&mut client, server_addr, TOTAL_LEN)
-            .await
-            .expect("exact total-message limit should be accepted");
-        assert_eq!(frame.len(), TOTAL_LEN);
-        server.await.unwrap();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            // Only the header is needed: rejection must precede content allocation/read.
-            socket.write_all(&[0x30, 0x82, 0x01, 0xe1]).await.unwrap();
-        });
-        let mut client = TcpStream::connect(server_addr).await.unwrap();
-        let error = read_ber_message(&mut client, server_addr, TOTAL_LEN - 1)
-            .await
-            .expect_err("one byte over total-message limit must be rejected");
-        assert!(matches!(*error, Error::Decode(_)));
-        server.await.unwrap();
-    }
-
-    /// Test that a custom `max_message_size` via builder is respected.
-    #[tokio::test]
-    async fn test_tcp_builder_custom_message_limit() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        // Server that sends a message claiming to be 10KB (larger than our 1KB limit)
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            let mut buf = [0u8; 64];
-            let _ = socket.read(&mut buf).await;
-
-            // Send a response claiming to be 10KB (0x2800 = 10240)
-            let response = [
-                0x30, // SEQUENCE tag
-                0x82, // Long form: 2 length bytes follow
-                0x28, 0x00, // Length = 10240 (10KB)
-            ];
-            let _ = socket.write_all(&response).await;
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-
-        // Use builder with 1KB limit
-        let transport = TcpTransport::builder()
-            .max_message_size(1024) // 1KB limit
-            .connect(server_addr)
-            .await
-            .unwrap();
-
-        let request = build_request_with_id(1);
-        transport.send(&request).await.unwrap();
-
-        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
-        let result = transport.recv(registration).await;
-
-        // Should reject 10KB message when limit is 1KB
-        assert!(
-            result.is_err(),
-            "Should reject message exceeding custom limit"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            matches!(*err, Error::Decode(_)),
-            "Expected Decode error, got: {err:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancellation_before_stream_lock_does_not_poison() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let held_lock = transport.inner.stream.clone().lock_owned().await;
-
-        let request = build_request_with_id(1);
-        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
-        let cancelled = timeout(
-            Duration::from_millis(30),
-            transport.request(&request, registration),
-        )
-        .await;
-        assert!(cancelled.is_err());
-        assert!(!transport.inner.is_poisoned());
-
-        drop(held_lock);
-        server.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn queued_request_deadline_includes_lock_wait_without_poisoning() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let held_lock = transport.inner.stream.clone().lock_owned().await;
-        assert!(!transport.inner.is_poisoned());
-
-        let second_data = build_request_with_id(2);
-        let mut second = Box::pin(transport.request(
-            &second_data,
-            RequestRegistration::v3(2, deadline_after(Duration::from_secs(5))),
-        ));
-        assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
-        assert!(!transport.inner.is_poisoned());
-        tokio::time::advance(Duration::from_secs(5)).await;
-        let error = second.await.unwrap_err();
-        assert!(matches!(
-            *error,
-            Error::Timeout {
-                elapsed,
-                retries: 0,
-                ..
-            } if elapsed == Duration::from_secs(5)
-        ));
-        assert!(
-            !transport.inner.is_poisoned(),
-            "expiry while queued did not touch the stream"
-        );
-
-        drop(held_lock);
-        server.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn request_uses_remaining_budget_after_lock_wait() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let held_lock = transport.inner.stream.clone().lock_owned().await;
-
-        let request_data = build_request_with_id(1);
-        let mut request = Box::pin(transport.request(
-            &request_data,
-            RequestRegistration::v3(1, deadline_after(Duration::from_secs(10))),
-        ));
-        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
-        tokio::time::advance(Duration::from_secs(6)).await;
-        drop(held_lock);
-        // Polling after lock acquisition arms the transaction and begins I/O.
-        // Do not await real socket readiness while time is paused: an idle
-        // runtime may auto-advance to the request's deadline.
-        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
-
-        tokio::time::advance(Duration::from_secs(3)).await;
-        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
-        tokio::time::advance(Duration::from_secs(1)).await;
-
-        let error = request.await.unwrap_err();
-        assert!(matches!(*error, Error::Timeout { .. }));
-        assert!(transport.inner.is_poisoned());
-        server.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn exact_deadline_boundary_after_lock_acquisition_does_not_poison() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_secs(1), socket.read_u8())
-                    .await
-                    .is_err(),
-                "an exact-boundary timeout must not write"
-            );
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let held_lock = transport.inner.stream.clone().lock_owned().await;
-
-        let data = build_request_with_id(1);
-        let mut request = Box::pin(transport.request(
-            &data,
-            RequestRegistration::v3(1, deadline_after(Duration::from_secs(5))),
-        ));
-        assert!(matches!(futures::poll!(request.as_mut()), Poll::Pending));
-        tokio::time::advance(Duration::from_secs(5)).await;
-        drop(held_lock);
-
-        let error = request.await.unwrap_err();
-        assert!(matches!(*error, Error::Timeout { .. }));
-        assert!(
-            !transport.inner.is_poisoned(),
-            "deadline won before the stream I/O future was polled"
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn standalone_send_lock_timeout_and_cancellation_do_not_poison() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            socket.read_exact(&mut request).await.unwrap();
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let held_lock = transport.inner.stream.clone().lock_owned().await;
-
-        let cancelled_transport = transport.clone();
-        let cancelled = tokio::spawn(async move {
-            cancelled_transport
-                .send_with_timeout(&build_request_with_id(1), Duration::from_secs(30))
-                .await
-        });
-        tokio::task::yield_now().await;
-        cancelled.abort();
-        assert!(cancelled.await.unwrap_err().is_cancelled());
-        assert!(!transport.inner.is_poisoned());
-
-        let timed_data = build_request_with_id(2);
-        let mut timed = Box::pin(transport.send_with_timeout(&timed_data, Duration::from_secs(5)));
-        assert!(matches!(futures::poll!(timed.as_mut()), Poll::Pending));
-        tokio::time::advance(Duration::from_secs(5)).await;
-        let error = timed.await.unwrap_err();
-        assert!(matches!(*error, Error::Timeout { .. }));
-        assert!(!transport.inner.is_poisoned());
-
-        drop(held_lock);
-        transport
-            .send_with_timeout(&build_request_with_id(3), Duration::from_secs(5))
-            .await
-            .unwrap();
-        server.await.unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test(start_paused = true)]
-    async fn standalone_send_write_timeout_poisons_after_partial_io() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let (touched_tx, touched_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            socket.read_u8().await.unwrap();
-            touched_tx.send(()).unwrap();
-            std::future::pending::<()>().await;
-        });
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_send_buffer_size(1024).unwrap();
-        let transport = TcpTransport::from_socket(
-            socket,
-            server_addr,
-            TcpOptions {
-                send_capacity: 16 * 1024 * 1024,
-                ..TcpOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let send_transport = transport.clone();
-        let send = tokio::spawn(async move {
-            let data = vec![0xaa; 16 * 1024 * 1024];
-            send_transport
-                .send_with_timeout(&data, Duration::from_secs(10))
-                .await
-        });
-        touched_rx.await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(!send.is_finished(), "large write must remain partial");
-        tokio::time::advance(Duration::from_secs(10)).await;
-
-        let error = send.await.unwrap().unwrap_err();
-        assert!(matches!(*error, Error::Timeout { .. }));
-        assert!(transport.inner.is_poisoned());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_complete_request_write_poisons() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            socket.read_exact(&mut request).await.unwrap();
-            written_tx.send(()).unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let request_transport = transport.clone();
-        let request = tokio::spawn(async move {
-            request_transport
-                .request(
-                    &build_request_with_id(1),
-                    RequestRegistration::v3(1, deadline_after(Duration::from_secs(30))),
-                )
-                .await
-        });
-
-        written_rx.await.unwrap();
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-        assert!(transport.inner.is_poisoned());
-
-        let error = transport
-            .request(
-                &build_request_with_id(2),
-                RequestRegistration::v3(2, deadline_after(Duration::from_secs(1))),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(*error, Error::Closed { .. }));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn cancellation_during_partial_frame_read_poisons() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 31];
-            socket.read_exact(&mut request).await.unwrap();
-            socket.write_all(&[0x30, 0x08, 0x02]).await.unwrap();
-            partial_tx.send(()).unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let request_transport = transport.clone();
-        let request = tokio::spawn(async move {
-            request_transport
-                .request(
-                    &build_request_with_id(1),
-                    RequestRegistration::v3(1, deadline_after(Duration::from_secs(30))),
-                )
-                .await
-        });
-
-        partial_rx.await.unwrap();
-        tokio::task::yield_now().await;
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-        assert!(transport.inner.is_poisoned());
-        server.abort();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn cancellation_during_partial_send_poisons() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            accepted_tx.send(()).unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        });
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_send_buffer_size(1024).unwrap();
-        let transport = TcpTransport::from_socket(
-            socket,
-            server_addr,
-            TcpOptions {
-                send_capacity: 16 * 1024 * 1024,
-                ..TcpOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        accepted_rx.await.unwrap();
-
-        let send_transport = transport.clone();
-        let send = tokio::spawn(async move {
-            let data = vec![0xaa; 16 * 1024 * 1024];
-            send_transport.send(&data).await
-        });
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!send.is_finished(), "test write must still be partial");
-        send.abort();
-        assert!(send.await.unwrap_err().is_cancelled());
-        assert!(transport.inner.is_poisoned());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn request_deadline_covers_partial_write() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        });
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_send_buffer_size(1024).unwrap();
-        let transport = TcpTransport::from_socket(
-            socket,
-            server_addr,
-            TcpOptions {
-                send_capacity: 16 * 1024 * 1024,
-                ..TcpOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        let data = vec![0xaa; 16 * 1024 * 1024];
-
-        let start = tokio::time::Instant::now();
-        let error = transport
-            .request(
-                &data,
-                RequestRegistration::v3(1, deadline_after(Duration::from_millis(50))),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(*error, Error::Timeout { .. }));
-        assert!(start.elapsed() < Duration::from_millis(500));
-        assert!(transport.inner.is_poisoned());
-        server.abort();
-    }
-
-    /// Regression test: a malformed frame must poison the stream so the next
-    /// request fails fast instead of parsing leftover/misaligned bytes.
-    ///
-    /// With `is_reliable() == true` the client does not retry, so a desynced
-    /// stream would otherwise have its next `request()` parse the tail of the
-    /// abandoned frame as a fresh message. The transport now marks the stream
-    /// poisoned after any malformed/oversized/truncated/timed-out read and
-    /// rejects later requests with [`Error::Closed`].
-    #[tokio::test]
-    async fn test_tcp_malformed_frame_poisons_stream() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            // Read the first request framing.
-            let mut hdr = [0u8; 2];
-            socket.read_exact(&mut hdr).await.unwrap();
-            let mut body = vec![0u8; hdr[1] as usize];
-            socket.read_exact(&mut body).await.unwrap();
-
-            // Reply with a non-SEQUENCE tag (0x31) plus trailing bytes that, if
-            // the stream were reused, could be misparsed as a following frame.
-            socket
-                .write_all(&[0x31, 0x02, 0xde, 0xad, 0x30, 0x00])
-                .await
-                .unwrap();
-            socket.flush().await.unwrap();
-
-            // Keep the connection open; the point is that the client must not
-            // reuse it, not that the server closed it.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-
-        // First request: the malformed reply is rejected and poisons the stream.
-        let request = build_request_with_id(1);
-        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
-        let first = transport.request(&request, registration).await;
-        let err = first.expect_err("malformed frame should error");
-        assert!(
-            matches!(*err, Error::Decode(_)),
-            "Expected Decode error, got: {err:?}"
-        );
-
-        // The stream must now be flagged as poisoned.
-        assert!(
-            transport.inner.is_poisoned(),
-            "stream should be poisoned after a malformed frame"
-        );
-
-        // The next request must fail fast with Closed rather than read the
-        // leftover bytes of the abandoned frame.
-        let request2 = build_request_with_id(2);
-        let registration = RequestRegistration::v3(2, deadline_after(Duration::from_secs(5)));
-        let second = timeout(
-            Duration::from_secs(5),
-            transport.request(&request2, registration),
-        )
-        .await
-        .expect("second request should not hang");
-        let err2 = second.expect_err("poisoned stream should reject the next request");
-        assert!(
-            matches!(*err2, Error::Closed { .. }),
-            "Expected Closed on poisoned stream, got: {err2:?}"
-        );
-
-        server.await.unwrap();
-    }
-
-    /// Regression test: a second client sharing a cloned transport must not be
-    /// able to overwrite the receive timeout of another client's request.
-    ///
-    /// Registration metadata is owned by the receive future, so its timeout is
-    /// used directly without shared mutable registration state.
-    #[tokio::test]
-    async fn test_tcp_receive_uses_owned_registration_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        // Server accepts the connection but never responds.
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_millis(150)));
-
-        let start = std::time::Instant::now();
-        let result = timeout(Duration::from_secs(5), transport.recv(registration))
-            .await
-            .expect("recv should honor the owned short timeout");
-        let elapsed = start.elapsed();
-
-        let err = result.expect_err("recv should time out");
-        assert!(
-            matches!(*err, Error::Timeout { .. }),
-            "Expected Timeout, got: {err:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "recv honored the wrong timeout; elapsed {elapsed:?}"
-        );
-
-        server.abort();
-    }
-
-    /// Regression test: a read that times out mid-frame poisons the stream.
-    ///
-    /// The server sends a frame header claiming more content than it delivers
-    /// and then stalls, so the client's content `read_exact` times out with
-    /// bytes still buffered. `recv()` must poison the stream so a later `recv()`
-    /// does not resume parsing at a misaligned offset.
-    #[tokio::test]
-    async fn test_tcp_timeout_mid_frame_poisons_stream() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-
-            let mut buf = [0u8; 64];
-            let _ = socket.read(&mut buf).await;
-
-            // Claim 8 content octets but send only 2, then stall without
-            // closing so the client's content read times out.
-            socket.write_all(&[0x30, 0x08, 0x01, 0x02]).await.unwrap();
-            socket.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        });
-
-        let transport = TcpTransport::connect(server_addr).await.unwrap();
-
-        let request = build_request_with_id(1);
-        transport.send(&request).await.unwrap();
-
-        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_millis(100)));
-        let first = transport.recv(registration).await;
-        let err = first.expect_err("mid-frame read should time out");
-        assert!(
-            matches!(*err, Error::Timeout { .. }),
-            "Expected Timeout, got: {err:?}"
-        );
-
-        assert!(
-            transport.inner.is_poisoned(),
-            "stream should be poisoned after a mid-frame timeout"
-        );
-
-        // A later recv must fail fast rather than parse leftover content bytes.
-        let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(5)));
-        let second = timeout(Duration::from_secs(5), transport.recv(registration))
-            .await
-            .expect("second recv should not hang");
-        let err2 = second.expect_err("poisoned stream should reject the next recv");
-        assert!(
-            matches!(*err2, Error::Closed { .. }),
-            "Expected Closed on poisoned stream, got: {err2:?}"
-        );
-
-        server.await.unwrap();
-    }
-}
+#[path = "tcp_tests.rs"]
+mod tests;
