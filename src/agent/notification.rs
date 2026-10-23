@@ -949,7 +949,7 @@ impl super::Agent {
                     self.inner.des_salt_state.as_ref(),
                     Some(engine_boots),
                     false, // reportable=false for traps
-                    self.inner.state.local_receive_capacity,
+                    crate::transport::EndpointLimits::UDP.receive.advertised(),
                 )?;
                 Ok(Bytes::from(encoded))
             }

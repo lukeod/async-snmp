@@ -1,6 +1,6 @@
 //! Transport abstractions for SNMP communication.
 //!
-//! The module provides the [`Transport`] trait and these implementations:
+//! The module provides the [`RequestTransport`] trait and these implementations:
 //!
 //! - [`UdpTransport`] + [`UdpHandle`] - UDP socket with per-target handles
 //! - [`TcpTransport`] - TCP stream with BER framing
@@ -13,10 +13,12 @@
 //! | Single target or few targets | [`Client::builder().connect()`](crate::Client::builder) - each client gets its own socket |
 //! | Many UDP targets from one process | Pass a preconstructed [`UdpTransport`] socket owner to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) - each target gets a handle on one socket and receive loop |
 //! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::TargetClientBuilder::connect_tcp) |
-//! | Preconstruct or implement any client transport | Pass the [`Transport`] implementation to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) without a target |
+//! | Preconstruct or implement any client transport | Pass the [`RequestTransport`] implementation to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) without a target |
 //! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) |
 
 mod builtin;
+mod received;
+pub use received::*;
 mod tcp;
 mod udp;
 mod udp_core;
@@ -479,7 +481,7 @@ pub enum Candidate<T> {
 /// Client-side transport abstraction.
 ///
 /// All transports implement this trait uniformly. For shared transports,
-/// handles (not the pool itself) implement Transport. A response that fails the
+/// handles (not the pool itself) implement RequestTransport. A response that fails the
 /// registered correlation metadata or the caller's validator must be ignored
 /// without consuming the pending request or extending its deadline.
 ///
@@ -487,12 +489,12 @@ pub enum Candidate<T> {
 /// compiled as part of this crate's unit tests:
 ///
 /// ```compile_fail,E0046
-/// use async_snmp::{RequestRegistration, Result, Transport};
+/// use async_snmp::{RequestRegistration, Result, RequestTransport};
 /// use std::net::{Ipv4Addr, SocketAddr};
 ///
 /// struct IncompleteTransport;
 ///
-/// impl Transport for IncompleteTransport {
+/// impl RequestTransport for IncompleteTransport {
 ///     async fn send(&self, _data: &[u8]) -> Result<()> { Ok(()) }
 ///
 ///     fn peer_addr(&self) -> SocketAddr {
@@ -506,7 +508,7 @@ pub enum Candidate<T> {
 ///     fn is_reliable(&self) -> bool { true }
 /// }
 /// ```
-pub trait Transport: Send + Sync {
+pub trait RequestTransport: Send + Sync {
     /// Send request data to the target.
     ///
     /// Implementations that return a finite [`send_capacity`](Self::send_capacity)
@@ -569,7 +571,11 @@ pub trait Transport: Send + Sync {
     /// sending, use [`RequestRegistration::deadline`] across queueing, write,
     /// candidate rejection, and response wait, and remove all registration
     /// state on every completion or cancellation path. Identity-correlated
-    /// candidates must pass through `validate`; rejection continues under the
+    /// candidates must pass through `validate` with their original receive metadata;
+    /// `received_len()` must equal the delivered bytes length. Capture the timestamp
+    /// at complete-message receipt, before correlation or validation. Custom
+    /// transports construct [`ReceivedMessageInfo`] without internal reply capabilities.
+    /// Rejection continues under the
     /// same deadline. Reliable transports must retain exclusive framing
     /// ownership across the complete operation and make an unsafe partially
     /// completed connection unusable.
@@ -581,7 +587,7 @@ pub trait Transport: Send + Sync {
     ) -> impl Future<Output = Result<T>> + Send
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send;
+        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send;
 
     /// The peer address for this transport.
     fn peer_addr(&self) -> SocketAddr;
@@ -625,7 +631,7 @@ pub trait Transport: Send + Sync {
 }
 
 /// Adapt a unit-test double's scripted response stream to the full
-/// [`Transport::request_with`] contract.
+/// [`RequestTransport::request_with`] contract.
 ///
 /// The script is installed before sending. Candidate polling starts after the
 /// send completes, allowing scripted doubles to construct responses from the
@@ -644,10 +650,10 @@ pub(crate) async fn request_with_scripted<T, F, R, S, U>(
 ) -> Result<T>
 where
     T: Send,
-    F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+    F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
     R: FnOnce(RequestRegistration) -> S + Send,
     S: futures_core::Stream<Item = Result<(Bytes, SocketAddr)>> + Send,
-    U: Transport + ?Sized,
+    U: RequestTransport + ?Sized,
 {
     use futures_util::StreamExt;
 
@@ -708,7 +714,15 @@ where
         {
             continue;
         }
-        match validate(data, source)? {
+        let info = crate::ReceivedMessageInfo::udp(
+            crate::EndpointId::new(),
+            transport.local_addr(),
+            source,
+            None,
+            tokio::time::Instant::now(),
+            data.len(),
+        );
+        match validate(data, info)? {
             Candidate::Accept(value) => return Ok(value),
             Candidate::Reject => {}
         }
@@ -717,7 +731,8 @@ where
 
 #[cfg(test)]
 mod cfg_test_transport_contract {
-    use super::{Candidate, RequestRegistration, Transport, request_with_scripted};
+    use super::{Candidate, RequestRegistration, RequestTransport, request_with_scripted};
+    use crate::ReceivedMessageInfo;
     use crate::{DecodeError, DecodeErrorKind, Error, Result};
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr};
@@ -734,11 +749,11 @@ mod cfg_test_transport_contract {
     fn transport_trait_surface_is_not_conditionally_compiled() {
         let source = include_str!("mod.rs").replace("\r\n", "\n");
         let (_, trait_and_after) = source
-            .split_once("pub trait Transport: Send + Sync {")
-            .expect("Transport trait declaration");
+            .split_once("pub trait RequestTransport: Send + Sync {")
+            .expect("RequestTransport trait declaration");
         let (trait_body, _) = trait_and_after
             .split_once("\n}\n\n/// Adapt a unit-test double")
-            .expect("end of Transport trait");
+            .expect("end of RequestTransport trait");
 
         assert_eq!(trait_body.matches("fn request_with").count(), 1);
         assert!(!trait_body.contains("fn recv("));
@@ -977,7 +992,7 @@ mod cfg_test_transport_contract {
         sent: Arc<AtomicBool>,
     }
 
-    impl Transport for ScriptedRequestTransport {
+    impl RequestTransport for ScriptedRequestTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             assert!(self.registered.load(Ordering::Relaxed));
             self.sent.store(true, Ordering::Relaxed);
@@ -992,7 +1007,7 @@ mod cfg_test_transport_contract {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             let registered = Arc::clone(&self.registered);
             let sent = Arc::clone(&self.sent);
@@ -1035,7 +1050,7 @@ mod cfg_test_transport_contract {
             .request_with(
                 b"request",
                 RequestRegistration::test_unchecked(6, Duration::from_secs(1)),
-                |data, source| Ok(Candidate::Accept((data, source))),
+                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
             )
             .await
             .unwrap();

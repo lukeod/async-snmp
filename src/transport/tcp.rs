@@ -22,7 +22,7 @@
 //!
 //! This uses the message's BER envelope without an additional framing header.
 //!
-//! # Transport differences
+//! # RequestTransport differences
 //!
 //! UDP preserves message boundaries and does not require connection state. TCP
 //! presents a byte stream, provides ordered delivery while the connection is
@@ -73,7 +73,9 @@
 
 #[cfg(test)]
 use super::extract_request_id;
-use super::{Candidate, CorrelationEnvelope, RequestRegistration, ResponseIdentity, Transport};
+use super::{
+    Candidate, CorrelationEnvelope, RequestRegistration, RequestTransport, ResponseIdentity,
+};
 use crate::error::{ConstructionStage, Error, Result};
 use crate::message_size::ReceiveLimits;
 use bytes::{Bytes, BytesMut};
@@ -234,6 +236,8 @@ impl TcpTransportBuilder {
 
         Ok(TcpTransport {
             inner: Arc::new(TcpTransportInner {
+                endpoint_id: crate::EndpointId::new(),
+                session_id: crate::SessionId::new(),
                 stream: Arc::new(Mutex::new(stream)),
                 target,
                 local_addr,
@@ -266,13 +270,13 @@ impl Default for TcpTransportBuilder {
 /// # No retries
 ///
 /// Since TCP guarantees delivery or failure, the client does not retry
-/// on timeout when using TCP transport ([`is_reliable()`](Transport::is_reliable)
+/// on timeout when using TCP transport ([`is_reliable()`](RequestTransport::is_reliable)
 /// returns `true`). A timeout indicates the connection is likely broken.
 ///
 /// # Serialized operations
 ///
 /// Request-response pairs are serialized to ensure correct correlation.
-/// [`request_with()`](Transport::request_with) owns the stream lock for the whole
+/// [`request_with()`](RequestTransport::request_with) owns the stream lock for the whole
 /// write-then-read exchange, preventing interleaving of concurrent requests.
 /// Because the lock is held by a single future (not stashed across independent
 /// await points), a dropped or cancelled request releases it instead of leaking
@@ -304,6 +308,8 @@ pub struct TcpTransport {
 }
 
 struct TcpTransportInner {
+    endpoint_id: crate::EndpointId,
+    session_id: crate::SessionId,
     /// The TCP stream, wrapped in Arc for owned guard pattern
     stream: Arc<Mutex<TcpStream>>,
     target: SocketAddr,
@@ -460,6 +466,8 @@ impl TcpTransport {
 
         Ok(Self {
             inner: Arc::new(TcpTransportInner {
+                endpoint_id: crate::EndpointId::new(),
+                session_id: crate::SessionId::new(),
                 stream: Arc::new(Mutex::new(stream)),
                 target,
                 local_addr,
@@ -471,7 +479,7 @@ impl TcpTransport {
     }
 }
 
-impl Transport for TcpTransport {
+impl RequestTransport for TcpTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         // Do not arm the transaction until the lock is acquired: cancellation
@@ -519,7 +527,7 @@ impl Transport for TcpTransport {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
     {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let request_id = registration.request_id();
@@ -547,6 +555,7 @@ impl Transport for TcpTransport {
                 &mut transaction,
                 read_validated_message(
                     &mut stream,
+                    &self.inner,
                     target,
                     self.inner.receive_limits.accepted(),
                     &registration,
@@ -603,10 +612,11 @@ impl TcpTransport {
                 &mut transaction,
                 read_validated_message(
                     &mut stream,
+                    &self.inner,
                     target,
                     self.inner.receive_limits.accepted(),
                     &registration,
-                    |data, source| Ok(Candidate::Accept((data, source))),
+                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
                 ),
             ),
         )
@@ -624,7 +634,7 @@ impl TcpTransport {
         registration: RequestRegistration,
     ) -> Result<(Bytes, SocketAddr)> {
         self.request_with(data, registration, |response, source| {
-            Ok(Candidate::Accept((response, source)))
+            Ok(Candidate::Accept((response, source.peer_addr())))
         })
         .await
     }
@@ -708,13 +718,14 @@ where
 
 async fn read_validated_message<T, F>(
     stream: &mut TcpStream,
+    inner: &TcpTransportInner,
     target: SocketAddr,
     max_message_size: usize,
     registration: &RequestRegistration,
     mut validate: F,
 ) -> std::result::Result<T, CorrelatedReadError>
 where
-    F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>>,
+    F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>>,
 {
     let request_id = registration.request_id();
     loop {
@@ -722,6 +733,14 @@ where
             .await
             .map_err(CorrelatedReadError::Framing)?;
 
+        let info = crate::ReceivedMessageInfo::tcp(
+            inner.endpoint_id,
+            inner.session_id,
+            inner.local_addr,
+            target,
+            tokio::time::Instant::now(),
+            frame.len(),
+        );
         let Some(envelope) = CorrelationEnvelope::parse(&frame) else {
             tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "complete response frame has no extractable correlation ID");
             continue;
@@ -745,7 +764,7 @@ where
                 continue;
             }
         }
-        match validate(frame, target).map_err(CorrelatedReadError::Validation)? {
+        match validate(frame, info).map_err(CorrelatedReadError::Validation)? {
             Candidate::Accept(value) => return Ok(value),
             Candidate::Reject => {
                 tracing::debug!(target: "async_snmp::transport::tcp", { request_id, %target }, "response rejected by client validation");

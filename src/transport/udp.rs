@@ -1,7 +1,7 @@
 //! UDP transport for SNMP clients.
 //!
 //! Provides [`UdpTransport`] as the socket owner, [`UdpHandle`] as a per-target
-//! [`Transport`], and [`UdpControl`] as the explicit endpoint-wide lifecycle
+//! [`RequestTransport`], and [`UdpControl`] as the explicit endpoint-wide lifecycle
 //! authority.
 //!
 //! # Architecture
@@ -38,7 +38,7 @@
 //! instead accepts a preconstructed `UdpTransport` socket owner and derives a
 //! per-target `UdpHandle`; it is distinct from target-free
 //! [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport),
-//! which accepts an arbitrary type that already implements `Transport`. The
+//! which accepts an arbitrary type that already implements `RequestTransport`. The
 //! demultiplexing logic is the same in both UDP cases; sharing avoids
 //! duplicating the socket and recv task.
 //! Dedicated endpoints are drop-managed by default. Call
@@ -79,7 +79,9 @@
 use super::udp_core::UdpCore;
 pub use super::udp_core::UdpStats;
 use super::udp_error::{UdpRecvErrorBackoff, UdpRecvErrorClass, classify_udp_recv_error};
-use super::{Candidate, CorrelationEnvelope, RequestRegistration, Transport, normalize_udp_target};
+use super::{
+    Candidate, CorrelationEnvelope, RequestRegistration, RequestTransport, normalize_udp_target,
+};
 use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
 use crate::util::bind_udp_socket;
@@ -122,6 +124,8 @@ pub struct UdpTransport {
 }
 
 struct UdpTransportInner {
+    endpoint_id: crate::EndpointId,
+    responder: Arc<crate::udp_responder::UdpResponder>,
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
     core: Arc<UdpCore>,
@@ -142,23 +146,28 @@ struct UdpTransportInner {
 }
 
 #[cfg(not(test))]
-async fn recv_datagram(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-    socket.recv_from(buf).await
+async fn recv_datagram(
+    socket: &UdpSocket,
+    responder: &crate::udp_responder::UdpResponder,
+    buf: &mut [u8],
+) -> std::io::Result<crate::udp_responder::ReceivedDatagram> {
+    responder.recv(socket, buf).await
 }
 
 #[cfg(test)]
 async fn recv_datagram(
     socket: &UdpSocket,
+    responder: &crate::udp_responder::UdpResponder,
     receive_errors: &std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
     receive_error_ready: &tokio::sync::Notify,
     buf: &mut [u8],
-) -> std::io::Result<(usize, SocketAddr)> {
+) -> std::io::Result<crate::udp_responder::ReceivedDatagram> {
     loop {
         if let Some(error) = receive_errors.lock().unwrap().pop_front() {
             return Err(error);
         }
         tokio::select! {
-            result = socket.recv_from(buf) => return result,
+            result = responder.recv(socket, buf) => return result,
             () = receive_error_ready.notified() => {}
         }
     }
@@ -192,7 +201,7 @@ impl UdpTransport {
 
     /// Create a handle for a specific target.
     ///
-    /// Handles implement [`Transport`] and can be used with [`Client`](crate::Client).
+    /// Handles implement [`RequestTransport`] and can be used with [`Client`](crate::Client).
     ///
     /// When the transport is bound to an IPv6 socket and the target is IPv4,
     /// the target is automatically mapped to an IPv4-mapped IPv6 address
@@ -253,6 +262,8 @@ impl UdpTransport {
         // last transport/handle reference drops, which can only happen if
         // the task keeps no strong reference to the inner state.
         let socket = inner.socket.clone();
+        let responder = inner.responder.clone();
+        let endpoint_id = inner.endpoint_id;
         let core = inner.core.clone();
         let shutdown = inner.shutdown.clone();
         let cleanup = UdpRecvTaskCleanup {
@@ -292,12 +303,16 @@ impl UdpTransport {
 
                     result = recv_datagram(
                         &socket,
+                        &responder,
                         #[cfg(test)] receive_errors.as_ref(),
                         #[cfg(test)] receive_error_ready.as_ref(),
                         &mut buf,
                     ) => {
                         match result {
-                            Ok((len, source)) => {
+                            Ok(received) => {
+                                let len = received.len;
+                                let source = received.source;
+                                let info = crate::ReceivedMessageInfo::udp(endpoint_id, local_addr, source, received.destination.map(|d| d.ip), tokio::time::Instant::now(), len);
                                 recv_error_backoff.reset();
                                 if len > receive_limits.advertised().as_usize() {
                                     tracing::debug!(target: "async_snmp::transport", { snmp.source = %source, received_size = len, advertised_size = receive_limits.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
@@ -307,7 +322,7 @@ impl UdpTransport {
                                 if let Some(envelope) = CorrelationEnvelope::parse(&data)
                                     && let Some(request_id) = envelope.request_id(&data)
                                 {
-                                    if !core.deliver_parsed(request_id, envelope, data, source) {
+                                    if !core.deliver_parsed(request_id, envelope, data, info) {
                                         tracing::debug!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.source = %source }, "response for unknown request");
                                     }
                                 } else {
@@ -483,6 +498,8 @@ impl UdpTransportBuilder {
         let shutdown = CancellationToken::new();
         let shutdown_complete = CancellationToken::new();
         let inner = Arc::new(UdpTransportInner {
+            endpoint_id: crate::EndpointId::new(),
+            responder: Arc::new(crate::udp_responder::UdpResponder::new(&socket)),
             socket: Arc::new(socket),
             local_addr,
             core: Arc::new(UdpCore::new()),
@@ -555,7 +572,7 @@ impl Default for UdpTransportBuilder {
 
 /// Handle to a UDP transport for a specific target.
 ///
-/// Implements [`Transport`] and can be used with [`Client`](crate::Client).
+/// Implements [`RequestTransport`] and can be used with [`Client`](crate::Client).
 /// Cheap to clone (Arc + `SocketAddr`).
 ///
 /// Handles expose endpoint observation but not lifecycle authority:
@@ -600,7 +617,7 @@ impl UdpHandle {
     }
 }
 
-impl Transport for UdpHandle {
+impl RequestTransport for UdpHandle {
     async fn send(&self, data: &[u8]) -> Result<()> {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let _operation = self.inner.operations.read().await;
@@ -616,7 +633,7 @@ impl Transport for UdpHandle {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
     {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let _operation = self.inner.operations.read().await;
@@ -702,7 +719,7 @@ impl UdpHandle {
         registration: &super::udp_core::UdpRegistration,
     ) -> Result<(Bytes, SocketAddr)> {
         self.recv_registered_with(registration, |data, source| {
-            Ok(Candidate::Accept((data, source)))
+            Ok(Candidate::Accept((data, source.peer_addr())))
         })
         .await
     }
@@ -713,7 +730,7 @@ impl UdpHandle {
         mut validate: F,
     ) -> Result<T>
     where
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>>,
+        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>>,
     {
         let request_id = registration.request_id();
         tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv waiting");
@@ -721,12 +738,13 @@ impl UdpHandle {
         let result = self
             .inner
             .core
-            .wait_for_response_with(registration, self.target, |data, source| {
+            .wait_for_response_with(registration, self.target, |data, info| {
+                let source = info.peer_addr();
                 if self.inner.config.warn_on_source_mismatch && source != self.target {
                     tracing::warn!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.target = %self.target, snmp.source = %source }, "response source address mismatch");
                 }
                 tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.source = %source, snmp.bytes = data.len() }, "UDP recv candidate");
-                validate(data, source)
+                validate(data, info)
             })
             .await;
 
@@ -1023,7 +1041,7 @@ mod tests {
                 .request_with(
                     b"request",
                     RequestRegistration::v3(44, deadline_after(Duration::from_secs(2))),
-                    |data, source| Ok(Candidate::Accept((data, source))),
+                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
                 )
                 .await
         };
@@ -1041,7 +1059,7 @@ mod tests {
                 .request_with(
                     b"request",
                     RequestRegistration::v3(45, deadline_after(Duration::from_secs(30))),
-                    |data, source| Ok(Candidate::Accept((data, source))),
+                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
                 )
                 .await
         });
@@ -1097,7 +1115,7 @@ mod tests {
                 .request_with(
                     b"request",
                     RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
-                    |data, source| Ok(Candidate::Accept((data, source))),
+                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
                 )
                 .await
         });
@@ -1210,7 +1228,7 @@ mod tests {
             .request_with(
                 b"must not be sent",
                 RequestRegistration::v3(101, deadline_after(Duration::from_secs(30))),
-                |data, source| Ok(Candidate::Accept((data, source))),
+                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
             )
             .await
             .unwrap_err();
@@ -1241,7 +1259,7 @@ mod tests {
             .request_with(
                 b"request",
                 RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
-                |data, source| Ok(Candidate::Accept((data, source))),
+                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
             )
             .await
             .expect_err("recv on closed transport should fail");
@@ -1260,7 +1278,7 @@ mod tests {
             .request_with(
                 b"request",
                 RequestRegistration::v3(42, tokio::time::Instant::now()),
-                |data, source| Ok(Candidate::Accept((data, source))),
+                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
             )
             .await
             .expect_err("zero-deadline receive should fail");
@@ -1287,7 +1305,7 @@ mod tests {
         let oversized = vec![0u8; 1473];
         let err = handle
             .request_with(&oversized, registration, |data, source| {
-                Ok(Candidate::Accept((data, source)))
+                Ok(Candidate::Accept((data, source.peer_addr())))
             })
             .await
             .expect_err("oversized send should fail");
@@ -1328,7 +1346,7 @@ mod tests {
                 RequestRegistration::v3(61, deadline_after(Duration::from_secs(30)))
                     .with_aliases([60])
                     .unwrap(),
-                |data, source| Ok(Candidate::Accept((data, source))),
+                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
             )
             .await
             .unwrap_err();
@@ -1353,7 +1371,7 @@ mod tests {
             .unwrap();
 
         let request = handle.request_with(b"request", registration, |data, source| {
-            Ok(Candidate::Accept((data, source)))
+            Ok(Candidate::Accept((data, source.peer_addr())))
         });
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
         drop(request);
@@ -1378,7 +1396,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 request_handle
                     .request_with(b"request", registration, |data, source| {
-                        Ok(Candidate::Accept((data, source)))
+                        Ok(Candidate::Accept((data, source.peer_addr())))
                     })
                     .await
             });

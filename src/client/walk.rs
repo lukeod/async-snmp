@@ -14,7 +14,7 @@ use futures_core::Stream;
 use crate::error::{Error, Result, WalkAbortReason};
 use crate::oid::Oid;
 use crate::pdu::Pdu;
-use crate::transport::Transport;
+use crate::transport::RequestTransport;
 use crate::varbind::VarBind;
 use crate::version::Version;
 
@@ -225,7 +225,7 @@ impl OidTracker {
 }
 
 /// Private GETNEXT walk state machine.
-struct GetNextDriver<T: Transport> {
+struct GetNextDriver<T: RequestTransport> {
     client: Client<T>,
     base_oid: Oid,
     current_oid: Oid,
@@ -247,7 +247,7 @@ struct GetNextDriver<T: Transport> {
     >,
 }
 
-impl<T: Transport> GetNextDriver<T> {
+impl<T: RequestTransport> GetNextDriver<T> {
     pub(crate) fn new(
         client: Client<T>,
         oid: Oid,
@@ -269,7 +269,7 @@ impl<T: Transport> GetNextDriver<T> {
     }
 }
 
-impl<T: Transport + 'static> GetNextDriver<T> {
+impl<T: RequestTransport + 'static> GetNextDriver<T> {
     fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
         if self.done {
             return Poll::Ready(None);
@@ -343,7 +343,7 @@ impl<T: Transport + 'static> GetNextDriver<T> {
                         self.done = true;
                         Poll::Ready(Some(Err(Error::ResponseShape {
                             target: self.client.peer_addr(),
-                            response,
+                            response: Box::new(response),
                         }
                         .boxed())))
                     }
@@ -373,7 +373,7 @@ impl<T: Transport + 'static> GetNextDriver<T> {
     }
 }
 
-impl<T: Transport + 'static> Stream for GetNextDriver<T> {
+impl<T: RequestTransport + 'static> Stream for GetNextDriver<T> {
     type Item = Result<VarBind>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -387,7 +387,7 @@ impl<T: Transport + 'static> Stream for GetNextDriver<T> {
 }
 
 /// Private GETBULK walk state machine.
-struct GetBulkDriver<T: Transport> {
+struct GetBulkDriver<T: RequestTransport> {
     client: Client<T>,
     base_oid: Oid,
     current_oid: Oid,
@@ -406,7 +406,7 @@ struct GetBulkDriver<T: Transport> {
     pending: Option<Pin<Box<dyn std::future::Future<Output = Result<BulkResponse>> + Send>>>,
 }
 
-impl<T: Transport> GetBulkDriver<T> {
+impl<T: RequestTransport> GetBulkDriver<T> {
     pub(crate) fn new(
         client: Client<T>,
         oid: Oid,
@@ -433,7 +433,7 @@ impl<T: Transport> GetBulkDriver<T> {
     }
 }
 
-impl<T: Transport + 'static> GetBulkDriver<T> {
+impl<T: RequestTransport + 'static> GetBulkDriver<T> {
     fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
         loop {
             if self.done {
@@ -551,7 +551,7 @@ impl<T: Transport + 'static> GetBulkDriver<T> {
     }
 }
 
-impl<T: Transport + 'static> Stream for GetBulkDriver<T> {
+impl<T: RequestTransport + 'static> Stream for GetBulkDriver<T> {
     type Item = Result<VarBind>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -564,12 +564,12 @@ impl<T: Transport + 'static> Stream for GetBulkDriver<T> {
     }
 }
 
-enum WalkDriver<T: Transport> {
+enum WalkDriver<T: RequestTransport> {
     GetNext(GetNextDriver<T>),
     GetBulk(GetBulkDriver<T>),
 }
 
-impl<T: Transport> WalkDriver<T> {
+impl<T: RequestTransport> WalkDriver<T> {
     fn metadata(&self) -> &ResponseMetadata {
         match self {
             Self::GetNext(walk) => &walk.metadata,
@@ -578,7 +578,7 @@ impl<T: Transport> WalkDriver<T> {
     }
 }
 
-impl<T: Transport + 'static> WalkDriver<T> {
+impl<T: RequestTransport + 'static> WalkDriver<T> {
     fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
         match self {
             Self::GetNext(walk) => walk.poll_next_with_metadata(cx),
@@ -604,11 +604,11 @@ impl<T: Transport + 'static> WalkDriver<T> {
 /// }
 /// ```
 #[must_use = "streams do nothing unless polled"]
-pub struct WalkStream<T: Transport> {
+pub struct WalkStream<T: RequestTransport> {
     driver: WalkDriver<T>,
 }
 
-impl<T: Transport> WalkStream<T> {
+impl<T: RequestTransport> WalkStream<T> {
     /// Create a walk stream using the configured method and SNMP version.
     pub(crate) fn new(
         client: Client<T>,
@@ -643,7 +643,7 @@ impl<T: Transport> WalkStream<T> {
     }
 }
 
-impl<T: Transport + 'static> WalkStream<T> {
+impl<T: RequestTransport + 'static> WalkStream<T> {
     /// Returns the next variable binding, or `None` when the walk is complete.
     pub async fn next(&mut self) -> Option<Result<VarBind>> {
         std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
@@ -662,7 +662,7 @@ impl<T: Transport + 'static> WalkStream<T> {
     }
 }
 
-impl<T: Transport + 'static> Stream for WalkStream<T> {
+impl<T: RequestTransport + 'static> Stream for WalkStream<T> {
     type Item = Result<VarBind>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -679,11 +679,11 @@ impl<T: Transport + 'static> Stream for WalkStream<T> {
 /// response. [`Self::metadata`] and [`Self::collect`] also retain metadata from
 /// accepted terminal responses that yield no binding.
 #[must_use = "streams do nothing unless polled"]
-pub struct WalkMetadataStream<T: Transport> {
+pub struct WalkMetadataStream<T: RequestTransport> {
     driver: WalkDriver<T>,
 }
 
-impl<T: Transport> WalkMetadataStream<T> {
+impl<T: RequestTransport> WalkMetadataStream<T> {
     pub(crate) fn new(inner: WalkStream<T>) -> Self {
         Self {
             driver: inner.driver,
@@ -696,7 +696,7 @@ impl<T: Transport> WalkMetadataStream<T> {
     }
 }
 
-impl<T: Transport + 'static> WalkMetadataStream<T> {
+impl<T: RequestTransport + 'static> WalkMetadataStream<T> {
     pub async fn next(&mut self) -> Option<std::result::Result<WalkItem, WalkError>> {
         std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }
@@ -713,7 +713,7 @@ impl<T: Transport + 'static> WalkMetadataStream<T> {
     }
 }
 
-impl<T: Transport + 'static> Stream for WalkMetadataStream<T> {
+impl<T: RequestTransport + 'static> Stream for WalkMetadataStream<T> {
     type Item = std::result::Result<WalkItem, WalkError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -980,7 +980,7 @@ mod tests {
         }
     }
 
-    impl Transport for BulkTooBigTransport {
+    impl RequestTransport for BulkTooBigTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(
@@ -1008,7 +1008,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -1144,7 +1145,7 @@ mod tests {
         }
     }
 
-    impl Transport for EmptyWalkTransport {
+    impl RequestTransport for EmptyWalkTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             let msg = CommunityMessage::decode(
@@ -1170,7 +1171,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -1258,8 +1260,8 @@ mod tests {
 
     #[test]
     fn explicit_constructors_share_the_two_public_stream_types() {
-        fn plain<T: Transport>(_: Result<WalkStream<T>>) {}
-        fn metadata<T: Transport>(_: Result<WalkMetadataStream<T>>) {}
+        fn plain<T: RequestTransport>(_: Result<WalkStream<T>>) {}
+        fn metadata<T: RequestTransport>(_: Result<WalkMetadataStream<T>>) {}
 
         let (client, requests) = empty_walk_client(None);
         let base = oid!(1, 3, 6, 1);
@@ -1514,7 +1516,7 @@ mod tests {
         }
     }
 
-    impl Transport for ScriptedWalkTransport {
+    impl RequestTransport for ScriptedWalkTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let message = CommunityMessage::decode(
                 Bytes::copy_from_slice(data),
@@ -1541,7 +1543,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,

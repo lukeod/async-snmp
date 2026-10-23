@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_snmp::DecodeConfig;
 use async_snmp::{
     Auth, Candidate, Client, ClientConfig, CommunityResponsePolicy, CommunityVersion, Error, Oid,
-    RequestRegistration, ResponseIdentity, Retry, Transport,
+    RequestRegistration, RequestTransport, ResponseIdentity, Retry,
 };
 use bytes::Bytes;
 use tokio::sync::oneshot;
@@ -22,6 +22,7 @@ struct ExternalTransport {
 }
 
 struct ExternalTransportInner {
+    endpoint_id: async_snmp::EndpointId,
     peer: SocketAddr,
     local: SocketAddr,
     replies: Mutex<VecDeque<(Bytes, SocketAddr)>>,
@@ -34,6 +35,7 @@ impl ExternalTransport {
     fn new(peer: SocketAddr, replies: Vec<(Bytes, SocketAddr)>) -> Self {
         Self {
             inner: Arc::new(ExternalTransportInner {
+                endpoint_id: async_snmp::EndpointId::new(),
                 peer,
                 local: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
                 replies: Mutex::new(replies.into()),
@@ -45,7 +47,7 @@ impl ExternalTransport {
     }
 }
 
-impl Transport for ExternalTransport {
+impl RequestTransport for ExternalTransport {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         Ok(())
     }
@@ -58,7 +60,7 @@ impl Transport for ExternalTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         self.inner.deadlines_armed.fetch_add(1, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
@@ -102,7 +104,15 @@ impl Transport for ExternalTransport {
             }
 
             self.inner.validator_calls.fetch_add(1, Ordering::Relaxed);
-            match validate(data, source)? {
+            let info = async_snmp::ReceivedMessageInfo::udp(
+                self.inner.endpoint_id,
+                self.local_addr(),
+                source,
+                None,
+                tokio::time::Instant::now(),
+                data.len(),
+            );
+            match validate(data, info)? {
                 Candidate::Accept(value) => return Ok(value),
                 Candidate::Reject => continue,
             }
@@ -128,6 +138,7 @@ struct ImmediateResponseTransport {
 }
 
 struct ImmediateResponseTransportInner {
+    endpoint_id: async_snmp::EndpointId,
     peer: SocketAddr,
     local: SocketAddr,
     response: Bytes,
@@ -149,6 +160,7 @@ impl ImmediateResponseTransport {
     fn new(peer: SocketAddr, response: Bytes) -> Self {
         Self {
             inner: Arc::new(ImmediateResponseTransportInner {
+                endpoint_id: async_snmp::EndpointId::new(),
                 peer,
                 local: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
                 response,
@@ -159,7 +171,7 @@ impl ImmediateResponseTransport {
     }
 }
 
-impl Transport for ImmediateResponseTransport {
+impl RequestTransport for ImmediateResponseTransport {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         let Some(pending) = self.inner.pending.lock().unwrap().take() else {
             self.inner
@@ -180,7 +192,7 @@ impl Transport for ImmediateResponseTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         let (sender, receiver) = oneshot::channel();
         assert!(self.inner.pending.lock().unwrap().replace(sender).is_none());
@@ -215,7 +227,15 @@ impl Transport for ImmediateResponseTransport {
             registration.evaluate_response_identity(&data, source == self.inner.peer),
             ResponseIdentity::Reject
         );
-        match validate(data, source)? {
+        let info = async_snmp::ReceivedMessageInfo::udp(
+            self.inner.endpoint_id,
+            self.local_addr(),
+            source,
+            None,
+            tokio::time::Instant::now(),
+            data.len(),
+        );
+        match validate(data, info)? {
             Candidate::Accept(value) => Ok(value),
             Candidate::Reject => Err(Error::MalformedResponse {
                 target: self.inner.peer,
@@ -279,7 +299,10 @@ async fn complete_exchange_registers_before_an_immediate_response() {
         .await
         .unwrap();
 
-    assert_eq!(received, (response, peer));
+    assert_eq!(received.0, response);
+    assert_eq!(received.1.peer_addr(), peer);
+    assert_eq!(received.1.received_len(), response.len());
+    assert_eq!(received.1.endpoint_id(), transport.inner.endpoint_id);
     assert_eq!(
         transport.inner.unmatched_responses.load(Ordering::Relaxed),
         0
@@ -297,7 +320,7 @@ struct ReadyReceiveTransport {
     error: bool,
 }
 
-impl Transport for ReadyReceiveTransport {
+impl RequestTransport for ReadyReceiveTransport {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         self.sends.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -311,7 +334,7 @@ impl Transport for ReadyReceiveTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         if self.error {
             Err(Error::Config("immediate receive error".into()).boxed())
@@ -357,7 +380,7 @@ async fn complete_exchange_can_return_local_error_without_sending() {
 #[derive(Clone, Copy)]
 struct SlowExchangeTransport;
 
-impl Transport for SlowExchangeTransport {
+impl RequestTransport for SlowExchangeTransport {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         tokio::time::sleep(Duration::from_secs(4)).await;
         Ok(())
@@ -371,7 +394,7 @@ impl Transport for SlowExchangeTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         let started = tokio::time::Instant::now();
         tokio::time::timeout_at(registration.deadline(), async {
@@ -433,7 +456,7 @@ struct FiniteCapacityTransport {
     sends: Arc<AtomicUsize>,
 }
 
-impl Transport for FiniteCapacityTransport {
+impl RequestTransport for FiniteCapacityTransport {
     async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
         if data.len() > self.send_capacity() {
             return Err(Error::OutboundMessageTooLarge {
@@ -454,7 +477,7 @@ impl Transport for FiniteCapacityTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         if data.len() > self.send_capacity() {
             return Err(Error::OutboundMessageTooLarge {
@@ -510,7 +533,7 @@ async fn complete_exchange_rejects_capacity_before_receive_setup() {
 #[derive(Clone, Copy)]
 struct PendingSendTransport;
 
-impl Transport for PendingSendTransport {
+impl RequestTransport for PendingSendTransport {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         std::future::pending().await
     }
@@ -523,7 +546,7 @@ impl Transport for PendingSendTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         panic!("receive is unused by the standalone-send test")
     }
@@ -617,7 +640,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
         })
         .await
         .unwrap();
-    assert_eq!(accepted, peer);
+    assert_eq!(accepted.peer_addr(), peer);
     assert_eq!(candidates, 2);
     assert_eq!(exact.inner.deadlines_armed.load(Ordering::Relaxed), 1);
     assert_eq!(exact.inner.identity_rejections.load(Ordering::Relaxed), 1);
@@ -644,7 +667,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
         )
         .await
         .unwrap();
-    assert_eq!(accepted.1, peer);
+    assert_eq!(accepted.1.peer_addr(), peer);
     assert_eq!(
         target_only
             .inner
@@ -668,7 +691,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
         )
         .await
         .unwrap();
-    assert_eq!(accepted.1, other);
+    assert_eq!(accepted.1.peer_addr(), other);
     assert_eq!(
         any_source.inner.identity_rejections.load(Ordering::Relaxed),
         0
@@ -773,7 +796,7 @@ struct RegistrationPolicyProbe {
     policies: Arc<Mutex<Vec<DecodeConfig>>>,
 }
 
-impl Transport for RegistrationPolicyProbe {
+impl RequestTransport for RegistrationPolicyProbe {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         Ok(())
     }
@@ -786,7 +809,7 @@ impl Transport for RegistrationPolicyProbe {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         self.policies
             .lock()

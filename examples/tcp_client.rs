@@ -21,8 +21,8 @@
 //! ```
 
 use async_snmp::{
-    Auth, AuthProtocol, Client, ClientBuilder, PrivProtocol, ResponseShapePolicy, Retry,
-    TcpTransport, Transport, oid,
+    Auth, AuthProtocol, Client, ClientBuilder, PrivProtocol, RequestTransport, ResponseShapePolicy,
+    Retry, TcpTransport, oid,
 };
 use std::net::SocketAddr;
 use std::time::Duration;

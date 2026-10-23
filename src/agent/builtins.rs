@@ -53,7 +53,7 @@ impl SnmpEngineHandler {
             3 => Some(Value::Integer(
                 self.state.authoritative_boots_time()?.1 as i32,
             )),
-            4 => Some(Value::Integer(self.state.local_receive_capacity.as_i32())),
+            4 => Some(Value::Integer(self.state.engine_receive_capacity.as_i32())),
             _ => None,
         })
     }
@@ -302,7 +302,7 @@ mod tests {
             engine_boots_base: 5,
             authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(12345),
             max_message_size: 1472,
-            local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
+            engine_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             decode_config: crate::DecodeConfig::default(),
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(10),

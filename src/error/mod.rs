@@ -637,7 +637,7 @@ pub enum Error {
     #[error("response shape anomaly from {target}: {response:?}")]
     ResponseShape {
         target: SocketAddr,
-        response: crate::client::FixedCardinalityResponse,
+        response: Box<crate::client::FixedCardinalityResponse>,
     },
 
     /// Walk aborted before observed natural completion.
@@ -763,7 +763,7 @@ impl Error {
         mut self: Box<Self>,
         prior: &crate::client::ResponseMetadata,
     ) -> Box<Self> {
-        if prior.decode_anomalies.is_empty() {
+        if prior.decode_anomalies.is_empty() && prior.received_messages.is_empty() {
             return self;
         }
 
@@ -1106,12 +1106,12 @@ mod tests {
             (
                 Error::ResponseShape {
                     target,
-                    response: crate::client::FixedCardinalityResponse {
+                    response: Box::new(crate::client::FixedCardinalityResponse {
                         operation: crate::client::FixedCardinalityOperation::Get,
                         varbinds: Vec::new(),
                         anomalies: Vec::new(),
                         metadata: crate::client::ResponseMetadata::default(),
-                    },
+                    }),
                 },
                 ErrorKind::ResponseShape,
             ),

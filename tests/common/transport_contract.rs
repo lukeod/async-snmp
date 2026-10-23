@@ -1,7 +1,7 @@
 #[derive(Clone, Copy)]
 struct ContractTransport;
 
-impl Transport for ContractTransport {
+impl RequestTransport for ContractTransport {
     async fn send(&self, _data: &[u8]) -> Result<()> {
         Ok(())
     }
@@ -14,7 +14,7 @@ impl Transport for ContractTransport {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
     {
         Err(Error::Config("compile-contract transport has no response".into()).boxed())
     }
@@ -34,7 +34,7 @@ impl Transport for ContractTransport {
 
 fn assert_send<T: Send>(_value: T) {}
 
-fn compile_default_and_generic_surface<T: Transport>(transport: &T) {
+fn compile_default_and_generic_surface<T: RequestTransport>(transport: &T) {
     let registration = RequestRegistration::v3(
         7,
         tokio::time::Instant::now() + std::time::Duration::from_secs(1),

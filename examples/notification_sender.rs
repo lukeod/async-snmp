@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..5 {
             match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
                 Ok(Ok(received)) => {
-                    print_notification(&received.notification, received.source);
+                    print_notification(&received.notification, received.receive_info.peer_addr());
                     if let Some(outcome) = received.inform_ack {
                         println!("  Inform acknowledgement: {outcome:?}");
                     }

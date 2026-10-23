@@ -33,7 +33,7 @@
 //! transport creation. For a preconfigured transport, use
 //! [`ClientBuilder::new`] with authentication and client policy only, then call
 //! [`ClientBuilder::build_with_transport`], which accepts any type implementing
-//! [`Transport`]; transport construction and its deadline remain
+//! [`RequestTransport`]; transport construction and its deadline remain
 //! application-owned. A preconstructed shared [`UdpTransport`] is a socket
 //! owner rather than a per-target transport, so pair it with a target through
 //! [`TargetClientBuilder::build_with`] to derive a [`UdpHandle`].
@@ -634,8 +634,9 @@ pub use pdu::{
     PduBody, PduType, RequestPdu, ResponsePdu, StandardPduType, TrapV1Notification, TrapV1Pdu,
 };
 pub use transport::{
-    BuiltinTransport, Candidate, CommunityResponsePolicy, RequestRegistration, ResponseIdentity,
-    TcpTransport, Transport, UdpControl, UdpHandle, UdpStats, UdpTransport,
+    BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId, ReceivedMessageInfo,
+    RequestRegistration, RequestTransport, ResponseIdentity, SessionId, TcpTransport,
+    TransportKind, UdpControl, UdpHandle, UdpStats, UdpTransport,
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, AuthoritativeEnginePersistenceError,

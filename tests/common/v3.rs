@@ -5,7 +5,7 @@ use async_snmp::message::{
     MsgFlags, MsgGlobalData, ScopedPdu, SecurityLevel, V3Message, V3MessageData,
 };
 use async_snmp::pdu::{Pdu, PduBody, PduType, ResponsePdu};
-use async_snmp::transport::Transport;
+use async_snmp::transport::RequestTransport;
 use async_snmp::v3::auth::{authenticate_message, verify_message};
 use async_snmp::v3::{SaltCounter, UsmSecurityParams};
 use async_snmp::{Error, Oid, ReceiveLimits, UDP_RECEIVE_LIMITS, UsmConfig, Value, VarBind};
@@ -66,7 +66,7 @@ impl TestV3Engine {
 pub struct CapturedV3Request {
     pub raw: Bytes,
     pub source: SocketAddr,
-    /// The ID passed to `Transport::request_with`; network peers leave this unset.
+    /// The ID passed to `RequestTransport::request_with`; network peers leave this unset.
     pub transport_request_id: Option<i32>,
     pub global_data: MsgGlobalData,
     pub usm: UsmSecurityParams,
@@ -1063,7 +1063,7 @@ impl ScriptedTransport {
     }
 }
 
-impl Transport for ScriptedTransport {
+impl RequestTransport for ScriptedTransport {
     async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
         Ok(())
     }
@@ -1076,7 +1076,11 @@ impl Transport for ScriptedTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<async_snmp::Candidate<T>> + Send,
+        F: FnMut(
+                Bytes,
+                async_snmp::ReceivedMessageInfo,
+            ) -> async_snmp::Result<async_snmp::Candidate<T>>
+            + Send,
     {
         let request_id = registration.request_id();
         let (request, step) = self
@@ -1097,7 +1101,15 @@ impl Transport for ScriptedTransport {
         {
             ScriptOutput::Replies(replies) => {
                 for reply in replies {
-                    if let async_snmp::Candidate::Accept(value) = validate(reply, self.0.peer)? {
+                    let info = async_snmp::ReceivedMessageInfo::udp(
+                        async_snmp::EndpointId::new(),
+                        self.local_addr(),
+                        self.0.peer,
+                        None,
+                        tokio::time::Instant::now(),
+                        reply.len(),
+                    );
+                    if let async_snmp::Candidate::Accept(value) = validate(reply, info)? {
                         return Ok(value);
                     }
                 }
@@ -1110,7 +1122,15 @@ impl Transport for ScriptedTransport {
             }
             ScriptOutput::DelayedReply(delay, reply) => {
                 tokio::time::sleep(delay).await;
-                match validate(reply, self.0.peer)? {
+                let info = async_snmp::ReceivedMessageInfo::udp(
+                    async_snmp::EndpointId::new(),
+                    self.local_addr(),
+                    self.0.peer,
+                    None,
+                    tokio::time::Instant::now(),
+                    reply.len(),
+                );
+                match validate(reply, info)? {
                     async_snmp::Candidate::Accept(value) => Ok(value),
                     async_snmp::Candidate::Reject => Err(Error::Timeout {
                         target: self.0.peer,

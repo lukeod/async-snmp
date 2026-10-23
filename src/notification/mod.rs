@@ -26,7 +26,7 @@
 //!     loop {
 //!         match receiver.recv().await {
 //!             Ok(received) => {
-//!                 println!("Received notification from {}: {:?}", received.source, received.notification);
+//!                 println!("Received notification from {}: {:?}", received.receive_info.peer_addr(), received.notification);
 //!                 println!("Inform acknowledgement: {:?}", received.inform_ack);
 //!             }
 //!             Err(e) => {
@@ -287,8 +287,8 @@ pub enum InformAckOutcome {
 pub struct ReceivedNotification {
     /// Accepted notification value.
     pub notification: Notification,
-    /// Datagram source address; SNMP does not cryptographically authenticate it.
-    pub source: SocketAddr,
+    /// Complete-message receive metadata, without a source authentication claim.
+    pub receive_info: crate::ReceivedMessageInfo,
     /// Version, request ID, and V3 message/security identity from the wire.
     pub wire_identity: NotificationWireIdentity,
     /// Local acknowledgement outcome for an Inform, or `None` for a trap.
@@ -298,12 +298,12 @@ pub struct ReceivedNotification {
 impl ReceivedNotification {
     fn trap(
         notification: Notification,
-        source: SocketAddr,
+        receive_info: crate::ReceivedMessageInfo,
         wire_identity: NotificationWireIdentity,
     ) -> Self {
         Self {
             notification,
-            source,
+            receive_info,
             wire_identity,
             inform_ack: None,
         }
@@ -311,13 +311,13 @@ impl ReceivedNotification {
 
     fn inform(
         notification: Notification,
-        source: SocketAddr,
+        receive_info: crate::ReceivedMessageInfo,
         wire_identity: NotificationWireIdentity,
         outcome: InformAckOutcome,
     ) -> Self {
         Self {
             notification,
-            source,
+            receive_info,
             wire_identity,
             inform_ack: Some(outcome),
         }
@@ -386,8 +386,8 @@ pub type NotificationAcceptanceResult =
 /// before any Inform response attempt or delivery.
 #[derive(Debug, Clone, Copy)]
 pub struct NotificationEnvelope<'a> {
-    /// Datagram source address; SNMP does not cryptographically authenticate it.
-    pub source: SocketAddr,
+    /// Complete-message receive metadata, without a source authentication claim.
+    pub receive_info: crate::ReceivedMessageInfo,
     /// Protocol version.
     pub version: Version,
     /// Community for v1/v2c, or `None` for v3.
@@ -437,14 +437,14 @@ pub struct NotificationEnvelope<'a> {
 }
 
 impl<'a> NotificationEnvelope<'a> {
-    fn new(source: SocketAddr, notification: &'a Notification) -> Self {
+    fn new(receive_info: crate::ReceivedMessageInfo, notification: &'a Notification) -> Self {
         match notification {
             Notification::TrapV1 {
                 community,
                 trap,
                 decode_anomalies,
             } => Self {
-                source,
+                receive_info,
                 version: Version::V1,
                 community: Some(community),
                 username: None,
@@ -474,7 +474,7 @@ impl<'a> NotificationEnvelope<'a> {
                 decode_anomalies,
                 ..
             } => Self {
-                source,
+                receive_info,
                 version: Version::V2c,
                 community: Some(community),
                 username: None,
@@ -514,7 +514,7 @@ impl<'a> NotificationEnvelope<'a> {
                 decode_anomalies,
                 ..
             } => Self {
-                source,
+                receive_info,
                 version: Version::V3,
                 community: None,
                 username: Some(username),
@@ -1092,8 +1092,9 @@ impl NotificationReceiverBuilder {
         Ok(NotificationReceiver {
             inner: Arc::new(ReceiverInner {
                 authoritative_engine,
-                socket,
-                udp_responder,
+                socket: Arc::new(socket),
+                udp_responder: Arc::new(udp_responder),
+                endpoint_id: crate::EndpointId::new(),
                 local_addr,
                 usm_users,
                 communities: self.communities,
@@ -1395,8 +1396,9 @@ pub struct NotificationReceiver {
 
 struct ReceiverInner {
     authoritative_engine: Option<AuthoritativeEngine>,
-    socket: UdpSocket,
-    udp_responder: UdpResponder,
+    socket: Arc<UdpSocket>,
+    udp_responder: Arc<UdpResponder>,
+    endpoint_id: crate::EndpointId,
     local_addr: SocketAddr,
     /// Configured USM users for V3 authentication
     usm_users: HashMap<Bytes, UsmUser>,
@@ -1449,11 +1451,16 @@ struct ReceiverInner {
 }
 
 impl ReceiverInner {
-    fn accepts(&self, source: SocketAddr, notification: &Notification) -> bool {
+    fn accepts(
+        &self,
+        receive_info: crate::ReceivedMessageInfo,
+        notification: &Notification,
+    ) -> bool {
         let Some(policy) = &self.acceptance_policy else {
             return true;
         };
-        let envelope = NotificationEnvelope::new(source, notification);
+        let source = receive_info.peer_addr();
+        let envelope = NotificationEnvelope::new(receive_info, notification);
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| policy.evaluate(&envelope)))
         {
             Ok(Ok(NotificationAcceptance::Accept)) => true,
@@ -1737,16 +1744,23 @@ impl NotificationReceiver {
                     }
                 },
             };
+            let received_at = tokio::time::Instant::now();
             let source = received.source;
             if received.len > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
                 tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, received_size = received.len, advertised_size = crate::UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
             }
             let data = Bytes::copy_from_slice(&buf[..received.len]);
 
-            match self
-                .parse_and_respond(data, source, received.destination)
-                .await
-            {
+            let message = crate::transport::ReceivedMessage::udp(
+                data,
+                self.inner.endpoint_id,
+                self.inner.socket.clone(),
+                self.inner.udp_responder.clone(),
+                received,
+                received_at,
+                crate::transport::EndpointLimits::UDP,
+            );
+            match self.parse_and_respond(message).await {
                 Ok(Some(notification)) => return Ok(notification),
                 Ok(None) => {} // Not a notification PDU, ignore
                 Err(e) if e.kind() == crate::ErrorKind::AuthoritativeEnginePersistence => {
@@ -1768,22 +1782,42 @@ impl NotificationReceiver {
     /// Returns `None` if the message is not a notification PDU.
     async fn parse_and_respond(
         &self,
+        message: crate::transport::ReceivedMessage,
+    ) -> Result<Option<ReceivedNotification>> {
+        match crate::message::peek_version(message.bytes.clone(), message.info.peer_addr())? {
+            Version::V1 => self.handle_v1_message(message).await,
+            Version::V2c => self.handle_v2c_message(message).await,
+            Version::V3 => self.handle_v3_message(message).await,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_message(
+        &self,
         data: Bytes,
         source: SocketAddr,
-        response_source: Option<crate::udp_responder::DestinationMetadata>,
-    ) -> Result<Option<ReceivedNotification>> {
-        match crate::message::peek_version(data.clone(), source)? {
-            Version::V1 => self.handle_v1(data, source).await,
-            Version::V2c => self.handle_v2c_at(data, source, response_source).await,
-            Version::V3 => self.handle_v3_at(data, source, response_source).await,
-        }
+        destination: Option<crate::udp_responder::DestinationMetadata>,
+    ) -> crate::transport::ReceivedMessage {
+        let received = ReceivedDatagram {
+            len: data.len(),
+            source,
+            destination,
+        };
+        crate::transport::ReceivedMessage::udp(
+            data,
+            self.inner.endpoint_id,
+            self.inner.socket.clone(),
+            self.inner.udp_responder.clone(),
+            received,
+            tokio::time::Instant::now(),
+            crate::transport::EndpointLimits::UDP,
+        )
     }
 
     async fn send_response(
         &self,
         data: &[u8],
-        destination: SocketAddr,
-        source: Option<crate::udp_responder::DestinationMetadata>,
+        route: &crate::transport::ReplyRoute,
     ) -> std::io::Result<()> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.response_send_timeout)
@@ -1813,7 +1847,7 @@ impl NotificationReceiver {
                 if let Some(gate) = &response_send_gate {
                     gate.acquire().await.expect("test send gate remains open").forget();
                 }
-                self.inner.udp_responder.send_to(&self.inner.socket, data, destination, source).await
+                route.send(data).await
             } => result,
         }
     }
@@ -4703,6 +4737,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn received_metadata_preserves_complete_datagrams_and_policy_identity() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let policy_observed = observed.clone();
+        let receiver = NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .acceptance_policy(move |envelope: &NotificationEnvelope<'_>| {
+                policy_observed.lock().unwrap().push(envelope.receive_info);
+                NotificationAcceptance::Accept
+            })
+            .build()
+            .await
+            .unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut endpoint = None;
+        for (message, suffix) in [
+            (build_v1_trap(b"public"), 512),
+            (build_v2c_trap(b"public"), 0),
+            (build_v2c_inform(b"public"), 5),
+        ] {
+            let mut bytes = message.to_vec();
+            bytes.resize(bytes.len() + suffix, 0xa5);
+            let before = tokio::time::Instant::now();
+            sender.send_to(&bytes, receiver.local_addr()).await.unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let info = received.receive_info;
+            assert_eq!(info.received_len(), bytes.len());
+            assert_eq!(info.peer_addr(), sender.local_addr().unwrap());
+            assert_eq!(info.local_addr(), receiver.local_addr());
+            assert_eq!(info.transport(), crate::TransportKind::Udp);
+            assert_eq!(info.session_id(), None);
+            assert!(info.received_at() >= before);
+            assert!(info.received_at() <= tokio::time::Instant::now());
+            assert_eq!(observed.lock().unwrap().last(), Some(&info));
+            if let Some(endpoint) = endpoint {
+                assert_eq!(info.endpoint_id(), endpoint);
+            }
+            endpoint = Some(info.endpoint_id());
+        }
+    }
+
+    #[tokio::test]
     async fn community_receiver_exposes_trailing_anomalies_in_notification_and_metadata() {
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let policy_observed = std::sync::Arc::clone(&observed);
@@ -4835,11 +4913,20 @@ mod tests {
             let source_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut message = message.to_vec();
             message.extend_from_slice(&[0x05, 0]);
-            let notification = receiver
-                .handle_v3(Bytes::from(message), source_socket.local_addr().unwrap())
+            let received_len = message.len();
+            source_socket
+                .send_to(&message, receiver.local_addr())
+                .await
+                .unwrap();
+            let notification = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(notification.receive_info.received_len(), received_len);
+            assert_eq!(
+                notification.receive_info.peer_addr(),
+                source_socket.local_addr().unwrap()
+            );
             assert_eq!(
                 notification.notification.decode_anomalies(),
                 [crate::DecodeAnomaly::TrailingBytes {
@@ -4956,7 +5043,7 @@ mod tests {
         let receiver = NotificationReceiver::builder()
             .bind("127.0.0.1:0")
             .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
-                assert_eq!(notification.source, source);
+                assert_eq!(notification.receive_info.peer_addr(), source);
                 assert_eq!(notification.version, Version::V1);
                 assert_eq!(
                     notification.community.map(Community::as_bytes),
@@ -5038,7 +5125,7 @@ mod tests {
             .bind("127.0.0.1:0")
             .community(b"public")
             .acceptance_policy(move |notification: &NotificationEnvelope<'_>| {
-                let inspected = notification.source == source
+                let inspected = notification.receive_info.peer_addr() == source
                     && notification.version == Version::V2c
                     && notification.community.map(Community::as_bytes)
                         == Some(b"public".as_slice())
@@ -5156,7 +5243,10 @@ mod tests {
             .expect("receiver did not continue after policy panic")
             .unwrap()
             .unwrap();
-        assert_eq!(received.source, sender.local_addr().unwrap());
+        assert_eq!(
+            received.receive_info.peer_addr(),
+            sender.local_addr().unwrap()
+        );
         assert!(matches!(
             received.notification,
             Notification::TrapV2c { .. }
@@ -5227,7 +5317,7 @@ mod tests {
             .await
             .expect("accepted Inform was not returned")
             .unwrap();
-        assert_eq!(first.source, sender.local_addr().unwrap());
+        assert_eq!(first.receive_info.peer_addr(), sender.local_addr().unwrap());
         assert_eq!(first.wire_identity.request_id, Some(1));
         assert!(matches!(first.inform_ack, Some(InformAckOutcome::Sent)));
 
@@ -5580,14 +5670,22 @@ mod tests {
         assert_eq!(source.ip(), destination.ip());
 
         let received = receive_task.await.unwrap().unwrap();
+        assert_eq!(
+            received
+                .receive_info
+                .datagram_destination()
+                .map(|ip| ip.to_canonical()),
+            Some(destination.ip().to_canonical())
+        );
+        assert!(received.receive_info.local_addr().ip().is_unspecified());
         assert!(matches!(
             received.notification,
             Notification::InformV2c { .. }
         ));
         let client_addr = client.local_addr().unwrap();
-        assert_eq!(received.source.port(), client_addr.port());
+        assert_eq!(received.receive_info.peer_addr().port(), client_addr.port());
         assert_eq!(
-            received.source.ip().to_canonical(),
+            received.receive_info.peer_addr().ip().to_canonical(),
             client_addr.ip().to_canonical()
         );
     }
@@ -5617,6 +5715,7 @@ mod tests {
             .await
             .expect("maximum UDP notification stalled")
             .unwrap();
+        assert_eq!(received.receive_info.received_len(), crate::MAX_UDP_PAYLOAD);
         let Notification::TrapV2c {
             request_id,
             decode_anomalies,
@@ -5844,14 +5943,22 @@ mod tests {
         assert_eq!(source.ip(), destination.ip());
 
         let received = receive_task.await.unwrap().unwrap();
+        assert_eq!(
+            received
+                .receive_info
+                .datagram_destination()
+                .map(|ip| ip.to_canonical()),
+            Some(destination.ip().to_canonical())
+        );
+        assert!(received.receive_info.local_addr().ip().is_unspecified());
         assert!(matches!(
             received.notification,
             Notification::InformV2c { .. }
         ));
         let client_addr = client.local_addr().unwrap();
-        assert_eq!(received.source.port(), client_addr.port());
+        assert_eq!(received.receive_info.peer_addr().port(), client_addr.port());
         assert_eq!(
-            received.source.ip().to_canonical(),
+            received.receive_info.peer_addr().ip().to_canonical(),
             client_addr.ip().to_canonical()
         );
     }
@@ -5934,6 +6041,14 @@ mod tests {
         assert_eq!(source.ip(), destination.ip());
 
         let received = receive_task.await.unwrap().unwrap();
+        assert_eq!(
+            received
+                .receive_info
+                .datagram_destination()
+                .map(|ip| ip.to_canonical()),
+            Some(destination.ip().to_canonical())
+        );
+        assert!(received.receive_info.local_addr().ip().is_unspecified());
         assert!(matches!(
             received.notification,
             Notification::InformV3 { .. }

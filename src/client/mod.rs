@@ -76,7 +76,7 @@ use crate::error::{Error, Result};
 use crate::message::{CommunityMessage, Message, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::{GetBulkPdu, NotificationPdu, Pdu, PduType, RequestPdu, TrapV1Notification};
-use crate::transport::{Candidate, Transport, UdpHandle, UdpStats};
+use crate::transport::{Candidate, RequestTransport, UdpHandle, UdpStats};
 use crate::v3::{DesSaltState, EngineCache, EngineState, PrivProtocol, SaltCounter};
 use crate::value::Value;
 use crate::varbind::VarBind;
@@ -157,17 +157,17 @@ pub const DEFAULT_MAX_REPETITIONS: u32 = 25;
 /// SNMP client.
 ///
 /// Generic over transport type, with `UdpHandle` as default.
-pub struct Client<T: Transport = UdpHandle> {
+pub struct Client<T: RequestTransport = UdpHandle> {
     inner: Arc<ClientInner<T>>,
 }
 
 #[derive(Debug)]
 pub(super) struct DecodedResponse {
     pub(super) pdu: Pdu,
-    pub(super) decode_anomalies: Vec<crate::DecodeAnomaly>,
+    pub(super) metadata: ResponseMetadata,
 }
 
-impl<T: Transport> Clone for Client<T> {
+impl<T: RequestTransport> Clone for Client<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -382,7 +382,7 @@ impl ClientEngine {
     }
 }
 
-struct ClientInner<T: Transport> {
+struct ClientInner<T: RequestTransport> {
     transport: T,
     config: ClientConfig,
     /// Coherent V3 identity, trusted time, and identity-localized keys.
@@ -605,12 +605,12 @@ impl ClientConfig {
     }
 }
 
-impl<T: Transport> Client<T> {
+impl<T: RequestTransport> Client<T> {
     /// Create a client with the given transport and configuration.
     ///
     /// For most use cases, prefer [`Client::builder()`] for a library-created
     /// transport or [`ClientBuilder::build_with_transport`] for an existing or
-    /// custom [`Transport`]. Use this lower-level constructor when configuring
+    /// custom [`RequestTransport`]. Use this lower-level constructor when configuring
     /// the client directly with [`ClientConfig`].
     ///
     /// # Errors
@@ -847,7 +847,8 @@ impl<T: Transport> Client<T> {
             match self
                 .inner
                 .transport
-                .request_with(data, registration, |response_data, source| {
+                .request_with(data, registration, |response_data, info| {
+                    let source = info.peer_addr();
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response candidate");
                     let Ok(decoded) = Message::decode_bounded_with_target(
                         response_data,
@@ -884,8 +885,8 @@ impl<T: Transport> Client<T> {
                         return Ok(Candidate::Reject);
                     }
                     Ok(Candidate::Accept(DecodedResponse {
+                        metadata: ResponseMetadata::from_received(info, response_pdu.pdu_type(), decoded.anomalies),
                         pdu: response_pdu,
-                        decode_anomalies: decoded.anomalies,
                     }))
                 })
                 .await
@@ -894,7 +895,7 @@ impl<T: Transport> Client<T> {
                     if let Some(err) = pdu_to_snmp_error(
                         &response.pdu,
                         self.peer_addr(),
-                        ResponseMetadata::from_decode_anomalies(response.decode_anomalies.clone()),
+                        response.metadata.clone(),
                     ) {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
@@ -971,7 +972,7 @@ impl<T: Transport> Client<T> {
         {
             return Err(Error::ResponseShape {
                 target: self.peer_addr(),
-                response,
+                response: Box::new(response),
             }
             .boxed());
         }
@@ -998,7 +999,7 @@ impl<T: Transport> Client<T> {
             0,
             0,
         );
-        classified.metadata.decode_anomalies = response.decode_anomalies;
+        classified.metadata = response.metadata;
         self.apply_response_shape_policy(classified)
     }
 
@@ -1077,7 +1078,7 @@ impl<T: Transport> Client<T> {
             0,
             0,
         );
-        classified.metadata.decode_anomalies = response.decode_anomalies;
+        classified.metadata = response.metadata;
         self.apply_response_shape_policy(classified)
     }
 
@@ -1136,7 +1137,7 @@ impl<T: Transport> Client<T> {
         .into_raw();
         let response = self.send_request(pdu).await?;
         let mut classified = classify(RequestShape::Set(&requested), response.pdu.varbinds, 0, 0);
-        classified.metadata.decode_anomalies = response.decode_anomalies;
+        classified.metadata = response.metadata;
         self.apply_response_shape_policy(classified)
     }
 
@@ -1196,7 +1197,7 @@ impl<T: Transport> Client<T> {
         let pdu = RequestPdu::set(self.inner.config.version(), request_id, vbs)?.into_raw();
         let response = self.send_request(pdu).await?;
         let mut classified = classify(RequestShape::Set(varbinds), response.pdu.varbinds, 0, 0);
-        classified.metadata.decode_anomalies = response.decode_anomalies;
+        classified.metadata = response.metadata;
         self.apply_response_shape_policy(classified)
     }
 
@@ -1377,16 +1378,14 @@ impl<T: Transport> Client<T> {
         let expected_varbinds = pdu.as_raw().varbinds().to_vec();
         let response = self.send_request(pdu.into_raw()).await?;
         if response.pdu.varbinds != expected_varbinds {
-            let metadata = ResponseMetadata::from_decode_anomalies(response.decode_anomalies);
+            let metadata = response.metadata;
             return Err(Error::MalformedResponse {
                 target: self.peer_addr(),
             }
             .boxed()
             .with_prior_response_metadata(&metadata));
         }
-        Ok(ResponseMetadata::from_decode_anomalies(
-            response.decode_anomalies,
-        ))
+        Ok(response.metadata)
     }
 
     /// GETBULK request (SNMPv2c/v3 only).
@@ -1471,9 +1470,7 @@ impl<T: Transport> Client<T> {
         let response = self.send_request(pdu).await?;
         Ok(BulkResponse {
             varbinds: response.pdu.varbinds,
-            metadata: ResponseMetadata {
-                decode_anomalies: response.decode_anomalies,
-            },
+            metadata: response.metadata,
         })
     }
 
@@ -1677,7 +1674,7 @@ mod tests {
         }
     }
 
-    impl Transport for TruncatingTransport {
+    impl RequestTransport for TruncatingTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             // Decode the sent request to extract the request_id.
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
@@ -1696,7 +1693,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -1727,7 +1725,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl Transport for ImmediateTimeoutTransport {
+    impl RequestTransport for ImmediateTimeoutTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -1740,7 +1738,8 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(Error::Timeout {
@@ -2051,7 +2050,7 @@ mod tests {
         }
     }
 
-    impl Transport for ScriptedResponseTransport {
+    impl RequestTransport for ScriptedResponseTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             self.pending.lock().unwrap().push_back(request_id);
@@ -2066,7 +2065,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -2110,7 +2110,7 @@ mod tests {
 
     fn response_shape_error(result: Result<FixedCardinalityResponse>) -> FixedCardinalityResponse {
         match *result.expect_err("strict policy must reject the scripted anomaly") {
-            Error::ResponseShape { response, .. } => response,
+            Error::ResponseShape { response, .. } => *response,
             ref other => panic!("expected ResponseShape, got {other:?}"),
         }
     }
@@ -2126,7 +2126,7 @@ mod tests {
         timeouts: Arc<Mutex<Vec<Duration>>>,
     }
 
-    impl Transport for SendTimeoutProbe {
+    impl RequestTransport for SendTimeoutProbe {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             panic!("client trap sending must use the bounded send contract")
         }
@@ -2144,7 +2144,8 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             panic!("send-timeout probe does not receive responses")
         }
@@ -2211,7 +2212,7 @@ mod tests {
         requests: Arc<AtomicUsize>,
     }
 
-    impl Transport for CapacityTransport {
+    impl RequestTransport for CapacityTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -2224,7 +2225,8 @@ mod tests {
         ) -> Result<U>
         where
             U: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<U>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<U>>
+                + Send,
         {
             self.requests.fetch_add(1, Ordering::Relaxed);
             Err(Error::Config("capacity boundary reached transport".into()).boxed())
@@ -2304,7 +2306,7 @@ mod tests {
         }
     }
 
-    impl Transport for CountingTransport {
+    impl RequestTransport for CountingTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             async { Ok(()) }
@@ -2318,7 +2320,8 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             panic!("receive must not be reached after encode failure")
         }
@@ -2499,7 +2502,7 @@ mod tests {
 
     #[test]
     fn client_config_validation() {
-        fn assert_config_error<T: Transport>(result: Result<Client<T>>) {
+        fn assert_config_error<T: RequestTransport>(result: Result<Client<T>>) {
             match result {
                 Err(error) => assert!(matches!(*error, Error::Config(_))),
                 Ok(_) => panic!("invalid client configuration was accepted"),
@@ -2684,7 +2687,10 @@ mod tests {
                     .send_inform(&trap_oid, 123, vec![additional.clone()])
                     .await
                     .expect_err("a malformed Inform acknowledgement must be rejected");
-                assert!(matches!(*error, Error::MalformedResponse { .. }));
+                assert!(matches!(
+                    error.exchange_source(),
+                    Error::MalformedResponse { .. }
+                ));
             }
         }
     }
@@ -3046,7 +3052,7 @@ mod tests {
         }
     }
 
-    impl Transport for TooBigTransport {
+    impl RequestTransport for TooBigTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             // Decode the message to count varbinds
@@ -3072,7 +3078,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -3152,7 +3159,7 @@ mod tests {
         }
     }
 
-    impl Transport for InformMetadataTransport {
+    impl RequestTransport for InformMetadataTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let message = CommunityMessage::decode(
                 Bytes::copy_from_slice(data),
@@ -3175,7 +3182,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -3449,7 +3457,7 @@ mod tests {
         }
     }
 
-    impl Transport for AdversarialTransport {
+    impl RequestTransport for AdversarialTransport {
         fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
             self.pending.lock().unwrap().push_back(request_id);
@@ -3464,7 +3472,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,

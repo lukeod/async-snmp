@@ -166,7 +166,7 @@ fn spawn_receiver(
             match receiver.recv().await {
                 Ok(received) => {
                     println!("[{label} receiver]");
-                    handle_notification(&received.notification, received.source);
+                    handle_notification(&received.notification, received.receive_info.peer_addr());
                     if let Some(outcome) = received.inform_ack {
                         println!("  Inform acknowledgement: {outcome:?}");
                     }

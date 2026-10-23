@@ -181,6 +181,8 @@ impl SecurityName {
 /// passed to a test handler.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
+    receive_info: Option<crate::ReceivedMessageInfo>,
+    pub(crate) endpoint_limits: crate::transport::EndpointLimits,
     /// Monotonic instant when the datagram was received.
     received_at: tokio::time::Instant,
 
@@ -301,6 +303,8 @@ impl RequestContext {
         };
         lifecycle.classify(pdu_type);
         Self {
+            receive_info: lifecycle.receive_info,
+            endpoint_limits: lifecycle.endpoint_limits,
             received_at: lifecycle.received_at,
             admitted_at: lifecycle.admitted_at,
             deadline: lifecycle.deadline,
@@ -361,6 +365,8 @@ impl RequestContext {
     ) -> Self {
         lifecycle.classify(pdu_type);
         Self {
+            receive_info: lifecycle.receive_info,
+            endpoint_limits: lifecycle.endpoint_limits,
             received_at: lifecycle.received_at,
             admitted_at: lifecycle.admitted_at,
             deadline: lifecycle.deadline,
@@ -382,10 +388,18 @@ impl RequestContext {
         }
     }
 
+    /// Transport metadata for a received request. Synthetic contexts have no reception.
+    pub const fn receive_info(&self) -> Option<&crate::ReceivedMessageInfo> {
+        self.receive_info.as_ref()
+    }
+
     /// Return the monotonic instant when the request datagram was received.
     #[must_use]
     pub const fn received_at(&self) -> tokio::time::Instant {
-        self.received_at
+        match self.receive_info {
+            Some(info) => info.received_at(),
+            None => self.received_at,
+        }
     }
 
     /// Return the monotonic instant when the request received an execution permit.
@@ -446,7 +460,10 @@ impl RequestContext {
     /// Return the source address of the request.
     #[must_use]
     pub const fn source(&self) -> SocketAddr {
-        self.source
+        match self.receive_info {
+            Some(info) => info.peer_addr(),
+            None => self.source,
+        }
     }
 
     /// Return the SNMP version.
@@ -545,6 +562,8 @@ pub(crate) enum RequestTaskPhase {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RequestLifecycle {
+    pub(crate) receive_info: Option<crate::ReceivedMessageInfo>,
+    pub(crate) endpoint_limits: crate::transport::EndpointLimits,
     pub(crate) received_at: tokio::time::Instant,
     pub(crate) admitted_at: tokio::time::Instant,
     pub(crate) deadline: Option<tokio::time::Instant>,
@@ -553,6 +572,16 @@ pub(crate) struct RequestLifecycle {
 }
 
 impl RequestLifecycle {
+    pub(crate) fn with_message(
+        mut self,
+        info: crate::ReceivedMessageInfo,
+        limits: crate::transport::EndpointLimits,
+    ) -> Self {
+        self.received_at = info.received_at();
+        self.receive_info = Some(info);
+        self.endpoint_limits = limits;
+        self
+    }
     pub(crate) fn new(
         received_at: tokio::time::Instant,
         admitted_at: tokio::time::Instant,
@@ -561,6 +590,8 @@ impl RequestLifecycle {
         phase: Arc<AtomicU8>,
     ) -> Self {
         Self {
+            receive_info: None,
+            endpoint_limits: crate::transport::EndpointLimits::UDP,
             received_at,
             admitted_at,
             deadline,

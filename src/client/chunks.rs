@@ -14,7 +14,7 @@ use crate::oid::Oid;
 #[cfg(test)]
 use crate::pdu::Pdu;
 use crate::pdu::{PduType, RequestPdu};
-use crate::transport::Transport;
+use crate::transport::RequestTransport;
 
 use super::response_shape::{RequestShape, classify};
 use super::{Client, DecodedResponse, FixedCardinalityOperation, FixedCardinalityResponse};
@@ -70,7 +70,7 @@ type PendingResponse = Pin<Box<dyn Future<Output = Result<DecodedResponse>> + Se
 /// source retains any recovered response metadata not already emitted with a
 /// successful leaf.
 #[must_use = "streams do nothing unless polled"]
-pub struct FixedCardinalityChunkStream<T: Transport> {
+pub struct FixedCardinalityChunkStream<T: RequestTransport> {
     client: Client<T>,
     oids: Arc<[Oid]>,
     operation: FixedCardinalityOperation,
@@ -83,7 +83,7 @@ pub struct FixedCardinalityChunkStream<T: Transport> {
     done: bool,
 }
 
-impl<T: Transport + 'static> FixedCardinalityChunkStream<T> {
+impl<T: RequestTransport + 'static> FixedCardinalityChunkStream<T> {
     pub(crate) fn new(
         client: &Client<T>,
         oids: &[Oid],
@@ -137,10 +137,10 @@ impl<T: Transport + 'static> FixedCardinalityChunkStream<T> {
                     {
                         let mut complete_response = response;
                         complete_response.response_extend(std::mem::replace(
-                            failed_response,
+                            failed_response.as_mut(),
                             FixedCardinalityResponse::empty(self.operation),
                         ));
-                        *failed_response = complete_response;
+                        **failed_response = complete_response;
                     } else {
                         source = source.with_prior_response_metadata(&response.metadata);
                     }
@@ -205,13 +205,11 @@ impl FixedCardinalityResponse {
         debug_assert_eq!(self.operation, response.operation);
         self.varbinds.extend(response.varbinds);
         self.anomalies.extend(response.anomalies);
-        self.metadata
-            .decode_anomalies
-            .extend(response.metadata.decode_anomalies);
+        self.metadata.append(response.metadata);
     }
 }
 
-impl<T: Transport + 'static> Stream for FixedCardinalityChunkStream<T> {
+impl<T: RequestTransport + 'static> Stream for FixedCardinalityChunkStream<T> {
     type Item = std::result::Result<FixedCardinalityChunk, FixedCardinalityChunkError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -262,10 +260,7 @@ impl<T: Transport + 'static> Stream for FixedCardinalityChunkStream<T> {
                         response_range.start,
                     );
                     response.metadata = std::mem::take(&mut this.deferred_metadata);
-                    response
-                        .metadata
-                        .decode_anomalies
-                        .extend(decoded.decode_anomalies);
+                    response.metadata.append(decoded.metadata);
 
                     if this.client.inner.config.response_shape_policy
                         == super::ResponseShapePolicy::Strict
@@ -273,7 +268,7 @@ impl<T: Transport + 'static> Stream for FixedCardinalityChunkStream<T> {
                     {
                         let source = Error::ResponseShape {
                             target: this.client.peer_addr(),
-                            response,
+                            response: Box::new(response),
                         }
                         .boxed();
                         let error = this.terminal_error(request_range, source);
@@ -476,7 +471,7 @@ mod tests {
         }
     }
 
-    impl Transport for ScriptTransport {
+    impl RequestTransport for ScriptTransport {
         fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             let message = CommunityMessage::decode(
@@ -510,7 +505,8 @@ mod tests {
         ) -> impl Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, std::net::SocketAddr) -> Result<crate::transport::Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
+                + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -949,6 +945,29 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_methods_collect_the_same_engine_results() {
+        fn assert_equivalent(a: FixedCardinalityResponse, b: FixedCardinalityResponse) {
+            assert_eq!(a.operation, b.operation);
+            assert_eq!(a.varbinds, b.varbinds);
+            assert_eq!(a.anomalies, b.anomalies);
+            assert_eq!(a.metadata.decode_anomalies, b.metadata.decode_anomalies);
+            assert_eq!(a.metadata.received_messages.len(), 2);
+            assert_eq!(b.metadata.received_messages.len(), 2);
+            for (a, b) in a
+                .metadata
+                .received_messages
+                .iter()
+                .zip(b.metadata.received_messages.iter())
+            {
+                assert_eq!(a.pdu_type, b.pdu_type);
+                assert_eq!(a.decode_anomalies, b.decode_anomalies);
+                assert_eq!(a.info.received_len(), b.info.received_len());
+                assert_ne!(
+                    a.info, b.info,
+                    "separate exchanges retain separate receipts"
+                );
+            }
+        }
+
         let oids = test_oids(4);
         let streamed_get_transport = ScriptTransport::new([Action::Echo, Action::Echo]);
         let streamed_get_client =
@@ -962,9 +981,9 @@ mod tests {
         let aggregate_get_transport = ScriptTransport::new([Action::Echo, Action::Echo]);
         let aggregate_get_client =
             client(aggregate_get_transport, 2, ResponseShapePolicy::Compatible);
-        assert_eq!(
+        assert_equivalent(
             aggregate_get_client.get_many(&oids).await.unwrap(),
-            streamed_get_response
+            streamed_get_response,
         );
 
         let streamed_transport = ScriptTransport::new([Action::Echo, Action::Echo]);
@@ -978,15 +997,15 @@ mod tests {
 
         let aggregate_transport = ScriptTransport::new([Action::Echo, Action::Echo]);
         let aggregate_client = client(aggregate_transport, 2, ResponseShapePolicy::Compatible);
-        assert_eq!(
+        assert_equivalent(
             aggregate_client.get_next_many(&oids).await.unwrap(),
-            streamed_response
+            streamed_response,
         );
 
         let failing_transport = ScriptTransport::new([Action::Echo, Action::Fail]);
         let failing_client = client(failing_transport, 2, ResponseShapePolicy::Compatible);
         let error = failing_client.get_many(&oids).await.unwrap_err();
-        assert!(matches!(*error, Error::Closed { .. }));
+        assert!(matches!(error.exchange_source(), Error::Closed { .. }));
     }
 
     #[tokio::test]
@@ -1052,7 +1071,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap_err();
-        assert!(matches!(*error, Error::Closed { .. }));
+        assert!(matches!(error.exchange_source(), Error::Closed { .. }));
         server.abort();
     }
 }

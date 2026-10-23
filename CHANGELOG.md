@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** The client exchange trait is named `RequestTransport`; validators
+  receive `ReceivedMessageInfo` alongside the original bytes. Notification results
+  and acceptance envelopes expose `receive_info` instead of `source`. Use
+  `receive_info.peer_addr()` for the sender and `receive_info.received_len()` for
+  the complete encoded SNMP input length, including accepted UDP suffixes.
+- `RequestContext::receive_info()` exposes the receiving endpoint and original
+  input length. Client response metadata retains received-message provenance
+  internally, including on errors through `Error::exchange_source()`.
+  `Error::ResponseShape::response` is boxed to keep the error representation bounded.
+
+
 ### Added
 
 - `HandlerError::drop_request` lets simulators suppress the entire SNMPv1/v2c/v3

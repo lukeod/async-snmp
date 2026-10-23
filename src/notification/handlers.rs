@@ -3,10 +3,12 @@
 //! This module contains the internal handlers for processing `SNMPv1`, v2c, and v3
 //! notification messages.
 
+#[cfg(test)]
 use std::net::SocketAddr;
 
 use bytes::Bytes;
 
+#[cfg(test)]
 use crate::udp_responder::DestinationMetadata;
 
 use crate::error::{Error, Result};
@@ -24,12 +26,27 @@ use super::{
 use crate::v3::DerivedKeys;
 
 impl super::NotificationReceiver {
-    /// Handle `SNMPv1` message.
+    #[cfg(test)]
     pub(super) async fn handle_v1(
         &self,
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<ReceivedNotification>> {
+        self.handle_v1_message(self.test_message(data, source, None))
+            .await
+    }
+
+    /// Handle `SNMPv1` message.
+    pub(super) async fn handle_v1_message(
+        &self,
+        message: crate::transport::ReceivedMessage,
+    ) -> Result<Option<ReceivedNotification>> {
+        let crate::transport::ReceivedMessage {
+            bytes: data,
+            info,
+            reply: _route,
+        } = message;
+        let source = info.peer_addr();
         let decoded =
             CommunityMessage::decode_with_target(data, Some(source), self.inner.decode_config)?;
         let decode_anomalies = decoded.anomalies;
@@ -52,13 +69,13 @@ impl super::NotificationReceiver {
                     trap,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(source, &notification) {
+                if !self.inner.accepts(info, &notification) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v1 trap");
                     return Ok(None);
                 }
                 Ok(Some(ReceivedNotification::trap(
                     notification,
-                    source,
+                    info,
                     NotificationWireIdentity {
                         version: crate::Version::V1,
                         request_id: None,
@@ -80,12 +97,27 @@ impl super::NotificationReceiver {
         self.handle_v2c_at(data, source, None).await
     }
 
+    #[cfg(test)]
     pub(super) async fn handle_v2c_at(
         &self,
         data: Bytes,
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
+        self.handle_v2c_message(self.test_message(data, source, response_source))
+            .await
+    }
+
+    pub(super) async fn handle_v2c_message(
+        &self,
+        message: crate::transport::ReceivedMessage,
+    ) -> Result<Option<ReceivedNotification>> {
+        let crate::transport::ReceivedMessage {
+            bytes: data,
+            info,
+            reply: route,
+        } = message;
+        let source = info.peer_addr();
         let decoded =
             CommunityMessage::decode_with_target(data, Some(source), self.inner.decode_config)?;
         let decode_anomalies = decoded.anomalies;
@@ -117,13 +149,13 @@ impl super::NotificationReceiver {
                     request_id: pdu.request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(source, &notification) {
+                if !self.inner.accepts(info, &notification) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c trap");
                     return Ok(None);
                 }
                 Ok(Some(ReceivedNotification::trap(
                     notification,
-                    source,
+                    info,
                     NotificationWireIdentity {
                         version: crate::Version::V2c,
                         request_id: Some(pdu.request_id),
@@ -143,7 +175,7 @@ impl super::NotificationReceiver {
                     request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(source, &notification) {
+                if !self.inner.accepts(info, &notification) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy dropped v2c Inform");
                     return Ok(None);
                 }
@@ -165,7 +197,7 @@ impl super::NotificationReceiver {
                             crate::Version::V2c,
                             pdu,
                             response,
-                            self.inner.max_message_size,
+                            self.inner.max_message_size.min(route.limits.send),
                             None,
                             &self.inner.snmp_silent_drops,
                             |response| {
@@ -183,10 +215,7 @@ impl super::NotificationReceiver {
                         let response_bytes = finalized
                             .into_bytes()
                             .expect("non-dropped response contains bytes");
-                        match self
-                            .send_response(&response_bytes, source, response_source)
-                            .await
-                        {
+                        match self.send_response(&response_bytes, &route).await {
                             Ok(()) => {
                                 tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
                                 InformAckOutcome::Sent
@@ -205,7 +234,7 @@ impl super::NotificationReceiver {
 
                 Ok(Some(ReceivedNotification::inform(
                     notification,
-                    source,
+                    info,
                     NotificationWireIdentity {
                         version: crate::Version::V2c,
                         request_id: Some(request_id),
@@ -234,12 +263,27 @@ impl super::NotificationReceiver {
         self.handle_v3_at(data, source, None).await
     }
 
+    #[cfg(test)]
     pub(super) async fn handle_v3_at(
         &self,
         data: Bytes,
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
+        self.handle_v3_message(self.test_message(data, source, response_source))
+            .await
+    }
+
+    pub(super) async fn handle_v3_message(
+        &self,
+        message: crate::transport::ReceivedMessage,
+    ) -> Result<Option<ReceivedNotification>> {
+        let crate::transport::ReceivedMessage {
+            bytes: data,
+            info,
+            reply: route,
+        } = message;
+        let source = info.peer_addr();
         let (our_boots, our_time) = super::unpack_boots_time(
             self.inner
                 .authoritative_snapshot
@@ -251,10 +295,10 @@ impl super::NotificationReceiver {
             engine_boots: our_boots,
             engine_time: our_time,
             authoritative_time: Some(&sample_authoritative_time),
-            local_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
-            accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
+            local_receive_capacity: route.limits.receive.advertised(),
+            accepted_receive_size: route.limits.receive.accepted(),
             decode_config: self.inner.decode_config,
-            outbound_limit: self.inner.max_message_size,
+            outbound_limit: self.inner.max_message_size.min(route.limits.send),
             usm_users: &self.inner.usm_users,
             stats: &self.inner.usm_stats,
             mpd: None,
@@ -271,7 +315,7 @@ impl super::NotificationReceiver {
                 // is diagnosable at the default log level.
                 tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.failure = ?failure }, "USM processing failed for inbound message");
                 if let Some(report) = report {
-                    if let Err(e) = self.send_response(&report, source, response_source).await {
+                    if let Err(e) = self.send_response(&report, &route).await {
                         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to send USM report");
                     } else {
                         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent USM report");
@@ -341,13 +385,13 @@ impl super::NotificationReceiver {
                     request_id: pdu.request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(source, &notification) {
+                if !self.inner.accepts(info, &notification) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
                     return Ok(None);
                 }
                 Ok(Some(ReceivedNotification::trap(
                     notification,
-                    source,
+                    info,
                     wire_identity,
                 )))
             }
@@ -366,7 +410,7 @@ impl super::NotificationReceiver {
                     request_id,
                     decode_anomalies,
                 };
-                if !self.inner.accepts(source, &notification) {
+                if !self.inner.accepts(info, &notification) {
                     tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.security_level = ?security_level, pdu_class = ?pdu_class }, "notification acceptance policy dropped v3 notification");
                     return Ok(None);
                 }
@@ -388,12 +432,13 @@ impl super::NotificationReceiver {
                             crate::Version::V3,
                             pdu,
                             response,
-                            self.inner.max_message_size,
+                            self.inner.max_message_size.min(route.limits.send),
                             Some(global_data.msg_max_size.as_usize()),
                             &self.inner.snmp_silent_drops,
                             |response_pdu| {
                                 build_v3_response(
                                     &self.inner,
+                                    route.limits.receive,
                                     global_data,
                                     usm_params,
                                     response_pdu,
@@ -414,10 +459,7 @@ impl super::NotificationReceiver {
                         let response_bytes = finalized
                             .into_bytes()
                             .expect("non-dropped response contains bytes");
-                        match self
-                            .send_response(&response_bytes, source, response_source)
-                            .await
-                        {
+                        match self.send_response(&response_bytes, &route).await {
                             Ok(()) => {
                                 tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "sent V3 Inform response");
                                 InformAckOutcome::Sent
@@ -436,7 +478,7 @@ impl super::NotificationReceiver {
 
                 Ok(Some(ReceivedNotification::inform(
                     notification,
-                    source,
+                    info,
                     wire_identity,
                     outcome,
                 )))
@@ -450,8 +492,10 @@ impl super::NotificationReceiver {
 ///
 /// The response uses the receiver's current authoritative engine tuple and
 /// echoes only the requester's username from the incoming USM parameters.
+#[allow(clippy::too_many_arguments)]
 fn build_v3_response(
     inner: &ReceiverInner,
+    receive_limits: crate::ReceiveLimits,
     incoming: &MsgGlobalData,
     incoming_usm: &UsmSecurityParams,
     response_pdu: Pdu,
@@ -475,7 +519,7 @@ fn build_v3_response(
         // RFC 3412 Section 6.3: msgMaxSize advertises this receiver's own
         // receive capacity, not the sender's echoed value. The receiver has no
         // configurable limit, so advertise the default UDP receive capacity.
-        crate::UDP_RECEIVE_LIMITS.advertised(),
+        receive_limits.advertised(),
         incoming.msg_flags.security_level,
         response_usm,
         context_engine_id,

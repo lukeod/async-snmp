@@ -90,6 +90,14 @@ struct ExpectedContext<'a> {
 
 fn assert_context(context: &RequestContext, expected: ExpectedContext<'_>) {
     assert_eq!(context.source(), expected.source);
+    let info = context
+        .receive_info()
+        .expect("socket request has receive metadata");
+    assert_eq!(info.peer_addr(), expected.source);
+    assert_eq!(info.received_at(), context.received_at());
+    assert_eq!(info.transport(), async_snmp::TransportKind::Udp);
+    assert!(info.received_len() > 0);
+    assert!(info.session_id().is_none());
     assert_eq!(context.version(), expected.version);
     assert_eq!(context.security_model(), expected.security_model);
     assert_eq!(context.security_name().as_bytes(), expected.security_name);

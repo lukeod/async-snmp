@@ -5,7 +5,7 @@
 mod common;
 
 use async_snmp::message::{ScopedPdu, SecurityLevel, V3Message, V3MessageData};
-use async_snmp::transport::Transport;
+use async_snmp::transport::RequestTransport;
 use async_snmp::v3::{AuthProtocol, DiscoveredEngine, PrivProtocol, ReportStatus, report_oids};
 use async_snmp::{
     Auth, Client, ClientConfig, DecodeConfig, EngineCache, ErrorStatus, MasterKeys, ReceiveLimits,
@@ -3263,7 +3263,7 @@ async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
     );
     let log = transport.log();
 
-    let (actual, _) = Transport::request_with(
+    let (actual, _) = RequestTransport::request_with(
         &transport,
         &request,
         async_snmp::RequestRegistration::v3(
@@ -3294,7 +3294,7 @@ async fn report_builder_uses_reporting_engine_context() {
         .encode()
         .unwrap();
 
-    let (response, _) = Transport::request_with(
+    let (response, _) = RequestTransport::request_with(
         &transport,
         &request,
         async_snmp::RequestRegistration::v3(

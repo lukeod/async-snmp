@@ -12,7 +12,7 @@ use crate::message::{
     decode_scoped_pdu,
 };
 use crate::pdu::{Pdu, PduType};
-use crate::transport::{Candidate, CorrelationWindow, RequestRegistration, Transport};
+use crate::transport::{Candidate, CorrelationWindow, RequestRegistration, RequestTransport};
 use crate::v3::{
     EngineCache, EngineState, ReportStatus, TimelinessCandidateOutcome,
     TimelinessPublicationOutcome, UsmSecurityParams, auth::verify_message, classify_report,
@@ -59,6 +59,7 @@ struct PacketLocalEngineTime {
 }
 
 struct ValidatedV3Response {
+    info: crate::ReceivedMessageInfo,
     usm: UsmSecurityParams,
     received_level: SecurityLevel,
     scoped_pdu: ScopedPdu,
@@ -118,7 +119,7 @@ fn check_and_update_engine_timeliness(
 }
 
 // V3-specific Client implementation
-impl<T: Transport> Client<T> {
+impl<T: RequestTransport> Client<T> {
     /// Ensure engine ID is discovered for V3 operations.
     #[instrument(level = "debug", skip(self), fields(snmp.target = %self.peer_addr()))]
     pub(super) async fn ensure_engine_discovered(&self) -> Result<ResponseMetadata> {
@@ -506,7 +507,8 @@ impl<T: Transport> Client<T> {
             let discovery_exchange =
                 self.inner
                     .transport
-                    .request_with(&discovery_data, registration, |data, source| {
+                    .request_with(&discovery_data, registration, |data, info| {
+                        let source = info.peer_addr();
                         let Ok(decoded) = RawV3Message::decode_bounded_with_target(
                             data,
                             self.inner.transport.receive_limits().accepted(),
@@ -515,7 +517,7 @@ impl<T: Transport> Client<T> {
                         ) else {
                             return Ok(Candidate::Reject);
                         };
-                        match self.validate_discovery_response(decoded, &msg_id_window, source) {
+                        match self.validate_discovery_response(decoded, &msg_id_window, info) {
                             Ok(response) => Ok(Candidate::Accept(response)),
                             Err(_) => Ok(Candidate::Reject),
                         }
@@ -582,8 +584,9 @@ impl<T: Transport> Client<T> {
         &self,
         decoded: crate::message::DecodeOutcome<RawV3Message>,
         msg_id_window: &BTreeSet<i32>,
-        source: std::net::SocketAddr,
+        info: crate::ReceivedMessageInfo,
     ) -> Result<DiscoveryResponse> {
+        let source = info.peer_addr();
         let malformed = || Error::MalformedResponse { target: source }.boxed();
         let response = decoded.value;
 
@@ -654,7 +657,11 @@ impl<T: Transport> Client<T> {
 
         Ok(DiscoveryResponse {
             engine_state,
-            metadata: ResponseMetadata::from_decode_anomalies(decode_anomalies),
+            metadata: ResponseMetadata::from_received(
+                info,
+                scoped_pdu.pdu.pdu_type(),
+                decode_anomalies,
+            ),
         })
     }
 
@@ -936,12 +943,13 @@ impl<T: Transport> Client<T> {
     fn validate_v3_candidate(
         &self,
         response_data: Bytes,
-        source: SocketAddr,
+        info: crate::ReceivedMessageInfo,
         msg_ids: &BTreeSet<i32>,
         request: &EncodedV3Request,
         expected_pdu_id: i32,
         expected_level: SecurityLevel,
     ) -> Result<Candidate<ValidatedV3Response>> {
+        let source = info.peer_addr();
         let Ok(decoded) = RawV3Message::decode_bounded_with_target(
             response_data.clone(),
             self.inner.transport.receive_limits().accepted(),
@@ -1062,6 +1070,7 @@ impl<T: Transport> Client<T> {
         }
 
         Ok(Candidate::Accept(ValidatedV3Response {
+            info,
             usm,
             received_level,
             scoped_pdu,
@@ -1166,20 +1175,19 @@ impl<T: Transport> Client<T> {
             // Send request and wait for response as a single unit so reliable
             // transports own their stream lock for the whole exchange.
             let exchange_result = {
-                let request_exchange = self.inner.transport.request_with(
-                    &request.data,
-                    registration,
-                    |data, source| {
-                        self.validate_v3_candidate(
-                            data,
-                            source,
-                            &msg_id_window,
-                            &request,
-                            pdu.request_id,
-                            security_level,
-                        )
-                    },
-                );
+                let request_exchange =
+                    self.inner
+                        .transport
+                        .request_with(&request.data, registration, |data, info| {
+                            self.validate_v3_candidate(
+                                data,
+                                info,
+                                &msg_id_window,
+                                &request,
+                                pdu.request_id,
+                                security_level,
+                            )
+                        });
                 tokio::pin!(request_exchange);
                 let exchange_result = tokio::select! {
                     biased;
@@ -1212,8 +1220,11 @@ impl<T: Transport> Client<T> {
                     let response_usm = validated.usm;
                     let received_level = validated.received_level;
                     let scoped_pdu = validated.scoped_pdu;
-                    let message_metadata =
-                        ResponseMetadata::from_decode_anomalies(validated.decode_anomalies);
+                    let message_metadata = ResponseMetadata::from_received(
+                        validated.info,
+                        scoped_pdu.pdu.pdu_type(),
+                        validated.decode_anomalies,
+                    );
                     exchange_metadata.append(message_metadata);
 
                     // Publish candidate timeliness state only after every deep
@@ -1459,7 +1470,7 @@ impl<T: Transport> Client<T> {
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                     return Ok(DecodedResponse {
                         pdu: response_pdu,
-                        decode_anomalies: exchange_metadata.decode_anomalies,
+                        metadata: exchange_metadata,
                     });
                 }
                 Err(e) if matches!(*e, Error::Timeout { .. }) => {
@@ -1597,7 +1608,7 @@ mod tests {
     use crate::client::ClientConfig;
     use crate::message::V3MessageData;
     use crate::oid;
-    use crate::transport::Transport;
+    use crate::transport::RequestTransport;
     use crate::value::Value;
     use crate::varbind::VarBind;
     use bytes::Bytes;
@@ -1626,7 +1637,7 @@ mod tests {
         }
     }
 
-    impl Transport for TestTransport {
+    impl RequestTransport for TestTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
@@ -1640,7 +1651,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Err(Error::Config(
@@ -1924,10 +1935,13 @@ mod tests {
             .err()
             .expect("changed engine generation must fail");
 
-        assert!(matches!(*err, Error::MalformedResponse { .. }));
+        assert!(matches!(
+            err.exchange_source(),
+            Error::MalformedResponse { .. }
+        ));
     }
 
-    /// Transport that times out on the first recv call, then returns a valid
+    /// RequestTransport that times out on the first recv call, then returns a valid
     /// discovery response on subsequent calls.
     #[derive(Clone)]
     struct RetryTestTransport {
@@ -1971,7 +1985,7 @@ mod tests {
         }
     }
 
-    impl Transport for RetryTestTransport {
+    impl RequestTransport for RetryTestTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
@@ -1984,7 +1998,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -2034,7 +2048,7 @@ mod tests {
         }
     }
 
-    impl Transport for DiscoveryLimitTransport {
+    impl RequestTransport for DiscoveryLimitTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
@@ -2048,7 +2062,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -2129,7 +2143,7 @@ mod tests {
         release: Arc<tokio::sync::Semaphore>,
     }
 
-    impl Transport for GatedDiscoveryTransport {
+    impl RequestTransport for GatedDiscoveryTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -2142,7 +2156,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.notify_waiters();
@@ -2154,7 +2168,16 @@ mod tests {
             let mut response =
                 build_discovery_response(b"shared-engine", registration.request_id()).to_vec();
             response.push(0xff);
-            match validate(Bytes::from(response), self.peer)? {
+            let response = Bytes::from(response);
+            let info = crate::ReceivedMessageInfo::udp(
+                crate::EndpointId::new(),
+                self.local_addr(),
+                self.peer,
+                None,
+                tokio::time::Instant::now(),
+                response.len(),
+            );
+            match validate(response, info)? {
                 Candidate::Accept(response) => Ok(response),
                 Candidate::Reject => Err(Error::MalformedResponse { target: self.peer }.boxed()),
             }
@@ -2410,9 +2433,9 @@ mod tests {
 
         let error = client.send_v3_and_recv(oversized).await.unwrap_err();
         assert!(matches!(
-            *error,
+            error.exchange_source(),
             Error::OutboundMessageTooLarge { limit, .. }
-                if limit == crate::MESSAGE_SIZE_MINIMUM
+                if *limit == crate::MESSAGE_SIZE_MINIMUM
         ));
         assert_eq!(
             sends.load(Ordering::Relaxed),
@@ -2425,7 +2448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discovery_fails_when_all_retries_timeout() {
-        // Transport that always times out
+        // RequestTransport that always times out
         #[derive(Clone)]
         struct AlwaysTimeoutTransport {
             peer: SocketAddr,
@@ -2448,7 +2471,7 @@ mod tests {
             }
         }
 
-        impl Transport for AlwaysTimeoutTransport {
+        impl RequestTransport for AlwaysTimeoutTransport {
             fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
                 ready(Ok(()))
             }
@@ -2460,7 +2483,7 @@ mod tests {
             ) -> impl std::future::Future<Output = Result<T>> + Send
             where
                 T: Send,
-                F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+                F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
             {
                 crate::transport::request_with_scripted(
                     self,
@@ -2517,7 +2540,7 @@ mod tests {
             calls: Arc<AtomicUsize>,
         }
 
-        impl Transport for PendingDiscoveryTransport {
+        impl RequestTransport for PendingDiscoveryTransport {
             async fn send(&self, _data: &[u8]) -> Result<()> {
                 Ok(())
             }
@@ -2530,7 +2553,7 @@ mod tests {
             ) -> Result<T>
             where
                 T: Send,
-                F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+                F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
             {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 std::future::pending().await
@@ -2576,7 +2599,7 @@ mod tests {
         release: Arc<tokio::sync::Semaphore>,
     }
 
-    impl Transport for SingleFlightFailureTransport {
+    impl RequestTransport for SingleFlightFailureTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -2589,7 +2612,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.notify_waiters();
@@ -2781,7 +2804,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl Transport for ImmediateTimeoutTransport {
+    impl RequestTransport for ImmediateTimeoutTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -2794,7 +2817,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(Error::Timeout {
@@ -2920,7 +2943,7 @@ mod tests {
         release: Arc<tokio::sync::Semaphore>,
     }
 
-    impl Transport for StructuredFailureTransport {
+    impl RequestTransport for StructuredFailureTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -2933,7 +2956,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.notify_waiters();
@@ -3023,7 +3046,7 @@ mod response_validation_tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
-    /// Transport that answers every request with one canned response.
+    /// RequestTransport that answers every request with one canned response.
     #[derive(Clone)]
     struct CannedTransport {
         peer: SocketAddr,
@@ -3054,7 +3077,7 @@ mod response_validation_tests {
         }
     }
 
-    impl Transport for CannedTransport {
+    impl RequestTransport for CannedTransport {
         fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
@@ -3076,7 +3099,7 @@ mod response_validation_tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -3124,7 +3147,7 @@ mod response_validation_tests {
         }
     }
 
-    impl Transport for DeferredUpdateTransport {
+    impl RequestTransport for DeferredUpdateTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -3137,11 +3160,19 @@ mod response_validation_tests {
         ) -> Result<U>
         where
             U: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<U>> + Send,
         {
             let response_number = self.response_number.fetch_add(1, Ordering::SeqCst);
             let response = build_deferred_update_response(data, response_number);
-            match validate(response, self.peer)? {
+            let info = crate::ReceivedMessageInfo::udp(
+                crate::EndpointId::new(),
+                self.local_addr(),
+                self.peer,
+                None,
+                tokio::time::Instant::now(),
+                response.len(),
+            );
+            match validate(response, info)? {
                 Candidate::Accept(value) => Ok(value),
                 Candidate::Reject => Err(Error::Timeout {
                     target: self.peer,
@@ -3184,7 +3215,7 @@ mod response_validation_tests {
         }
     }
 
-    impl Transport for RediscoveryRaceTransport {
+    impl RequestTransport for RediscoveryRaceTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             Ok(())
         }
@@ -3197,7 +3228,7 @@ mod response_validation_tests {
         ) -> Result<U>
         where
             U: Send,
-            F: FnMut(Bytes, SocketAddr) -> Result<Candidate<U>> + Send,
+            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<U>> + Send,
         {
             let request =
                 V3Message::decode(Bytes::copy_from_slice(data), crate::DecodeConfig::default())
@@ -3214,7 +3245,15 @@ mod response_validation_tests {
             } else {
                 build_rediscovery_race_authenticated_response(request)
             };
-            match validate(response, self.peer)? {
+            let info = crate::ReceivedMessageInfo::udp(
+                crate::EndpointId::new(),
+                self.local_addr(),
+                self.peer,
+                None,
+                tokio::time::Instant::now(),
+                response.len(),
+            );
+            match validate(response, info)? {
                 Candidate::Accept(value) => Ok(value),
                 Candidate::Reject => Err(Error::Timeout {
                     target: self.peer,
@@ -3536,7 +3575,7 @@ mod response_validation_tests {
             .expect("advancement-complete waiter dropped");
 
         let err = stale_request.await.unwrap().unwrap_err();
-        assert!(matches!(*err, Error::Auth { .. }));
+        assert!(matches!(err.exchange_source(), Error::Auth { .. }));
         let engine = client.inner.engine.read().unwrap();
         let trusted = engine.as_ref().unwrap().state.authenticated_time().unwrap();
         assert_eq!(trusted.latest_received_time(), 1400);
@@ -3640,7 +3679,10 @@ mod response_validation_tests {
         rediscovery.expect("rediscovery should install the replacement engine");
 
         let err = stale_request.await.unwrap().unwrap_err();
-        assert!(matches!(*err, Error::MalformedResponse { .. }));
+        assert!(matches!(
+            err.exchange_source(),
+            Error::MalformedResponse { .. }
+        ));
         let engine = client.inner.engine.read().unwrap();
         let state = &engine.as_ref().unwrap().state;
         assert_eq!(state.engine_id(), REPLACEMENT_ENGINE_ID);

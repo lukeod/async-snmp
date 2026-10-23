@@ -1,4 +1,4 @@
-use super::{Candidate, RequestRegistration, TcpTransport, Transport, UdpHandle};
+use super::{Candidate, RequestRegistration, RequestTransport, TcpTransport, UdpHandle};
 use crate::error::Result;
 use crate::message_size::ReceiveLimits;
 use bytes::Bytes;
@@ -49,7 +49,7 @@ impl From<TcpTransport> for BuiltinTransport {
     }
 }
 
-impl Transport for BuiltinTransport {
+impl RequestTransport for BuiltinTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
         match self {
             Self::Udp(transport) => transport.send(data).await,
@@ -72,7 +72,7 @@ impl Transport for BuiltinTransport {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
     {
         match self {
             Self::Udp(transport) => transport.request_with(data, registration, validate).await,
@@ -172,7 +172,12 @@ mod tests {
                 Ok(Candidate::Accept((data, source)))
             });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
-        assert_eq!(result.unwrap().0.as_ref(), response(4));
+        let (data, info) = result.unwrap();
+        assert_eq!(data.as_ref(), response(4));
+        assert_eq!(info.received_len(), data.len());
+        assert_eq!(info.local_addr(), expected_local);
+        assert_eq!(info.peer_addr(), server_addr);
+        assert_eq!(info.session_id().is_some(), transport.is_reliable());
 
         let server_exchange = async {
             let (length, source) = server.recv_from(&mut buffer).await.unwrap();
@@ -222,7 +227,12 @@ mod tests {
                 Ok(Candidate::Accept((data, source)))
             });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
-        assert_eq!(result.unwrap().0.as_ref(), response(4));
+        let (data, info) = result.unwrap();
+        assert_eq!(data.as_ref(), response(4));
+        assert_eq!(info.received_len(), data.len());
+        assert_eq!(info.local_addr(), expected_local);
+        assert_eq!(info.peer_addr(), server_addr);
+        assert_eq!(info.session_id().is_some(), transport.is_reliable());
 
         let server_exchange = async {
             assert_eq!(read_frame(&mut server).await, request(5));
@@ -296,7 +306,8 @@ mod tests {
         RequestRegistration::test_unchecked(request_id, TEST_TIMEOUT)
     }
 
-    fn reject_first() -> impl FnMut(Bytes, SocketAddr) -> Result<Candidate<Bytes>> + Send {
+    fn reject_first()
+    -> impl FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<Bytes>> + Send {
         let mut candidates = 0;
         move |data, _| {
             candidates += 1;
@@ -310,7 +321,7 @@ mod tests {
 
     fn reject_first_matching(
         expected: u8,
-    ) -> impl FnMut(Bytes, SocketAddr) -> Result<Candidate<u8>> + Send {
+    ) -> impl FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<u8>> + Send {
         let mut candidates = 0;
         move |_data, _| {
             candidates += 1;

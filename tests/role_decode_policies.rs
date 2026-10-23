@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use async_snmp::{
     Auth, BoundedStringKind, Candidate, ClientBuilder, DecodeAnomaly, DecodeConfig, Error,
-    Notification, NotificationReceiver, Oid, RequestRegistration, Retry, Transport, Value,
+    Notification, NotificationReceiver, Oid, RequestRegistration, RequestTransport, Retry, Value,
 };
 use bytes::Bytes;
 use tokio::net::UdpSocket;
@@ -32,7 +32,7 @@ impl CommunityPolicyTransport {
     }
 }
 
-impl Transport for CommunityPolicyTransport {
+impl RequestTransport for CommunityPolicyTransport {
     async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
         let request = async_snmp::message::CommunityMessage::decode(
             Bytes::copy_from_slice(data),
@@ -62,7 +62,7 @@ impl Transport for CommunityPolicyTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, SocketAddr) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
     {
         let peer = self.peer_addr();
         let started = tokio::time::Instant::now();
@@ -81,7 +81,15 @@ impl Transport for CommunityPolicyTransport {
             {
                 continue;
             }
-            if let Candidate::Accept(value) = validate(data, peer)? {
+            let info = async_snmp::ReceivedMessageInfo::udp(
+                async_snmp::EndpointId::new(),
+                self.local_addr(),
+                peer,
+                None,
+                tokio::time::Instant::now(),
+                data.len(),
+            );
+            if let Candidate::Accept(value) = validate(data, info)? {
                 return Ok(value);
             }
         }

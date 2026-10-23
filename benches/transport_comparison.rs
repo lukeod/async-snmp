@@ -246,7 +246,7 @@ fn print_stats(stats: &BenchmarkStats) {
     );
 }
 
-async fn run_benchmark<T: async_snmp::Transport + 'static>(
+async fn run_benchmark<T: async_snmp::RequestTransport + 'static>(
     clients: &[Client<T>],
     concurrency_per_client: usize,
 ) -> BenchmarkStats {

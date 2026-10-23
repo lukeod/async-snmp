@@ -16,7 +16,7 @@ use crate::client::walk::WalkOptions;
 use crate::client::{Auth, ClientConfig};
 use crate::error::{ConstructionStage, Error, Result};
 use crate::transport::{
-    CommunityResponsePolicy, TcpTransport, Transport, UdpControl, UdpHandle, UdpTransport,
+    CommunityResponsePolicy, RequestTransport, TcpTransport, UdpControl, UdpHandle, UdpTransport,
 };
 use crate::v3::{AuthoritativeEngine, DesSaltState, EngineCache};
 
@@ -107,7 +107,7 @@ impl From<SocketAddr> for Target {
 /// This builder deliberately has no target or built-in transport settings.
 /// Call [`target`](Self::target) to configure library-created UDP or TCP
 /// transport, or [`build_with_transport`](Self::build_with_transport) when the
-/// caller already owns any type that implements [`Transport`]. Shared
+/// caller already owns any type that implements [`RequestTransport`]. Shared
 /// [`UdpTransport`] socket owners are the exception: call
 /// [`TargetClientBuilder::build_with`] to resolve a target and derive a
 /// per-target [`UdpHandle`].
@@ -506,7 +506,7 @@ impl ClientBuilder {
 
     /// Build a client around an already-created transport implementation.
     ///
-    /// This accepts any [`Transport`], including a [`TcpTransport`], a
+    /// This accepts any [`RequestTransport`], including a [`TcpTransport`], a
     /// per-target [`UdpHandle`], a [`BuiltinTransport`](crate::BuiltinTransport),
     /// or a custom transport.
     /// The supplied transport owns its peer address, source-validation policy,
@@ -514,7 +514,7 @@ impl ClientBuilder {
     /// target resolution or socket creation.
     ///
     /// A shared [`UdpTransport`] is a socket owner rather than a per-target
-    /// [`Transport`]. Use [`TargetClientBuilder::build_with`] to resolve the
+    /// [`RequestTransport`]. Use [`TargetClientBuilder::build_with`] to resolve the
     /// target and create its [`UdpHandle`] on that shared socket.
     ///
     /// # Errors
@@ -535,7 +535,7 @@ impl ClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn build_with_transport<T: Transport>(self, transport: T) -> Result<Client<T>> {
+    pub fn build_with_transport<T: RequestTransport>(self, transport: T) -> Result<Client<T>> {
         self.build_inner(transport)
     }
 
@@ -546,7 +546,7 @@ impl ClientBuilder {
     }
 
     /// Build the client with the given transport.
-    fn build_inner<T: Transport>(self, transport: T) -> Result<Client<T>> {
+    fn build_inner<T: RequestTransport>(self, transport: T) -> Result<Client<T>> {
         let config = self.config;
 
         if let Some(cache) = self.engine_cache {
@@ -873,7 +873,7 @@ impl TargetClientBuilder {
     /// builder's target, and creates a
     /// [`UdpHandle`] for the first compatible address. All clients built this
     /// way share one socket and one recv loop. For an arbitrary already-created
-    /// type that implements [`Transport`], use
+    /// type that implements [`RequestTransport`], use
     /// [`ClientBuilder::build_with_transport`] instead.
     ///
     /// # Errors
@@ -1494,7 +1494,7 @@ mod tests {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl Transport for CustomTransport {
+    impl RequestTransport for CustomTransport {
         async fn send(&self, _data: &[u8]) -> Result<()> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1509,7 +1509,10 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(bytes::Bytes, std::net::SocketAddr) -> Result<crate::transport::Candidate<T>>
+            F: FnMut(
+                    bytes::Bytes,
+                    crate::ReceivedMessageInfo,
+                ) -> Result<crate::transport::Candidate<T>>
                 + Send,
         {
             self.calls

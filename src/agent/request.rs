@@ -65,6 +65,7 @@ impl Agent {
         community_version: CommunityVersion,
         lifecycle: RequestLifecycle,
     ) -> Result<Option<Bytes>> {
+        let limits = lifecycle.endpoint_limits;
         let version = Version::from(community_version);
         let decoded = CommunityMessage::decode_with_target(
             data,
@@ -132,7 +133,7 @@ impl Agent {
                 version,
                 pdu,
                 pdu.to_response(version)?,
-                self.inner.state.max_message_size,
+                self.inner.state.max_message_size.min(limits.send),
                 None,
                 &self.inner.state.snmp_silent_drops,
                 encode,
@@ -162,7 +163,7 @@ impl Agent {
             version,
             pdu,
             response_pdu,
-            self.inner.state.max_message_size,
+            self.inner.state.max_message_size.min(limits.send),
             None,
             &self.inner.state.snmp_silent_drops,
             encode,
@@ -186,6 +187,7 @@ impl Agent {
         source: SocketAddr,
         lifecycle: RequestLifecycle,
     ) -> Result<Option<Bytes>> {
+        let limits = lifecycle.endpoint_limits;
         let state = &self.inner.state;
         let (engine_boots, engine_time) = state.authoritative_boots_time()?;
         let usm_ctx = V3LocalContext {
@@ -193,10 +195,10 @@ impl Agent {
             engine_boots,
             engine_time,
             authoritative_time: None,
-            local_receive_capacity: state.local_receive_capacity,
-            accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
+            local_receive_capacity: limits.receive.advertised(),
+            accepted_receive_size: limits.receive.accepted(),
             decode_config: state.decode_config,
-            outbound_limit: state.max_message_size,
+            outbound_limit: state.max_message_size.min(limits.send),
             usm_users: &self.inner.usm_users,
             stats: &state.usm_stats,
             mpd: Some(MpdCounters {
@@ -260,6 +262,7 @@ impl Agent {
             // rejected value.
             return self
                 .finalize_v3_response(
+                    limits,
                     global_data,
                     usm_params,
                     pdu,
@@ -291,6 +294,7 @@ impl Agent {
         let preflight_success = if pdu.pdu_type() == PduType::SetRequest {
             let success_pdu = pdu.to_response(Version::V3)?;
             match self.finalize_v3_response(
+                limits,
                 global_data,
                 usm_params,
                 pdu,
@@ -328,6 +332,7 @@ impl Agent {
 
         // Build and exactly finalize non-SET responses and SET error responses.
         self.finalize_v3_response(
+            limits,
             global_data,
             usm_params,
             pdu,

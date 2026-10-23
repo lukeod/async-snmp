@@ -89,7 +89,7 @@ impl RegistrationOwner {
 }
 
 struct ResponseSlot {
-    responses: VecDeque<(Bytes, SocketAddr)>,
+    responses: VecDeque<(Bytes, crate::ReceivedMessageInfo)>,
     owner: Arc<RegistrationOwner>,
     /// Configured target, used by conditional community rewrite policy.
     target_source: SocketAddr,
@@ -418,7 +418,15 @@ impl UdpCore {
     /// `false` if there was no matching pending request.
     #[cfg(test)]
     pub fn deliver(&self, request_id: i32, data: Bytes, source: SocketAddr) -> bool {
-        self.deliver_with_envelope(request_id, None, data, source)
+        let info = crate::ReceivedMessageInfo::udp(
+            crate::EndpointId::new(),
+            source,
+            source,
+            None,
+            Instant::now(),
+            data.len(),
+        );
+        self.deliver_with_envelope(request_id, None, data, info)
     }
 
     pub(crate) fn deliver_parsed(
@@ -426,9 +434,9 @@ impl UdpCore {
         request_id: i32,
         envelope: CorrelationEnvelope,
         data: Bytes,
-        source: SocketAddr,
+        info: crate::ReceivedMessageInfo,
     ) -> bool {
-        self.deliver_with_envelope(request_id, Some(envelope), data, source)
+        self.deliver_with_envelope(request_id, Some(envelope), data, info)
     }
 
     fn deliver_with_envelope(
@@ -436,7 +444,7 @@ impl UdpCore {
         request_id: i32,
         envelope: Option<CorrelationEnvelope>,
         data: Bytes,
-        source: SocketAddr,
+        info: crate::ReceivedMessageInfo,
     ) -> bool {
         let (target_id, owner) = {
             let pending = self.shard(request_id).pending.lock().unwrap();
@@ -446,14 +454,7 @@ impl UdpCore {
                 None => (request_id, None),
             }
         };
-        self.deliver_to(
-            target_id,
-            owner.as_ref(),
-            request_id,
-            envelope,
-            data,
-            source,
-        )
+        self.deliver_to(target_id, owner.as_ref(), request_id, envelope, data, info)
     }
 
     fn deliver_to(
@@ -463,8 +464,9 @@ impl UdpCore {
         request_id: i32,
         envelope: Option<CorrelationEnvelope>,
         data: Bytes,
-        source: SocketAddr,
+        info: crate::ReceivedMessageInfo,
     ) -> bool {
+        let source = info.peer_addr();
         let shard = self.shard(target_id);
         let mut pending = shard.pending.lock().unwrap();
 
@@ -519,11 +521,9 @@ impl UdpCore {
                 }
                 ResponseIdentity::Match => {}
             }
-            if slot
-                .responses
-                .iter()
-                .any(|(parked, parked_source)| *parked_source == source && *parked == data)
-                || slot.responses.len() >= MAX_PARKED_CANDIDATES
+            if slot.responses.iter().any(|(parked, parked_source)| {
+                parked_source.peer_addr() == source && *parked == data
+            }) || slot.responses.len() >= MAX_PARKED_CANDIDATES
             {
                 // Ignore exact duplicates and bound per-exchange memory if
                 // candidates arrive faster than
@@ -534,7 +534,7 @@ impl UdpCore {
                     .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
-            slot.responses.push_back((data, source));
+            slot.responses.push_back((data, info));
             let notify = slot.owner.notify.clone();
             drop(pending);
             notify.notify_one();
@@ -564,7 +564,7 @@ impl UdpCore {
         mut validate: F,
     ) -> Result<T>
     where
-        F: FnMut(Bytes, SocketAddr) -> Result<Candidate<T>>,
+        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>>,
     {
         let request_id = registration.primary;
         let shard = self.shard(request_id);
@@ -612,8 +612,9 @@ impl UdpCore {
                 }
             };
 
-            if let Some((data, source)) = response {
-                match validate(data, source)? {
+            if let Some((data, info)) = response {
+                let source = info.peer_addr();
+                match validate(data, info)? {
                     Candidate::Accept(value) => {
                         self.remove_owned(request_id, &registration.owner);
                         return Ok(value);
@@ -646,7 +647,7 @@ impl UdpCore {
         target: SocketAddr,
     ) -> Result<(Bytes, SocketAddr)> {
         self.wait_for_response_with(registration, target, |data, source| {
-            Ok(Candidate::Accept((data, source)))
+            Ok(Candidate::Accept((data, source.peer_addr())))
         })
         .await
     }
@@ -1077,7 +1078,7 @@ mod tests {
         let error = core
             .wait_for_response_with(&registration, target, |data, source| {
                 validations += 1;
-                Ok(Candidate::Accept((data, source)))
+                Ok(Candidate::Accept((data, source.peer_addr())))
             })
             .await
             .unwrap_err();

@@ -24,17 +24,45 @@ pub enum FixedCardinalityOperation {
 /// Metadata retained from decoding one or more network responses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResponseMetadata {
+    pub(crate) received_messages: Vec<ReceivedResponse>,
     /// Accepted BER/value deviations in response and decode order.
     pub decode_anomalies: Vec<crate::DecodeAnomaly>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceivedResponse {
+    pub(crate) info: crate::ReceivedMessageInfo,
+    pub(crate) pdu_type: crate::PduType,
+    pub(crate) decode_anomalies: Vec<crate::DecodeAnomaly>,
+}
+
 impl ResponseMetadata {
-    pub(crate) fn append(&mut self, mut other: Self) {
-        self.decode_anomalies.append(&mut other.decode_anomalies);
+    pub(crate) fn from_received(
+        info: crate::ReceivedMessageInfo,
+        pdu_type: crate::PduType,
+        decode_anomalies: Vec<crate::DecodeAnomaly>,
+    ) -> Self {
+        Self {
+            received_messages: vec![ReceivedResponse {
+                info,
+                pdu_type,
+                decode_anomalies: decode_anomalies.clone(),
+            }],
+            decode_anomalies,
+        }
     }
 
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.decode_anomalies.append(&mut other.decode_anomalies);
+        self.received_messages.append(&mut other.received_messages);
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_decode_anomalies(decode_anomalies: Vec<crate::DecodeAnomaly>) -> Self {
-        Self { decode_anomalies }
+        Self {
+            decode_anomalies,
+            received_messages: Vec::new(),
+        }
     }
 }
 

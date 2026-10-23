@@ -15,6 +15,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_v3_response(
         &self,
+        limits: crate::transport::EndpointLimits,
         incoming: &MsgGlobalData,
         incoming_usm: &UsmSecurityParams,
         request_pdu: &Pdu,
@@ -49,14 +50,14 @@ impl Agent {
             crate::Version::V3,
             request_pdu,
             response_pdu,
-            self.inner.state.max_message_size,
+            self.inner.state.max_message_size.min(limits.send),
             Some(incoming.msg_max_size.as_usize()),
             &self.inner.state.snmp_silent_drops,
             |response_pdu| {
                 encode_v3_response(
                     response_pdu,
                     incoming.msg_id,
-                    self.inner.state.local_receive_capacity,
+                    limits.receive.advertised(),
                     security_level,
                     response_usm.clone(),
                     context_engine_id.clone(),
@@ -88,6 +89,7 @@ impl Agent {
             Vec::new(),
         );
         self.finalize_v3_response(
+            crate::transport::EndpointLimits::UDP,
             incoming,
             incoming_usm,
             &request,
@@ -390,7 +392,7 @@ mod tests {
         let mut msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
         msg.msg_max_size = crate::MessageSize::new(4096).unwrap();
         assert_eq!(agent.inner.state.max_message_size, 1400);
-        assert_eq!(agent.inner.state.local_receive_capacity, 65507);
+        assert_eq!(agent.inner.state.engine_receive_capacity, 65507);
         let usm = dummy_usm();
 
         let result = agent
@@ -412,5 +414,48 @@ mod tests {
             decoded.global_data.msg_max_size, 65507,
             "response must advertise local receive capacity, not the peer value or response cap"
         );
+
+        let request = dummy_response_pdu();
+        let limits = crate::transport::EndpointLimits {
+            receive: crate::ReceiveLimits::tcp(8192).unwrap(),
+            send: 1024,
+        };
+        let result = agent
+            .finalize_v3_response(
+                limits,
+                &msg,
+                &usm,
+                &request,
+                dummy_response_pdu(),
+                Bytes::from_static(b"engine"),
+                Bytes::new(),
+                None,
+            )
+            .unwrap()
+            .expect("route response fits");
+        assert!(result.len() <= limits.send);
+        let decoded = V3Message::decode(result, crate::DecodeConfig::default())
+            .unwrap()
+            .value;
+        assert_eq!(decoded.global_data.msg_max_size, 8192);
+        assert_eq!(agent.inner.state.engine_receive_capacity, 65507);
+
+        let limits = crate::transport::EndpointLimits { send: 1, ..limits };
+        let result = agent
+            .finalize_v3_response(
+                limits,
+                &msg,
+                &usm,
+                &request,
+                dummy_response_pdu(),
+                Bytes::from_static(b"engine"),
+                Bytes::new(),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            crate::response_finalizer::FinalizedResponse::Dropped
+        ));
     }
 }

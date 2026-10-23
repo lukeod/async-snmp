@@ -974,8 +974,8 @@ async fn agent_inform_sinks_share_source_endpoint() {
         .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 2), 1000, vec![])
         .await;
     assert!(outcome.all_succeeded());
-    let first_source = first.await.unwrap().source;
-    let second_source = second.await.unwrap().source;
+    let first_source = first.await.unwrap().receive_info.peer_addr();
+    let second_source = second.await.unwrap().receive_info.peer_addr();
     assert_eq!(first_source, second_source);
     assert_ne!(first_source.port(), agent.local_addr().port());
 }

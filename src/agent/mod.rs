@@ -494,7 +494,7 @@ struct ValidatedAgentBuilder {
     usm: ValidatedAuthoritativeUsm,
     handlers: Vec<RegisteredHandler>,
     max_message_size: usize,
-    local_receive_capacity: MessageSize,
+    engine_receive_capacity: MessageSize,
     decode_config: crate::DecodeConfig,
     concurrency_limit: Option<Arc<Semaphore>>,
     recv_buffer_size: Option<usize>,
@@ -1301,7 +1301,7 @@ impl AgentBuilder {
             #[cfg(test)]
             authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
             max_message_size: config.max_message_size,
-            local_receive_capacity: config.local_receive_capacity,
+            engine_receive_capacity: config.engine_receive_capacity,
             decode_config: config.decode_config,
             snmp_in_asn_parse_errs: AtomicU32::new(0),
             snmp_invalid_msgs: AtomicU32::new(0),
@@ -1346,7 +1346,8 @@ impl AgentBuilder {
         let agent = Agent {
             inner: Arc::new(AgentInner {
                 socket: Arc::new(socket),
-                udp_responder,
+                udp_responder: Arc::new(udp_responder),
+                endpoint_id: crate::EndpointId::new(),
                 local_addr,
                 communities: config.communities,
                 usm_users,
@@ -1435,10 +1436,10 @@ impl AgentBuilder {
             }
         }
 
-        let local_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
-        if self.max_message_size > local_receive_capacity.as_usize() {
+        let engine_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
+        if self.max_message_size > engine_receive_capacity.as_usize() {
             return Err(Error::Config(
-                format!("max_message_size must not exceed UDP capacity {local_receive_capacity}")
+                format!("max_message_size must not exceed UDP capacity {engine_receive_capacity}")
                     .into(),
             )
             .boxed());
@@ -1534,7 +1535,7 @@ impl AgentBuilder {
             usm,
             handlers: self.handlers,
             max_message_size: self.max_message_size,
-            local_receive_capacity,
+            engine_receive_capacity,
             decode_config: self.decode_config,
             concurrency_limit,
             recv_buffer_size: self.recv_buffer_size,
@@ -1680,8 +1681,8 @@ pub(crate) struct AgentState {
     authoritative_elapsed_override: std::sync::atomic::AtomicU64,
     /// Configured upper bound for outbound response messages.
     pub(crate) max_message_size: usize,
-    /// Wire-valid `msgMaxSize` advertising this agent's UDP receive capacity.
-    pub(crate) local_receive_capacity: MessageSize,
+    /// Engine MIB receive capacity: the minimum across configured transports.
+    pub(crate) engine_receive_capacity: MessageSize,
     /// Inbound decode configuration snapshot.
     pub(crate) decode_config: crate::DecodeConfig,
     /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
@@ -1785,7 +1786,8 @@ impl AgentState {
 /// Inner state shared across agent clones.
 pub(crate) struct AgentInner {
     pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) udp_responder: UdpResponder,
+    pub(crate) udp_responder: Arc<UdpResponder>,
+    pub(crate) endpoint_id: crate::EndpointId,
     pub(crate) local_addr: SocketAddr,
     pub(crate) communities: Vec<crate::Community>,
     pub(crate) usm_users: HashMap<Bytes, UsmUser>,
@@ -2254,6 +2256,15 @@ impl Agent {
             if data.len() > UDP_RECEIVE_LIMITS.advertised().as_usize() {
                 tracing::debug!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, received_size = data.len(), advertised_size = UDP_RECEIVE_LIMITS.advertised().as_usize() }, "accepted bounded UDP datagram above advertised capacity");
             }
+            let message = crate::transport::ReceivedMessage::udp(
+                data,
+                self.inner.endpoint_id,
+                self.inner.socket.clone(),
+                self.inner.udp_responder.clone(),
+                recv_meta,
+                received_at,
+                crate::transport::EndpointLimits::UDP,
+            );
             let agent = self.clone();
 
             let permit = if let Some(ref sem) = self.inner.concurrency_limit {
@@ -2287,17 +2298,18 @@ impl Agent {
                 deadline,
                 request_cancel.clone(),
                 phase.clone(),
-            );
+            )
+            .with_message(message.info, message.reply.limits);
             request_tasks.spawn(phase, async move {
                 let _permit = permit;
 
                 let request = async {
                     match agent
-                        .handle_request_with_lifecycle(data, recv_meta.source, lifecycle)
+                        .handle_request_with_lifecycle(message.bytes, message.info.peer_addr(), lifecycle)
                         .await
                     {
                         Ok(Some(response_bytes)) => {
-                            if let Err(e) = agent.send_response(&response_bytes, &recv_meta).await {
+                            if let Err(e) = agent.send_response(&response_bytes, &message.reply).await {
                                 tracing::warn!(target: "async_snmp::agent", { snmp.source = %recv_meta.source, error = %e }, "failed to send response");
                             }
                         }
@@ -2380,7 +2392,7 @@ impl Agent {
     async fn send_response(
         &self,
         data: &[u8],
-        recv_meta: &ReceivedDatagram,
+        route: &crate::transport::ReplyRoute,
     ) -> std::io::Result<()> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.response_send_timeout)
@@ -2402,7 +2414,7 @@ impl Agent {
                 if let Some(gate) = &response_send_gate {
                     gate.acquire().await.expect("test send gate remains open").forget();
                 }
-                self.inner.udp_responder.reply(&self.inner.socket, data, recv_meta).await
+                route.send(data).await
             } => result,
         }
     }
@@ -2529,7 +2541,11 @@ impl Agent {
     /// the agent's configured limit and the client's advertised `msgMaxSize`
     /// (v3). v1/v2c requests carry no `msg_max_size`, so the agent limit applies.
     fn effective_max_size(&self, ctx: &RequestContext) -> usize {
-        let agent_max = self.inner.state.max_message_size;
+        let agent_max = self
+            .inner
+            .state
+            .max_message_size
+            .min(ctx.endpoint_limits.send);
         match ctx.msg_max_size() {
             Some(client_max) => agent_max.min(client_max),
             None => agent_max,
@@ -6944,7 +6960,7 @@ mod tests {
             .unwrap();
         assert_eq!(agent.inner.state.max_message_size, 0);
         assert_eq!(
-            agent.inner.state.local_receive_capacity,
+            agent.inner.state.engine_receive_capacity,
             UDP_RECEIVE_LIMITS.advertised()
         );
     }
