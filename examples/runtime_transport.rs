@@ -5,7 +5,7 @@
 //! `cargo run --example runtime_transport -- tcp 127.0.0.1:161`
 
 use async_snmp::{
-    Auth, BuiltinTransport, ClientBuilder, RuntimeClient, TcpTransport, UdpTransport, oid,
+    Auth, BuiltinTransport, ClientBuilder, RuntimeClient, TcpTransport, UdpEndpoint, oid,
 };
 use std::net::SocketAddr;
 
@@ -20,14 +20,17 @@ async fn main() -> async_snmp::Result<()> {
 
     // Apply transport-specific settings before erasing the concrete type into
     // BuiltinTransport. The client builder preserves these settings.
+    let mut udp_service = None;
     let transport = match protocol.as_str() {
         "udp" => {
-            let endpoint = UdpTransport::builder()
+            let endpoint = UdpEndpoint::builder()
                 .bind("0.0.0.0:0")
                 .max_message_size(8192)
-                .build()
+                .spawn()
                 .await?;
-            BuiltinTransport::from(endpoint.handle(target)?)
+            let peer = endpoint.handle(target)?;
+            udp_service = Some(endpoint);
+            BuiltinTransport::from(peer)
         }
         "tcp" => BuiltinTransport::from(
             TcpTransport::builder()
@@ -42,5 +45,8 @@ async fn main() -> async_snmp::Result<()> {
         ClientBuilder::new(Auth::v2c("public")).build_with_transport(transport)?;
     let response = client.get(&oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)).await?;
     println!("{response:?}");
+    if let Some(service) = udp_service {
+        service.shutdown().await?;
+    }
     Ok(())
 }

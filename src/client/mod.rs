@@ -63,7 +63,7 @@ impl Client<UdpHandle> {
     /// Snapshot cumulative statistics for this client's UDP endpoint.
     ///
     /// Dedicated clients observe their private endpoint. Clients built from a
-    /// shared [`UdpTransport`](crate::UdpTransport) observe the same counters as
+    /// shared [`UdpEndpoint`](crate::UdpEndpoint) observe the same counters as
     /// every other client and handle using that endpoint.
     #[must_use]
     pub fn stats(&self) -> UdpStats {
@@ -1961,7 +1961,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_protocol_metadata_is_transport_independent() {
-        let udp_transport = crate::UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let udp_transport = crate::UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
         let udp_handle = udp_transport
             .handle("127.0.0.1:161".parse().unwrap())
             .unwrap();

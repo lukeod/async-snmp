@@ -1,8 +1,8 @@
-//! Transport comparison benchmark: per-client vs shared `UdpTransport`
+//! Transport comparison benchmark: per-client vs shared `UdpEndpoint`
 //!
 //! This benchmark compares performance characteristics between two usage patterns:
-//! - Per-client: Each client creates its own `UdpTransport` via `.connect()`
-//! - Shared: Multiple clients share a single `UdpTransport` via handles
+//! - Per-client: Each client creates its own `UdpEndpoint` via `.connect()`
+//! - Shared: Multiple clients share a single `UdpEndpoint` via handles
 //!
 //! Metrics measured:
 //! - Throughput (requests/sec)
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use async_snmp::{Auth, Client, Retry, UdpHandle, UdpTransport, oid};
+use async_snmp::{Auth, Client, Retry, UdpEndpoint, UdpHandle, oid};
 use futures::future::join_all;
 use hdrhistogram::Histogram;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -94,7 +94,7 @@ async fn run_comparison(num_containers: usize, concurrency_per_target: usize) {
     let baseline_fds = count_fds();
 
     // Warmup and benchmark per-client transport
-    println!("\n[Per-Client Transport (implicit UdpTransport per client)]");
+    println!("\n[Per-Client Transport (implicit UdpEndpoint per client)]");
     let non_shared_result = benchmark_non_shared(&targets, concurrency_per_target).await;
 
     let non_shared_fds = count_fds();
@@ -108,7 +108,7 @@ async fn run_comparison(num_containers: usize, concurrency_per_target: usize) {
     println!("  FDs after cleanup: {after_non_shared_fds}");
 
     // Warmup and benchmark shared transport
-    println!("\n[Shared Transport (explicit UdpTransport with handles)]");
+    println!("\n[Shared Transport (explicit UdpEndpoint with handles)]");
     let shared_result = benchmark_shared(&targets, concurrency_per_target).await;
 
     let shared_fds = count_fds();
@@ -134,6 +134,7 @@ async fn run_comparison(num_containers: usize, concurrency_per_target: usize) {
 }
 
 struct BenchmarkResult<C> {
+    _service: Option<async_snmp::RunningUdpEndpoint>,
     stats: BenchmarkStats,
     #[allow(dead_code)]
     clients: Vec<C>,
@@ -163,7 +164,7 @@ async fn benchmark_non_shared(
     targets: &[SocketAddr],
     concurrency: usize,
 ) -> BenchmarkResult<Client> {
-    // Create one client per target (each creates its own UdpTransport via .connect())
+    // Create one client per target (each creates its own UdpEndpoint via .connect())
     let mut clients = Vec::with_capacity(targets.len());
     for target in targets {
         let client = Client::builder(target.to_string(), Auth::v2c(COMMUNITY))
@@ -186,7 +187,11 @@ async fn benchmark_non_shared(
 
     print_stats(&stats);
 
-    BenchmarkResult { stats, clients }
+    BenchmarkResult {
+        stats,
+        clients,
+        _service: None,
+    }
 }
 
 async fn benchmark_shared(
@@ -194,9 +199,9 @@ async fn benchmark_shared(
     concurrency: usize,
 ) -> BenchmarkResult<Client<UdpHandle>> {
     // Create shared transport
-    let shared = UdpTransport::builder()
+    let shared = UdpEndpoint::builder()
         .bind("0.0.0.0:0")
-        .build()
+        .spawn()
         .await
         .expect("Failed to bind shared transport");
 
@@ -223,7 +228,11 @@ async fn benchmark_shared(
 
     print_stats(&stats);
 
-    BenchmarkResult { stats, clients }
+    BenchmarkResult {
+        stats,
+        clients,
+        _service: Some(shared),
+    }
 }
 
 #[allow(clippy::cast_precision_loss, reason = "approximation is fine here")]

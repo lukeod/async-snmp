@@ -126,7 +126,7 @@ impl RequestTransport for BuiltinTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{TcpOptions, UdpTransport};
+    use crate::transport::{TcpOptions, UdpEndpoint};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
@@ -138,10 +138,10 @@ mod tests {
     async fn udp_delegates_every_transport_method() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
-        let endpoint = UdpTransport::builder()
+        let endpoint = UdpEndpoint::builder()
             .bind("127.0.0.1:0")
             .max_message_size(4096)
-            .build()
+            .spawn()
             .await
             .unwrap();
         let handle = endpoint.handle(server_addr).unwrap();

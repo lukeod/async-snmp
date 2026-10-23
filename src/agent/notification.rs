@@ -26,7 +26,7 @@ use crate::handler::SecurityModel;
 use crate::message::{CommunityMessage, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::NotificationPdu;
-use crate::transport::{UdpHandle, UdpTransport};
+use crate::transport::{UdpEndpoint, UdpHandle};
 use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -228,8 +228,8 @@ pub(crate) struct TrapSink {
 
 /// Agent-owned Inform endpoints, shared by every sink in an address family.
 pub(crate) struct InformTransportPool {
-    ipv4: AsyncMutex<Option<UdpTransport>>,
-    ipv6: AsyncMutex<Option<UdpTransport>>,
+    ipv4: AsyncMutex<Option<crate::transport::RunningUdpEndpoint>>,
+    ipv6: AsyncMutex<Option<crate::transport::RunningUdpEndpoint>>,
 }
 
 impl InformTransportPool {
@@ -248,7 +248,7 @@ impl InformTransportPool {
         };
         let mut transport = slot.lock().await;
         if transport.is_none() {
-            *transport = Some(UdpTransport::bind(bind_addr).await?);
+            *transport = Some(UdpEndpoint::spawn(bind_addr).await?);
         }
         transport
             .as_ref()

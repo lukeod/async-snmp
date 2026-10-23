@@ -24,7 +24,7 @@ use std::time::Duration;
 use async_snmp::DesSaltState;
 #[cfg(all(feature = "crypto-rustcrypto", unix))]
 use async_snmp::PersistedDesSaltState;
-use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, Retry, UdpTransport, Value, oid};
+use async_snmp::{Auth, AuthProtocol, Client, PrivProtocol, Retry, UdpEndpoint, Value, oid};
 #[cfg(all(feature = "crypto-rustcrypto", unix))]
 use fs2::FileExt;
 #[cfg(all(feature = "crypto-rustcrypto", unix))]
@@ -903,9 +903,9 @@ async fn shared_transport_multiple_clients() {
     } else {
         "0.0.0.0:0"
     };
-    let shared = UdpTransport::builder()
+    let shared = UdpEndpoint::builder()
         .bind(bind_addr)
-        .build()
+        .spawn()
         .await
         .expect("Failed to bind shared transport");
 

@@ -19,7 +19,7 @@ use async_snmp::{
     ConstructionStage, DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT,
     DecodeConfig, DecodeError, DecodeErrorKind, DecodeErrorOrigin, Error, ErrorIndex, ErrorKind,
     ErrorStatus, GetBulkPdu, Oid, Pdu, PduBody, RequestPdu, RequestRegistration, ResponsePdu,
-    StandardPduType, Target, UdpControl, UdpHandle, UdpStats, UdpTransport, Value, ValueKind,
+    StandardPduType, Target, UdpControl, UdpEndpoint, UdpHandle, UdpStats, Value, ValueKind,
     VarBind, Version, WalkAbortReason,
 };
 use bytes::Bytes;
@@ -435,7 +435,7 @@ fn request_registration_exposes_read_only_normalized_metadata() {
 
 #[tokio::test]
 async fn udp_handle_construction_is_publicly_fallible() {
-    let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let transport = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
     let handle: async_snmp::Result<UdpHandle> = transport.handle("127.0.0.1:161".parse().unwrap());
     let handle = handle.unwrap();
     let control: UdpControl = transport.control();

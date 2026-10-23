@@ -1,11 +1,11 @@
 //! Share a transport for high-throughput polling
 //!
-//! One `UdpTransport` polls many targets. All clients share one UDP socket and
+//! One `UdpEndpoint` polls many targets. All clients share one UDP socket and
 //! use protocol-aware response correlation, which reduces file descriptor use.
 //!
 //! The example covers these concepts:
 //!
-//! - `UdpTransport` shares one UDP socket across clients.
+//! - `UdpEndpoint` shares one UDP socket across clients.
 //! - `TargetClientBuilder::build_with` resolves each target and creates its
 //!   `UdpHandle` from the existing socket.
 //! - SNMPv1 and SNMPv2c responses correlate by request ID, version, and
@@ -25,7 +25,7 @@
 //! docker run -d -p 11161:161/udp async-snmp-test:latest
 //! ```
 
-use async_snmp::transport::UdpTransport;
+use async_snmp::transport::UdpEndpoint;
 use async_snmp::{
     Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol, ResponseShapePolicy, Retry,
     oid,
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Basic shared transport ---\n");
 
     // Create a shared transport bound to an ephemeral port.
-    let shared = UdpTransport::bind("0.0.0.0:0").await?;
+    let shared = UdpEndpoint::spawn("0.0.0.0:0").await?;
 
     println!("Shared transport bound to {}", shared.local_addr());
 
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Concurrent polling ---\n");
 
     // Poll multiple OIDs concurrently through the shared transport.
-    let shared = UdpTransport::bind("0.0.0.0:0").await?;
+    let shared = UdpEndpoint::spawn("0.0.0.0:0").await?;
 
     let oids = [
         oid!(1, 3, 6, 1, 2, 1, 1, 1, 0), // sysDescr
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Master keys derived (one-time cost)");
     println!("Engine cache created for sharing\n");
 
-    let shared_v3 = UdpTransport::bind("0.0.0.0:0").await?;
+    let shared_v3 = UdpEndpoint::spawn("0.0.0.0:0").await?;
 
     // Poll multiple OIDs over SNMPv3 with shared resources.
     let v3_oids = [
@@ -191,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("192.0.2.2", 161), // TEST-NET-1 (unreachable)
     ];
 
-    let shared = UdpTransport::bind("0.0.0.0:0").await?;
+    let shared = UdpEndpoint::spawn("0.0.0.0:0").await?;
 
     let mut futures = FuturesUnordered::new();
 

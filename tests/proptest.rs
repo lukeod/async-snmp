@@ -12,7 +12,7 @@ use async_snmp::oid::Oid;
 use async_snmp::pdu::{
     GenericTrap, OutboundPdu, Pdu, PduBody, PduType, StandardPduType, TrapV1Notification, TrapV1Pdu,
 };
-use async_snmp::transport::UdpTransport;
+use async_snmp::transport::UdpEndpoint;
 use async_snmp::value::Value;
 use async_snmp::varbind::VarBind;
 use async_snmp::{Auth, Client};
@@ -30,7 +30,7 @@ use tokio::runtime::Runtime;
 struct SharedEnv {
     runtime: Runtime,
     agent: TestAgent,
-    transport: UdpTransport,
+    transport: async_snmp::transport::RunningUdpEndpoint,
     case_counter: AtomicU32,
 }
 
@@ -39,7 +39,7 @@ impl SharedEnv {
         let runtime = Runtime::new().expect("failed to create runtime");
         let agent = runtime.block_on(TestAgent::new());
         let transport = runtime
-            .block_on(UdpTransport::bind("0.0.0.0:0"))
+            .block_on(UdpEndpoint::spawn("0.0.0.0:0"))
             .expect("bind transport");
         Self {
             runtime,

@@ -2,7 +2,7 @@
 //!
 //! The module provides the [`RequestTransport`] trait and these implementations:
 //!
-//! - [`UdpTransport`] + [`UdpHandle`] - UDP socket with per-target handles
+//! - [`UdpEndpoint`] + [`UdpHandle`] - UDP socket with per-target handles
 //! - [`TcpTransport`] - TCP stream with BER framing
 //! - [`BuiltinTransport`] - runtime selection between library-maintained transports
 //!
@@ -11,7 +11,7 @@
 //! | Scenario | Approach |
 //! |----------|---------|
 //! | Single target or few targets | [`Client::builder().connect()`](crate::Client::builder) - each client gets its own socket |
-//! | Many UDP targets from one process | Pass a preconstructed [`UdpTransport`] socket owner to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) - each target gets a handle on one socket and receive loop |
+//! | Many UDP targets from one process | Pass a preconstructed [`UdpEndpoint`] socket owner to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) - each target gets a handle on one socket and receive loop |
 //! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::TargetClientBuilder::connect_tcp) |
 //! | Preconstruct or implement any client transport | Pass the [`RequestTransport`] implementation to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) without a target |
 //! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) |

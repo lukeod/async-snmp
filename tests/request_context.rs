@@ -8,7 +8,7 @@ use std::convert::Infallible;
 
 use async_snmp::{
     Agent, Auth, BoxFuture, Client, GetNextResult, GetResult, HandlerResult, MibHandler, Oid,
-    PduType, RequestContext, SecurityLevel, SecurityModel, SecurityName, UdpTransport, Value,
+    PduType, RequestContext, SecurityLevel, SecurityModel, SecurityName, UdpEndpoint, Value,
     Version, oid,
 };
 use bytes::Bytes;
@@ -68,7 +68,7 @@ impl RunningAgent {
     }
 }
 
-async fn capture_get(agent: &RunningAgent, transport: &UdpTransport, auth: Auth) -> RequestContext {
+async fn capture_get(agent: &RunningAgent, transport: &UdpEndpoint, auth: Auth) -> RequestContext {
     let client = Client::builder(agent.address, auth)
         .build_with(transport)
         .await
@@ -164,7 +164,7 @@ async fn agent_captures_complete_v1_and_v2c_contexts() {
         cancel,
         task,
     };
-    let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let transport = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
     let source = transport.local_addr();
 
     let v1 = capture_get(&agent, &transport, Auth::v1(V1_COMMUNITY)).await;
@@ -266,10 +266,10 @@ async fn agent_captures_complete_v3_contexts_at_every_security_level() {
         cancel,
         task,
     };
-    let transport = UdpTransport::builder()
+    let transport = UdpEndpoint::builder()
         .bind("127.0.0.1:0")
         .receive_capacity(CLIENT_MAX_MESSAGE_SIZE)
-        .build()
+        .spawn()
         .await
         .unwrap();
     let source = transport.local_addr();

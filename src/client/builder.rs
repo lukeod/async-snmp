@@ -16,7 +16,7 @@ use crate::client::walk::WalkOptions;
 use crate::client::{Auth, ClientConfig};
 use crate::error::{ConstructionStage, Error, Result};
 use crate::transport::{
-    CommunityResponsePolicy, RequestTransport, TcpTransport, UdpControl, UdpHandle, UdpTransport,
+    CommunityResponsePolicy, RequestTransport, TcpTransport, UdpControl, UdpEndpoint, UdpHandle,
 };
 use crate::v3::{AuthoritativeEngine, DesSaltState, EngineCache};
 
@@ -108,7 +108,7 @@ impl From<SocketAddr> for Target {
 /// Call [`target`](Self::target) to configure library-created UDP or TCP
 /// transport, or [`build_with_transport`](Self::build_with_transport) when the
 /// caller already owns any type that implements [`RequestTransport`]. Shared
-/// [`UdpTransport`] socket owners are the exception: call
+/// [`UdpEndpoint`] socket owners are the exception: call
 /// [`TargetClientBuilder::build_with`] to resolve a target and derive a
 /// per-target [`UdpHandle`].
 ///
@@ -513,7 +513,7 @@ impl ClientBuilder {
     /// construction, and any construction deadline. This path performs no
     /// target resolution or socket creation.
     ///
-    /// A shared [`UdpTransport`] is a socket owner rather than a per-target
+    /// A shared [`UdpEndpoint`] is a socket owner rather than a per-target
     /// [`RequestTransport`]. Use [`TargetClientBuilder::build_with`] to resolve the
     /// target and create its [`UdpHandle`] on that shared socket.
     ///
@@ -742,7 +742,7 @@ impl TargetClientBuilder {
     }
 
     fn select_udp_handle(
-        transport: &UdpTransport,
+        transport: &UdpEndpoint,
         target: &Target,
         candidates: &[SocketAddr],
     ) -> Result<UdpHandle> {
@@ -765,7 +765,9 @@ impl TargetClientBuilder {
     /// Connect via UDP (default).
     ///
     /// Create a UDP socket for this client. Each call allocates a
-    /// separate socket and recv loop.
+    /// separate socket and starts its receiver. The task result is retained by
+    /// the endpoint; `connect_with_control` provides status and joining. For
+    /// caller-owned execution, prepare a `UdpEndpoint` and use `build_with`.
     ///
     /// To share a single socket across multiple clients, use
     /// [`build_with()`](Self::build_with) instead.
@@ -796,6 +798,9 @@ impl TargetClientBuilder {
     ///
     /// The returned [`UdpControl`] controls the whole endpoint. Shutdown is
     /// irreversible and affects the returned client and all of its clones.
+    /// After requesting shutdown, call `UdpControl::join` to observe the driver
+    /// result. The endpoint retains its task; controls keep it alive after the
+    /// final client is dropped.
     /// Use [`connect()`](Self::connect) when drop-managed cleanup is sufficient.
     ///
     /// # Errors
@@ -831,7 +836,11 @@ impl TargetClientBuilder {
                             .boxed()
                     })
             },
-            |bind_addr| async move { UdpTransport::bind(bind_addr).await },
+            |bind_addr| async move {
+                UdpEndpoint::spawn(bind_addr)
+                    .await
+                    .map(|running| running.into_managed())
+            },
         )
         .await
     }
@@ -845,7 +854,7 @@ impl TargetClientBuilder {
         R: FnOnce(String, u16) -> RFut,
         RFut: Future<Output = Result<Vec<SocketAddr>>>,
         B: FnOnce(&'static str) -> BFut,
-        BFut: Future<Output = Result<UdpTransport>>,
+        BFut: Future<Output = Result<UdpEndpoint>>,
     {
         self.client.validate_and_precompute()?;
         let deadline = ConstructionDeadline::new(&self.target, self.construction_timeout)?;
@@ -869,7 +878,7 @@ impl TargetClientBuilder {
 
     /// Build a per-target client handle on a shared UDP transport.
     ///
-    /// Accepts a preconstructed [`UdpTransport`] socket owner, resolves the
+    /// Accepts a preconstructed [`UdpEndpoint`] socket owner, resolves the
     /// builder's target, and creates a
     /// [`UdpHandle`] for the first compatible address. All clients built this
     /// way share one socket and one recv loop. For an arbitrary already-created
@@ -885,10 +894,10 @@ impl TargetClientBuilder {
     ///
     /// ```rust,no_run
     /// use async_snmp::{Auth, ClientBuilder};
-    /// use async_snmp::transport::UdpTransport;
+    /// use async_snmp::transport::UdpEndpoint;
     ///
     /// # async fn example() -> async_snmp::Result<()> {
-    /// let transport = UdpTransport::bind("0.0.0.0:0").await?;
+    /// let transport = UdpEndpoint::spawn("0.0.0.0:0").await?;
     ///
     /// let client1 = async_snmp::Client::builder("192.168.1.1:161", Auth::v2c("public"))
     ///     .build_with(&transport).await?;
@@ -897,7 +906,7 @@ impl TargetClientBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn build_with(self, transport: &UdpTransport) -> Result<Client<UdpHandle>> {
+    pub async fn build_with(self, transport: &UdpEndpoint) -> Result<Client<UdpHandle>> {
         self.build_with_resolver(transport, |host, port| async move {
             tokio::net::lookup_host((host.as_str(), port))
                 .await
@@ -912,7 +921,7 @@ impl TargetClientBuilder {
 
     async fn build_with_resolver<R, RFut>(
         mut self,
-        transport: &UdpTransport,
+        transport: &UdpEndpoint,
         resolver: R,
     ) -> Result<Client<UdpHandle>>
     where
@@ -1377,7 +1386,7 @@ mod tests {
             .construction_timeout(Duration::from_secs(2))
             .connect_with_control_using(
                 |_, _| async { panic!("numeric targets must not invoke the resolver") },
-                |_| std::future::pending::<Result<UdpTransport>>(),
+                |_| std::future::pending::<Result<UdpEndpoint>>(),
             );
         let task = tokio::spawn(future);
         tokio::task::yield_now().await;
@@ -1599,7 +1608,7 @@ mod tests {
         let custom = CustomTransport {
             calls: Arc::clone(&calls),
         };
-        let endpoint = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
         let peer = "127.0.0.1:161".parse().unwrap();
 
         for (auth, expected) in [
@@ -1660,7 +1669,7 @@ mod tests {
             .unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        let endpoint = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
         let error = ClientBuilder::new(Auth::v2c("public"))
             .target("unresolvable.invalid")
             .build_with_resolver(&endpoint, |_, _| async {
@@ -1825,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_candidate_selection_skips_incompatible_family() {
-        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
         let target = Target::from("example.invalid");
         let candidates = [
             "[2001:db8::1]:161".parse().unwrap(),
@@ -1839,7 +1848,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_candidate_selection_rejects_ipv6_only_for_ipv4_transport() {
-        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
         let target = Target::from("example.invalid");
         let candidates = [
             "[2001:db8::1]:161".parse().unwrap(),
@@ -1855,7 +1864,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_candidate_selection_normalizes_mapped_ipv6() {
-        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
         let target = Target::from("example.invalid");
         let candidates = ["[::ffff:192.0.2.1]:161".parse().unwrap()];
 
@@ -1866,7 +1875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_with_rejects_explicit_native_ipv6_for_ipv4_transport() {
-        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpEndpoint::spawn("127.0.0.1:0").await.unwrap();
         let error = Client::builder("[2001:db8::1]:161", Auth::v2c("public"))
             .build_with(&transport)
             .await

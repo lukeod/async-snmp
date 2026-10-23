@@ -3,7 +3,7 @@
 
 mod common;
 
-use async_snmp::transport::UdpTransport;
+use async_snmp::transport::UdpEndpoint;
 use async_snmp::{Auth, Client, Error, Retry, Value, oid};
 use common::TestAgent;
 use std::time::Duration;
@@ -244,7 +244,7 @@ async fn ipv6_transport_reaches_ipv6_agent() {
     let agent = TestAgent::new_ipv6().await;
     assert!(agent.addr().is_ipv6(), "TestAgent should bind to IPv6");
 
-    let transport = UdpTransport::bind("[::]:0").await.unwrap();
+    let transport = UdpEndpoint::spawn("[::]:0").await.unwrap();
     let client = Client::builder(agent.addr(), Auth::v2c("public"))
         .request_timeout(Duration::from_secs(2))
         .build_with(&transport)
@@ -263,8 +263,8 @@ async fn ipv6_transport_reaches_ipv4_agent() {
     assert!(agent.addr().is_ipv4(), "TestAgent should bind to IPv4");
 
     // Bind an IPv6 transport and use it to reach the IPv4 agent.
-    // UdpTransport::handle() maps the IPv4 target to ::ffff:x.x.x.x.
-    let transport = UdpTransport::bind("[::]:0").await.unwrap();
+    // UdpEndpoint::handle() maps the IPv4 target to ::ffff:x.x.x.x.
+    let transport = UdpEndpoint::spawn("[::]:0").await.unwrap();
     let client = Client::builder(agent.addr().to_string(), Auth::v2c("public"))
         .request_timeout(Duration::from_secs(2))
         .build_with(&transport)

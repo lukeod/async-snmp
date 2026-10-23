@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `UdpTransport` is now `UdpEndpoint`. Its builder uses `prepare()`
+  for an unstarted endpoint/runner pair, or explicit `spawn()`/`spawn_on()` for a
+  `RunningUdpEndpoint` that retains the task result and requests shutdown on drop.
+  `from_socket()` accepts an owned unconnected Tokio socket without migrating its
+  runtime registration. `UdpControl` separates shutdown requests from completion
+  waits and exposes terminal status. Driver termination closes all sends and
+  requests, including when the runner is dropped before its first poll.
+
 - **Breaking:** The client exchange trait is named `RequestTransport`; validators
   receive `ReceivedMessageInfo` alongside the original bytes. Notification results
   and acceptance envelopes expose `receive_info` instead of `source`. Use

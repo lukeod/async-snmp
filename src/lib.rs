@@ -34,7 +34,7 @@
 //! [`ClientBuilder::new`] with authentication and client policy only, then call
 //! [`ClientBuilder::build_with_transport`], which accepts any type implementing
 //! [`RequestTransport`]; transport construction and its deadline remain
-//! application-owned. A preconstructed shared [`UdpTransport`] is a socket
+//! application-owned. A preconstructed shared [`UdpEndpoint`] is a socket
 //! owner rather than a per-target transport, so pair it with a target through
 //! [`TargetClientBuilder::build_with`] to derive a [`UdpHandle`].
 //!
@@ -182,19 +182,19 @@
 //!
 //! [`TargetClientBuilder::connect`] gives each client its own UDP endpoint.
 //! [`TargetClientBuilder::build_with`] instead creates a per-target client handle on
-//! an existing [`UdpTransport`]. Clients built from the same transport share
+//! an existing [`UdpEndpoint`]. Clients built from the same transport share
 //! its socket, receive task, statistics, and lifecycle. Responses are
 //! correlated by request identity; v1/v2c also applies version and community
 //! checks, while v3 performs its authenticated client checks.
 //!
 //! ```rust,no_run
-//! use async_snmp::{Auth, Client, UdpTransport, oid};
+//! use async_snmp::{Auth, Client, UdpEndpoint, oid};
 //! use futures::future::join_all;
 //!
 //! async fn poll_many_devices(
 //!     targets: Vec<&str>,
 //! ) -> Vec<(&str, Result<String, String>)> {
-//!     let transport = UdpTransport::bind("0.0.0.0:0")
+//!     let transport = UdpEndpoint::spawn("0.0.0.0:0")
 //!         .await
 //!         .expect("failed to bind UDP transport");
 //!     let sys_descr = oid!(1, 3, 6, 1, 2, 1, 1, 1, 0);
@@ -241,7 +241,7 @@
 //! # {
 //! use async_snmp::{
 //!     Auth, AuthProtocol, Client, EngineCache, MasterKeys, PrivProtocol,
-//!     UdpTransport, UsmConfig, oid,
+//!     UdpEndpoint, UsmConfig, oid,
 //! };
 //! use std::sync::Arc;
 //!
@@ -251,7 +251,7 @@
 //!     .with_privacy(PrivProtocol::Aes128, b"privpassword")
 //!     .expect("valid privacy configuration");
 //! let engine_cache = Arc::new(EngineCache::new());
-//! let transport = UdpTransport::bind("0.0.0.0:0").await?;
+//! let transport = UdpEndpoint::spawn("0.0.0.0:0").await?;
 //!
 //! for target in ["192.0.2.1:161", "192.0.2.2:161"] {
 //!     let auth = UsmConfig::new("snmpuser")
@@ -634,9 +634,10 @@ pub use pdu::{
     PduBody, PduType, RequestPdu, ResponsePdu, StandardPduType, TrapV1Notification, TrapV1Pdu,
 };
 pub use transport::{
-    BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId, ReceivedMessageInfo,
-    RequestRegistration, RequestTransport, ResponseIdentity, SessionId, TcpTransport,
-    TransportKind, UdpControl, UdpHandle, UdpStats, UdpTransport,
+    BuiltinTransport, Candidate, CommunityResponsePolicy, EndpointId, PreparedUdpEndpoint,
+    ReceivedMessageInfo, RequestRegistration, RequestTransport, ResponseIdentity,
+    RunningUdpEndpoint, SessionId, TcpTransport, TransportKind, UdpControl, UdpEndpoint,
+    UdpEndpointBuilder, UdpHandle, UdpRunner, UdpStats, UdpStatus,
 };
 pub use v3::{
     AuthProtocol, AuthoritativeEngine, AuthoritativeEnginePersistenceError,
