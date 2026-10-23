@@ -15,9 +15,10 @@ pub(crate) struct InboundWork {
 #[derive(Clone)]
 pub(crate) struct ApplicationIngress {
     pub(crate) sender: mpsc::Sender<InboundWork>,
-    pub(crate) enabled: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) disabled: tokio_util::sync::CancellationToken,
     pub(crate) capacity: Arc<Semaphore>,
     pub(crate) budget: Arc<Semaphore>,
+    pub(crate) budget_limit: usize,
     pub(crate) overload_timeout: Duration,
     pub(crate) drops: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) session: Option<Arc<Semaphore>>,
@@ -29,7 +30,7 @@ impl std::fmt::Debug for ApplicationIngress {
 }
 impl ApplicationIngress {
     pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled.load(std::sync::atomic::Ordering::Acquire) && !self.sender.is_closed()
+        !self.disabled.is_cancelled() && !self.sender.is_closed()
     }
     pub(crate) fn deliver_udp(&self, message: ReceivedMessage) {
         if !self.is_enabled() {
@@ -60,9 +61,53 @@ impl ApplicationIngress {
         &self,
         message: ReceivedMessage,
         buffers: BufferPermits,
+        fail_fast: bool,
     ) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
         let target = message.info.peer_addr();
-        tokio::time::timeout(self.overload_timeout, async {
+        if fail_fast {
+            let overload = || {
+                Error::Network {
+                    target,
+                    source: std::io::Error::other(format!(
+                        "TCP session {:?} application admission overload",
+                        message.info.session_id()
+                    )),
+                }
+                .boxed()
+            };
+            let session = self
+                .session
+                .as_ref()
+                .map(|limit| limit.clone().try_acquire_owned())
+                .transpose()
+                .map_err(|_| overload())?;
+            let admission = self
+                .capacity
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| overload())?;
+            let work = InboundWork {
+                message,
+                _admission: admission,
+                _session: session,
+                _buffers: Some(buffers),
+            };
+            return self.sender.try_send(work).map_err(|error| {
+                Error::Network {
+                    target,
+                    source: std::io::Error::other(format!(
+                        "TCP application admission overload: {error}"
+                    )),
+                }
+                .boxed()
+            });
+        }
+        tokio::select! { biased;
+        () = self.disabled.cancelled() => Ok(()),
+        result = tokio::time::timeout(self.overload_timeout, async {
             let session = if let Some(limit) = &self.session {
                 Some(tokio::select! { biased;
                     () = self.sender.closed() => return Ok(()),
@@ -74,6 +119,7 @@ impl ApplicationIngress {
                 permit = self.capacity.clone().acquire_owned() => permit.map_err(|_| Error::Closed { target }.boxed())?,
             };
             let _ = self.sender.send(InboundWork { message, _admission: admission, _session: session, _buffers: Some(buffers) }).await; Ok(())
-        }).await.map_err(|_| Error::Network { target, source: std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP application admission overload") }.boxed())?
+        }) => result.map_err(|_| Error::Network { target, source: std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP application admission overload") }.boxed())?,
+        }
     }
 }

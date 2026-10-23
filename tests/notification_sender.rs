@@ -186,7 +186,7 @@ async fn notification_varbind_validation_controls_trap_delivery() {
     let malformed =
         encode_raw_v2c_notification(PduType::TrapV2, 41, nonstandard_name_varbinds(1234));
     sender
-        .send_to(&malformed, tolerant.local_addr())
+        .send_to(&malformed, tolerant.bound_addresses()[0].local_addr)
         .await
         .unwrap();
 
@@ -216,7 +216,7 @@ async fn notification_varbind_validation_controls_trap_delivery() {
         .spawn()
         .await
         .unwrap();
-    let strict_addr = strict.local_addr();
+    let strict_addr = strict.bound_addresses()[0].local_addr;
     let mut recv_handle = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), strict.recv())
             .await
@@ -242,7 +242,7 @@ async fn notification_varbind_validation_controls_trap_delivery() {
 #[tokio::test]
 async fn notification_varbind_validation_controls_inform_acknowledgement() {
     let mut tolerant = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let tolerant_addr = tolerant.local_addr();
+    let tolerant_addr = tolerant.bound_addresses()[0].local_addr;
     let recv_handle = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), tolerant.recv())
             .await
@@ -284,7 +284,7 @@ async fn notification_varbind_validation_controls_inform_acknowledgement() {
         .spawn()
         .await
         .unwrap();
-    let strict_addr = strict.local_addr();
+    let strict_addr = strict.bound_addresses()[0].local_addr;
     let recv_handle = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), strict.recv())
             .await
@@ -317,7 +317,7 @@ async fn notification_varbind_validation_rejects_unusable_prefixes_without_ackno
             .spawn()
             .await
             .unwrap();
-        let receiver_addr = receiver.local_addr();
+        let receiver_addr = receiver.bound_addresses()[0].local_addr;
         let recv_handle = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(5), receiver.recv())
                 .await
@@ -373,7 +373,7 @@ async fn notification_varbind_validation_rejects_unusable_prefixes_without_ackno
 #[tokio::test]
 async fn v2c_trap_send_receive() {
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let client = Client::builder(recv_addr.to_string(), Auth::v2c("public"))
         .connect()
@@ -419,7 +419,7 @@ async fn v2c_trap_send_receive() {
 #[tokio::test]
 async fn v2c_inform_send_receive() {
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     // Spawn receiver in background (it auto-responds to informs)
     let recv_handle = tokio::spawn(async move {
@@ -482,7 +482,7 @@ async fn v3_trap_send_receive() {
         .spawn()
         .await
         .unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let client = Client::builder(
         recv_addr.to_string(),
@@ -544,7 +544,7 @@ async fn v3_inform_send_receive() {
         .spawn()
         .await
         .unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let recv_handle = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), receiver.recv())
@@ -602,7 +602,7 @@ async fn v1_trap_send_receive() {
     use async_snmp::pdu::GenericTrap;
 
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let client = Client::builder(recv_addr.to_string(), Auth::v1("public"))
         .connect()
@@ -636,7 +636,7 @@ async fn v1_trap_send_v1_trap_explicit() {
     use async_snmp::pdu::GenericTrap;
 
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let client = Client::builder(recv_addr.to_string(), Auth::v1("public"))
         .connect()
@@ -683,7 +683,7 @@ async fn v1_trap_send_v1_trap_explicit() {
 async fn v1_trap_counter64_rejected() {
     // V1 cannot carry Counter64 - send_trap should fail
     let receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let client = Client::builder(recv_addr.to_string(), Auth::v1("public"))
         .connect()
@@ -710,7 +710,7 @@ async fn v1_trap_counter64_rejected() {
 #[tokio::test]
 async fn v1_inform_returns_error() {
     let receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let client = Client::builder(recv_addr.to_string(), Auth::v1("public"))
         .connect()
@@ -737,7 +737,7 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
         .spawn()
         .await
         .unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let client = Client::builder(
         recv_addr.to_string(),
@@ -762,7 +762,7 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
 #[tokio::test]
 async fn agent_v2c_trap_to_sink() {
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
@@ -861,7 +861,7 @@ async fn agent_rejects_unrepresentable_trap_send_timeout() {
 #[tokio::test]
 async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
@@ -903,7 +903,7 @@ async fn agent_trap_stream_is_lazy_and_preserves_sink_identity() {
 #[tokio::test]
 async fn agent_v2c_inform_to_sink() {
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
@@ -949,8 +949,8 @@ async fn agent_v2c_inform_to_sink() {
 async fn agent_inform_sinks_share_source_endpoint() {
     let mut first_receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
     let mut second_receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let first_addr = first_receiver.local_addr();
-    let second_addr = second_receiver.local_addr();
+    let first_addr = first_receiver.bound_addresses()[0].local_addr;
+    let second_addr = second_receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .trap_sink(
@@ -1001,7 +1001,7 @@ async fn agent_v3_trap_to_sink() {
         .spawn()
         .await
         .unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
@@ -1053,8 +1053,8 @@ async fn agent_v3_trap_to_sink() {
 async fn agent_multiple_sinks() {
     let mut recv1 = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
     let mut recv2 = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let addr1 = recv1.local_addr();
-    let addr2 = recv2.local_addr();
+    let addr1 = recv1.bound_addresses()[0].local_addr;
+    let addr2 = recv2.bound_addresses()[0].local_addr;
 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
@@ -1114,7 +1114,7 @@ async fn agent_v1_trap_to_sink() {
     use async_snmp::pdu::GenericTrap;
 
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
@@ -1158,8 +1158,8 @@ async fn agent_mixed_v1_v2c_sinks() {
 
     let mut recv_v1 = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
     let mut recv_v2 = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let addr_v1 = recv_v1.local_addr();
-    let addr_v2 = recv_v2.local_addr();
+    let addr_v1 = recv_v1.bound_addresses()[0].local_addr;
+    let addr_v2 = recv_v2.bound_addresses()[0].local_addr;
 
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
@@ -1570,7 +1570,7 @@ async fn agent_inform_stream_yields_live_sink_before_unreachable_sink_timeout() 
     drop(probe);
 
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let live_addr = receiver.local_addr();
+    let live_addr = receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
@@ -1663,7 +1663,7 @@ async fn agent_inform_aggregate_restores_configuration_order() {
     drop(probe);
 
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let live_addr = receiver.local_addr();
+    let live_addr = receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
@@ -1700,7 +1700,7 @@ async fn agent_inform_aggregate_restores_configuration_order() {
 #[tokio::test]
 async fn agent_trap_reports_total_conversion_failure() {
     let receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let sink_addr = receiver.local_addr();
+    let sink_addr = receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
@@ -1740,8 +1740,8 @@ async fn agent_trap_reports_total_conversion_failure() {
 async fn agent_trap_reports_ordered_partial_success() {
     let v1_receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
     let mut v2_receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let v1_addr = v1_receiver.local_addr();
-    let v2_addr = v2_receiver.local_addr();
+    let v1_addr = v1_receiver.bound_addresses()[0].local_addr;
+    let v2_addr = v2_receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
@@ -1791,7 +1791,7 @@ async fn agent_trap_reports_ordered_partial_success() {
 #[tokio::test]
 async fn agent_v1_inform_is_explicitly_skipped() {
     let receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    let sink_addr = receiver.local_addr();
+    let sink_addr = receiver.bound_addresses()[0].local_addr;
     let agent = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
@@ -1855,7 +1855,7 @@ async fn agent_best_effort_helpers_complete_after_failure_and_skip() {
         .community(b"public")
         .trap_sink(
             NotificationSinkId::new("v1").unwrap(),
-            receiver.local_addr().to_string(),
+            receiver.bound_addresses()[0].local_addr.to_string(),
             Auth::v1("public"),
         )
         .allow_all_access()

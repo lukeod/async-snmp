@@ -2,7 +2,6 @@
 use super::*;
 use crate::transport::ingress::InboundWork;
 use crate::transport::listener::PreparedListener;
-use crate::transport::{BoundListener, TcpTransport, UdpEndpoint};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::DropGuard;
@@ -19,46 +18,36 @@ pub enum AgentStatus {
 }
 
 pub(crate) struct AgentNetwork {
-    pub(crate) bound: Vec<BoundListener>,
-    pub(crate) udp: Vec<UdpEndpoint>,
-    pub(crate) sessions: std::sync::Mutex<HashMap<crate::SessionId, TcpTransport>>,
-    connections: Arc<Semaphore>,
+    pub(crate) io: Arc<crate::transport::network::NetworkState>,
     drops: Arc<AtomicU64>,
     status: std::sync::Mutex<AgentStatus>,
     complete: CancellationToken,
-    stop: CancellationToken,
 }
 impl AgentNetwork {
     pub(super) fn new(
         listeners: &[PreparedListener],
         max_connections: usize,
         drops: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
-            bound: listeners.iter().map(PreparedListener::bound).collect(),
-            udp: listeners
-                .iter()
-                .filter_map(|l| match l {
-                    PreparedListener::Udp { endpoint, .. } => Some(endpoint.clone()),
-                    _ => None,
-                })
-                .collect(),
-            sessions: std::sync::Mutex::new(HashMap::new()),
-            connections: Arc::new(Semaphore::new(max_connections)),
+    ) -> Result<Self> {
+        Ok(Self {
+            io: Arc::new(crate::transport::network::NetworkState::new(
+                listeners,
+                max_connections,
+            )?),
             drops,
             status: std::sync::Mutex::new(AgentStatus::Prepared),
             complete: CancellationToken::new(),
-            stop: CancellationToken::new(),
-        }
+        })
     }
     fn close_endpoints(&self) {
-        self.stop.cancel();
-        for endpoint in &self.udp {
-            endpoint.control().request_shutdown();
-        }
-        for session in self.sessions.lock().unwrap().values() {
-            session.control().request_shutdown();
-        }
+        self.io.close_endpoints();
+    }
+}
+
+impl std::ops::Deref for AgentNetwork {
+    type Target = crate::transport::network::NetworkState;
+    fn deref(&self) -> &Self::Target {
+        &self.io
     }
 }
 
@@ -329,37 +318,16 @@ impl AgentRunner {
             let failures = failures.clone();
             #[cfg(test)]
             let test_inner = self.processor.inner.clone();
-            children.spawn(async move {
-                match listener {
-                    PreparedListener::Udp { bound, runner, .. } => {
-                        #[cfg(test)]
-                        let mut runner = runner;
-                        #[cfg(test)]
-                        runner.test_receive_state(
-                            test_inner.receive_errors.clone(),
-                            test_inner.receive_attempts.clone(),
-                        );
-                        match runner.run().await {
-                            Ok(()) => Err(listener_error(
-                                bound,
-                                Error::Config("UDP listener stopped unexpectedly".into()).boxed(),
-                            )),
-                            Err(source) => Err(listener_error(bound, source)),
-                        }
-                    }
-                    PreparedListener::Tcp {
-                        bound,
-                        listener,
-                        options,
-                        ingress,
-                    } => {
-                        run_tcp_listener(
-                            bound, listener, options, ingress, network, cancel, failures,
-                        )
-                        .await
-                    }
-                }
-            });
+            #[allow(unused_mut)]
+            let mut listener = listener;
+            #[cfg(test)]
+            if let PreparedListener::Udp { runner, .. } = &mut listener {
+                runner.test_receive_state(
+                    test_inner.receive_errors.clone(),
+                    test_inner.receive_attempts.clone(),
+                );
+            }
+            children.spawn(network.io.clone().run_source(listener, cancel, failures));
         }
         let result = loop {
             tokio::select! {
@@ -420,7 +388,7 @@ impl AgentRunner {
         result
     }
     fn dispatch(&self, requests: &mut RequestTasks, work: InboundWork) {
-        if !self.processor.inner.commands_open.load(Ordering::Acquire) {
+        if self.processor.inner.command_stop.is_cancelled() {
             return;
         }
         let received_at = work.message.info.received_at();
@@ -461,80 +429,11 @@ impl AgentRunner {
         });
     }
 }
-struct SessionGuard {
-    network: Arc<AgentNetwork>,
-    id: crate::SessionId,
-}
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        if let Some(session) = self.network.sessions.lock().unwrap().remove(&self.id) {
-            session.control().request_shutdown();
-        }
-    }
-}
-
-async fn run_tcp_listener(
-    bound: BoundListener,
-    listener: tokio::net::TcpListener,
-    options: crate::TcpOptions,
-    ingress: crate::transport::ingress::ApplicationIngress,
-    network: Arc<AgentNetwork>,
-    cancel: CancellationToken,
-    failures: mpsc::Sender<Box<Error>>,
-) -> Result<()> {
-    let mut sessions = JoinSet::new();
-    let mut backoff = UdpRecvErrorBackoff::default();
-    let mut accepting = true;
-    loop {
-        tokio::select! {
-            biased;
-            () = network.stop.cancelled() => return Ok(()),
-            () = cancel.cancelled(), if accepting => { accepting = false; },
-            _ = sessions.join_next(), if !sessions.is_empty() => {},
-            accepted = listener.accept(), if accepting => match accepted {
-                Ok((stream, _)) => {
-                    backoff.reset();
-                    let Ok(permit) = network.connections.clone().try_acquire_owned() else { drop(stream); continue; };
-                    let prepared = match TcpTransport::builder().from_stream(stream).options(options.clone()).ingress(ingress.clone(), bound.endpoint_id).prepare().await {
-                        Ok(prepared) => prepared,
-                        Err(error) => { tracing::debug!(%error, "accepted TCP session preparation failed"); continue; }
-                    };
-                    let (transport, runner) = prepared.into_parts();
-                    let id = transport.session_id();
-                    network.sessions.lock().unwrap().insert(id, transport);
-                    let network = network.clone();
-                    let guard = SessionGuard { network, id };
-                    sessions.spawn(async move {
-                        let _guard = guard;
-                        let _permit = permit;
-                        if let Err(error) = runner.run().await { tracing::debug!(%error, "agent TCP session terminated"); }
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted || error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::ConnectionAborted => {
-                    tokio::select! { () = cancel.cancelled() => { accepting = false; }, () = tokio::time::sleep(backoff.advance()) => {} }
-                }
-                Err(source) => {
-                    let _ = failures.try_send(listener_error(bound, Error::Network { target: bound.local_addr, source }.boxed()));
-                    accepting = false;
-                },
-            }
-        }
-    }
-}
 
 fn log_request_result(result: Option<std::result::Result<(), JoinError>>) {
     if let Some(Err(error)) = result {
         tracing::debug!(%error, "agent request task terminated");
     }
-}
-fn listener_error(bound: BoundListener, source: Box<Error>) -> Box<Error> {
-    Error::Listener {
-        endpoint_id: bound.endpoint_id,
-        transport: bound.transport,
-        local_addr: bound.local_addr,
-        source,
-    }
-    .boxed()
 }
 
 #[cfg(test)]

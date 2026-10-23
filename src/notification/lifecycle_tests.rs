@@ -343,7 +343,7 @@ async fn supplied_socket_preserves_options_and_rejects_conflicts_and_unbound_soc
         .unwrap()
         .into_parts();
     assert_eq!(receiver.local_addr(), local);
-    assert_eq!(receiver.inner.socket.ttl().unwrap(), 29);
+    assert_eq!(receiver.inner.socket.as_ref().unwrap().ttl().unwrap(), 29);
     drop(runner);
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     assert!(
@@ -619,4 +619,55 @@ async fn colliding_informs_blocked_in_ack_leave_response_allowance_available() {
         assert!(receiver.recv().await.is_some());
     }
     assert!(receiver.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn tcp_shutdown_drains_reserved_acknowledgement_and_abort_terminates_route() {
+    use crate::{Auth, Client, ListenerSource, Retry};
+    for abort in [false, true] {
+        let (mut receiver, runner) = NotificationReceiver::builder()
+            .listener(ListenerSource::tcp("127.0.0.1:0"))
+            .queue_capacity(1)
+            .prepare()
+            .await
+            .unwrap()
+            .into_parts();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *receiver.inner.response_send_gate.lock().unwrap() = Some(gate.clone());
+        let driver = tokio::spawn(runner.run());
+        let client = Client::builder(
+            receiver.bound_addresses()[0].local_addr.to_string(),
+            Auth::v2c("public"),
+        )
+        .retry(Retry::none())
+        .request_timeout(Duration::from_secs(1))
+        .connect_tcp()
+        .await
+        .unwrap();
+        let inform =
+            tokio::spawn(async move { client.send_inform(&oids::cold_start(), 1, vec![]).await });
+        processing_started(&receiver).await;
+        if abort {
+            driver.abort();
+            assert!(driver.await.is_err());
+            gate.add_permits(1);
+            assert!(inform.await.unwrap().is_err());
+            assert!(receiver.recv().await.is_none());
+            assert_eq!(receiver.control().status(), NotificationStatus::Interrupted);
+        } else {
+            receiver.control().request_shutdown();
+            receiver.close();
+            tokio::task::yield_now().await;
+            assert!(!driver.is_finished());
+            gate.add_permits(1);
+            inform.await.unwrap().unwrap();
+            driver.await.unwrap().unwrap();
+            assert!(matches!(
+                receiver.recv().await.unwrap().inform_ack,
+                Some(InformAckOutcome::Sent)
+            ));
+            assert!(receiver.recv().await.is_none());
+            assert_eq!(receiver.control().status(), NotificationStatus::Stopped);
+        }
+    }
 }

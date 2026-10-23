@@ -277,7 +277,7 @@ async fn notification_receiver_applies_only_targeted_empty_oid_normalization() {
         .spawn()
         .await
         .unwrap();
-    let receiver_addr = receiver.local_addr();
+    let receiver_addr = receiver.bound_addresses()[0].local_addr;
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     sender

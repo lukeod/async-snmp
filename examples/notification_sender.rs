@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .spawn()
         .await?;
-    let recv_addr = receiver.local_addr();
+    let recv_addr = receiver.bound_addresses()[0].local_addr;
     println!("Receiver listening on {recv_addr}\n");
 
     // Spawn a receive loop for the five notifications sent below.

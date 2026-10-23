@@ -44,7 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind to unprivileged port 1162 instead of the standard port 162.
     let receiver = NotificationReceiver::spawn("0.0.0.0:1162").await?;
 
-    println!("Listening for notifications on {}", receiver.local_addr());
+    println!(
+        "Listening for notifications on {}",
+        receiver.bound_addresses()[0].local_addr
+    );
     println!("This receiver handles SNMPv1 and SNMPv2c only; SNMPv3 notifications are rejected");
     println!(
         "(use NotificationReceiver::builder() with authoritative_engine and usm_user to accept SNMPv3)\n"
@@ -100,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "SNMPv3 authenticated receiver on {}",
-        authenticated_receiver.local_addr()
+        authenticated_receiver.bound_addresses()[0].local_addr
     );
     println!("Configured users: trapuser (authPriv), readonly (authNoPriv)\n");
 
@@ -122,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "Community-filtered receiver on {} (accepts: public, monitor)\n",
-        filtered_receiver.local_addr()
+        filtered_receiver.bound_addresses()[0].local_addr
     );
 
     // =========================================================================

@@ -231,6 +231,120 @@ impl DispatchRoles {
             }
         });
     }
+    /// TCP reuses frame/session/service byte permits rather than UDP classifier
+    /// budgets. Admission pauses occur between complete frames, outside peer
+    /// framing deadlines. Mixed-role sessions fail immediately on app overload.
+    pub(crate) async fn dispatch_tcp(
+        self: &Arc<Self>,
+        message: ReceivedMessage,
+        buffers: super::framing::BufferPermits,
+        core: Arc<UdpCore>,
+        ingress: &ApplicationIngress,
+        tasks: &mut JoinSet<()>,
+    ) -> Result<()> {
+        let envelope = CorrelationEnvelope::parse(&message.bytes);
+        let registration = if self.client_exchanges {
+            envelope.and_then(|e| {
+                e.request_id(&message.bytes).and_then(|id| {
+                    core.candidate_registration(id, &message.bytes, e, message.info.peer_addr())
+                })
+            })
+        } else {
+            None
+        };
+        let mut client_context = registration.is_some();
+        let class = self.classify(
+            &message,
+            registration.as_ref(),
+            envelope,
+            &mut client_context,
+        );
+        if matches!(class, Ok(Some(PduType::Response | PduType::Report)))
+            || (client_context && !matches!(class, Ok(Some(_))))
+        {
+            if registration.is_some()
+                && let Some(envelope) = envelope
+                && let Some(id) = envelope.request_id(&message.bytes)
+            {
+                core.deliver_parsed_buffered(id, envelope, message.bytes, message.info, buffers);
+            }
+            return Ok(());
+        }
+        let needs_delivery = matches!(
+            class,
+            Ok(Some(
+                PduType::TrapV1 | PduType::TrapV2 | PduType::InformRequest
+            ))
+        );
+        let commands = self.commands.as_ref().filter(|role| role.is_enabled());
+        let notification = match class {
+            Ok(Some(PduType::TrapV1 | PduType::TrapV2 | PduType::InformRequest)) => {
+                self.notifications.as_ref()
+            }
+            Ok(Some(_)) if commands.is_some() => None,
+            Ok(Some(_)) => self.notifications.as_ref(),
+            Err(_) | Ok(None) => self.notifications.as_ref().filter(|role| role.is_enabled()),
+        };
+        let target = message.info.peer_addr();
+        let session = message.info.session_id();
+        let admit = async {
+            if let Some(processor) = notification {
+                if !processor.is_enabled() {
+                    return Ok::<(), Box<Error>>(());
+                }
+                let admission = async {
+                    let slot = acquire_tcp(self.application.clone(), self.client_exchanges).await?;
+                    let session_slot = if let Some(limit) = &ingress.session {
+                        Some(acquire_tcp(limit.clone(), self.client_exchanges).await?)
+                    } else {
+                        None
+                    };
+                    let admission = if needs_delivery {
+                        let Some(admission) = processor.reserve_tcp(self.client_exchanges).await?
+                        else {
+                            return Ok::<(), Box<Error>>(());
+                        };
+                        admission
+                    } else {
+                        crate::notification::NotificationAdmission::default()
+                    };
+                    let work = processor.process_admitted(message, admission);
+                    tasks.spawn(async move {
+                        let (_slot, _session_slot, _buffers) = (slot, session_slot, buffers);
+                        work.await;
+                    });
+                    Ok::<(), Box<Error>>(())
+                };
+                tokio::select! { biased;
+                    () = processor.admission_closed() => {},
+                    result = admission => result?,
+                }
+            } else if commands.is_some() {
+                ingress
+                    .deliver_tcp(message, buffers, self.client_exchanges)
+                    .await?;
+            }
+            Ok(())
+        };
+        match tokio::time::timeout(ingress.overload_timeout, admit).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Error::Network {
+                target,
+                source: std::io::Error::other(format!(
+                    "TCP session {session:?} admission failed: {error}"
+                )),
+            }
+            .boxed()),
+            Err(_) => Err(Error::Network {
+                target,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("TCP session {session:?} admission overload deadline"),
+                ),
+            }
+            .boxed()),
+        }
+    }
     fn classify(
         &self,
         message: &ReceivedMessage,
@@ -345,5 +459,21 @@ impl DispatchRoles {
                 ))
             }
         }
+    }
+}
+
+async fn acquire_tcp(
+    limit: Arc<Semaphore>,
+    fail_fast: bool,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    if fail_fast {
+        limit
+            .try_acquire_owned()
+            .map_err(|_| Error::Config("TCP application capacity exhausted".into()).boxed())
+    } else {
+        limit
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Config("TCP application admission closed".into()).boxed())
     }
 }

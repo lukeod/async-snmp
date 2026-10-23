@@ -180,3 +180,7 @@ required-features = ["mib"]
 [[example]]
 name = "shared_udp_roles"
 required-features = ["agent"]
+
+[[example]]
+name = "shared_tcp_roles"
+required-features = ["agent"]

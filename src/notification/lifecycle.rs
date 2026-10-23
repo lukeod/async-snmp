@@ -13,6 +13,7 @@ struct DeliveryState {
 pub(super) struct Delivery {
     state: Mutex<DeliveryState>,
     overloaded: AtomicU64,
+    closed: CancellationToken,
 }
 impl Delivery {
     pub(super) fn new(sender: Sender<ReceivedNotification>) -> Self {
@@ -22,15 +23,18 @@ impl Delivery {
                 sender: Some(sender),
             }),
             overloaded: AtomicU64::new(0),
+            closed: CancellationToken::new(),
         }
     }
     fn close_admission(&self) {
         self.state.lock().unwrap().open = false;
+        self.closed.cancel();
     }
     fn finish(&self) {
         let mut state = self.state.lock().unwrap();
         state.open = false;
         state.sender.take();
+        self.closed.cancel();
     }
     fn is_open(&self) -> bool {
         self.state.lock().unwrap().open
@@ -38,12 +42,15 @@ impl Delivery {
 }
 
 #[derive(Default)]
-pub(super) struct NotificationAdmission {
+pub(crate) struct NotificationAdmission {
     failure: Option<NotificationDisposition>,
     permit: Option<OwnedPermit<ReceivedNotification>>,
 }
 impl NotificationAdmission {
     pub(super) fn reserve(&mut self, delivery: &Delivery) -> bool {
+        if self.permit.is_some() {
+            return true;
+        }
         let state = delivery.state.lock().unwrap();
         if !state.open {
             self.failure = Some(NotificationDisposition::Disabled);
@@ -253,15 +260,27 @@ impl NotificationControl {
 impl NotificationReceiver {
     /// Identified addresses used by this notification role.
     pub fn bound_addresses(&self) -> &[crate::transport::BoundListener] {
-        &self.bound
+        &self.network.bound
     }
     /// Select a shared endpoint prepared with client exchanges enabled.
     pub fn udp_endpoint(&self, id: crate::EndpointId) -> Option<crate::UdpEndpoint> {
-        self.endpoints
+        self.network
+            .udp
             .iter()
             .find(|endpoint| endpoint.endpoint_id() == id)
             .cloned()
             .map(|endpoint| endpoint.with_service_lease(self.lease.clone()))
+    }
+    /// Snapshot exact accepted or configured TCP sessions, retaining service lifetime.
+    pub fn tcp_sessions(&self) -> Vec<crate::TcpTransport> {
+        self.network
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .map(|session| session.with_service_lease(self.lease.clone()))
+            .collect()
     }
     #[cfg(feature = "agent")]
     pub(crate) fn attach_lifetime(&mut self, lease: Arc<dyn Send + Sync>) {
@@ -365,12 +384,12 @@ impl RunningNotificationReceiver {
         let Some(task) = self.task.as_mut() else {
             return match self.control().status() {
                 NotificationStatus::Failed(message) => Err(Error::Network {
-                    target: self.local_addr(),
+                    target: self.bound_addresses()[0].local_addr,
                     source: std::io::Error::other(message.to_string()),
                 }
                 .boxed()),
                 NotificationStatus::Interrupted => Err(Error::Network {
-                    target: self.local_addr(),
+                    target: self.bound_addresses()[0].local_addr,
                     source: std::io::Error::other("notification runner interrupted"),
                 }
                 .boxed()),
@@ -383,7 +402,7 @@ impl RunningNotificationReceiver {
             *self.receiver.state.status.lock().unwrap() =
                 NotificationStatus::Failed(Arc::from(source.to_string()));
             Error::Network {
-                target: self.local_addr(),
+                target: self.bound_addresses()[0].local_addr,
                 source: std::io::Error::other(source),
             }
             .boxed()
@@ -396,60 +415,71 @@ impl RunningNotificationReceiver {
     }
 }
 
-/// Owned UDP execution. A single reader dispatches bounded protocol tasks;
-/// delivery capacity is reserved before application acceptance and responses.
+/// Owned listener and session execution. Graceful shutdown drains admitted replies.
 #[must_use = "drive or drop the notification runner"]
 pub struct NotificationRunner {
-    endpoint: crate::UdpEndpoint,
-    runner: crate::transport::UdpRunner,
+    network: crate::transport::network::NetworkCleanup,
+    listeners: Vec<crate::transport::listener::PreparedListener>,
     processor: NotificationProcessor,
     cleanup: RunnerCleanup,
 }
 impl NotificationRunner {
-    pub(super) fn from_endpoint(
-        endpoint: crate::UdpEndpoint,
-        runner: crate::transport::UdpRunner,
+    pub(super) fn from_network(
+        network: Arc<crate::transport::network::NetworkState>,
+        #[allow(unused_mut)] mut listeners: Vec<crate::transport::listener::PreparedListener>,
         processor: NotificationProcessor,
         cleanup: RunnerCleanup,
     ) -> Self {
         #[cfg(test)]
-        let mut runner = runner;
-        #[cfg(test)]
-        runner.test_receive_faults(
-            processor.inner.receive_errors.clone(),
-            processor.inner.receive_error_ready.clone(),
-        );
+        for listener in &mut listeners {
+            if let crate::transport::listener::PreparedListener::Udp { runner, .. } = listener {
+                runner.test_receive_faults(
+                    processor.inner.receive_errors.clone(),
+                    processor.inner.receive_error_ready.clone(),
+                );
+            }
+        }
         Self {
-            endpoint,
-            runner,
+            network: crate::transport::network::NetworkCleanup(network),
+            listeners,
             processor,
             cleanup,
         }
     }
-    /// Run the one endpoint reader and bounded notification processor until shutdown.
-    /// Graceful shutdown finishes admitted acknowledgements before closing the endpoint.
+    /// Run all prepared sources. Graceful shutdown finishes admitted acknowledgements
+    /// before terminating session writers; queue consumption is not required.
     pub async fn run(self) -> Result<()> {
         let Self {
-            endpoint,
-            runner,
+            network,
+            listeners,
             processor,
             cleanup,
         } = self;
         cleanup.started();
-        let run = runner.run();
-        tokio::pin!(run);
+        let mut children = tokio::task::JoinSet::new();
+        let (failures, mut failure_rx) = mpsc::channel(listeners.len());
+        for source in listeners {
+            let state = network.0.clone();
+            let cancel = cleanup.state.shutdown.clone();
+            let failures = failures.clone();
+            children.spawn(state.run_source(source, cancel, failures));
+        }
         let result = tokio::select! {
             biased;
-            () = cleanup.state.shutdown.cancelled() => {
-                cleanup.stop_admission();
-                processor.drain().await;
-                endpoint.control().request_shutdown();
-                run.await
+            () = cleanup.state.shutdown.cancelled() => Ok(()),
+            Some(error) = failure_rx.recv() => Err(error),
+            joined = children.join_next() => match joined {
+                Some(Ok(result)) => result,
+                Some(Err(error)) => Err(Error::Config(format!("notification network task failed: {error}").into()).boxed()),
+                None => Ok(()),
             }
-            result = &mut run => result,
         };
         cleanup.stop_admission();
+        cleanup.state.shutdown.cancel();
         processor.drain().await;
+        network.0.close_endpoints();
+        children.abort_all();
+        while children.join_next().await.is_some() {}
         cleanup.finished(&result);
         result
     }
@@ -490,6 +520,48 @@ impl NotificationProcessor {
             notified.await;
         }
     }
+    pub(crate) async fn admission_closed(&self) {
+        self.inner.delivery.closed.cancelled().await;
+    }
+    pub(crate) async fn reserve_tcp(
+        &self,
+        fail_fast: bool,
+    ) -> Result<Option<NotificationAdmission>> {
+        let delivery = &self.inner.delivery;
+        let sender = {
+            let state = delivery.state.lock().unwrap();
+            if !state.open {
+                return Ok(None);
+            }
+            let Some(sender) = state.sender.clone() else {
+                return Ok(None);
+            };
+            sender
+        };
+        let permit = if fail_fast {
+            match sender.try_reserve_owned() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(None),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.note_overload();
+                    return Err(Error::Config("TCP notification delivery overload".into()).boxed());
+                }
+            }
+        } else {
+            tokio::select! { biased;
+                () = delivery.closed.cancelled() => return Ok(None),
+                permit = sender.reserve_owned() => match permit { Ok(permit) => permit, Err(_) => return Ok(None) },
+            }
+        };
+        let state = delivery.state.lock().unwrap();
+        if !state.open {
+            return Ok(None);
+        }
+        Ok(Some(NotificationAdmission {
+            failure: None,
+            permit: Some(permit),
+        }))
+    }
     pub(crate) async fn process(
         &self,
         message: crate::transport::ReceivedMessage,
@@ -497,6 +569,14 @@ impl NotificationProcessor {
         if !self.is_enabled() {
             return NotificationDisposition::Disabled;
         }
+        self.process_admitted(message, NotificationAdmission::default())
+            .await
+    }
+    pub(crate) fn process_admitted(
+        &self,
+        message: crate::transport::ReceivedMessage,
+        mut admission: NotificationAdmission,
+    ) -> impl std::future::Future<Output = NotificationDisposition> + Send + 'static {
         struct Active(Arc<ReceiverInner>);
         impl Drop for Active {
             fn drop(&mut self) {
@@ -505,27 +585,31 @@ impl NotificationProcessor {
             }
         }
         self.inner.active.fetch_add(1, Ordering::AcqRel);
-        let _active = Active(self.inner.clone());
-        let source = message.info.peer_addr();
-        let mut admission = NotificationAdmission::default();
-        match self.parse_and_respond(message, &mut admission).await {
-            Ok(Some(notification)) => {
-                admission.publish(notification);
-                NotificationDisposition::Delivered
-            }
-            Ok(None) => admission
-                .failure
-                .unwrap_or(NotificationDisposition::Rejected),
-            Err(error) => {
-                if matches!(&*error, Error::Decode(error) if !matches!(error.kind,
-                    crate::DecodeErrorKind::UnknownVersion(_) | crate::DecodeErrorKind::InvalidMsgFlags | crate::DecodeErrorKind::UnknownSecurityModel(_)))
-                {
-                    self.inner
-                        .snmp_in_asn_parse_errs
-                        .fetch_add(1, Ordering::Relaxed);
+        let active = Active(self.inner.clone());
+        let processor = self.clone();
+        async move {
+            let _active = active;
+            let source = message.info.peer_addr();
+            match processor.parse_and_respond(message, &mut admission).await {
+                Ok(Some(notification)) => {
+                    admission.publish(notification);
+                    NotificationDisposition::Delivered
                 }
-                tracing::debug!(target: "async_snmp::notification", %source, %error, "notification rejected before admission");
-                NotificationDisposition::Rejected
+                Ok(None) => admission
+                    .failure
+                    .unwrap_or(NotificationDisposition::Rejected),
+                Err(error) => {
+                    if matches!(&*error, Error::Decode(error) if !matches!(error.kind,
+                    crate::DecodeErrorKind::UnknownVersion(_) | crate::DecodeErrorKind::InvalidMsgFlags | crate::DecodeErrorKind::UnknownSecurityModel(_)))
+                    {
+                        processor
+                            .inner
+                            .snmp_in_asn_parse_errs
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::debug!(target: "async_snmp::notification", %source, %error, "notification rejected before admission");
+                    NotificationDisposition::Rejected
+                }
             }
         }
     }

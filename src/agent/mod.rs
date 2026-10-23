@@ -55,6 +55,22 @@
 //! additional bounds. Overload drops before application acceptance or Inform ACK;
 //! classification of a colliding request transfers off the response allowance.
 //!
+//! Add `.session(TcpTransport::builder().target(peer))` to prepare an outbound
+//! connection with these same roles, or use `from_stream` for an owned connection.
+//! Explicit sources suppress the default UDP bind. `tcp_sessions()` returns exact
+//! live connections; their handles and controls retain the containing service.
+//! A closed handle never reconnects or selects a new connection by address.
+//! Both connection directions support locally initiated transactions when enabled;
+//! reverse-direction transactions require explicit deployment support from the peer.
+//! TCP frame, dispatch, parked candidate and write bytes share the configured
+//! session/service budgets (32/64 MiB by default). Each session has one queued
+//! classification frame, 16 concurrent application tasks and 32 queued writes by
+//! default; maximum frame/send size is 10 MiB. Notification delivery holds bounded
+//! decoded events separately. Inbound-only application admission may pause for the
+//! overload timeout (default five seconds), excluding framing progress deadlines.
+//! Sessions with client exchanges enabled close on application exhaustion, even
+//! when no exchange is pending. TCP ordering still permits head-of-line blocking.
+//!
 //! Encrypted classification does not publish Reports or security state. The
 //! selected application or exchange performs its own final checks. A shared USM
 //! username must use compatible credentials; conflicting client credentials are
@@ -165,6 +181,7 @@ use crate::oid::Oid;
 use crate::pdu::NotificationPdu;
 use crate::pdu::{Pdu, PduBody, PduType, ResponsePdu};
 use crate::transport::normalize_udp_target;
+#[cfg(test)]
 use crate::transport::udp_error::UdpRecvErrorBackoff;
 #[cfg(test)]
 use crate::transport::udp_error::{UdpRecvErrorClass, classify_udp_recv_error};
@@ -567,14 +584,14 @@ struct ValidatedAgentBuilder {
 }
 
 impl AgentBuilder {
-    /// Enable client exchanges on the prepared UDP endpoints (default false).
+    /// Enable client exchanges on prepared UDP endpoints and TCP sessions (default false).
     /// The existing endpoint runner remains the sole socket reader.
     #[must_use]
     pub fn client_exchanges(mut self, enabled: bool) -> Self {
         self.client_exchanges = enabled;
         self
     }
-    /// Attach one notification consumer to every UDP endpoint. Its engine, USM
+    /// Attach one notification consumer to every endpoint/session. Its engine, USM
     /// users and privacy sender state are inherited from this agent. Take the
     /// consumer from the prepared or running agent before receiving events.
     #[must_use]
@@ -588,6 +605,11 @@ impl AgentBuilder {
     #[must_use]
     pub fn listener(mut self, source: crate::transport::ListenerSource) -> Self {
         self.listeners.push(source);
+        self
+    }
+    /// Prepare an outbound or supplied connected session with this service's roles.
+    pub fn session(mut self, source: crate::TcpTransportBuilder) -> Self {
+        self.listeners.push(crate::ListenerSource::Session(source));
         self
     }
     /// Bound simultaneous TCP connections across all listeners (default 128).
@@ -933,7 +955,8 @@ impl AgentBuilder {
     /// Set the maximum number of requests that the agent processes concurrently.
     ///
     /// The default is 1000. UDP drops are counted when admission is full.
-    /// Inbound TCP sessions wait up to the configured overload deadline.
+    /// Inbound-only TCP sessions wait up to the overload deadline; sessions with
+    /// client exchanges enabled close when application capacity is exhausted.
     ///
     /// This controls memory usage under high load while still allowing
     /// parallel request processing.
@@ -1336,8 +1359,9 @@ impl AgentBuilder {
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity.available_permits());
         let ingress = crate::transport::ingress::ApplicationIngress {
             sender,
-            enabled: Arc::new(AtomicBool::new(true)),
+            disabled: CancellationToken::new(),
             capacity,
+            budget_limit: config.buffered_bytes,
             budget: Arc::new(Semaphore::new(config.buffered_bytes)),
             overload_timeout: config.overload_timeout,
             drops: Arc::new(AtomicU64::new(0)),
@@ -1386,7 +1410,7 @@ impl AgentBuilder {
             &listeners,
             config.max_connections,
             ingress.drops.clone(),
-        ));
+        )?);
 
         let mut trap_sinks = Vec::with_capacity(config.trap_sinks.len());
         for (index, sink) in config.trap_sinks.into_iter().enumerate() {
@@ -1501,7 +1525,7 @@ impl AgentBuilder {
 
         let inner = Arc::new(AgentInner {
             discard_notifications: config.discard_notifications,
-            commands_open: ingress.enabled.clone(),
+            command_stop: ingress.disabled.clone(),
             task_changed: tokio::sync::Notify::new(),
             mutation_failures: AtomicU64::new(0),
             communities: config.communities,
@@ -1550,24 +1574,14 @@ impl AgentBuilder {
             inner: inner.clone(),
         };
         let (notifications, notification_role) = if let Some(role) = config.notifications {
-            let endpoint = network.udp.first().ok_or_else(|| {
-                Error::Config("attached notifications currently require a UDP listener".into())
-                    .boxed()
-            })?;
-            let (mut consumer, processor, cleanup) = role.prepare_attached(&processor, endpoint)?;
+            let (mut consumer, processor, cleanup) =
+                role.prepare_attached(&processor, &network.io)?;
             consumer.attach_lifetime(agent.lease.clone());
-            consumer.endpoints = network.udp.clone();
-            consumer.bound = network
-                .bound
-                .iter()
-                .filter(|bound| bound.transport == crate::TransportKind::Udp)
-                .copied()
-                .collect();
             (Some(consumer), Some((processor, cleanup)))
         } else {
             (None, None)
         };
-        if config.client_exchanges || notification_role.is_some() {
+        {
             let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
                 Some(ingress),
                 notification_role
@@ -1579,8 +1593,8 @@ impl AgentBuilder {
                     .as_ref()
                     .map_or(64, |(processor, _)| processor.processing_limit()),
             ));
-            for endpoint in &network.udp {
-                endpoint.configure_dispatch(roles.clone());
+            for listener in &mut listeners {
+                listener.configure_dispatch(roles.clone());
             }
         }
         let mut runner = AgentRunner::new(inner, network, listeners, receiver);
@@ -1649,6 +1663,12 @@ impl AgentBuilder {
             .boxed());
         }
         if self.listeners.len() > 32
+            || self
+                .listeners
+                .iter()
+                .filter(|source| matches!(source, crate::ListenerSource::Session(_)))
+                .count()
+                > self.max_connections
             || self.max_connections == 0
             || self.max_connections > 65536
             || self.buffered_bytes < crate::UDP_RECEIVE_BUFFER_SIZE
@@ -2022,7 +2042,7 @@ impl AgentState {
 /// Inner state shared across agent clones.
 pub(crate) struct AgentInner {
     discard_notifications: bool,
-    commands_open: Arc<AtomicBool>,
+    command_stop: CancellationToken,
     task_changed: tokio::sync::Notify,
     mutation_failures: AtomicU64,
     pub(crate) communities: Vec<crate::Community>,
@@ -2115,7 +2135,7 @@ impl Agent {
     }
     /// Disable new command processing while shared notifications and exchanges continue.
     pub fn close_commands(&self) {
-        self.inner.commands_open.store(false, Ordering::Release);
+        self.inner.command_stop.cancel();
     }
 
     /// Clone a selected UDP endpoint without creating a reader.
@@ -2127,7 +2147,7 @@ impl Agent {
             .cloned()
             .map(|endpoint| endpoint.with_service_lease(self.lease.clone()))
     }
-    /// Snapshot handles selecting the currently accepted TCP sessions.
+    /// Snapshot handles selecting live accepted and configured TCP sessions.
     pub fn tcp_sessions(&self) -> Vec<crate::TcpTransport> {
         self.network
             .sessions
@@ -2135,6 +2155,7 @@ impl Agent {
             .unwrap()
             .values()
             .cloned()
+            .map(|session| session.with_service_lease(self.lease.clone()))
             .collect()
     }
     #[cfg(test)]

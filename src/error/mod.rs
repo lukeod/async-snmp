@@ -503,6 +503,16 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// Terminal failure of one exact TCP session.
+    #[error("TCP session {session_id:?} ({local_addr} -> {peer_addr}) failed: {source}")]
+    Session {
+        endpoint_id: crate::EndpointId,
+        session_id: crate::SessionId,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        source: Box<Error>,
+    },
+
     /// A failure shared by concurrent participants in one internal operation.
     #[error("{source}")]
     SharedOperation {
@@ -686,7 +696,7 @@ impl Error {
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
         match self {
-            Self::Listener { source, .. } => source.kind(),
+            Self::Listener { source, .. } | Self::Session { source, .. } => source.kind(),
             Self::SharedOperation { source } => source.kind(),
             Self::Exchange { source, .. } => source.kind(),
             Self::Network { .. } => ErrorKind::Network,
@@ -722,7 +732,9 @@ impl Error {
     pub fn response_metadata(&self) -> Option<&crate::client::ResponseMetadata> {
         match self {
             Self::SharedOperation { source } => source.response_metadata(),
-            Self::Listener { source, .. } => source.response_metadata(),
+            Self::Listener { source, .. } | Self::Session { source, .. } => {
+                source.response_metadata()
+            }
             Self::Exchange { metadata, .. }
             | Self::Snmp { metadata, .. }
             | Self::Report { metadata, .. } => Some(metadata.as_ref()),
@@ -740,7 +752,9 @@ impl Error {
     #[must_use]
     pub fn exchange_source(&self) -> &Error {
         match self {
-            Self::Listener { source, .. } => source.exchange_source(),
+            Self::Listener { source, .. } | Self::Session { source, .. } => {
+                source.exchange_source()
+            }
             Self::SharedOperation { source } => source.exchange_source(),
             Self::Exchange { source, .. } => source.exchange_source(),
             _ => self,

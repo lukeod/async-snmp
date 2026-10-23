@@ -242,6 +242,14 @@ impl TcpTransportBuilder {
             .map(|duration| tcp_deadline(duration, "TCP connect timeout"))
             .transpose()?;
         let limits = self.options.validate()?;
+        if let Some(ingress) = &self.ingress
+            && self.options.max_buffered_bytes > ingress.budget_limit
+        {
+            return Err(Error::Config(
+                "service aggregate buffer limit must accommodate one TCP session budget".into(),
+            )
+            .boxed());
+        }
         let stream = if let Some(stream) = self.stream {
             if self.target.is_some() || self.socket.is_some() || self.connect_timeout.is_some() {
                 return Err(Error::Config(
@@ -299,6 +307,7 @@ impl TcpTransportBuilder {
             terminal_error: Mutex::new(None),
             in_flight: Arc::new(Semaphore::new(self.options.max_in_flight)),
             budget: Arc::new(Semaphore::new(self.options.max_buffered_bytes)),
+            dispatch: Mutex::new(None),
             ingress: self.ingress.map(|mut ingress| {
                 ingress.session = Some(Arc::new(Semaphore::new(
                     self.options.max_application_in_flight,
@@ -307,6 +316,7 @@ impl TcpTransportBuilder {
             }),
         });
         let transport = TcpTransport {
+            service_lease: None,
             inner: Arc::new(TcpTransportInner {
                 _lease: state.shutdown.clone().drop_guard(),
                 state: state.clone(),
@@ -344,6 +354,7 @@ impl TcpTransportBuilder {
 /// A closed handle never connects again or selects another session by address.
 #[derive(Clone)]
 pub struct TcpTransport {
+    service_lease: Option<Arc<dyn Send + Sync>>,
     inner: Arc<TcpTransportInner>,
 }
 struct TcpTransportInner {
@@ -353,6 +364,7 @@ struct TcpTransportInner {
     _lease: DropGuard,
 }
 struct SessionState {
+    dispatch: Mutex<Option<Arc<super::dispatch::DispatchRoles>>>,
     endpoint_id: crate::EndpointId,
     session_id: crate::SessionId,
     target: SocketAddr,
@@ -478,7 +490,18 @@ impl TcpRunner {
             result = read_loop(read, state, transport) => result,
             result = write_loop(write, writes, state) => result,
         };
-        result.map_err(|error| state.fail(error))
+        result.map_err(|source| {
+            state.fail(
+                Error::Session {
+                    endpoint_id: state.endpoint_id,
+                    session_id: state.session_id,
+                    local_addr: state.local_addr,
+                    peer_addr: state.target,
+                    source,
+                }
+                .boxed(),
+            )
+        })
     }
 }
 
@@ -581,6 +604,20 @@ impl TcpControl {
 }
 
 impl TcpTransport {
+    pub(crate) fn with_service_lease(mut self, lease: Arc<dyn Send + Sync>) -> Self {
+        self.service_lease = Some(lease);
+        self
+    }
+    pub(crate) fn configure_dispatch(&self, roles: Arc<super::dispatch::DispatchRoles>) {
+        *self.inner.state.dispatch.lock().unwrap() = Some(roles);
+    }
+    pub(crate) fn limits(&self) -> super::EndpointLimits {
+        super::EndpointLimits {
+            receive: self.receive_limits(),
+            send: self.send_capacity(),
+        }
+    }
+
     /// Configure a session from an outbound target or an owned stream.
     pub fn builder() -> TcpTransportBuilder {
         TcpTransportBuilder::new()
@@ -739,6 +776,9 @@ impl RequestTransport for TcpTransport {
         let result = async {
             let state = &self.inner.state;
             crate::message_size::enforce_outbound_size(data.len(), state.options.send_capacity)?;
+            if let Some(roles) = state.dispatch.lock().unwrap().as_ref() {
+                roles.validate_registration(&registration)?;
+            }
             let deadline = registration.deadline();
             let _permit = self
                 .before(deadline, async {
@@ -821,11 +861,49 @@ async fn read_loop(
     if let Some(ingress) = &state.ingress {
         framer = framer.with_shared_budget(ingress.budget.clone(), ingress.overload_timeout);
     }
-    while let Some(frame) = framer.next(&mut read, state.target).await? {
-        let super::framing::ReceivedFrame {
+    let roles = state.dispatch.lock().unwrap().clone();
+    // One queued complete frame, one classifier and one frame under construction.
+    // All retain the original session/global byte permits. Protocol work runs
+    // in an owned worker, independently from the framing reader and writer.
+    let mut workers = tokio::task::JoinSet::new();
+    let dispatch = state.ingress.as_ref().map(|ingress| {
+        let ingress = ingress.clone();
+        let core = state.core.clone();
+        let (sender, mut receiver) = mpsc::channel::<(super::ReceivedMessage, super::framing::BufferPermits)>(1);
+        workers.spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    joined = tasks.join_next(), if !tasks.is_empty() => {
+                        if let Some(Err(error)) = joined { return Err(Error::Config(format!("TCP dispatch task failed: {error}").into()).boxed()); }
+                    },
+                    message = receiver.recv() => {
+                        let Some((message, permit)) = message else { break; };
+                        if let Some(roles) = &roles { roles.dispatch_tcp(message, permit, core.clone(), &ingress, &mut tasks).await?; }
+                        else { ingress.deliver_tcp(message, permit, false).await?; }
+                    }
+                }
+            }
+            while let Some(joined) = tasks.join_next().await {
+                joined.map_err(|error| Error::Config(format!("TCP dispatch task failed: {error}").into()).boxed())?;
+            }
+            Ok(())
+        });
+        sender
+    });
+    loop {
+        let frame = tokio::select! { biased;
+            joined = workers.join_next(), if !workers.is_empty() => return dispatch_result(joined),
+            frame = framer.next(&mut read, state.target) => frame?,
+        };
+        let Some(super::framing::ReceivedFrame {
             bytes: frame,
             permit,
-        } = frame;
+        }) = frame
+        else {
+            break;
+        };
         let info = crate::ReceivedMessageInfo::tcp(
             state.endpoint_id,
             state.session_id,
@@ -834,12 +912,22 @@ async fn read_loop(
             Instant::now(),
             frame.len(),
         );
-        if let Some(ingress) = &state.ingress {
+        if let Some(dispatch) = &dispatch {
             let Some(inner) = transport.upgrade() else {
                 return Ok(());
             };
-            let message = super::ReceivedMessage::tcp(frame, info, TcpTransport { inner });
-            ingress.deliver_tcp(message, permit).await?;
+            let message = super::ReceivedMessage::tcp(
+                frame,
+                info,
+                TcpTransport {
+                    inner,
+                    service_lease: None,
+                },
+            );
+            tokio::select! { biased;
+                joined = workers.join_next() => return dispatch_result(joined),
+                sent = dispatch.send((message, permit)) => { if sent.is_err() { return dispatch_result(workers.join_next().await); } }
+            }
         } else if let Some(envelope) = CorrelationEnvelope::parse(&frame)
             && let Some(id) = envelope.request_id(&frame)
         {
@@ -850,7 +938,20 @@ async fn read_loop(
             state.core.note_malformed();
         }
     }
+    drop(dispatch);
+    if !workers.is_empty() {
+        dispatch_result(workers.join_next().await)?;
+    }
+
     Ok(())
+}
+
+fn dispatch_result(
+    joined: Option<std::result::Result<Result<()>, tokio::task::JoinError>>,
+) -> Result<()> {
+    joined
+        .ok_or_else(|| Error::Config("TCP dispatcher stopped".into()).boxed())?
+        .map_err(|error| Error::Config(format!("TCP dispatcher failed: {error}").into()).boxed())?
 }
 
 async fn write_loop(

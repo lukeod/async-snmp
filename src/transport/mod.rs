@@ -24,6 +24,9 @@ mod framing;
 pub(crate) mod ingress;
 #[cfg_attr(not(feature = "agent"), allow(dead_code))]
 pub(crate) mod listener;
+pub(crate) mod network;
+#[cfg(all(test, feature = "agent"))]
+mod shared_tcp_tests;
 pub use listener::{BoundListener, ListenerSource, TcpListenerSource};
 mod received;
 pub use received::*;

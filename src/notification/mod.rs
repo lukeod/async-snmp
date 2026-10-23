@@ -112,7 +112,7 @@
 //! # }
 //! ```
 //!
-//! # Shared UDP client exchanges
+//! # Shared endpoint client exchanges
 //!
 //! Set [`NotificationReceiverBuilder::client_exchanges`] before preparation to
 //! enable follow-up polling or Informs through `receiver.udp_endpoint(id)` and
@@ -127,11 +127,34 @@
 //! admission uses the exchange deadline and is cancelled by endpoint shutdown.
 //!
 //! With the agent feature, `AgentBuilder::notifications` attaches this consumer
-//! to the agent's UDP endpoints. Configure engine/users/client capability on the
+//! to all of the agent's configured endpoints and sessions. Configure engine/users/client capability on the
 //! agent; attached notification configuration must omit those independent fields.
 //! Attached control shutdown closes only notifications; standalone control
 //! shutdown stops its endpoint service. Consumer closure never enables itself
 //! again through a retained control or client handle.
+//!
+//! Configure `.listener(ListenerSource::udp(...))` and
+//! `.listener(ListenerSource::tcp(...))` for multiple sources, or
+//! `.session(TcpTransport::builder().target(peer))` for an explicitly connected
+//! session. A supplied `TcpStream` uses the same builder's `from_stream` method.
+//! Explicit sources replace the default UDP bind. `bound_addresses()` identifies
+//! each endpoint; `tcp_sessions()` snapshots exact live sessions without reconnecting.
+//! Both accepted and connected sessions support the configured roles. Starting
+//! transactions over a reverse-direction connection requires explicit peer support.
+//!
+//! TCP defaults to 128 service connections, 64 MiB aggregate transport buffering,
+//! 32 MiB per session and 10 MiB frame/send capacity. One frame may be queued for
+//! classification per session, in addition to the active classifier and framer.
+//! Frame, dispatch, write and parked-candidate bytes retain those same budgets;
+//! UDP response reserves remain separate. Session application concurrency defaults
+//! to 16, with service notification processing limited by `max_processing`.
+//! Decoded delivery retains at most `queue_capacity` events and is separate from
+//! the transport byte budgets. Each event is bounded by its receiving frame limit.
+//! Inbound-only TCP sessions pause for capacity for at most five seconds; this
+//! local pause excludes header/body progress deadlines. Sessions configured with
+//! client exchanges close on application/delivery exhaustion even with no pending
+//! exchange. Separate endpoints/sessions continue independently. TCP ordering still
+//! permits head-of-line blocking; shared connections do not promise response isolation.
 //!
 //! # Mixed versions on one port
 //!
@@ -243,14 +266,15 @@ mod lifecycle;
 #[cfg(test)]
 mod lifecycle_tests;
 mod varbind;
-pub(crate) use lifecycle::RunnerCleanup;
-use lifecycle::{Delivery, NotificationAdmission, NotificationLease};
+use lifecycle::{Delivery, NotificationLease};
+pub(crate) use lifecycle::{NotificationAdmission, RunnerCleanup};
 pub use lifecycle::{
     NotificationControl, NotificationHealth, NotificationRunner, NotificationStatus,
     PreparedNotificationReceiver, RunningNotificationReceiver,
 };
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -267,7 +291,7 @@ use crate::oid::Oid;
 use crate::pdu::TrapV1Pdu;
 #[cfg(test)]
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
-use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
+use crate::util::{PreparedAuthoritativeUsm, validate_authoritative_usm};
 use crate::v3::process::RemoteEngineTable;
 use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, SaltCounter};
@@ -739,6 +763,11 @@ pub mod oids {
 /// acceptance policy. See the
 /// [module docs](crate::notification#mixed-versions-on-one-port).
 pub struct NotificationReceiverBuilder {
+    listeners: Vec<crate::ListenerSource>,
+    network_explicit: bool,
+    max_connections: usize,
+    buffered_bytes: usize,
+    overload_timeout: Duration,
     client_exchanges: bool,
     bind_addr: String,
     bind_explicit: bool,
@@ -768,6 +797,11 @@ impl NotificationReceiverBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            listeners: Vec::new(),
+            network_explicit: false,
+            max_connections: 128,
+            buffered_bytes: 64 * 1024 * 1024,
+            overload_timeout: Duration::from_secs(5),
             client_exchanges: false,
             bind_addr: "0.0.0.0:162".to_string(),
             bind_explicit: false,
@@ -786,7 +820,36 @@ impl NotificationReceiverBuilder {
         }
     }
 
-    /// Enable locally initiated exchanges on the same UDP endpoint. Responses
+    /// Add a UDP endpoint or TCP acceptor. Explicit sources replace the default UDP bind.
+    pub fn listener(mut self, source: crate::ListenerSource) -> Self {
+        self.listeners.push(source);
+        self
+    }
+    /// Prepare an outbound or supplied connected TCP session with this notification role.
+    pub fn session(mut self, source: crate::TcpTransportBuilder) -> Self {
+        self.listeners.push(crate::ListenerSource::Session(source));
+        self
+    }
+    /// Limit simultaneous TCP sessions across all sources (default 128).
+    pub fn max_connections(mut self, limit: usize) -> Self {
+        self.network_explicit = true;
+        self.max_connections = limit;
+        self
+    }
+    /// Bound transport-retained bytes across sources (default 64 MiB).
+    pub fn max_buffered_bytes(mut self, limit: usize) -> Self {
+        self.network_explicit = true;
+        self.buffered_bytes = limit;
+        self
+    }
+    /// Limit intentional inbound-only TCP admission pauses (default 5 seconds).
+    pub fn overload_timeout(mut self, timeout: Duration) -> Self {
+        self.network_explicit = true;
+        self.overload_timeout = timeout;
+        self
+    }
+
+    /// Enable locally initiated exchanges on every configured endpoint/session. UDP responses
     /// have an independent bounded dispatch allowance from notification delivery.
     #[must_use]
     pub fn client_exchanges(mut self, enabled: bool) -> Self {
@@ -818,8 +881,8 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Bound concurrent protocol/response work. Default: 64 tasks. Inputs above
-    /// this bound are counted and dropped without blocking the UDP reader.
+    /// Bound concurrent protocol/response work. Default: 64 tasks. UDP overload
+    /// drops without blocking the reader; TCP follows its configured-role admission policy.
     pub fn max_processing(mut self, limit: usize) -> Self {
         self.max_processing = limit;
         self
@@ -1131,15 +1194,11 @@ impl NotificationReceiverBuilder {
             )
             .boxed());
         }
-        if self.max_message_size > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
-            return Err(Error::Config(
-                format!(
-                    "max_message_size must not exceed UDP capacity {}",
-                    crate::UDP_RECEIVE_LIMITS.advertised()
-                )
-                .into(),
-            )
-            .boxed());
+
+        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
+            return Err(
+                Error::Config("max_message_size exceeds the SNMP size range".into()).boxed(),
+            );
         }
         crate::transport::checked_deadline(
             self.response_send_timeout,
@@ -1180,33 +1239,56 @@ impl NotificationReceiverBuilder {
             "authoritative engine state is required for SNMPv3 notification receiving",
         )?;
 
-        let bind_addr: SocketAddr = self.bind_addr.parse().map_err(|_| {
-            Error::Config(format!("invalid bind address: {}", self.bind_addr).into())
-        })?;
-
-        let socket = match self.socket.take() {
-            Some(socket) => {
-                if socket.peer_addr().is_ok() {
-                    return Err(
-                        Error::Config("notification socket must be unconnected".into()).boxed(),
-                    );
-                }
-                socket
-            }
-            None => bind_udp_socket(bind_addr, None, None, false)
-                .await
-                .map_err(|source| Error::Network {
-                    target: bind_addr,
-                    source,
-                })?,
-        };
-        let local_addr = socket.local_addr().map_err(|source| Error::Network {
-            target: bind_addr,
-            source,
-        })?;
-        if local_addr.port() == 0 {
-            return Err(Error::Config("notification socket must already be bound".into()).boxed());
+        if !self.listeners.is_empty() && (self.bind_explicit || self.socket.is_some()) {
+            return Err(Error::Config(
+                "explicit listeners conflict with notification bind/socket configuration".into(),
+            )
+            .boxed());
         }
+        if self.listeners.len() > 32
+            || self
+                .listeners
+                .iter()
+                .filter(|source| matches!(source, crate::ListenerSource::Session(_)))
+                .count()
+                > self.max_connections
+            || self.max_connections == 0
+            || self.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+            || self.buffered_bytes == 0
+            || self.buffered_bytes > u32::MAX as usize
+            || self.buffered_bytes > tokio::sync::Semaphore::MAX_PERMITS
+            || self.overload_timeout.is_zero()
+        {
+            return Err(Error::Config("invalid notification network limits".into()).boxed());
+        }
+        crate::transport::checked_deadline(self.overload_timeout, "notification overload timeout")?;
+        let (sender, _) = mpsc::channel(self.max_processing);
+        let ingress = crate::transport::ingress::ApplicationIngress {
+            sender,
+            disabled: tokio_util::sync::CancellationToken::new(),
+            capacity: Arc::new(tokio::sync::Semaphore::new(self.max_processing)),
+            budget_limit: self.buffered_bytes,
+            budget: Arc::new(tokio::sync::Semaphore::new(self.buffered_bytes)),
+            overload_timeout: self.overload_timeout,
+            drops: Arc::new(AtomicU64::new(0)),
+            session: None,
+        };
+        let sources = if self.listeners.is_empty() {
+            vec![match self.socket.take() {
+                Some(socket) => crate::ListenerSource::udp_socket(socket),
+                None => crate::ListenerSource::udp(&self.bind_addr),
+            }]
+        } else {
+            std::mem::take(&mut self.listeners)
+        };
+        let mut listeners = Vec::new();
+        for source in sources {
+            listeners.push(source.prepare(ingress.clone()).await?);
+        }
+        let network = Arc::new(crate::transport::network::NetworkState::new(
+            &listeners,
+            self.max_connections,
+        )?);
 
         let PreparedAuthoritativeUsm {
             users: usm_users,
@@ -1215,12 +1297,6 @@ impl NotificationReceiverBuilder {
             engine_boots,
         } = validated_usm.prepare(generate_engine_id)?;
         let salt_counter = uses_aes.then(SaltCounter::new).transpose()?.map(Arc::new);
-        let (endpoint, udp_runner) = crate::UdpEndpoint::builder()
-            .from_socket(socket)
-            .max_message_size(crate::MAX_UDP_PAYLOAD)
-            .prepare()
-            .await?
-            .into_parts();
         let enabled = self.client_exchanges;
         let engine = NotificationEngine {
             authoritative_engine,
@@ -1237,27 +1313,24 @@ impl NotificationReceiverBuilder {
 
             time_source: None,
         };
-        let (mut receiver, processor, cleanup) = self.prepare_role(engine, &endpoint)?;
-        endpoint.configure_dispatch(Arc::new(crate::transport::dispatch::DispatchRoles::new(
+        let (receiver, processor, cleanup) = self.prepare_role(engine, network.clone())?;
+        let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
             None,
             Some(processor.clone()),
             processor.inner.usm_users.clone(),
             enabled,
             processor.processing_limit(),
-        )));
-        receiver.endpoints.push(endpoint.clone());
-        receiver.bound.push(crate::transport::BoundListener {
-            endpoint_id: endpoint.endpoint_id(),
-            transport: crate::TransportKind::Udp,
-            local_addr,
-        });
-        let runner = NotificationRunner::from_endpoint(endpoint, udp_runner, processor, cleanup);
+        ));
+        for listener in &mut listeners {
+            listener.configure_dispatch(roles.clone());
+        }
+        let runner = NotificationRunner::from_network(network, listeners, processor, cleanup);
         Ok(PreparedNotificationReceiver { receiver, runner })
     }
     fn prepare_role(
         self,
         engine: NotificationEngine,
-        endpoint: &crate::UdpEndpoint,
+        network: Arc<crate::transport::network::NetworkState>,
     ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
         if self.queue_capacity == 0
             || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
@@ -1268,6 +1341,11 @@ impl NotificationReceiverBuilder {
                 "notification queue and processing limits must be nonzero and representable".into(),
             )
             .boxed());
+        }
+        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
+            return Err(
+                Error::Config("max_message_size exceeds the SNMP size range".into()).boxed(),
+            );
         }
         crate::transport::checked_deadline(
             self.response_send_timeout,
@@ -1285,11 +1363,11 @@ impl NotificationReceiverBuilder {
         let inner = Arc::new(ReceiverInner {
             authoritative_engine: engine.authoritative_engine,
             #[cfg(test)]
-            socket: endpoint.test_socket(),
+            socket: network.udp.first().map(crate::UdpEndpoint::test_socket),
             #[cfg(test)]
-            udp_responder: endpoint.test_responder(),
+            udp_responder: network.udp.first().map(crate::UdpEndpoint::test_responder),
             #[cfg(test)]
-            endpoint_id: endpoint.endpoint_id(),
+            endpoint_id: network.bound[0].endpoint_id,
             delivery: delivery.clone(),
             health,
             usm_users: engine.usm_users,
@@ -1331,9 +1409,7 @@ impl NotificationReceiverBuilder {
         let state = Arc::new(lifecycle::ServiceState::new());
         let lease = Arc::new(NotificationLease::new(state.shutdown.clone()));
         let receiver = NotificationReceiver {
-            local_addr: endpoint.local_addr(),
-            endpoints: Vec::new(),
-            bound: Vec::new(),
+            network,
             inner: inner.clone(),
             events,
             state: state.clone(),
@@ -1349,6 +1425,8 @@ impl NotificationReceiverBuilder {
     #[cfg(feature = "agent")]
     pub(crate) fn validate_attached(&self, has_users: bool) -> Result<()> {
         if self.socket.is_some()
+            || self.network_explicit
+            || !self.listeners.is_empty()
             || self.bind_explicit
             || self.authoritative_engine.is_some()
             || !self.usm_users.is_empty()
@@ -1367,9 +1445,10 @@ impl NotificationReceiverBuilder {
             )
             .boxed());
         }
-        if self.max_message_size > crate::UDP_RECEIVE_LIMITS.advertised().as_usize() {
+
+        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
             return Err(
-                Error::Config("notification max_message_size exceeds UDP capacity".into()).boxed(),
+                Error::Config("max_message_size exceeds the SNMP size range".into()).boxed(),
             );
         }
         crate::transport::checked_deadline(
@@ -1389,7 +1468,7 @@ impl NotificationReceiverBuilder {
     pub(crate) fn prepare_attached(
         self,
         agent: &crate::agent::AgentProcessor,
-        endpoint: &crate::UdpEndpoint,
+        network: &Arc<crate::transport::network::NetworkState>,
     ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
         self.validate_attached(!agent.inner.usm_users.is_empty())?;
         let state = agent.inner.state.clone();
@@ -1408,7 +1487,7 @@ impl NotificationReceiverBuilder {
 
             time_source: Some(Arc::new(move || state.authoritative_boots_time())),
         };
-        self.prepare_role(engine, endpoint)
+        self.prepare_role(engine, network.clone())
     }
 
     /// Prepare and spawn the same runner on the current runtime.
@@ -1688,9 +1767,7 @@ impl Notification {
 /// # }
 /// ```
 pub struct NotificationReceiver {
-    pub(crate) endpoints: Vec<crate::UdpEndpoint>,
-    pub(crate) bound: Vec<crate::transport::BoundListener>,
-    local_addr: SocketAddr,
+    network: Arc<crate::transport::network::NetworkState>,
     inner: Arc<ReceiverInner>,
     events: mpsc::Receiver<ReceivedNotification>,
     state: Arc<lifecycle::ServiceState>,
@@ -1726,9 +1803,9 @@ struct ReceiverInner {
     idle: tokio::sync::Notify,
     authoritative_engine: Option<AuthoritativeEngine>,
     #[cfg(test)]
-    socket: Arc<UdpSocket>,
+    socket: Option<Arc<UdpSocket>>,
     #[cfg(test)]
-    udp_responder: Arc<UdpResponder>,
+    udp_responder: Option<Arc<UdpResponder>>,
     #[cfg(test)]
     endpoint_id: crate::EndpointId,
     delivery: Arc<Delivery>,
@@ -1959,10 +2036,9 @@ impl NotificationReceiver {
             .await
     }
 
-    /// Returns the local address that this receiver is bound to.
-    #[must_use]
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    #[cfg(test)]
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.network.bound[0].local_addr
     }
 
     /// Return the configured notification decode configuration.
@@ -2076,8 +2152,8 @@ impl NotificationProcessor {
         crate::transport::ReceivedMessage::udp(
             data,
             self.inner.endpoint_id,
-            self.inner.socket.clone(),
-            self.inner.udp_responder.clone(),
+            self.inner.socket.clone().expect("UDP test fixture"),
+            self.inner.udp_responder.clone().expect("UDP test fixture"),
             received,
             tokio::time::Instant::now(),
             crate::transport::EndpointLimits::UDP,
@@ -2285,7 +2361,13 @@ mod tests {
             assert_eq!(receiver.snmp_silent_drops(), 0);
             assert!(receiver.inner.acceptance_policy.is_none());
             assert_eq!(
-                receiver.inner.socket.local_addr().unwrap(),
+                receiver
+                    .inner
+                    .socket
+                    .as_ref()
+                    .unwrap()
+                    .local_addr()
+                    .unwrap(),
                 receiver.local_addr()
             );
         }

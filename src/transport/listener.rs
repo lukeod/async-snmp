@@ -2,11 +2,11 @@
 use super::{
     EndpointLimits, TcpOptions, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner,
 };
-use crate::{EndpointId, Error, Result};
+use crate::{EndpointId, Error, RequestTransport, Result};
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, UdpSocket};
 
-/// Identified bound address. TCP sessions retain this listener identity while
+/// Identified bound endpoint address, including a configured connection. Accepted sessions retain the listener identity while
 /// receiving distinct session identities and connected local addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundListener {
@@ -15,10 +15,12 @@ pub struct BoundListener {
     pub local_addr: SocketAddr,
 }
 
-/// A UDP endpoint or TCP acceptor configured before application execution.
+/// A UDP endpoint, TCP acceptor or explicit connected session configured before execution.
 pub enum ListenerSource {
     Udp(UdpEndpointBuilder),
     Tcp(TcpListenerSource),
+    /// An explicitly connected session, prepared before execution.
+    Session(super::TcpTransportBuilder),
 }
 impl ListenerSource {
     /// Configure UDP with full datagram receive/send capacities.
@@ -63,9 +65,24 @@ impl ListenerSource {
                     runner,
                 })
             }
+            Self::Session(builder) => {
+                let id = EndpointId::new();
+                let (transport, runner) =
+                    builder.ingress(ingress, id).prepare().await?.into_parts();
+                let bound = BoundListener {
+                    endpoint_id: id,
+                    transport: TransportKind::Tcp,
+                    local_addr: transport.local_addr(),
+                };
+                Ok(PreparedListener::Session {
+                    bound,
+                    transport,
+                    runner,
+                })
+            }
             Self::Tcp(source) => {
                 source.options.validate()?;
-                if source.options.max_buffered_bytes > ingress.budget.available_permits() {
+                if source.options.max_buffered_bytes > ingress.budget_limit {
                     return Err(Error::Config(
                         "listener aggregate buffer limit must accommodate one TCP session budget"
                             .into(),
@@ -116,6 +133,7 @@ impl ListenerSource {
                     listener,
                     options: source.options,
                     ingress,
+                    roles: None,
                 })
             }
         }
@@ -151,6 +169,11 @@ impl TcpListenerSource {
 }
 
 pub(crate) enum PreparedListener {
+    Session {
+        bound: BoundListener,
+        transport: super::TcpTransport,
+        runner: super::TcpRunner,
+    },
     Udp {
         bound: BoundListener,
         endpoint: UdpEndpoint,
@@ -161,17 +184,32 @@ pub(crate) enum PreparedListener {
         listener: TcpListener,
         options: TcpOptions,
         ingress: super::ingress::ApplicationIngress,
+        roles: Option<std::sync::Arc<super::dispatch::DispatchRoles>>,
     },
 }
 impl PreparedListener {
+    pub(crate) fn configure_dispatch(
+        &mut self,
+        dispatch: std::sync::Arc<super::dispatch::DispatchRoles>,
+    ) {
+        match self {
+            Self::Udp { endpoint, .. } => endpoint.configure_dispatch(dispatch),
+            Self::Session { transport, .. } => transport.configure_dispatch(dispatch),
+            Self::Tcp { roles, .. } => *roles = Some(dispatch),
+        }
+    }
+
     pub(crate) fn bound(&self) -> BoundListener {
         match self {
-            Self::Udp { bound, .. } | Self::Tcp { bound, .. } => *bound,
+            Self::Udp { bound, .. } | Self::Tcp { bound, .. } | Self::Session { bound, .. } => {
+                *bound
+            }
         }
     }
     pub(crate) fn limits(&self) -> EndpointLimits {
         match self {
             Self::Udp { endpoint, .. } => endpoint.limits(),
+            Self::Session { transport, .. } => transport.limits(),
             Self::Tcp { options, .. } => EndpointLimits {
                 receive: crate::ReceiveLimits::tcp(options.max_message_size).expect("validated"),
                 send: options.send_capacity,

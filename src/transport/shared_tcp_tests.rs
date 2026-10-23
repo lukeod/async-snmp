@@ -1,0 +1,1013 @@
+//! Real-socket application/session composition and admission boundaries.
+use super::*;
+use crate::{Agent, Auth, Client, ClientBuilder, NotificationReceiver, Retry, Value, oid};
+use bytes::Bytes;
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+};
+
+fn engine(id: &'static [u8]) -> crate::AuthoritativeEngine {
+    crate::AuthoritativeEngine::install(id.to_vec(), |_| Ok::<_, Infallible>(())).unwrap()
+}
+fn agent(id: &'static [u8]) -> crate::agent::AgentBuilder {
+    Agent::builder()
+        .community(b"public")
+        .allow_all_access()
+        .authoritative_engine(engine(id))
+        .client_exchanges(true)
+        .notifications(NotificationReceiver::builder().accept_all_notifications())
+}
+fn client(session: TcpTransport, auth: Auth) -> Client<TcpTransport> {
+    ClientBuilder::new(auth)
+        .retry(Retry::none())
+        .request_timeout(Duration::from_secs(2))
+        .build_with_transport(session)
+        .unwrap()
+}
+fn oid() -> crate::Oid {
+    oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0)
+}
+fn trap() -> crate::Oid {
+    crate::notification::oids::cold_start()
+}
+fn community(pdu: crate::Pdu) -> Bytes {
+    crate::message::CommunityMessage::v2c("public", pdu)
+        .unwrap()
+        .encode()
+        .unwrap()
+}
+fn registration(id: i32) -> RequestRegistration {
+    RequestRegistration::community(
+        id,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        crate::CommunityVersion::V2c,
+        "public",
+        CommunityResponsePolicy::Exact,
+    )
+}
+async fn until(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+async fn read(stream: &mut TcpStream) -> Bytes {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = vec![0; 2];
+        stream.read_exact(&mut bytes).await.unwrap();
+        let len = if bytes[1] < 128 {
+            bytes[1] as usize
+        } else {
+            let n = (bytes[1] & 127) as usize;
+            bytes.resize(2 + n, 0);
+            stream.read_exact(&mut bytes[2..]).await.unwrap();
+            bytes[2..]
+                .iter()
+                .fold(0usize, |value, byte| value * 256 + *byte as usize)
+        };
+        let header = bytes.len();
+        bytes.resize(header + len, 0);
+        stream.read_exact(&mut bytes[header..]).await.unwrap();
+        Bytes::from(bytes)
+    })
+    .await
+    .unwrap()
+}
+async fn accepted(service: &Agent) -> TcpTransport {
+    until(|| !service.tcp_sessions().is_empty()).await;
+    service.tcp_sessions()[0].clone()
+}
+
+#[tokio::test]
+async fn accepted_and_connected_roles_exchange_both_directions_and_close_independently() {
+    let mut a = agent(b"tcp-acceptor")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let mut b = agent(b"tcp-connector")
+        .session(TcpTransport::builder().target(a.bound_addresses()[0].local_addr))
+        .spawn()
+        .await
+        .unwrap();
+    assert_eq!(b.bound_addresses().len(), 1);
+    assert_eq!(b.bound_addresses()[0].transport, TransportKind::Tcp);
+    let mut na = a.take_notifications().unwrap();
+    let mut nb = b.take_notifications().unwrap();
+    let sa = accepted(&a).await;
+    let sb = b.tcp_sessions()[0].clone();
+    assert_eq!(sa.peer_addr(), sb.local_addr());
+    assert_eq!(sb.peer_addr(), sa.local_addr());
+    for auth in [Auth::v1("public"), Auth::v2c("public")] {
+        let ab = client(sa.clone(), auth.clone());
+        let ba = client(sb.clone(), auth);
+        let oid = oid();
+        let (x, y) = tokio::join!(ab.get(&oid), ba.get(&oid));
+        assert_eq!(
+            x.unwrap().varbinds[0].value,
+            Value::OctetString(b.engine_id().to_vec().into())
+        );
+        assert_eq!(
+            y.unwrap().varbinds[0].value,
+            Value::OctetString(a.engine_id().to_vec().into())
+        );
+        ab.send_trap(&trap(), 1, vec![]).await.unwrap();
+        let event = nb.recv().await.unwrap();
+        assert_eq!(event.receive_info.session_id(), Some(sb.session_id()));
+        assert_eq!(event.receive_info.endpoint_id(), sb.endpoint_id());
+        assert_eq!(event.receive_info.local_addr(), sb.local_addr());
+        assert!(event.receive_info.received_len() > 20);
+    }
+    let ab = client(sa.clone(), Auth::v2c("public"));
+    let ba = client(sb.clone(), Auth::v2c("public"));
+    let trap = trap();
+    let (x, y) = tokio::join!(
+        ab.send_inform(&trap, 1, vec![]),
+        ba.send_inform(&trap, 1, vec![])
+    );
+    x.unwrap();
+    y.unwrap();
+    na.recv().await.unwrap();
+    nb.recv().await.unwrap();
+    nb.close();
+    ab.get(&oid()).await.unwrap();
+    ba.get(&oid()).await.unwrap();
+    ab.send_trap(&trap, 2, vec![]).await.unwrap();
+    assert!(nb.recv().await.is_none());
+    b.shutdown().await.unwrap();
+    until(|| sa.control().is_shutdown()).await;
+    assert!(ab.get(&oid()).await.is_err());
+    let replacement = TcpTransport::connect(a.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    until(|| !a.tcp_sessions().is_empty()).await;
+    assert_ne!(a.tcp_sessions()[0].session_id(), sa.session_id());
+    assert!(ab.get(&oid()).await.is_err());
+    replacement.control().shutdown().await;
+    a.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_notification_mixed_sources_and_outbound_session() {
+    let mut peer = agent(b"collector-peer")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let mut collector = NotificationReceiver::builder()
+        .client_exchanges(true)
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .session(TcpTransport::builder().target(peer.bound_addresses()[0].local_addr))
+        .spawn()
+        .await
+        .unwrap();
+    let _peer_notifications = peer.take_notifications().unwrap();
+    assert_eq!(collector.bound_addresses().len(), 3);
+    let outbound = collector.tcp_sessions()[0].clone();
+    client(outbound.clone(), Auth::v2c("public"))
+        .get(&oid())
+        .await
+        .unwrap();
+    for bound in collector.bound_addresses().to_vec().into_iter().take(2) {
+        for auth in [Auth::v1("public"), Auth::v2c("public")] {
+            let builder = Client::builder(bound.local_addr.to_string(), auth).retry(Retry::none());
+            if bound.transport == TransportKind::Tcp {
+                let sender = builder.connect_tcp().await.unwrap();
+                sender.send_trap(&trap(), 1, vec![]).await.unwrap();
+            } else {
+                let sender = builder.connect().await.unwrap();
+                sender.send_trap(&trap(), 1, vec![]).await.unwrap();
+            }
+            let event = collector.recv().await.unwrap();
+            assert_eq!(event.receive_info.endpoint_id(), bound.endpoint_id);
+            assert_eq!(event.receive_info.transport(), bound.transport);
+        }
+    }
+    let incoming = client(accepted(&peer).await, Auth::v2c("public"));
+    incoming.send_inform(&trap(), 1, vec![]).await.unwrap();
+    assert_eq!(
+        collector.recv().await.unwrap().receive_info.session_id(),
+        Some(outbound.session_id())
+    );
+    collector.close();
+    client(outbound, Auth::v2c("public"))
+        .get(&oid())
+        .await
+        .unwrap();
+    collector.shutdown().await.unwrap();
+    peer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn collision_rejection_and_identical_ids_are_session_scoped() {
+    let mut service = agent(b"tcp-collision")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let mut events = service.take_notifications().unwrap();
+    let mut peers = Vec::new();
+    for _ in 0..2 {
+        peers.push(
+            TcpStream::connect(service.bound_addresses()[0].local_addr)
+                .await
+                .unwrap(),
+        );
+    }
+    until(|| service.tcp_sessions().len() == 2).await;
+    let mut pending = Vec::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    for stream in &mut peers {
+        let session = service
+            .tcp_sessions()
+            .into_iter()
+            .find(|s| s.peer_addr() == stream.local_addr().unwrap())
+            .unwrap();
+        let calls = calls.clone();
+        pending.push(tokio::spawn(async move {
+            session
+                .request_with(
+                    &community(crate::Pdu::get_request(41, &[oid()])),
+                    registration(41),
+                    move |bytes, _| {
+                        let pdu = crate::message::CommunityMessage::decode(
+                            bytes,
+                            crate::DecodeConfig::DEFAULT,
+                        )?
+                        .value
+                        .into_pdu()
+                        .unwrap();
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if pdu.varbinds().is_empty() {
+                            Ok(Candidate::Reject)
+                        } else {
+                            Ok(Candidate::Accept(()))
+                        }
+                    },
+                )
+                .await
+        }));
+        read(stream).await;
+        stream
+            .write_all(&community(crate::Pdu::inform_request(
+                41,
+                1,
+                &trap(),
+                vec![],
+            )))
+            .await
+            .unwrap();
+        read(stream).await;
+        assert_eq!(
+            events.recv().await.unwrap().wire_identity.request_id,
+            Some(41)
+        );
+        stream.write_all(&[0x30, 0]).await.unwrap();
+        stream
+            .write_all(&community(crate::Pdu::response(41, 0, 0, vec![])))
+            .await
+            .unwrap();
+    }
+    for stream in &mut peers {
+        stream
+            .write_all(&community(crate::Pdu::response(
+                41,
+                0,
+                0,
+                vec![crate::VarBind::new(oid(), Value::Null)],
+            )))
+            .await
+            .unwrap();
+    }
+    for request in pending {
+        request.await.unwrap().unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn full_shared_notification_queue_closes_session_and_fails_pending_with_identity() {
+    let mut service = NotificationReceiver::builder()
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .client_exchanges(true)
+        .queue_capacity(1)
+        .spawn()
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    stream
+        .write_all(&community(crate::Pdu::inform_request(
+            1,
+            1,
+            &trap(),
+            vec![],
+        )))
+        .await
+        .unwrap();
+    read(&mut stream).await;
+    let session = service.tcp_sessions()[0].clone();
+    let id = session.session_id();
+    let handle = session.clone();
+    let request = tokio::spawn(async move {
+        handle
+            .request_with(
+                &community(crate::Pdu::get_request(42, &[oid()])),
+                registration(42),
+                |_, _| Ok(Candidate::Accept(())),
+            )
+            .await
+    });
+    read(&mut stream).await;
+    stream
+        .write_all(&community(crate::Pdu::inform_request(
+            2,
+            1,
+            &trap(),
+            vec![],
+        )))
+        .await
+        .unwrap();
+    let error = request.await.unwrap().unwrap_err();
+    let crate::Error::SharedOperation { source } = &*error else {
+        panic!("{error:?}")
+    };
+    assert!(matches!(&**source, crate::Error::Session { session_id, .. } if *session_id == id));
+    until(|| session.control().is_shutdown()).await;
+    service.recv().await.unwrap();
+    let independent = TcpTransport::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    client(independent, Auth::v2c("public"))
+        .send_inform(&trap(), 1, vec![])
+        .await
+        .unwrap();
+    service.recv().await.unwrap();
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inbound_only_queue_pause_excludes_progress_deadline_and_times_out_separately() {
+    let options = TcpOptions {
+        header_timeout: Duration::from_millis(20),
+        body_timeout: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let mut service = NotificationReceiver::builder()
+        .listener(ListenerSource::Tcp(
+            TcpListenerSource::bind("127.0.0.1:0").session_options(options),
+        ))
+        .queue_capacity(1)
+        .overload_timeout(Duration::from_millis(350))
+        .spawn()
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let inform = community(crate::Pdu::inform_request(1, 1, &trap(), vec![]));
+    stream.write_all(&inform).await.unwrap();
+    read(&mut stream).await;
+    stream.write_all(&inform).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    assert!(!service.tcp_sessions()[0].control().is_shutdown());
+    service.recv().await.unwrap();
+    read(&mut stream).await;
+    service.recv().await.unwrap();
+    stream.write_all(&inform).await.unwrap();
+    read(&mut stream).await;
+    let session = service.tcp_sessions()[0].clone();
+    stream.write_all(&inform).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), session.control().wait_closed())
+        .await
+        .unwrap();
+    assert!(matches!(session.control().status(), TcpStatus::Failed(_)));
+    service.recv().await.unwrap();
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_session_controls_retain_root_lifetime_without_driver_cycle() {
+    let service = agent(b"tcp-lease")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .prepare()
+        .await
+        .unwrap();
+    let (agent, runner) = service.into_parts();
+    let root = agent.control();
+    let task = tokio::spawn(runner.run());
+    let mut stream = TcpStream::connect(agent.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let selected = accepted(&agent).await;
+    let control = selected.control();
+    drop(selected);
+    drop(agent);
+    drop(root);
+    stream
+        .write_all(&community(crate::Pdu::get_request(1, &[oid()])))
+        .await
+        .unwrap();
+    read(&mut stream).await;
+    assert!(!task.is_finished());
+    drop(control);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn partial_notification_setup_failure_releases_owned_sources() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp = socket.local_addr().unwrap();
+    assert!(
+        NotificationReceiver::builder()
+            .listener(ListenerSource::tcp_listener(listener))
+            .listener(ListenerSource::udp_socket(socket))
+            .listener(ListenerSource::tcp("invalid"))
+            .prepare()
+            .await
+            .is_err()
+    );
+    tokio::net::TcpListener::bind(address).await.unwrap();
+    UdpSocket::bind(udp).await.unwrap();
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+fn secured_agent(id: &'static [u8]) -> crate::agent::AgentBuilder {
+    agent(id)
+        .usm_user("noauth", Ok)
+        .unwrap()
+        .usm_user("auth", |u| {
+            u.auth(crate::AuthProtocol::Sha256, b"shared-auth-password")
+        })
+        .unwrap()
+        .usm_user("priv", |u| {
+            u.auth_priv(
+                crate::AuthProtocol::Sha256,
+                b"shared-auth-password",
+                crate::PrivProtocol::Aes128,
+                b"shared-priv-password",
+            )
+        })
+        .unwrap()
+}
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+fn security(name: &str) -> crate::UsmConfig {
+    let config = crate::UsmConfig::new(name.to_owned());
+    match name {
+        "noauth" => config,
+        "auth" => config
+            .auth(crate::AuthProtocol::Sha256, b"shared-auth-password")
+            .unwrap(),
+        _ => config
+            .auth_priv(
+                crate::AuthProtocol::Sha256,
+                b"shared-auth-password",
+                crate::PrivProtocol::Aes128,
+                b"shared-priv-password",
+            )
+            .unwrap(),
+    }
+}
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+fn secured(pdu: crate::Pdu, id: i32, engine: &[u8], config: &crate::UsmConfig) -> bytes::Bytes {
+    let keys = config.derive_keys(engine).unwrap();
+    let reportable = matches!(
+        pdu.pdu_type(),
+        crate::PduType::GetRequest | crate::PduType::InformRequest
+    );
+    crate::v3::encode::encode_v3_message(
+        &pdu,
+        id,
+        engine,
+        1,
+        0,
+        config,
+        Some(&keys),
+        Some(&crate::v3::SaltCounter::new().unwrap()),
+        None,
+        None,
+        reportable,
+        crate::MessageSize::from_i32(65507).unwrap(),
+    )
+    .unwrap()
+    .into()
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn encrypted_collision_preserves_role_and_failure_ownership() {
+    let mut service = secured_agent(b"tcp-secured-collision")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let mut events = service.take_notifications().unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let session = accepted(&service).await;
+    let config = security("priv");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let registration =
+        RequestRegistration::v3(77, tokio::time::Instant::now() + Duration::from_secs(2))
+            .with_classification_usm(
+                config.clone(),
+                Some(Bytes::from_static(b"tcp-remote-engine")),
+            );
+    let outgoing = secured(
+        crate::Pdu::get_request(77, &[oid()]),
+        77,
+        b"tcp-remote-engine",
+        &config,
+    );
+    let pending = tokio::spawn(async move {
+        session
+            .request_with(&outgoing, registration, move |_, _| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Candidate::Reject)
+                } else {
+                    Ok(Candidate::Accept(()))
+                }
+            })
+            .await
+    });
+    read(&mut stream).await;
+    for pdu in [
+        crate::Pdu::get_request(77, &[oid()]),
+        crate::Pdu::inform_request(77, 1, &trap(), vec![]),
+    ] {
+        stream
+            .write_all(&secured(pdu, 77, service.engine_id(), &config))
+            .await
+            .unwrap();
+        read(&mut stream).await;
+    }
+    events.recv().await.unwrap();
+    stream
+        .write_all(&secured(
+            crate::Pdu::trap_v2(77, 1, &trap(), vec![]),
+            77,
+            b"tcp-remote-engine",
+            &config,
+        ))
+        .await
+        .unwrap();
+    events.recv().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let valid = secured(
+        crate::Pdu::response(77, 0, 0, vec![]),
+        77,
+        b"tcp-remote-engine",
+        &config,
+    );
+    let mut bad = valid.to_vec();
+    *bad.last_mut().unwrap() ^= 1;
+    stream.write_all(&bad).await.unwrap();
+    until(|| calls.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(events.usm_wrong_digests(), 0);
+    stream.write_all(&valid).await.unwrap();
+    pending.await.unwrap().unwrap();
+    service.shutdown().await.unwrap();
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn v3_bidirectional_commands_traps_and_informs_use_one_accepted_connected_session() {
+    let mut a = secured_agent(b"tcp-v3-acceptor")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let mut b = secured_agent(b"tcp-v3-connector")
+        .session(TcpTransport::builder().target(a.bound_addresses()[0].local_addr))
+        .spawn()
+        .await
+        .unwrap();
+    let mut na = a.take_notifications().unwrap();
+    let mut nb = b.take_notifications().unwrap();
+    let sa = accepted(&a).await;
+    let sb = b.tcp_sessions()[0].clone();
+    for name in ["noauth", "auth", "priv"] {
+        let ab = client(sa.clone(), security(name).into());
+        let ba = client(sb.clone(), security(name).into());
+        let oid = oid();
+        let trap = trap();
+        let (x, y) = tokio::join!(ab.get(&oid), ba.get(&oid));
+        x.unwrap();
+        y.unwrap();
+        let (x, y) = tokio::join!(
+            ab.send_inform(&trap, 1, vec![]),
+            ba.send_inform(&trap, 1, vec![])
+        );
+        x.unwrap();
+        y.unwrap();
+        na.recv().await.unwrap();
+        nb.recv().await.unwrap();
+        let sender = ClientBuilder::new(security(name))
+            .local_authoritative_engine(engine(b"tcp-remote-trap-sender"))
+            .build_with_transport(sa.clone())
+            .unwrap();
+        sender.send_trap(&trap, 1, vec![]).await.unwrap();
+        let event = nb.recv().await.unwrap();
+        assert_eq!(event.receive_info.session_id(), Some(sb.session_id()));
+    }
+    nb.close();
+    client(sa, security("priv").into())
+        .get(&oid())
+        .await
+        .unwrap();
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_discovery() {
+    let mut collector = NotificationReceiver::builder()
+        .client_exchanges(true)
+        .queue_capacity(1)
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .authoritative_engine(engine(b"tcp-collector-engine"))
+        .accept_all_notifications()
+        .usm_user("noauth", Ok)
+        .unwrap()
+        .usm_user("auth", |u| {
+            u.auth(crate::AuthProtocol::Sha256, b"shared-auth-password")
+        })
+        .unwrap()
+        .usm_user("priv", |u| {
+            u.auth_priv(
+                crate::AuthProtocol::Sha256,
+                b"shared-auth-password",
+                crate::PrivProtocol::Aes128,
+                b"shared-priv-password",
+            )
+        })
+        .unwrap()
+        .spawn()
+        .await
+        .unwrap();
+    for bound in collector.bound_addresses().to_vec() {
+        for name in ["noauth", "auth", "priv"] {
+            let builder = Client::builder(bound.local_addr.to_string(), security(name))
+                .local_authoritative_engine(engine(b"tcp-standalone-trapper"))
+                .retry(Retry::none());
+            if bound.transport == TransportKind::Tcp {
+                let sender = builder.connect_tcp().await.unwrap();
+                sender.send_trap(&trap(), 1, vec![]).await.unwrap();
+                collector.recv().await.unwrap();
+                sender.send_inform(&trap(), 1, vec![]).await.unwrap();
+            } else {
+                let sender = builder.connect().await.unwrap();
+                sender.send_trap(&trap(), 1, vec![]).await.unwrap();
+                collector.recv().await.unwrap();
+                sender.send_inform(&trap(), 1, vec![]).await.unwrap();
+            }
+            let event = collector.recv().await.unwrap();
+            assert_eq!(event.receive_info.endpoint_id(), bound.endpoint_id);
+        }
+    }
+    let session = TcpTransport::connect(collector.bound_addresses()[1].local_addr)
+        .await
+        .unwrap();
+    client(session.clone(), Auth::v2c("public"))
+        .send_inform(&trap(), 1, vec![])
+        .await
+        .unwrap();
+    // Discovery is report-only and needs no delivery capacity. Explicit discovery
+    // is exercised by a fresh v3 client GET, which receives the Report before its
+    // unsupported command times out, leaving the shared session alive.
+    let poller = ClientBuilder::new(security("priv"))
+        .request_timeout(Duration::from_millis(80))
+        .retry(Retry::none())
+        .build_with_transport(session.clone())
+        .unwrap();
+    assert!(poller.get(&oid()).await.is_err());
+    assert!(!session.control().is_shutdown());
+    collector.recv().await.unwrap();
+    collector.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_tcp_response_above_one_megabyte_retains_exact_metadata() {
+    let service = agent(b"large-shared-tcp")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let session = accepted(&service).await;
+    let id = session.session_id();
+    let pending = tokio::spawn(async move {
+        session
+            .request_with(
+                &community(crate::Pdu::get_request(42, &[oid()])),
+                registration(42),
+                |bytes, info| Ok(Candidate::Accept((bytes, info))),
+            )
+            .await
+    });
+    read(&mut stream).await;
+    let bytes = community(crate::Pdu::response(
+        42,
+        0,
+        0,
+        vec![crate::VarBind::new(
+            oid(),
+            Value::OctetString(vec![42; 1_100_000].into()),
+        )],
+    ));
+    stream.write_all(&bytes).await.unwrap();
+    let (received, info) = pending.await.unwrap().unwrap();
+    assert_eq!(received, bytes);
+    assert_eq!(info.received_len(), bytes.len());
+    assert_eq!(info.session_id(), Some(id));
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_sessions_share_connection_budget_and_owned_stream_source() {
+    let remote = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let outgoing = TcpStream::connect(remote.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (_remote, _) = remote.accept().await.unwrap();
+    let service = agent(b"configured-budget")
+        .max_connections(1)
+        .session(TcpTransport::builder().from_stream(outgoing))
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let configured = service.tcp_sessions()[0].clone();
+    let mut rejected = TcpStream::connect(service.bound_addresses()[1].local_addr)
+        .await
+        .unwrap();
+    let mut byte = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    configured.control().shutdown().await;
+    until(|| service.tcp_sessions().is_empty()).await;
+    let newcomer = TcpTransport::connect(service.bound_addresses()[1].local_addr)
+        .await
+        .unwrap();
+    client(newcomer, Auth::v2c("public"))
+        .get(&oid())
+        .await
+        .unwrap();
+    assert!(
+        configured
+            .send(&community(crate::Pdu::get_request(3, &[oid()])))
+            .await
+            .is_err()
+    );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn notification_session_peer_and_control_keep_service_alive_after_consumer_drop() {
+    let peer = agent(b"notification-lease-peer")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let (receiver, runner) = NotificationReceiver::builder()
+        .client_exchanges(true)
+        .session(TcpTransport::builder().target(peer.bound_addresses()[0].local_addr))
+        .prepare()
+        .await
+        .unwrap()
+        .into_parts();
+    let selected = receiver.tcp_sessions()[0].clone();
+    let control = selected.control();
+    let task = tokio::spawn(runner.run());
+    drop(receiver);
+    client(selected.clone(), Auth::v2c("public"))
+        .get(&oid())
+        .await
+        .unwrap();
+    drop(selected);
+    assert!(!task.is_finished());
+    drop(control);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    peer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn overloaded_session_leaves_commands_and_other_session_progressing() {
+    let mut service = Agent::builder()
+        .community(b"public")
+        .allow_all_access()
+        .client_exchanges(true)
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .notifications(NotificationReceiver::builder().queue_capacity(1))
+        .spawn()
+        .await
+        .unwrap();
+    let mut events = service.take_notifications().unwrap();
+    let mut overloaded = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let bytes = community(crate::Pdu::inform_request(1, 1, &trap(), vec![]));
+    overloaded.write_all(&bytes).await.unwrap();
+    read(&mut overloaded).await;
+    let first = service.tcp_sessions()[0].clone();
+    overloaded.write_all(&bytes).await.unwrap();
+    let independent = TcpTransport::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    client(independent, Auth::v2c("public"))
+        .get(&oid())
+        .await
+        .unwrap();
+    until(|| first.control().is_shutdown()).await;
+    // The full queue remains undrained until after the independent command finishes.
+    events.recv().await.unwrap();
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_only_notification_accepts_and_acknowledges_frames_above_udp_capacity() {
+    let mut service = NotificationReceiver::builder()
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .max_message_size(2_000_000)
+        .spawn()
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let bytes = community(crate::Pdu::inform_request(
+        1,
+        1,
+        &trap(),
+        vec![crate::VarBind::new(
+            oid(),
+            Value::OctetString(vec![42; 1_100_000].into()),
+        )],
+    ));
+    stream.write_all(&bytes).await.unwrap();
+    let response = read(&mut stream).await;
+    assert!(response.len() > 1_000_000);
+    let event = service.recv().await.unwrap();
+    assert_eq!(event.receive_info.received_len(), bytes.len());
+    assert!(matches!(
+        event.inform_ack,
+        Some(crate::notification::InformAckOutcome::Sent)
+    ));
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_notification_role_resumes_paused_session_commands() {
+    let mut service = agent(b"pause-close-notifications")
+        .client_exchanges(false)
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .notifications(NotificationReceiver::builder().queue_capacity(1))
+        .spawn()
+        .await
+        .unwrap();
+    let mut events = service.take_notifications().unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let inform = community(crate::Pdu::inform_request(1, 1, &trap(), vec![]));
+    stream.write_all(&inform).await.unwrap();
+    read(&mut stream).await;
+    stream.write_all(&inform).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    events.close();
+    stream
+        .write_all(&community(crate::Pdu::get_request(3, &[oid()])))
+        .await
+        .unwrap();
+    let response = crate::message::CommunityMessage::decode(
+        read(&mut stream).await,
+        crate::DecodeConfig::DEFAULT,
+    )
+    .unwrap()
+    .value
+    .into_pdu()
+    .unwrap();
+    assert_eq!(response.request_id(), 3);
+    events.recv().await.unwrap();
+    assert!(events.recv().await.is_none());
+    service.shutdown().await.unwrap();
+}
+
+struct GateHandler(Arc<tokio::sync::Semaphore>, Arc<AtomicUsize>);
+impl crate::handler::MibHandler for GateHandler {
+    fn get<'a>(
+        &'a self,
+        _: &'a crate::handler::RequestContext,
+        _: &'a crate::Oid,
+    ) -> crate::handler::BoxFuture<'a, crate::handler::HandlerResult<crate::handler::GetResult>>
+    {
+        Box::pin(async move {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            let _permit = self.0.acquire().await.unwrap();
+            Ok(crate::handler::GetResult::Value(Value::Null))
+        })
+    }
+    fn get_next<'a>(
+        &'a self,
+        _: &'a crate::handler::RequestContext,
+        _: &'a crate::Oid,
+    ) -> crate::handler::BoxFuture<'a, crate::handler::HandlerResult<crate::handler::GetNextResult>>
+    {
+        Box::pin(async { Ok(crate::handler::GetNextResult::EndOfMibView) })
+    }
+}
+
+#[tokio::test]
+async fn closing_command_role_resumes_paused_session_notifications() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let request_oid = oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0);
+    let mut service = agent(b"pause-close-commands")
+        .client_exchanges(false)
+        .max_concurrent_requests(1)
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .handler(
+            oid!(1, 3, 6, 1, 4, 1, 99999),
+            Arc::new(GateHandler(gate.clone(), entered.clone())),
+        )
+        .spawn()
+        .await
+        .unwrap();
+    let mut events = service.take_notifications().unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    stream
+        .write_all(&community(crate::Pdu::get_request(
+            1,
+            std::slice::from_ref(&request_oid),
+        )))
+        .await
+        .unwrap();
+    until(|| entered.load(Ordering::SeqCst) == 1).await;
+    stream
+        .write_all(&community(crate::Pdu::get_request(2, &[request_oid])))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    service.close_commands();
+    stream
+        .write_all(&community(crate::Pdu::inform_request(
+            3,
+            1,
+            &trap(),
+            vec![],
+        )))
+        .await
+        .unwrap();
+    let response = crate::message::CommunityMessage::decode(
+        read(&mut stream).await,
+        crate::DecodeConfig::DEFAULT,
+    )
+    .unwrap()
+    .value
+    .into_pdu()
+    .unwrap();
+    assert_eq!(response.request_id(), 3);
+    events.recv().await.unwrap();
+    gate.add_permits(1);
+    read(&mut stream).await;
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    service.shutdown().await.unwrap();
+}
