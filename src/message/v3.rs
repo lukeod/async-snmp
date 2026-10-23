@@ -608,6 +608,14 @@ impl V3Message {
     /// 2. Compute HMAC over the entire encoded message
     /// 3. Replace the placeholder with the actual HMAC
     pub fn encode(&self) -> Result<Bytes> {
+        Ok(self.encode_buf()?.finish())
+    }
+
+    pub(crate) fn encode_vec(&self) -> Result<Vec<u8>> {
+        Ok(self.encode_buf()?.finish_vec())
+    }
+
+    fn encode_buf(&self) -> Result<EncodeBuf> {
         self.validate_outbound()?;
         let mut buf = EncodeBuf::new();
 
@@ -629,7 +637,7 @@ impl V3Message {
             Ok(())
         })?;
 
-        Ok(buf.finish())
+        Ok(buf)
     }
 
     /// Decode a complete V3 message and retain every accepted anomaly.
@@ -1844,6 +1852,7 @@ mod tests {
         let scoped = ScopedPdu::with_empty_context(pdu);
         let msg = V3Message::new(global, no_auth_security_params(), scoped).unwrap();
 
+        assert_eq!(msg.encode_vec().unwrap(), msg.encode().unwrap());
         let encoded = msg.encode().unwrap();
         let decoded = V3Message::decode(encoded, DecodeConfig::default())
             .unwrap()
@@ -1872,6 +1881,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(msg.encode_vec().unwrap(), msg.encode().unwrap());
         let encoded = msg.encode().unwrap();
         let decoded = V3Message::decode(encoded, DecodeConfig::default())
             .unwrap()

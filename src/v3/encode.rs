@@ -169,7 +169,7 @@ pub fn encode_v3_message(
         }
     };
 
-    let mut encoded = msg.encode()?.to_vec();
+    let mut encoded = msg.encode_vec()?;
 
     // Apply authentication if needed
     if let Some(key) = &auth_key {
@@ -260,7 +260,7 @@ pub(crate) fn encode_v3_report(
 
     match auth_key {
         Some(key) => {
-            let mut bytes = msg.encode()?.to_vec();
+            let mut bytes = msg.encode_vec()?;
             sign_v3_message(key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))
         }
@@ -301,9 +301,7 @@ pub(crate) fn encode_v3_response(
         SecurityLevel::AuthNoPriv => {
             let (_, auth_key) = require_auth_key(derived_keys, target)?;
             let usm = usm.with_auth_placeholder(auth_key.mac_len())?;
-            let mut bytes = V3Message::new(global, usm.encode()?, scoped)?
-                .encode()?
-                .to_vec();
+            let mut bytes = V3Message::new(global, usm.encode()?, scoped)?.encode_vec()?;
             sign_v3_message(auth_key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))
         }
@@ -353,8 +351,7 @@ pub(crate) fn encode_v3_response(
                 .with_priv_params(priv_params)?;
             let mut bytes =
                 V3Message::new_with_opaque_encrypted_scoped_pdu(global, usm.encode()?, encrypted)?
-                    .encode()?
-                    .to_vec();
+                    .encode_vec()?;
             sign_v3_message(auth_key, &mut bytes, target)?;
             Ok(Bytes::from(bytes))
         }
