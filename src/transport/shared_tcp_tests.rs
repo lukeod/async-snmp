@@ -1011,3 +1011,103 @@ async fn closing_command_role_resumes_paused_session_notifications() {
     assert_eq!(entered.load(Ordering::SeqCst), 1);
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn mixed_session_survives_command_closure_during_admission() {
+    use super::ingress::ApplicationIngress;
+    use std::sync::{Mutex, atomic::AtomicU64};
+    use tokio::sync::{Semaphore, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    // Close after the initial enabled check, at each failing admission boundary.
+    // The final case keeps admission open and must still terminate on overload.
+    for mode in 0..4 {
+        let (sender, receiver) = mpsc::channel(1);
+        let receiver = Arc::new(Mutex::new(Some(receiver)));
+        let disabled = CancellationToken::new();
+        let hook_token = disabled.clone();
+        let hook_receiver = receiver.clone();
+        let ingress = ApplicationIngress {
+            admission_hook: Some(Arc::new(move |ingress, before_send| {
+                if before_send != (mode == 2) {
+                    return;
+                }
+                match mode {
+                    0 => hook_token.cancel(),
+                    1 => {
+                        hook_token.cancel();
+                        let limit = ingress.session.as_ref().unwrap();
+                        limit.forget_permits(limit.available_permits());
+                    }
+                    2 => {
+                        hook_receiver.lock().unwrap().take();
+                    }
+                    _ => {}
+                }
+            })),
+            sender,
+            disabled,
+            capacity: Arc::new(Semaphore::new(if mode == 0 || mode == 3 { 0 } else { 1 })),
+            budget: Arc::new(Semaphore::new(32 * 1024 * 1024)),
+            budget_limit: 32 * 1024 * 1024,
+            overload_timeout: Duration::from_secs(2),
+            drops: Arc::new(AtomicU64::new(0)),
+            session: (mode == 1).then(|| Arc::new(Semaphore::new(0))),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (observer, mut observations) = TransportObserver::channel(16).unwrap();
+        let prepared = TcpTransport::builder()
+            .from_stream(stream)
+            .observer(observer)
+            .ingress(ingress.clone(), EndpointId::new())
+            .prepare()
+            .await
+            .unwrap();
+        let (transport, runner) = prepared.into_parts();
+        transport.configure_dispatch(Arc::new(dispatch::DispatchRoles::new(
+            Some(ingress),
+            None,
+            Default::default(),
+            true,
+            1,
+        )));
+        let task = tokio::spawn(runner.run());
+        peer.write_all(&community(crate::Pdu::get_request(1, &[oid()])))
+            .await
+            .unwrap();
+        let disposition = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ObservationEvent::Disposition { disposition, .. }) =
+                    observations.recv().await
+                {
+                    break disposition;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if mode == 3 {
+            assert_eq!(disposition, MessageDisposition::Overloaded);
+            assert!(task.await.unwrap().is_err());
+            continue;
+        }
+        assert_eq!(disposition, MessageDisposition::Disabled, "mode {mode}");
+        let request = community(crate::Pdu::get_request(41, &[oid()]));
+        let exchange =
+            transport.request_with(&request, registration(41), |_, _| Ok(Candidate::Accept(())));
+        let remote = async {
+            assert_eq!(read(&mut peer).await, request);
+            peer.write_all(&community(crate::Pdu::response(41, 0, 0, vec![])))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(exchange, remote);
+        result.unwrap();
+        transport.control().shutdown().await;
+        task.await.unwrap().unwrap();
+    }
+}

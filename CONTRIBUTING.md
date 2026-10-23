@@ -57,6 +57,17 @@ docker build -t async-snmp-test:latest tests/containers/snmpd/
 cargo test --locked --test interop --all-features -- --ignored
 ```
 
+The listener interoperability suite uses local net-snmp command-line tools
+(`snmpget`, `snmpgetnext`, `snmpbulkget`, `snmpset`, `snmptrap`, and `snmpinform`).
+It tests UDP/TCP command handling and notification reception with isolated client
+configuration and ephemeral loopback listeners:
+
+```bash
+cargo test --locked --test net_snmp_cli --all-features -- --ignored
+```
+
+Missing tools produce an explicit skip message; use `--nocapture` to display it.
+
 ## Build the documentation
 
 Test, build, and open the documentation:

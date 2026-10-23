@@ -12,8 +12,13 @@ pub(crate) struct InboundWork {
     pub(crate) _session: Option<OwnedSemaphorePermit>,
     pub(crate) _buffers: Option<BufferPermits>,
 }
+#[cfg(test)]
+type AdmissionHook = Arc<dyn Fn(&ApplicationIngress, bool) + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct ApplicationIngress {
+    #[cfg(test)]
+    pub(crate) admission_hook: Option<AdmissionHook>,
     pub(crate) sender: mpsc::Sender<InboundWork>,
     pub(crate) disabled: tokio_util::sync::CancellationToken,
     pub(crate) capacity: Arc<Semaphore>,
@@ -80,14 +85,14 @@ impl ApplicationIngress {
         let info = message.info;
         let result = self.deliver_tcp_inner(message, buffers, fail_fast).await;
         if result.is_err() {
-            observation.disposition(
-                info,
-                if self.is_enabled() {
-                    super::MessageDisposition::Overloaded
-                } else {
-                    super::MessageDisposition::Disabled
-                },
-            );
+            // Decide overload only while the role is still enabled. Closing a
+            // role can race with semaphore/channel admission on a mixed session.
+            // That closure must not terminate the other roles or exchanges.
+            if !self.is_enabled() {
+                observation.disposition(info, super::MessageDisposition::Disabled);
+                return Ok(());
+            }
+            observation.disposition(info, super::MessageDisposition::Overloaded);
         }
         result
     }
@@ -100,6 +105,10 @@ impl ApplicationIngress {
         if !self.is_enabled() {
             message.observe(super::MessageDisposition::Disabled);
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.admission_hook {
+            hook(self, false);
         }
         let target = message.info.peer_addr();
         let info = message.info;
@@ -126,6 +135,14 @@ impl ApplicationIngress {
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| overload())?;
+            if !self.is_enabled() {
+                observation.disposition(info, super::MessageDisposition::Disabled);
+                return Ok(());
+            }
+            #[cfg(test)]
+            if let Some(hook) = &self.admission_hook {
+                hook(self, true);
+            }
             let work = InboundWork {
                 message,
                 _admission: admission,

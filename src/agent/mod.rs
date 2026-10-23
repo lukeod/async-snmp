@@ -1363,6 +1363,8 @@ impl AgentBuilder {
         let capacity = config.concurrency_limit.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity.available_permits());
         let ingress = crate::transport::ingress::ApplicationIngress {
+            #[cfg(test)]
+            admission_hook: None,
             sender,
             disabled: CancellationToken::new(),
             capacity,

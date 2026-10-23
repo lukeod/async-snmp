@@ -367,6 +367,12 @@ impl DispatchRoles {
             .boxed()),
         };
         if result.is_err() && notification.is_some() {
+            // Admission errors race with consumer/role closure. An independently
+            // disabled role does not make a shared session overloaded.
+            if notification.is_some_and(|processor| !processor.is_enabled()) {
+                observation.disposition(info, super::MessageDisposition::Disabled);
+                return Ok(());
+            }
             observation.disposition(info, super::MessageDisposition::Overloaded);
         }
         result

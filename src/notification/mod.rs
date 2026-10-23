@@ -1264,6 +1264,8 @@ impl NotificationReceiverBuilder {
         crate::transport::checked_deadline(self.overload_timeout, "notification overload timeout")?;
         let (sender, _) = mpsc::channel(self.max_processing);
         let ingress = crate::transport::ingress::ApplicationIngress {
+            #[cfg(test)]
+            admission_hook: None,
             sender,
             disabled: tokio_util::sync::CancellationToken::new(),
             capacity: Arc::new(tokio::sync::Semaphore::new(self.max_processing)),
