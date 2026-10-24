@@ -105,33 +105,28 @@ pub use walk::{
 // Shared helpers
 // ============================================================================
 
-/// Extract an SNMP-level error from a PDU and convert it to an `Error::Snmp`.
+/// Convert a PDU carrying an SNMP error status to an `Error::Snmp`.
 ///
-/// Returns `Some(err)` if the PDU carries an SNMP error status, `None` otherwise.
 /// The `error_index` field is 1-based; 0 means the error applies to the whole PDU.
 pub(crate) fn pdu_to_snmp_error(
     pdu: &Pdu,
     target: SocketAddr,
     metadata: ResponseMetadata,
-) -> Option<Box<Error>> {
-    if !pdu.is_error() {
-        return None;
-    }
+) -> Box<Error> {
+    debug_assert!(pdu.is_error());
     let status = pdu.error_status_enum();
     let oid = (pdu.error_index() as usize)
         .checked_sub(1)
         .and_then(|idx| pdu.varbinds.get(idx))
         .map(|vb| Box::new(vb.oid.clone()));
-    Some(
-        Error::Snmp {
-            target,
-            status,
-            index: pdu.error_index().try_into().unwrap_or(0),
-            oid,
-            metadata: Box::new(metadata),
-        }
-        .boxed(),
-    )
+    Error::Snmp {
+        target,
+        status,
+        index: pdu.error_index().try_into().unwrap_or(0),
+        oid,
+        metadata: Box::new(metadata),
+    }
+    .boxed()
 }
 
 // ============================================================================
@@ -891,14 +886,14 @@ impl<T: RequestTransport> Client<T> {
                 .await
             {
                 Ok(response) => {
-                    if let Some(err) = pdu_to_snmp_error(
-                        &response.pdu,
-                        self.peer_addr(),
-                        response.metadata.clone(),
-                    ) {
+                    if response.pdu.is_error() {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
-                        return Err(err);
+                        return Err(pdu_to_snmp_error(
+                            &response.pdu,
+                            self.peer_addr(),
+                            response.metadata,
+                        ));
                     }
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
                     return Ok(response);

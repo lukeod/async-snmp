@@ -1476,14 +1476,14 @@ impl<T: RequestTransport> Client<T> {
                     exchange_metadata.append(message_metadata);
 
                     // Check for SNMP error
-                    if let Some(err) = super::pdu_to_snmp_error(
-                        &response_pdu,
-                        self.peer_addr(),
-                        exchange_metadata.clone(),
-                    ) {
+                    if response_pdu.is_error() {
                         Span::current()
                             .record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
-                        return Err(err);
+                        return Err(super::pdu_to_snmp_error(
+                            &response_pdu,
+                            self.peer_addr(),
+                            exchange_metadata,
+                        ));
                     }
 
                     Span::current().record("snmp.elapsed_ms", start.elapsed().as_millis() as u64);
