@@ -102,6 +102,11 @@ name = "transport_comparison"
 harness = false
 
 [[bench]]
+name = "transport_pipeline"
+harness = false
+required-features = ["agent", "crypto-rustcrypto"]
+
+[[bench]]
 name = "remote_engine_cache"
 harness = false
 
