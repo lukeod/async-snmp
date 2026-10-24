@@ -145,7 +145,9 @@
 //! TCP defaults to 128 service connections, 64 MiB aggregate transport buffering,
 //! 32 MiB per session and 10 MiB frame/send capacity. One frame may be queued for
 //! classification per session, in addition to the active classifier and framer.
-//! Frame, dispatch, write and parked-candidate bytes retain those same budgets;
+//! Each budget reserves the largest applicable send capacity for output. Frame,
+//! dispatch and parked-candidate input use only the remainder, so input saturation
+//! cannot block replies. Writes retain their output permits through completion;
 //! UDP response reserves remain separate. Session application concurrency defaults
 //! to 16, with service notification processing limited by `max_processing`.
 //! Decoded delivery retains at most `queue_capacity` events and is separate from
@@ -837,6 +839,8 @@ impl NotificationReceiverBuilder {
         self
     }
     /// Bound transport-retained bytes across sources (default 64 MiB).
+    /// The largest configured TCP send capacity is reserved for output; the
+    /// remainder must accommodate every listener's inbound buffer capacity.
     pub fn max_buffered_bytes(mut self, limit: usize) -> Self {
         self.network_explicit = true;
         self.buffered_bytes = limit;
@@ -1269,8 +1273,9 @@ impl NotificationReceiverBuilder {
             sender,
             disabled: tokio_util::sync::CancellationToken::new(),
             capacity: Arc::new(tokio::sync::Semaphore::new(self.max_processing)),
-            budget_limit: self.buffered_bytes,
-            budget: Arc::new(tokio::sync::Semaphore::new(self.buffered_bytes)),
+            budget: Arc::new(crate::transport::framing::BufferBudget::new(
+                self.buffered_bytes,
+            )),
             overload_timeout: self.overload_timeout,
             drops: Arc::new(AtomicU64::new(0)),
             session: None,

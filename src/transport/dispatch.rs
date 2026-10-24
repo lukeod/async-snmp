@@ -8,7 +8,8 @@ use super::{
     CorrelationEnvelope, ReceivedMessage, RequestRegistration, ingress::ApplicationIngress,
     udp_core::UdpCore,
 };
-use crate::message::{CommunityMessage, RawMsgData, RawV3Message, decode_scoped_pdu};
+use crate::ber::Decoder;
+use crate::message::{RawMsgData, RawV3Message};
 use crate::v3::{UsmSecurityParams, UsmUser};
 use crate::{Error, PduType, Result, Version};
 use bytes::Bytes;
@@ -389,17 +390,23 @@ impl DispatchRoles {
             ..crate::DecodeConfig::DEFAULT
         };
         let source = message.info.peer_addr();
-        match crate::message::peek_version(message.bytes.clone(), source)? {
+        let version = match envelope {
+            Some(envelope) => envelope.version,
+            None => crate::message::peek_version(message.bytes.clone(), source)?,
+        };
+        match version {
             Version::V1 | Version::V2c => {
-                let decoded = CommunityMessage::decode_with_target(
-                    message.bytes.clone(),
-                    Some(source),
-                    decode,
-                )?;
-                Ok(Some(match decoded.value.pdu() {
-                    crate::message::CommunityPdu::TrapV1(_) => PduType::TrapV1,
-                    crate::message::CommunityPdu::Standard(pdu) => pdu.pdu_type(),
-                }))
+                let Some(envelope) = envelope else {
+                    return Ok(None);
+                };
+                let mut decoder = Decoder::with_target(
+                    message
+                        .bytes
+                        .slice(envelope.after_version..envelope.content_end),
+                    source,
+                );
+                decoder.read_octet_string()?; // community
+                peek_pdu_class(&decoder, version)
             }
             Version::V3 => {
                 let raw = RawV3Message::decode_bounded_with_target(
@@ -435,12 +442,7 @@ impl DispatchRoles {
                 // Plaintext only supplies an untrusted class; the selected role
                 // performs all security checks before user-visible acceptance.
                 if let RawMsgData::Plaintext { data, offset } = &raw.msg_data {
-                    return Ok(Some(
-                        decode_scoped_pdu(data.clone(), *offset, source, None, decode)?
-                            .value
-                            .pdu
-                            .pdu_type(),
-                    ));
+                    return scoped_pdu_class(data.clone(), *offset, source);
                 }
                 let keys = if let Some(user) = self.users.get(&usm.username) {
                     user.derive_keys(&usm.engine_id)
@@ -483,15 +485,30 @@ impl DispatchRoles {
                 let decrypted = key
                     .decrypt(data, usm.engine_boots, usm.engine_time, &usm.priv_params)
                     .map_err(|_| Error::Auth { target: source }.boxed())?;
-                Ok(Some(
-                    decode_scoped_pdu(decrypted, 0, source, Some(key.protocol()), decode)?
-                        .value
-                        .pdu
-                        .pdu_type(),
-                ))
+                scoped_pdu_class(decrypted, 0, source)
             }
         }
     }
+}
+
+// Classification only needs the envelope's PDU tag. Leave varbind decoding,
+// suffix rules and role-specific compatibility checks to the selected consumer.
+// In particular, do not allocate OIDs/varbinds twice for every received message.
+fn scoped_pdu_class(data: Bytes, offset: usize, source: SocketAddr) -> Result<Option<PduType>> {
+    let mut decoder = Decoder::with_context(data, offset, Some(source));
+    let mut scoped = decoder.read_sequence()?;
+    scoped.read_octet_string()?; // contextEngineID
+    scoped.read_octet_string()?; // contextName
+    peek_pdu_class(&scoped, Version::V3)
+}
+fn peek_pdu_class(decoder: &Decoder<'_>, version: Version) -> Result<Option<PduType>> {
+    let tag = decoder
+        .peek_byte()
+        .ok_or_else(|| decoder.malformed(crate::DecodeErrorKind::TruncatedData))?;
+    let kind = PduType::from_tag(tag)
+        .filter(|kind| crate::pdu::pdu_type_valid_for_version(*kind, version))
+        .ok_or_else(|| decoder.malformed(crate::DecodeErrorKind::UnknownPduType(tag)))?;
+    Ok(Some(kind))
 }
 
 async fn acquire_tcp(

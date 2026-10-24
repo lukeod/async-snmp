@@ -63,7 +63,9 @@
 //! Both connection directions support locally initiated transactions when enabled;
 //! reverse-direction transactions require explicit deployment support from the peer.
 //! TCP frame, dispatch, parked candidate and write bytes share the configured
-//! session/service budgets (32/64 MiB by default). Each session has one queued
+//! session/service budgets (32/64 MiB by default). Each budget reserves the largest
+//! applicable send capacity for output so retained input cannot block replies.
+//! Each session has one queued
 //! classification frame, 16 concurrent application tasks and 32 queued writes by
 //! default; maximum frame/send size is 10 MiB. Notification delivery holds bounded
 //! decoded events separately. Inbound-only application admission may pause for the
@@ -621,6 +623,8 @@ impl AgentBuilder {
         self
     }
     /// Bound transport-retained message bytes across listeners (default 64 MiB).
+    /// The largest configured TCP send capacity is reserved for output; the
+    /// remainder must accommodate every listener's inbound buffer capacity.
     #[must_use]
     pub fn buffered_bytes(mut self, bytes: usize) -> Self {
         self.buffered_bytes = bytes;
@@ -1368,8 +1372,9 @@ impl AgentBuilder {
             sender,
             disabled: CancellationToken::new(),
             capacity,
-            budget_limit: config.buffered_bytes,
-            budget: Arc::new(Semaphore::new(config.buffered_bytes)),
+            budget: Arc::new(crate::transport::framing::BufferBudget::new(
+                config.buffered_bytes,
+            )),
             overload_timeout: config.overload_timeout,
             drops: Arc::new(AtomicU64::new(0)),
             session: None,

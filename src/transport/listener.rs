@@ -53,7 +53,9 @@ impl ListenerSource {
     ) -> Result<PreparedListener> {
         match self {
             Self::Udp(builder) => {
+                let budget = ingress.budget.clone();
                 let (endpoint, runner) = builder.ingress(ingress).prepare().await?.into_parts();
+                budget.reserve(endpoint.limits().receive.accepted(), 0)?;
                 let bound = BoundListener {
                     endpoint_id: endpoint.endpoint_id(),
                     transport: TransportKind::Udp,
@@ -82,13 +84,10 @@ impl ListenerSource {
             }
             Self::Tcp(source) => {
                 source.options.validate()?;
-                if source.options.max_buffered_bytes > ingress.budget_limit {
-                    return Err(Error::Config(
-                        "listener aggregate buffer limit must accommodate one TCP session budget"
-                            .into(),
-                    )
-                    .boxed());
-                }
+                ingress.budget.reserve(
+                    source.options.max_buffered_bytes - source.options.send_capacity,
+                    source.options.send_capacity,
+                )?;
                 let listener = match (source.address, source.listener) {
                     (Some(_), Some(_)) => {
                         return Err(Error::Config(

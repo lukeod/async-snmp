@@ -91,6 +91,74 @@ async fn accepted(service: &Agent) -> TcpTransport {
 }
 
 #[tokio::test]
+async fn coalesced_informs_cannot_consume_session_output_budget() {
+    coalesced_informs_with_budgets(2048, 8192).await;
+}
+
+#[tokio::test]
+async fn coalesced_informs_cannot_consume_service_output_budget() {
+    coalesced_informs_with_budgets(8192, 8192).await;
+}
+
+async fn coalesced_informs_with_budgets(session_budget: usize, service_budget: usize) {
+    let options = TcpOptions {
+        max_message_size: 1024,
+        send_capacity: 1024,
+        max_buffered_bytes: session_budget,
+        ..TcpOptions::default()
+    };
+    let mut receiver = NotificationReceiver::builder()
+        .max_buffered_bytes(service_budget)
+        .queue_capacity(32)
+        .listener(ListenerSource::Tcp(
+            TcpListenerSource::bind("127.0.0.1:0").session_options(options),
+        ))
+        .spawn()
+        .await
+        .unwrap();
+    let mut peers = Vec::new();
+    let mut input = Vec::new();
+    for id in 1..=8 {
+        let frame = community(crate::Pdu::inform_request(
+            id,
+            1,
+            &trap(),
+            vec![crate::VarBind::new(
+                oid(),
+                Value::OctetString(vec![42; 800].into()),
+            )],
+        ));
+        assert!((800..=1024).contains(&frame.len()));
+        input.extend_from_slice(&frame);
+    }
+    for _ in 0..2 {
+        let mut peer = TcpStream::connect(receiver.bound_addresses()[0].local_addr)
+            .await
+            .unwrap();
+        peer.write_all(&input).await.unwrap();
+        peers.push(peer);
+    }
+    for peer in &mut peers {
+        let mut ids = Vec::new();
+        for _ in 1..=8 {
+            let response = crate::message::CommunityMessage::decode(
+                read(peer).await,
+                crate::DecodeConfig::DEFAULT,
+            )
+            .unwrap()
+            .value;
+            ids.push(response.pdu().standard().unwrap().request_id());
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=8).collect::<Vec<_>>());
+    }
+    for _ in 0..16 {
+        receiver.recv().await.unwrap();
+    }
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn accepted_and_connected_roles_exchange_both_directions_and_close_independently() {
     let mut a = agent(b"tcp-acceptor")
         .listener(ListenerSource::tcp("127.0.0.1:0"))
@@ -1048,8 +1116,7 @@ async fn mixed_session_survives_command_closure_during_admission() {
             sender,
             disabled,
             capacity: Arc::new(Semaphore::new(if mode == 0 || mode == 3 { 0 } else { 1 })),
-            budget: Arc::new(Semaphore::new(32 * 1024 * 1024)),
-            budget_limit: 32 * 1024 * 1024,
+            budget: Arc::new(super::framing::BufferBudget::new(32 * 1024 * 1024)),
             overload_timeout: Duration::from_secs(2),
             drops: Arc::new(AtomicU64::new(0)),
             session: (mode == 1).then(|| Arc::new(Semaphore::new(0))),

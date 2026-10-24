@@ -20,7 +20,7 @@ mod builtin;
 pub(crate) mod dispatch;
 #[cfg(all(test, feature = "agent"))]
 mod dispatch_tests;
-mod framing;
+pub(crate) mod framing;
 pub(crate) mod ingress;
 #[cfg_attr(not(feature = "agent"), allow(dead_code))]
 pub(crate) mod listener;

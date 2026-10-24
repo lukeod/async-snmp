@@ -22,8 +22,7 @@ pub(crate) struct ApplicationIngress {
     pub(crate) sender: mpsc::Sender<InboundWork>,
     pub(crate) disabled: tokio_util::sync::CancellationToken,
     pub(crate) capacity: Arc<Semaphore>,
-    pub(crate) budget: Arc<Semaphore>,
-    pub(crate) budget_limit: usize,
+    pub(crate) budget: Arc<super::framing::BufferBudget>,
     pub(crate) overload_timeout: Duration,
     pub(crate) drops: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) session: Option<Arc<Semaphore>>,
@@ -50,6 +49,7 @@ impl ApplicationIngress {
         };
         let Ok(buffer) = self
             .budget
+            .inbound
             .clone()
             .try_acquire_many_owned(message.bytes.len() as u32)
         else {

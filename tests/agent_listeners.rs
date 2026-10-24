@@ -42,6 +42,87 @@ fn engine() -> AuthoritativeEngine {
 }
 
 #[tokio::test]
+async fn tcp_budget_reserves_space_for_a_maximum_sized_reply() {
+    for budget in [1024, 2048] {
+        let mut options = TcpOptions::default();
+        options.max_message_size = 1024;
+        options.send_capacity = 1024;
+        options.max_buffered_bytes = budget;
+        let prepared = Agent::builder()
+            .community(b"public")
+            .allow_all_access()
+            .max_message_size(1024)
+            .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(BytesHandler(960)))
+            .listener(ListenerSource::Tcp(
+                TcpListenerSource::bind("127.0.0.1:0").session_options(options),
+            ))
+            .prepare()
+            .await;
+        if budget == 1024 {
+            assert!(matches!(
+                *prepared
+                    .err()
+                    .expect("input-only budget must fail preparation"),
+                async_snmp::Error::Config(_)
+            ));
+            continue;
+        }
+        let agent = prepared.unwrap().spawn();
+        let client = Client::builder(
+            agent.bound_addresses()[0].local_addr.to_string(),
+            Auth::v2c("public"),
+        )
+        .retry(Retry::none())
+        .request_timeout(Duration::from_secs(2))
+        .connect_tcp()
+        .await
+        .unwrap();
+        let result = client
+            .get(&oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0))
+            .await
+            .unwrap();
+        assert_eq!(result.varbinds[0].value.as_bytes().unwrap().len(), 960);
+        assert!(result.metadata.received_messages[0].info.received_len() <= 1024);
+        agent.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn service_buffer_partition_validates_all_listener_capacities() {
+    for reverse in [false, true] {
+        for total in [6144, 8192] {
+            let mut capacities = [(1024, 4096), (4096, 1024)];
+            if reverse {
+                capacities.reverse();
+            }
+            let mut builder = async_snmp::NotificationReceiver::builder().max_buffered_bytes(total);
+            for (receive, send) in capacities {
+                let mut options = TcpOptions::default();
+                options.max_message_size = receive;
+                options.send_capacity = send;
+                options.max_buffered_bytes = receive + send;
+                builder = builder.listener(ListenerSource::Tcp(
+                    TcpListenerSource::bind("127.0.0.1:0").session_options(options),
+                ));
+            }
+            let prepared = builder.prepare().await;
+            if total == 6144 {
+                assert!(matches!(
+                    *prepared
+                        .err()
+                        .expect("largest input and output must both fit"),
+                    async_snmp::Error::Config(_)
+                ));
+            } else {
+                let (receiver, runner) = prepared.unwrap().into_parts();
+                assert_eq!(receiver.bound_addresses().len(), 2);
+                drop(runner);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn mixed_owned_listeners_share_engine_and_isolate_bad_sessions() {
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();

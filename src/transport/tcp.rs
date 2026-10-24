@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use super::framing::{BerFramer, BufferedFrame};
+use super::framing::{BerFramer, BufferBudget, BufferedFrame};
 use super::udp_core::UdpCore;
 use super::{Candidate, CorrelationEnvelope, RequestRegistration, RequestTransport};
 use crate::error::{ConstructionStage, Error, Result};
@@ -61,7 +61,8 @@ pub struct TcpOptions {
     pub write_queue_capacity: usize,
     /// Aggregate buffered inbound/outbound bytes, including parked and validating
     /// candidates; default 32 MiB. Accepted caller-owned results are excluded.
-    /// Must accommodate each configured message limit.
+    /// Reserves `send_capacity` for outgoing messages; the remainder is inbound.
+    /// Must accommodate `max_message_size + send_capacity`.
     pub max_buffered_bytes: usize,
     /// Complete a started BER header within this duration; default 5 seconds.
     pub header_timeout: Duration,
@@ -104,10 +105,13 @@ impl TcpOptions {
         }
         if self.max_buffered_bytes > u32::MAX as usize
             || self.max_buffered_bytes > Semaphore::MAX_PERMITS
-            || self.max_buffered_bytes < self.max_message_size.max(self.send_capacity)
+            || self
+                .max_message_size
+                .checked_add(self.send_capacity)
+                .is_none_or(|sum| self.max_buffered_bytes < sum)
         {
             return Err(Error::Config(
-                "TCP buffered-byte capacity must fit semaphore accounting and every message limit"
+                "TCP buffered-byte capacity must fit semaphore accounting and both message limits"
                     .into(),
             )
             .boxed());
@@ -254,13 +258,13 @@ impl TcpTransportBuilder {
             .map(|duration| tcp_deadline(duration, "TCP connect timeout"))
             .transpose()?;
         let limits = self.options.validate()?;
-        if let Some(ingress) = &self.ingress
-            && self.options.max_buffered_bytes > ingress.budget_limit
-        {
-            return Err(Error::Config(
-                "service aggregate buffer limit must accommodate one TCP session budget".into(),
-            )
-            .boxed());
+        let budget = Arc::new(BufferBudget::new(self.options.max_buffered_bytes));
+        let inbound = self.options.max_buffered_bytes - self.options.send_capacity;
+        budget.reserve(inbound, self.options.send_capacity)?;
+        if let Some(ingress) = &self.ingress {
+            ingress
+                .budget
+                .reserve(inbound, self.options.send_capacity)?;
         }
         let stream = if let Some(stream) = self.stream {
             if self.target.is_some() || self.socket.is_some() || self.connect_timeout.is_some() {
@@ -319,7 +323,7 @@ impl TcpTransportBuilder {
             status: Mutex::new(TcpStatus::Prepared),
             terminal_error: Mutex::new(None),
             in_flight: Arc::new(Semaphore::new(self.options.max_in_flight)),
-            budget: Arc::new(Semaphore::new(self.options.max_buffered_bytes)),
+            budget,
             dispatch: Mutex::new(None),
             ingress: self.ingress.map(|mut ingress| {
                 ingress.session = Some(Arc::new(Semaphore::new(
@@ -392,7 +396,7 @@ struct SessionState {
     status: Mutex<TcpStatus>,
     terminal_error: Mutex<Option<Arc<Error>>>,
     in_flight: Arc<Semaphore>,
-    budget: Arc<Semaphore>,
+    budget: Arc<BufferBudget>,
     ingress: Option<super::ingress::ApplicationIngress>,
 }
 impl SessionState {
@@ -718,6 +722,7 @@ impl TcpTransport {
                 .map_err(|_| state.closed_error())?;
             let budget = state
                 .budget
+                .outbound
                 .clone()
                 .acquire_many_owned(data.len() as u32)
                 .await
@@ -726,6 +731,7 @@ impl TcpTransport {
                 Some(
                     ingress
                         .budget
+                        .outbound
                         .clone()
                         .acquire_many_owned(data.len() as u32)
                         .await
@@ -877,10 +883,11 @@ async fn read_loop(
         state.receive_limits.accepted(),
         state.options.header_timeout,
         state.options.body_timeout,
-        state.budget.clone(),
+        state.budget.inbound.clone(),
     );
     if let Some(ingress) = &state.ingress {
-        framer = framer.with_shared_budget(ingress.budget.clone(), ingress.overload_timeout);
+        framer =
+            framer.with_shared_budget(ingress.budget.inbound.clone(), ingress.overload_timeout);
     }
     let roles = state.dispatch.lock().unwrap().clone();
     // One queued complete frame, one classifier and one frame under construction.

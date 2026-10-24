@@ -1,7 +1,7 @@
 //! Bounded incremental BER framing shared by connected and accepted sessions.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -10,6 +10,56 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::{DecodeError, DecodeErrorKind, Error, Result};
+
+/// Partition a fixed total during preparation. Input retention must never consume
+/// the space needed to send a reply. The service reserves the largest configured
+/// TCP send capacity, shared by all writers, rather than one reserve per session.
+pub(crate) struct BufferBudget {
+    pub(crate) inbound: Arc<Semaphore>,
+    pub(crate) outbound: Arc<Semaphore>,
+    total: usize,
+    capacities: Mutex<(usize, usize)>, // minimum inbound, reserved outbound
+}
+impl BufferBudget {
+    pub(crate) fn new(total: usize) -> Self {
+        Self {
+            inbound: Arc::new(Semaphore::new(total)),
+            outbound: Arc::new(Semaphore::new(0)),
+            total,
+            capacities: Mutex::new((0, 0)),
+        }
+    }
+
+    /// Called for every configured listener before execution. Accepted sessions
+    /// repeat the same reservation without changing the partition.
+    pub(crate) fn reserve(&self, inbound: usize, outbound: usize) -> Result<()> {
+        let mut capacities = self.capacities.lock().unwrap();
+        let required = (capacities.0.max(inbound), capacities.1.max(outbound));
+        if required
+            .0
+            .checked_add(required.1)
+            .is_none_or(|sum| sum > self.total)
+        {
+            return Err(Error::Config(
+                "buffer budget must accommodate inbound capacity and reserved TCP output".into(),
+            )
+            .boxed());
+        }
+        let extra = required.1 - capacities.1;
+        if extra != 0 {
+            self.inbound
+                .clone()
+                .try_acquire_many_owned(extra as u32)
+                .map_err(|_| {
+                    Error::Config("buffer reservation must precede execution".into()).boxed()
+                })?
+                .forget();
+            self.outbound.add_permits(extra);
+        }
+        *capacities = required;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct BufferPermits {

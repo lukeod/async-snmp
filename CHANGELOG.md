@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connected streams or configured pre-connect sockets, and creates no task.
   Explicit `spawn()`/`spawn_on()` return a `RunningTcpSession`; `TcpControl`
   exposes shutdown, status and managed-driver joining. Session handles never reconnect.
+  Session and service budgets reserve output capacity so retained input cannot
+  block Responses or Inform acknowledgements. Session budgets must accommodate
+  the sum of receive/send limits; service budgets must accommodate the largest
+  inbound partition and largest send capacity across their listeners.
+
+- Shared endpoint dispatch classifies PDU headers without decoding varbinds a
+  second time. Applications retain their own full decoding and security checks.
 
 - **Breaking:** `UdpTransport` is now `UdpEndpoint`. Its builder uses `prepare()`
   for an unstarted endpoint/runner pair, or explicit `spawn()`/`spawn_on()` for a

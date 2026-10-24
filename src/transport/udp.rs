@@ -386,7 +386,7 @@ impl UdpRunner {
         self.receive_errors = errors;
         self.receive_error_ready = ready;
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agent"))]
     pub(crate) fn test_receive_state(
         &mut self,
         errors: Arc<Mutex<std::collections::VecDeque<std::io::Error>>>,

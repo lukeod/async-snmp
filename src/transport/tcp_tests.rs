@@ -1107,12 +1107,15 @@ async fn framing_clean_eof_and_partial_eof_are_distinct() {
 async fn oversized_declared_body_is_rejected_before_allocation() {
     let (prepared, mut peer) = pair(TcpTransport::builder().max_message_size(484)).await;
     let running = prepared.spawn();
-    let initial = running.inner.state.budget.available_permits();
+    let initial = running.inner.state.budget.inbound.available_permits();
     peer.write_all(&[0x30, 0x84, 0x06, 0x40, 0, 0])
         .await
         .unwrap();
     running.control().wait_closed().await;
-    assert_eq!(running.inner.state.budget.available_permits(), initial);
+    assert_eq!(
+        running.inner.state.budget.inbound.available_permits(),
+        initial
+    );
     assert_eq!(
         running.join().await.unwrap_err().kind(),
         crate::ErrorKind::Decode
@@ -1351,7 +1354,7 @@ async fn retained_candidates_exhaust_session_budget_without_unbounded_allocation
         TcpTransport::builder()
             .max_message_size(484)
             .send_capacity(484)
-            .max_buffered_bytes(484),
+            .max_buffered_bytes(968),
     )
     .await;
     let running = prepared.spawn();
@@ -1409,7 +1412,7 @@ async fn accepted_decoded_values_outlive_transport_buffer_accounting() {
         TcpTransport::builder()
             .max_message_size(484)
             .send_capacity(484)
-            .max_buffered_bytes(484),
+            .max_buffered_bytes(968),
     )
     .await;
     let running = prepared.spawn();
@@ -1454,7 +1457,7 @@ async fn accepted_decoded_values_outlive_transport_buffer_accounting() {
             .all(|response| response.varbinds[0].value.as_bytes() == Some(&[7; 100]))
     );
     server.await.unwrap();
-    assert_eq!(running.inner.state.budget.available_permits(), 484);
+    assert_eq!(running.inner.state.budget.inbound.available_permits(), 484);
     running.join().await.unwrap();
 }
 
@@ -1464,11 +1467,11 @@ async fn receive_permit_is_held_during_validation_and_released_on_acceptance() {
         TcpTransport::builder()
             .max_message_size(484)
             .send_capacity(484)
-            .max_buffered_bytes(484),
+            .max_buffered_bytes(968),
     )
     .await;
     let running = prepared.spawn();
-    let budget = running.inner.state.budget.clone();
+    let budget = running.inner.state.budget.inbound.clone();
     let server = tokio::spawn(async move {
         let address = peer.peer_addr().unwrap();
         read_ber_message(&mut peer, address, 484).await.unwrap();
