@@ -124,9 +124,8 @@ impl DispatchRoles {
         }
         let registration = if self.client_exchanges {
             envelope.and_then(|e| {
-                e.request_id(&message.bytes).and_then(|id| {
-                    core.candidate_registration(id, &message.bytes, e, message.info.peer_addr())
-                })
+                e.request_id(&message.bytes)
+                    .and_then(|id| core.candidate_registration(id, &message.bytes, e, message.info))
             })
         } else {
             None
@@ -179,18 +178,17 @@ impl DispatchRoles {
             let mut client_context = candidate;
             let class = roles.classify(
                 &mut message,
-                registration.as_ref(),
+                registration
+                    .as_ref()
+                    .map(|candidate| candidate.registration()),
                 envelope,
                 &mut client_context,
                 &mut buffers,
             );
             let is_response = matches!(class, Ok(Some(PduType::Response | PduType::Report)));
             if is_response || (client_context && !matches!(class, Ok(Some(_)))) {
-                if candidate
-                    && let Some(envelope) = envelope
-                    && let Some(id) = envelope.request_id(&message.bytes)
-                {
-                    core.deliver_parsed_buffered(id, envelope, message.into_packet(), buffers);
+                if let Some(registration) = registration {
+                    core.deliver_candidate(registration, message.into_packet(), buffers);
                 } else {
                     message.observe(super::MessageDisposition::Unmatched);
                 }
@@ -282,9 +280,8 @@ impl DispatchRoles {
         let envelope = CorrelationEnvelope::parse(&message.bytes);
         let registration = if self.client_exchanges {
             envelope.and_then(|e| {
-                e.request_id(&message.bytes).and_then(|id| {
-                    core.candidate_registration(id, &message.bytes, e, message.info.peer_addr())
-                })
+                e.request_id(&message.bytes)
+                    .and_then(|id| core.candidate_registration(id, &message.bytes, e, message.info))
             })
         } else {
             None
@@ -292,7 +289,9 @@ impl DispatchRoles {
         let mut client_context = registration.is_some();
         let class = self.classify(
             &mut message,
-            registration.as_ref(),
+            registration
+                .as_ref()
+                .map(|candidate| candidate.registration()),
             envelope,
             &mut client_context,
             &mut buffers,
@@ -300,11 +299,8 @@ impl DispatchRoles {
         if matches!(class, Ok(Some(PduType::Response | PduType::Report)))
             || (client_context && !matches!(class, Ok(Some(_))))
         {
-            if registration.is_some()
-                && let Some(envelope) = envelope
-                && let Some(id) = envelope.request_id(&message.bytes)
-            {
-                core.deliver_parsed_buffered(id, envelope, message.into_packet(), buffers);
+            if let Some(registration) = registration {
+                core.deliver_candidate(registration, message.into_packet(), buffers);
             } else {
                 message.observe(super::MessageDisposition::Unmatched);
             }

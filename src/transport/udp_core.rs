@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -76,6 +76,7 @@ struct RegistrationOwner {
     expired: AtomicBool,
     notify: Arc<Notify>,
     correlation_window_id: Option<u64>,
+    registration: RequestRegistration,
 }
 
 impl RegistrationOwner {
@@ -99,6 +100,12 @@ struct ResponseCandidate {
     _permit: Option<super::framing::BufferPermits>,
 }
 
+struct CandidateIdentity {
+    request_id: i32,
+    envelope: Option<CorrelationEnvelope>,
+    checked: Option<ResponseIdentity>,
+}
+
 struct ResponseSlot {
     responses: VecDeque<ResponseCandidate>,
     owner: Arc<RegistrationOwner>,
@@ -106,7 +113,32 @@ struct ResponseSlot {
     target_source: SocketAddr,
     /// When true, only responses from exactly the target are delivered.
     strict_source: bool,
-    registration: RequestRegistration,
+}
+
+/// A shallow identity check bound to one input and immutable registration owner.
+/// Classification may retain this snapshot without cloning its alias tree.
+pub(crate) struct CandidateRegistration {
+    primary: i32,
+    request_id: i32,
+    owner: Arc<RegistrationOwner>,
+    wire: Bytes,
+    reception_id: crate::ReceptionId,
+    source: SocketAddr,
+    envelope: CorrelationEnvelope,
+    identity: ResponseIdentity,
+}
+
+impl CandidateRegistration {
+    pub(crate) fn registration(&self) -> &RequestRegistration {
+        &self.owner.registration
+    }
+
+    fn matches(&self, packet: &crate::ReceivedPacket) -> bool {
+        self.reception_id == packet.info().reception_id()
+            && self.source == packet.info().peer_addr()
+            && self.wire.as_ptr() == packet.bytes().as_ptr()
+            && self.wire.len() == packet.bytes().len()
+    }
 }
 
 enum PendingEntry {
@@ -351,6 +383,8 @@ impl UdpCore {
             }
         }
 
+        let mut registration = registration;
+        registration.clear_correlation_window();
         let owner = Arc::new(RegistrationOwner {
             registered_at: now,
             deadline,
@@ -358,15 +392,13 @@ impl UdpCore {
             expired: AtomicBool::new(false),
             notify: Arc::new(Notify::new()),
             correlation_window_id,
+            registration,
         });
-        let mut registration = registration;
-        registration.clear_correlation_window();
         let slot = ResponseSlot {
             responses: carried_responses,
             owner: owner.clone(),
             target_source,
             strict_source,
-            registration,
         };
 
         let primary_shard = Self::shard_index(primary);
@@ -502,6 +534,80 @@ impl UdpCore {
         )
     }
 
+    /// Complete a shared dispatch lookup. The usual path takes just the final
+    /// queue lock; only a retry handoff resolves and checks the identity again.
+    pub(crate) fn deliver_candidate(
+        &self,
+        token: CandidateRegistration,
+        packet: crate::ReceivedPacket,
+        permit: super::framing::BufferPermits,
+    ) -> bool {
+        let info = packet.info();
+        let delivered = if token.matches(&packet) {
+            self.deliver_candidate_inner(token, packet, permit)
+        } else {
+            self.stats
+                .discarded_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        if !delivered {
+            self.observation
+                .disposition(info, super::MessageDisposition::Unmatched);
+        }
+        delivered
+    }
+
+    fn deliver_candidate_inner(
+        &self,
+        mut token: CandidateRegistration,
+        packet: crate::ReceivedPacket,
+        permit: super::framing::BufferPermits,
+    ) -> bool {
+        let mut pending = self.shard(token.primary).pending.lock().unwrap();
+        if !matches!(pending.get(&token.primary), Some(PendingEntry::Slot(slot)) if Arc::ptr_eq(&token.owner, &slot.owner))
+        {
+            // A delayed classified response may belong to a newer attempt in
+            // this same exchange. A new unrelated owner cannot inherit proof
+            // from the previous registration, even if it reuses the same ID.
+            drop(pending);
+            let current = self.candidate_registration(
+                token.request_id,
+                packet.bytes(),
+                token.envelope,
+                packet.info(),
+            );
+            let Some(current) = current.filter(|current| {
+                token.owner.correlation_window_id.is_some()
+                    && token.owner.correlation_window_id == current.owner.correlation_window_id
+            }) else {
+                self.stats
+                    .discarded_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            token = current;
+            pending = self.shard(token.primary).pending.lock().unwrap();
+        }
+        let (data, info, prepared) = packet.into_prepared();
+        self.deliver_locked(
+            pending,
+            token.primary,
+            Some(&token.owner),
+            CandidateIdentity {
+                request_id: token.request_id,
+                envelope: Some(token.envelope),
+                checked: Some(token.identity),
+            },
+            ResponseCandidate {
+                data,
+                info,
+                prepared,
+                _permit: Some(permit),
+            },
+        )
+    }
+
     fn deliver_with_envelope(
         &self,
         request_id: i32,
@@ -533,15 +639,40 @@ impl UdpCore {
         envelope: Option<CorrelationEnvelope>,
         candidate: ResponseCandidate,
     ) -> bool {
+        let pending = self.shard(target_id).pending.lock().unwrap();
+        self.deliver_locked(
+            pending,
+            target_id,
+            expected_owner,
+            CandidateIdentity {
+                request_id,
+                envelope,
+                checked: None,
+            },
+            candidate,
+        )
+    }
+
+    fn deliver_locked(
+        &self,
+        mut pending: MutexGuard<'_, HashMap<i32, PendingEntry>>,
+        target_id: i32,
+        expected_owner: Option<&Arc<RegistrationOwner>>,
+        identity: CandidateIdentity,
+        candidate: ResponseCandidate,
+    ) -> bool {
         let ResponseCandidate {
             data,
             info,
             prepared,
             _permit,
         } = candidate;
+        let CandidateIdentity {
+            request_id,
+            envelope,
+            checked: checked_identity,
+        } = identity;
         let source = info.peer_addr();
-        let shard = self.shard(target_id);
-        let mut pending = shard.pending.lock().unwrap();
 
         if let Some(PendingEntry::Slot(slot)) = pending.get_mut(&target_id)
             && expected_owner.is_none_or(|owner| Arc::ptr_eq(owner, &slot.owner))
@@ -558,7 +689,7 @@ impl UdpCore {
             }
 
             let source_is_target = slot.target_source == source;
-            if slot.strict_source && !source_is_target {
+            if checked_identity.is_none() && slot.strict_source && !source_is_target {
                 // Leave the slot and original deadline intact.
                 drop(pending);
                 self.stats
@@ -567,19 +698,22 @@ impl UdpCore {
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id, %source }, "response rejected by strict source correlation");
                 return false;
             }
-            let identity = envelope.map_or_else(
-                || {
-                    slot.registration
-                        .evaluate_response_identity(&data, source_is_target)
-                },
-                |envelope| {
-                    slot.registration.evaluate_parsed_response_identity(
-                        &data,
-                        envelope,
-                        source_is_target,
-                    )
-                },
-            );
+            let identity = checked_identity.unwrap_or_else(|| {
+                envelope.map_or_else(
+                    || {
+                        slot.owner
+                            .registration
+                            .evaluate_response_identity(&data, source_is_target)
+                    },
+                    |envelope| {
+                        slot.owner.registration.evaluate_parsed_response_identity(
+                            &data,
+                            envelope,
+                            source_is_target,
+                        )
+                    },
+                )
+            });
             match identity {
                 ResponseIdentity::Reject => {
                     drop(pending);
@@ -635,37 +769,61 @@ impl UdpCore {
     pub(crate) fn candidate_registration(
         &self,
         id: i32,
-        data: &[u8],
+        data: &Bytes,
         envelope: CorrelationEnvelope,
-        source: SocketAddr,
-    ) -> Option<RequestRegistration> {
-        let primary = {
+        info: crate::ReceivedMessageInfo,
+    ) -> Option<CandidateRegistration> {
+        // Most candidates use their primary ID and need only this one lookup.
+        let (primary, owner) = {
             let pending = self.shard(id).pending.lock().unwrap();
             match pending.get(&id)? {
-                PendingEntry::Slot(_) => id,
-                PendingEntry::Alias { primary, .. } => *primary,
+                PendingEntry::Slot(slot) => {
+                    return Self::candidate_for_slot(slot, id, data, envelope, info);
+                }
+                PendingEntry::Alias { primary, owner } => (*primary, owner.clone()),
             }
         };
         let pending = self.shard(primary).pending.lock().unwrap();
         let PendingEntry::Slot(slot) = pending.get(&primary)? else {
             return None;
         };
+        if !Arc::ptr_eq(&owner, &slot.owner) {
+            return None;
+        }
+        Self::candidate_for_slot(slot, id, data, envelope, info)
+    }
+
+    fn candidate_for_slot(
+        slot: &ResponseSlot,
+        id: i32,
+        data: &Bytes,
+        envelope: CorrelationEnvelope,
+        info: crate::ReceivedMessageInfo,
+    ) -> Option<CandidateRegistration> {
+        let source = info.peer_addr();
         if slot.owner.deadline <= Instant::now()
             || (slot.strict_source && slot.target_source != source)
         {
             return None;
         }
-        if matches!(
-            slot.registration.evaluate_parsed_response_identity(
-                data,
-                envelope,
-                slot.target_source == source
-            ),
-            ResponseIdentity::Reject
-        ) {
+        let identity = slot.owner.registration.evaluate_parsed_response_identity(
+            data,
+            envelope,
+            slot.target_source == source,
+        );
+        if matches!(identity, ResponseIdentity::Reject) {
             return None;
         }
-        Some(slot.registration.clone())
+        Some(CandidateRegistration {
+            primary: slot.owner.registration.request_id(),
+            request_id: id,
+            owner: slot.owner.clone(),
+            wire: data.clone(),
+            reception_id: info.reception_id(),
+            source,
+            envelope,
+            identity,
+        })
     }
 
     /// Record a datagram from which no request ID could be extracted.
@@ -912,6 +1070,228 @@ mod tests {
         .unwrap()
         .encode()
         .unwrap()
+    }
+
+    fn community_registration(request_id: i32, community: &'static [u8]) -> RequestRegistration {
+        RequestRegistration::community(
+            request_id,
+            deadline_after(Duration::from_secs(30)),
+            crate::CommunityVersion::V2c,
+            Bytes::from_static(community),
+            CommunityResponsePolicy::Exact,
+        )
+    }
+
+    fn received_packet(data: Bytes, source: SocketAddr) -> crate::ReceivedPacket {
+        let info = crate::ReceivedMessageInfo::udp(
+            crate::EndpointId::new(),
+            test_addr(),
+            source,
+            None,
+            Instant::now(),
+            data.len(),
+        );
+        crate::ReceivedPacket::new(data, info)
+    }
+
+    fn lookup_candidate(core: &UdpCore, packet: &crate::ReceivedPacket) -> CandidateRegistration {
+        let envelope = CorrelationEnvelope::parse(packet.bytes()).unwrap();
+        core.candidate_registration(
+            envelope.request_id(packet.bytes()).unwrap(),
+            packet.bytes(),
+            envelope,
+            packet.info(),
+        )
+        .unwrap()
+    }
+
+    fn deliver_candidate(
+        core: &UdpCore,
+        token: CandidateRegistration,
+        packet: crate::ReceivedPacket,
+    ) -> bool {
+        let permit = Arc::new(tokio::sync::Semaphore::new(packet.bytes().len()))
+            .try_acquire_many_owned(packet.bytes().len() as u32)
+            .unwrap();
+        core.deliver_candidate(token, packet, permit.into())
+    }
+
+    #[tokio::test]
+    async fn candidate_token_shares_registration_and_retains_queue_checks() {
+        let core = Arc::new(UdpCore::new());
+        let registration = core
+            .register(
+                community_registration(30, b"public")
+                    .with_aliases([20, 21])
+                    .unwrap(),
+                test_addr(),
+                true,
+            )
+            .unwrap();
+        let bytes = community_packet(30, b"public");
+        for attempt in 0..=MAX_PARKED_CANDIDATES {
+            let packet = received_packet(bytes.clone(), test_addr());
+            let token = lookup_candidate(&core, &packet);
+            assert!(std::ptr::eq(
+                token.registration(),
+                &registration.owner.registration
+            ));
+            // Exact duplicate candidates are still rejected after token lookup.
+            assert_eq!(deliver_candidate(&core, token, packet), attempt == 0);
+        }
+        let (accepted, source) = core
+            .wait_for_response(&registration, test_addr())
+            .await
+            .unwrap();
+        assert_eq!(accepted, bytes);
+        assert_eq!(source, test_addr());
+        assert_eq!(core.stats().correlated_datagrams, 1);
+
+        // The stream policy does not deduplicate, but still enforces queue capacity.
+        let core = Arc::new(UdpCore::for_stream());
+        let _registration = core
+            .register(community_registration(30, b"public"), test_addr(), true)
+            .unwrap();
+        for attempt in 0..=MAX_PARKED_CANDIDATES {
+            let packet = received_packet(bytes.clone(), test_addr());
+            let token = lookup_candidate(&core, &packet);
+            assert_eq!(
+                deliver_candidate(&core, token, packet),
+                attempt < MAX_PARKED_CANDIDATES
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_token_rejects_changed_input_or_receive_identity() {
+        let core = Arc::new(UdpCore::new());
+        let _registration = core
+            .register(community_registration(30, b"public"), test_addr(), true)
+            .unwrap();
+        for changed_source in [false, true] {
+            let packet = received_packet(community_packet(30, b"public"), test_addr());
+            let token = lookup_candidate(&core, &packet);
+            let changed = if changed_source {
+                received_packet(packet.bytes().clone(), "127.0.0.2:161".parse().unwrap())
+            } else {
+                crate::ReceivedPacket::new(community_packet(30, b"wrong"), packet.info())
+            };
+            assert!(!deliver_candidate(&core, token, changed));
+        }
+        assert_eq!(core.stats().correlated_datagrams, 0);
+    }
+
+    #[test]
+    fn candidate_token_rejects_cancellation_and_unrelated_id_reuse() {
+        for reuse in [false, true] {
+            let core = Arc::new(UdpCore::new());
+            let registration = core
+                .register(community_registration(30, b"public"), test_addr(), true)
+                .unwrap();
+            let packet = received_packet(community_packet(30, b"public"), test_addr());
+            let token = lookup_candidate(&core, &packet);
+            drop(registration);
+            let _replacement = reuse.then(|| {
+                core.register(community_registration(30, b"public"), test_addr(), true)
+                    .unwrap()
+            });
+            assert!(!deliver_candidate(&core, token, packet));
+            assert_eq!(core.stats().correlated_datagrams, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_token_rechecks_deadline_after_classification() {
+        let core = Arc::new(UdpCore::new());
+        let _registration = core
+            .register(community_registration(30, b"public"), test_addr(), true)
+            .unwrap();
+        let packet = received_packet(community_packet(30, b"public"), test_addr());
+        let token = lookup_candidate(&core, &packet);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(!deliver_candidate(&core, token, packet));
+        assert_eq!(core.stats().expired_registrations, 1);
+        assert_eq!(core.stats().correlated_datagrams, 0);
+    }
+
+    #[tokio::test]
+    async fn candidate_token_follows_primary_and_alias_retry_handoffs() {
+        for incoming in [9, 10] {
+            let core = Arc::new(UdpCore::new());
+            let window = CorrelationWindow::new();
+            let first = core
+                .register(
+                    community_registration(10, b"public")
+                        .with_aliases([9])
+                        .unwrap()
+                        .with_correlation_window(window.clone()),
+                    test_addr(),
+                    true,
+                )
+                .unwrap();
+            let packet = received_packet(community_packet(incoming, b"public"), test_addr());
+            let info = packet.info();
+            let token = lookup_candidate(&core, &packet);
+            drop(first);
+            let second = core
+                .register(
+                    community_registration(11, b"public")
+                        .with_aliases([9, 10])
+                        .unwrap()
+                        .with_correlation_window(window.clone()),
+                    test_addr(),
+                    true,
+                )
+                .unwrap();
+            assert!(deliver_candidate(&core, token, packet));
+            let received = core
+                .wait_for_response_with(&second, test_addr(), |packet| {
+                    Ok(Candidate::Accept(packet.info()))
+                })
+                .await
+                .unwrap();
+            assert_eq!(received, info);
+        }
+    }
+
+    #[test]
+    fn candidate_token_retry_handoff_rechecks_source_community_and_decode_policy() {
+        for policy in ["source", "community", "decode"] {
+            let core = Arc::new(UdpCore::new());
+            let window = CorrelationWindow::new();
+            let source = "127.0.0.2:161".parse().unwrap();
+            let first = core
+                .register(
+                    community_registration(10, b"public").with_correlation_window(window.clone()),
+                    test_addr(),
+                    false,
+                )
+                .unwrap();
+            let mut bytes = community_packet(10, b"public").to_vec();
+            bytes.extend_from_slice(b"suffix");
+            let packet = received_packet(Bytes::from(bytes), source);
+            let token = lookup_candidate(&core, &packet);
+            drop(first);
+            let mut next = community_registration(
+                11,
+                if policy == "community" {
+                    b"private"
+                } else {
+                    b"public"
+                },
+            )
+            .with_aliases([10])
+            .unwrap()
+            .with_correlation_window(window.clone());
+            if policy == "decode" {
+                next = next.with_decode_config(crate::DecodeConfig::STRICT);
+            }
+            let _second = core
+                .register(next, test_addr(), policy == "source")
+                .unwrap();
+            assert!(!deliver_candidate(&core, token, packet), "{policy}");
+            assert_eq!(core.stats().correlated_datagrams, 0);
+        }
     }
 
     #[tokio::test]
